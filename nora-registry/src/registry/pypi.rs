@@ -55,7 +55,7 @@ pub fn routes() -> Router<AppState> {
                 .post(upload)
                 .fallback(|| async { method_not_allowed("GET, POST") }),
         )
-        .route("/simple/{name}/", get(package_versions))
+        .route("/simple/{name}/", get(package_versions_filtered))
         .route("/simple/{name}/{filename}", get(download_file))
 }
 
@@ -122,6 +122,30 @@ async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> imp
 
 /// GET /simple/{name}/ — list files for a package (PEP 503 HTML or PEP 691 JSON).
 ///
+/// Q04: the simple index of a proxied package is served without files younger than
+/// `min_release_age` (see `crate::metadata_filter`), dated by `dates.json`.
+async fn package_versions_filtered(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let normalized = normalize_name(&name);
+    let resp = package_versions(State(state.clone()), Path(name), headers).await;
+    let curation = state.curation();
+    let engine = &curation.curation_engine;
+    if resp.status() != StatusCode::OK
+        || !engine.metadata_filter_active()
+        || crate::curation::is_internal_namespace(engine, RegistryType::PyPI, &normalized)
+    {
+        return resp;
+    }
+    let dates = ensure_pypi_dates_cached(&state, &normalized, None).await;
+    crate::metadata_filter::rewrite_body(resp, |body| {
+        crate::metadata_filter::pypi_index(engine, &normalized, body, &dates)
+    })
+    .await
+}
+
 /// When proxy is configured, merges the upstream index with locally cached/uploaded
 /// files, so pip sees all available wheels (e.g. both cp310 and cp314) regardless of
 /// which were cached first. The upstream half is cached per project for
@@ -1690,7 +1714,7 @@ async fn fetch_upstream_dates(
 
 /// Normalize package name according to PEP 503: lowercase, and every run of
 /// `-`, `_`, `.` becomes a single `-` (`re.sub(r"[-_.]+", "-", name).lower()`).
-fn normalize_name(name: &str) -> String {
+pub(crate) fn normalize_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
         if matches!(c, '-' | '_' | '.') {

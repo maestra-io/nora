@@ -139,6 +139,9 @@ pub struct EvaluationResult {
 pub struct CurationEngine {
     config: CurationConfig,
     filters: Vec<Box<dyn ProxyFilter>>,
+    /// The min-release-age filter (also in `filters`), for hiding young versions
+    /// from metadata (Q04).
+    min_age: Option<MinReleaseAgeFilter>,
     /// Namespace isolation filter — always active, even in Off mode.
     namespace_filter: Option<Box<dyn ProxyFilter>>,
     metrics: CurationMetrics,
@@ -150,6 +153,7 @@ impl CurationEngine {
         Self {
             config,
             filters: Vec::new(),
+            min_age: None,
             namespace_filter: None,
             metrics: CurationMetrics::new(),
         }
@@ -159,6 +163,56 @@ impl CurationEngine {
     /// Evaluation order = insertion order.
     pub fn add_filter(&mut self, filter: Box<dyn ProxyFilter>) {
         self.filters.push(filter);
+    }
+
+    /// Install the min-release-age filter: at the end of the chain for downloads,
+    /// and for [`Self::hides_from_metadata`].
+    pub fn set_min_release_age(&mut self, filter: MinReleaseAgeFilter) {
+        self.filters.push(Box::new(filter.clone()));
+        self.min_age = Some(filter);
+    }
+
+    /// Whether metadata responses go through [`Self::hides_from_metadata`] at all:
+    /// curation is on and a min-release-age is configured.
+    pub fn metadata_filter_active(&self) -> bool {
+        self.is_active() && self.min_age.is_some()
+    }
+
+    /// Q04: hide `version` from package metadata (npm packument, PyPI simple index,
+    /// NuGet registration/version list)? True for a version younger than its
+    /// registry's `min_release_age`, not on the `allow` list, in enforce mode, so a
+    /// client resolving a range picks the newest allowed version instead of failing
+    /// on the download's 403. Audit mode logs and hides nothing. An unknown date
+    /// hides nothing (the download gate and the quarantine still apply).
+    pub fn hides_from_metadata(
+        &self,
+        registry: RegistryType,
+        name: &str,
+        version: &str,
+        published: Option<i64>,
+    ) -> bool {
+        let Some(filter) = self.min_age.as_ref().filter(|_| self.is_active()) else {
+            return false;
+        };
+        let Some(publish_ts) = published else {
+            return false;
+        };
+        let (threshold, _) = filter.threshold(registry);
+        if crate::cache_ttl::now_unix() as i64 - publish_ts >= threshold
+            || filter.allowed(registry, name, version)
+        {
+            return false;
+        }
+        if self.config.mode == CurationMode::Audit {
+            tracing::info!(
+                registry = %registry,
+                package = %name,
+                version = %version,
+                "[AUDIT] Version would be hidden from metadata (min-release-age)"
+            );
+            return false;
+        }
+        true
     }
 
     /// Set the namespace isolation filter (always active, even in Off mode).
@@ -1212,6 +1266,7 @@ pub fn parse_duration(s: &str) -> Result<i64, String> {
 /// `min_age_secs`. Versions on the per-registry `allow` list
 /// (`[curation.<registry>] allow = ["name@version"]`) are exempt from the age check
 /// only; the digest quarantine still applies to them.
+#[derive(Clone)]
 pub struct MinReleaseAgeFilter {
     min_age_secs: i64,
     label: String,
@@ -1266,6 +1321,20 @@ impl MinReleaseAgeFilter {
         self.overrides.insert(registry, (age_secs, label));
     }
 
+    /// The threshold (seconds) and its label for `registry`: a per-registry
+    /// override takes precedence over the global default.
+    fn threshold(&self, registry: RegistryType) -> (i64, &str) {
+        match self.overrides.get(&registry) {
+            Some((secs, lbl)) => (*secs, lbl.as_str()),
+            None => (self.min_age_secs, self.label.as_str()),
+        }
+    }
+
+    /// Whether `name@version` is on `registry`'s allow list.
+    fn allowed(&self, registry: RegistryType, name: &str, version: &str) -> bool {
+        !self.allow.is_empty() && self.allow.contains(&allow_key(registry, name, version))
+    }
+
     fn format_duration(secs: i64) -> String {
         if secs >= 604800 {
             let weeks = secs / 604800;
@@ -1289,13 +1358,7 @@ impl ProxyFilter for MinReleaseAgeFilter {
     }
 
     fn evaluate(&self, request: &FilterRequest) -> Decision {
-        // Resolve the threshold for this registry first: a per-registry override
-        // takes precedence over the global default.
-        let (threshold, label) = if let Some((secs, lbl)) = self.overrides.get(&request.registry) {
-            (*secs, lbl.as_str())
-        } else {
-            (self.min_age_secs, self.label.as_str())
-        };
+        let (threshold, label) = self.threshold(request.registry);
 
         let Some(publish_ts) = request.publish_date else {
             // Defer to digest-quarantine — the unspoofable first-seen holder
@@ -1319,10 +1382,7 @@ impl ProxyFilter for MinReleaseAgeFilter {
         let age = now - publish_ts;
         if age < threshold {
             if let Some(version) = request.version.known() {
-                if self
-                    .allow
-                    .contains(&allow_key(request.registry, &request.name, version))
-                {
+                if self.allowed(request.registry, &request.name, version) {
                     crate::metrics::CURATION_MIN_AGE_ALLOWED_TOTAL
                         .with_label_values(&[request.registry.as_str()])
                         .inc();

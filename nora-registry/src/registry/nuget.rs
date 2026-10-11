@@ -34,6 +34,7 @@ use axum::{
     Router,
 };
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::time::Duration;
 
 pub(crate) mod hosted;
@@ -191,11 +192,11 @@ fn routes_with_prefix(prefix: &str) -> Router<AppState> {
         )
         .route(
             &format!("/{prefix}/v3/registration/{{id}}/index.json"),
-            get(registration_index),
+            get(registration_index_filtered),
         )
         .route(
             &format!("/{prefix}/v3/registration/{{id}}/page/{{lower}}/{{*upper}}"),
-            get(registration_page),
+            get(registration_page_filtered),
         )
         .route(
             &format!("/{prefix}/v3/flatcontainer/{{*path}}"),
@@ -295,7 +296,7 @@ async fn search_query(
                 crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
-            with_json(rewritten.into_bytes())
+            with_json(filter_search_results(&state, rewritten).await)
         }
         Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
         Err(_) => {
@@ -388,7 +389,11 @@ async fn autocomplete_query(
                 crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
-            with_json(rewritten.into_bytes())
+            // `?id=` asks for one package's versions (hosted IDs never get here).
+            match qs.split('&').find_map(|kv| kv.strip_prefix("id=")) {
+                Some(id) => with_json(filter_autocomplete_versions(&state, id, rewritten).await),
+                None => with_json(rewritten.into_bytes()),
+            }
         }
         Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
         Err(_) => {
@@ -714,7 +719,7 @@ async fn flatcontainer_handler(
     //   {id}/{ver}/{filename}.nuspec → package spec
     let parts: Vec<&str> = path.splitn(3, '/').collect();
     match parts.len() {
-        2 if parts[1] == "index.json" => version_list(state, parts[0]).await,
+        2 if parts[1] == "index.json" => version_list_filtered(state, parts[0]).await,
         3 => flatcontainer_download(state, headers, &path, parts[0], parts[1], parts[2]).await,
         _ => StatusCode::NOT_FOUND.into_response(),
     }
@@ -1396,6 +1401,278 @@ async fn extract_nuget_publish_date(
             leaf_published(page.get("items")?.as_array()?, version)?
         }
     }
+}
+
+// ── Q04: hide young versions from proxied metadata ─────────────────────
+
+/// A catalog entry's version as the flat container spells it: lowercase, no
+/// SemVer 2 build metadata.
+fn entry_version(entry: &serde_json::Value) -> Option<String> {
+    let v = entry.get("version")?.as_str()?;
+    Some(v.split('+').next().unwrap_or(v).to_lowercase())
+}
+
+/// Whether `leaf` (a registration leaf) is a version metadata must hide.
+fn leaf_hidden(
+    engine: &crate::curation::CurationEngine,
+    id: &str,
+    leaf: &serde_json::Value,
+) -> bool {
+    let Some(entry) = leaf.get("catalogEntry") else {
+        return false;
+    };
+    let Some(version) = entry_version(entry) else {
+        return false;
+    };
+    let published = leaf_published(std::slice::from_ref(leaf), &version).flatten();
+    engine.hides_from_metadata(RegistryType::Nuget, id, &version, published)
+}
+
+/// Drop hidden leaves from a registration index (its inlined pages) or page, fixing
+/// each `count`. `None` when nothing is hidden.
+fn filter_registration(
+    engine: &crate::curation::CurationEngine,
+    id: &str,
+    body: &[u8],
+) -> Option<Vec<u8>> {
+    fn retain(
+        engine: &crate::curation::CurationEngine,
+        id: &str,
+        holder: &mut serde_json::Value,
+    ) -> bool {
+        let Some(leaves) = holder.get_mut("items").and_then(|i| i.as_array_mut()) else {
+            return false;
+        };
+        let before = leaves.len();
+        leaves.retain(|leaf| !leaf_hidden(engine, id, leaf));
+        let after = leaves.len();
+        if after != before {
+            holder["count"] = serde_json::json!(after);
+        }
+        after != before
+    }
+    let mut doc: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let is_page = doc
+        .get("items")?
+        .as_array()?
+        .iter()
+        .any(|i| i.get("catalogEntry").is_some());
+    let changed = if is_page {
+        retain(engine, id, &mut doc)
+    } else {
+        let mut changed = false;
+        for page in doc.get_mut("items")?.as_array_mut()? {
+            changed |= retain(engine, id, page);
+        }
+        changed
+    };
+    changed.then(|| serde_json::to_vec(&doc).ok()).flatten()
+}
+
+/// The versions of a proxied `id` metadata must hide, from its registration: the
+/// index (cached within `metadata_ttl`, else refetched) and, for an ID whose pages
+/// are not inlined, the page documents (cached by their bounds, fetched once,
+/// concurrently). `last_page_only` reads only the newest page: search results show
+/// many IDs at once, and a fresh version almost always lands there.
+async fn hidden_versions(state: &AppState, id: &str, last_page_only: bool) -> HashSet<String> {
+    let curation = state.curation();
+    let engine = &curation.curation_engine;
+    let index_key = registration_key(id);
+    let fresh = match state.storage.stat(&index_key).await {
+        Some(m) if is_within_ttl(m.modified, state.config.nuget.metadata_ttl) => {
+            read_json(&state.storage, &index_key).await
+        }
+        _ => None,
+    };
+    let index = match fresh {
+        Some(doc) => Some(doc),
+        None => {
+            match fetch_registration_doc(state, &index_key, &format!("{id}/index.json")).await {
+                Some(doc) => Some(doc),
+                None => read_json(&state.storage, &index_key).await,
+            }
+        }
+    };
+    let Some(pages) = index
+        .as_ref()
+        .and_then(|d| d.get("items")?.as_array().cloned())
+    else {
+        return HashSet::new();
+    };
+    let skip = if last_page_only {
+        pages.len().saturating_sub(1)
+    } else {
+        0
+    };
+    let docs = futures::future::join_all(pages.into_iter().skip(skip).map(|page| async move {
+        if page.get("items").is_some() {
+            return Some(page);
+        }
+        let bound = |k: &str| {
+            page.get(k)
+                .and_then(|v| v.as_str())
+                .map(str::to_lowercase)
+                .filter(|v| is_valid_version(v))
+        };
+        let (lower, upper) = (bound("lower")?, bound("upper")?);
+        let key = registration_page_key(id, &lower, &upper);
+        match read_json(&state.storage, &key).await {
+            Some(doc) => Some(doc),
+            None => {
+                fetch_registration_doc(state, &key, &format!("{id}/page/{lower}/{upper}.json"))
+                    .await
+            }
+        }
+    }))
+    .await;
+    docs.iter()
+        .flatten()
+        .filter_map(|d| d.get("items")?.as_array())
+        .flatten()
+        .filter(|leaf| leaf_hidden(engine, id, leaf))
+        .filter_map(|leaf| entry_version(leaf.get("catalogEntry")?))
+        .collect()
+}
+
+/// Whether a proxied ID's metadata goes through the Q04 filter at all.
+async fn filters_metadata(state: &AppState, id_lower: &str) -> bool {
+    let curation = state.curation();
+    let engine = &curation.curation_engine;
+    engine.metadata_filter_active()
+        && is_valid_package_id(id_lower)
+        && !crate::curation::is_internal_namespace(engine, RegistryType::Nuget, id_lower)
+        && hosted::is_proxied(state, id_lower).await
+}
+
+/// Remove `hidden` (lowercase) from a JSON string array at `field`.
+fn drop_versions(body: &[u8], field: &str, hidden: &HashSet<String>) -> Option<Vec<u8>> {
+    if hidden.is_empty() {
+        return None;
+    }
+    let mut doc: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let list = doc.get_mut(field)?.as_array_mut()?;
+    let before = list.len();
+    list.retain(|v| {
+        v.as_str()
+            .is_none_or(|v| !hidden.contains(&v.to_lowercase()))
+    });
+    (list.len() != before)
+        .then(|| serde_json::to_vec(&doc).ok())
+        .flatten()
+}
+
+async fn registration_index_filtered(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let id_lower = id.to_lowercase();
+    let resp = registration_index(State(state.clone()), headers, Path(id)).await;
+    if !filters_metadata(&state, &id_lower).await {
+        return resp;
+    }
+    let curation = state.curation();
+    let engine = &curation.curation_engine;
+    crate::metadata_filter::rewrite_body(resp, |b| filter_registration(engine, &id_lower, b)).await
+}
+
+async fn registration_page_filtered(
+    State(state): State<AppState>,
+    Path((id, lower, upper)): Path<(String, String, String)>,
+) -> Response {
+    let id_lower = id.to_lowercase();
+    let resp = registration_page(State(state.clone()), Path((id, lower, upper))).await;
+    if !filters_metadata(&state, &id_lower).await {
+        return resp;
+    }
+    let curation = state.curation();
+    let engine = &curation.curation_engine;
+    crate::metadata_filter::rewrite_body(resp, |b| filter_registration(engine, &id_lower, b)).await
+}
+
+/// Flat-container `index.json` — what `dotnet restore` resolves ranges against.
+async fn version_list_filtered(state: AppState, id: &str) -> Response {
+    let id_lower = id.to_lowercase();
+    let resp = version_list(state.clone(), id).await;
+    if resp.status() != StatusCode::OK || !filters_metadata(&state, &id_lower).await {
+        return resp;
+    }
+    let hidden = hidden_versions(&state, &id_lower, false).await;
+    crate::metadata_filter::rewrite_body(resp, |b| drop_versions(b, "versions", &hidden)).await
+}
+
+/// Autocomplete `?id=` lists one package's versions in `data`.
+async fn filter_autocomplete_versions(state: &AppState, id: &str, body: String) -> Vec<u8> {
+    let id_lower = id.to_lowercase();
+    if !filters_metadata(state, &id_lower).await {
+        return body.into_bytes();
+    }
+    let hidden = hidden_versions(state, &id_lower, false).await;
+    drop_versions(body.as_bytes(), "data", &hidden).unwrap_or_else(|| body.into_bytes())
+}
+
+/// Search results: per hit, drop hidden entries from `versions` and move `version`
+/// to the newest one left (a hit with none left is dropped).
+async fn filter_search_results(state: &AppState, body: String) -> Vec<u8> {
+    if !state.curation().curation_engine.metadata_filter_active() {
+        return body.into_bytes();
+    }
+    let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return body.into_bytes();
+    };
+    let Some(hits) = doc.get_mut("data").and_then(|d| d.as_array_mut()) else {
+        return body.into_bytes();
+    };
+    let ids: Vec<String> = hits
+        .iter()
+        .map(|h| {
+            h.get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .to_lowercase()
+        })
+        .collect();
+    let hidden = futures::future::join_all(ids.iter().map(|id| async move {
+        if filters_metadata(state, id).await {
+            hidden_versions(state, id, true).await
+        } else {
+            HashSet::new()
+        }
+    }))
+    .await;
+    let mut changed = false;
+    let mut keep = Vec::with_capacity(hits.len());
+    for (hit, hidden) in hits.iter_mut().zip(&hidden) {
+        if hidden.is_empty() {
+            keep.push(true);
+            continue;
+        }
+        changed = true;
+        let Some(versions) = hit.get_mut("versions").and_then(|v| v.as_array_mut()) else {
+            keep.push(true);
+            continue;
+        };
+        versions.retain(|v| {
+            v.get("version")
+                .and_then(|v| v.as_str())
+                .is_none_or(|v| !hidden.contains(&v.to_lowercase()))
+        });
+        let newest = versions
+            .iter()
+            .filter_map(|v| v.get("version")?.as_str())
+            .max_by(|a, b| hosted::compare_versions(&a.to_lowercase(), &b.to_lowercase()))
+            .map(str::to_string);
+        keep.push(newest.is_some());
+        if let Some(newest) = newest {
+            hit["version"] = serde_json::Value::String(newest);
+        }
+    }
+    if !changed {
+        return body.into_bytes();
+    }
+    let mut flags = keep.into_iter();
+    hits.retain(|_| flags.next().unwrap_or(true));
+    serde_json::to_vec(&doc).unwrap_or_else(|_| body.into_bytes())
 }
 
 fn upstream_url(state: &AppState) -> String {
@@ -2664,6 +2941,276 @@ mod integration_tests {
             resp.headers().contains_key("x-nora-quarantine"),
             "held by the quarantine on nora's clock, not by min-release-age on a cache mtime"
         );
+    }
+
+    /// Body of a (possibly gzip-encoded) JSON response.
+    async fn json_body(resp: axum::http::Response<axum::body::Body>) -> serde_json::Value {
+        assert_eq!(resp.status(), StatusCode::OK);
+        let gz = resp.headers().contains_key("content-encoding");
+        let raw = body_bytes(resp).await;
+        let mut out = Vec::new();
+        if gz {
+            std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&raw[..]), &mut out)
+                .unwrap();
+        } else {
+            out = raw.to_vec();
+        }
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    fn leaf_versions(leaves: &serde_json::Value) -> Vec<String> {
+        leaves
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["catalogEntry"]["version"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// A paged registration (two non-inlined pages) for `big.pkg`, plus its flat index:
+    /// 1.0.0 / 2.0.0 are old, 2.1.0 and 3.0.0-beta are young.
+    async fn mount_paged(upstream: &wiremock::MockServer) {
+        let base = upstream.uri();
+        let reg = "/v3/registration5-gz-semver2/big.pkg";
+        mount_json(
+            upstream,
+            &format!("{reg}/index.json"),
+            serde_json::json!({ "count": 2, "items": [
+                { "@id": format!("{base}{reg}/page/1.0.0/2.0.0.json"), "count": 2, "lower": "1.0.0", "upper": "2.0.0" },
+                { "@id": format!("{base}{reg}/page/2.1.0/3.0.0-beta.json"), "count": 2, "lower": "2.1.0", "upper": "3.0.0-beta" }
+            ] }),
+        )
+        .await;
+        mount_json(
+            upstream,
+            &format!("{reg}/page/1.0.0/2.0.0.json"),
+            serde_json::json!({ "count": 2, "lower": "1.0.0", "upper": "2.0.0",
+                "items": [leaf("1.0.0", &iso_ago(90 * 86400)), leaf("2.0.0", &iso_ago(30 * 86400))] }),
+        )
+        .await;
+        mount_json(
+            upstream,
+            &format!("{reg}/page/2.1.0/3.0.0-beta.json"),
+            serde_json::json!({ "count": 2, "lower": "2.1.0", "upper": "3.0.0-beta",
+                "items": [leaf("2.1.0", &iso_ago(3600)), leaf("3.0.0-beta", &iso_ago(600))] }),
+        )
+        .await;
+        mount_json(
+            upstream,
+            "/v3-flatcontainer/big.pkg/index.json",
+            serde_json::json!({ "versions": ["1.0.0", "2.0.0", "2.1.0", "3.0.0-beta"] }),
+        )
+        .await;
+    }
+
+    async fn flat_versions(ctx: &crate::test_helpers::TestContext, id: &str) -> serde_json::Value {
+        let uri = format!("/nuget/v3/flatcontainer/{id}/index.json");
+        json_body(send(&ctx.app, Method::GET, &uri, "").await).await["versions"].clone()
+    }
+
+    /// Q04: `dotnet restore` resolves ranges against the flat-container version list:
+    /// young versions are gone from it (dated through the paged registration), the
+    /// registration page drops them too, and an allowlisted one stays.
+    #[tokio::test]
+    async fn test_q04_flat_index_and_pages_hide_young_versions() {
+        let (upstream, ctx) = cooldown_upstream(true, &[], false).await;
+        mount_paged(&upstream).await;
+        assert_eq!(
+            flat_versions(&ctx, "big.pkg").await,
+            serde_json::json!(["1.0.0", "2.0.0"])
+        );
+        let page = json_body(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/nuget/v3/registration/big.pkg/page/2.1.0/3.0.0-beta.json",
+                "",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(page["count"], 0);
+        assert!(page["items"].as_array().unwrap().is_empty());
+
+        let (upstream, ctx) = cooldown_upstream(true, &["Big.Pkg@2.1.0"], false).await;
+        mount_paged(&upstream).await;
+        assert_eq!(
+            flat_versions(&ctx, "big.pkg").await,
+            serde_json::json!(["1.0.0", "2.0.0", "2.1.0"])
+        );
+    }
+
+    /// Q04: an inlined registration index loses its young leaves (count fixed); the
+    /// cache keeps the upstream original. Audit mode filters nothing.
+    #[tokio::test]
+    async fn test_q04_registration_index_hides_young_leaves_enforce_only() {
+        let index = serde_json::json!({ "count": 1, "items": [{ "count": 2, "lower": "1.0.0", "upper": "1.1.0",
+            "items": [leaf("1.0.0", &iso_ago(30 * 86400)), leaf("1.1.0", &iso_ago(600))] }] });
+        let (upstream, ctx) = cooldown_upstream(true, &[], false).await;
+        mount_json(
+            &upstream,
+            "/v3/registration5-gz-semver2/fresh.pkg/index.json",
+            index.clone(),
+        )
+        .await;
+        let uri = "/nuget/v3/registration/fresh.pkg/index.json";
+        let doc = json_body(send(&ctx.app, Method::GET, uri, "").await).await;
+        assert_eq!(leaf_versions(&doc["items"][0]["items"]), ["1.0.0"]);
+        assert_eq!(doc["items"][0]["count"], 1);
+        for _ in 0..50 {
+            if let Ok(raw) = ctx
+                .state
+                .storage
+                .get("nuget/registration/fresh.pkg/index.json")
+                .await
+            {
+                let cached: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+                assert_eq!(
+                    leaf_versions(&cached["items"][0]["items"]),
+                    ["1.0.0", "1.1.0"]
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_json(
+            &upstream,
+            "/v3/registration5-gz-semver2/fresh.pkg/index.json",
+            index,
+        )
+        .await;
+        let up = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(up);
+            cfg.curation.mode = crate::config::CurationMode::Audit;
+            cfg.curation.min_release_age = Some("7d".to_string());
+        });
+        let doc = json_body(send(&ctx.app, Method::GET, uri, "").await).await;
+        assert_eq!(leaf_versions(&doc["items"][0]["items"]), ["1.0.0", "1.1.0"]);
+    }
+
+    /// Q04: search moves a hit's `version` to the newest allowed one; autocomplete
+    /// `?id=` lists only allowed versions.
+    #[tokio::test]
+    async fn test_q04_search_and_autocomplete_hide_young_versions() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let upstream = wiremock::MockServer::start().await;
+        let (up, search, auto) = (
+            upstream.uri(),
+            format!("{}/query", upstream.uri()),
+            format!("{}/autocomplete", upstream.uri()),
+        );
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(up);
+            cfg.nuget.search_service = search;
+            cfg.nuget.autocomplete = auto;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+        });
+        mount_paged(&upstream).await;
+        let hit = serde_json::json!({ "totalHits": 1, "data": [{ "id": "Big.Pkg", "version": "3.0.0-beta",
+            "versions": [{ "version": "1.0.0" }, { "version": "2.0.0" }, { "version": "2.1.0" }, { "version": "3.0.0-beta" }] }] });
+        Mock::given(method("GET"))
+            .and(path("/query"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(hit))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/autocomplete"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "totalHits": 4, "data": ["1.0.0", "2.0.0", "2.1.0", "3.0.0-beta"] }),
+            ))
+            .mount(&upstream)
+            .await;
+        let doc = json_body(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/nuget/v3/query?q=big&prerelease=true",
+                "",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(doc["data"][0]["version"], "2.0.0");
+        assert_eq!(doc["data"][0]["versions"].as_array().unwrap().len(), 2);
+        let doc = json_body(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/nuget/v3/autocomplete?id=big.pkg&prerelease=true",
+                "",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(doc["data"], serde_json::json!(["1.0.0", "2.0.0"]));
+    }
+
+    /// Q04: a hosted package and an internal-namespace one are served as stored, even
+    /// with versions published a minute ago.
+    #[tokio::test]
+    async fn test_q04_hosted_and_internal_packages_not_filtered() {
+        use super::hosted::test_support::{multipart, nupkg};
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.nuget.metadata_proxy_timeout = 1;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+            cfg.curation.internal_namespaces = vec!["corp.*".to_string()];
+        });
+        let (ct, body) = multipart(&nupkg("Own.Lib", "1.0.0", ""));
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/nuget/v3/package/",
+            vec![("content-type", ct.as_str())],
+            body,
+        )
+        .await;
+        assert!(resp.status().is_success(), "push: {}", resp.status());
+        assert_eq!(
+            flat_versions(&ctx, "own.lib").await,
+            serde_json::json!(["1.0.0"])
+        );
+        let doc = json_body(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/nuget/v3/registration/own.lib/index.json",
+                "",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(leaf_versions(&doc["items"][0]["items"]), ["1.0.0"]);
+
+        let index = serde_json::json!({ "items": [{ "items": [leaf("2.0.0", &iso_ago(60))] }] });
+        ctx.state
+            .storage
+            .put(
+                "nuget/registration/corp.lib/index.json",
+                index.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        let doc = json_body(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/nuget/v3/registration/corp.lib/index.json",
+                "",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(leaf_versions(&doc["items"][0]["items"]), ["2.0.0"]);
     }
 
     #[tokio::test]

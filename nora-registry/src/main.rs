@@ -37,6 +37,7 @@ mod hash_pin_store;
 mod health;
 mod import;
 mod log_redact;
+mod metadata_filter;
 mod metrics;
 mod migrate;
 mod mirror;
@@ -2733,7 +2734,7 @@ fn build_curation_engine(config: &Config) -> Result<curation::CurationEngine, St
             Ok(secs) => {
                 let mut filter = curation::MinReleaseAgeFilter::new(secs, age_str);
                 load_registry_overrides(&mut filter, &config.curation);
-                engine.add_filter(Box::new(filter));
+                engine.set_min_release_age(filter);
                 info!(min_age = %age_str, seconds = secs, "Min-release-age filter loaded");
             }
             Err(e) if enforce => return Err(format!("invalid min_release_age {age_str}: {e}")),
