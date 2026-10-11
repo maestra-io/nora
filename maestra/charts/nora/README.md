@@ -104,6 +104,17 @@ config:
     general_burst: 200
 ```
 
+### Audit, circuit breaker, NuGet, extra server keys
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `config.audit.mode` | `file` (`{storage.path}/audit.jsonl`, never rotated), `stdout` (pod log), `both`, `off` | `stdout` |
+| `config.circuit_breaker.*` | `enabled`, `failure_threshold`, `reset_timeout`: fail fast (503) on an upstream that keeps failing | `true`, `5`, `30` |
+| `config.nuget.*` | Any `[nuget]` key, e.g. `proxy_timeout`, `metadata_proxy_timeout` | `30`, `15` |
+| `config.server.*` | Keys besides host/port/public_url are rendered as is, e.g. `body_limit_mb`, `shutdown_timeout` | unset |
+
+nora's own defaults differ: audit `file`, circuit breaker off, NuGet metadata timeout 2 s (too short for a large registration index on a cold cache).
+
 ### Authentication
 
 Maps to `[auth]` (and optionally `[auth.oidc]`) in `config.toml`.

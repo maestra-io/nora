@@ -498,3 +498,47 @@ tests:
       - notMatchRegex:
           path: data["config.toml"]
           pattern: 's3_credentials_dir'
+
+  # Maestra: audit switch (C78), circuit breaker (C52), NuGet timeouts (C46)
+  - it: sends audit to stdout, enables the circuit breaker and gives NuGet metadata 15 s by default
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[audit\]\nmode = "stdout"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[circuit_breaker\]\nenabled = true\nfailure_threshold = 5\nreset_timeout = 30\n'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[nuget\]\nmetadata_proxy_timeout = 15\nproxy_timeout = 30\n'
+
+  - it: switches audit mode and tunes NuGet timeouts
+    set:
+      config.audit.mode: file
+      config.nuget.metadata_proxy_timeout: 20
+      config.nuget.serve_stale: false
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[audit\]\nmode = "file"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[nuget\]\nmetadata_proxy_timeout = 20\nproxy_timeout = 30\nserve_stale = false\n'
+
+  - it: renders extra [server] keys
+    set:
+      config.server.body_limit_mb: 256
+      config.server.shutdown_timeout: 20
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'public_url = "https://registry\.example\.com"\nbody_limit_mb = 256\nshutdown_timeout = 20\n'
+
+  - it: refuses a table where the chart renders scalars
+    set:
+      config.circuit_breaker.overrides:
+        npm:
+          failure_threshold: 3
+    asserts:
+      - failedTemplate:
+          errorPattern: 'config key "overrides" is a table'

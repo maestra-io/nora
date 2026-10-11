@@ -125,6 +125,11 @@ config:
     # Set explicitly for non-standard setups (CDN, reverse proxy, NodePort).
     # Example: "https://registry.example.com"
     public_url: ""
+    # -- Any other [server] key is rendered as is, e.g. body_limit_mb (2048),
+    # shutdown_timeout (15, see terminationGracePeriodSeconds), proxy_coalesce,
+    # trust_upstream_dates.
+    # body_limit_mb: 256
+    # shutdown_timeout: 15
   registries:
     enable: "all"
   storage:
@@ -224,6 +229,34 @@ config:
       #        namespace_scope: ["ci-transport/**"]  # narrows the provider scope
       #      - pattern: "repo:myorg/*"
       #        role: read
+
+  # -- Audit log: file ({storage.path}/audit.jsonl, append-only, never
+  # rotated), stdout (JSONL to stderr, i.e. the pod log), both, off.
+  # stdout on Kubernetes: the cluster log pipeline keeps it and nothing grows
+  # on the volume. Env NORA_AUDIT_LOG overrides.
+  audit:
+    mode: stdout
+
+  # -- Upstream circuit breaker ([circuit_breaker]): after failure_threshold
+  # consecutive upstream failures a registry's proxy fails fast (503) for
+  # reset_timeout seconds instead of every cache miss waiting out two
+  # proxy_timeout attempts. nora's default is off; on here. Flat keys only
+  # (per-registry `overrides` need a table: use NORA_CB_* env or extend the
+  # chart). Env NORA_CB_ENABLED / NORA_CB_THRESHOLD / NORA_CB_RESET_TIMEOUT
+  # override.
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5
+    reset_timeout: 30
+
+  # -- [nuget] keys, rendered as is: proxy_timeout (artifact download, 30 s
+  # per attempt), metadata_proxy_timeout (registration index / version list,
+  # nora default 2 s, which a large registration index on a busy link
+  # exceeds), metadata_ttl, serve_stale, revalidate, proxy, search_service,
+  # autocomplete. Enable NuGet itself via registries.enable.
+  nuget:
+    proxy_timeout: 30
+    metadata_proxy_timeout: 15
 
   # -- Rate limiting (token bucket). See https://getnora.dev/configuration/rate-limits/
   # Env overrides (NORA_RATE_LIMIT_*) still apply if set via extraEnv.

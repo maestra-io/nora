@@ -20,6 +20,9 @@ data:
     {{- else }}
     {{- fail "config.server.public_url is required when ingress and httpRoute are both disabled. Set config.server.public_url in your values (e.g. https://registry.example.com)." }}
     {{- end }}
+    {{- with include "nora.tomlScalars" (omit .Values.config.server "host" "port" "public_url") | trim }}
+    {{- . | nindent 4 }}
+    {{- end }}
 
     {{- if .Values.config.registries }}
 
@@ -135,6 +138,19 @@ data:
     {{- end }}
     {{- end }}
     {{- end }}
+    {{- end }}
+
+    [audit]
+    mode = {{ .Values.config.audit.mode | quote }}
+    {{- with .Values.config.circuit_breaker }}
+
+    [circuit_breaker]
+    {{- include "nora.tomlScalars" . | trim | nindent 4 }}
+    {{- end }}
+    {{- with .Values.config.nuget }}
+
+    [nuget]
+    {{- include "nora.tomlScalars" . | trim | nindent 4 }}
     {{- end }}
 
     [rate_limit]

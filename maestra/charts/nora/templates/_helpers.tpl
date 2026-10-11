@@ -125,3 +125,16 @@ s3Credentials.existingSecret is set, otherwise the explicit value.
 {{- $st.s3_credentials_dir -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+`key = value` lines for a flat map of scalars or scalar lists (toJson output is
+valid TOML for strings, numbers, booleans and string arrays).
+*/}}
+{{- define "nora.tomlScalars" -}}
+{{- range $k, $v := . }}
+{{- if kindIs "map" $v }}
+{{- fail (printf "config key %q is a table; the chart renders scalar values here only" $k) }}
+{{- end }}
+{{ $k }} = {{ toJson $v }}
+{{- end }}
+{{- end }}
