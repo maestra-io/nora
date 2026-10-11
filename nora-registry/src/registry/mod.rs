@@ -1051,6 +1051,55 @@ pub(crate) async fn write_validators(storage: &crate::Storage, key: &str, v: &Va
     }
 }
 
+/// Record that the cached `key` was just revalidated (upstream answered 304) by
+/// stamping `validated_at` (Unix seconds) into its `.meta` sidecar, next to the
+/// validators it keeps. Only that small sidecar is written: re-uploading the whole
+/// body to bump its mtime cost one full object PUT per key per TTL window (C56).
+pub(crate) async fn mark_revalidated(storage: &crate::Storage, registry: &str, key: &str) {
+    let sidecar = validators_key(key);
+    let mut doc = match storage.get(&sidecar).await.ok().map(|d| serde_json::from_slice(&d)) {
+        Some(Ok(serde_json::Value::Object(map))) => map,
+        _ => serde_json::Map::new(),
+    };
+    doc.insert(
+        "validated_at".into(),
+        crate::cache_ttl::now_unix().into(),
+    );
+    let data = serde_json::Value::Object(doc).to_string();
+    if let Err(e) = storage.put(&sidecar, data.as_bytes()).await {
+        crate::record_cache_write_error(registry, &sidecar, &e);
+    }
+}
+
+/// Whether the cached `key`, last written at `modified`, is still fresh under
+/// `ttl_secs`: written within the TTL, or revalidated (a 304, see
+/// [`mark_revalidated`]) within it. The sidecar is read only when the write time
+/// alone says stale.
+pub(crate) async fn fresh_within_ttl(
+    storage: &crate::Storage,
+    key: &str,
+    modified: u64,
+    ttl_secs: i64,
+) -> bool {
+    if crate::cache_ttl::is_within_ttl(modified, ttl_secs) {
+        return true;
+    }
+    if ttl_secs <= 0 {
+        return false;
+    }
+    #[derive(serde::Deserialize)]
+    struct Freshness {
+        validated_at: Option<u64>,
+    }
+    let Ok(data) = storage.get(&validators_key(key)).await else {
+        return false;
+    };
+    serde_json::from_slice::<Freshness>(&data)
+        .ok()
+        .and_then(|f| f.validated_at)
+        .is_some_and(|t| crate::cache_ttl::is_within_ttl(t, ttl_secs))
+}
+
 fn header_string(resp: &reqwest::Response, name: reqwest::header::HeaderName) -> Option<String> {
     resp.headers()
         .get(name)
@@ -1679,6 +1728,45 @@ mod tests {
         assert!(
             matches!(after, Err(ProxyError::CircuitOpen(_))),
             "control: breaker opens"
+        );
+    }
+
+    /// C56: a 304 is recorded as `validated_at` in the `.meta` sidecar, keeping the
+    /// validators, and that is what keeps a body whose write time is past the TTL
+    /// fresh — no re-upload of the body needed.
+    #[tokio::test]
+    async fn revalidation_freshness_lives_in_the_sidecar() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::Storage::new_local(dir.path().to_str().unwrap());
+        let key = "nuget/flatcontainer/pkg/index.json";
+        storage.put(key, b"{}").await.unwrap();
+        let v = Validators {
+            etag: Some("\"e1\"".to_string()),
+            last_modified: None,
+        };
+        write_validators(&storage, key, &v).await;
+        // The body was written two hours ago.
+        let two_hours_ago = std::time::SystemTime::now() - Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.path().join(key))
+            .unwrap()
+            .set_modified(two_hours_ago)
+            .unwrap();
+        let modified = storage.stat(key).await.unwrap().modified;
+
+        assert!(!fresh_within_ttl(&storage, key, modified, 3600).await);
+        mark_revalidated(&storage, "nuget", key).await;
+        assert!(fresh_within_ttl(&storage, key, modified, 3600).await);
+        assert!(
+            !fresh_within_ttl(&storage, key, modified, 0).await,
+            "ttl 0 is always stale"
+        );
+        assert_eq!(read_validators(&storage, key).await, Some(v), "validators kept");
+        assert_eq!(
+            storage.stat(key).await.unwrap().modified,
+            modified,
+            "the body is not rewritten"
         );
     }
 

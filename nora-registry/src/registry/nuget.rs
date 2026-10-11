@@ -17,9 +17,9 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::config::UpstreamAuth;
 use crate::registry::{
-    cache_read, nora_base_url, proxy_error_response, proxy_fetch_bytes, proxy_fetch_conditional,
-    proxy_fetch_shared, proxy_fetch_text, read_validators, write_validators, ProxyError,
-    Revalidation, Validators,
+    cache_read, fresh_within_ttl, mark_revalidated, nora_base_url, proxy_error_response,
+    proxy_fetch_bytes, proxy_fetch_conditional, proxy_fetch_shared, proxy_fetch_text,
+    read_validators, write_validators, ProxyError, Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -462,7 +462,8 @@ async fn registration_index(
     // TTL cache — rewrite URLs on read (cache may contain pre-fix entries)
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, state.config.nuget.metadata_ttl) {
+            let ttl = state.config.nuget.metadata_ttl;
+            if fresh_within_ttl(&state.storage, &storage_key, meta.modified, ttl).await {
                 state.metrics.record_download("nuget");
                 state.metrics.record_cache_hit("nuget");
                 let text = String::from_utf8_lossy(data);
@@ -671,7 +672,8 @@ async fn version_list(state: AppState, id: &str) -> Response {
     // TTL cache
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, state.config.nuget.metadata_ttl) {
+            let ttl = state.config.nuget.metadata_ttl;
+            if fresh_within_ttl(&state.storage, &storage_key, meta.modified, ttl).await {
                 state.metrics.record_download("nuget");
                 state.metrics.record_cache_hit("nuget");
                 return with_json(data.to_vec());
@@ -750,8 +752,9 @@ async fn refresh_metadata(
         )
         .await
         {
-            // Upstream unchanged — serve the cached body and bump its freshness so we
-            // do not revalidate again until the next TTL window. No body downloaded.
+            // Upstream unchanged — serve the cached body and record the revalidation
+            // so we do not revalidate again until the next TTL window. No body is
+            // downloaded, and none is re-uploaded (C56).
             Ok(Revalidation::NotModified) => {
                 let body = state
                     .storage
@@ -768,11 +771,8 @@ async fn refresh_metadata(
                 state.metrics.record_cache_hit("nuget");
                 let storage = state.storage.clone();
                 let key_clone = storage_key.to_string();
-                let bump = body.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = storage.put(&key_clone, &bump).await {
-                        crate::record_cache_write_error("nuget", &key_clone, &e);
-                    }
+                    mark_revalidated(&storage, "nuget", &key_clone).await;
                 });
                 Ok(body)
             }
@@ -4126,6 +4126,64 @@ mod spec_conformance_tests {
             cache_control.contains("immutable"),
             "nupkg must have immutable cache-control, got: {}",
             cache_control
+        );
+    }
+
+    /// C56: an upstream 304 writes only the small `.meta` sidecar (one PUT carrying
+    /// `validated_at`), never the cached body again.
+    #[tokio::test]
+    async fn test_nuget_304_writes_only_the_sidecar() {
+        use crate::registry::{validators_key, write_validators, Validators};
+        use crate::test_helpers::{
+            create_test_context_with_storage_and_config, op_counting_storage, send,
+        };
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(upstream.uri());
+            cfg.nuget.metadata_ttl = 0; // always stale → always revalidate
+        });
+        let key = "nuget/flatcontainer/sidecar-pkg/index.json";
+        ctx.state
+            .storage
+            .put(key, br#"{"versions":["1.0.0"]}"#)
+            .await
+            .unwrap();
+        let v = Validators {
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+        };
+        write_validators(&ctx.state.storage, key, &v).await;
+        ops.reset();
+
+        let uri = "/nuget/v3/flatcontainer/sidecar-pkg/index.json";
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut stamped = false;
+        for _ in 0..100 {
+            let sidecar = ctx.state.storage.get(&validators_key(key)).await.unwrap();
+            if String::from_utf8_lossy(&sidecar).contains("validated_at") {
+                stamped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stamped, "the 304 is recorded in the sidecar");
+        assert_eq!(
+            ops.snapshot().get("put"),
+            Some(&1),
+            "only the sidecar is written: {:?}",
+            ops.snapshot()
         );
     }
 

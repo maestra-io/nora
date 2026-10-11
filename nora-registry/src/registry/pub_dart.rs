@@ -175,7 +175,8 @@ async fn package_listing(
     let cached_data = state.storage.get(&key).await.ok();
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&key).await {
-            if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
+            let ttl = state.config.pub_dart.metadata_ttl;
+            if crate::registry::fresh_within_ttl(&state.storage, &key, meta.modified, ttl).await {
                 return pub_json_response(data.to_vec());
             }
         }
@@ -244,11 +245,11 @@ async fn package_listing(
             crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
                 .with_label_values(&["pub"])
                 .inc_by(body.len() as u64);
+            // Record the revalidation in the `.meta` sidecar; no body re-upload (C56).
             let storage = state.storage.clone();
             let key_clone = key.clone();
-            let bump = body.clone();
             tokio::spawn(async move {
-                let _ = storage.put(&key_clone, &bump).await;
+                crate::registry::mark_revalidated(&storage, "pub", &key_clone).await;
             });
             pub_json_response(body.to_vec())
         }

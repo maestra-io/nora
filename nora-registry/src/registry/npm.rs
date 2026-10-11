@@ -767,7 +767,8 @@ async fn handle_request(
         if !is_tarball {
             let ttl = state.config.npm.metadata_ttl;
             if let Some(meta) = state.storage.stat(&key).await {
-                if !crate::cache_ttl::is_within_ttl(meta.modified, ttl) {
+                if !crate::registry::fresh_within_ttl(&state.storage, &key, meta.modified, ttl).await
+                {
                     // #68 namespace isolation: a stale internal-namespace package must
                     // NOT be revalidated upstream (dependency confusion) — refetch_metadata
                     // proxies the name. Serve the cached copy already in hand instead; an
@@ -1322,8 +1323,8 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
     .await
     {
         // Upstream unchanged — serve the cached (already-rewritten) body and
-        // refresh its freshness so we don't revalidate again until the next TTL
-        // window. No body was downloaded.
+        // record the revalidation so we don't revalidate again until the next TTL
+        // window. No body was downloaded, and none is re-uploaded (C56).
         Ok(Revalidation::NotModified) => {
             match state.storage.get(key).await {
                 Ok(cached) => {
@@ -1341,15 +1342,10 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
                     if memchr::memmem::find(&cached, PUBLIC_BASE.as_bytes()).is_none() {
                         let _ = state.storage.delete(&validators_key(key)).await;
                     }
-
-                    // Re-put bumps the file mtime (the freshness source) without an
-                    // upstream download.
                     let storage = state.storage.clone();
                     let key_clone = key.to_string();
-                    let body = cached.clone();
-                    let origin = origin_of(proxy_url);
                     tokio::spawn(async move {
-                        let _ = put_with_origin(&storage, &key_clone, body, &origin).await;
+                        crate::registry::mark_revalidated(&storage, "npm", &key_clone).await;
                     });
                     Some(cached.to_vec())
                 }

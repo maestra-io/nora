@@ -194,7 +194,10 @@ async fn compact_index(
     let cached_data = state.storage.get(&storage_key).await.ok();
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, state.config.gems.metadata_ttl) {
+            let ttl = state.config.gems.metadata_ttl;
+            if crate::registry::fresh_within_ttl(&state.storage, &storage_key, meta.modified, ttl)
+                .await
+            {
                 state.metrics.record_download("gems");
                 state.metrics.record_cache_hit("gems");
                 state.activity.push(ActivityEntry::new(
@@ -269,12 +272,11 @@ async fn compact_index(
                 .inc_by(cached.len() as u64);
             state.metrics.record_download("gems");
             state.metrics.record_cache_hit("gems");
-            // Re-put bumps the file mtime (the freshness source) without download.
+            // Record the revalidation in the `.meta` sidecar; no body re-upload (C56).
             let storage = state.storage.clone();
             let key_clone = storage_key.clone();
-            let body = cached.clone();
             tokio::spawn(async move {
-                let _ = storage.put(&key_clone, &body).await;
+                crate::registry::mark_revalidated(&storage, "gems", &key_clone).await;
             });
             with_text(cached.to_vec())
         }
