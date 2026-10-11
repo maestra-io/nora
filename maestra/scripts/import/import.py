@@ -65,7 +65,7 @@ def log(fmt, pkg, ver, status, size=0, secs=0.0, detail=""):
         print(f"{now()} {fmt} {pkg} {ver} {status} {size}B {secs:.2f}s {detail}".rstrip(), flush=True)
 
 
-def call(sess, limiter, method, url, ok=(200, 201, 204), tries=8, **kw):
+def call(sess, limiter, method, url, tries=8, **kw):
     """HTTP with retries on transport errors, 429 and 5xx; returns the response for any other status."""
     for i in range(tries):
         limiter.wait()
