@@ -444,9 +444,13 @@ fn build_http_client(
 ) -> reqwest::Client {
     // A black-holed upstream fails the connect in seconds instead of eating the
     // whole per-request timeout (twice, with the proxy retry).
+    // Idle pooled connections are dropped after 30 s, before the usual 60 s idle
+    // cut of upstream load balancers/CDNs: reusing one they already closed fails the
+    // request (reqwest's default keeps them 90 s).
     let mut builder = reqwest::ClientBuilder::new()
         .user_agent(USER_AGENT)
-        .connect_timeout(std::time::Duration::from_secs(10));
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .pool_idle_timeout(std::time::Duration::from_secs(30));
 
     if let Some(t) = timeout {
         builder = builder.timeout(t);

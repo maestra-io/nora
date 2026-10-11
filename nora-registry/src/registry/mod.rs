@@ -1066,8 +1066,9 @@ fn header_string(resp: &reqwest::Response, name: reqwest::header::HeaderName) ->
 ///
 /// Circuit breaker: 304/200 record success; transport/5xx and a 200 whose body
 /// cannot be read record failure; 4xx returns `NotFound` (matching
-/// `proxy_fetch_core`). No retry — revalidation is a lightweight check and the
-/// caller falls back to a full fetch on error.
+/// `proxy_fetch_core`). A 5xx or transport error is retried once after 1 s, as in
+/// `proxy_fetch_core`: this is also the first (validator-less) fetch of a NuGet
+/// registration or version list, where one blip would otherwise be a 5xx.
 pub(crate) async fn proxy_fetch_conditional(
     client: &reqwest::Client,
     url: &str,
@@ -1081,67 +1082,74 @@ pub(crate) async fn proxy_fetch_conditional(
     let cb_key = scope.into().key();
     let probe = cb.check(&cb_key)?;
 
-    let mut request = client.get(url).timeout(timeout);
-    if let Some(value) = auth_header {
-        request = request.header(header::AUTHORIZATION, value);
-    }
-    if let Some(ref etag) = validators.etag {
-        request = request.header(header::IF_NONE_MATCH, etag);
-    }
-    if let Some(ref lm) = validators.last_modified {
-        request = request.header(header::IF_MODIFIED_SINCE, lm);
-    }
+    for attempt in 0..2 {
+        let mut request = client.get(url).timeout(timeout);
+        if let Some(value) = &auth_header {
+            request = request.header(header::AUTHORIZATION, value.clone());
+        }
+        if let Some(ref etag) = validators.etag {
+            request = request.header(header::IF_NONE_MATCH, etag);
+        }
+        if let Some(ref lm) = validators.last_modified {
+            request = request.header(header::IF_MODIFIED_SINCE, lm);
+        }
 
-    match request.send().await {
-        Ok(response) => {
-            let status = response.status();
-            if status == reqwest::StatusCode::NOT_MODIFIED {
-                cb.record_success(&cb_key, probe);
-                return Ok(Revalidation::NotModified);
-            }
-            if status.is_success() {
-                let new_validators = Validators {
-                    etag: header_string(&response, header::ETAG),
-                    last_modified: header_string(&response, header::LAST_MODIFIED),
-                };
-                return match response.bytes().await {
-                    Ok(body) => {
-                        cb.record_success(&cb_key, probe);
-                        Ok(Revalidation::Modified {
-                            body: body.to_vec(),
-                            validators: new_validators,
-                        })
-                    }
-                    Err(e) => {
-                        // 2xx but the body could not be read (e.g. a mid-stream
-                        // drop) — a fetch failure for the breaker, as in
-                        // proxy_fetch_core; unreported, a half-open probe would
-                        // hold its slot until the #585 stall recovery.
-                        cb.record_failure(&cb_key, probe);
-                        Err(transport_error(e))
-                    }
-                };
-            }
-            let code = status.as_u16();
-            if (400..500).contains(&code) {
-                // 4xx — upstream alive; recover the breaker without clearing a
-                // real failure tally, consistent with proxy_fetch_core (#606).
-                let err = upstream_4xx(code, response.headers());
-                if matches!(err, ProxyError::RateLimited(_)) {
-                    cb.record_failure(&cb_key, probe);
-                } else {
-                    cb.record_alive(&cb_key, probe);
+        let err = match request.send().await {
+            Ok(response) => {
+                let status = response.status();
+                if status == reqwest::StatusCode::NOT_MODIFIED {
+                    cb.record_success(&cb_key, probe);
+                    return Ok(Revalidation::NotModified);
                 }
-                return Err(err);
+                if status.is_success() {
+                    let new_validators = Validators {
+                        etag: header_string(&response, header::ETAG),
+                        last_modified: header_string(&response, header::LAST_MODIFIED),
+                    };
+                    return match response.bytes().await {
+                        Ok(body) => {
+                            cb.record_success(&cb_key, probe);
+                            Ok(Revalidation::Modified {
+                                body: body.to_vec(),
+                                validators: new_validators,
+                            })
+                        }
+                        Err(e) => {
+                            // 2xx but the body could not be read (e.g. a mid-stream
+                            // drop) — a fetch failure for the breaker, as in
+                            // proxy_fetch_core; unreported, a half-open probe would
+                            // hold its slot until the #585 stall recovery.
+                            cb.record_failure(&cb_key, probe);
+                            Err(transport_error(e))
+                        }
+                    };
+                }
+                let code = status.as_u16();
+                if (400..500).contains(&code) {
+                    // 4xx — upstream alive; recover the breaker without clearing a
+                    // real failure tally, consistent with proxy_fetch_core (#606).
+                    let err = upstream_4xx(code, response.headers());
+                    if matches!(err, ProxyError::RateLimited(_)) {
+                        cb.record_failure(&cb_key, probe);
+                    } else {
+                        cb.record_alive(&cb_key, probe);
+                    }
+                    return Err(err);
+                }
+                ProxyError::Upstream(code)
             }
-            cb.record_failure(&cb_key, probe);
-            Err(ProxyError::Upstream(code))
+            Err(e) => transport_error(e),
+        };
+        if attempt == 0 {
+            tracing::debug!(url, error = ?err, "conditional upstream fetch failed, retrying in 1s");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
         }
-        Err(e) => {
-            cb.record_failure(&cb_key, probe);
-            Err(transport_error(e))
-        }
+        cb.record_failure(&cb_key, probe);
+        return Err(err);
     }
+    cb.record_failure(&cb_key, probe);
+    Err(ProxyError::Network("max retries exceeded".into()))
 }
 
 #[cfg(test)]
@@ -1404,6 +1412,43 @@ mod tests {
         .unwrap();
 
         assert!(matches!(out, Revalidation::NotModified));
+    }
+
+    /// A 5xx on the conditional fetch (also the first, validator-less fetch of a
+    /// NuGet registration or version list) is retried once, as `proxy_fetch_core`
+    /// does, instead of surfacing the first blip as a 502 (C46).
+    #[tokio::test]
+    async fn conditional_fetch_retries_once_on_5xx() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("BODY"))
+            .mount(&upstream)
+            .await;
+
+        let out = proxy_fetch_conditional(
+            &reqwest::Client::new(),
+            &upstream.uri(),
+            Duration::from_secs(5),
+            None,
+            &Validators::default(),
+            &noop_cb(),
+            RegistryType::Nuget,
+        )
+        .await;
+        assert!(
+            matches!(out, Ok(Revalidation::Modified { ref body, .. }) if body == b"BODY"),
+            "{:?}",
+            out.as_ref().err()
+        );
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 2);
     }
 
     /// Run one half-open probe through `proxy_fetch_conditional` against an

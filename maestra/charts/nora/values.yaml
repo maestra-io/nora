@@ -251,9 +251,9 @@ config:
 
   # -- [nuget] keys, rendered as is: proxy_timeout (artifact download, 30 s
   # per attempt), metadata_proxy_timeout (registration index / version list,
-  # nora default 2 s, which a large registration index on a busy link
-  # exceeds), metadata_ttl, serve_stale, revalidate, proxy, search_service,
-  # autocomplete. Enable NuGet itself via registries.enable.
+  # per attempt, one retry; nora default 10 s), metadata_ttl, serve_stale,
+  # revalidate, proxy, search_service, autocomplete. Enable NuGet itself via
+  # registries.enable.
   nuget:
     proxy_timeout: 30
     metadata_proxy_timeout: 15
