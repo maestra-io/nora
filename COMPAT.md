@@ -105,10 +105,12 @@ This document describes which parts of each registry protocol are implemented in
 | Simple index (JSON) | Full | PEP 691, via Accept header |
 | Package versions page | Full | HTML + JSON |
 | File download | Full | Wheel, sdist, egg |
-| `twine upload` | Full | Multipart form-data |
+| `twine upload` | Full | Multipart form-data, streamed to disk; the filename must match the form's project and version; `requires_python` is kept |
 | SHA256 hashes | Full | In metadata links |
+| Requires-Python / yanked | Full | `data-requires-python` / `data-yanked` (PEP 503/592), `requires-python` / `yanked` in JSON |
+| Core metadata (PEP 658/714) | Full | `<wheel>.metadata` for stored wheels (extracted on upload and cache) and proxied from upstreams that advertise it; `data-core-metadata` / `core-metadata` only where served |
 | Case normalization | Full | `My-Package` → `my-package` |
-| Upstream proxy | Full | Configurable TTL |
+| Upstream proxy | Full | Upstream index cached per project for `pypi.metadata_ttl` seconds (default 300, `NORA_PYPI_METADATA_TTL`; an upstream 404 included), refreshed single-flight; a failed refresh serves the last good index with `Warning: 110`, or 5xx when there is none |
 | JSON API metadata | Full | `application/vnd.pypi.simple.v1+json` |
 | Yanking | — | Not implemented |
 | Upload signatures (PGP) | — | Not implemented |

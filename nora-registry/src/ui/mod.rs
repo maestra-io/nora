@@ -481,7 +481,15 @@ async fn pypi_list(
     let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
     let auth_enabled = state.auth.is_some();
 
-    let all_packages = state.repo_index.get("pypi", &state.storage).await;
+    // A project with only bookkeeping (cached upstream index, dates) holds no release.
+    let all_packages: Vec<_> = state
+        .repo_index
+        .get("pypi", &state.storage)
+        .await
+        .iter()
+        .filter(|p| p.versions > 0)
+        .cloned()
+        .collect();
     let (packages, total) = paginate(&all_packages, page, limit);
 
     Html(render_registry_list_paginated(
