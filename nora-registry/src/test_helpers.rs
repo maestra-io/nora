@@ -666,6 +666,10 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         self.inner.refresh_total_size().await
     }
 
+    async fn refresh_reachability(&self) {
+        self.inner.refresh_reachability().await
+    }
+
     async fn put_from_path(
         &self,
         key: &str,

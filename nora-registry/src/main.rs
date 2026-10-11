@@ -306,8 +306,9 @@ impl AppState {
         let repo_index = Arc::clone(&self.repo_index);
         tokio::spawn(
             std::panic::AssertUnwindSafe(async move {
-                if storage.put(&key, &data).await.is_ok() {
-                    repo_index.invalidate(registry);
+                match storage.put(&key, &data).await {
+                    Ok(()) => repo_index.invalidate(registry),
+                    Err(e) => record_cache_write_error(registry, &key, &e),
                 }
             })
             .catch_unwind()
@@ -325,8 +326,12 @@ impl AppState {
         let repo_index = Arc::clone(&self.repo_index);
         tokio::spawn(
             std::panic::AssertUnwindSafe(async move {
-                if storage.stat(&key).await.is_none() && storage.put(&key, &data).await.is_ok() {
-                    repo_index.invalidate(registry);
+                if storage.stat(&key).await.is_some() {
+                    return;
+                }
+                match storage.put(&key, &data).await {
+                    Ok(()) => repo_index.invalidate(registry),
+                    Err(e) => record_cache_write_error(registry, &key, &e),
                 }
             })
             .catch_unwind()
@@ -337,6 +342,19 @@ impl AppState {
             }),
         );
     }
+}
+
+/// Cadence of the full-bucket size walk behind `nora_storage_bytes{registry="total"}`.
+const STORAGE_SIZE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A background cache write failed: the client was already served from upstream,
+/// so without this the proxy silently degrades to pass-through (e.g. expired bucket
+/// credentials). Logged and counted in `nora_cache_write_errors_total`.
+pub(crate) fn record_cache_write_error(registry: &str, key: &str, err: &dyn std::fmt::Display) {
+    tracing::warn!(registry, key, error = %err, "background cache write failed");
+    metrics::CACHE_WRITE_ERRORS
+        .with_label_values(&[registry, "put"])
+        .inc();
 }
 
 /// Mask credentials in a proxy URL for safe logging.
@@ -481,6 +499,72 @@ async fn run_healthcheck(timeout_secs: u64) -> i32 {
             eprintln!("healthcheck: {url} -> {e}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod ops_tests {
+    use axum::body::Bytes;
+
+    /// A background cache write that fails is logged and counted, for both helpers —
+    /// it used to vanish, leaving a proxy that silently never caches.
+    #[tokio::test]
+    async fn failed_background_cache_writes_are_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        // Storage root below a regular file: every put fails.
+        let storage = crate::storage::Storage::new_local(file.join("root").to_str().unwrap());
+        let ctx = crate::test_helpers::create_test_context_with_storage(storage);
+        let errors = || {
+            crate::metrics::CACHE_WRITE_ERRORS
+                .with_label_values(&["ops-test", "put"])
+                .get()
+        };
+        let before = errors();
+        let data = Bytes::from_static(b"data");
+        ctx.state
+            .spawn_cache("ops-test", "raw/a".into(), data.clone());
+        ctx.state
+            .spawn_cache_immutable("ops-test", "raw/b".into(), data);
+        for _ in 0..200 {
+            if errors() >= before + 2 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("cache write failures were not counted");
+    }
+
+    /// The release profile must unwind: with `panic = "abort"` every catch_unwind guard
+    /// and CatchPanicLayer are dead code and one panic kills the only replica.
+    #[test]
+    fn release_profile_unwinds() {
+        let manifest = include_str!("../../Cargo.toml");
+        assert!(
+            !manifest
+                .lines()
+                .any(|l| l.trim().starts_with("panic = \"abort\"")),
+            "profile.release must not set panic = \"abort\""
+        );
+    }
+
+    /// A panicking handler behind CatchPanicLayer answers 500 instead of tearing down
+    /// the connection (and, with unwinding, the process survives).
+    #[tokio::test]
+    async fn handler_panic_is_a_500() {
+        use tower::ServiceExt;
+        async fn boom() -> &'static str {
+            panic!("handler bug")
+        }
+        let app = axum::Router::new()
+            .route("/boom", axum::routing::get(boom))
+            .layer(tower_http::catch_panic::CatchPanicLayer::new());
+        let req = axum::http::Request::get("/boom")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
 
@@ -1937,7 +2021,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         // Middleware layer order — LOAD-BEARING, do not reorder (#542).
         //
         // In axum, last .layer() = outermost (runs first). Execution order:
-        //   reject_null_bytes → metrics → auth → leak_detection → request_id → handler
+        //   reject_null_bytes → metrics → catch_panic → auth → leak_detection → request_id → handler
         //
         // reject_null_bytes MUST be outermost to block null-byte path attacks
         // before any processing occurs.
@@ -1960,6 +2044,8 @@ async fn run_server(mut config: Config, storage: Storage) {
             state.clone(),
             auth::auth_middleware,
         ))
+        // A panic in auth or a handler becomes a counted 500 instead of killing the process.
+        .layer(tower_http::catch_panic::CatchPanicLayer::new())
         .layer(middleware::from_fn(metrics::metrics_middleware))
         .layer(middleware::from_fn(validation::reject_null_bytes_middleware))
         .with_state(state.clone());
@@ -2017,6 +2103,22 @@ async fn run_server(mut config: Config, storage: Storage) {
         "System endpoints"
     );
 
+    // Background task: the "total" storage gauge lists the whole bucket on object
+    // stores, so it runs on its own slow cadence instead of inside the maintenance loop
+    // below, where a long listing would delay token flushes and readiness.
+    let size_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(STORAGE_SIZE_REFRESH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            size_state.storage.refresh_total_size_cache().await;
+            metrics::STORAGE_BYTES
+                .with_label_values(&["total"])
+                .set(size_state.storage.total_size().await as i64);
+        }
+    });
+
     // Background task: flush token last_used + periodic maintenance every 30 seconds
     let metrics_state = state.clone();
     tokio::spawn(async move {
@@ -2035,13 +2137,10 @@ async fn run_server(mut config: Config, storage: Storage) {
             }
 
             // Every 60s (odd ticks — the interval's first tick fires immediately, so the
-            // boot pass runs right away: object-store reachability (#869) and the storage
-            // gauge are populated before the first readiness probe, not 30s in).
+            // boot pass runs right away: object-store reachability (#869) is populated
+            // before the first readiness probe, not 30s in). One HEAD, not a bucket walk.
             if !tick_count.is_multiple_of(2) {
-                metrics_state.storage.refresh_total_size_cache().await;
-                metrics::STORAGE_BYTES
-                    .with_label_values(&["total"])
-                    .set(metrics_state.storage.total_size().await as i64);
+                metrics_state.storage.refresh_reachability().await;
                 // Per-registry artifact counts + logical bytes from the cached index,
                 // plus process uptime (#446). The "total" storage_bytes label above is
                 // the full physical footprint; per-registry is summed artifact size.

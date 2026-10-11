@@ -538,7 +538,9 @@ async fn registration_index(
             let key_clone = storage_key.clone();
             let bump = body.clone();
             tokio::spawn(async move {
-                let _ = storage.put(&key_clone, &bump).await;
+                if let Err(e) = storage.put(&key_clone, &bump).await {
+                    crate::record_cache_write_error("nuget", &key_clone, &e);
+                }
             });
             let text = String::from_utf8_lossy(&body);
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
@@ -818,7 +820,9 @@ async fn version_list(state: AppState, id: &str) -> Response {
             let key_clone = storage_key.clone();
             let bump = body.clone();
             tokio::spawn(async move {
-                let _ = storage.put(&key_clone, &bump).await;
+                if let Err(e) = storage.put(&key_clone, &bump).await {
+                    crate::record_cache_write_error("nuget", &key_clone, &e);
+                }
             });
             with_json(body.to_vec())
         }
@@ -958,20 +962,6 @@ async fn flatcontainer_download(
             "CACHE",
         ));
 
-        // Track last download time for .nupkg files
-        if ends_with_ci(filename, ".nupkg") {
-            let storage = state.storage.clone();
-            let meta_key = format!("nuget/flatcontainer/{}/.nora-meta.json", id_lower);
-            tokio::spawn(async move {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let meta = format!(r#"{{"last_downloaded_at":{}}}"#, now);
-                let _ = storage.put(&meta_key, meta.as_bytes()).await;
-            });
-        }
-
         let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
             state.config.curation.nuget.quarantine.as_ref().or(state
                 .config
@@ -1107,22 +1097,12 @@ async fn flatcontainer_download(
                         )
                         .await
                         {
-                            let _ = state2.storage.put(&index_key, text.as_bytes()).await;
-                            state2.repo_index.invalidate("nuget");
+                            match state2.storage.put(&index_key, text.as_bytes()).await {
+                                Ok(()) => state2.repo_index.invalidate("nuget"),
+                                Err(e) => crate::record_cache_write_error("nuget", &index_key, &e),
+                            }
                         }
                     }
-                });
-
-                // Track last download time
-                let storage3 = state.storage.clone();
-                let meta_key = format!("nuget/flatcontainer/{}/.nora-meta.json", id_lower);
-                tokio::spawn(async move {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let meta = format!(r#"{{"last_downloaded_at":{}}}"#, now);
-                    let _ = storage3.put(&meta_key, meta.as_bytes()).await;
                 });
             }
             let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(

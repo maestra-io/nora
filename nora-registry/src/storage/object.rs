@@ -154,15 +154,13 @@ pub struct ObjectStorage {
     cached_total_size: std::sync::atomic::AtomicU64,
     /// Whether cached_total_size has been initialized at least once.
     size_cache_initialized: std::sync::atomic::AtomicBool,
-    /// Outcome of the last background refresh, served by `health_check()`.
-    /// Starts `false` so readiness gates until the boot refresh confirms the
-    /// store — a live probe here would list the whole bucket on every kubelet
-    /// and LB health check, and slow listings under load mark the backend
-    /// unhealthy exactly when it is busiest (#869).
+    /// Outcome of the last background reachability probe, served by `health_check()`.
+    /// Starts `false` so readiness gates until the boot probe confirms the store —
+    /// kubelet and LB health checks never touch the store themselves (#869).
     cached_reachable: std::sync::atomic::AtomicBool,
-    /// Unix seconds of the last background refresh (`0` = never refreshed). Paired with
+    /// Unix seconds of the last background probe (`0` = never probed). Paired with
     /// `cached_reachable`, which is only ever written by the 60s maintenance loop: if that
-    /// task stalls or dies, the stale flag would otherwise pin readiness forever. A refresh
+    /// task stalls or dies, the stale flag would otherwise pin readiness forever. A probe
     /// older than `HEALTH_MAX_STALE_SECS` is treated as unreachable (#872).
     last_refresh_unix: std::sync::atomic::AtomicU64,
 }
@@ -172,6 +170,14 @@ pub struct ObjectStorage {
 /// dead maintenance loop un-readies the pod within the window instead of pinning a stale
 /// `true` (#872).
 const HEALTH_MAX_STALE_SECS: i64 = 150;
+
+/// Key the readiness probe HEADs. Nothing writes it: a NotFound answer proves the
+/// endpoint, bucket and credentials work at O(1) cost, whatever the bucket size.
+const HEALTH_PROBE_KEY: &str = ".nora-health-probe";
+
+/// Upper bound on one readiness probe, so a hung connection cannot stall the
+/// maintenance loop that runs it.
+const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl ObjectStorage {
     /// Create new S3 storage with optional credentials.
@@ -538,8 +544,8 @@ impl StorageBackend for ObjectStorage {
     }
 
     async fn health_check(&self) -> bool {
-        // Cached outcome of the last background refresh (#869) — probes must never hit the
-        // store. False until the boot refresh succeeds, so readiness still gates a
+        // Cached outcome of the last background probe (#869) — kubelet probes must never hit
+        // the store. False until the boot probe succeeds, so readiness still gates a
         // misconfigured store at rollout. Self-expiring (#872): the flag is only written by
         // the 60s maintenance loop, so a stalled or dead loop lets the staleness window lapse
         // and un-readies the pod rather than pinning a stale `true` forever.
@@ -561,23 +567,55 @@ impl StorageBackend for ObjectStorage {
         self.name
     }
 
-    async fn refresh_total_size(&self) {
-        let result: std::result::Result<Vec<_>, _> = self.store.list(None).try_collect().await;
-
+    async fn refresh_reachability(&self) {
+        let probe = tokio::time::timeout(
+            HEALTH_PROBE_TIMEOUT,
+            self.store.head(&Path::from(HEALTH_PROBE_KEY)),
+        )
+        .await;
+        let reachable = match probe {
+            Ok(Ok(_)) | Ok(Err(object_store::Error::NotFound { .. })) => true,
+            Ok(Err(e)) => {
+                tracing::warn!(backend = self.name, error = %e, "object store readiness probe failed");
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    backend = self.name,
+                    "object store readiness probe timed out"
+                );
+                false
+            }
+        };
         self.cached_reachable
-            .store(result.is_ok(), std::sync::atomic::Ordering::Relaxed);
+            .store(reachable, std::sync::atomic::Ordering::Relaxed);
         // Stamp every run (success or failure): this marks the maintenance loop as alive so
         // `health_check` can expire the cached verdict if the loop stops (#872).
         self.last_refresh_unix.store(
             crate::cache_ttl::now_unix(),
             std::sync::atomic::Ordering::Relaxed,
         );
-        if let Ok(objects) = result {
-            let total: u64 = objects.iter().map(|m| m.size).sum();
-            self.cached_total_size
-                .store(total, std::sync::atomic::Ordering::Relaxed);
-            self.size_cache_initialized
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    async fn refresh_total_size(&self) {
+        // Full-bucket walk: runs on its own slow cadence, never on the readiness path.
+        let total = self
+            .store
+            .list(None)
+            .try_fold(0u64, |acc, m| async move {
+                Ok::<_, object_store::Error>(acc + m.size)
+            })
+            .await;
+        match total {
+            Ok(total) => {
+                self.cached_total_size
+                    .store(total, std::sync::atomic::Ordering::Relaxed);
+                self.size_cache_initialized
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::warn!(backend = self.name, error = %e, "object store size refresh failed");
+            }
         }
     }
 
@@ -777,8 +815,44 @@ mod tests {
     async fn test_health_check_cached_not_live() {
         let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false);
         assert!(!storage.health_check().await);
-        storage.refresh_total_size().await;
+        storage.refresh_reachability().await;
         assert!(!storage.health_check().await);
+    }
+
+    /// Readiness is one HEAD, not a bucket walk: with listing throttled to an hour a
+    /// probe still marks the store reachable at once, and the size walk no longer
+    /// touches the readiness verdict (#869).
+    #[tokio::test]
+    async fn test_reachability_probe_does_not_list() {
+        use object_store::throttle::{ThrottleConfig, ThrottledStore};
+        let inner = object_store::memory::InMemory::new();
+        inner
+            .put(&Path::from("raw/a"), PutPayload::from_static(b"x"))
+            .await
+            .unwrap();
+        let throttled = ThrottledStore::new(
+            inner,
+            ThrottleConfig {
+                wait_list_per_call: std::time::Duration::from_secs(3600),
+                ..Default::default()
+            },
+        );
+        let storage = ObjectStorage {
+            store: Box::new(throttled),
+            name: "s3",
+            cached_total_size: std::sync::atomic::AtomicU64::new(0),
+            size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
+            cached_reachable: std::sync::atomic::AtomicBool::new(false),
+            last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
+        };
+        assert!(!storage.health_check().await);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            storage.refresh_reachability(),
+        )
+        .await
+        .expect("probe must not list the bucket");
+        assert!(storage.health_check().await);
     }
 
     /// Cached reachability self-expires (#872): a `true` verdict whose last refresh is older
@@ -917,9 +991,10 @@ mod tests {
             Some("secret"),
             virtual_hosted,
         );
-        assert!(!storage.health_check().await);
         storage.refresh_total_size().await;
-        assert!(storage.health_check().await);
+        assert!(storage
+            .size_cache_initialized
+            .load(std::sync::atomic::Ordering::Relaxed));
         let requests = server.received_requests().await.unwrap();
         requests[0].url.path().to_string()
     }
