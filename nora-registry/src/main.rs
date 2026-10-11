@@ -658,7 +658,7 @@ fn bind_v6_dual_stack(addr: std::net::SocketAddr) -> std::io::Result<tokio::net:
 mod shutdown_drain_tests {
     //! Graceful shutdown drains in-flight requests for at most the shutdown timeout
     //! (#1016): a client that stops reading can no longer hold the process past it.
-    use super::{serve_with_drain, ServeEnd};
+    use super::{serve_with_drain, ConnLimits, ServeEnd};
     use axum::body::{Body, Bytes};
     use axum::routing::get;
     use axum::Router;
@@ -687,7 +687,7 @@ mod shutdown_drain_tests {
     ) -> (
         std::net::SocketAddr,
         tokio::sync::oneshot::Sender<()>,
-        tokio::task::JoinHandle<std::io::Result<ServeEnd>>,
+        tokio::task::JoinHandle<ServeEnd>,
     ) {
         let app = Router::new()
             .route("/endless", get(endless))
@@ -702,6 +702,10 @@ mod shutdown_drain_tests {
                 let _ = rx.await;
             },
             drain,
+            ConnLimits {
+                header_read_timeout: Some(Duration::from_secs(30)),
+                max_connections: 64,
+            },
         ));
         (addr, tx, server)
     }
@@ -726,7 +730,6 @@ mod shutdown_drain_tests {
         let end = tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .expect("serving must end at the drain deadline, not wait on the stalled client")
-            .unwrap()
             .unwrap();
         assert_eq!(end, ServeEnd::DeadlinePassed);
         assert!(
@@ -756,13 +759,123 @@ mod shutdown_drain_tests {
         let end = tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .unwrap()
-            .unwrap()
             .unwrap();
         assert_eq!(end, ServeEnd::Drained);
         let response = download.await.unwrap();
         let body_bytes = response.iter().filter(|b| matches!(b, 0..=2)).count();
         assert!(response.starts_with(b"HTTP/1.1 200"));
         assert!(body_bytes >= 3 * 1024, "the whole body arrived");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod conn_limit_tests {
+    //! The serve loop bounds header reads and open connections (C61).
+    use super::{serve_with_drain, ConnLimits};
+    use axum::routing::get;
+    use axum::Router;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn start(limits: ConnLimits) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
+        let app = Router::new().route(
+            "/peer",
+            get(
+                |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<
+                    std::net::SocketAddr,
+                >| async move { peer.ip().to_string() },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(serve_with_drain(
+            listener,
+            app,
+            async move {
+                let _ = rx.await;
+            },
+            Duration::from_secs(1),
+            limits,
+        ));
+        (addr, tx)
+    }
+
+    /// One whole request on a fresh connection; returns the raw response.
+    async fn get_peer(addr: std::net::SocketAddr) -> String {
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c.write_all(b"GET /peer HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        c.read_to_end(&mut out).await.unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// A slowloris client that trickles its headers slower than the header-read
+    /// timeout is disconnected; a normal request still gets its answer, with the
+    /// peer address the trusted-proxy logic reads.
+    #[tokio::test]
+    async fn slow_header_client_is_disconnected() {
+        let (addr, _stop) = start(ConnLimits {
+            header_read_timeout: Some(Duration::from_millis(300)),
+            max_connections: 16,
+        })
+        .await;
+        let mut slow = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let started = Instant::now();
+        let trickle = async {
+            slow.write_all(b"GET /peer HTTP/1.1\r\n").await?;
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                slow.write_all(b"X-Slow: 1\r\n").await?;
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        // The server closes the socket: a write fails, or the read below sees EOF.
+        let _ = tokio::time::timeout(Duration::from_secs(10), trickle).await;
+        let mut rest = Vec::new();
+        let closed =
+            tokio::time::timeout(Duration::from_secs(5), slow.read_to_end(&mut rest)).await;
+        assert!(
+            closed.is_ok(),
+            "the server must close a slowloris connection"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "closed near the 300 ms header timeout, not after the whole trickle"
+        );
+        let resp = get_peer(addr).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(
+            resp.ends_with("127.0.0.1"),
+            "ConnectInfo carries the peer: {resp}"
+        );
+    }
+
+    /// Past `max_connections` new clients wait unserved until a connection closes.
+    #[tokio::test]
+    async fn connections_past_the_limit_wait_for_a_free_slot() {
+        let (addr, _stop) = start(ConnLimits {
+            header_read_timeout: Some(Duration::from_secs(30)),
+            max_connections: 1,
+        })
+        .await;
+        let holder = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await; // accepted, holds the slot
+        let waiting = tokio::spawn(get_peer(addr));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !waiting.is_finished(),
+            "a second connection is not served past the limit"
+        );
+        drop(holder);
+        let resp = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("served once the slot frees")
+            .unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
     }
 }
 
@@ -2219,10 +2332,8 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     // Graceful shutdown on SIGTERM/SIGINT, draining for at most `shutdown_timeout` (#1016)
     let drain = std::time::Duration::from_secs(state.config.server.shutdown_timeout);
-    match serve_with_drain(listener, app, shutdown_signal(), drain)
-        .await
-        .expect("Server error")
-    {
+    let limits = ConnLimits::from_config(&state.config.server);
+    match serve_with_drain(listener, app, shutdown_signal(), drain, limits).await {
         ServeEnd::Drained => {}
         ServeEnd::DeadlinePassed => warn!(
             shutdown_timeout_secs = state.config.server.shutdown_timeout,
@@ -2269,52 +2380,123 @@ enum ServeEnd {
     DeadlinePassed,
 }
 
+/// Per-connection limits of the serve loop (`[server]` knobs).
+#[derive(Debug, Clone, Copy)]
+struct ConnLimits {
+    /// Time a client gets to send request headers; `None` disables it.
+    header_read_timeout: Option<std::time::Duration>,
+    /// Connections served at once.
+    max_connections: usize,
+}
+
+impl ConnLimits {
+    fn from_config(server: &config::ServerConfig) -> Self {
+        Self {
+            header_read_timeout: (server.header_read_timeout > 0)
+                .then(|| std::time::Duration::from_secs(server.header_read_timeout)),
+            max_connections: match server.max_connections {
+                0 => tokio::sync::Semaphore::MAX_PERMITS,
+                n => n,
+            },
+        }
+    }
+}
+
 /// Serve `app` until `shutdown` resolves, then give in-flight requests `drain` to finish.
 ///
-/// axum's graceful shutdown stops accepting at once but then waits for every open
-/// connection with no limit, so a client that stops reading a response holds it
-/// forever. Connections still open when the window passes are not awaited any more:
-/// their tasks end when the runtime shuts down at process exit, after the shutdown
-/// steps (schedulers, audit drain, token flush) have run.
+/// The accept loop is hyper-util's, not `axum::serve`: axum sets no hyper timer, so
+/// hyper's header-read timeout was silently off and a client that never finished its
+/// headers held a task and a socket forever. Here HTTP/1 header reads are bounded by
+/// `limits.header_read_timeout`, HTTP/2 connections are pinged and dropped when the
+/// peer is gone, and at most `limits.max_connections` are served at once: past it the
+/// loop stops accepting and new clients wait in the listen backlog. Request bodies
+/// and responses are not time-bounded, so slow Docker pushes and long downloads work.
+///
+/// On shutdown the loop stops accepting at once; open connections finish their
+/// in-flight requests. Connections still open when `drain` passes are not awaited any
+/// more: their tasks end when the runtime shuts down at process exit, after the
+/// shutdown steps (schedulers, audit drain, token flush) have run.
 async fn serve_with_drain<F>(
     listener: tokio::net::TcpListener,
     app: Router,
     shutdown: F,
     drain: std::time::Duration,
-) -> std::io::Result<ServeEnd>
+    limits: ConnLimits,
+) -> ServeEnd
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let signalled = Arc::new(tokio::sync::Notify::new());
-    let notify = Arc::clone(&signalled);
-    let server = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        shutdown.await;
-        // A stored permit: the wait below sees it even if it starts afterwards.
-        notify.notify_one();
-    });
-    let server = std::future::IntoFuture::into_future(server);
-    tokio::pin!(server);
-    // CANCEL-SAFETY: both arms only poll; the server future stays pinned here and is
-    // polled again below, `notified()` holds nothing.
-    tokio::select! {
-        served = &mut server => {
-            served?;
-            return Ok(ServeEnd::Drained);
-        }
-        () = signalled.notified() => {}
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+    use hyper_util::server::conn::auto::Builder;
+
+    let mut builder = Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.header_read_timeout);
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .keep_alive_interval(std::time::Duration::from_secs(60))
+        .keep_alive_timeout(std::time::Duration::from_secs(20));
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    tokio::pin!(shutdown);
+    loop {
+        // CANCEL-SAFETY: on shutdown an unfinished acquire/accept is dropped; neither
+        // has taken anything yet (a pending accept leaves the socket in the backlog).
+        let slot = tokio::select! {
+            slot = Arc::clone(&slots).acquire_owned() => match slot {
+                Ok(slot) => slot,
+                Err(_) => break, // never closed
+            },
+            () = &mut shutdown => break,
+        };
+        let (io, remote) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(conn) => conn,
+                Err(e) => {
+                    // Per-connection errors (reset before accept) are not worth a pause;
+                    // anything else (EMFILE) gets one so the loop does not spin.
+                    if !matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset
+                    ) {
+                        error!(error = %e, "accept failed");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    continue;
+                }
+            },
+            () = &mut shutdown => break,
+        };
+        // The peer address the trusted-proxy and rate-limit logic read as ConnectInfo.
+        let service =
+            tower::ServiceExt::map_request(app.clone(), move |mut req: axum::http::Request<_>| {
+                req.extensions_mut()
+                    .insert(axum::extract::ConnectInfo(remote));
+                req
+            });
+        let conn = builder
+            .serve_connection_with_upgrades(
+                TokioIo::new(io),
+                hyper_util::service::TowerToHyperService::new(service),
+            )
+            .into_owned();
+        let conn = graceful.watch(conn);
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::debug!(peer = %remote, error = %e, "connection ended with an error");
+            }
+            drop(slot);
+        });
     }
-    // CANCEL-SAFETY: on timeout the server future is dropped; that only stops waiting
-    // for the open connections, whose tasks are owned by the runtime.
-    match tokio::time::timeout(drain, &mut server).await {
-        Ok(served) => {
-            served?;
-            Ok(ServeEnd::Drained)
-        }
-        Err(_) => Ok(ServeEnd::DeadlinePassed),
+    drop(listener);
+    // CANCEL-SAFETY: on timeout `shutdown()` is dropped; that only stops waiting for
+    // the open connections, whose tasks are owned by the runtime.
+    match tokio::time::timeout(drain, graceful.shutdown()).await {
+        Ok(()) => ServeEnd::Drained,
+        Err(_) => ServeEnd::DeadlinePassed,
     }
 }
 

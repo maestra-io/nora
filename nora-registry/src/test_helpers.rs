@@ -141,6 +141,8 @@ fn build_context_with(
             // the trust=false path has its own dedicated tests).
             shutdown_timeout: 15,
             trust_upstream_dates: true,
+            header_read_timeout: 30,
+            max_connections: 4096,
         },
         storage: StorageConfig {
             mode: StorageMode::Local,

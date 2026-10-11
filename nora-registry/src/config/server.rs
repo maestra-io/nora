@@ -42,6 +42,16 @@ pub struct ServerConfig {
     /// (up to 10 s) it fits Kubernetes' default 30 s grace period.
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout: u64,
+    /// Seconds a client gets to send a request's headers, on a new connection and
+    /// between keep-alive requests; a client that is slower is disconnected
+    /// (slowloris). Default 30 (hyper's own default, which `axum::serve` never armed).
+    /// 0 disables the timeout.
+    #[serde(default = "default_header_read_timeout")]
+    pub header_read_timeout: u64,
+    /// Open client connections served at once. Past it NORA stops accepting until
+    /// one closes; new clients wait in the listen backlog. Default 4096; 0 = no limit.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
 }
 
 pub(super) fn default_server_host() -> String {
@@ -68,6 +78,14 @@ pub(super) fn default_shutdown_timeout() -> u64 {
     15
 }
 
+pub(super) fn default_header_read_timeout() -> u64 {
+    30
+}
+
+pub(super) fn default_max_connections() -> usize {
+    4096
+}
+
 /// TLS configuration for outbound connections to upstream registries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsConfig {
@@ -86,6 +104,8 @@ impl Default for ServerConfig {
             proxy_coalesce: default_proxy_coalesce(),
             shutdown_timeout: default_shutdown_timeout(),
             trust_upstream_dates: default_trust_upstream_dates(),
+            header_read_timeout: default_header_read_timeout(),
+            max_connections: default_max_connections(),
         }
     }
 }
@@ -176,6 +196,16 @@ impl ServerConfig {
         if let Ok(val) = env::var("NORA_SHUTDOWN_TIMEOUT") {
             super::parse_env_warn("NORA_SHUTDOWN_TIMEOUT", &val, &mut self.shutdown_timeout);
         }
+        if let Ok(val) = env::var("NORA_HEADER_READ_TIMEOUT") {
+            super::parse_env_warn(
+                "NORA_HEADER_READ_TIMEOUT",
+                &val,
+                &mut self.header_read_timeout,
+            );
+        }
+        if let Ok(val) = env::var("NORA_MAX_CONNECTIONS") {
+            super::parse_env_warn("NORA_MAX_CONNECTIONS", &val, &mut self.max_connections);
+        }
         if let Ok(val) = env::var("NORA_TRUST_UPSTREAM_DATES") {
             super::parse_env_warn(
                 "NORA_TRUST_UPSTREAM_DATES",
@@ -203,6 +233,22 @@ mod tests {
         assert_eq!(config.shutdown_timeout, 4);
     }
 
+    /// The header-read timeout and the connection limit have safe defaults and
+    /// follow the env.
+    #[test]
+    fn connection_limits_default_and_env_override() {
+        let _lock = crate::test_env::env_lock();
+        let d = ServerConfig::default();
+        assert_eq!((d.header_read_timeout, d.max_connections), (30, 4096));
+        let mut config = ServerConfig::default();
+        std::env::set_var("NORA_HEADER_READ_TIMEOUT", "5");
+        std::env::set_var("NORA_MAX_CONNECTIONS", "10");
+        config.apply_env_overrides();
+        std::env::remove_var("NORA_HEADER_READ_TIMEOUT");
+        std::env::remove_var("NORA_MAX_CONNECTIONS");
+        assert_eq!((config.header_read_timeout, config.max_connections), (5, 10));
+    }
+
     fn server(host: &str, port: u16) -> ServerConfig {
         ServerConfig {
             host: host.to_string(),
@@ -212,6 +258,8 @@ mod tests {
             proxy_coalesce: true,
             trust_upstream_dates: false,
             shutdown_timeout: 15,
+            header_read_timeout: 30,
+            max_connections: 4096,
         }
     }
 
