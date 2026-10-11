@@ -321,7 +321,7 @@ fn build_context_with(
         if let Ok(secs) = crate::curation::parse_duration(age_str) {
             let mut filter = crate::curation::MinReleaseAgeFilter::new(secs, age_str);
             crate::load_registry_overrides(&mut filter, &config.curation);
-            curation_engine.add_filter(Box::new(filter));
+            curation_engine.set_min_release_age(filter);
         }
     }
 

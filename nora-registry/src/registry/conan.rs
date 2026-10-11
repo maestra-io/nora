@@ -1186,9 +1186,9 @@ async fn extract_conan_publish_date(
 ) -> Option<i64> {
     let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
     let meta_key = format!("conan/{}/latest.json", ref_str);
-    // #513: untrusted upstream dates → NORA cache mtime, never upstream time.
+    // #513: untrusted upstream dates → no date: never upstream time, nor the cache mtime.
     if !trust_upstream {
-        return crate::curation::extract_mtime_as_publish_date(storage, &meta_key).await;
+        return None;
     }
     let data = storage.get(&meta_key).await.ok()?;
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
@@ -1684,10 +1684,10 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_conan_untrusted_dates_use_cache_mtime_not_upstream() {
-        // #513: with trust=false, a spoofed-OLD upstream `time` must be ignored
-        // and NORA's own cache mtime used instead, so an attacker cannot backdate
-        // a freshly-published package past the min-release-age quarantine.
+    async fn test_conan_untrusted_dates_ignore_upstream_and_mtime() {
+        // #513: with trust=false, a spoofed-OLD upstream `time` must be ignored so an
+        // attacker cannot backdate a fresh package; the cache mtime is no publish date
+        // either (C49), so there is no date and the quarantine's own clock decides.
         let dir = tempfile::tempdir().unwrap();
         let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
         let meta = serde_json::json!({ "revision": "r1", "time": "2000-01-01T00:00:00.000+0000" });
@@ -1706,12 +1706,8 @@ mod integration_tests {
 
         // trust=true honors the (spoofed, old) upstream date
         assert_eq!(trusted, Some(946_684_800)); // 2000-01-01T00:00:00Z
-                                                // trust=false ignores it and uses the recent cache mtime instead
-        let untrusted = untrusted.expect("cached file has an mtime");
-        assert!(
-            untrusted > 946_684_800,
-            "trust=false must use recent cache mtime, not the old upstream date (got {untrusted})"
-        );
+                                                // trust=false ignores it, and the cache mtime is no release date either (C49)
+        assert_eq!(untrusted, None);
     }
 
     #[tokio::test]

@@ -404,9 +404,9 @@ async fn extract_go_publish_date(
     info_key: &str,
     trust_upstream: bool,
 ) -> Option<i64> {
-    // #513: untrusted upstream dates → NORA cache mtime, never upstream .info Time.
+    // #513: untrusted upstream dates → no date: never upstream .info Time, nor the cache mtime.
     if !trust_upstream {
-        return crate::curation::extract_mtime_as_publish_date(storage, info_key).await;
+        return None;
     }
     let data = storage.get(info_key).await.ok()?;
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;

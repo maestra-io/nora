@@ -31,7 +31,7 @@ use std::time::Duration;
 pub fn routes() -> Router<AppState> {
     Router::new().route(
         "/npm/{*path}",
-        get(handle_request)
+        get(handle_get)
             .put(handle_publish)
             .post(handle_npm_post)
             .delete(handle_npm_delete)
@@ -464,6 +464,55 @@ async fn handle_search(state: &AppState, query: &str) -> Response {
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => proxy_error_response("npm", &url, &e),
     }
+}
+
+/// Q04: a proxied packument is served without versions younger than
+/// `min_release_age` (see `crate::metadata_filter`); everything else as is.
+async fn handle_get(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(path): Path<String>,
+    query: RawQuery,
+    user: Extension<AuthenticatedUser>,
+) -> Response {
+    let resp = handle_request(
+        State(state.clone()),
+        headers,
+        Path(path.clone()),
+        query,
+        user,
+    )
+    .await;
+    let packument = !path.starts_with("-/")
+        && !path.contains("/-/")
+        && github_packages_tarball(&path).is_none();
+    let curation = state.curation();
+    let engine = &curation.curation_engine;
+    if !packument
+        || resp.status() != StatusCode::OK
+        || !engine.metadata_filter_active()
+        || crate::curation::is_internal_namespace(engine, RegistryType::Npm, &path)
+        || has_local_versions(&state.storage, &path).await
+    {
+        return resp;
+    }
+    // The abbreviated form carries no `time`: date it from the cached full packument
+    // (written in the background on a cold miss, so prime it here if it is not yet).
+    let meta_key = format!("npm/{path}/metadata.json");
+    if state.storage.stat(&meta_key).await.is_none() {
+        ensure_npm_metadata_cached(&state, &path).await;
+    }
+    let stored: Option<serde_json::Value> = state
+        .storage
+        .get(&meta_key)
+        .await
+        .ok()
+        .and_then(|d| serde_json::from_slice(&d).ok());
+    let stored_time = stored.as_ref().and_then(|d| d.get("time")?.as_object());
+    crate::metadata_filter::rewrite_body(resp, |body| {
+        crate::metadata_filter::npm_packument(engine, &path, body, stored_time)
+    })
+    .await
 }
 
 // LOCK-SAFE: cache-through proxy — get miss → fetch upstream → put; no RMW race
@@ -2187,7 +2236,7 @@ fn max_semver<'a>(versions: impl Iterator<Item = &'a String>) -> Option<String> 
         .cloned()
 }
 
-fn semver_key(v: &str) -> (u64, u64, u64, bool) {
+pub(crate) fn semver_key(v: &str) -> (u64, u64, u64, bool) {
     let core = v.split(['-', '+']).next().unwrap_or(v);
     let mut it = core.trim_start_matches('v').split('.');
     let n = |x: Option<&str>| x.and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
@@ -2269,11 +2318,10 @@ async fn extract_npm_publish_date(
     version: &str,
     trust_upstream: bool,
 ) -> Option<i64> {
-    // #513: when upstream dates are not trusted, derive age from NORA's own
-    // cache mtime instead of the (spoofable) upstream metadata date. Never fall
-    // back to the upstream date here — that would reopen the spoof vector.
+    // #513: untrusted upstream dates → no date: never the (spoofable) upstream
+    // date, nor the cache mtime (refreshed with the metadata, not a release date).
     if !trust_upstream {
-        return crate::curation::extract_mtime_as_publish_date(storage, metadata_key).await;
+        return None;
     }
     let data = storage.get(metadata_key).await.ok()?;
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
@@ -3420,6 +3468,24 @@ mod integration_tests {
             Some(1579084200),
             "ISO 8601 → Unix for 2020-01-15T10:30:00Z"
         );
+    }
+
+    /// C49: with untrusted dates neither the packument's `time` nor its cache mtime
+    /// (moved to now by every metadata refresh) is a publish date.
+    #[tokio::test]
+    async fn test_extract_npm_publish_date_untrusted_ignores_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().to_str().unwrap());
+        let meta = serde_json::json!({ "time": { "1.0.0": "2020-01-15T10:30:00.000Z" } });
+        storage
+            .put("npm/p/metadata.json", meta.to_string().as_bytes())
+            .await
+            .unwrap();
+        let date = |trust| {
+            super::extract_npm_publish_date(&storage, "npm/p/metadata.json", "1.0.0", trust)
+        };
+        assert_eq!(date(false).await, None);
+        assert_eq!(date(true).await, Some(1579084200));
     }
 
     /// Cached metadata short-circuits ensure_npm_metadata_cached — no upstream

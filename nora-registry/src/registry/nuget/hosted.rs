@@ -392,6 +392,11 @@ async fn lookup(state: &AppState, id_lower: &str) -> Lookup {
     }
 }
 
+/// True for an ID nora does not host (proxied): only those get metadata filtering (Q04).
+pub(super) async fn is_proxied(state: &AppState, id_lower: &str) -> bool {
+    matches!(lookup(state, id_lower).await, Lookup::NotHosted)
+}
+
 // ── Push / unlist / relist ─────────────────────────────────────────────
 
 /// Upload spool file, removed when dropped (after `put_from_path` moved it, the

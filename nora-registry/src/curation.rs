@@ -139,6 +139,9 @@ pub struct EvaluationResult {
 pub struct CurationEngine {
     config: CurationConfig,
     filters: Vec<Box<dyn ProxyFilter>>,
+    /// The min-release-age filter (also in `filters`), for hiding young versions
+    /// from metadata (Q04).
+    min_age: Option<MinReleaseAgeFilter>,
     /// Namespace isolation filter — always active, even in Off mode.
     namespace_filter: Option<Box<dyn ProxyFilter>>,
     metrics: CurationMetrics,
@@ -150,6 +153,7 @@ impl CurationEngine {
         Self {
             config,
             filters: Vec::new(),
+            min_age: None,
             namespace_filter: None,
             metrics: CurationMetrics::new(),
         }
@@ -159,6 +163,56 @@ impl CurationEngine {
     /// Evaluation order = insertion order.
     pub fn add_filter(&mut self, filter: Box<dyn ProxyFilter>) {
         self.filters.push(filter);
+    }
+
+    /// Install the min-release-age filter: at the end of the chain for downloads,
+    /// and for [`Self::hides_from_metadata`].
+    pub fn set_min_release_age(&mut self, filter: MinReleaseAgeFilter) {
+        self.filters.push(Box::new(filter.clone()));
+        self.min_age = Some(filter);
+    }
+
+    /// Whether metadata responses go through [`Self::hides_from_metadata`] at all:
+    /// curation is on and a min-release-age is configured.
+    pub fn metadata_filter_active(&self) -> bool {
+        self.is_active() && self.min_age.is_some()
+    }
+
+    /// Q04: hide `version` from package metadata (npm packument, PyPI simple index,
+    /// NuGet registration/version list)? True for a version younger than its
+    /// registry's `min_release_age`, not on the `allow` list, in enforce mode, so a
+    /// client resolving a range picks the newest allowed version instead of failing
+    /// on the download's 403. Audit mode logs and hides nothing. An unknown date
+    /// hides nothing (the download gate and the quarantine still apply).
+    pub fn hides_from_metadata(
+        &self,
+        registry: RegistryType,
+        name: &str,
+        version: &str,
+        published: Option<i64>,
+    ) -> bool {
+        let Some(filter) = self.min_age.as_ref().filter(|_| self.is_active()) else {
+            return false;
+        };
+        let Some(publish_ts) = published else {
+            return false;
+        };
+        let (threshold, _) = filter.threshold(registry);
+        if crate::cache_ttl::now_unix() as i64 - publish_ts >= threshold
+            || filter.allowed(registry, name, version)
+        {
+            return false;
+        }
+        if self.config.mode == CurationMode::Audit {
+            tracing::info!(
+                registry = %registry,
+                package = %name,
+                version = %version,
+                "[AUDIT] Version would be hidden from metadata (min-release-age)"
+            );
+            return false;
+        }
+        true
     }
 
     /// Set the namespace isolation filter (always active, even in Off mode).
@@ -440,11 +494,10 @@ pub fn namespace_filter_active(engine: &CurationEngine) -> bool {
     engine.namespace_filter.is_some()
 }
 
-/// Extract publish date from file mtime. Used for hosted registries, and — when
-/// `server.trust_upstream_dates = false` — for proxy registries too (#513): the
-/// NORA-cache mtime is NORA-controlled, so it cannot be spoofed by an upstream
-/// registry the way an upstream-supplied `published`/`time`/etc. date can. NB in
-/// proxy mode this measures cache-age, not real publish date.
+/// Extract publish date from file mtime. For hosted (locally published) artifacts
+/// only. Never for proxied content: a cache mtime is when nora last wrote the file,
+/// which a metadata refresh moves to now, so it is no release date (C49). With
+/// `server.trust_upstream_dates = false` a proxy extractor returns `None` instead.
 pub async fn extract_mtime_as_publish_date(
     storage: &crate::storage::Storage,
     key: &str,
@@ -1207,17 +1260,35 @@ pub fn parse_duration(s: &str) -> Result<i64, String> {
 
 /// Filter that blocks packages published less than `min_age_secs` ago.
 ///
-/// If `publish_date` is `None` (unknown), the filter fails **closed**: it returns
-/// `Block` when the quarantine is active (threshold > 0), so an unverifiable age
-/// cannot slip past the cooldown, and `Skip` only when the quarantine is disabled
-/// for that registry (threshold `0`). Supports per-registry overrides: if a
+/// If `publish_date` is `None` (unknown), the filter returns `Skip` and defers to
+/// the digest quarantine (see `evaluate`). Supports per-registry overrides: if a
 /// registry has its own threshold, it takes precedence over the global
-/// `min_age_secs`.
+/// `min_age_secs`. Versions on the per-registry `allow` list
+/// (`[curation.<registry>] allow = ["name@version"]`) are exempt from the age check
+/// only; the digest quarantine still applies to them.
+#[derive(Clone)]
 pub struct MinReleaseAgeFilter {
     min_age_secs: i64,
     label: String,
     /// Per-registry override thresholds (seconds).
     overrides: std::collections::HashMap<RegistryType, (i64, String)>,
+    /// Exact versions exempt from the age check: (registry, name, version), normalized.
+    allow: std::collections::HashSet<(RegistryType, String, String)>,
+}
+
+/// The form a name and version are compared in on the `allow` list: NuGet IDs and
+/// versions are case-insensitive, PyPI names compare PEP 503-normalized; every other
+/// format compares as written (npm names are case-sensitive, `@scope/name` included).
+fn allow_key(registry: RegistryType, name: &str, version: &str) -> (RegistryType, String, String) {
+    let (name, version) = match registry {
+        RegistryType::Nuget => (name.to_lowercase(), version.to_lowercase()),
+        RegistryType::PyPI => (
+            crate::registry::pypi::normalize_name(name),
+            version.to_string(),
+        ),
+        _ => (name.to_string(), version.to_string()),
+    };
+    (registry, name, version)
 }
 
 impl MinReleaseAgeFilter {
@@ -1226,6 +1297,21 @@ impl MinReleaseAgeFilter {
             min_age_secs,
             label: label.to_string(),
             overrides: std::collections::HashMap::new(),
+            allow: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Exempt one exact version (`name@version`; the last `@` splits, so an npm
+    /// `@scope/name@1.0.0` works) of `registry` from the age check.
+    pub fn add_allow(&mut self, registry: RegistryType, entry: &str) -> Result<(), String> {
+        match entry.trim().rsplit_once('@') {
+            Some((name, version)) if !name.is_empty() && !version.is_empty() => {
+                self.allow.insert(allow_key(registry, name, version));
+                Ok(())
+            }
+            _ => Err(format!(
+                "invalid curation.{registry}.allow entry {entry:?}: expected \"name@version\""
+            )),
         }
     }
 
@@ -1233,6 +1319,20 @@ impl MinReleaseAgeFilter {
     /// it will be used instead of the global default.
     pub fn add_override(&mut self, registry: RegistryType, age_secs: i64, label: String) {
         self.overrides.insert(registry, (age_secs, label));
+    }
+
+    /// The threshold (seconds) and its label for `registry`: a per-registry
+    /// override takes precedence over the global default.
+    fn threshold(&self, registry: RegistryType) -> (i64, &str) {
+        match self.overrides.get(&registry) {
+            Some((secs, lbl)) => (*secs, lbl.as_str()),
+            None => (self.min_age_secs, self.label.as_str()),
+        }
+    }
+
+    /// Whether `name@version` is on `registry`'s allow list.
+    fn allowed(&self, registry: RegistryType, name: &str, version: &str) -> bool {
+        !self.allow.is_empty() && self.allow.contains(&allow_key(registry, name, version))
     }
 
     fn format_duration(secs: i64) -> String {
@@ -1258,13 +1358,7 @@ impl ProxyFilter for MinReleaseAgeFilter {
     }
 
     fn evaluate(&self, request: &FilterRequest) -> Decision {
-        // Resolve the threshold for this registry first: a per-registry override
-        // takes precedence over the global default.
-        let (threshold, label) = if let Some((secs, lbl)) = self.overrides.get(&request.registry) {
-            (*secs, lbl.as_str())
-        } else {
-            (self.min_age_secs, self.label.as_str())
-        };
+        let (threshold, label) = self.threshold(request.registry);
 
         let Some(publish_ts) = request.publish_date else {
             // Defer to digest-quarantine — the unspoofable first-seen holder
@@ -1287,6 +1381,21 @@ impl ProxyFilter for MinReleaseAgeFilter {
 
         let age = now - publish_ts;
         if age < threshold {
+            if let Some(version) = request.version.known() {
+                if self.allowed(request.registry, &request.name, version) {
+                    crate::metrics::CURATION_MIN_AGE_ALLOWED_TOTAL
+                        .with_label_values(&[request.registry.as_str()])
+                        .inc();
+                    tracing::warn!(
+                        registry = %request.registry,
+                        package = %request.name,
+                        version = %version,
+                        age = %Self::format_duration(age.max(0)),
+                        "[SECURITY] min-release-age exempted by curation allow list"
+                    );
+                    return Decision::Skip;
+                }
+            }
             Decision::Block {
                 rule: "min-release-age".to_string(),
                 reason: format!(
@@ -3635,6 +3744,78 @@ mod min_release_age_tests {
             publish_date: Some(now - 86400), // 1 day ago
         };
         assert!(matches!(filter.evaluate(&request), Decision::Block { .. }));
+    }
+
+    /// A young version decided by the per-registry allow list (Q03).
+    fn young_request(registry: RegistryType, name: &str, version: &str) -> FilterRequest {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        FilterRequest {
+            registry,
+            upstream: None,
+            name: name.to_string(),
+            version: RequestVersion::Known(version.to_string()),
+            integrity: None,
+            bypass: false,
+            publish_date: Some(now - 3600),
+        }
+    }
+
+    #[test]
+    fn test_min_release_age_allow_exempts_exact_version_only() {
+        let mut filter = MinReleaseAgeFilter::new(604800, "7d");
+        filter
+            .add_allow(RegistryType::Npm, "left-pad@1.3.0")
+            .unwrap();
+        filter
+            .add_allow(RegistryType::Npm, "@scope/pkg@2.0.0")
+            .unwrap();
+        let ok = |r: &FilterRequest| matches!(filter.evaluate(r), Decision::Skip);
+        assert!(ok(&young_request(RegistryType::Npm, "left-pad", "1.3.0")));
+        assert!(ok(&young_request(RegistryType::Npm, "@scope/pkg", "2.0.0")));
+        // Another version, another registry, another case (npm is case-sensitive): held.
+        assert!(!ok(&young_request(RegistryType::Npm, "left-pad", "1.3.1")));
+        assert!(!ok(&young_request(RegistryType::PyPI, "left-pad", "1.3.0")));
+        assert!(!ok(&young_request(RegistryType::Npm, "Left-Pad", "1.3.0")));
+        assert!(!ok(&young_request(
+            RegistryType::Npm,
+            "@scope/pkg",
+            "2.0.1"
+        )));
+    }
+
+    #[test]
+    fn test_min_release_age_allow_nuget_case_insensitive() {
+        let mut filter = MinReleaseAgeFilter::new(604800, "7d");
+        filter
+            .add_allow(RegistryType::Nuget, "Newtonsoft.Json@13.0.4-Beta")
+            .unwrap();
+        let req = young_request(RegistryType::Nuget, "newtonsoft.json", "13.0.4-beta");
+        assert!(matches!(filter.evaluate(&req), Decision::Skip));
+        let other = young_request(RegistryType::Nuget, "newtonsoft.json", "13.0.5");
+        assert!(matches!(filter.evaluate(&other), Decision::Block { .. }));
+    }
+
+    #[test]
+    fn test_min_release_age_allow_pypi_pep503_name() {
+        let mut filter = MinReleaseAgeFilter::new(604800, "7d");
+        filter
+            .add_allow(RegistryType::PyPI, "Zope.Interface@6.0")
+            .unwrap();
+        let req = young_request(RegistryType::PyPI, "zope-interface", "6.0");
+        assert!(matches!(filter.evaluate(&req), Decision::Skip));
+        let other = young_request(RegistryType::PyPI, "zope-interface", "6.1");
+        assert!(matches!(filter.evaluate(&other), Decision::Block { .. }));
+    }
+
+    #[test]
+    fn test_min_release_age_allow_rejects_malformed_entries() {
+        let mut filter = MinReleaseAgeFilter::new(604800, "7d");
+        for bad in ["left-pad", "@scope/pkg", "left-pad@", "@1.0.0", ""] {
+            assert!(filter.add_allow(RegistryType::Npm, bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

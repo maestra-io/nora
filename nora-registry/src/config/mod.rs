@@ -3261,6 +3261,35 @@ proxies = [
     }
 
     #[test]
+    fn test_curation_allow_from_toml_and_env() {
+        let _lock = env_lock();
+        let toml = r#"
+            [curation.nuget]
+            allow = ["Newtonsoft.Json@13.0.4"]
+
+            [curation.npm]
+            allow = ["left-pad@1.3.0", "@scope/pkg@2.0.0"]
+        "#;
+        let mut config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.curation.nuget.allow, ["Newtonsoft.Json@13.0.4"]);
+        assert_eq!(
+            config.curation.npm.allow,
+            ["left-pad@1.3.0", "@scope/pkg@2.0.0"]
+        );
+        assert!(config.curation.pypi.allow.is_empty());
+
+        std::env::set_var("NORA_CURATION_PYPI_ALLOW", "requests@2.32.3, numpy@2.1.0,");
+        let applied = config.apply_env_overrides();
+        std::env::remove_var("NORA_CURATION_PYPI_ALLOW");
+        applied.unwrap();
+        assert_eq!(
+            config.curation.pypi.allow,
+            ["requests@2.32.3", "numpy@2.1.0"]
+        );
+        assert_eq!(config.curation.nuget.allow, ["Newtonsoft.Json@13.0.4"]);
+    }
+
+    #[test]
     fn test_curation_config_missing_defaults_to_off() {
         let toml = r#"
             [server]

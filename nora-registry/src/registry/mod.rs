@@ -15,7 +15,7 @@ mod maven;
 pub(crate) mod npm;
 pub(crate) mod nuget;
 pub(crate) mod pub_dart;
-mod pypi;
+pub(crate) mod pypi;
 pub(crate) mod range;
 pub(crate) mod raw;
 #[cfg(feature = "rpm")]

@@ -37,6 +37,7 @@ mod hash_pin_store;
 mod health;
 mod import;
 mod log_redact;
+mod metadata_filter;
 mod metrics;
 mod migrate;
 mod mirror;
@@ -1459,6 +1460,9 @@ fn load_registry_overrides(
         (RegistryType::Nuget, &curation_config.nuget),
         (RegistryType::PubDart, &curation_config.pub_dart),
         (RegistryType::Conan, &curation_config.conan),
+        (RegistryType::Rpm, &curation_config.rpm),
+        (RegistryType::Deb, &curation_config.deb),
+        (RegistryType::Cpan, &curation_config.cpan),
     ];
 
     for (registry, override_cfg) in registry_overrides {
@@ -1481,6 +1485,17 @@ fn load_registry_overrides(
                         "Invalid per-registry min_release_age"
                     );
                 }
+            }
+        }
+        // An invalid entry is dropped: that version stays held, never wrongly let through.
+        for entry in &override_cfg.allow {
+            match filter.add_allow(*registry, entry) {
+                Ok(()) => tracing::info!(
+                    registry = %registry,
+                    entry = %entry,
+                    "min-release-age allow entry loaded"
+                ),
+                Err(e) => tracing::error!(error = %e, "Invalid min-release-age allow entry"),
             }
         }
     }
@@ -2719,7 +2734,7 @@ fn build_curation_engine(config: &Config) -> Result<curation::CurationEngine, St
             Ok(secs) => {
                 let mut filter = curation::MinReleaseAgeFilter::new(secs, age_str);
                 load_registry_overrides(&mut filter, &config.curation);
-                engine.add_filter(Box::new(filter));
+                engine.set_min_release_age(filter);
                 info!(min_age = %age_str, seconds = secs, "Min-release-age filter loaded");
             }
             Err(e) if enforce => return Err(format!("invalid min_release_age {age_str}: {e}")),
@@ -2891,6 +2906,32 @@ mod curation_reload_tests {
         let config = config_with_allowlist(CurationMode::Enforce, path.to_str().unwrap().into());
         let engine = build_curation_engine(&config).expect("valid allowlist must build");
         assert!(engine.is_active(), "allowlist filter must be installed");
+    }
+
+    /// Q03: the per-registry `allow` list rides the engine `reload_curation()` swaps
+    /// in on SIGHUP: an allowlisted young version passes, its neighbour is held.
+    #[test]
+    fn engine_carries_min_age_allow_list() {
+        use crate::curation::{Decision, FilterRequest, RegistryType, RequestVersion};
+        let mut config = Config::default();
+        config.curation.mode = CurationMode::Enforce;
+        config.curation.min_release_age = Some("7d".into());
+        config.curation.nuget.allow = vec!["Newtonsoft.Json@13.0.4".into()];
+        let engine = build_curation_engine(&config).unwrap();
+        let young = |version: &str| FilterRequest {
+            registry: RegistryType::Nuget,
+            upstream: None,
+            name: "newtonsoft.json".into(),
+            version: RequestVersion::Known(version.into()),
+            integrity: None,
+            bypass: false,
+            publish_date: Some(crate::cache_ttl::now_unix() as i64 - 60),
+        };
+        assert_eq!(engine.evaluate(&young("13.0.4")).decision, Decision::Allow);
+        assert!(matches!(
+            engine.evaluate(&young("13.0.5")).decision,
+            Decision::Block { .. }
+        ));
     }
 
     /// Audit/off mode stays lenient (matches boot behavior): a broken file
