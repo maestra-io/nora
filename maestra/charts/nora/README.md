@@ -25,7 +25,23 @@ helm install nora ./helm-charts/charts/nora/
 |-----------|-------------|---------|
 | `image.repository` | Container image | `ghcr.io/getnora-io/nora` |
 | `image.tag` | Image tag (defaults to `appVersion`) | `""` |
+| `image.digest` | Pin the image: renders `repository:tag@digest` | `""` |
 | `image.pullPolicy` | Pull policy | `IfNotPresent` |
+
+### Rollout
+
+nora is a single writer (in-process publish locks, upload sessions, quarantine ledger; `/data` is ReadWriteOnce), so the chart runs one replica and replaces it with `Recreate`: the old pod is gone before the new one starts.
+On shutdown the pod sleeps `preStopSleepSeconds` (the ingress drops the endpoint meanwhile), then nora gets SIGTERM, drains in-flight requests for `config.server.shutdown_timeout` (default 15 s), waits up to 10 s for its background schedulers, drains the audit log and flushes token `last_used`.
+`terminationGracePeriodSeconds` must cover all of it; the chart fails to render when it does not.
+
+No PodDisruptionBudget: with one replica, `minAvailable: 1` / `maxUnavailable: 0` would block every node drain forever, and anything looser is a no-op. An eviction is the same short outage as a rollout.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `strategy` | Deployment strategy | `{type: Recreate}` |
+| `terminationGracePeriodSeconds` | Grace period; >= preStop + shutdown_timeout + 10 | `40` |
+| `preStopSleepSeconds` | preStop `sleep` before SIGTERM (0 disables) | `5` |
+| `deploymentAnnotations` | Annotations on the Deployment object | `{}` |
 
 ### Service
 
@@ -277,11 +293,13 @@ auth = "user:token"
 
 ### Resources
 
+Memory request equals the limit. nora holds a proxied artifact or a publish body in RAM (up to ~3x the body), so size memory for the largest package and cap `config.server.body_limit_mb` accordingly.
+
 ```yaml
 resources:
   requests:
     cpu: 100m
-    memory: 128Mi
+    memory: 512Mi
   limits:
     memory: 512Mi
 ```

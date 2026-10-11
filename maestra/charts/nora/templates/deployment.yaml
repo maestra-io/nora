@@ -1,11 +1,24 @@
 apiVersion: apps/v1
 kind: Deployment
+{{- $drain := int (.Values.config.server.shutdown_timeout | default 15) }}
+{{- $needed := add (int .Values.preStopSleepSeconds) $drain 10 }}
+{{- if lt (int .Values.terminationGracePeriodSeconds) $needed }}
+{{- fail (printf "terminationGracePeriodSeconds (%d) must cover preStopSleepSeconds (%d) + config.server.shutdown_timeout (%d) + 10 s scheduler wait = %d, or the kubelet SIGKILLs nora before it drains audit and flushes tokens" (int .Values.terminationGracePeriodSeconds) (int .Values.preStopSleepSeconds) $drain $needed) }}
+{{- end }}
 metadata:
   name: {{ include "nora.fullname" . }}
   labels:
     {{- include "nora.labels" . | nindent 4 }}
+  {{- with .Values.deploymentAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- with .Values.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "nora.selectorLabels" . | nindent 6 }}
@@ -27,6 +40,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "nora.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -35,6 +49,14 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- if .Values.preStopSleepSeconds }}
+          # Keep serving while the endpoint removal reaches the ingress: nora
+          # stops accepting the moment SIGTERM arrives (serve_with_drain).
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "{{ .Values.preStopSleepSeconds }}"]
+          {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.config.server.port | default 4000 }}

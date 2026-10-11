@@ -1,9 +1,38 @@
+# -- Keep 1. nora is a single writer: publish locks, upload sessions, the
+# digest-quarantine ledger and the token verify cache are in-process
+# (COMPAT.md, multi-replica), and /data is a ReadWriteOnce volume.
 replicaCount: 1
+
+# -- Deployment strategy. Recreate stops the old pod before the new one
+# starts: a RollingUpdate would run two writers on the same /data volume
+# (same node) or wedge on Multi-Attach (another node). ARCHITECTURE.md assumes
+# Recreate.
+strategy:
+  type: Recreate
+
+# -- Seconds the pod gets after the preStop hook starts. Must cover
+# preStopSleepSeconds + config.server.shutdown_timeout (in-flight drain,
+# default 15) + 10 (nora's background-scheduler wait) so the audit drain and
+# the token last_used flush run before SIGKILL; the chart refuses to render
+# otherwise.
+terminationGracePeriodSeconds: 40
+
+# -- preStop `sleep` before SIGTERM, so the ingress drops the endpoint before
+# nora stops accepting (no 502s on rollout). The image is alpine and ships
+# `sleep`. 0 disables the hook.
+preStopSleepSeconds: 5
+
+# -- Annotations on the Deployment object itself (e.g.
+# reloader.stakater.com/auto: "true").
+deploymentAnnotations: {}
 
 image:
   repository: ghcr.io/getnora-io/nora
   # -- Image tag. Leave empty to use Chart.appVersion (recommended).
   tag: ""
+  # -- Image digest (`sha256:...`). When set the image is `repository:tag@digest`,
+  # so the pod runs exactly this build whatever the tag points to later.
+  digest: ""
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -20,11 +49,17 @@ podLabels: {}
 
 podSecurityContext:
   fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
 
 securityContext:
   runAsNonRoot: true
   runAsUser: 1000
+  runAsGroup: 1000
   readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
 
 service:
   type: ClusterIP
@@ -231,10 +266,13 @@ extraEnv: []
 #         name: nora-s3-credentials
 extraEnvFrom: []
 
+# -- Memory request == limit (Guaranteed memory, no overcommit OOM kills).
+# nora buffers a proxied artifact and a publish body in RAM (up to ~3x the
+# body), so size memory for the largest package; lower body_limit_mb to match.
 resources:
   requests:
     cpu: 100m
-    memory: 128Mi
+    memory: 512Mi
   limits:
     memory: 512Mi
 

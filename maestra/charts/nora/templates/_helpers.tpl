@@ -61,13 +61,19 @@ Create the name of the service account to use.
 
 {{/*
 Image reference. Tag defaults to Chart.appVersion; set image.tag to override.
+image.digest pins it: repo:tag@sha256:... (the digest is what runs, the tag
+only says which release it is).
 */}}
 {{- define "nora.image" -}}
 {{- $tag := .Chart.AppVersion }}
 {{- if .Values.image.tag }}
 {{- $tag = .Values.image.tag }}
 {{- end }}
+{{- if .Values.image.digest }}
+{{- printf "%s:%s@%s" .Values.image.repository $tag .Values.image.digest }}
+{{- else }}
 {{- printf "%s:%s" .Values.image.repository $tag }}
+{{- end }}
 {{- end }}
 
 {{/*
