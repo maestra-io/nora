@@ -1815,6 +1815,7 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     let cb_config = config.circuit_breaker.clone();
     let audit_mode = config.audit.mode.clone();
+    let audit_rotation = audit::Rotation::from(&config.audit);
 
     // Initialize digest quarantine store. Load the durable on-disk store whenever
     // ANY quarantine is effectively active — global OR a per-registry override
@@ -1862,7 +1863,11 @@ async fn run_server(mut config: Config, storage: Storage) {
         tokens,
         metrics: Arc::new(DashboardMetrics::new()),
         activity: Arc::new(ActivityLog::new(50)),
-        audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
+        audit: Arc::new(AuditLog::with_rotation(
+            &storage_path,
+            audit_mode,
+            audit_rotation,
+        )),
         docker_auth: Arc::new(docker_auth),
         repo_index: Arc::new(RepoIndex::new()),
         http_client,
