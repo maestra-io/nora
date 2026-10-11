@@ -1161,13 +1161,18 @@ mod tests {
             c.rpm.enabled = true;
         });
         let over = vec![b'x'; 1024 * 1024 + 1];
-        for uri in [
+        #[allow(unused_mut)]
+        let mut uris = vec![
             "/npm/pkg",
             "/maven2/com/acme/lib/1.0/lib-1.0.jar",
             "/cargo/api/v1/crates/new",
-            "/deb/repo/pool/x.deb",
-            "/rpm/repo/x.rpm",
-        ] {
+        ];
+        // Not mounted on a --no-default-features (release) build.
+        #[cfg(feature = "deb")]
+        uris.push("/deb/repo/pool/x.deb");
+        #[cfg(feature = "rpm")]
+        uris.push("/rpm/repo/x.rpm");
+        for uri in uris {
             let resp = send(&ctx.app, Method::PUT, uri, over.clone()).await;
             assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
         }
