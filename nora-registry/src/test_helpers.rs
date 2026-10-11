@@ -235,6 +235,7 @@ fn build_context_with(
             trusted_proxies: crate::config::TrustedProxies::default_loopback(),
             oidc: crate::config::OidcConfig::default(),
             admin_users: Vec::new(),
+            read_only_users: Vec::new(),
             public_web_ui: false,
             public_metrics: true,
         },

@@ -1000,6 +1000,16 @@ async fn tokens_create(
         "admin" => Role::Admin,
         _ => Role::Read,
     };
+    // A token never outranks the credential that mints it (a read caller
+    // cannot mint write).
+    if role.can_write() && !caller_role.0.can_write() {
+        return (
+            StatusCode::FORBIDDEN,
+            Html(
+                r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Token role exceeds your own role</div>"##.to_string(),
+            ),
+        );
+    }
     // Admin mint needs both an admin-role credential and an auth.admin_users
     // entry, as on POST /api/tokens (GHSA-78cx-cfhm-rgmx).
     if role == Role::Admin

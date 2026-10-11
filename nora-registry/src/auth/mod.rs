@@ -23,8 +23,9 @@ pub use token_routes::{token_routes, TokenListItem, TokenListResponse};
 pub struct AuthenticatedUser(pub String);
 
 /// The verified role carried in request extensions after successful auth.
-/// Basic-auth (htpasswd) identities have no role concept and are recorded as
-/// `Write` (never admin), so role-gated owner-scope treats them as non-admin.
+/// Basic-auth (htpasswd) identities are recorded as `Write`, or `Read` when
+/// listed in `auth.read_only_users`, never admin, so role-gated owner-scope
+/// treats them as non-admin.
 #[derive(Clone, Debug)]
 pub struct AuthenticatedRole(pub crate::tokens::Role);
 
@@ -692,6 +693,17 @@ pub async fn auth_middleware(
     if is_admin {
         return (StatusCode::FORBIDDEN, "Admin role required").into_response();
     }
+    let role = state.config.auth.htpasswd_role(username);
+    let method = request.method().clone();
+    if (method == axum::http::Method::PUT
+        || method == axum::http::Method::POST
+        || method == axum::http::Method::DELETE
+        || method == axum::http::Method::PATCH)
+        && !is_npm_audit
+        && !role.can_write()
+    {
+        return (StatusCode::FORBIDDEN, "Read-only account").into_response();
+    }
     // Basic-auth identities are not namespace-scoped (#583 is OIDC-only).
     request
         .extensions_mut()
@@ -699,9 +711,7 @@ pub async fn auth_middleware(
     request
         .extensions_mut()
         .insert(AuthenticatedUser(username.to_string()));
-    request
-        .extensions_mut()
-        .insert(AuthenticatedRole(crate::tokens::Role::Write));
+    request.extensions_mut().insert(AuthenticatedRole(role));
     next.run(request).await
 }
 
@@ -748,7 +758,12 @@ async fn try_basic_auth(encoded: &str, state: &AppState) -> Option<(String, crat
     }
     htpasswd_ok(state.auth.as_deref(), username, password)
         .await
-        .then(|| (username.to_string(), crate::tokens::Role::Write))
+        .then(|| {
+            (
+                username.to_string(),
+                state.config.auth.htpasswd_role(username),
+            )
+        })
 }
 
 fn unauthorized_response(message: &str, realm: &str) -> Response {
@@ -1836,6 +1851,89 @@ mod integration_tests {
         let minted = store.list_tokens("boss");
         assert_eq!(minted.len(), 2);
         assert!(minted.iter().all(|t| t.role == crate::tokens::Role::Admin));
+    }
+
+    /// An htpasswd account in auth.read_only_users authenticates as Read: it
+    /// pulls but cannot push; other htpasswd accounts keep Write.
+    #[tokio::test]
+    async fn test_htpasswd_read_only_user_cannot_write() {
+        let ctx = create_test_context_with_auth_and_config(
+            &[("admin", "secret"), ("viewer", "pw")],
+            |cfg| cfg.auth.read_only_users = vec!["viewer".to_string()],
+        );
+        let admin = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let viewer = format!("Basic {}", STANDARD.encode("viewer:pw"));
+        let app = &ctx.app;
+        let put = |auth: String| async move {
+            send_with_headers(
+                app,
+                Method::PUT,
+                "/raw/test.txt",
+                vec![("authorization", &auth)],
+                b"data".to_vec(),
+            )
+            .await
+            .status()
+        };
+        assert_eq!(put(viewer.clone()).await, StatusCode::FORBIDDEN);
+        assert_eq!(put(admin).await, StatusCode::OK);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/test.txt",
+            vec![("authorization", &viewer)],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// No self-service mint outranks the caller: a read-only htpasswd account
+    /// gets read tokens only from POST /api/tokens, and a read credential
+    /// cannot mint write through the UI. Write accounts are unchanged.
+    #[tokio::test]
+    async fn test_token_mint_capped_at_caller_role() {
+        let ctx = create_test_context_with_auth_and_config(
+            &[("admin", "secret"), ("viewer", "pw")],
+            |cfg| cfg.auth.read_only_users = vec!["viewer".to_string()],
+        );
+        let store = ctx.state.tokens.as_ref().unwrap();
+        let app = &ctx.app;
+        let api_mint = |user: &'static str, pass: &'static str, role: &'static str| async move {
+            send_with_headers(
+                app,
+                Method::POST,
+                "/api/tokens",
+                vec![("content-type", "application/json")],
+                format!(r#"{{"username":"{user}","password":"{pass}","role":"{role}"}}"#),
+            )
+            .await
+            .status()
+        };
+        assert_eq!(
+            api_mint("viewer", "pw", "write").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            api_mint("viewer", "pw", "admin").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(api_mint("viewer", "pw", "read").await, StatusCode::OK);
+        let minted = store.list_tokens("viewer");
+        assert_eq!(minted.len(), 1);
+        assert_eq!(minted[0].role, crate::tokens::Role::Read);
+        assert_eq!(api_mint("admin", "secret", "write").await, StatusCode::OK);
+
+        let viewer = format!("Basic {}", STANDARD.encode("viewer:pw"));
+        let response = ui_create_token(&ctx, &viewer, "write").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let read_token = store
+            .create_token("ro", 30, None, crate::tokens::Role::Read)
+            .unwrap();
+        let response = ui_create_token(&ctx, &format!("Bearer {read_token}"), "write").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(store.list_tokens("viewer").len(), 1);
+        assert_eq!(store.list_tokens("ro").len(), 1);
     }
 }
 
