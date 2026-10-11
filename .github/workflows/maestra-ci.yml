@@ -1,7 +1,8 @@
 name: Maestra CI
 
-# cargo test on PRs into our default branch. Upstream's CI only targets main,
-# which in this fork is the untouched upstream mirror (see MAESTRA.md).
+# fmt, clippy, cargo test, RustSec advisories and the vendored chart on PRs into
+# our default branch. Upstream's CI only targets main, which in this fork is the
+# untouched upstream mirror (see MAESTRA.md).
 
 on:
   pull_request:
@@ -30,8 +31,24 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
+      # --locked everywhere: a manifest change without its Cargo.lock update fails
+      # here instead of being re-resolved silently at image build time.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy -p nora-registry --all-targets --locked -- -D warnings
+
       - name: Run tests
-        run: cargo test --package nora-registry
+        run: cargo test --package nora-registry --locked
+
+      # maestra-release.yml builds with --no-default-features (no rpm/deb):
+      # hold the shipped feature set to the same gates.
+      - name: Clippy (release features)
+        run: cargo clippy -p nora-registry --all-targets --no-default-features --locked -- -D warnings
+
+      - name: Run tests (release features)
+        run: cargo test --package nora-registry --no-default-features --locked
 
   # Vendored Helm chart (maestra/charts/nora, see its MAESTRA-CHART.md).
   chart:
@@ -57,3 +74,18 @@ jobs:
           helm lint --strict . -f ci/maestra-values.yaml
           helm template nora . -f ci/maestra-values.yaml > /dev/null
           helm template nora . --set config.server.public_url=https://registry.example.com > /dev/null
+
+  advisories:
+    name: cargo deny advisories
+    runs-on: runs-on=${{ github.run_id }}/pool=build
+    steps:
+      - uses: runs-on/action@v2
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      # RustSec advisories against Cargo.lock; accepted ones live in deny.toml
+      # (the one ignore list, also read by upstream's `cargo deny check`).
+      - name: cargo deny check advisories
+        uses: EmbarkStudios/cargo-deny-action@a4d2d701318fdc1c6ae17ba8cea8f329c5110eb2 # v2.0.17
+        with:
+          command: check advisories
