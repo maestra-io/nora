@@ -925,23 +925,28 @@ fn versions_from_filenames(files: &[FileEntry]) -> Vec<String> {
     vs
 }
 
-/// Extract the release version from a wheel or sdist filename (best-effort).
-/// wheel: `{distribution}-{version}(-{build})?-{py}-{abi}-{platform}.whl`
+/// Extract the release version from a wheel, egg or sdist filename (best-effort).
+pub(crate) fn version_from_filename(filename: &str) -> Option<String> {
+    split_dist_filename(filename).map(|(_, version)| version.to_string())
+}
+
+/// `(distribution, version)` of a distribution filename (best-effort):
+/// wheel/egg: `{distribution}-{version}(-{build})?-{py}-...`
 /// sdist: `{name}-{version}.tar.gz|.tar.bz2|.tar.xz|.tgz|.zip`
-fn version_from_filename(filename: &str) -> Option<String> {
-    if let Some(stem) = filename.strip_suffix(".whl") {
-        return stem
-            .split('-')
-            .nth(1)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+fn split_dist_filename(filename: &str) -> Option<(&str, &str)> {
+    if let Some(stem) = filename
+        .strip_suffix(".whl")
+        .or_else(|| filename.strip_suffix(".egg"))
+    {
+        let mut parts = stem.splitn(3, '-');
+        let (name, version) = (parts.next()?, parts.next()?);
+        return (!name.is_empty() && !version.is_empty()).then_some((name, version));
     }
     for ext in [".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip"] {
         if let Some(stem) = filename.strip_suffix(ext) {
             return stem
                 .rsplit_once('-')
-                .map(|(_, v)| v.to_string())
-                .filter(|s| !s.is_empty());
+                .filter(|(name, version)| !name.is_empty() && !version.is_empty());
         }
     }
     None
@@ -1231,7 +1236,7 @@ async fn backfill_hash_marker(
 }
 
 /// Validate PyPI filename.
-fn is_valid_pypi_filename(name: &str) -> bool {
+pub(crate) fn is_valid_pypi_filename(name: &str) -> bool {
     !name.is_empty()
         && !name.contains("..")
         && !name.contains('/')
