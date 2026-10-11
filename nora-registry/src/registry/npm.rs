@@ -2269,11 +2269,10 @@ async fn extract_npm_publish_date(
     version: &str,
     trust_upstream: bool,
 ) -> Option<i64> {
-    // #513: when upstream dates are not trusted, derive age from NORA's own
-    // cache mtime instead of the (spoofable) upstream metadata date. Never fall
-    // back to the upstream date here — that would reopen the spoof vector.
+    // #513: untrusted upstream dates → no date: never the (spoofable) upstream
+    // date, nor the cache mtime (refreshed with the metadata, not a release date).
     if !trust_upstream {
-        return crate::curation::extract_mtime_as_publish_date(storage, metadata_key).await;
+        return None;
     }
     let data = storage.get(metadata_key).await.ok()?;
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
@@ -3420,6 +3419,24 @@ mod integration_tests {
             Some(1579084200),
             "ISO 8601 → Unix for 2020-01-15T10:30:00Z"
         );
+    }
+
+    /// C49: with untrusted dates neither the packument's `time` nor its cache mtime
+    /// (moved to now by every metadata refresh) is a publish date.
+    #[tokio::test]
+    async fn test_extract_npm_publish_date_untrusted_ignores_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().to_str().unwrap());
+        let meta = serde_json::json!({ "time": { "1.0.0": "2020-01-15T10:30:00.000Z" } });
+        storage
+            .put("npm/p/metadata.json", meta.to_string().as_bytes())
+            .await
+            .unwrap();
+        let date = |trust| {
+            super::extract_npm_publish_date(&storage, "npm/p/metadata.json", "1.0.0", trust)
+        };
+        assert_eq!(date(false).await, None);
+        assert_eq!(date(true).await, Some(1579084200));
     }
 
     /// Cached metadata short-circuits ensure_npm_metadata_cached — no upstream

@@ -938,9 +938,9 @@ async fn extract_pub_publish_date(
     trust_upstream: bool,
 ) -> Option<i64> {
     let meta_key = format!("pub/api/packages/{}.json", package);
-    // #513: untrusted upstream dates → NORA cache mtime, never upstream published.
+    // #513: untrusted upstream dates → no date: never upstream published, nor the cache mtime.
     if !trust_upstream {
-        return crate::curation::extract_mtime_as_publish_date(storage, &meta_key).await;
+        return None;
     }
     let data = storage.get(&meta_key).await.ok()?;
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
