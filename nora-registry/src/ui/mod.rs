@@ -8,8 +8,9 @@ pub mod i18n;
 mod static_assets;
 mod templates;
 
+use crate::audit::AuditEntry;
 use crate::repo_index::paginate;
-use crate::tokens::Role;
+use crate::tokens::{Role, MAX_TOKEN_TTL_DAYS};
 use crate::AppState;
 use axum::{
     body::Body,
@@ -102,16 +103,6 @@ fn extract_lang_from_headers(headers: &axum::http::HeaderMap) -> Lang {
         }
     }
     Lang::default()
-}
-
-/// Extract username from Basic Auth header (already validated by auth middleware)
-fn extract_basic_auth_user(headers: &axum::http::HeaderMap) -> Option<String> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let auth_header = headers.get("authorization")?.to_str().ok()?;
-    let encoded = auth_header.strip_prefix("Basic ")?;
-    let decoded = String::from_utf8(STANDARD.decode(encoded).ok()?).ok()?;
-    let (user, _) = decoded.split_once(':')?;
-    Some(user.to_string())
 }
 
 pub fn routes() -> Router<AppState> {
@@ -976,6 +967,8 @@ struct CreateTokenForm {
 
 async fn tokens_create(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Extension(caller_role): Extension<AuthenticatedRole>,
     headers: axum::http::HeaderMap,
     Form(form): Form<CreateTokenForm>,
 ) -> impl IntoResponse {
@@ -996,19 +989,10 @@ async fn tokens_create(
         }
     };
 
-    // Get authenticated user from Basic Auth header — token creation requires
-    // knowing who created it, so we reject requests without Basic auth identity.
-    let user = match extract_basic_auth_user(&headers) {
-        Some(u) => u,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Html(
-                    r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Token creation requires Basic authentication to identify the owner</div>"##.to_string(),
-                ),
-            );
-        }
-    };
+    // The owner is the identity the auth middleware verified, never the
+    // username field of a Basic header (an nra_ token as the Basic password
+    // would otherwise let the caller name any owner).
+    let user = user.0;
 
     let role = match form.role.as_str() {
         "read" => Role::Read,
@@ -1016,8 +1000,20 @@ async fn tokens_create(
         "admin" => Role::Admin,
         _ => Role::Read,
     };
+    // Admin mint needs both an admin-role credential and an auth.admin_users
+    // entry, as on POST /api/tokens (GHSA-78cx-cfhm-rgmx).
+    if role == Role::Admin
+        && !(caller_role.0.can_admin() && state.config.auth.admin_users.contains(&user))
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Html(
+                r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Admin tokens require an admin credential and an auth.admin_users entry</div>"##.to_string(),
+            ),
+        );
+    }
 
-    let ttl_days = form.ttl_days.unwrap_or(90).clamp(1, 3650);
+    let ttl_days = form.ttl_days.unwrap_or(90).clamp(1, MAX_TOKEN_TTL_DAYS);
 
     let description = if form.description.trim().is_empty() {
         None
@@ -1025,8 +1021,12 @@ async fn tokens_create(
         Some(form.description.trim().to_string())
     };
 
+    let detail = format!("role={} ttl_days={}", role, ttl_days);
     match store.create_token(&user, ttl_days, description, role) {
         Ok(raw_token) => {
+            state
+                .audit
+                .log(AuditEntry::new("token_mint", &user, &user, "ui", &detail));
             let html = render_token_created_fragment(&raw_token, lang);
             (StatusCode::OK, Html(html))
         }

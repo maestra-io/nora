@@ -56,6 +56,14 @@ pub fn create_test_context_with_auth(users: &[(&str, &str)]) -> TestContext {
     build_context(true, users, false, |_| {})
 }
 
+/// Build a test context with auth **enabled** plus custom config tweaks.
+pub fn create_test_context_with_auth_and_config(
+    users: &[(&str, &str)],
+    customize: impl FnOnce(&mut Config),
+) -> TestContext {
+    build_context(true, users, false, customize)
+}
+
 /// Build a test context with auth + anonymous_read.
 pub fn create_test_context_with_anonymous_read(users: &[(&str, &str)]) -> TestContext {
     build_context(true, users, true, |_| {})
