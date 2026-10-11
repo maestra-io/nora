@@ -414,7 +414,11 @@ fn build_http_client(
     timeout: Option<std::time::Duration>,
     no_proxy: bool,
 ) -> reqwest::Client {
-    let mut builder = reqwest::ClientBuilder::new().user_agent(USER_AGENT);
+    // A black-holed upstream fails the connect in seconds instead of eating the
+    // whole per-request timeout (twice, with the proxy retry).
+    let mut builder = reqwest::ClientBuilder::new()
+        .user_agent(USER_AGENT)
+        .connect_timeout(std::time::Duration::from_secs(10));
 
     if let Some(t) = timeout {
         builder = builder.timeout(t);

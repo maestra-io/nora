@@ -3897,6 +3897,7 @@ pub async fn fetch_manifest_from_upstream(
             tracing::debug!("Token acquired, retrying with auth");
             client
                 .get(&url)
+                .timeout(Duration::from_secs(timeout))
                 .header("Accept", accept_header)
                 .header("Authorization", format!("Bearer {}", token))
                 .send()

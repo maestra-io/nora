@@ -8,9 +8,9 @@ use crate::circuit_breaker::BreakerScope;
 use crate::config::npm_scope_of;
 use crate::metrics::{METADATA_CORRUPT_TOTAL, PACKUMENT_REBUILT_TOTAL};
 use crate::registry::{
-    circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_conditional,
-    proxy_forward_post, read_validators, validators_key, write_validators, ProxyError,
-    Revalidation, Validators,
+    cache_read, circuit_open_response, method_not_allowed, nora_base_url, proxy_error_response,
+    proxy_fetch, proxy_fetch_conditional, proxy_forward_post, read_validators, validators_key,
+    write_validators, ProxyError, Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::AppState;
@@ -597,7 +597,20 @@ async fn handle_request(
     // .sha256 sidecar check below stays: it is the integrity check on S3 (storage
     // pins are local-only).
     let cached = if cache_trusted {
-        state.storage.get_verified(&key).await.ok()
+        let internal = crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Npm,
+            &package_name,
+        );
+        match cache_read(
+            state.storage.get_verified(&key).await,
+            "npm",
+            &key,
+            internal,
+        ) {
+            Ok(cached) => cached,
+            Err(resp) => return resp,
+        }
     } else {
         None
     };
@@ -954,12 +967,9 @@ async fn handle_request(
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
             // The upstream answered "no such package": a real 404.
             Err(ProxyError::NotFound) => {}
-            // The upstream is down or unreachable: a gateway failure, not a missing
-            // package — npm retries a 502 and reports E502 instead of E404 (#1055).
-            Err(e @ (ProxyError::Upstream(_) | ProxyError::Network(_))) => {
-                tracing::warn!(registry = "npm", path = %path, error = ?e, "npm upstream failed, returning 502");
-                return StatusCode::BAD_GATEWAY.into_response();
-            }
+            // The upstream is down, slow, throttling or refusing us: a gateway failure,
+            // not a missing package — npm retries a 5xx and reports E502 instead of E404 (#1055).
+            Err(e) => return proxy_error_response("npm", &url, &e),
         }
     }
 
@@ -5838,6 +5848,16 @@ mod multi_upstream_tests {
             .respond_with(ResponseTemplate::new(404))
             .mount(&private)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/@vendor/throttled"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "7"))
+            .mount(&private)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/@vendor/denied"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&private)
+            .await;
         Mock::given(any())
             .respond_with(ResponseTemplate::new(503))
             .mount(&private)
@@ -5848,6 +5868,9 @@ mod multi_upstream_tests {
         for (uri, want) in [
             ("/npm/@vendor%2fmissing", StatusCode::NOT_FOUND),
             ("/npm/@vendor%2fdown", StatusCode::BAD_GATEWAY),
+            // Throttling and auth refusals are not "no such package" either.
+            ("/npm/@vendor%2fthrottled", StatusCode::SERVICE_UNAVAILABLE),
+            ("/npm/@vendor%2fdenied", StatusCode::BAD_GATEWAY),
             (
                 "/npm/@vendor/down/-/down-1.0.0.tgz",
                 StatusCode::BAD_GATEWAY,
