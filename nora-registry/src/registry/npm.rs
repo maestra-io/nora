@@ -1292,6 +1292,8 @@ async fn handle_publish(
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response(),
     };
+    // The parsed payload holds everything needed; free the raw body before decoding.
+    drop(body);
 
     // Security: verify payload name matches URL path (required field)
     match payload.get("name").and_then(|n| n.as_str()) {
@@ -1426,14 +1428,18 @@ async fn handle_publish(
         };
 
         let tarball_bytes = match base64::engine::general_purpose::STANDARD.decode(base64_data) {
-            Ok(b) => b,
+            Ok(b) => Bytes::from(b),
             Err(_) => {
                 return (StatusCode::BAD_REQUEST, "Invalid base64 in attachment").into_response()
             }
         };
 
         let tarball_key = format!("npm/{}/tarballs/{}", package_name, normalized_name);
-        if let Err(e) = state.storage.put(&tarball_key, &tarball_bytes).await {
+        if let Err(e) = state
+            .storage
+            .put_bytes(&tarball_key, tarball_bytes.clone())
+            .await
+        {
             tracing::error!(key = %tarball_key, error = ?e, "npm publish: failed to store tarball");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
