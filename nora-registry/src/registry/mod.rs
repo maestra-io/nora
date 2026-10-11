@@ -47,6 +47,9 @@ pub use pub_dart::routes as pub_dart_routes;
 pub use pypi::routes as pypi_routes;
 // Retention retires a PyPI file's hash markers together with the file.
 pub(crate) use pypi::HASH_MARKER_PREFIX as PYPI_HASH_MARKER_PREFIX;
+// Retention and the repo index tell distribution files from sidecars and group releases.
+pub(crate) use pypi::is_valid_pypi_filename as is_pypi_dist_filename;
+pub(crate) use pypi::version_from_filename as pypi_version_from_filename;
 pub use raw::routes as raw_routes;
 pub(crate) use raw::storage_key as raw_storage_key;
 pub use rpm::routes as rpm_routes;

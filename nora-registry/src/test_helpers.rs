@@ -179,6 +179,7 @@ fn build_context_with(
             proxy_auth: None,
             proxies: Vec::new(),
             proxy_timeout: 5,
+            metadata_ttl: 300,
         },
         go: GoConfig {
             enabled: true,

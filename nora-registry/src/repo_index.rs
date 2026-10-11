@@ -417,9 +417,10 @@ async fn build_pypi_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
                 let name = parts[0].to_string();
                 let entry = packages.entry(name).or_insert((0, 0, 0));
                 // Count only real distribution files — a checksum sidecar
-                // (`<file>.sha256`) is not a separate artifact (#588). Its bytes
-                // still count toward size so the total matches on-disk du.
-                if !crate::gc::is_checksum_sidecar(key) {
+                // (`<file>.sha256`, #588), a `<file>.metadata` or a project's
+                // bookkeeping JSON is not a separate artifact. Their bytes still
+                // count toward size so the total matches on-disk du.
+                if parts.len() == 2 && crate::registry::is_pypi_dist_filename(parts[1]) {
                     entry.0 += 1;
                 }
 

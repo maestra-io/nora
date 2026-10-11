@@ -22,6 +22,11 @@ pub struct PypiConfig {
     pub proxies: Vec<PypiProxyEntry>,
     #[serde(default = "super::super::default_timeout")]
     pub proxy_timeout: u64,
+    /// Seconds a project's upstream index (`/simple/{name}/` of every upstream, an
+    /// upstream 404 included) is reused before it is fetched again (`-1` forever, `0`
+    /// every request). Past it, a failed refetch serves the last good copy.
+    #[serde(default = "super::super::default_metadata_ttl")]
+    pub metadata_ttl: i64,
 }
 
 /// PyPI upstream proxy configuration (mirrors `MavenProxyEntry`).
@@ -78,6 +83,7 @@ impl Default for PypiConfig {
             proxy_auth: None,
             proxies: Vec::new(),
             proxy_timeout: 30,
+            metadata_ttl: super::super::default_metadata_ttl(),
         }
     }
 }
@@ -141,6 +147,9 @@ impl PypiConfig {
         }
         if let Ok(val) = env::var("NORA_PYPI_PROXY_TIMEOUT") {
             super::super::parse_env_warn("NORA_PYPI_PROXY_TIMEOUT", &val, &mut self.proxy_timeout);
+        }
+        if let Ok(val) = env::var("NORA_PYPI_METADATA_TTL") {
+            super::super::parse_env_warn("NORA_PYPI_METADATA_TTL", &val, &mut self.metadata_ttl);
         }
     }
 }

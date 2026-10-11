@@ -16,7 +16,7 @@ use crate::circuit_breaker::BreakerScope;
 use crate::config::UpstreamAuth;
 use crate::registry::{
     cache_read, circuit_open_response, method_not_allowed, nora_base_url, proxy_error_response,
-    proxy_fetch_bytes, proxy_fetch_shared, proxy_fetch_text,
+    proxy_fetch_bytes, proxy_fetch_shared, proxy_fetch_text, TempFileGuard,
 };
 use crate::registry_type::RegistryType;
 use crate::ui::components::html_escape;
@@ -37,6 +37,16 @@ use std::time::Duration;
 /// PEP 691 JSON content type
 const PEP691_JSON: &str = "application/vnd.pypi.simple.v1+json";
 
+/// `pypi/<project>/` object caching the project's upstream file list (every upstream's
+/// index merged, an all-404 answer as an empty list), reused for `pypi.metadata_ttl`.
+const UPSTREAM_INDEX_FILE: &str = "upstream-index.json";
+
+/// `pypi/<project>/` object mapping each uploaded filename to twine's `requires_python`.
+const REQUIRES_PYTHON_FILE: &str = "requires-python.json";
+
+/// Largest `.dist-info/METADATA` stored for PEP 658; a larger one is not served.
+const MAX_CORE_METADATA_BYTES: u64 = 16 << 20;
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
@@ -54,26 +64,19 @@ pub fn routes() -> Router<AppState> {
 // ============================================================================
 
 /// GET /simple/ — list all packages (PEP 503 HTML or PEP 691 JSON).
+///
+/// Served from the in-memory repo index (rebuilt only after an upload or a proxy cache
+/// write), not a listing of the whole `pypi/` prefix per request. Only projects holding
+/// at least one distribution file are listed.
 async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let keys = match state.storage.list("pypi/").await {
-        Ok(k) => k,
-        Err(e) => {
-            tracing::error!(error = ?e, "pypi: failed to list storage for packages");
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-    };
-    let mut packages = std::collections::HashSet::new();
-
-    for key in keys {
-        if let Some(pkg) = key.strip_prefix("pypi/").and_then(|k| k.split('/').next()) {
-            if !pkg.is_empty() {
-                packages.insert(pkg.to_string());
-            }
-        }
-    }
-
-    let mut pkg_list: Vec<_> = packages.into_iter().collect();
-    pkg_list.sort();
+    let index = state.repo_index.get("pypi", &state.storage).await;
+    let pkg_list: Vec<&str> = index
+        .iter()
+        .filter(|repo| repo.versions > 0)
+        .map(|repo| repo.name.as_str())
+        .collect();
+    let base_url = nora_base_url(&state);
+    let base = base_url.trim_end_matches('/');
 
     if wants_json(&headers) {
         // PEP 691 JSON response
@@ -100,12 +103,8 @@ async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> imp
             "<!DOCTYPE html>\n<html><head><title>Simple Index</title></head><body><h1>Simple Index</h1>\n",
         );
         for pkg in pkg_list {
-            let _ = writeln!(
-                html,
-                "<a href=\"/simple/{}/\">{}</a><br>",
-                html_escape(&pkg),
-                html_escape(&pkg)
-            );
+            let pkg = html_escape(pkg);
+            let _ = writeln!(html, "<a href=\"{base}/simple/{pkg}/\">{pkg}</a><br>");
         }
         html.push_str("</body></html>");
         (
@@ -123,10 +122,10 @@ async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> imp
 
 /// GET /simple/{name}/ — list files for a package (PEP 503 HTML or PEP 691 JSON).
 ///
-/// When proxy is configured, always fetches the upstream index and merges with
-/// locally cached/uploaded files. This ensures pip sees all available wheels
-/// (e.g. both cp310 and cp314) regardless of which were cached first.
-/// Falls back to local-only when upstream is unavailable.
+/// When proxy is configured, merges the upstream index with locally cached/uploaded
+/// files, so pip sees all available wheels (e.g. both cp310 and cp314) regardless of
+/// which were cached first. The upstream half is cached per project for
+/// `pypi.metadata_ttl` (see [`upstream_index`]); local files are always read fresh.
 async fn package_versions(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -141,7 +140,7 @@ async fn package_versions(
     // The map is read ONCE here and threaded through to [`pep700_meta`] — re-reading
     // `dates.json` per response was a second round-trip on the hot path (#969).
     let dates = if wants_json(&headers) {
-        ensure_pypi_dates_cached(&state, &normalized).await
+        ensure_pypi_dates_cached(&state, &normalized, None).await
     } else {
         serde_json::Map::new()
     };
@@ -176,6 +175,23 @@ async fn package_versions(
     {
         markers.entry(filename).or_default().push(sha256);
     }
+    let listed: std::collections::HashSet<&str> = keys.iter().map(|(k, _)| k.as_str()).collect();
+    // twine's `requires_python` of uploaded files: one object per project, read only when
+    // the listing shows it exists.
+    let requires_python_key = format!("{prefix}{REQUIRES_PYTHON_FILE}");
+    let requires_python: std::collections::HashMap<String, String> = if listed
+        .contains(requires_python_key.as_str())
+    {
+        match state.storage.get(&requires_python_key).await {
+            Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(key = %requires_python_key, error = %e, "pypi: failed to read requires-python");
+                Default::default()
+            }
+        }
+    } else {
+        Default::default()
+    };
     let mut backfill: Vec<String> = Vec::new();
     let mut local_files: Vec<FileEntry> = Vec::new();
     let mut local_sizes: std::collections::HashMap<String, u64> =
@@ -200,10 +216,25 @@ async fn package_versions(
                             .and_then(|d| String::from_utf8(d.to_vec()).ok())
                     }
                 };
+                // PEP 658: advertised only when `<file>.metadata` is stored next to it.
+                let core_metadata =
+                    listed
+                        .contains(format!("{key}.metadata").as_str())
+                        .then(|| {
+                            match markers
+                                .get(format!("{filename}.metadata").as_str())
+                                .map(Vec::as_slice)
+                            {
+                                Some([sha256]) => format!("sha256={sha256}"),
+                                _ => "true".to_string(),
+                            }
+                        });
                 local_sizes.insert(filename.to_string(), meta.size);
                 local_files.push(FileEntry {
                     filename: filename.to_string(),
                     sha256,
+                    requires_python: requires_python.get(filename).cloned(),
+                    core_metadata,
                     ..Default::default()
                 });
             }
@@ -228,16 +259,12 @@ async fn package_versions(
         }));
     }
 
-    // When proxy is configured, fetch upstream index and merge with local files.
+    // When proxy is configured, merge the upstream index with the local files.
     // This fixes the case where a cp314 wheel is cached but pip 3.10 needs to
     // see the full upstream file list to find a compatible cp310 wheel.
-    // Fetch each configured upstream's index and merge them (#663). Precedence is
-    // the upstream order: the first upstream that lists a file wins (local files
-    // win over all upstreams). One upstream's failure or open breaker must not
-    // sink the others — skip it and serve the merge of what answered.
     // #68 namespace isolation: an internal-namespace package must never be fetched
     // upstream (dependency confusion). Skip the upstream merge entirely; a locally
-    // published copy is still served from the local-only branch below, and an
+    // published copy is still served from the local files, and an
     // internal name with no local copy is blocked (never proxied). Computed without
     // the `blocked` metric — the metric fires only on the actual block path below.
     let is_internal = crate::curation::is_internal_namespace(
@@ -246,56 +273,39 @@ async fn package_versions(
         &normalized,
     );
 
-    let upstreams = state.config.pypi.upstreams();
-    let mut circuit_open = false;
-    let mut upstream_err: Option<(String, crate::registry::ProxyError)> = None;
-    if !is_internal && !upstreams.is_empty() {
-        let mut upstream_files: Vec<FileEntry> = Vec::new();
-        for up in &upstreams {
-            let url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
-            match proxy_fetch_text(
-                &state.http_client,
-                &url,
-                Duration::from_secs(state.config.pypi.proxy_timeout),
-                up.auth().map(UpstreamAuth::Basic),
-                Some(("Accept", "text/html")),
-                &state.circuit_breaker,
-                BreakerScope::upstream(RegistryType::PyPI, up.url()),
-            )
-            .await
-            {
-                Ok(html) => upstream_files.extend(parse_upstream_files(&html)),
-                Err(crate::registry::ProxyError::CircuitOpen(_)) => {
-                    circuit_open = true;
-                    continue;
-                }
-                Err(crate::registry::ProxyError::NotFound) => continue,
-                Err(e) => {
-                    tracing::debug!(error = ?e, package = %normalized, upstream = %up.url(), "PyPI upstream index fetch failed, skipping");
-                    upstream_err = Some((url, e));
-                    continue;
-                }
+    let mut files = local_files;
+    let mut stale = false;
+    if !is_internal && !state.config.pypi.upstreams().is_empty() {
+        let cache_key = format!("{prefix}{UPSTREAM_INDEX_FILE}");
+        let cached_at = keys
+            .iter()
+            .find(|(key, _)| *key == cache_key)
+            .map(|(_, meta)| meta.modified);
+        let upstream = match upstream_index(&state, &normalized, &cache_key, cached_at).await {
+            UpstreamIndex::Files(upstream) => upstream,
+            UpstreamIndex::Stale(upstream) => {
+                stale = true;
+                upstream
             }
-        }
-        let merged = merge_file_lists(upstream_files, &local_files);
-        if !merged.is_empty() {
-            return if wants_json(&headers) {
-                let pep700 = pep700_meta(&merged, &local_sizes, &dates);
-                versions_json_response(&normalized, &merged, &base_url, &pep700)
-            } else {
-                versions_html_response(&normalized, &merged, &base_url)
-            };
-        }
+            UpstreamIndex::Failed(response) => return response,
+        };
+        files = merge_file_lists(upstream, &files);
     }
 
-    // Local files only — degrade gracefully when upstreams list nothing or are down.
-    if !local_files.is_empty() {
-        return if wants_json(&headers) {
-            let pep700 = pep700_meta(&local_files, &local_sizes, &dates);
-            versions_json_response(&normalized, &local_files, &base_url, &pep700)
+    if !files.is_empty() {
+        let mut response = if wants_json(&headers) {
+            let pep700 = pep700_meta(&files, &local_sizes, &dates);
+            versions_json_response(&normalized, &files, &base_url, &pep700)
         } else {
-            versions_html_response(&normalized, &local_files, &base_url)
+            versions_html_response(&normalized, &files, &base_url)
         };
+        if stale {
+            response.headers_mut().insert(
+                header::WARNING,
+                header::HeaderValue::from_static("110 - \"Response is Stale\""),
+            );
+        }
+        return response;
     }
 
     // #68: an internal-namespace package with no local copy is blocked, never
@@ -311,18 +321,137 @@ async fn package_versions(
         }
     }
 
-    // No upstream result and no local copy: a tripped breaker means the upstream is
-    // temporarily down — return 503 (retryable) rather than 404, which would poison
-    // pip's negative cache.
-    if circuit_open {
-        return circuit_open_response(RegistryType::PyPI.as_str());
+    StatusCode::NOT_FOUND.into_response()
+}
+
+/// The upstream half of a project's index ([`upstream_index`]).
+enum UpstreamIndex {
+    /// Within `metadata_ttl`, just fetched, or the merge of the upstreams that answered.
+    Files(Vec<FileEntry>),
+    /// The refetch failed: the last good copy, served with a `Warning`.
+    Stale(Vec<FileEntry>),
+    /// The refetch failed and there is no copy: the 5xx to send. Serving only the local
+    /// files instead would let pip resolve an older cached version without a signal.
+    Failed(Response),
+}
+
+/// What asking every upstream for a project's index returned.
+#[derive(Default)]
+struct UpstreamFetch {
+    files: Vec<FileEntry>,
+    /// At least one upstream listed the project or answered 404.
+    answered: bool,
+    circuit_open: bool,
+    error: Option<(String, crate::registry::ProxyError)>,
+}
+
+/// Fetch each configured upstream's index and merge them (#663). Precedence is the
+/// upstream order: the first upstream that lists a file wins.
+async fn fetch_upstream_index(state: &AppState, normalized: &str) -> UpstreamFetch {
+    let mut out = UpstreamFetch::default();
+    for up in &state.config.pypi.upstreams() {
+        let url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
+        match proxy_fetch_text(
+            &state.http_client,
+            &url,
+            Duration::from_secs(state.config.pypi.proxy_timeout),
+            up.auth().map(UpstreamAuth::Basic),
+            Some(("Accept", "text/html")),
+            &state.circuit_breaker,
+            BreakerScope::upstream(RegistryType::PyPI, up.url()),
+        )
+        .await
+        {
+            Ok(html) => {
+                out.answered = true;
+                out.files.extend(parse_upstream_files(&html));
+            }
+            Err(crate::registry::ProxyError::NotFound) => out.answered = true,
+            Err(crate::registry::ProxyError::CircuitOpen(_)) => out.circuit_open = true,
+            Err(e) => {
+                tracing::debug!(error = ?e, package = %normalized, upstream = %up.url(), "PyPI upstream index fetch failed, skipping");
+                out.error = Some((url, e));
+            }
+        }
     }
-    // An upstream failed (not "not found"): a 5xx pip retries, not a 404 it trusts.
-    if let Some((url, e)) = upstream_err {
-        return proxy_error_response("pypi", &url, &e);
+    out
+}
+
+/// The upstream file list of `normalized`, cached in `cache_key` (`cached_at` is its
+/// mtime from the project listing, `None` when absent).
+///
+/// Within `pypi.metadata_ttl` the stored copy is served without asking the upstreams,
+/// so a project every upstream 404s (a private one outside
+/// `curation.internal_namespaces`) is not looked up on every request, and a CI fan-out
+/// costs one upstream fetch per project per TTL. A refetch runs single-flight per
+/// project and is stored only when every upstream answered. When it fails, the last
+/// good copy is served stale; with no copy, the merge of the upstreams that did answer
+/// (one dead mirror must not sink the others, #663), or the upstream error when none did.
+async fn upstream_index(
+    state: &AppState,
+    normalized: &str,
+    cache_key: &str,
+    cached_at: Option<u64>,
+) -> UpstreamIndex {
+    let read_cached = || async {
+        let data = state.storage.get(cache_key).await.ok()?;
+        serde_json::from_slice::<Vec<FileEntry>>(&data).ok()
+    };
+    if cached_at.is_some_and(|m| crate::cache_ttl::is_within_ttl(m, state.config.pypi.metadata_ttl))
+    {
+        if let Some(files) = read_cached().await {
+            return UpstreamIndex::Files(files);
+        }
     }
 
-    StatusCode::NOT_FOUND.into_response()
+    // The fetch runs once per caller at most (as the leader, or as a follower whose
+    // leader failed); its result lands in `fetch`.
+    let mut fetch = UpstreamFetch::default();
+    let fetch_slot = &mut fetch;
+    let refresh = move || async move {
+        *fetch_slot = fetch_upstream_index(state, normalized).await;
+        if fetch_slot.circuit_open || fetch_slot.error.is_some() {
+            return None;
+        }
+        let bytes = serde_json::to_vec(&fetch_slot.files).ok()?;
+        if let Err(e) = state.storage.put(cache_key, &bytes).await {
+            tracing::warn!(key = %cache_key, error = %e, "pypi: failed to cache the upstream index");
+        }
+        Some(axum::body::Bytes::from(bytes))
+    };
+    let shared = if state.config.server.proxy_coalesce {
+        let budget = crate::proxy_coalesce::follower_budget(state.config.pypi.proxy_timeout)
+            * state.config.pypi.upstreams().len().max(1) as u32;
+        state
+            .proxy_coalesce
+            .coalesced(&format!("index:{cache_key}"), "pypi", budget, refresh)
+            .await
+    } else {
+        refresh().await
+    };
+    if let Some(files) = shared.and_then(|b| serde_json::from_slice(&b).ok()) {
+        return UpstreamIndex::Files(files);
+    }
+
+    if cached_at.is_some() {
+        if let Some(files) = read_cached().await {
+            tracing::warn!(package = %normalized, "PyPI upstream index refetch failed, serving the last good copy");
+            return UpstreamIndex::Stale(files);
+        }
+    }
+    if fetch.answered {
+        return UpstreamIndex::Files(fetch.files);
+    }
+    // A tripped breaker means the upstream is temporarily down — 503 (retryable)
+    // rather than 404, which would poison pip's negative cache.
+    if fetch.circuit_open {
+        return UpstreamIndex::Failed(circuit_open_response(RegistryType::PyPI.as_str()));
+    }
+    // An upstream failed (not "not found"): a 5xx pip retries, not a 404 it trusts.
+    match fetch.error {
+        Some((url, e)) => UpstreamIndex::Failed(proxy_error_response("pypi", &url, &e)),
+        None => UpstreamIndex::Failed(StatusCode::BAD_GATEWAY.into_response()),
+    }
 }
 
 // ============================================================================
@@ -338,6 +467,14 @@ async fn download_file(
 ) -> Response {
     let normalized = normalize_name(&name);
 
+    // PEP 658: `<wheel>.metadata`.
+    if let Some(wheel) = filename.strip_suffix(".metadata") {
+        if ends_with_ci(wheel, ".whl") && is_valid_pypi_filename(wheel) {
+            return core_metadata(&state, &normalized, wheel).await;
+        }
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     // Block download of internal bookkeeping files (dates.json, etc.) that
     // live alongside packages in storage but are not real artifacts (#891).
     if !is_valid_pypi_filename(&filename) {
@@ -350,20 +487,18 @@ async fn download_file(
     // Extract the upstream release date for this file (PEP 700 `upload-time` from
     // the PEP 691 simple JSON, cached as dates.json). Seeds the digest-quarantine
     // first-seen clock so a provably-old release is not held as "new to this
-    // mirror" (#748/#750). Only consulted when upstream dates are trusted.
-    let dates_key = format!("pypi/{}/dates.json", normalized);
-    if state.config.server.trust_upstream_dates {
-        // The map is re-read from storage by `extract_pypi_publish_date` below (which
-        // also handles the untrusted-dates branch); only the caching side effect matters here.
-        let _ = ensure_pypi_dates_cached(&state, &normalized).await;
-    }
-    let publish_date = extract_pypi_publish_date(
-        &state.storage,
-        &dates_key,
-        &filename,
-        state.config.server.trust_upstream_dates,
-    )
-    .await;
+    // mirror" (#748/#750). Only consulted when upstream dates are trusted. A file the
+    // cached map does not date (published after it was fetched) refreshes it, so a new
+    // release is never dated by an older snapshot.
+    let publish_date = if state.config.server.trust_upstream_dates {
+        ensure_pypi_dates_cached(&state, &normalized, Some(&filename))
+            .await
+            .get(&filename)
+            .and_then(|v| v.as_str())
+            .and_then(crate::curation::parse_iso8601_to_unix)
+    } else {
+        extract_pypi_publish_date(&state.storage, &normalized, &filename).await
+    };
 
     // #733 serve-local: an internal-namespace package is operator-owned — skip curation
     // and serve any local copy below; the upstream branch is blocked separately (never proxy).
@@ -602,11 +737,19 @@ async fn download_file(
                     let repo_index = Arc::clone(&state.repo_index);
                     tokio::spawn(async move {
                         let hash = hex::encode(sha2::Sha256::digest(&data_clone));
+                        let core_meta = if ends_with_ci(&file_name, ".whl") {
+                            wheel_core_metadata(std::io::Cursor::new(&data_clone[..]))
+                        } else {
+                            None
+                        };
                         if storage.put_bytes(&key_clone, data_clone).await.is_ok() {
                             let _ = storage
                                 .put(&format!("{}.sha256", key_clone), hash.as_bytes())
                                 .await;
                             put_hash_marker(&storage, &project, &file_name, &hash).await;
+                            if let Some(meta) = core_meta {
+                                put_core_metadata(&storage, &project, &file_name, &meta).await;
+                            }
                             repo_index.invalidate("pypi");
                         }
                     });
@@ -654,6 +797,108 @@ async fn download_file(
     StatusCode::NOT_FOUND.into_response()
 }
 
+/// GET /simple/{name}/{wheel}.metadata — PEP 658 core metadata: the copy stored next to
+/// a local wheel, else the upstream's own `.metadata` where its index advertises one.
+async fn core_metadata(state: &AppState, normalized: &str, wheel: &str) -> Response {
+    let respond = |data: axum::body::Bytes| {
+        (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            ],
+            data,
+        )
+            .into_response()
+    };
+    let internal = crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::PyPI,
+        normalized,
+    );
+    let key = format!("pypi/{normalized}/{wheel}.metadata");
+    match cache_read(state.storage.get(&key).await, "pypi", &key, internal) {
+        Ok(Some(data)) => return respond(data),
+        Ok(None) => {}
+        Err(response) => return response,
+    }
+    if internal {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let mut circuit_open = false;
+    let mut upstream_err: Option<(String, crate::registry::ProxyError)> = None;
+    for up in &state.config.pypi.upstreams() {
+        let timeout = Duration::from_secs(state.config.pypi.proxy_timeout);
+        let page_url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
+        let html = match proxy_fetch_text(
+            &state.http_client,
+            &page_url,
+            timeout,
+            up.auth().map(UpstreamAuth::Basic),
+            Some(("Accept", "text/html")),
+            &state.circuit_breaker,
+            BreakerScope::upstream(RegistryType::PyPI, up.url()),
+        )
+        .await
+        {
+            Ok(html) => html,
+            Err(crate::registry::ProxyError::CircuitOpen(_)) => {
+                circuit_open = true;
+                continue;
+            }
+            Err(crate::registry::ProxyError::NotFound) => continue,
+            Err(e) => {
+                upstream_err = Some((page_url, e));
+                continue;
+            }
+        };
+        let Some((file_url, _)) = find_file_url(&html, wheel, &page_url) else {
+            continue;
+        };
+        // Only where this upstream's index advertises it, as PEP 658 requires.
+        let Some(advertised) = parse_upstream_files(&html)
+            .into_iter()
+            .find(|f| f.filename == wheel)
+            .and_then(|f| f.core_metadata)
+        else {
+            continue;
+        };
+        let url = format!("{file_url}.metadata");
+        match proxy_fetch_bytes(
+            &state.http_client,
+            &url,
+            timeout,
+            up.auth().map(UpstreamAuth::Basic),
+            &state.circuit_breaker,
+            BreakerScope::upstream(RegistryType::PyPI, up.url()),
+        )
+        .await
+        {
+            Ok(data) => {
+                if let Some(expected) = advertised.strip_prefix("sha256=") {
+                    let actual = hex::encode(sha2::Sha256::digest(&data));
+                    if !actual.eq_ignore_ascii_case(expected) {
+                        tracing::warn!(package = %normalized, wheel = %wheel, upstream = %up.url(), %expected, %actual, "PyPI upstream core metadata does not match the index digest, refusing it");
+                        return StatusCode::BAD_GATEWAY.into_response();
+                    }
+                }
+                return respond(data);
+            }
+            Err(crate::registry::ProxyError::CircuitOpen(_)) => circuit_open = true,
+            Err(crate::registry::ProxyError::NotFound) => {}
+            Err(e) => upstream_err = Some((url, e)),
+        }
+    }
+    if circuit_open {
+        return circuit_open_response(RegistryType::PyPI.as_str());
+    }
+    if let Some((url, e)) = upstream_err {
+        return proxy_error_response("pypi", &url, &e);
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
 // ============================================================================
 // Twine upload (PEP 503 — POST /simple/)
 // ============================================================================
@@ -667,22 +912,30 @@ async fn download_file(
 ///   filetype = "sdist" | "bdist_wheel"
 ///   content = the file bytes
 ///   sha256_digest = hex SHA-256 of file (optional)
+///   requires_python = the `Requires-Python` specifier (optional, persisted)
 ///   metadata_version, summary, etc. (optional metadata)
+///
+/// `content` is streamed to a temp file with a running SHA-256, never held in memory.
 async fn upload(
     State(state): State<AppState>,
     Extension(authority): Extension<NamespaceAuthority>,
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
     mut multipart: Multipart,
 ) -> Response {
+    use tokio::io::AsyncWriteExt as _;
+
     let mut action = String::new();
     let mut name = String::new();
     let mut version = String::new();
     let mut filename = String::new();
-    let mut file_data: Option<Vec<u8>> = None;
     let mut sha256_digest = String::new();
+    let mut requires_python = String::new();
+    // (temp file, its guard, size, sha256) of the `content` field.
+    let mut content: Option<(std::path::PathBuf, TempFileGuard, u64, String)> = None;
+    let budget = (state.config.server.body_limit_mb as u64).saturating_mul(1024 * 1024);
 
     // Parse multipart fields
-    while let Ok(Some(field)) = multipart.next_field().await {
+    while let Ok(Some(mut field)) = multipart.next_field().await {
         let field_name = field.name().unwrap_or("").to_string();
 
         match field_name.as_str() {
@@ -698,22 +951,65 @@ async fn upload(
             "sha256_digest" => {
                 sha256_digest = field.text().await.ok().unwrap_or_default();
             }
-            "content" => {
+            "requires_python" => {
+                requires_python = field.text().await.ok().unwrap_or_default();
+            }
+            "content" if content.is_none() => {
                 filename = field.file_name().unwrap_or("unknown").to_string();
-                match field.bytes().await {
-                    Ok(b) => file_data = Some(b.to_vec()),
+                let dir =
+                    std::path::PathBuf::from(&state.config.storage.path).join("tmp/pypi-uploads");
+                if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+                    tracing::error!(path = %dir.display(), error = %e, "pypi: cannot create upload temp dir");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+                let path = dir.join(uuid::Uuid::new_v4().to_string());
+                let guard = TempFileGuard::new(path.clone());
+                let mut file = match tokio::fs::File::create(&path).await {
+                    Ok(f) => f,
                     Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("Failed to read file: {}", e),
-                        )
-                            .into_response()
+                        tracing::error!(error = %e, "pypi: cannot create upload temp file");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                };
+                let mut hasher = sha2::Sha256::new();
+                let mut size = 0u64;
+                loop {
+                    match field.chunk().await {
+                        Ok(Some(chunk)) => {
+                            size += chunk.len() as u64;
+                            if size > budget {
+                                return (
+                                    StatusCode::PAYLOAD_TOO_LARGE,
+                                    format!("file exceeds {} MiB", budget >> 20),
+                                )
+                                    .into_response();
+                            }
+                            hasher.update(&chunk);
+                            if let Err(e) = file.write_all(&chunk).await {
+                                tracing::error!(error = %e, "pypi: upload temp write failed");
+                                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                format!("Failed to read file: {}", e),
+                            )
+                                .into_response()
+                        }
                     }
                 }
+                // Durable before put_from_path's rename publishes it.
+                if let Err(e) = file.sync_all().await {
+                    tracing::error!(error = %e, "pypi: upload temp fsync failed");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+                content = Some((path, guard, size, hex::encode(hasher.finalize())));
             }
             _ => {
-                // Skip other metadata fields (summary, author, etc.)
-                let _ = field.bytes().await;
+                // Skip other metadata fields (summary, author, etc.) without buffering.
+                while let Ok(Some(_)) = field.chunk().await {}
             }
         }
     }
@@ -727,8 +1023,8 @@ async fn upload(
         return (StatusCode::BAD_REQUEST, "Missing name or version").into_response();
     }
 
-    let data = match file_data {
-        Some(d) if !d.is_empty() => d,
+    let (temp_path, _temp_guard, computed_hash) = match content {
+        Some((path, guard, size, hash)) if size > 0 => (path, guard, hash),
         _ => return (StatusCode::BAD_REQUEST, "Missing file content").into_response(),
     };
 
@@ -738,8 +1034,7 @@ async fn upload(
     }
 
     // Verify SHA-256 if provided
-    let computed_hash = hex::encode(sha2::Sha256::digest(&data));
-    if !sha256_digest.is_empty() && sha256_digest != computed_hash {
+    if !sha256_digest.is_empty() && !sha256_digest.eq_ignore_ascii_case(&computed_hash) {
         tracing::warn!(
             package = %name,
             expected = %sha256_digest,
@@ -752,10 +1047,31 @@ async fn upload(
     // Normalize name and store
     let normalized = normalize_name(&name);
 
+    // The file must be a release of the project and version it is uploaded as, so the
+    // storage key, the index and the audit trail agree on what it is.
+    if let Some(reason) = upload_filename_mismatch(&filename, &normalized, &version) {
+        return (StatusCode::BAD_REQUEST, reason).into_response();
+    }
+
     // Enforce OIDC namespace_scope on the project coordinate (#583).
     if enforce_namespace_scope(&authority, &normalized).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
+
+    // PEP 658 core metadata, read before put_from_path moves the temp file.
+    let core_meta = if ends_with_ci(&filename, ".whl") {
+        let path = temp_path.clone();
+        tokio::task::spawn_blocking(move || {
+            std::fs::File::open(&path)
+                .ok()
+                .and_then(|f| wheel_core_metadata(std::io::BufReader::new(f)))
+        })
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
 
     // TOCTOU protection: lock per file to prevent concurrent uploads
     let file_key = format!("pypi/{}/{}", normalized, filename);
@@ -772,7 +1088,12 @@ async fn upload(
     }
 
     // Store file
-    if state.storage.put(&file_key, &data).await.is_err() {
+    if let Err(e) = state
+        .storage
+        .put_from_path(&file_key, &temp_path, Some(&computed_hash))
+        .await
+    {
+        tracing::error!(key = %file_key, error = %e, "pypi: failed to store upload");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -784,6 +1105,10 @@ async fn upload(
 
     // Hash marker: the simple index reads every digest from one listing.
     put_hash_marker(&state.storage, &normalized, &filename, &computed_hash).await;
+    if let Some(meta) = core_meta {
+        put_core_metadata(&state.storage, &normalized, &filename, &meta).await;
+    }
+    record_requires_python(&state, &normalized, &filename, requires_python.trim()).await;
 
     state.metrics.record_upload("pypi");
     let artifact = format!("{}-{}", name, version);
@@ -805,18 +1130,63 @@ async fn upload(
     StatusCode::OK.into_response()
 }
 
+/// Record twine's `requires_python` for an uploaded file in the project's
+/// [`REQUIRES_PYTHON_FILE`] (an empty one drops a stale entry of an earlier file of the
+/// same name). Best-effort: a failure is logged and the file is listed without it.
+async fn record_requires_python(
+    state: &AppState,
+    project: &str,
+    filename: &str,
+    requires_python: &str,
+) {
+    use crate::storage::StorageError;
+    let key = format!("pypi/{project}/{REQUIRES_PYTHON_FILE}");
+    let lock = state.publish_lock(&key);
+    let _guard = lock.lock().await;
+    let mut map: serde_json::Map<String, serde_json::Value> = match state.storage.get(&key).await {
+        Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),
+        Err(StorageError::NotFound) if requires_python.is_empty() => return,
+        Err(StorageError::NotFound) => serde_json::Map::new(),
+        Err(e) => {
+            tracing::warn!(key = %key, error = %e, "pypi: failed to read requires-python");
+            return;
+        }
+    };
+    let changed = if requires_python.is_empty() {
+        map.remove(filename).is_some()
+    } else {
+        map.insert(filename.to_string(), requires_python.into()) != Some(requires_python.into())
+    };
+    if changed {
+        if let Err(e) = state
+            .storage
+            .put(&key, &serde_json::to_vec(&map).unwrap_or_default())
+            .await
+        {
+            tracing::warn!(key = %key, error = %e, "pypi: failed to store requires-python");
+        }
+    }
+}
+
 // ============================================================================
 // PEP 691 JSON responses — typed structs per spec
 // ============================================================================
 
-#[derive(Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct FileEntry {
     filename: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     sha256: Option<String>,
     /// PEP 503 `data-requires-python`, unescaped (e.g. `>=3.8`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     requires_python: Option<String>,
     /// PEP 592 `data-yanked`: `Some("")` is yanked without a reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     yanked: Option<String>,
+    /// PEP 658/714 `data-core-metadata` value: `true` or `sha256=<hex>`. Set only where
+    /// nora can serve `<file>.metadata`: a stored copy, or the upstream's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    core_metadata: Option<String>,
 }
 
 /// PEP 691 top-level response — typed to prevent field-name drift.
@@ -854,6 +1224,12 @@ struct Pep691File {
     /// PEP 691: `true`, or the yank reason as a string.
     #[serde(skip_serializing_if = "Option::is_none")]
     yanked: Option<serde_json::Value>,
+    /// PEP 658/714: `true` or `{"sha256": ...}`.
+    #[serde(rename = "core-metadata", skip_serializing_if = "Option::is_none")]
+    core_metadata: Option<serde_json::Value>,
+    /// The pre-PEP 714 name of `core-metadata`, still read by older pip.
+    #[serde(rename = "dist-info-metadata", skip_serializing_if = "Option::is_none")]
+    dist_info_metadata: Option<serde_json::Value>,
 }
 
 #[derive(serde::Serialize)]
@@ -876,6 +1252,15 @@ fn versions_json_response(
         .iter()
         .map(|f| {
             let (size, upload_time) = pep700.get(&f.filename).cloned().unwrap_or((None, None));
+            // `sha256=<hex>` becomes `{"sha256": "<hex>"}`, anything else `true`.
+            let core_metadata = f.core_metadata.as_ref().map(|v| match v.split_once('=') {
+                Some((alg, hash)) => serde_json::Value::Object(
+                    [(alg.to_string(), serde_json::Value::from(hash))]
+                        .into_iter()
+                        .collect(),
+                ),
+                None => serde_json::Value::Bool(true),
+            });
             Pep691File {
                 filename: f.filename.clone(),
                 url: format!("{}/simple/{}/{}", base, normalized, f.filename),
@@ -893,6 +1278,8 @@ fn versions_json_response(
                         serde_json::Value::String(r.clone())
                     }
                 }),
+                dist_info_metadata: core_metadata.clone(),
+                core_metadata,
             }
         })
         .collect();
@@ -925,26 +1312,145 @@ fn versions_from_filenames(files: &[FileEntry]) -> Vec<String> {
     vs
 }
 
-/// Extract the release version from a wheel or sdist filename (best-effort).
-/// wheel: `{distribution}-{version}(-{build})?-{py}-{abi}-{platform}.whl`
+/// Extract the release version from a wheel, egg or sdist filename (best-effort).
+pub(crate) fn version_from_filename(filename: &str) -> Option<String> {
+    split_dist_filename(filename).map(|(_, version)| version.to_string())
+}
+
+/// `(distribution, version)` of a distribution filename (best-effort):
+/// wheel/egg: `{distribution}-{version}(-{build})?-{py}-...`
 /// sdist: `{name}-{version}.tar.gz|.tar.bz2|.tar.xz|.tgz|.zip`
-fn version_from_filename(filename: &str) -> Option<String> {
-    if let Some(stem) = filename.strip_suffix(".whl") {
-        return stem
-            .split('-')
-            .nth(1)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+fn split_dist_filename(filename: &str) -> Option<(&str, &str)> {
+    if let Some(stem) = filename
+        .strip_suffix(".whl")
+        .or_else(|| filename.strip_suffix(".egg"))
+    {
+        let mut parts = stem.splitn(3, '-');
+        let (name, version) = (parts.next()?, parts.next()?);
+        return (!name.is_empty() && !version.is_empty()).then_some((name, version));
     }
     for ext in [".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip"] {
         if let Some(stem) = filename.strip_suffix(ext) {
             return stem
                 .rsplit_once('-')
-                .map(|(_, v)| v.to_string())
-                .filter(|s| !s.is_empty());
+                .filter(|(name, version)| !name.is_empty() && !version.is_empty());
         }
     }
     None
+}
+
+/// Loose PEP 440 comparison key: case, a leading `v`, separators, leading zeros, trailing
+/// `.0` release components and the alternate pre/post-release spellings do not matter
+/// (`v1.0-RC.01` and `1.0.0rc1` are one version), as `packaging.Version` equality has it.
+fn version_key(version: &str) -> Vec<String> {
+    let version = version.trim().to_ascii_lowercase();
+    let version = version.strip_prefix('v').unwrap_or(&version);
+    let (public, local) = version.split_once('+').unwrap_or((version, ""));
+    let tokens = |s: &str| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut rest = s;
+        while let Some(c) = rest.chars().next() {
+            let len = if c.is_ascii_digit() {
+                rest.find(|c: char| !c.is_ascii_digit())
+            } else if c.is_ascii_alphabetic() {
+                rest.find(|c: char| !c.is_ascii_alphabetic())
+            } else {
+                Some(c.len_utf8()) // a separator
+            }
+            .unwrap_or(rest.len());
+            let (token, tail) = rest.split_at(len);
+            rest = tail;
+            if c.is_ascii_digit() {
+                let trimmed = token.trim_start_matches('0');
+                out.push(if trimmed.is_empty() { "0" } else { trimmed }.to_string());
+            } else if c.is_ascii_alphabetic() {
+                out.push(
+                    match token {
+                        "alpha" => "a",
+                        "beta" => "b",
+                        "c" | "pre" | "preview" => "rc",
+                        "rev" | "r" => "post",
+                        other => other,
+                    }
+                    .to_string(),
+                );
+            }
+        }
+        out
+    };
+    let mut key = tokens(public);
+    let release = key
+        .iter()
+        .position(|t| !t.starts_with(|c: char| c.is_ascii_digit()))
+        .unwrap_or(key.len());
+    let trailing_zeros = key[..release]
+        .iter()
+        .skip(1)
+        .rev()
+        .take_while(|t| *t == "0")
+        .count();
+    key.drain(release - trailing_zeros..release);
+    if !local.is_empty() {
+        key.push("+".to_string());
+        key.extend(tokens(local));
+    }
+    key
+}
+
+/// Why an uploaded `filename` cannot belong to release `version` of project `normalized`.
+fn upload_filename_mismatch(filename: &str, normalized: &str, version: &str) -> Option<String> {
+    let Some((dist, file_version)) = split_dist_filename(filename) else {
+        return Some(format!("cannot read the project and version of {filename}"));
+    };
+    if normalize_name(dist) != normalized {
+        return Some(format!("{filename} is not a file of project {normalized}"));
+    }
+    if version_key(file_version) != version_key(version) {
+        return Some(format!("{filename} is not a file of version {version}"));
+    }
+    None
+}
+
+/// The PEP 658 core metadata of a wheel: its root-level `*.dist-info/METADATA`. `None`
+/// when the archive is not a zip, has no single such entry, or it is too large.
+fn wheel_core_metadata(data: impl std::io::Read + std::io::Seek) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let mut zip = zip::ZipArchive::new(data).ok()?;
+    let names: Vec<String> = zip
+        .file_names()
+        .filter(|n| {
+            n.split_once('/')
+                .is_some_and(|(dir, rest)| rest == "METADATA" && dir.ends_with(".dist-info"))
+        })
+        .map(str::to_string)
+        .collect();
+    let [name] = names.as_slice() else {
+        return None;
+    };
+    let mut out = Vec::new();
+    zip.by_name(name)
+        .ok()?
+        .take(MAX_CORE_METADATA_BYTES + 1)
+        .read_to_end(&mut out)
+        .ok()?;
+    (out.len() as u64 <= MAX_CORE_METADATA_BYTES).then_some(out)
+}
+
+/// Store a wheel's core metadata as `<file>.metadata` with a hash marker, so the index
+/// advertises `data-core-metadata="sha256=..."` from its one marker listing.
+async fn put_core_metadata(
+    storage: &crate::storage::Storage,
+    project: &str,
+    filename: &str,
+    metadata: &[u8],
+) {
+    let key = format!("pypi/{project}/{filename}.metadata");
+    if let Err(e) = storage.put(&key, metadata).await {
+        tracing::warn!(key = %key, error = %e, "pypi: failed to store core metadata");
+        return;
+    }
+    let sha256 = hex::encode(sha2::Sha256::digest(metadata));
+    put_hash_marker(storage, project, &format!("{filename}.metadata"), &sha256).await;
 }
 
 /// Gather PEP 700 per-file metadata keyed by filename: `size` from the local
@@ -995,6 +1501,13 @@ fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str)
         if let Some(reason) = &f.yanked {
             let _ = write!(attrs, " data-yanked=\"{}\"", html_escape(reason));
         }
+        if let Some(meta) = &f.core_metadata {
+            let meta = html_escape(meta);
+            let _ = write!(
+                attrs,
+                " data-core-metadata=\"{meta}\" data-dist-info-metadata=\"{meta}\""
+            );
+        }
         let _ = writeln!(
             html,
             "<a href=\"{}/simple/{}/{}{}\"{}>{}</a><br>",
@@ -1015,45 +1528,77 @@ fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str)
 // Helpers
 // ============================================================================
 
-/// Extract a file's upstream upload-time from the cached `dates.json`
-/// (filename → PEP 700 `upload-time`, populated by [`ensure_pypi_dates_cached`]).
+/// Seconds a cached `dates.json` that lacks a requested file is kept before that
+/// miss refetches it (bounds the upstream lookups for files no upstream dates).
+const DATES_MISS_REFETCH_SECS: i64 = 60;
+
+/// Untrusted upstream dates (#513): NORA's own first-seen clock, the mtime of the
+/// `dates.json` that listed the file (never rewritten in this mode). A file it does not
+/// list appeared later: its date is unknown (`None`, curation policy decides), never
+/// the older snapshot's.
 async fn extract_pypi_publish_date(
     storage: &crate::storage::Storage,
-    dates_key: &str,
+    normalized: &str,
     filename: &str,
-    trust_upstream: bool,
 ) -> Option<i64> {
-    // #513: untrusted upstream dates → use NORA's own cache mtime, never the
-    // (spoofable) upstream upload-time.
-    if !trust_upstream {
-        return crate::curation::extract_mtime_as_publish_date(storage, dates_key).await;
+    let dates_key = format!("pypi/{normalized}/dates.json");
+    let data = storage.get(&dates_key).await.ok()?;
+    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&data).ok()?;
+    if !map.contains_key(filename) {
+        return None;
     }
-    let data = storage.get(dates_key).await.ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
-    let date_str = json.get(filename)?.as_str()?;
-    crate::curation::parse_iso8601_to_unix(date_str)
+    crate::curation::extract_mtime_as_publish_date(storage, &dates_key).await
 }
 
 /// Cache a `filename → upload-time` map (`pypi/{name}/dates.json`) from the
-/// upstream PEP 691 simple JSON (PEP 700 `upload-time`) and return it. No-op if
-/// already cached or no upstream supplies a date. Best-effort: any failure leaves no
-/// dates and the quarantine clock falls back to NORA's own time. The PEP 503 HTML
-/// index NORA fetches for the file *listing* carries no dates, hence this JSON fetch.
+/// upstream PEP 691 simple JSON (PEP 700 `upload-time`) and return it. Best-effort:
+/// any failure returns the cached map (or none) and the quarantine clock falls back
+/// to NORA's own time. The PEP 503 HTML index NORA fetches for the file *listing*
+/// carries no dates, hence this JSON fetch.
+///
+/// With trusted upstream dates a cached map is refreshed (single-flight per project)
+/// when it is older than `pypi.metadata_ttl` (`want` = `None`, the index), or when it
+/// does not list `want` and is older than [`DATES_MISS_REFETCH_SECS`]: a release
+/// published after the map was fetched would otherwise carry no date and pass the
+/// `min_release_age` cooldown. With untrusted dates a cached map is never rewritten,
+/// its mtime is the first-seen clock ([`extract_pypi_publish_date`]).
 ///
 /// #969: an upstream that answers but emits no `upload-time` (any pre-PEP-700 index —
 /// devpi, Artifactory, an older NORA) used to leave nothing cached, so every single
 /// `/simple/{name}/` JSON request re-downloaded the whole upstream JSON index. An
 /// answered-but-dateless upstream is now recorded as an empty map, which reads back
 /// identically for the quarantine clock (no entry for the file either way) and stops
-/// the refetch. A failed/open-breaker fetch still caches nothing, so a transient
-/// outage stays retryable.
+/// the refetch. So is an upstream 404. A failed/open-breaker fetch still caches
+/// nothing, so a transient outage stays retryable.
 async fn ensure_pypi_dates_cached(
     state: &AppState,
     normalized: &str,
+    want: Option<&str>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let key = format!("pypi/{}/dates.json", normalized);
-    if let Ok(data) = state.storage.get(&key).await {
-        return serde_json::from_slice(&data).unwrap_or_default();
+    let cached: Option<serde_json::Map<String, serde_json::Value>> = state
+        .storage
+        .get(&key)
+        .await
+        .ok()
+        .map(|data| serde_json::from_slice(&data).unwrap_or_default());
+    if let Some(map) = &cached {
+        if !state.config.server.trust_upstream_dates {
+            return cached.unwrap_or_default();
+        }
+        let ttl = match want {
+            Some(file) if map.contains_key(file) => return cached.unwrap_or_default(),
+            Some(_) => DATES_MISS_REFETCH_SECS,
+            None => state.config.pypi.metadata_ttl,
+        };
+        let fresh = state
+            .storage
+            .stat(&key)
+            .await
+            .is_some_and(|meta| crate::cache_ttl::is_within_ttl(meta.modified, ttl));
+        if fresh {
+            return cached.unwrap_or_default();
+        }
     }
     // #68: never fetch an internal-namespace package's metadata upstream.
     if crate::curation::is_internal_namespace(
@@ -1061,13 +1606,47 @@ async fn ensure_pypi_dates_cached(
         crate::curation::RegistryType::PyPI,
         normalized,
     ) {
-        return serde_json::Map::new();
+        return cached.unwrap_or_default();
     }
+    let refresh = || async {
+        let map = fetch_upstream_dates(state, normalized).await?;
+        // An empty map is still worth persisting once an upstream has actually answered:
+        // it marks "this index carries no upload-time" and spares every later request
+        // the full upstream JSON download (#969).
+        let bytes = serde_json::to_vec(&map).ok()?;
+        if let Err(e) = state.storage.put(&key, &bytes).await {
+            tracing::warn!(key = %key, error = %e, "pypi: failed to cache dates");
+        }
+        Some(axum::body::Bytes::from(bytes))
+    };
+    let fetched = if state.config.server.proxy_coalesce {
+        let budget = crate::proxy_coalesce::follower_budget(state.config.pypi.proxy_timeout)
+            * state.config.pypi.upstreams().len().max(1) as u32;
+        state
+            .proxy_coalesce
+            .coalesced(&format!("dates:{key}"), "pypi", budget, refresh)
+            .await
+    } else {
+        refresh().await
+    };
+    fetched
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .or(cached)
+        .unwrap_or_default()
+}
+
+/// The upload-time map of the first upstream whose PEP 691 JSON dates any file, an
+/// empty map when the upstreams answered without dates (or 404), `None` when none
+/// answered.
+async fn fetch_upstream_dates(
+    state: &AppState,
+    normalized: &str,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     let mut map = serde_json::Map::new();
     let mut upstream_answered = false;
     for up in &state.config.pypi.upstreams() {
         let url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
-        let Ok(text) = proxy_fetch_text(
+        let text = match proxy_fetch_text(
             &state.http_client,
             &url,
             Duration::from_secs(state.config.pypi.proxy_timeout),
@@ -1077,8 +1656,15 @@ async fn ensure_pypi_dates_cached(
             BreakerScope::upstream(RegistryType::PyPI, up.url()),
         )
         .await
-        else {
-            continue;
+        {
+            Ok(text) => text,
+            // A 404 is an answer: a project the upstream does not have (a private one)
+            // has no dates there, and must not be asked again on every request.
+            Err(crate::registry::ProxyError::NotFound) => {
+                upstream_answered = true;
+                continue;
+            }
+            Err(_) => continue,
         };
         upstream_answered = true;
         let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -1099,17 +1685,7 @@ async fn ensure_pypi_dates_cached(
             break; // first upstream that listed dated files wins
         }
     }
-    // An empty map is still worth persisting once an upstream has actually answered:
-    // it marks "this index carries no upload-time" and spares every later request the
-    // full upstream JSON download (#969).
-    if !map.is_empty() || upstream_answered {
-        // Serialize from a reference — the map is returned to the caller and can hold
-        // tens of thousands of entries for a large project, so do not clone it.
-        if let Ok(bytes) = serde_json::to_vec(&map) {
-            let _ = state.storage.put(&key, &bytes).await;
-        }
-    }
-    map
+    upstream_answered.then_some(map)
 }
 
 /// Normalize package name according to PEP 503: lowercase, and every run of
@@ -1231,7 +1807,7 @@ async fn backfill_hash_marker(
 }
 
 /// Validate PyPI filename.
-fn is_valid_pypi_filename(name: &str) -> bool {
+pub(crate) fn is_valid_pypi_filename(name: &str) -> bool {
     !name.is_empty()
         && !name.contains("..")
         && !name.contains('/')
@@ -1297,6 +1873,9 @@ fn parse_upstream_files(html: &str) -> Vec<FileEntry> {
                 sha256: url.find("#sha256=").map(|pos| url[pos + 8..].to_string()),
                 requires_python: html_attr(tag, "data-requires-python").map(html_unescape),
                 yanked: html_attr(tag, "data-yanked").map(html_unescape),
+                core_metadata: html_attr(tag, "data-core-metadata")
+                    .or_else(|| html_attr(tag, "data-dist-info-metadata"))
+                    .map(html_unescape),
             });
         }
     }
@@ -1342,12 +1921,7 @@ fn merge_file_lists(upstream: Vec<FileEntry>, local: &[FileEntry]) -> Vec<FileEn
     // never carries a duplicate filename regardless of caller input.
     for f in local {
         if seen.insert(f.filename.clone()) {
-            result.push(FileEntry {
-                filename: f.filename.clone(),
-                sha256: f.sha256.clone(),
-                requires_python: f.requires_python.clone(),
-                yanked: f.yanked.clone(),
-            });
+            result.push(f.clone());
         }
     }
 
@@ -1360,7 +1934,9 @@ fn merge_file_lists(upstream: Vec<FileEntry>, local: &[FileEntry]) -> Vec<FileEn
             result.push(f);
         } else if let Some(cached) = result.iter_mut().find(|r| r.filename == f.filename) {
             // A proxied file cached locally keeps the upstream's PEP 503/592
-            // metadata: local storage does not record it.
+            // metadata: local storage does not record it. Not its core metadata: a
+            // local file of the same name may hold other bytes than the upstream's,
+            // so only a `.metadata` stored next to it is advertised.
             cached.requires_python = cached.requires_python.take().or(f.requires_python);
             cached.yanked = cached.yanked.take().or(f.yanked);
         }
@@ -1928,10 +2504,12 @@ mod tests {
                 sha256: Some("aa".into()),
                 requires_python: Some(">=3.8".into()),
                 yanked: None,
+                core_metadata: Some("sha256=cc".into()),
             },
             FileEntry {
                 filename: "pkg-1.1.tar.gz".into(),
                 yanked: Some(String::new()),
+                core_metadata: Some("true".into()),
                 ..Default::default()
             },
             FileEntry {
@@ -1956,6 +2534,18 @@ mod tests {
         assert_eq!(parsed[0].sha256.as_deref(), Some("aa"));
         assert_eq!(parsed[1].yanked.as_deref(), Some(""));
         assert_eq!(parsed[2].yanked.as_deref(), Some("bad \"build\""));
+        // PEP 658/714: both attribute names, read back from either.
+        assert!(
+            html.contains(r#"data-core-metadata="sha256=cc" data-dist-info-metadata="sha256=cc""#),
+            "{html}"
+        );
+        assert_eq!(parsed[0].core_metadata.as_deref(), Some("sha256=cc"));
+        assert_eq!(parsed[1].core_metadata.as_deref(), Some("true"));
+        assert_eq!(parsed[2].core_metadata, None);
+        let legacy = parse_upstream_files(
+            r#"<a href="https://up/pkg-1.0-py3-none-any.whl" data-dist-info-metadata="sha256=dd">x</a>"#,
+        );
+        assert_eq!(legacy[0].core_metadata.as_deref(), Some("sha256=dd"));
 
         let json = body(versions_json_response(
             "pkg",
@@ -1969,6 +2559,62 @@ mod tests {
         assert_eq!(json["files"][1]["yanked"], true);
         assert_eq!(json["files"][2]["yanked"], "bad \"build\"");
         assert!(json["files"][1].get("requires-python").is_none());
+        assert_eq!(json["files"][0]["core-metadata"]["sha256"], "cc");
+        assert_eq!(json["files"][0]["dist-info-metadata"]["sha256"], "cc");
+        assert_eq!(json["files"][1]["core-metadata"], true);
+        assert!(json["files"][2].get("core-metadata").is_none());
+    }
+
+    #[test]
+    fn test_upload_filename_must_match_project_and_version() {
+        // PEP 440 spellings of one version compare equal.
+        for (a, b) in [
+            ("1.0.0rc1", "V1.0.0-RC.01"),
+            ("1.0", "1.0.0"),
+            ("2.0b1", "2.0-beta.1"),
+            ("1.0.post2", "1.0-r2"),
+            ("1.0+local.1", "1.0.0+LOCAL-1"),
+        ] {
+            assert_eq!(version_key(a), version_key(b), "{a} == {b}");
+        }
+        for (a, b) in [("1.0", "1.1"), ("1.0rc1", "1.0"), ("1.0+a", "1.0")] {
+            assert_ne!(version_key(a), version_key(b), "{a} != {b}");
+        }
+        assert!(
+            upload_filename_mismatch("foo_bar-1.0-py3-none-any.whl", "foo-bar", "1.0").is_none()
+        );
+        assert!(upload_filename_mismatch("Foo.Bar-1.0.tar.gz", "foo-bar", "1.0").is_none());
+        assert!(upload_filename_mismatch("requests-1.0.tar.gz", "foo", "1.0").is_some());
+        assert!(upload_filename_mismatch("foo-1.1.tar.gz", "foo", "1.0").is_some());
+        assert!(upload_filename_mismatch("foo.tar.gz", "foo", "1.0").is_some());
+    }
+
+    #[test]
+    fn test_wheel_core_metadata_reads_the_root_dist_info() {
+        use std::io::Write;
+        let build = |entries: &[&str]| {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            for name in entries {
+                w.start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                w.write_all(format!("from {name}").as_bytes()).unwrap();
+            }
+            w.finish().unwrap().into_inner()
+        };
+        let one = build(&["pkg/__init__.py", "pkg-1.0.dist-info/METADATA"]);
+        assert_eq!(
+            wheel_core_metadata(std::io::Cursor::new(&one[..])).as_deref(),
+            Some(&b"from pkg-1.0.dist-info/METADATA"[..])
+        );
+        // Vendored metadata deeper in the tree does not count; two at the root are ambiguous.
+        let nested = build(&["pkg/_vendor/x-1.0.dist-info/METADATA"]);
+        assert_eq!(wheel_core_metadata(std::io::Cursor::new(&nested[..])), None);
+        let two = build(&["a-1.0.dist-info/METADATA", "b-1.0.dist-info/METADATA"]);
+        assert_eq!(wheel_core_metadata(std::io::Cursor::new(&two[..])), None);
+        assert_eq!(
+            wheel_core_metadata(std::io::Cursor::new(&b"not a zip"[..])),
+            None
+        );
     }
 
     #[test]
@@ -1978,6 +2624,7 @@ mod tests {
             sha256: Some("up".into()),
             requires_python: Some(">=3.9".into()),
             yanked: Some("cve".into()),
+            core_metadata: Some("sha256=up".into()),
         }];
         let local = vec![FileEntry {
             filename: "pkg-1.0.whl".into(),
@@ -1989,6 +2636,10 @@ mod tests {
         assert_eq!(merged[0].sha256.as_deref(), Some("local"));
         assert_eq!(merged[0].requires_python.as_deref(), Some(">=3.9"));
         assert_eq!(merged[0].yanked.as_deref(), Some("cve"));
+        assert_eq!(
+            merged[0].core_metadata, None,
+            "the upstream's core metadata may describe other bytes than the local file"
+        );
     }
 }
 
@@ -2992,6 +3643,587 @@ mod integration_tests {
             let resp = send(&ctx.app, Method::GET, uri, "").await;
             assert_eq!(resp.status(), want, "{uri}");
         }
+    }
+
+    /// A twine multipart body: `fields`, then `content` as `filename`.
+    fn twine_body(fields: &[(&str, &str)], filename: &str, content: &[u8]) -> (String, Vec<u8>) {
+        const B: &str = "nora-r2-boundary";
+        let mut body = Vec::new();
+        for (field, value) in [(":action", "file_upload")].iter().chain(fields) {
+            body.extend_from_slice(
+                format!(
+                    "--{B}\r\nContent-Disposition: form-data; name=\"{field}\"\r\n\r\n{value}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        body.extend_from_slice(
+            format!(
+                "--{B}\r\nContent-Disposition: form-data; name=\"content\"; filename=\"{filename}\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(content);
+        body.extend_from_slice(format!("\r\n--{B}--\r\n").as_bytes());
+        (format!("multipart/form-data; boundary={B}"), body)
+    }
+
+    async fn twine_upload(
+        app: &axum::Router,
+        fields: &[(&str, &str)],
+        filename: &str,
+        content: &[u8],
+    ) -> axum::http::Response<axum::body::Body> {
+        let (content_type, body) = twine_body(fields, filename, content);
+        send_with_headers(
+            app,
+            Method::POST,
+            "/simple/",
+            vec![("content-type", content_type.as_str())],
+            body,
+        )
+        .await
+    }
+
+    /// A wheel holding `{dist_info}/METADATA` and one module.
+    fn wheel(dist_info: &str, metadata: &str) -> Vec<u8> {
+        use std::io::Write;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        w.start_file(format!("{dist_info}/METADATA"), opts).unwrap();
+        w.write_all(metadata.as_bytes()).unwrap();
+        w.start_file("pkg/__init__.py", opts).unwrap();
+        w.write_all(b"x = 1\n").unwrap();
+        w.finish().unwrap().into_inner()
+    }
+
+    fn sha256_hex(data: &[u8]) -> String {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(data))
+    }
+
+    async fn text(resp: axum::http::Response<axum::body::Body>) -> String {
+        String::from_utf8(body_bytes(resp).await.to_vec()).unwrap()
+    }
+
+    /// C36: an uploaded wheel's `.dist-info/METADATA` is served as `<wheel>.metadata`
+    /// (PEP 658) and advertised with its digest; twine's `requires_python` is kept and
+    /// listed in both index forms.
+    #[tokio::test]
+    async fn hosted_wheel_serves_core_metadata_and_requires_python() {
+        let ctx = create_test_context();
+        let metadata =
+            "Metadata-Version: 2.1\nName: hostpkg\nVersion: 1.0\nRequires-Python: >=3.9\n";
+        let whl = wheel("hostpkg-1.0.dist-info", metadata);
+        let resp = twine_upload(
+            &ctx.app,
+            &[
+                ("name", "hostpkg"),
+                ("version", "1.0"),
+                ("requires_python", ">=3.9"),
+            ],
+            "hostpkg-1.0-py3-none-any.whl",
+            &whl,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = twine_upload(
+            &ctx.app,
+            &[("name", "hostpkg"), ("version", "1.0")],
+            "hostpkg-1.0.tar.gz",
+            b"sdist",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let digest = sha256_hex(metadata.as_bytes());
+        let html = text(send(&ctx.app, Method::GET, "/simple/hostpkg/", "").await).await;
+        let wheel_line = html
+            .lines()
+            .find(|l| l.contains("hostpkg-1.0-py3-none-any.whl"))
+            .unwrap();
+        assert!(
+            wheel_line.contains(&format!("data-core-metadata=\"sha256={digest}\"")),
+            "{wheel_line}"
+        );
+        assert!(
+            wheel_line.contains("data-requires-python=\"&gt;=3.9\""),
+            "{wheel_line}"
+        );
+        let sdist_line = html
+            .lines()
+            .find(|l| l.contains("hostpkg-1.0.tar.gz"))
+            .unwrap();
+        assert!(!sdist_line.contains("data-core-metadata"), "{sdist_line}");
+        assert!(!sdist_line.contains("data-requires-python"), "{sdist_line}");
+
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/hostpkg/",
+            vec![("Accept", "application/vnd.pypi.simple.v1+json")],
+            "",
+        )
+        .await;
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let file = json["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["filename"] == "hostpkg-1.0-py3-none-any.whl")
+            .unwrap();
+        assert_eq!(file["core-metadata"]["sha256"], digest.as_str());
+        assert_eq!(file["requires-python"], ">=3.9");
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/hostpkg/hostpkg-1.0-py3-none-any.whl.metadata",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(text(resp).await, metadata);
+        // No metadata for an sdist, and none for a wheel nora does not have.
+        for uri in [
+            "/simple/hostpkg/hostpkg-1.0.tar.gz.metadata",
+            "/simple/hostpkg/hostpkg-2.0-py3-none-any.whl.metadata",
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    /// C36: an upstream-only wheel's `.metadata` is proxied only where the upstream's
+    /// index advertises one, checked against the advertised digest; a wheel cached from
+    /// upstream gets its own `.metadata` extracted and advertised.
+    #[tokio::test]
+    async fn proxied_core_metadata_follows_the_upstream_advertisement() {
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let meta = "Metadata-Version: 2.1\nName: uppkg\nVersion: 1.0\n";
+        let whl = wheel("uppkg-1.0.dist-info", meta);
+        let index = format!(
+            r#"<a href="{u}/f/uppkg-1.0-py3-none-any.whl#sha256={w}" data-core-metadata="sha256={m}">a</a>
+<a href="{u}/f/uppkg-1.1-py3-none-any.whl" data-dist-info-metadata="sha256={m}">b</a>
+<a href="{u}/f/uppkg-1.2-py3-none-any.whl">c</a>"#,
+            u = upstream.uri(),
+            w = sha256_hex(&whl),
+            m = sha256_hex(meta.as_bytes()),
+        );
+        Mock::given(method("GET"))
+            .and(path("/uppkg/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(index))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/f/uppkg-1.0-py3-none-any.whl.metadata"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(meta))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/f/uppkg-1.1-py3-none-any.whl.metadata"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("tampered"))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/f/uppkg-1.0-py3-none-any.whl"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(whl.clone()))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| cfg.pypi.proxy = Some(uri));
+
+        let html = text(send(&ctx.app, Method::GET, "/simple/uppkg/", "").await).await;
+        assert_eq!(html.matches("data-core-metadata=").count(), 2, "{html}");
+
+        let ok = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/uppkg/uppkg-1.0-py3-none-any.whl.metadata",
+            "",
+        )
+        .await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(text(ok).await, meta);
+        let bad = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/uppkg/uppkg-1.1-py3-none-any.whl.metadata",
+            "",
+        )
+        .await;
+        assert_eq!(bad.status(), StatusCode::BAD_GATEWAY, "digest mismatch");
+        let none = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/uppkg/uppkg-1.2-py3-none-any.whl.metadata",
+            "",
+        )
+        .await;
+        assert_eq!(
+            none.status(),
+            StatusCode::NOT_FOUND,
+            "not advertised upstream"
+        );
+
+        // Cache the wheel: its metadata is extracted and stored next to it.
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/uppkg/uppkg-1.0-py3-none-any.whl",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sidecar = "pypi/uppkg/uppkg-1.0-py3-none-any.whl.metadata";
+        for _ in 0..100 {
+            if ctx.state.storage.stat(sidecar).await.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            &ctx.state.storage.get(sidecar).await.unwrap()[..],
+            meta.as_bytes()
+        );
+    }
+
+    /// C37: the upload body is spooled to disk, stored byte for byte, and the spool file
+    /// is gone afterwards, also when the upload is refused.
+    #[tokio::test]
+    async fn upload_spools_content_and_cleans_up() {
+        let ctx = create_test_context();
+        let spool =
+            std::path::PathBuf::from(&ctx.state.config.storage.path).join("tmp/pypi-uploads");
+        let content: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let resp = twine_upload(
+            &ctx.app,
+            &[
+                ("name", "big"),
+                ("version", "1.0"),
+                ("sha256_digest", &sha256_hex(&content)),
+            ],
+            "big-1.0.tar.gz",
+            &content,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            &ctx.state
+                .storage
+                .get("pypi/big/big-1.0.tar.gz")
+                .await
+                .unwrap()[..],
+            &content[..]
+        );
+
+        let resp = twine_upload(
+            &ctx.app,
+            &[
+                ("name", "big"),
+                ("version", "1.1"),
+                ("sha256_digest", &"0".repeat(64)),
+            ],
+            "big-1.1.tar.gz",
+            &content,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "digest mismatch");
+        assert!(ctx
+            .state
+            .storage
+            .stat("pypi/big/big-1.1.tar.gz")
+            .await
+            .is_none());
+        let left = std::fs::read_dir(&spool).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(left, 0, "no spool file is left behind");
+    }
+
+    /// C44: the uploaded filename must name the form's project and version.
+    #[tokio::test]
+    async fn upload_rejects_a_filename_of_another_project_or_version() {
+        let ctx = create_test_context();
+        for (name, version, filename, want) in [
+            (
+                "foo",
+                "1.0",
+                "requests-99.0-py3-none-any.whl",
+                StatusCode::BAD_REQUEST,
+            ),
+            ("foo", "1.0", "foo-2.0.tar.gz", StatusCode::BAD_REQUEST),
+            ("foo", "1.0", "foo-1.0.0-py3-none-any.whl", StatusCode::OK),
+            (
+                "Foo.Bar",
+                "V1.0-RC.1",
+                "foo_bar-1.0rc1.tar.gz",
+                StatusCode::OK,
+            ),
+        ] {
+            let resp = twine_upload(
+                &ctx.app,
+                &[("name", name), ("version", version)],
+                filename,
+                b"data",
+            )
+            .await;
+            assert_eq!(resp.status(), want, "{name} {version} {filename}");
+        }
+        assert!(ctx
+            .state
+            .storage
+            .stat("pypi/foo/requests-99.0-py3-none-any.whl")
+            .await
+            .is_none());
+    }
+
+    /// Q02: a release published upstream after `dates.json` was cached is not in it; a
+    /// download of it refreshes the dates, so a `min_release_age` cooldown holds it
+    /// instead of letting an undated file through.
+    #[tokio::test]
+    async fn new_release_missing_from_cached_dates_is_held_by_min_release_age() {
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let u = upstream.uri();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        Mock::given(method("GET"))
+            .and(path("/fresh/"))
+            .and(header("accept", super::PEP691_JSON))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"meta":{{"api-version":"1.1"}},"name":"fresh","files":[
+                {{"filename":"fresh-1.0.tar.gz","url":"{u}/f/fresh-1.0.tar.gz","upload-time":"2020-01-01T00:00:00Z"}},
+                {{"filename":"fresh-2.0.tar.gz","url":"{u}/f/fresh-2.0.tar.gz","upload-time":"{now}"}}]}}"#
+            )))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/fresh/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<a href="{u}/f/fresh-1.0.tar.gz">a</a><a href="{u}/f/fresh-2.0.tar.gz">b</a>"#
+            )))
+            .mount(&upstream)
+            .await;
+        for v in ["1.0", "2.0"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/f/fresh-{v}.tar.gz")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"sdist".to_vec()))
+                .mount(&upstream)
+                .await;
+        }
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxy = Some(u);
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+        });
+        // The snapshot cached before 2.0 was published, an hour ago.
+        let dates = "pypi/fresh/dates.json";
+        ctx.state
+            .storage
+            .put(dates, br#"{"fresh-1.0.tar.gz":"2020-01-01T00:00:00Z"}"#)
+            .await
+            .unwrap();
+        let file = std::path::Path::new(&ctx.state.config.storage.path).join(dates);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+
+        let resp = send(&ctx.app, Method::GET, "/simple/fresh/fresh-2.0.tar.gz", "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a release published today is held"
+        );
+        let resp = send(&ctx.app, Method::GET, "/simple/fresh/fresh-1.0.tar.gz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "an old release passes");
+        let cached: serde_json::Value =
+            serde_json::from_slice(&ctx.state.storage.get(dates).await.unwrap()).unwrap();
+        assert!(
+            cached.get("fresh-2.0.tar.gz").is_some(),
+            "the dates were refreshed"
+        );
+    }
+
+    /// C40: a project only nora has (every upstream answers 404) is looked up upstream
+    /// once per `metadata_ttl`, not on every index request, for HTML and JSON clients.
+    #[tokio::test]
+    async fn hosted_project_upstream_404_is_cached() {
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| cfg.pypi.proxy = Some(uri));
+        let resp = twine_upload(
+            &ctx.app,
+            &[("name", "priv"), ("version", "1.0")],
+            "priv-1.0.tar.gz",
+            b"x",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        for _ in 0..3 {
+            for accept in ["text/html", "application/vnd.pypi.simple.v1+json"] {
+                let resp = send_with_headers(
+                    &ctx.app,
+                    Method::GET,
+                    "/simple/priv/",
+                    vec![("Accept", accept)],
+                    "",
+                )
+                .await;
+                assert_eq!(resp.status(), StatusCode::OK);
+                assert!(text(resp).await.contains("priv-1.0.tar.gz"));
+            }
+        }
+        let hits = upstream.received_requests().await.unwrap().len();
+        assert_eq!(
+            hits, 2,
+            "one index and one dates lookup in total, not one per request"
+        );
+    }
+
+    /// C41: concurrent index requests for one project cost one upstream fetch, and the
+    /// result is reused within `metadata_ttl`.
+    #[tokio::test]
+    async fn upstream_index_is_single_flight_and_cached() {
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/hot/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<a href="https://up/hot-1.0.tar.gz">hot</a>"#)
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| cfg.pypi.proxy = Some(uri));
+
+        let requests = (0..8).map(|_| send(&ctx.app, Method::GET, "/simple/hot/", ""));
+        for resp in futures::future::join_all(requests).await {
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(text(resp).await.contains("hot-1.0.tar.gz"));
+        }
+        let resp = send(&ctx.app, Method::GET, "/simple/hot/", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// C41: when the refetch fails, the last good merged index is served (with a
+    /// `Warning`), never just the local files; with no good copy it is a 5xx.
+    #[tokio::test]
+    async fn upstream_failure_serves_last_good_index_or_5xx() {
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flaky/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="https://up/flaky-2.0.tar.gz">new</a><a href="https://up/flaky-1.0.tar.gz">old</a>"#,
+            ))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/down/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxy = Some(uri);
+            cfg.pypi.metadata_ttl = 0; // refetch on every request
+        });
+        for key in ["pypi/flaky/flaky-1.0.tar.gz", "pypi/down/down-1.0.tar.gz"] {
+            ctx.state.storage.put(key, b"cached").await.unwrap();
+        }
+
+        let resp = send(&ctx.app, Method::GET, "/simple/flaky/", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(header::WARNING).is_none());
+
+        upstream.reset().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        let resp = send(&ctx.app, Method::GET, "/simple/flaky/", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get(header::WARNING).is_some(),
+            "stale is flagged"
+        );
+        assert!(
+            text(resp).await.contains("flaky-2.0.tar.gz"),
+            "the newer upstream release survives"
+        );
+
+        let resp = send(&ctx.app, Method::GET, "/simple/down/", "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "no good copy: not a partial local index"
+        );
+    }
+
+    /// C45: `/simple/` lists only projects holding a distribution file, with absolute
+    /// hrefs, from the repo index — not a storage listing per request.
+    #[tokio::test]
+    async fn root_index_comes_from_the_repo_index() {
+        use crate::test_helpers::{create_test_context_with_storage, op_counting_storage};
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage(storage);
+        ctx.state
+            .storage
+            .put("pypi/real/real-1.0.tar.gz", b"x")
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("pypi/ghost/dates.json", b"{}")
+            .await
+            .unwrap();
+
+        let html = text(send(&ctx.app, Method::GET, "/simple/", "").await).await;
+        let base = crate::registry::nora_base_url(&ctx.state);
+        let base = base.trim_end_matches('/');
+        assert!(
+            html.contains(&format!("<a href=\"{base}/simple/real/\">real</a>")),
+            "{html}"
+        );
+        assert!(!html.contains("ghost"), "{html}");
+
+        ops.reset();
+        let resp = send(&ctx.app, Method::GET, "/simple/", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            ops.total(),
+            0,
+            "a warm /simple/ costs no storage round-trip"
+        );
     }
 }
 

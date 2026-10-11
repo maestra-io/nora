@@ -604,34 +604,36 @@ async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
     result
 }
 
-/// Collect PyPI package files.
+/// Collect PyPI releases: every distribution file of one version (sdist and wheels)
+/// forms one entry, so `keep_last` keeps or retires whole releases.
 async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
     let all_keys = storage.list("pypi/").await.unwrap_or_else(|e| {
         tracing::error!("Failed to list pypi/ keys: {}", e);
         Vec::new()
     });
-    let mut packages: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-
+    let listed: std::collections::HashSet<&str> = all_keys.iter().map(String::as_str).collect();
+    // package -> release version -> distribution file keys. Checksums, `<file>.metadata`
+    // and the project's bookkeeping JSON (dates, upstream index) are not releases.
+    let mut packages: std::collections::HashMap<
+        &str,
+        std::collections::HashMap<String, Vec<&str>>,
+    > = std::collections::HashMap::new();
     for key in &all_keys {
-        if let Some(rest) = key.strip_prefix("pypi/") {
-            // Skip checksums and metadata.json — metadata is the package index,
-            // not a version artifact. Deleting it makes the package undiscoverable.
-            if !ends_with_ci(key, ".sha256")
-                && !ends_with_ci(key, ".sha1")
-                && !ends_with_ci(key, ".md5")
-                && !ends_with_ci(key, ".sha512")
-                && !ends_with_ci(key, "/metadata.json")
-            {
-                let pkg = rest.split('/').next().unwrap_or("");
-                if !pkg.is_empty() {
-                    packages
-                        .entry(pkg.to_string())
-                        .or_default()
-                        .push(key.clone());
-                }
-            }
+        let Some((pkg, filename)) = key.strip_prefix("pypi/").and_then(|r| r.split_once('/'))
+        else {
+            continue;
+        };
+        if pkg.is_empty() || !crate::registry::is_pypi_dist_filename(filename) {
+            continue;
         }
+        let release = crate::registry::pypi_version_from_filename(filename)
+            .unwrap_or_else(|| filename.to_string());
+        packages
+            .entry(pkg)
+            .or_default()
+            .entry(release)
+            .or_default()
+            .push(key.as_str());
     }
 
     // Hash markers live outside `pypi/`, one directory per file:
@@ -653,21 +655,30 @@ async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEnt
     }
 
     let mut result = Vec::new();
-    for (pkg, file_keys) in &packages {
+    for (pkg, releases) in &packages {
         let mut entries = Vec::new();
-        for key in file_keys {
-            let filename = key.rsplit('/').next().unwrap_or("");
-            let (modified, size) = aggregate_meta(storage, std::slice::from_ref(key)).await;
-            let mut keys = vec![key.clone()];
-            let hash_key = format!("{}.sha256", key);
-            if storage.stat(&hash_key).await.is_some() {
-                keys.push(hash_key);
+        for (release, files) in releases {
+            let mut keys = Vec::new();
+            for file in files {
+                let filename = file.rsplit('/').next().unwrap_or("");
+                keys.push(file.to_string());
+                for sidecar in [format!("{file}.sha256"), format!("{file}.metadata")] {
+                    if listed.contains(sidecar.as_str()) {
+                        keys.push(sidecar);
+                    }
+                }
+                for marked in [filename.to_string(), format!("{filename}.metadata")] {
+                    if let Some(file_markers) = markers.get(format!("{pkg}/{marked}").as_str()) {
+                        keys.extend(file_markers.iter().cloned());
+                    }
+                }
             }
-            if let Some(file_markers) = markers.get(format!("{pkg}/{filename}").as_str()) {
-                keys.extend(file_markers.iter().cloned());
-            }
+            // Age and size of the release's files; a marker or sidecar written later
+            // (backfill) must not make an old release look new.
+            let file_keys: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+            let (modified, size) = aggregate_meta(storage, &file_keys).await;
             entries.push(VersionEntry {
-                name: filename.to_string(),
+                name: release.clone(),
                 keys,
                 modified,
                 size,
@@ -2242,6 +2253,72 @@ mod format_retention_tests {
             .collect();
         versions.sort();
         versions
+    }
+
+    /// keep_last counts PyPI releases, not files: a release's sdist and wheels (and
+    /// their sidecars) are kept or retired together; project bookkeeping is never a release.
+    #[tokio::test]
+    async fn test_pypi_retention_keeps_whole_releases() {
+        let ctx = crate::test_helpers::create_test_context();
+        let storage = &ctx.state.storage;
+        let marker_root = crate::registry::PYPI_HASH_MARKER_PREFIX;
+        let release = |v: &str| {
+            vec![
+                format!("rel-{v}.tar.gz"),
+                format!("rel-{v}-cp311-cp311-manylinux_2_17_x86_64.whl"),
+                format!("rel-{v}-cp312-cp312-manylinux_2_17_x86_64.whl"),
+                format!("rel-{v}-py3-none-any.whl"),
+            ]
+        };
+        for v in ["1.0", "1.1"] {
+            for file in release(v) {
+                let key = format!("pypi/rel/{file}");
+                storage.put(&key, b"bytes").await.unwrap();
+                storage.put(&format!("{key}.sha256"), b"h").await.unwrap();
+                storage.put(&format!("{key}.metadata"), b"m").await.unwrap();
+                storage
+                    .put(
+                        &format!("{marker_root}rel/{file}.metadata/{}", "a".repeat(64)),
+                        b"",
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        for bookkeeping in ["dates.json", "upstream-index.json", "requires-python.json"] {
+            storage
+                .put(&format!("pypi/rel/{bookkeeping}"), b"{}")
+                .await
+                .unwrap();
+        }
+
+        let rules = vec![rule("pypi", None, Some(1), None)];
+        let result = run_retention(
+            storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 1, "one release retired, not files");
+
+        let left = storage.list("pypi/rel/").await.unwrap();
+        for file in release("1.1") {
+            for suffix in ["", ".sha256", ".metadata"] {
+                let key = format!("pypi/rel/{file}{suffix}");
+                assert!(left.contains(&key), "{key} kept: {left:?}");
+            }
+        }
+        assert!(
+            !left.iter().any(|k| k.contains("rel-1.0")),
+            "the whole 1.0 release goes: {left:?}"
+        );
+        for bookkeeping in ["dates.json", "upstream-index.json", "requires-python.json"] {
+            assert!(left.contains(&format!("pypi/rel/{bookkeeping}")));
+        }
+        let markers = storage.list(&format!("{marker_root}rel/")).await.unwrap();
+        assert_eq!(markers.len(), 4, "only 1.1's markers remain: {markers:?}");
     }
 
     /// A retired PyPI file takes its hash markers with it; a surviving file keeps its own.
