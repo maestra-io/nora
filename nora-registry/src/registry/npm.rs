@@ -33,7 +33,8 @@ pub fn routes() -> Router<AppState> {
         get(handle_request)
             .put(handle_publish)
             .post(handle_npm_post)
-            .fallback(|| async { method_not_allowed("GET, PUT, POST") }),
+            .delete(handle_npm_delete)
+            .fallback(|| async { method_not_allowed("GET, PUT, POST, DELETE") }),
     )
 }
 
@@ -417,6 +418,29 @@ async fn handle_request(
     // Handle npm whoami endpoint
     if path == "-/whoami" {
         return handle_whoami(&user).await;
+    }
+    // `npm dist-tag ls`: answered from local versions only, never proxied (the name
+    // would leak upstream).
+    if let Some(name) = path
+        .strip_prefix("-/package/")
+        .and_then(|rest| rest.strip_suffix("/dist-tags"))
+    {
+        let packument = state
+            .storage
+            .get(&format!("npm/{name}/metadata.json"))
+            .await;
+        let tags = match packument {
+            Ok(data) if has_local_versions(&state.storage, name).await => {
+                serde_json::from_slice::<serde_json::Value>(&data)
+                    .ok()
+                    .and_then(|p| p.get("dist-tags").cloned())
+            }
+            _ => None,
+        };
+        return match tags {
+            Some(tags) => axum::Json(tags).into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
     }
 
     let github_packages = github_packages_tarball(&path);
@@ -1230,6 +1254,17 @@ async fn handle_publish(
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
     body: Bytes,
 ) -> Response {
+    if let Some(rest) = path.strip_prefix("-/package/") {
+        // `npm dist-tag add`: the body is the version, as a JSON string.
+        let Ok(version) = serde_json::from_slice::<String>(&body) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                "dist-tag body must be a JSON string",
+            )
+                .into_response();
+        };
+        return set_dist_tag(&state, &authority, &user, rest, Some(&version)).await;
+    }
     let package_name = path;
 
     // Enforce OIDC namespace_scope on the package coordinate (#583).
@@ -1267,8 +1302,12 @@ async fn handle_publish(
     }
 
     let attachments = match payload.get("_attachments").and_then(|a| a.as_object()) {
-        Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, "Missing _attachments").into_response(),
+        Some(a) if !a.is_empty() => a,
+        // `npm deprecate` PUTs the packument back without attachments.
+        _ if has_local_versions(&state.storage, &package_name).await => {
+            return deprecate_versions(&state, &user, &package_name, &payload).await;
+        }
+        _ => return (StatusCode::BAD_REQUEST, "Missing _attachments").into_response(),
     };
 
     let new_versions = match payload.get("versions").and_then(|v| v.as_object()) {
@@ -1508,6 +1547,128 @@ async fn handle_publish(
     state.repo_index.invalidate("npm");
 
     StatusCode::CREATED.into_response()
+}
+
+/// `DELETE /-/package/<name>/dist-tags/<tag>` (`npm dist-tag rm`). Unpublish is not
+/// supported: versions are immutable.
+async fn handle_npm_delete(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Extension(authority): Extension<NamespaceAuthority>,
+    user: Option<Extension<crate::auth::AuthenticatedUser>>,
+) -> Response {
+    match path.strip_prefix("-/package/") {
+        Some(rest) => set_dist_tag(&state, &authority, &user, rest, None).await,
+        None => method_not_allowed("GET, PUT, POST"),
+    }
+}
+
+/// Point (`Some(version)`) or remove (`None`) a dist-tag of a package published here.
+async fn set_dist_tag(
+    state: &AppState,
+    authority: &NamespaceAuthority,
+    user: &Option<Extension<crate::auth::AuthenticatedUser>>,
+    rest: &str,
+    version: Option<&str>,
+) -> Response {
+    let Some((name, tag)) = rest.rsplit_once("/dist-tags/") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if enforce_namespace_scope(authority, name).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    // npm refuses to remove `latest`; the tag is a storage key segment.
+    if !is_valid_attachment_name(tag) || (tag == "latest" && version.is_none()) {
+        return (StatusCode::BAD_REQUEST, "Invalid dist-tag").into_response();
+    }
+    let lock = state.publish_lock(&format!("npm/{name}/metadata.json"));
+    let _guard = lock.lock().await;
+    let tag_key = format!("npm/{name}/dist-tags/{tag}");
+    let written = match version {
+        Some(v)
+            if state
+                .storage
+                .stat(&format!("npm/{name}/versions/{v}.json"))
+                .await
+                .is_some() =>
+        {
+            state.storage.put(&tag_key, v.as_bytes()).await
+        }
+        None if state.storage.stat(&tag_key).await.is_some() => {
+            state.storage.delete(&tag_key).await
+        }
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    if written.is_err() || regenerate_packument(&state.storage, name).await.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let action = if version.is_some() {
+        "dist_tag_add"
+    } else {
+        "dist_tag_rm"
+    };
+    let actor = crate::auth::audit_actor(user);
+    state
+        .audit
+        .log(AuditEntry::new(action, actor, name, "npm", tag));
+    axum::Json(serde_json::json!({})).into_response()
+}
+
+/// `npm deprecate`: apply only the `deprecated` field of each version published here
+/// (`""` clears it); every other difference in the PUT packument is ignored.
+async fn deprecate_versions(
+    state: &AppState,
+    user: &Option<Extension<crate::auth::AuthenticatedUser>>,
+    name: &str,
+    payload: &serde_json::Value,
+) -> Response {
+    let Some(versions) = payload.get("versions").and_then(|v| v.as_object()) else {
+        return (StatusCode::BAD_REQUEST, "Missing versions").into_response();
+    };
+    let lock = state.publish_lock(&format!("npm/{name}/metadata.json"));
+    let _guard = lock.lock().await;
+    for (ver, data) in versions {
+        let key = format!("npm/{name}/versions/{ver}.json");
+        let Ok(stored) = state.storage.get(&key).await else {
+            continue;
+        };
+        let Ok(mut stored) = serde_json::from_slice::<serde_json::Value>(&stored) else {
+            continue;
+        };
+        let wanted = data
+            .get("deprecated")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        let current = stored
+            .get("deprecated")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        if wanted == current {
+            continue;
+        }
+        let Some(obj) = stored.as_object_mut() else {
+            continue;
+        };
+        if wanted.is_empty() {
+            obj.remove("deprecated");
+        } else {
+            obj.insert("deprecated".into(), wanted.into());
+        }
+        let Ok(bytes) = serde_json::to_vec(&stored) else {
+            continue;
+        };
+        if state.storage.put(&key, &bytes).await.is_err() {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    if regenerate_packument(&state.storage, name).await.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let actor = crate::auth::audit_actor(user);
+    state
+        .audit
+        .log(AuditEntry::new("deprecate", actor, name, "npm", ""));
+    axum::Json(serde_json::json!({})).into_response()
 }
 
 // ============================================================================
@@ -3683,6 +3844,84 @@ mod integration_tests {
             .await
             .is_none());
         assert!(ctx.state.storage.stat(&sidecar).await.is_none());
+    }
+
+    /// `npm dist-tag add|ls|rm` on a hosted package; `ls` is never proxied.
+    #[tokio::test]
+    async fn dist_tag_add_ls_rm() {
+        let ctx = create_test_context();
+        assert_eq!(
+            publish(&ctx.app, "@corp/tagged", "1.0.0").await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            publish(&ctx.app, "@corp/tagged", "2.0.0").await,
+            StatusCode::CREATED
+        );
+        let tag_url = "/npm/-/package/@corp/tagged/dist-tags/beta";
+        let ls_url = "/npm/-/package/@corp/tagged/dist-tags";
+
+        let resp = send(&ctx.app, Method::PUT, tag_url, "\"1.0.0\"").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let tags: serde_json::Value = serde_json::from_slice(
+            &body_bytes(send(&ctx.app, Method::GET, ls_url, "").await).await,
+        )
+        .unwrap();
+        assert_eq!(tags["beta"], "1.0.0");
+        assert_eq!(tags["latest"], "2.0.0");
+        assert_eq!(
+            packument(&ctx.app, "@corp/tagged").await["dist-tags"]["beta"],
+            "1.0.0"
+        );
+
+        // Unknown version, removing `latest`, unknown package: refused.
+        let resp = send(&ctx.app, Method::PUT, tag_url, "\"3.0.0\"").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let latest = "/npm/-/package/@corp/tagged/dist-tags/latest";
+        let resp = send(&ctx.app, Method::DELETE, latest, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = send(&ctx.app, Method::GET, "/npm/-/package/nope/dist-tags", "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = send(&ctx.app, Method::DELETE, tag_url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(packument(&ctx.app, "@corp/tagged").await["dist-tags"]
+            .get("beta")
+            .is_none());
+    }
+
+    /// `npm deprecate` PUTs the packument back without attachments; only the
+    /// `deprecated` field is applied, and `""` clears it.
+    #[tokio::test]
+    async fn deprecate_sets_and_clears() {
+        let ctx = create_test_context();
+        assert_eq!(
+            publish(&ctx.app, "old-pkg", "1.0.0").await,
+            StatusCode::CREATED
+        );
+        let put = |msg: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "name": "old-pkg",
+                "versions": { "1.0.0": { "deprecated": msg, "description": "ignored" } }
+            }))
+            .unwrap()
+        };
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/npm/old-pkg",
+            Body::from(put("use v2")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = packument(&ctx.app, "old-pkg").await;
+        assert_eq!(json["versions"]["1.0.0"]["deprecated"], "use v2");
+        assert!(json["versions"]["1.0.0"].get("description").is_none());
+
+        let resp = send(&ctx.app, Method::PUT, "/npm/old-pkg", Body::from(put(""))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = packument(&ctx.app, "old-pkg").await;
+        assert!(json["versions"]["1.0.0"].get("deprecated").is_none());
     }
 }
 

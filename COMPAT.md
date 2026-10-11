@@ -59,7 +59,8 @@ This document describes which parts of each registry protocol are implemented in
 | Tarball URL rewriting | Full | Points to NORA, not upstream |
 | Publish (`npm publish`) | Full | Immutable versions |
 | Unpublish | — | Immutable; use quarantine/blocklist to disable a version |
-| Dist-tags (`latest`, `next`) | Partial | Read from metadata, no explicit management |
+| Dist-tags (`latest`, `next`) | Full | Set at publish; `npm dist-tag ls/add/rm` on packages published here (never proxied); `latest` cannot be removed |
+| Deprecate (`npm deprecate`) | Full | Packages published here: only each version's `deprecated` field is applied, `""` clears it |
 | Search (`/-/v1/search`) | — | Not implemented |
 | Audit (`bulk` npm7 / `audits/quick` npm6 / `audits` pnpm) | Full | Proxy repos: forwarded to upstream verbatim; internal-namespace names stripped/refused; anonymous-read eligible and allowed for read-only tokens. Proxied packages only (no local advisory DB). (#597) |
 | Upstream proxy | Full | Configurable TTL. A package with versions published here is never revalidated or overwritten from upstream, internal namespace or not |
