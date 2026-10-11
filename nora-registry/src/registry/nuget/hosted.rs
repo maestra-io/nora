@@ -799,18 +799,7 @@ fn parse_nuspec(xml: &str) -> Result<Nuspec, String> {
                             | "projectUrl"
                     ) =>
             {
-                let text = reader
-                    .read_text(start.name())
-                    .map_err(|e| format!("invalid nuspec <{field}>: {e}"))?;
-                let text = text
-                    .decode()
-                    .ok()
-                    .and_then(|t| {
-                        quick_xml::escape::unescape(&t)
-                            .ok()
-                            .map(|t| t.trim().to_string())
-                    })
-                    .ok_or_else(|| format!("invalid nuspec <{field}> text"))?;
+                let text = read_field_text(&mut reader, field)?;
                 let slot = match field {
                     "id" => &mut spec.id,
                     "version" => &mut spec.version,
@@ -822,7 +811,7 @@ fn parse_nuspec(xml: &str) -> Result<Nuspec, String> {
                     _ => &mut spec.project_url,
                 };
                 *slot = text;
-                continue; // read_text consumed the end tag
+                continue; // read_field_text consumed the end tag
             }
             (["package", "metadata", "dependencies"], "group") => {
                 spec.dependency_groups.push(DependencyGroup {
@@ -867,6 +856,56 @@ fn parse_nuspec(xml: &str) -> Result<Nuspec, String> {
         return Err("nuspec must declare <id> and <version>".to_string());
     }
     Ok(spec)
+}
+
+/// Text of a leaf element up to its end tag: text, entity and character references,
+/// and CDATA sections (taken verbatim) concatenated, then trimmed. Trimming is off while
+/// reading so the spaces around an entity (`A &amp; B`) survive.
+fn read_field_text(reader: &mut quick_xml::Reader<&[u8]>, field: &str) -> Result<String, String> {
+    use quick_xml::events::Event;
+
+    let bad = |e: &dyn std::fmt::Display| format!("invalid nuspec <{field}>: {e}");
+    reader.config_mut().trim_text(false);
+    let mut text = String::new();
+    let mut depth = 0usize;
+    let result = loop {
+        let event = match reader.read_event() {
+            Ok(e) => e,
+            Err(e) => break Err(bad(&e)),
+        };
+        match event {
+            Event::Text(t) => match t.decode() {
+                Ok(t) => text.push_str(&t),
+                Err(e) => break Err(bad(&e)),
+            },
+            Event::CData(c) => match c.decode() {
+                Ok(c) => text.push_str(&c),
+                Err(e) => break Err(bad(&e)),
+            },
+            Event::GeneralRef(r) => {
+                let resolved = match r.resolve_char_ref() {
+                    Ok(Some(c)) => Some(c.to_string()),
+                    Ok(None) => r
+                        .decode()
+                        .ok()
+                        .and_then(|name| quick_xml::escape::resolve_predefined_entity(&name))
+                        .map(str::to_string),
+                    Err(_) => None,
+                };
+                match resolved {
+                    Some(v) => text.push_str(&v),
+                    None => break Err(format!("invalid nuspec <{field}>: unknown entity")),
+                }
+            }
+            Event::Start(_) => depth += 1,
+            Event::End(_) if depth == 0 => break Ok(text.trim().to_string()),
+            Event::End(_) => depth -= 1,
+            Event::Eof => break Err(format!("unterminated nuspec <{field}>")),
+            _ => {}
+        }
+    };
+    reader.config_mut().trim_text(true);
+    result
 }
 
 // ── Versions ───────────────────────────────────────────────────────────
@@ -1088,6 +1127,22 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// CDATA is valid nuspec text: kept verbatim (a bare `&` included), mixed with
+    /// escaped text and character references.
+    #[test]
+    fn parse_nuspec_reads_cdata_and_references() {
+        let xml = r#"<package><metadata><id>A</id><version>1.0.0</version>
+            <description><![CDATA[Foo & <Bar>]]> &amp; baz &#169;</description>
+            <title><![CDATA[plain]]></title></metadata></package>"#;
+        let spec = parse_nuspec(xml).unwrap();
+        assert_eq!(spec.description, "Foo & <Bar> & baz \u{a9}");
+        assert_eq!(spec.title, "plain");
+        assert!(parse_nuspec(
+            "<package><metadata><id>A</id><version>1</version><title>&nope;</title></metadata></package>"
+        )
+        .is_err());
     }
 
     #[test]

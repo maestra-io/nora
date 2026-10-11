@@ -1,0 +1,34 @@
+name: Maestra CI
+
+# cargo test on PRs into our default branch. Upstream's CI only targets main,
+# which in this fork is the untouched upstream mirror (see MAESTRA.md).
+
+on:
+  pull_request:
+    branches: [maestra/main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maestra-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: runs-on=${{ github.run_id }}/pool=build
+    steps:
+      - uses: runs-on/action@v2
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      # rustup reads rust-toolchain.toml and installs the pinned channel.
+      - name: Install toolchain
+        run: rustup toolchain install || rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Run tests
+        run: cargo test --package nora-registry
