@@ -29,6 +29,25 @@ fn streaming_client_options() -> object_store::ClientOptions {
     object_store::ClientOptions::new().with_timeout(STREAM_ATTEMPT_TIMEOUT)
 }
 
+/// Bounds for calls that do not stream a body to a client. The client timeout above
+/// is sized for streamed downloads; without these a silently dropped connection holds
+/// a HEAD or a small GET for STREAM_ATTEMPT_TIMEOUT. Request-to-headers / small ops:
+const METADATA_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Whole in-memory body transfers (`put`, the body of `get`).
+const BODY_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+async fn bounded<T>(
+    limit: std::time::Duration,
+    fut: impl std::future::Future<Output = object_store::Result<T>>,
+) -> object_store::Result<T> {
+    tokio::time::timeout(limit, fut).await.unwrap_or_else(|_| {
+        Err(object_store::Error::Generic {
+            store: "object_store",
+            source: format!("request exceeded {} s", limit.as_secs()).into(),
+        })
+    })
+}
+
 fn streaming_retry_config() -> object_store::RetryConfig {
     object_store::RetryConfig {
         retry_timeout: STREAM_ATTEMPT_TIMEOUT.saturating_mul(2),
@@ -269,8 +288,7 @@ impl StorageBackend for ObjectStorage {
             attributes: pin_attributes(sha256),
             ..Default::default()
         };
-        self.store
-            .put_opts(&path, payload, opts)
+        bounded(BODY_OP_TIMEOUT, self.store.put_opts(&path, payload, opts))
             .await
             .map_err(map_err)?;
         Ok(())
@@ -279,18 +297,22 @@ impl StorageBackend for ObjectStorage {
     async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
-        let result = match self.store.get(&path).await {
+        let result = match bounded(METADATA_OP_TIMEOUT, self.store.get(&path)).await {
             Ok(result) => result,
             Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
                 // Fallback: try legacy _at_ encoding for pre-#534 data.
                 // Only needed when key contains @, since otherwise both schemes produce the same output.
                 let legacy_path = Path::from(encode_object_key_legacy(key));
-                self.store.get(&legacy_path).await.map_err(map_err)?
+                bounded(METADATA_OP_TIMEOUT, self.store.get(&legacy_path))
+                    .await
+                    .map_err(map_err)?
             }
             Err(e) => return Err(map_err(e)),
         };
         let pin = read_pin(&result.attributes);
-        let bytes = result.bytes().await.map_err(map_err)?;
+        let bytes = bounded(BODY_OP_TIMEOUT, result.bytes())
+            .await
+            .map_err(map_err)?;
         Ok((bytes, pin))
     }
 
@@ -300,12 +322,17 @@ impl StorageBackend for ObjectStorage {
             ..Default::default()
         };
         let path = Path::from(encode_object_key(key));
-        let result = match self.store.get_opts(&path, head()).await {
+        let result = match bounded(METADATA_OP_TIMEOUT, self.store.get_opts(&path, head())).await {
             Ok(r) => r,
             Err(_) if key.contains('@') => {
                 // Fallback: try legacy _at_ encoding for pre-#534 data.
                 let legacy_path = Path::from(encode_object_key_legacy(key));
-                self.store.get_opts(&legacy_path, head()).await.ok()?
+                bounded(
+                    METADATA_OP_TIMEOUT,
+                    self.store.get_opts(&legacy_path, head()),
+                )
+                .await
+                .ok()?
             }
             Err(_) => return None,
         };
@@ -315,7 +342,9 @@ impl StorageBackend for ObjectStorage {
     async fn delete(&self, key: &str) -> Result<()> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
-        self.store.delete(&path).await.map_err(map_err)?;
+        bounded(METADATA_OP_TIMEOUT, self.store.delete(&path))
+            .await
+            .map_err(map_err)?;
         Ok(())
     }
 
@@ -382,12 +411,14 @@ impl StorageBackend for ObjectStorage {
     async fn stat(&self, key: &str) -> Option<FileMeta> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
-        let meta = match self.store.head(&path).await {
+        let meta = match bounded(METADATA_OP_TIMEOUT, self.store.head(&path)).await {
             Ok(m) => m,
             Err(_) if key.contains('@') => {
                 // Fallback: try legacy _at_ encoding for pre-#534 data
                 let legacy_path = Path::from(encode_object_key_legacy(key));
-                self.store.head(&legacy_path).await.ok()?
+                bounded(METADATA_OP_TIMEOUT, self.store.head(&legacy_path))
+                    .await
+                    .ok()?
             }
             Err(_) => return None,
         };
@@ -497,7 +528,9 @@ impl StorageBackend for ObjectStorage {
         // user metadata, so `dst` inherits the pin without re-writing it.
         let from_path = Path::from(encode_object_key(src));
         let to_path = Path::from(encode_object_key(dst));
-        self.store.copy(&from_path, &to_path).await.map_err(map_err)
+        bounded(BODY_OP_TIMEOUT, self.store.copy(&from_path, &to_path))
+            .await
+            .map_err(map_err)
     }
 
     async fn get_reader(
@@ -506,11 +539,13 @@ impl StorageBackend for ObjectStorage {
     ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
-        let result = match self.store.get(&path).await {
+        let result = match bounded(METADATA_OP_TIMEOUT, self.store.get(&path)).await {
             Ok(r) => r,
             Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
                 let legacy_path = Path::from(encode_object_key_legacy(key));
-                self.store.get(&legacy_path).await.map_err(map_err)?
+                bounded(METADATA_OP_TIMEOUT, self.store.get(&legacy_path))
+                    .await
+                    .map_err(map_err)?
             }
             Err(e) => return Err(map_err(e)),
         };
@@ -532,17 +567,20 @@ impl StorageBackend for ObjectStorage {
             ..Default::default()
         };
         let path = Path::from(encode_object_key(key));
-        let result = match self.store.get_opts(&path, make_opts()).await {
-            Ok(r) => r,
-            Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
-                let legacy_path = Path::from(encode_object_key_legacy(key));
-                self.store
-                    .get_opts(&legacy_path, make_opts())
+        let result =
+            match bounded(METADATA_OP_TIMEOUT, self.store.get_opts(&path, make_opts())).await {
+                Ok(r) => r,
+                Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
+                    let legacy_path = Path::from(encode_object_key_legacy(key));
+                    bounded(
+                        METADATA_OP_TIMEOUT,
+                        self.store.get_opts(&legacy_path, make_opts()),
+                    )
                     .await
                     .map_err(map_err)?
-            }
-            Err(e) => return Err(map_err(e)),
-        };
+                }
+                Err(e) => return Err(map_err(e)),
+            };
         let size = result.meta.size;
         let stream = result.into_stream().map_err(std::io::Error::other);
         let reader = tokio_util::io::StreamReader::new(stream);
@@ -853,6 +891,17 @@ mod tests {
             encode_object_key_legacy("npm/chalk/metadata.json"),
             "npm/chalk/metadata.json"
         );
+    }
+
+    /// A store call that never answers is cut off at its bound and surfaces as a
+    /// storage error, instead of holding the caller for STREAM_ATTEMPT_TIMEOUT.
+    #[tokio::test]
+    async fn test_bounded_cuts_off_a_hung_request() {
+        let hung = std::future::pending::<object_store::Result<()>>();
+        let limit = std::time::Duration::from_millis(50);
+        let err = bounded(limit, hung).await.unwrap_err();
+        assert!(matches!(map_err(err), StorageError::Network(_)));
+        assert!(bounded(METADATA_OP_TIMEOUT, async { Ok(1) }).await.is_ok());
     }
 }
 
