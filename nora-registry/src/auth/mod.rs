@@ -358,7 +358,12 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
         // `public_web_ui` escape; /metrics has its own default-open switch —
         // labels carry registry formats, not repository names.
         let config = &state.config.auth;
+        // `npm login` / `npm adduser`: the npm handler only answers how to set up a
+        // token, and the client that needs that answer has no credentials yet.
+        let npm_login =
+            *request.method() == axum::http::Method::PUT && path.starts_with("/npm/-/user/");
         let open = is_public_path(path)
+            || npm_login
             || (is_web_surface(path) && (config.anonymous_read || config.public_web_ui))
             || (path == "/metrics" && config.public_metrics);
         // Probes and metrics never validate credentials: a Basic header there

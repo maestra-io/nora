@@ -56,12 +56,14 @@ This document describes which parts of each registry protocol are implemented in
 | Package metadata (GET) | Full | JSON with all versions |
 | Scoped packages `@scope/name` | Full | URL-encoded path |
 | Tarball download | Full | SHA256 verified |
-| Tarball URL rewriting | Full | Points to NORA, not upstream |
-| Publish (`npm publish`) | Full | Immutable versions |
-| Unpublish | — | Immutable; use quarantine/blocklist to disable a version |
+| Tarball URL rewriting | Full | Points to NORA, not upstream. Stored packuments hold no host: every serve uses the current `server.public_url`, for hosted and cached packages alike |
+| Publish (`npm publish`) | Full | Immutable versions; hosted packuments carry `time` (per version, `created`, `modified`) |
+| Unpublish (`npm unpublish`) | Full | Packages published here: `<pkg>@<ver>` removes that version's document, tarball and the dist-tags pointing at it (`latest` moves to the highest remaining version); `<pkg> --force` removes them all. As on npmjs, a version string is never published again. Proxied packages: refused, never sent upstream |
 | Dist-tags (`latest`, `next`) | Full | Set at publish; `npm dist-tag ls/add/rm` on packages published here (never proxied); `latest` cannot be removed |
 | Deprecate (`npm deprecate`) | Full | Packages published here: only each version's `deprecated` field is applied, `""` clears it |
-| Search (`/-/v1/search`) | — | Not implemented |
+| Search (`/-/v1/search`) | Partial | Forwarded to the upstream with its query, never cached; refused (501) while internal namespaces or private scopes are configured, since the search text could carry their names |
+| Ping (`npm ping`) | Full | `200 {}` |
+| Login (`npm login` / `adduser`) | — | 405 with a hint: authenticate with an API token (`//<host>/npm/:_authToken`) |
 | Audit (`bulk` npm7 / `audits/quick` npm6 / `audits` pnpm) | Full | Proxy repos: forwarded to upstream verbatim; internal-namespace names stripped/refused; anonymous-read eligible and allowed for read-only tokens. Proxied packages only (no local advisory DB). (#597) |
 | Upstream proxy | Full | Configurable TTL. A package with versions published here is never revalidated or overwritten from upstream, internal namespace or not |
 

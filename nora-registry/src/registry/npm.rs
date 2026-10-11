@@ -17,7 +17,7 @@ use crate::registry_type::RegistryType;
 use crate::AppState;
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -329,6 +329,25 @@ fn github_packages_tarball(path: &str) -> Option<(&str, &str)> {
     Some((&rest[..scope.len() + 1 + name.len()], version))
 }
 
+/// Stand-in for `server.public_url` in every stored npm document: published
+/// `versions/<v>.json`, regenerated and proxied packuments. [`with_public_base`] swaps
+/// it for the current base on every packument serve, so a `public_url` change never
+/// strands a tarball URL in storage or behind an upstream 304.
+const PUBLIC_BASE: &str = "nora://public-url";
+
+/// Substitute the current `public_url` for [`PUBLIC_BASE`]. A byte scan, not a JSON
+/// parse: it runs on every packument serve, and proxied packuments run to megabytes.
+fn with_public_base(data: Bytes, nora_base: &str) -> Bytes {
+    if memchr::memmem::find(&data, PUBLIC_BASE.as_bytes()).is_none() {
+        return data;
+    }
+    Bytes::from(replace_upstream_bytes(
+        &data,
+        PUBLIC_BASE,
+        nora_base.trim_end_matches('/'),
+    ))
+}
+
 /// Rewrite tarball URLs in npm metadata to point to NORA.
 ///
 /// Replaces upstream registry URLs (e.g. `https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz`)
@@ -336,7 +355,9 @@ fn github_packages_tarball(path: &str) -> Option<(&str, &str)> {
 ///
 /// Two-layer approach (#439):
 /// 1. Targeted: parse JSON, rewrite `versions.*.dist.tarball`
-/// 2. Safety net: byte-level replace of upstream URL prefix in serialized output
+/// 2. Safety net: byte-level replace of this package's upstream tarball links
+///    (`<upstream>/<name>/-/`) in the serialized output, e.g. `_resolved`. Other
+///    fields that merely mention the upstream (a readme) are left alone.
 fn rewrite_tarball_urls(data: &[u8], nora_base: &str, upstream_url: &str) -> Result<Vec<u8>, ()> {
     let mut json: serde_json::Value = serde_json::from_slice(data).map_err(|e| {
         tracing::warn!(error = %e, "npm: JSON parse failed in rewrite_tarball_urls");
@@ -365,12 +386,16 @@ fn rewrite_tarball_urls(data: &[u8], nora_base: &str, upstream_url: &str) -> Res
         tracing::warn!(error = %e, "npm: JSON serialize failed in rewrite_tarball_urls");
     })?;
 
-    // Safety net: byte-level replace of any remaining upstream URL prefix (#439).
+    // Safety net: byte-level replace of any remaining upstream tarball link (#439).
     // Catches edge cases where targeted rewrite missed (e.g. new npm metadata fields).
+    let name = json.get("name").and_then(|n| n.as_str());
+    let Some(name) = name.filter(|_| !upstream_trimmed.is_empty()) else {
+        return Ok(output);
+    };
     Ok(replace_upstream_bytes(
         &output,
-        upstream_trimmed,
-        &nora_npm_base,
+        &format!("{upstream_trimmed}/{name}/-/"),
+        &format!("{nora_npm_base}/{name}/-/"),
     ))
 }
 
@@ -409,17 +434,57 @@ async fn handle_whoami(user: &AuthenticatedUser) -> Response {
     axum::Json(serde_json::json!({ "username": user.0 })).into_response()
 }
 
+/// `npm search` (`GET /-/v1/search?text=…`): forwarded to the upstream with its query,
+/// never cached. The text is free-form, so, as with the audit, nothing is sent while a
+/// namespace filter or an owned scope makes some names private: it could carry them.
+async fn handle_search(state: &AppState, query: &str) -> Response {
+    if crate::curation::namespace_filter_active(&state.curation().curation_engine)
+        || state.config.npm.owned_scopes().next().is_some()
+    {
+        return audit_refused(
+            StatusCode::NOT_IMPLEMENTED,
+            "npm search is not forwarded while internal namespaces or private scopes are configured",
+        );
+    }
+    let Some(upstream) = state.config.npm.route("-/v1/search") else {
+        return audit_refused(StatusCode::NOT_IMPLEMENTED, "npm search needs an upstream");
+    };
+    let url = format!("{}/-/v1/search?{query}", upstream.url.trim_end_matches('/'));
+    match proxy_fetch(
+        &state.http_client,
+        &url,
+        Duration::from_secs(state.config.npm.proxy_timeout),
+        upstream.auth,
+        &state.circuit_breaker,
+        BreakerScope::upstream(RegistryType::Npm, upstream.url),
+    )
+    .await
+    {
+        Ok(body) => ([(header::CONTENT_TYPE, "application/json")], body).into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
+        Err(e) => proxy_error_response("npm", &url, &e),
+    }
+}
+
 // LOCK-SAFE: cache-through proxy — get miss → fetch upstream → put; no RMW race
 async fn handle_request(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(path): Path<String>,
+    RawQuery(query): RawQuery,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Response {
     // Handle npm whoami endpoint
     if path == "-/whoami" {
         return handle_whoami(&user).await;
     }
+    if path == "-/ping" {
+        return axum::Json(serde_json::json!({})).into_response();
+    }
+    if path == "-/v1/search" {
+        return handle_search(&state, query.as_deref().unwrap_or("")).await;
+    }
+
     // `npm dist-tag ls`: answered from local versions only, never proxied (the name
     // would leak upstream).
     if let Some(name) = path
@@ -442,6 +507,12 @@ async fn handle_request(
             Some(tags) => axum::Json(tags).into_response(),
             None => StatusCode::NOT_FOUND.into_response(),
         };
+    }
+    // Any other registry endpoint (`-/user/…`, `-/v1/login`, `-/org/…`): never a
+    // packument, never proxied (it can carry private names) or cached. `-/-/…` is
+    // still the tarball of the package named `-`.
+    if path.starts_with("-/") && !path.starts_with("-/-/") {
+        return audit_refused(StatusCode::NOT_FOUND, "not supported by this registry");
     }
 
     let github_packages = github_packages_tarball(&path);
@@ -532,7 +603,7 @@ async fn handle_request(
     }
 
     // Resolved here, not at the serve site, so the range branch below can see it.
-    let (q_mode, q_secs) =
+    let (mut q_mode, q_secs) =
         crate::digest_quarantine::resolve_global(
             state.config.curation.npm.quarantine.as_ref().or(state
                 .config
@@ -545,6 +616,25 @@ async fn handle_request(
                 .quarantine_ttl
                 .as_deref()),
         );
+    // A hosted tarball (internal namespace, or this version published here) is our
+    // own publish, not a new upstream artifact: never held by the quarantine.
+    if is_tarball && !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+        let hosted = crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Npm,
+            &package_name,
+        ) || match tarball_version.as_deref() {
+            Some(v) => state
+                .storage
+                .stat(&format!("npm/{package_name}/versions/{v}.json"))
+                .await
+                .is_some(),
+            None => false,
+        };
+        if hosted {
+            q_mode = crate::digest_quarantine::QuarantineMode::Off;
+        }
+    }
 
     // Resumable download (#657): serve the requested bytes from the backend and skip
     // the full read below. Tarballs only — a packument is mutable and has a TTL. A
@@ -591,6 +681,9 @@ async fn handle_request(
         }
     }
 
+    // Every packument served below gets this base in place of `PUBLIC_BASE`.
+    let base = nora_base_url(&state);
+
     // --- Cache hit path ---
     // get_verified discharges the integrity witness at the serve site (compile-time
     // guarantee — see crate::verified). Both the tarball serve (pinned, Verified arm)
@@ -634,10 +727,10 @@ async fn handle_request(
                     // The same holds for any package published here, internal
                     // namespace or not: an upstream copy must never replace it.
                     if has_local_versions(&state.storage, &package_name).await {
-                        let base = nora_base_url(&state);
                         return packument_response(
                             &headers,
-                            rebase_hosted_tarballs(data, &base, &package_name),
+                            rebase_hosted_tarballs(data, PUBLIC_BASE, &package_name),
+                            &base,
                         );
                     }
                     if crate::curation::is_internal_namespace(
@@ -645,7 +738,7 @@ async fn handle_request(
                         crate::curation::RegistryType::Npm,
                         &package_name,
                     ) {
-                        return packument_response(&headers, data);
+                        return packument_response(&headers, data, &base);
                     }
                     // Single-flight: when a popular packument expires and a CI
                     // fleet stampedes the same key, one request revalidates
@@ -663,7 +756,7 @@ async fn handle_request(
                         refetch_metadata(&state, &path, &key).await.map(Bytes::from)
                     };
                     if let Some(fresh) = fresh {
-                        return packument_response(&headers, fresh);
+                        return packument_response(&headers, fresh, &base);
                     }
                     // Upstream failed — serve stale if configured, otherwise 502
                     if state.config.npm.serve_stale {
@@ -674,7 +767,7 @@ async fn handle_request(
                         );
                         // Degraded, but still the representation that was asked
                         // for: body and Content-Type must agree here too.
-                        let (stale_body, stale_type) = packument_body(&headers, data);
+                        let (stale_body, stale_type) = packument_body(&headers, data, &base);
                         return (
                             StatusCode::OK,
                             [
@@ -701,7 +794,7 @@ async fn handle_request(
                     return StatusCode::BAD_GATEWAY.into_response();
                 }
             }
-            return packument_response(&headers, data);
+            return packument_response(&headers, data, &base);
         }
 
         // Tarball: integrity check if hash exists
@@ -810,10 +903,10 @@ async fn handle_request(
                     "Rebuilt packument from per-version keys"
                 );
                 state.metrics.record_cache_hit("npm");
-                let base = nora_base_url(&state);
                 return packument_response(
                     &headers,
-                    rebase_hosted_tarballs(data, &base, &package_name),
+                    rebase_hosted_tarballs(data, PUBLIC_BASE, &package_name),
+                    &base,
                 );
             }
         }
@@ -850,6 +943,17 @@ async fn handle_request(
                 let data_to_serve;
 
                 if is_tarball {
+                    // Curation integrity runs on the first serve too, not only on cache
+                    // hits: a blocked body is neither served nor cached.
+                    if let Some(response) = crate::curation::verify_integrity(
+                        &state.curation().curation_engine,
+                        crate::curation::RegistryType::Npm,
+                        &package_name,
+                        tarball_version.as_deref(),
+                        &data,
+                    ) {
+                        return response;
+                    }
                     // Compute and store sha256
                     if fetched {
                         let hash = hex::encode(sha2::Sha256::digest(&data));
@@ -878,8 +982,8 @@ async fn handle_request(
                     data_to_serve = data;
                 } else {
                     // Metadata: rewrite tarball URLs to point to NORA
-                    let nora_base = nora_base_url(&state);
-                    let rewritten = rewrite_tarball_urls(&data, &nora_base, proxy_url)
+                    let nora_base = PUBLIC_BASE;
+                    let rewritten = rewrite_tarball_urls(&data, nora_base, proxy_url)
                         .unwrap_or_else(|()| {
                             tracing::warn!(
                                 path = %path,
@@ -967,7 +1071,7 @@ async fn handle_request(
                 if is_tarball {
                     return with_content_type(true, data_to_serve).into_response();
                 }
-                return packument_response(&headers, data_to_serve);
+                return packument_response(&headers, data_to_serve, &base);
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
             // The upstream answered "no such package": a real 404.
@@ -1110,26 +1214,32 @@ fn rebase_hosted_tarballs(data: Bytes, nora_base: &str, name: &str) -> Bytes {
         .get_mut("versions")
         .and_then(|v| v.as_object_mut());
     for version in versions.into_iter().flat_map(|v| v.values_mut()) {
-        let Some(tarball) = version.pointer_mut("/dist/tarball") else {
-            continue;
-        };
-        let Some(file) = tarball
-            .as_str()
-            .and_then(|t| t.rsplit_once("/-/"))
-            .map(|(_, f)| f)
-        else {
-            continue;
-        };
-        let rebased = format!("{prefix}{file}");
-        if tarball.as_str() != Some(rebased.as_str()) {
-            *tarball = serde_json::Value::String(rebased);
-            changed = true;
-        }
+        changed |= rebase_tarball(version, &prefix);
     }
     match changed.then(|| serde_json::to_vec(&packument)) {
         Some(Ok(bytes)) => Bytes::from(bytes),
         _ => data,
     }
+}
+
+/// Point one version's `dist.tarball` at `<prefix><file>`; whether it changed.
+fn rebase_tarball(version: &mut serde_json::Value, prefix: &str) -> bool {
+    let Some(tarball) = version.pointer_mut("/dist/tarball") else {
+        return false;
+    };
+    let Some(file) = tarball
+        .as_str()
+        .and_then(|t| t.rsplit_once("/-/"))
+        .map(|(_, f)| f)
+    else {
+        return false;
+    };
+    let rebased = format!("{prefix}{file}");
+    if tarball.as_str() == Some(rebased.as_str()) {
+        return false;
+    }
+    *tarball = serde_json::Value::String(rebased);
+    true
 }
 
 /// Refetch metadata from upstream, rewrite URLs, update cache.
@@ -1174,6 +1284,15 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
                     crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
                         .with_label_values(&["npm"])
                         .inc_by(cached.len() as u64);
+                    // Cached before PUBLIC_BASE: its tarball URLs carry the public_url
+                    // of that day, and a 304 would keep them forever. Without
+                    // validators the next revalidation refetches it in the current form.
+                    // ponytail: a packument with no tarball NORA rewrites never carries
+                    // PUBLIC_BASE, so it loses conditional revalidation.
+                    if memchr::memmem::find(&cached, PUBLIC_BASE.as_bytes()).is_none() {
+                        let _ = state.storage.delete(&validators_key(key)).await;
+                    }
+
                     // Re-put bumps the file mtime (the freshness source) without an
                     // upstream download.
                     let storage = state.storage.clone();
@@ -1206,9 +1325,9 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
             if has_local_versions(&state.storage, path).await {
                 return None;
             }
-            let nora_base = nora_base_url(state);
+            let nora_base = PUBLIC_BASE;
             let rewritten =
-                rewrite_tarball_urls(&body, &nora_base, proxy_url).unwrap_or_else(|()| {
+                rewrite_tarball_urls(&body, nora_base, proxy_url).unwrap_or_else(|()| {
                     tracing::warn!(
                         path = %path,
                         "npm metadata refetch: JSON parse failed, using byte-level URL rewrite"
@@ -1280,6 +1399,13 @@ async fn handle_publish(
                 .into_response();
         };
         return set_dist_tag(&state, &authority, &user, rest, Some(&version)).await;
+    }
+    // `npm login` / `npm adduser` (CouchDB user document): NORA has no user database.
+    if path.starts_with("-/user/") {
+        return audit_refused(StatusCode::METHOD_NOT_ALLOWED, NPM_LOGIN_UNSUPPORTED);
+    }
+    if let Some((name, _rev)) = path.rsplit_once("/-rev/") {
+        return unpublish_put(&state, &authority, &user, name, &body).await;
     }
     let package_name = path;
 
@@ -1390,6 +1516,20 @@ async fn handle_publish(
             )
                 .into_response();
         }
+        // As on npmjs, a version string once published is never reused, even after
+        // an unpublish: a lockfile pinning it must not resolve to different bytes.
+        if state
+            .storage
+            .stat(&time_key(&package_name, ver))
+            .await
+            .is_some()
+        {
+            return (
+                StatusCode::CONFLICT,
+                format!("Version {ver} was published before and cannot be reused"),
+            )
+                .into_response();
+        }
     }
 
     // Lazily migrate an old embedded-packument package to per-version keys BEFORE writing the new
@@ -1449,8 +1589,9 @@ async fn handle_publish(
     // Write each new version as its OWN immutable key, with the tarball URL rewritten to point at
     // this registry. Concurrent publishes of DIFFERENT versions write distinct keys, so none is
     // lost — the heart of the #39 fix (vs the old read-merge-write of the shared packument).
-    let nora_base = nora_base_url(&state);
+    let nora_base = PUBLIC_BASE;
     let short_name = package_name.split('/').next_back().unwrap_or(&package_name);
+    let now = npm_time_now();
     for (ver, ver_data) in new_versions {
         let mut vd = ver_data.clone();
         if let Some(dist) = vd.get_mut("dist") {
@@ -1469,6 +1610,12 @@ async fn handle_publish(
                 if let Err(e) = state.storage.put(&version_key, &bytes).await {
                     tracing::error!(key = %version_key, error = ?e, "npm publish: failed to store version");
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+                // The packument's `time[<ver>]`; best-effort, an unpublish writes it
+                // if missing.
+                let key = time_key(&package_name, ver);
+                if let Err(e) = state.storage.put(&key, now.as_bytes()).await {
+                    tracing::warn!(key = %key, error = ?e, "npm publish: failed to store publish time");
                 }
             }
             Err(e) => {
@@ -1565,18 +1712,232 @@ async fn handle_publish(
     StatusCode::CREATED.into_response()
 }
 
-/// `DELETE /-/package/<name>/dist-tags/<tag>` (`npm dist-tag rm`). Unpublish is not
-/// supported: versions are immutable.
+/// Shown to `npm login` / `npm adduser`.
+const NPM_LOGIN_UNSUPPORTED: &str = "npm login is not supported by this registry: create an \
+     API token in the NORA UI and set //<host>/npm/:_authToken=<token> in .npmrc";
+
+/// `DELETE /-/package/<name>/dist-tags/<tag>` (`npm dist-tag rm`), and the DELETEs of
+/// `npm unpublish`: `/<name>/-rev/<rev>` (the whole package) and
+/// `/<tarball path>/-rev/<rev>` (the tarball of a version already unpublished).
 async fn handle_npm_delete(
     State(state): State<AppState>,
     Path(path): Path<String>,
     Extension(authority): Extension<NamespaceAuthority>,
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
 ) -> Response {
-    match path.strip_prefix("-/package/") {
-        Some(rest) => set_dist_tag(&state, &authority, &user, rest, None).await,
-        None => method_not_allowed("GET, PUT, POST"),
+    if let Some(rest) = path.strip_prefix("-/package/") {
+        return set_dist_tag(&state, &authority, &user, rest, None).await;
     }
+    let Some((target, _rev)) = path.rsplit_once("/-rev/") else {
+        return method_not_allowed("GET, PUT, POST");
+    };
+    if let Some((prefix, file)) = target.rsplit_once("/-/") {
+        return unpublish_tarball(&state, &authority, prefix, file).await;
+    }
+    let name = target;
+    if enforce_namespace_scope(&authority, name).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let lock = state.publish_lock(&format!("npm/{name}/metadata.json"));
+    let _guard = lock.lock().await;
+    let versions = local_version_list(&state.storage, name).await;
+    if versions.is_empty() {
+        return not_published_here(name);
+    }
+    unpublish(&state, &user, name, &versions).await
+}
+
+/// `npm unpublish <pkg>@<ver>`, first step: `PUT /<name>/-rev/<rev>` with the packument
+/// minus that version. NORA keeps no revisions, so the version missing from the body
+/// is the one removed; a body missing more than one (a version published after the
+/// client read the packument) is a conflict, as a stale `_rev` is on npmjs. A body
+/// missing none (`npm owner`) applies only `deprecated`, as `npm deprecate` does.
+async fn unpublish_put(
+    state: &AppState,
+    authority: &NamespaceAuthority,
+    user: &Option<Extension<crate::auth::AuthenticatedUser>>,
+    name: &str,
+    body: &[u8],
+) -> Response {
+    if enforce_namespace_scope(authority, name).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return (StatusCode::BAD_REQUEST, "Invalid JSON").into_response();
+    };
+    if payload.get("name").and_then(|n| n.as_str()) != Some(name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Package name in URL does not match payload",
+        )
+            .into_response();
+    }
+    let Some(kept) = payload.get("versions").and_then(|v| v.as_object()) else {
+        return (StatusCode::BAD_REQUEST, "Missing versions").into_response();
+    };
+    let lock = state.publish_lock(&format!("npm/{name}/metadata.json"));
+    let guard = lock.lock().await;
+    let local = local_version_list(&state.storage, name).await;
+    if local.is_empty() {
+        return not_published_here(name);
+    }
+    let missing: Vec<String> = local
+        .into_iter()
+        .filter(|v| !kept.contains_key(v))
+        .collect();
+    match missing.len() {
+        0 => {
+            drop(guard);
+            deprecate_versions(state, user, name, &payload).await
+        }
+        1 => unpublish(state, user, name, &missing).await,
+        _ => audit_refused(
+            StatusCode::CONFLICT,
+            "the packument changed since it was read; unpublish one version at a time",
+        ),
+    }
+}
+
+/// Remove `versions` of a package published here: each version's document, tarball
+/// and the dist-tags pointing at it. `time[<ver>]` stays as the tombstone that keeps
+/// the version string from being published again. With no version left the packument,
+/// package fields and tags go too. The caller holds the package's publish lock.
+async fn unpublish(
+    state: &AppState,
+    user: &Option<Extension<crate::auth::AuthenticatedUser>>,
+    name: &str,
+    versions: &[String],
+) -> Response {
+    let storage = &state.storage;
+    let short = name.rsplit('/').next().unwrap_or(name);
+    for ver in versions {
+        let tombstone = time_key(name, ver);
+        if storage.stat(&tombstone).await.is_none()
+            && storage
+                .put(&tombstone, npm_time_now().as_bytes())
+                .await
+                .is_err()
+        {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        if storage
+            .delete(&format!("npm/{name}/versions/{ver}.json"))
+            .await
+            .is_err()
+        {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        let tarball = format!("npm/{name}/tarballs/{short}-{ver}.tgz");
+        let _ = storage.delete(&format!("{tarball}.sha256")).await;
+        let _ = storage.delete(&tarball).await;
+    }
+    let remaining = has_local_versions(storage, name).await;
+    for (tag_key, data) in super::read_keyed_blobs(storage, &format!("npm/{name}/dist-tags/")).await
+    {
+        let target = String::from_utf8_lossy(&data);
+        if !remaining || versions.iter().any(|v| *v == target.trim()) {
+            let _ = storage.delete(&tag_key).await;
+        }
+    }
+    let rebuilt = if remaining {
+        // `latest` pointed at a removed version: regenerate derives the highest left.
+        regenerate_packument(storage, name).await.is_ok()
+    } else {
+        let _ = storage.delete(&format!("npm/{name}/pkg.json")).await;
+        storage
+            .delete(&format!("npm/{name}/metadata.json"))
+            .await
+            .is_ok()
+    };
+    if !rebuilt {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let detail = if remaining {
+        versions.join(",")
+    } else {
+        "*".to_string()
+    };
+    let actor = crate::auth::audit_actor(user);
+    state
+        .audit
+        .log(AuditEntry::new("unpublish", actor, name, "npm", &detail));
+    state.repo_index.invalidate("npm");
+    axum::Json(serde_json::json!({})).into_response()
+}
+
+/// `npm unpublish <pkg>@<ver>`, last step: `DELETE /<tarball path>/-rev/<rev>`. The
+/// path is the tarball URL's (so it may carry `public_url`'s path and `npm/`); the
+/// package is its last segment, or last two when scoped. The PUT already removed the
+/// tarball, so this only clears what is left of a version unpublished here.
+async fn unpublish_tarball(
+    state: &AppState,
+    authority: &NamespaceAuthority,
+    prefix: &str,
+    file: &str,
+) -> Response {
+    let mut tail = prefix.rsplit('/');
+    let name = match (tail.next(), tail.next()) {
+        (Some(last), Some(scope)) if scope.starts_with('@') => format!("{scope}/{last}"),
+        (Some(last), _) => last.to_string(),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    if enforce_namespace_scope(authority, &name).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let version = crate::curation::parse_npm_tarball_version(&name, file);
+    let (Some(ver), true) = (version, is_valid_attachment_name(file)) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let lock = state.publish_lock(&format!("npm/{name}/metadata.json"));
+    let _guard = lock.lock().await;
+    if state
+        .storage
+        .stat(&format!("npm/{name}/versions/{ver}.json"))
+        .await
+        .is_some()
+    {
+        return audit_refused(StatusCode::CONFLICT, "this version is still published");
+    }
+    if state.storage.stat(&time_key(&name, &ver)).await.is_none() {
+        return not_published_here(&name);
+    }
+    let tarball = format!("npm/{name}/tarballs/{file}");
+    let _ = state.storage.delete(&format!("{tarball}.sha256")).await;
+    let _ = state.storage.delete(&tarball).await;
+    axum::Json(serde_json::json!({})).into_response()
+}
+
+/// Unpublish refused: only what was published to this registry can be removed, and a
+/// proxied package is never touched (nor its name sent upstream). 403, not 404: npm
+/// treats a 404 on unpublish as already done and would report success.
+fn not_published_here(name: &str) -> Response {
+    audit_refused(
+        StatusCode::FORBIDDEN,
+        &format!("{name} has no versions published to this registry"),
+    )
+}
+
+/// The versions published here, from their `versions/<v>.json` keys.
+async fn local_version_list(storage: &crate::Storage, name: &str) -> Vec<String> {
+    storage
+        .list(&format!("npm/{name}/versions/"))
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|key| key.rsplit('/').next()?.strip_suffix(".json"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `npm/<name>/time/<ver>`: when the version was published, as the packument's
+/// `time[<ver>]`. Kept after an unpublish, so a version string is never reused.
+fn time_key(name: &str, ver: &str) -> String {
+    format!("npm/{name}/time/{ver}")
+}
+
+/// Now, as npm writes `time` entries (`2024-01-15T10:30:00.000Z`).
+fn npm_time_now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// Point (`Some(version)`) or remove (`None`) a dist-tag of a package published here.
@@ -1706,11 +2067,15 @@ pub(crate) async fn regenerate_packument(
     // runs on a read (#956), so a package with thousands of versions used to pay them
     // one after another. An unreadable or unparsable key is skipped, as before.
     let versions_prefix = format!("npm/{}/versions/", package_name);
+    // A version stored with an absolute tarball URL (published before PUBLIC_BASE)
+    // follows `public_url` like the rest.
+    let tarball_prefix = format!("{PUBLIC_BASE}/npm/{package_name}/-/");
     let mut versions = serde_json::Map::new();
     for (key, data) in super::read_keyed_blobs(storage, &versions_prefix).await {
-        let Ok(vd) = serde_json::from_slice::<serde_json::Value>(&data) else {
+        let Ok(mut vd) = serde_json::from_slice::<serde_json::Value>(&data) else {
             continue;
         };
+        rebase_tarball(&mut vd, &tarball_prefix);
         if let Some(ver) = key.rsplit('/').next().and_then(|f| f.strip_suffix(".json")) {
             versions.insert(ver.to_string(), vd);
         }
@@ -1746,7 +2111,26 @@ pub(crate) async fn regenerate_packument(
     );
     obj.insert("versions".to_string(), serde_json::Value::Object(versions));
 
+    // `time`: when each version was published here (unpublished ones included, as on
+    // npmjs), plus `created`/`modified`. The values share one format, so the string
+    // order is the time order.
+    let mut time = serde_json::Map::new();
+    for (key, data) in super::read_keyed_blobs(storage, &format!("npm/{package_name}/time/")).await
+    {
+        if let (Some(ver), Ok(at)) = (key.rsplit('/').next(), String::from_utf8(data.to_vec())) {
+            time.insert(ver.to_string(), serde_json::Value::String(at));
+        }
+    }
+    let span = time.values().filter_map(|t| t.as_str());
+    if let (Some(created), Some(modified)) = (span.clone().min(), span.max()) {
+        let (created, modified) = (created.to_string(), modified.to_string());
+        time.insert("created".to_string(), created.into());
+        time.insert("modified".to_string(), modified.into());
+        obj.insert("time".to_string(), serde_json::Value::Object(time));
+    }
+
     let bytes = serde_json::to_vec(&packument).map_err(|_| ())?;
+
     storage
         .put(&format!("npm/{}/metadata.json", package_name), &bytes)
         .await
@@ -1853,8 +2237,8 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
         // Rewrite tarball URLs to point at NORA, exactly as the proxy path and
         // refetch_metadata do, so a subsequent client reading the cached
         // packument is not sent back to the upstream.
-        let nora_base = nora_base_url(state);
-        let rewritten = rewrite_tarball_urls(&data, &nora_base, proxy_url).unwrap_or_else(|()| {
+        let nora_base = PUBLIC_BASE;
+        let rewritten = rewrite_tarball_urls(&data, nora_base, proxy_url).unwrap_or_else(|()| {
             tracing::warn!(
                 package = %package_name,
                 "npm metadata self-prime: JSON parse failed, using byte-level URL rewrite",
@@ -1973,20 +2357,22 @@ fn abbreviate_packument(full: &[u8]) -> Option<Vec<u8>> {
 /// `Vary: Accept` is not decoration here: the body depends on a request header
 /// and NORA marks metadata `Cache-Control: public`, so without it a shared cache
 /// can hand the abbreviated document to a client that asked for the full one.
-fn packument_body(headers: &HeaderMap, data: Bytes) -> (Bytes, &'static str) {
-    if !wants_install_v1(headers) {
-        return (data, "application/json");
-    }
-    match abbreviate_packument(&data) {
-        Some(short) => (Bytes::from(short), NPM_INSTALL_V1),
-        // Unparsable body: serve it unchanged. The client asked for a
-        // projection of this document, not for an error.
-        None => (data, "application/json"),
-    }
+fn packument_body(headers: &HeaderMap, data: Bytes, nora_base: &str) -> (Bytes, &'static str) {
+    let (body, content_type) = if !wants_install_v1(headers) {
+        (data, "application/json")
+    } else {
+        match abbreviate_packument(&data) {
+            Some(short) => (Bytes::from(short), NPM_INSTALL_V1),
+            // Unparsable body: serve it unchanged. The client asked for a
+            // projection of this document, not for an error.
+            None => (data, "application/json"),
+        }
+    };
+    (with_public_base(body, nora_base), content_type)
 }
 
-fn packument_response(headers: &HeaderMap, data: Bytes) -> Response {
-    let (body, content_type) = packument_body(headers, data);
+fn packument_response(headers: &HeaderMap, data: Bytes, nora_base: &str) -> Response {
+    let (body, content_type) = packument_body(headers, data, nora_base);
 
     (
         StatusCode::OK,
@@ -2352,6 +2738,29 @@ mod tests {
         assert_eq!(
             json["repository"]["url"],
             "git+https://github.com/test/test.git"
+        );
+    }
+
+    /// The byte-level safety net rewrites this package's upstream tarball links only:
+    /// a readme that mentions the upstream registry is not touched.
+    #[test]
+    fn rewrite_safety_net_touches_only_tarball_links() {
+        let metadata = serde_json::json!({
+            "name": "test",
+            "readme": "npm config set registry https://registry.npmjs.org/",
+            "versions": { "1.0.0": {
+                "dist": { "tarball": "https://registry.npmjs.org/test/-/test-1.0.0.tgz" },
+                "_resolved": "https://registry.npmjs.org/test/-/test-1.0.0.tgz"
+            } }
+        });
+        let data = serde_json::to_vec(&metadata).unwrap();
+        let out =
+            rewrite_tarball_urls(&data, "http://nora:5000", "https://registry.npmjs.org/").unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(json["readme"], metadata["readme"]);
+        assert_eq!(
+            json["versions"]["1.0.0"]["_resolved"],
+            "http://nora:5000/npm/test/-/test-1.0.0.tgz"
         );
     }
 
@@ -2985,9 +3394,11 @@ mod integration_tests {
             !tarball_url.contains(&upstream.uri()[..]),
             "upstream tarball URL leaked into cached metadata: {tarball_url}"
         );
-        assert!(
-            tarball_url.starts_with("http://127.0.0.1") && tarball_url.contains("/npm/"),
-            "tarball URL not rewritten to NORA: {tarball_url}"
+        // Stored against PUBLIC_BASE; every serve substitutes the current public_url.
+        assert_eq!(
+            tarball_url,
+            format!("{}/npm/testpkg/-/testpkg-1.0.0.tgz", super::PUBLIC_BASE),
+            "tarball URL not rewritten to NORA"
         );
 
         // The publish date must now be resolvable from the cached packument.
@@ -3938,6 +4349,357 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let json = packument(&ctx.app, "old-pkg").await;
         assert!(json["versions"]["1.0.0"].get("deprecated").is_none());
+    }
+
+    /// `npm unpublish` as the npm CLI drives it: PUT the packument minus a version to
+    /// `/-rev/`, DELETE the tarball by its URL path, DELETE `/-rev/` for the rest. A
+    /// version string is never published again.
+    #[tokio::test]
+    async fn unpublish_version_then_package() {
+        let ctx = create_test_context();
+        let name = "@corp/gone";
+        for ver in ["1.0.0", "2.0.0"] {
+            assert_eq!(publish(&ctx.app, name, ver).await, StatusCode::CREATED);
+        }
+        let tag = "/npm/-/package/@corp/gone/dist-tags/beta";
+        assert_eq!(
+            send(&ctx.app, Method::PUT, tag, "\"2.0.0\"").await.status(),
+            StatusCode::OK
+        );
+        let put = |doc: &serde_json::Value| Body::from(serde_json::to_vec(doc).unwrap());
+        let rev = "/npm/@corp/gone/-rev/undefined";
+
+        // A body missing two versions is a stale read: refused, nothing removed.
+        let mut doc = packument(&ctx.app, name).await;
+        doc["versions"] = serde_json::json!({});
+        let resp = send(&ctx.app, Method::PUT, rev, put(&doc)).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        let mut doc = packument(&ctx.app, name).await;
+        doc["versions"].as_object_mut().unwrap().remove("2.0.0");
+        let resp = send(&ctx.app, Method::PUT, rev, put(&doc)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = packument(&ctx.app, name).await;
+        assert_eq!(json["versions"].as_object().unwrap().len(), 1, "{json}");
+        assert_eq!(json["dist-tags"]["latest"], "1.0.0", "{json}");
+        assert!(json["dist-tags"].get("beta").is_none(), "{json}");
+        assert!(
+            json["time"].get("2.0.0").is_some(),
+            "tombstone kept: {json}"
+        );
+        let storage = &ctx.state.storage;
+        assert!(storage
+            .stat("npm/@corp/gone/tarballs/gone-2.0.0.tgz")
+            .await
+            .is_none());
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/@corp/gone/-/gone-2.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // The tarball DELETE carries the tarball URL's path (`npm/` included).
+        let del = "/npm/npm/@corp/gone/-/gone-2.0.0.tgz/-rev/2-x";
+        assert_eq!(
+            send(&ctx.app, Method::DELETE, del, "").await.status(),
+            StatusCode::OK
+        );
+        let live = "/npm/npm/@corp/gone/-/gone-1.0.0.tgz/-rev/2-x";
+        assert_eq!(
+            send(&ctx.app, Method::DELETE, live, "").await.status(),
+            StatusCode::CONFLICT,
+            "a published version's tarball is not deleted"
+        );
+
+        assert_eq!(publish(&ctx.app, name, "2.0.0").await, StatusCode::CONFLICT);
+        assert_eq!(publish(&ctx.app, name, "3.0.0").await, StatusCode::CREATED);
+
+        let resp = send(&ctx.app, Method::DELETE, rev, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = send(&ctx.app, Method::GET, "/npm/@corp/gone", "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(storage
+            .list("npm/@corp/gone/tarballs/")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(publish(&ctx.app, name, "1.0.0").await, StatusCode::CONFLICT);
+
+        // A package not published here is never unpublished (403: npm takes a 404
+        // as already done).
+        let resp = send(&ctx.app, Method::DELETE, "/npm/lodash/-rev/1", "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Hosted packuments carry `time` (per version, `created`, `modified`), and the
+    /// release-age date of a hosted version is read from it.
+    #[tokio::test]
+    async fn hosted_packument_has_time_map() {
+        let ctx = create_test_context();
+        assert_eq!(
+            publish(&ctx.app, "timed", "1.0.0").await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            publish(&ctx.app, "timed", "1.1.0").await,
+            StatusCode::CREATED
+        );
+        let json = packument(&ctx.app, "timed").await;
+        let time = &json["time"];
+        assert_eq!(time["created"], time["1.0.0"], "{json}");
+        assert_eq!(time["modified"], time["1.1.0"], "{json}");
+        let date = super::extract_npm_publish_date(
+            &ctx.state.storage,
+            "npm/timed/metadata.json",
+            "1.0.0",
+            true,
+        )
+        .await;
+        let now = chrono::Utc::now().timestamp();
+        assert!(date.is_some_and(|d| (now - d).abs() < 60), "{date:?}");
+    }
+
+    /// Tarball URLs follow the current `public_url` on every serve path: a fresh
+    /// hosted packument, a version stored with an absolute URL before PUBLIC_BASE, a
+    /// fresh proxied packument and one an upstream 304 keeps.
+    #[tokio::test]
+    async fn tarball_urls_follow_public_url() {
+        use crate::test_helpers::{
+            create_test_context_with_config, create_test_context_with_storage_and_config,
+        };
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header("if-none-match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_json(serde_json::json!({
+                        "name": "lodash",
+                        "versions": { "1.0.0": { "dist": {
+                            "tarball": format!("{}/lodash/-/lodash-1.0.0.tgz", upstream.uri())
+                        } } }
+                    })),
+            )
+            .mount(&upstream)
+            .await;
+        let old = create_test_context_with_config(|cfg| {
+            cfg.server.public_url = Some("https://old.example".into());
+            cfg.npm.proxy = Some(upstream.uri());
+        });
+        let storage = old.state.storage.clone();
+        let tarball =
+            |json: &serde_json::Value| json["versions"]["1.0.0"]["dist"]["tarball"].clone();
+
+        assert_eq!(
+            publish(&old.app, "hosted", "1.0.0").await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            tarball(&packument(&old.app, "hosted").await),
+            "https://old.example/npm/hosted/-/hosted-1.0.0.tgz"
+        );
+        assert_eq!(
+            tarball(&packument(&old.app, "lodash").await),
+            "https://old.example/npm/lodash/-/lodash-1.0.0.tgz"
+        );
+        // Published before PUBLIC_BASE: an absolute URL in the version document.
+        storage
+            .put(
+                "npm/legacy/versions/1.0.0.json",
+                br#"{"dist":{"tarball":"http://older:4000/npm/legacy/-/legacy-1.0.0.tgz"}}"#,
+            )
+            .await
+            .unwrap();
+        super::regenerate_packument(&storage, "legacy")
+            .await
+            .unwrap();
+        // The proxy cache write is spawned; wait for it.
+        for _ in 0..50 {
+            if storage.stat("npm/lodash/metadata.json").await.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let new = create_test_context_with_storage_and_config(storage.clone(), |cfg| {
+            cfg.server.public_url = Some("https://new.example/".into());
+            cfg.npm.proxy = Some(upstream.uri());
+        });
+        for name in ["hosted", "legacy", "lodash"] {
+            assert_eq!(
+                tarball(&packument(&new.app, name).await),
+                format!("https://new.example/npm/{name}/-/{name}-1.0.0.tgz"),
+                "fresh {name}"
+            );
+        }
+
+        // Stale: the upstream answers 304 and the cached body is served.
+        crate::registry::write_validators(
+            &storage,
+            "npm/lodash/metadata.json",
+            &crate::registry::Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+        let stale = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.server.public_url = Some("https://stale.example".into());
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 0;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let before = crate::metrics::PROXY_UPSTREAM_304_TOTAL
+            .with_label_values(&["npm"])
+            .get();
+        assert_eq!(
+            tarball(&packument(&stale.app, "lodash").await),
+            "https://stale.example/npm/lodash/-/lodash-1.0.0.tgz"
+        );
+        let after = crate::metrics::PROXY_UPSTREAM_304_TOTAL
+            .with_label_values(&["npm"])
+            .get();
+        assert!(after > before, "served through a 304");
+    }
+
+    /// Digest quarantine never holds a tarball published here.
+    #[tokio::test]
+    async fn quarantine_skips_hosted_tarballs() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("1h".to_string());
+        });
+        assert_eq!(
+            publish(&ctx.app, "fresh", "1.0.0").await,
+            StatusCode::CREATED
+        );
+        let resp = send(&ctx.app, Method::GET, "/npm/fresh/-/fresh-1.0.0.tgz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"tgz");
+    }
+
+    /// An allowlisted integrity pin is checked on the first proxied download too: a
+    /// mismatching body is neither served nor cached.
+    #[tokio::test]
+    async fn integrity_pin_checked_on_first_proxied_download() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"TAMPERED".to_vec()))
+            .mount(&upstream)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = dir.path().join("allowlist.json");
+        let pin = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"GENUINE"));
+        std::fs::write(
+            &allowlist,
+            format!(
+                r#"{{"version": 1, "entries": [{{"registry": "npm", "name": "pinned",
+                "version": "1.0.0", "integrity": "sha256:{pin}"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(allowlist.to_string_lossy().into_owned());
+        });
+        let resp = send(&ctx.app, Method::GET, "/npm/pinned/-/pinned-1.0.0.tgz", "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(ctx
+            .state
+            .storage
+            .stat("npm/pinned/tarballs/pinned-1.0.0.tgz")
+            .await
+            .is_none());
+    }
+
+    /// `npm ping`, `npm search` and `npm login` are registry endpoints, not packuments:
+    /// nothing under `npm/-/` is cached, and only search reaches the upstream, with
+    /// its query, while no name is private.
+    #[tokio::test]
+    async fn registry_endpoints_are_not_packuments() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/-/v1/search"))
+            .and(query_param("text", "left pad"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "objects": [], "total": 0
+            })))
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+        });
+
+        let resp = send(&ctx.app, Method::GET, "/npm/-/ping", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"{}");
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/-/v1/search?text=left%20pad",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["total"], 0);
+        let resp = send(&ctx.app, Method::GET, "/npm/-/org/corp/package", "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let requests = upstream.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "only the search went upstream");
+        assert!(ctx.state.storage.list("npm/-/").await.unwrap().is_empty());
+
+        // Under a namespace filter the search text could carry a private name.
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.curation.internal_namespaces = vec!["@corp/*".to_string()];
+        });
+        let resp = send(&ctx.app, Method::GET, "/npm/-/v1/search?text=%40corp", "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// `npm login` gets a 405 that says how to set up a token, without credentials,
+    /// and the PUT never becomes a publish.
+    #[tokio::test]
+    async fn npm_login_points_at_token_setup() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let user = serde_json::json!({
+            "_id": "org.couchdb.user:bob", "name": "bob", "password": "x",
+            "_attachments": { "x.tgz": { "data": "eA==" } }, "versions": {}
+        });
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/npm/-/user/org.couchdb.user:bob",
+            Body::from(serde_json::to_vec(&user).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let error = body_json(resp).await["error"].as_str().unwrap().to_string();
+        assert!(error.contains("_authToken"), "{error}");
+        assert!(ctx.state.storage.list("npm/").await.unwrap().is_empty());
+    }
+
+    async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {
+        serde_json::from_slice(&body_bytes(resp).await).unwrap()
     }
 }
 
