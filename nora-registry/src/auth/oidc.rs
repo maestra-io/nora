@@ -26,6 +26,9 @@ use std::time::{Duration, Instant};
 use crate::config::{OidcConfig, OidcProvider, ScopeEnforcement};
 use crate::tokens::Role;
 
+/// On an unknown `kid`, refetch the JWKS if the cached set is older than this.
+const JWKS_KID_MISS_REFETCH: Duration = Duration::from_secs(60);
+
 /// Result of a successful OIDC authentication.
 #[derive(Debug, Clone)]
 pub struct OidcIdentity {
@@ -163,27 +166,38 @@ impl OidcValidator {
             ));
         }
 
-        // Get JWKS (cached or fetch)
-        let jwks = self.get_jwks(provider).await?;
-
         // Find the matching key by kid
         let kid = header.kid.as_deref().unwrap_or("");
-        let jwk = jwks
-            .keys
-            .iter()
-            .find(|k| {
-                k.common.key_id.as_deref() == Some(kid) || (kid.is_empty() && jwks.keys.len() == 1)
-            })
+        let find = |jwks: &JwkSet| {
+            jwks.keys
+                .iter()
+                .find(|k| {
+                    k.common.key_id.as_deref() == Some(kid)
+                        || (kid.is_empty() && jwks.keys.len() == 1)
+                })
+                .cloned()
+        };
+        let cache_ttl = Duration::from_secs(self.config.jwks_cache_secs);
+        let jwk = match find(&self.get_jwks(provider, cache_ttl).await?) {
+            Some(jwk) => jwk,
+            // Unknown kid: the issuer may have rotated keys. Refetch once, unless the
+            // cached set is younger than JWKS_KID_MISS_REFETCH (bounds forged-kid traffic).
+            None => find(
+                &self
+                    .get_jwks(provider, cache_ttl.min(JWKS_KID_MISS_REFETCH))
+                    .await?,
+            )
             .ok_or_else(|| {
                 format!(
                     "No matching key (kid={}) in JWKS for provider {}",
                     kid, provider.name
                 )
-            })?;
+            })?,
+        };
 
         // Build decoding key from JWK
         let decoding_key =
-            DecodingKey::from_jwk(jwk).map_err(|e| format!("Cannot build key from JWK: {}", e))?;
+            DecodingKey::from_jwk(&jwk).map_err(|e| format!("Cannot build key from JWK: {}", e))?;
 
         // Full validation
         let mut validation = Validation::new(header.alg);
@@ -232,10 +246,12 @@ impl OidcValidator {
         })
     }
 
-    /// Fetch or return cached JWKS for a provider.
-    async fn get_jwks(&self, provider: &OidcProvider) -> Result<JwkSet, String> {
-        let cache_ttl = Duration::from_secs(self.config.jwks_cache_secs);
-
+    /// Fetch, or return the cached JWKS for a provider if younger than `cache_ttl`.
+    async fn get_jwks(
+        &self,
+        provider: &OidcProvider,
+        cache_ttl: Duration,
+    ) -> Result<JwkSet, String> {
         // Try cache first
         {
             let cache = self.jwks_cache.read();
@@ -579,5 +595,82 @@ mod tests {
         assert!(multi.contains("nora"));
         assert!(multi.contains("api"));
         assert!(!multi.contains("other"));
+    }
+
+    /// A token signed with a kid the cached JWKS does not know (the issuer rotated
+    /// keys) triggers one refetch when the cached set is older than 60 s; a younger
+    /// set is trusted, so a forged kid cannot make every request hit the issuer.
+    #[tokio::test]
+    async fn test_unknown_kid_refetches_stale_jwks_once() {
+        use crate::auth::oidc_integration_tests::{TEST_JWKS_JSON, TEST_RSA_PRIVATE_KEY};
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let issuer = server.uri();
+        let config = OidcConfig {
+            enabled: true,
+            jwks_cache_secs: 3600,
+            providers: vec![OidcProvider {
+                name: "ci".to_string(),
+                issuer: issuer.clone(),
+                jwks_uri: Some(format!("{issuer}/jwks")),
+                audience: "nora".to_string(),
+                algorithms: vec!["RS256".to_string()],
+                max_token_lifetime_secs: 900,
+                namespace_scope: vec!["*".to_string()],
+                namespace_scope_enforcement: crate::config::ScopeEnforcement::Enforce,
+                enabled: true,
+                role_rules: vec![OidcRoleRule {
+                    pattern: "repo:myorg/*".to_string(),
+                    role: "read".to_string(),
+                    namespace_scope: None,
+                }],
+            }],
+            ..OidcConfig::default()
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-key-1".to_string());
+        let claims = serde_json::json!({
+            "iss": issuer, "sub": "repo:myorg/app", "aud": "nora", "iat": now, "exp": now + 600,
+        });
+        let key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
+        let token = encode(&header, &claims, &key).unwrap();
+        // Cached set predating the rotation: a single key with another kid.
+        let old: JwkSet =
+            serde_json::from_str(&TEST_JWKS_JSON.replace("test-key-1", "old-key")).unwrap();
+        let primed = |age_secs: u64| {
+            let v = OidcValidator::new(config.clone(), Client::new());
+            v.jwks_cache.write().insert(
+                issuer.clone(),
+                CachedJwks {
+                    jwks: old.clone(),
+                    fetched_at: Instant::now()
+                        .checked_sub(Duration::from_secs(age_secs))
+                        .unwrap(),
+                },
+            );
+            v
+        };
+
+        let young = primed(10);
+        let err = young.validate_token(&token).await.unwrap_err();
+        assert!(err.contains("No matching key"), "{err}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        let aged = primed(120);
+        assert!(aged.validate_token(&token).await.is_ok());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }
