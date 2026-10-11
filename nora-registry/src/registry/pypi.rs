@@ -1073,42 +1073,20 @@ async fn upload(
         None
     };
 
-    // TOCTOU protection: lock per file to prevent concurrent uploads
-    let file_key = format!("pypi/{}/{}", normalized, filename);
-    let lock = state.publish_lock(&file_key);
-    let _guard = lock.lock().await;
-
-    // Check immutability (same filename = already exists)
-    if state.storage.stat(&file_key).await.is_some() {
-        return (
-            StatusCode::CONFLICT,
-            format!("File {} already exists", filename),
-        )
-            .into_response();
-    }
-
-    // Store file
-    if let Err(e) = state
-        .storage
-        .put_from_path(&file_key, &temp_path, Some(&computed_hash))
-        .await
+    if let Err(e) = store_file(
+        &state.storage,
+        &state.publish_locks,
+        &normalized,
+        &filename,
+        &temp_path,
+        &computed_hash,
+        core_meta,
+        requires_python.trim(),
+    )
+    .await
     {
-        tracing::error!(key = %file_key, error = %e, "pypi: failed to store upload");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return e.into_response();
     }
-
-    // Store SHA-256 hash
-    let hash_key = format!("{}.sha256", file_key);
-    if let Err(e) = state.storage.put(&hash_key, computed_hash.as_bytes()).await {
-        tracing::warn!(key = %hash_key, error = %e, "pypi: failed to store hash sidecar");
-    }
-
-    // Hash marker: the simple index reads every digest from one listing.
-    put_hash_marker(&state.storage, &normalized, &filename, &computed_hash).await;
-    if let Some(meta) = core_meta {
-        put_core_metadata(&state.storage, &normalized, &filename, &meta).await;
-    }
-    record_requires_python(&state, &normalized, &filename, requires_python.trim()).await;
 
     state.metrics.record_upload("pypi");
     let artifact = format!("{}-{}", name, version);
@@ -1130,20 +1108,73 @@ async fn upload(
     StatusCode::OK.into_response()
 }
 
+/// Store a validated distribution file of `project` as an upload does, under the file's
+/// publish lock: the file itself (immutable: an existing name is a 409), its `.sha256`
+/// sidecar and hash marker, a wheel's core metadata as `<file>.metadata`, and its
+/// `Requires-Python` (empty = none). Shared with `nora import`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn store_file(
+    storage: &crate::storage::Storage,
+    locks: &crate::PublishLocks,
+    project: &str,
+    filename: &str,
+    src: &std::path::Path,
+    sha256: &str,
+    core_meta: Option<Vec<u8>>,
+    requires_python: &str,
+) -> Result<(), (StatusCode, String)> {
+    // TOCTOU protection: lock per file to prevent concurrent uploads
+    let file_key = format!("pypi/{project}/{filename}");
+    let lock = crate::acquire_publish_lock(locks, &file_key);
+    let _guard = lock.lock().await;
+
+    // Check immutability (same filename = already exists)
+    if storage.stat(&file_key).await.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("File {filename} already exists"),
+        ));
+    }
+
+    // Store file
+    if let Err(e) = storage.put_from_path(&file_key, src, Some(sha256)).await {
+        tracing::error!(key = %file_key, error = %e, "pypi: failed to store upload");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to store {filename}"),
+        ));
+    }
+
+    // Store SHA-256 hash
+    let hash_key = format!("{file_key}.sha256");
+    if let Err(e) = storage.put(&hash_key, sha256.as_bytes()).await {
+        tracing::warn!(key = %hash_key, error = %e, "pypi: failed to store hash sidecar");
+    }
+
+    // Hash marker: the simple index reads every digest from one listing.
+    put_hash_marker(storage, project, filename, sha256).await;
+    if let Some(meta) = core_meta {
+        put_core_metadata(storage, project, filename, &meta).await;
+    }
+    record_requires_python(storage, locks, project, filename, requires_python).await;
+    Ok(())
+}
+
 /// Record twine's `requires_python` for an uploaded file in the project's
 /// [`REQUIRES_PYTHON_FILE`] (an empty one drops a stale entry of an earlier file of the
 /// same name). Best-effort: a failure is logged and the file is listed without it.
 async fn record_requires_python(
-    state: &AppState,
+    storage: &crate::storage::Storage,
+    locks: &crate::PublishLocks,
     project: &str,
     filename: &str,
     requires_python: &str,
 ) {
     use crate::storage::StorageError;
     let key = format!("pypi/{project}/{REQUIRES_PYTHON_FILE}");
-    let lock = state.publish_lock(&key);
+    let lock = crate::acquire_publish_lock(locks, &key);
     let _guard = lock.lock().await;
-    let mut map: serde_json::Map<String, serde_json::Value> = match state.storage.get(&key).await {
+    let mut map: serde_json::Map<String, serde_json::Value> = match storage.get(&key).await {
         Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),
         Err(StorageError::NotFound) if requires_python.is_empty() => return,
         Err(StorageError::NotFound) => serde_json::Map::new(),
@@ -1158,14 +1189,26 @@ async fn record_requires_python(
         map.insert(filename.to_string(), requires_python.into()) != Some(requires_python.into())
     };
     if changed {
-        if let Err(e) = state
-            .storage
+        if let Err(e) = storage
             .put(&key, &serde_json::to_vec(&map).unwrap_or_default())
             .await
         {
             tracing::warn!(key = %key, error = %e, "pypi: failed to store requires-python");
         }
     }
+}
+
+/// The `Requires-Python` header of core metadata (`METADATA` / `PKG-INFO`), if any.
+pub(crate) fn metadata_requires_python(metadata: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(metadata)
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("Requires-Python")
+                .then(|| value.trim().to_string())
+        })
+        .filter(|v| !v.is_empty())
 }
 
 // ============================================================================
@@ -1320,7 +1363,7 @@ pub(crate) fn version_from_filename(filename: &str) -> Option<String> {
 /// `(distribution, version)` of a distribution filename (best-effort):
 /// wheel/egg: `{distribution}-{version}(-{build})?-{py}-...`
 /// sdist: `{name}-{version}.tar.gz|.tar.bz2|.tar.xz|.tgz|.zip`
-fn split_dist_filename(filename: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_dist_filename(filename: &str) -> Option<(&str, &str)> {
     if let Some(stem) = filename
         .strip_suffix(".whl")
         .or_else(|| filename.strip_suffix(".egg"))
@@ -1413,7 +1456,7 @@ fn upload_filename_mismatch(filename: &str, normalized: &str, version: &str) -> 
 
 /// The PEP 658 core metadata of a wheel: its root-level `*.dist-info/METADATA`. `None`
 /// when the archive is not a zip, has no single such entry, or it is too large.
-fn wheel_core_metadata(data: impl std::io::Read + std::io::Seek) -> Option<Vec<u8>> {
+pub(crate) fn wheel_core_metadata(data: impl std::io::Read + std::io::Seek) -> Option<Vec<u8>> {
     use std::io::Read as _;
     let mut zip = zip::ZipArchive::new(data).ok()?;
     let names: Vec<String> = zip
@@ -1690,7 +1733,7 @@ async fn fetch_upstream_dates(
 
 /// Normalize package name according to PEP 503: lowercase, and every run of
 /// `-`, `_`, `.` becomes a single `-` (`re.sub(r"[-_.]+", "-", name).lower()`).
-fn normalize_name(name: &str) -> String {
+pub(crate) fn normalize_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
         if matches!(c, '-' | '_' | '.') {

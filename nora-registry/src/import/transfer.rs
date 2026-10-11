@@ -27,10 +27,10 @@ use crate::curation::{CurationEngine, Decision, FilterRequest};
 use crate::registry_type::RegistryType;
 use crate::storage::Storage;
 
-/// RAII guard that deletes a temp file on drop unless disarmed. Import owns its
-/// own copy rather than reaching into `registry::docker::TempFileGuard` (whose
-/// `disarm` is module-private) so the import→registry boundary stays clean while
-/// reusing the exact crash-safe delete-on-drop shape (#580, review R-Linus4).
+/// RAII guard that deletes a temp file on drop (a NotFound after storage moved it
+/// into place is ignored). Import owns its own copy rather than reaching into
+/// `registry::docker::TempFileGuard` so the import→registry boundary stays clean
+/// while reusing the exact crash-safe delete-on-drop shape (#580, review R-Linus4).
 struct TempFileGuard {
     path: Option<PathBuf>,
 }
@@ -38,10 +38,6 @@ struct TempFileGuard {
 impl TempFileGuard {
     fn new(path: PathBuf) -> Self {
         Self { path: Some(path) }
-    }
-    /// Caller took ownership of cleanup (storage moved/deleted the file).
-    fn disarm(&mut self) {
-        self.path = None;
     }
 }
 
@@ -125,6 +121,7 @@ pub async fn transfer_artifact(
     curation_name: &str,
     source_host: &str,
     storage: &Storage,
+    locks: &crate::PublishLocks,
     curation: &CurationEngine,
     temp_dir: &Path,
     opts: TransferOpts,
@@ -164,7 +161,7 @@ pub async fn transfer_artifact(
     };
     let Staged {
         path: temp_path,
-        mut guard,
+        guard,
         sha256,
         sha1,
         bytes,
@@ -213,19 +210,27 @@ pub async fn transfer_artifact(
         };
     }
 
-    // 5. COMMIT (unless dry-run, which has already streamed+hashed+verified).
+    // 5. PREPARE: read the package for its format's publish path (npm/NuGet/PyPI),
+    // so a dry-run also reports a package that path would refuse.
+    let prepared = match super::publish::prepare(rt, artifact, &temp_path).await {
+        Ok(p) => p,
+        Err(reason) => return Outcome::Failed { reason },
+    };
+
+    // 6. COMMIT (unless dry-run, which has already streamed+hashed+verified).
     if opts.dry_run {
         return Outcome::Imported { bytes, sha256 }; // rehearsal — guard drops temp
     }
     let _ = provenance; // (Weak provenance is surfaced by the orchestrator's report, not here.)
-    match storage.put_from_path(key, &temp_path, Some(&sha256)).await {
-        Ok(()) => {
-            guard.disarm(); // storage moved the temp file into place
-            Outcome::Imported { bytes, sha256 }
-        }
-        Err(e) => Outcome::Failed {
-            reason: format!("commit {key}: {e}"),
-        },
+    let committed =
+        super::publish::commit(prepared, storage, locks, key, &temp_path, &sha256, bytes).await;
+    // Storage moved the temp file into place, or (npm) read it; either way the
+    // guard's delete is the cleanup or a harmless NotFound.
+    drop(guard);
+    match committed {
+        Ok(super::publish::Committed::Stored) => Outcome::Imported { bytes, sha256 },
+        Ok(super::publish::Committed::AlreadyHosted(reason)) => Outcome::Skipped { reason },
+        Err(reason) => Outcome::Failed { reason },
     }
 }
 
@@ -467,6 +472,7 @@ mod tests {
             "com/x",
             "src-host",
             storage,
+            &Default::default(),
             curation,
             td,
             opts,
