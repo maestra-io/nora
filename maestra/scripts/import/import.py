@@ -155,7 +155,7 @@ def nuget_pkg(p, st, a):
                     raise Failed(f"unlist HTTP {r.status_code} {r.text[:200]}")
                 st.put(key + ":unlisted", "pushed")
                 log("nuget", p["id"], ver, "unlisted")
-        except Failed as e:
+        except (Failed, OSError) as e:
             st.put(key, "failed", reason=str(e))
             log("nuget", p["id"], ver, "failed", 0, time.monotonic() - t0, str(e))
 
@@ -200,7 +200,7 @@ def npm_pkg(p, st, a):
                 os.unlink(path)
             st.put(key, status, size=size)
             log("npm", name, ver, status, size, time.monotonic() - t0, short)
-        except Failed as e:
+        except (Failed, OSError) as e:
             st.put(key, "failed", reason=str(e))
             log("npm", name, ver, "failed", 0, time.monotonic() - t0, str(e))
     if a.dry_run:
@@ -242,7 +242,7 @@ def pypi_pkg(p, st, a):
                 os.unlink(path)
             st.put(key, status, size=size)
             log("pypi", p["name"], v["filename"], status, size, time.monotonic() - t0)
-        except Failed as e:
+        except (Failed, OSError) as e:
             st.put(key, "failed", reason=str(e))
             log("pypi", p["name"], v["filename"], "failed", 0, time.monotonic() - t0, str(e))
 
