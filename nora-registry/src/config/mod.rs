@@ -956,6 +956,26 @@ impl Config {
             );
         }
 
+        // 7b. OIDC provider without an audience: `aud` is not validated, so a token
+        // the issuer minted for another service is accepted. Strict mode refuses it.
+        if self.auth.oidc.enabled {
+            for p in self.auth.oidc.providers.iter() {
+                if p.enabled && p.audience.is_empty() {
+                    let msg = format!(
+                        "auth.oidc provider \"{}\" has an empty audience — the `aud` claim is not \
+                         validated, so a token from {} minted for any other service is accepted. Set \
+                         audience to the value your CI requests (e.g. the registry hostname)",
+                        p.name, p.issuer
+                    );
+                    if config_strict_from_env() {
+                        errors.push(format!("{msg} (NORA_CONFIG_STRICT is on)"));
+                    } else {
+                        warnings.push(msg);
+                    }
+                }
+            }
+        }
+
         // 8. "Enabled but empty" — subsystems that silently do nothing
         if self.gc.enabled && self.gc.dry_run {
             warnings.push(
@@ -2667,6 +2687,41 @@ proxies = [
                 warnings
             );
         }
+    }
+
+    /// An enabled OIDC provider with an empty audience skips `aud` validation:
+    /// a warning by default, refused under NORA_CONFIG_STRICT.
+    #[test]
+    fn test_validate_oidc_empty_audience_warns_and_strict_refuses() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.auth.oidc = toml::from_str(
+            "enabled = true\n[[providers]]\nname = \"gha\"\nissuer = \"https://issuer.example\"",
+        )
+        .unwrap();
+        let (warnings, errors) = config.validate_with_config_path(None);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("\"gha\" has an empty audience")),
+            "{warnings:?}"
+        );
+
+        std::env::set_var("NORA_CONFIG_STRICT", "true");
+        let (_, strict_errors) = config.validate_with_config_path(None);
+        std::env::remove_var("NORA_CONFIG_STRICT");
+        assert!(
+            strict_errors.iter().any(|e| e.contains("empty audience")),
+            "{strict_errors:?}"
+        );
+
+        config.auth.oidc.providers[0].audience = "packages.example.com".to_string();
+        let (warnings, _) = config.validate_with_config_path(None);
+        assert!(
+            !warnings.iter().any(|w| w.contains("audience")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

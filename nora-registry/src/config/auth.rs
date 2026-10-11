@@ -335,7 +335,10 @@ pub struct OidcProvider {
     /// JWKS endpoint doesn't follow the standard `/.well-known/jwks.json` path.
     #[serde(default)]
     pub jwks_uri: Option<String>,
-    /// Expected audience (`aud` claim). If empty, audience is not validated.
+    /// Expected audience (`aud` claim). If empty, audience is not validated: a
+    /// token this issuer minted for any other service (e.g. `sts.amazonaws.com`)
+    /// is accepted if its `sub` matches a role rule. Config validation warns
+    /// about an enabled provider without one, and `NORA_CONFIG_STRICT` refuses it.
     #[serde(default)]
     pub audience: String,
     /// Allowed JWT algorithms (default: RS256, ES256). Reject all others.
