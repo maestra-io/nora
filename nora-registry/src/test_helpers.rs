@@ -238,6 +238,8 @@ fn build_context_with(
             read_only_users: Vec::new(),
             public_web_ui: false,
             public_metrics: true,
+            htpasswd_allowed_peers: None,
+            teleport: crate::config::TeleportConfig::default(),
         },
         rate_limit: RateLimitConfig {
             enabled: false,
@@ -346,6 +348,15 @@ fn build_context_with(
             reqwest::Client::new(),
         ))
     });
+    let teleport = config.auth.teleport.enabled.then(|| {
+        Arc::new(
+            crate::auth::TeleportValidator::new(
+                config.auth.teleport.clone(),
+                reqwest::Client::new(),
+            )
+            .expect("valid auth.teleport"),
+        )
+    });
     let state = AppState {
         storage,
         config: Arc::new(config),
@@ -365,6 +376,7 @@ fn build_context_with(
         reloadable,
         auth_failures: Arc::new(crate::auth::AuthFailureTracker::new(5, 900)),
         oidc,
+        teleport,
         circuit_breaker: Arc::new(crate::circuit_breaker::CircuitBreakerRegistry::new(
             cb_config,
         )),

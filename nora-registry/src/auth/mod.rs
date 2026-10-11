@@ -11,11 +11,13 @@
 mod htpasswd;
 mod namespace;
 pub mod oidc;
+pub mod teleport;
 mod token_routes;
 
 pub use htpasswd::HtpasswdAuth;
 pub use namespace::{enforce_namespace_scope, NamespaceAuthority};
 pub use oidc::OidcValidator;
+pub use teleport::TeleportValidator;
 pub use token_routes::{token_routes, TokenListItem, TokenListResponse};
 
 /// Authenticated username carried in request extensions after successful auth.
@@ -250,12 +252,25 @@ async fn anonymous_read_passthrough(mut request: Request<Body>, next: Next) -> R
     next.run(request).await
 }
 
-/// Auth middleware - supports Basic auth, Bearer tokens, and OIDC JWT
+/// Auth middleware - supports Basic auth, Bearer tokens, OIDC JWT and (Maestra
+/// fork) Teleport app-access JWT on the web UI.
 pub async fn auth_middleware(
     State(state): State<AppState>,
-    mut request: Request<Body>,
+    request: Request<Body>,
     next: Next,
 ) -> Response {
+    // Maestra: with the UI behind Teleport, a browser never gets a Basic
+    // challenge, so no password dialog on the public hostname.
+    let drop_challenge = state.teleport.as_ref().is_some_and(|t| t.require_for_ui())
+        && teleport::is_browser(request.headers());
+    let mut response = authenticate(state, request, next).await;
+    if drop_challenge && response.status() == StatusCode::UNAUTHORIZED {
+        response.headers_mut().remove(header::WWW_AUTHENTICATE);
+    }
+    response
+}
+
+async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -> Response {
     // Skip auth if disabled (neither htpasswd nor OIDC configured)
     if !state.config.auth.enabled {
         request
@@ -266,6 +281,50 @@ pub async fn auth_middleware(
             .insert(AuthenticatedUser("anonymous".to_string()));
         return next.run(request).await;
     }
+
+    // Maestra: the web UI takes its identity from Teleport app access
+    // (auth/teleport.rs); registry paths never look at the Teleport header.
+    if let Some(teleport) = state.teleport.as_deref() {
+        if teleport::is_ui_path(request.uri().path()) {
+            let jwt = teleport.trusted_header(&request);
+            let id = match jwt {
+                Some(jwt) => teleport.identify(&jwt).await,
+                None => None,
+            };
+            if let Some(id) = id {
+                request
+                    .extensions_mut()
+                    .insert(NamespaceAuthority::Unrestricted);
+                request
+                    .extensions_mut()
+                    .insert(AuthenticatedUser(id.username));
+                request.extensions_mut().insert(AuthenticatedRole(id.role));
+                return next.run(request).await;
+            }
+            if teleport.require_for_ui() {
+                return teleport::ui_only_response();
+            }
+        }
+    }
+
+    // Maestra: htpasswd passwords only from auth.htpasswd_allowed_peers (TCP
+    // peer). Elsewhere no password is checked (no bcrypt reachable), the
+    // password token-mint routes are refused, and Basic carries tokens/JWTs only.
+    let htpasswd_peer_ok = match &state.config.auth.htpasswd_allowed_peers {
+        None => true,
+        Some(allowed) => request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .is_some_and(|ci| allowed.contains(ci.0.ip())),
+    };
+    if !htpasswd_peer_ok && request.uri().path().starts_with("/api/tokens") {
+        return (
+            StatusCode::FORBIDDEN,
+            "Password authentication is not accepted from this address",
+        )
+            .into_response();
+    }
+    let htpasswd = state.auth.as_deref().filter(|_| htpasswd_peer_ok);
 
     // NuGet clients send the push/delete credential as `X-NuGet-ApiKey`, never as
     // Authorization (#983): verify it as a Bearer credential (nra_ token or OIDC JWT).
@@ -321,7 +380,8 @@ pub async fn auth_middleware(
                 .filter(|_| !is_probe && !blocked)
             {
                 if let Some(encoded) = auth_val.strip_prefix("Basic ") {
-                    if let Some((username, role)) = try_basic_auth(encoded, &state).await {
+                    if let Some((username, role)) = try_basic_auth(encoded, &state, htpasswd).await
+                    {
                         request
                             .extensions_mut()
                             .insert(NamespaceAuthority::Unrestricted);
@@ -606,7 +666,7 @@ pub async fn auth_middleware(
 
     // Basic carries either an htpasswd password or an API token (#736): it is
     // unusable only when neither store is configured.
-    if state.auth.is_none() && state.tokens.is_none() {
+    if htpasswd.is_none() && state.tokens.is_none() {
         return unauthorized_response("Basic auth not configured", realm);
     }
 
@@ -633,7 +693,7 @@ pub async fn auth_middleware(
     // A token-shaped password goes to the token store first: CI sending
     // `<htpasswd user>:nra_…` must not pay a bcrypt on every request.
     let token_first = password.starts_with("nra_");
-    if token_first || !htpasswd_ok(state.auth.as_deref(), username, password).await {
+    if token_first || !htpasswd_ok(htpasswd, username, password).await {
         let token_result = state.tokens.as_ref().map(|ts| ts.verify_token(password));
         // Same fail-closed rule as the Bearer path: a store I/O/parse failure is
         // not "wrong password". A 401 here makes valid token creds flap and feeds
@@ -676,7 +736,7 @@ pub async fn auth_middleware(
             request.extensions_mut().insert(AuthenticatedRole(role));
             return next.run(request).await;
         }
-        if !(token_first && htpasswd_ok(state.auth.as_deref(), username, password).await) {
+        if !(token_first && htpasswd_ok(htpasswd, username, password).await) {
             if let Some(ip) = client_ip {
                 state.auth_failures.record_failure(ip);
             }
@@ -746,7 +806,11 @@ async fn htpasswd_ok(auth: Option<&HtpasswdAuth>, username: &str, password: &str
 /// Used by the opportunistic-auth path on open web surfaces so that
 /// authenticated users get their real identity even on publicly browsable
 /// pages.
-async fn try_basic_auth(encoded: &str, state: &AppState) -> Option<(String, crate::tokens::Role)> {
+async fn try_basic_auth(
+    encoded: &str,
+    state: &AppState,
+    htpasswd: Option<&HtpasswdAuth>,
+) -> Option<(String, crate::tokens::Role)> {
     use base64::{engine::general_purpose::STANDARD, Engine};
     let decoded = String::from_utf8(STANDARD.decode(encoded).ok()?).ok()?;
     let (username, password) = decoded.split_once(':')?;
@@ -756,14 +820,12 @@ async fn try_basic_auth(encoded: &str, state: &AppState) -> Option<(String, crat
             return Some(identity);
         }
     }
-    htpasswd_ok(state.auth.as_deref(), username, password)
-        .await
-        .then(|| {
-            (
-                username.to_string(),
-                state.config.auth.htpasswd_role(username),
-            )
-        })
+    htpasswd_ok(htpasswd, username, password).await.then(|| {
+        (
+            username.to_string(),
+            state.config.auth.htpasswd_role(username),
+        )
+    })
 }
 
 fn unauthorized_response(message: &str, realm: &str) -> Response {
@@ -2092,6 +2154,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             })),
             auth_failures: Arc::new(crate::auth::AuthFailureTracker::new(5, 900)),
             oidc: Some(Arc::new(oidc_validator)),
+            teleport: None,
             circuit_breaker: Arc::new(crate::circuit_breaker::CircuitBreakerRegistry::new(
                 ctx.state.config.circuit_breaker.clone(),
             )),
@@ -2815,7 +2878,7 @@ mod web_surface_gating_tests {
         let ctx = create_test_context_with_auth(&[("admin", "secret")]);
         let encoded = STANDARD.encode("admin:secret");
         assert_eq!(
-            super::try_basic_auth(&encoded, &ctx.state).await,
+            super::try_basic_auth(&encoded, &ctx.state, ctx.state.auth.as_deref()).await,
             Some(("admin".to_string(), crate::tokens::Role::Write))
         );
     }
@@ -2825,7 +2888,10 @@ mod web_surface_gating_tests {
     async fn test_try_basic_auth_wrong_password() {
         let ctx = create_test_context_with_auth(&[("admin", "secret")]);
         let encoded = STANDARD.encode("admin:wrong");
-        assert_eq!(super::try_basic_auth(&encoded, &ctx.state).await, None);
+        assert_eq!(
+            super::try_basic_auth(&encoded, &ctx.state, ctx.state.auth.as_deref()).await,
+            None
+        );
     }
 
     /// try_basic_auth returns None when no htpasswd store is available.
@@ -2833,7 +2899,10 @@ mod web_surface_gating_tests {
     async fn test_try_basic_auth_no_store() {
         let ctx = create_test_context_with_auth(&[]);
         let encoded = STANDARD.encode("admin:secret");
-        assert_eq!(super::try_basic_auth(&encoded, &ctx.state).await, None);
+        assert_eq!(
+            super::try_basic_auth(&encoded, &ctx.state, ctx.state.auth.as_deref()).await,
+            None
+        );
     }
 
     /// try_basic_auth returns None for garbage base64.
@@ -2841,7 +2910,7 @@ mod web_surface_gating_tests {
     async fn test_try_basic_auth_invalid_base64() {
         let ctx = create_test_context_with_auth(&[]);
         assert_eq!(
-            super::try_basic_auth("%%%not-base64%%%", &ctx.state).await,
+            super::try_basic_auth("%%%not-base64%%%", &ctx.state, ctx.state.auth.as_deref()).await,
             None
         );
     }
