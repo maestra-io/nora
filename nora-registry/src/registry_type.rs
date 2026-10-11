@@ -106,6 +106,17 @@ impl RegistryType {
             _ => None,
         }
     }
+
+    /// Whether this build serves the format: rpm and deb sit behind the cargo
+    /// features of the same name (default on).
+    #[allow(clippy::match_like_matches_macro)] // arms are cfg!-dependent
+    pub fn compiled_in(&self) -> bool {
+        match self {
+            Self::Rpm => cfg!(feature = "rpm"),
+            Self::Deb => cfg!(feature = "deb"),
+            _ => true,
+        }
+    }
 }
 
 impl fmt::Display for RegistryType {

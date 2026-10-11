@@ -3,9 +3,11 @@
 
 //! `nora mirror` — pre-fetch dependencies through NORA proxy cache.
 
+#[cfg(feature = "deb")]
 mod deb;
 mod docker;
 mod npm;
+#[cfg(feature = "rpm")]
 mod rpm;
 
 use clap::Subcommand;
@@ -52,6 +54,7 @@ pub enum MirrorFormat {
         lockfile: PathBuf,
     },
     /// Warm a pull-through RPM repo for offline use (fetch every package through NORA)
+    #[cfg(feature = "rpm")]
     Rpm {
         /// Proxied repo name (an entry in `[rpm.proxies]`)
         #[arg(long)]
@@ -61,6 +64,7 @@ pub enum MirrorFormat {
         arch: Option<Vec<String>>,
     },
     /// Warm a pull-through DEB repo for offline use (fetch every package through NORA)
+    #[cfg(feature = "deb")]
     Deb {
         /// Proxied repo name (an entry in `[deb.proxies]`)
         #[arg(long)]
@@ -189,9 +193,11 @@ pub async fn run_mirror(
         MirrorFormat::Maven { lockfile } => {
             mirror_lockfile(client, registry, "maven", &lockfile).await?
         }
+        #[cfg(feature = "rpm")]
         MirrorFormat::Rpm { repo, arch } => {
             rpm::run_rpm_mirror(client, registry, &repo, arch.as_deref(), concurrency).await?
         }
+        #[cfg(feature = "deb")]
         MirrorFormat::Deb {
             repo,
             dist,
@@ -356,6 +362,7 @@ async fn mirror_lockfile(
 /// GET each repo-relative path through the NORA pull-through repo so the
 /// proxy cache is warmed for offline use. A path NORA already has (HEAD 200,
 /// local-only check) is skipped and counted as fetched with 0 new bytes.
+#[cfg(any(feature = "rpm", feature = "deb"))]
 async fn warm_repo_paths(
     client: &reqwest::Client,
     base: &str,
@@ -427,6 +434,7 @@ async fn warm_repo_paths(
 }
 
 /// Fetch a repo-relative path through the NORA proxy, returning the body.
+#[cfg(any(feature = "rpm", feature = "deb"))]
 async fn fetch_repo_file(
     client: &reqwest::Client,
     base: &str,
@@ -452,6 +460,7 @@ async fn fetch_repo_file(
 /// Decompress an index file by its extension (`.gz`/`.xz`/plain) to text.
 /// Repo indexes are operator-chosen upstream data read on the client side —
 /// no decompression cap needed (unlike the server's control.tar bomb cap).
+#[cfg(any(feature = "rpm", feature = "deb"))]
 fn decompress_index(path: &str, raw: Vec<u8>) -> Result<String, String> {
     use std::io::Read;
     if path.ends_with(".gz") {

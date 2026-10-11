@@ -333,6 +333,7 @@ fn build_context_with(
 
     let enabled_registries = Arc::new(enabled_registries);
     let signing_dir = TempDir::new().expect("signing tempdir");
+    #[cfg(any(feature = "rpm", feature = "deb"))]
     let signer = if config.signing.enabled {
         Some(Arc::new(
             crate::signing::RepoSigner::load_or_generate(&signing_dir.path().join("signing.key"))
@@ -341,6 +342,8 @@ fn build_context_with(
     } else {
         None
     };
+    #[cfg(not(any(feature = "rpm", feature = "deb")))]
+    let signer = None;
     // OIDC-enabled configs get a live validator (the JWKS is fetched lazily).
     let oidc = config.auth.oidc.is_active().then(|| {
         Arc::new(crate::auth::OidcValidator::new(
@@ -433,12 +436,17 @@ fn build_context_with(
             crate::registry_type::RegistryType::Conan => {
                 registry_routes = registry_routes.merge(registry::conan_routes());
             }
+            #[cfg(feature = "rpm")]
             crate::registry_type::RegistryType::Rpm => {
                 registry_routes = registry_routes.merge(registry::rpm_routes());
             }
+            #[cfg(feature = "deb")]
             crate::registry_type::RegistryType::Deb => {
                 registry_routes = registry_routes.merge(registry::deb_routes());
             }
+            #[cfg(not(all(feature = "rpm", feature = "deb")))]
+            #[allow(unreachable_patterns)]
+            crate::registry_type::RegistryType::Rpm | crate::registry_type::RegistryType::Deb => {}
             crate::registry_type::RegistryType::Cpan => {
                 registry_routes = registry_routes.merge(registry::cpan_routes());
             }

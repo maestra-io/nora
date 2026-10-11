@@ -28,6 +28,8 @@ COPY nora-registry/ nora-registry/
 # the workspace intact so --locked holds; `-p nora-registry` never builds them.
 COPY fuzz/ fuzz/
 
+# CARGO_FEATURES: extra cargo args, e.g. "--no-default-features" drops the rpm
+# and deb registries (and their rpgp signer).
 ARG CARGO_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
