@@ -65,20 +65,44 @@ impl DirCredentialProvider {
     }
 
     fn read(&self) -> std::io::Result<AwsCredential> {
+        use std::io::{Error, ErrorKind};
+        // A Kubernetes Secret volume publishes each generation by swapping the
+        // `..data` symlink; resolve it once so all files come from the same
+        // generation (a plain directory has no `..data` and is read as is).
+        let dir =
+            std::fs::canonicalize(self.dir.join("..data")).unwrap_or_else(|_| self.dir.clone());
         let file = |name: &str| -> std::io::Result<String> {
-            Ok(std::fs::read_to_string(self.dir.join(name))?
+            Ok(std::fs::read_to_string(dir.join(name))?
                 .trim_end()
                 .to_string())
         };
+        let required = |name: &str| -> std::io::Result<String> {
+            let v = file(name)?;
+            if v.is_empty() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("{name} is empty"),
+                ));
+            }
+            Ok(v)
+        };
         let token = match file("session_token") {
-            Ok(t) if !t.is_empty() => Some(t),
-            Ok(_) => None,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Ok(t) if t.is_empty() => None,
+            // object_store turns the token into a header with unwrap(): reject
+            // what would panic there, keep the last good credential instead.
+            Ok(t) if axum::http::HeaderValue::from_str(&t).is_err() => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "session_token is not a valid header value",
+                ));
+            }
+            Ok(t) => Some(t),
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
             Err(e) => return Err(e),
         };
         Ok(AwsCredential {
-            key_id: file("access_key_id")?,
-            secret_key: file("secret_access_key")?,
+            key_id: required("access_key_id")?,
+            secret_key: required("secret_access_key")?,
             token,
         })
     }
@@ -101,10 +125,13 @@ impl CredentialProvider for DirCredentialProvider {
                 *cached = Some((Instant::now(), Arc::clone(&cred)));
                 Ok(cred)
             }
-            Err(e) => match cached.as_ref() {
+            Err(e) => match cached.take() {
                 Some((_, cred)) => {
                     tracing::warn!(dir = %self.dir.display(), error = %e, "S3 credentials re-read failed, keeping the last good ones");
-                    Ok(Arc::clone(cred))
+                    // Restart the TTL: a failing re-read is retried once per TTL,
+                    // not on every request.
+                    *cached = Some((Instant::now(), Arc::clone(&cred)));
+                    Ok(cred)
                 }
                 None => Err(object_store::Error::Generic {
                     store: "S3",
@@ -200,6 +227,8 @@ impl ObjectStorage {
             .with_virtual_hosted_style_request(virtual_hosted)
             .with_retry(streaming_retry_config());
 
+        // `s3_credentials_dir = ""` in TOML means unset, as the env override does.
+        let credentials_dir = credentials_dir.filter(|d| !d.is_empty());
         match (credentials_dir, access_key, secret_key) {
             (Some(dir), _, _) => {
                 builder = builder.with_credentials(Arc::new(DirCredentialProvider::new(dir)));
@@ -702,6 +731,31 @@ mod tests {
 
         std::fs::remove_file(dir.path().join("secret_access_key")).unwrap();
         assert_eq!(p.get_credential().await.unwrap().key_id, "ak2");
+
+        // An empty key or an unsendable token is a failed re-read, not a new pair.
+        write("secret_access_key", "  \n");
+        write("access_key_id", "ak3");
+        assert_eq!(p.get_credential().await.unwrap().key_id, "ak2");
+        write("secret_access_key", "sk3");
+        write("session_token", "tok\nsplit");
+        assert_eq!(p.get_credential().await.unwrap().key_id, "ak2");
+
+        // A failed re-read restarts the TTL: no re-read until it expires again.
+        p.ttl = Duration::from_secs(3600);
+        write("session_token", "tok3");
+        assert_eq!(p.get_credential().await.unwrap().key_id, "ak2");
+        p.ttl = Duration::ZERO;
+        assert_eq!(p.get_credential().await.unwrap().key_id, "ak3");
+
+        // Kubernetes Secret volume layout: files are read through `..data`.
+        let gen = dir.path().join("..2026_10_11_gen1");
+        std::fs::create_dir(&gen).unwrap();
+        for (k, v) in [("access_key_id", "ak4"), ("secret_access_key", "sk4")] {
+            std::fs::write(gen.join(k), v).unwrap();
+        }
+        std::os::unix::fs::symlink(&gen, dir.path().join("..data")).unwrap();
+        let c = p.get_credential().await.unwrap();
+        assert_eq!((c.key_id.as_str(), c.token.as_deref()), ("ak4", None));
 
         // The builder accepts the provider (no static keys needed).
         let s = ObjectStorage::new_s3(
