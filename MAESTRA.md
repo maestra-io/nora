@@ -22,3 +22,7 @@ Changes meant for upstream: branch from `main`, cherry-pick, open the PR against
 - `.github/workflows/maestra-ci.yml`: `cargo test` on PRs into `maestra/main` (RunsOn `pool=build`).
 - `.github/workflows/maestra-release.yml`: tag `v<version>-maestra.<n>` (version = `Cargo.toml`) on `maestra/main` builds the upstream `Dockerfile` and pushes `515260921971.dkr.ecr.us-west-2.amazonaws.com/nora:<version>-maestra.<n>` via the Teleport image-push bot (token `image-push-github-actions-nora`, fluxcd `iota/us-iota-lw-kube-infra/teleport-maestra/operator-crs/image-push-tokens.yaml`). Re-run: `gh workflow run maestra-release.yml -f tag=<tag>`.
 - Our workflows carry a `maestra-` prefix so upstream merges never conflict on them. Upstream `Release`, `Post-Release Gate` and `PR Image Cleanup` target upstream's ghcr/self-hosted runners and are disabled in this repo (`gh workflow disable`); upstream `Release` would otherwise fire on our `v*` tags.
+
+## Helm chart
+
+`maestra/charts/nora`: upstream getnora-io/helm-charts `charts/nora` vendored with our fixes (Recreate, full `[auth]`, PVC-safe S3 mode, `s3_credentials_dir`, envFrom secrets). Provenance, differences and re-sync: `maestra/charts/nora/MAESTRA-CHART.md`.
