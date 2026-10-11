@@ -73,6 +73,10 @@ pub enum CurationOnFailure {
 /// - `NORA_CURATION_MIN_RELEASE_AGE` — minimum release age (e.g., "7d", "24h", "1w")
 /// - `NORA_CURATION_QUARANTINE` — quarantine mode: off/observe/enforce (default: off)
 /// - `NORA_CURATION_QUARANTINE_TTL` — quarantine hold duration (e.g., "14d", "24h")
+/// - `NORA_CURATION_<REGISTRY>_MIN_RELEASE_AGE` / `_QUARANTINE` / `_QUARANTINE_TTL` —
+///   per-registry overrides
+/// - `NORA_CURATION_<REGISTRY>_ALLOW` — comma-separated `name@version` list exempt
+///   from `min_release_age` (e.g., `NORA_CURATION_NUGET_ALLOW=Newtonsoft.Json@13.0.4`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurationConfig {
     #[serde(default)]
@@ -149,6 +153,12 @@ pub struct RegistryCurationOverride {
     /// Override quarantine TTL for this specific registry.
     #[serde(default)]
     pub quarantine_ttl: Option<String>,
+    /// Exact versions exempt from `min_release_age`, as `"name@version"` (npm
+    /// `"@scope/name@1.0.0"`; NuGet compares case-insensitively, PyPI by PEP 503 name).
+    /// Exempts the age check only: the digest quarantine still holds a new digest.
+    /// Reloaded on SIGHUP with the rest of the curation policy.
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 
 impl Default for CurationConfig {
@@ -269,6 +279,14 @@ impl CurationConfig {
             }
             if let Ok(val) = env::var(format!("NORA_CURATION_{}_QUARANTINE_TTL", env_suffix)) {
                 field.quarantine_ttl = if val.is_empty() { None } else { Some(val) };
+            }
+            if let Ok(val) = env::var(format!("NORA_CURATION_{}_ALLOW", env_suffix)) {
+                field.allow = val
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
             }
         }
 

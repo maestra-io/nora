@@ -45,6 +45,17 @@ pub static CURATION_DECISIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| 
     .expect("failed to create CURATION_DECISIONS_TOTAL metric at startup")
 });
 
+/// Downloads younger than `min_release_age` let through because their exact version is
+/// on `[curation.<registry>] allow` — each one a deliberate cooldown exemption.
+pub static CURATION_MIN_AGE_ALLOWED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_curation_min_age_allowed_total",
+        "Downloads exempted from min_release_age by the curation allow list, by registry",
+        &["registry"]
+    )
+    .expect("failed to create CURATION_MIN_AGE_ALLOWED_TOTAL metric at startup")
+});
+
 /// Internal-namespace requests refused by namespace isolation — the
 /// dependency-confusion defense firing: an internal name that was neither served
 /// from local storage nor proxied upstream (blocked / 404'd). Previously the guard

@@ -14,6 +14,7 @@ Maestra-only changes (not upstream):
 - `[auth] htpasswd_allowed_peers` / `NORA_AUTH_HTPASSWD_ALLOWED_PEERS`: TCP peers whose htpasswd password is checked (unset = all, as upstream). Any other peer: no bcrypt, `/api/tokens*` → 403, Basic carries only `nra_` tokens and OIDC JWTs.
 - Cargo features `rpm` and `deb` (default on): `--no-default-features` builds without those registries, their parsers and the rpgp index signer; a config enabling them on such a build logs an error and does not mount them. Our release image is built that way (`CARGO_FEATURES=--no-default-features`).
 - Builds are `--locked` (Dockerfile, CI); Swagger UI comes from the `vendored` feature of `utoipa-swagger-ui` (crates.io, checksummed), not a build-time GitHub download.
+- `[curation.<registry>] allow = ["name@version"]` / `NORA_CURATION_<REGISTRY>_ALLOW` (comma-separated): exact versions exempt from `min_release_age` only (the digest quarantine still applies), names normalized per format (NuGet case-insensitive, PyPI PEP 503); reloaded on SIGHUP; each exemption logs `[SECURITY]` and counts in `nora_curation_min_age_allowed_total{registry}`.
 
 ### Auth matrix, packages.maestra.io (fluxcd `iota/us-iota-lw-kube-infra/nora/`)
 
