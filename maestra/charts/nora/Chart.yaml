@@ -1,0 +1,27 @@
+apiVersion: v2
+name: nora
+description: NORA — lightweight multi-format artifact registry (Docker, Maven, npm, PyPI, Cargo, NuGet, and more)
+type: application
+version: 0.4.11-maestra.1
+appVersion: "1.3.3"
+annotations:
+  artifacthub.io/category: integration-delivery
+home: https://github.com/getnora-io/nora
+sources:
+  - https://github.com/getnora-io/nora
+maintainers:
+  - name: getnora-io
+    url: https://github.com/getnora-io
+icon: https://avatars.githubusercontent.com/u/257139033?v=4
+keywords:
+  - registry
+  - artifact-registry
+  - proxy
+  - cache
+  - oci
+  - docker
+  - maven
+  - npm
+  - pypi
+  - cargo
+  - nuget

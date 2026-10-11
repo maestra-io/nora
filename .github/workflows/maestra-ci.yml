@@ -32,3 +32,28 @@ jobs:
 
       - name: Run tests
         run: cargo test --package nora-registry
+
+  # Vendored Helm chart (maestra/charts/nora, see its MAESTRA-CHART.md).
+  chart:
+    name: helm chart
+    runs-on: runs-on=${{ github.run_id }}/pool=build
+    steps:
+      - uses: runs-on/action@v2
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.22.0
+
+      - name: helm unittest
+        run: |
+          helm plugin install https://github.com/helm-unittest/helm-unittest --version v1.1.0
+          helm unittest maestra/charts/nora
+
+      - name: helm lint + template
+        working-directory: maestra/charts/nora
+        run: |
+          helm lint --strict . -f ci/maestra-values.yaml
+          helm template nora . -f ci/maestra-values.yaml > /dev/null
+          helm template nora . --set config.server.public_url=https://registry.example.com > /dev/null

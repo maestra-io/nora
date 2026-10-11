@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "nora.fullname" . }}-test-connection"
+  labels:
+    {{- include "nora.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  restartPolicy: Never
+  containers:
+    - name: wget
+      image: busybox:1.36
+      command: ['wget']
+      args: ['--spider', '--timeout=5', '{{ include "nora.fullname" . }}:{{ .Values.service.port }}/health']

@@ -1,0 +1,66 @@
+suite: ingress
+templates:
+  - templates/ingress.yaml
+tests:
+  - it: does not render when disabled
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders ingress with class and TLS
+    set:
+      ingress.enabled: true
+      ingress.className: nginx
+      ingress.annotations:
+        cert-manager.io/cluster-issuer: letsencrypt
+      ingress.hosts:
+        - host: registry.example.com
+          paths:
+            - path: /
+              pathType: Prefix
+      ingress.tls:
+        - secretName: registry-tls
+          hosts:
+            - registry.example.com
+    asserts:
+      - isKind:
+          of: Ingress
+      - equal:
+          path: spec.ingressClassName
+          value: nginx
+      - equal:
+          path: metadata.annotations["cert-manager.io/cluster-issuer"]
+          value: letsencrypt
+      - equal:
+          path: spec.tls[0].secretName
+          value: registry-tls
+      - equal:
+          path: spec.rules[0].host
+          value: registry.example.com
+      - equal:
+          path: spec.rules[0].http.paths[0].backend.service.name
+          value: RELEASE-NAME-nora
+      - equal:
+          path: spec.rules[0].http.paths[0].backend.service.port.name
+          value: http
+
+  - it: supports multiple paths per host
+    set:
+      ingress.enabled: true
+      ingress.hosts:
+        - host: registry.example.com
+          paths:
+            - path: /v2
+              pathType: Prefix
+            - path: /ui
+              pathType: Prefix
+    asserts:
+      - lengthEqual:
+          path: spec.rules[0].http.paths
+          count: 2
+      - equal:
+          path: spec.rules[0].http.paths[0].path
+          value: /v2
+      - equal:
+          path: spec.rules[0].http.paths[1].path
+          value: /ui

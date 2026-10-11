@@ -1,0 +1,20 @@
+suite: test connection hook
+templates:
+  - templates/tests/test-connection.yaml
+tests:
+  - it: renders helm test pod targeting service health
+    asserts:
+      - isKind:
+          of: Pod
+      - equal:
+          path: metadata.annotations["helm.sh/hook"]
+          value: test
+      - equal:
+          path: spec.restartPolicy
+          value: Never
+      - equal:
+          path: spec.containers[0].image
+          value: busybox:1.36
+      - contains:
+          path: spec.containers[0].args
+          content: RELEASE-NAME-nora:4000/health

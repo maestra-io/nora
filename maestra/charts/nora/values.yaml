@@ -1,0 +1,357 @@
+# -- Keep 1. nora is a single writer: publish locks, upload sessions, the
+# digest-quarantine ledger and the token verify cache are in-process
+# (COMPAT.md, multi-replica), and /data is a ReadWriteOnce volume.
+replicaCount: 1
+
+# -- Deployment strategy. Recreate stops the old pod before the new one
+# starts: a RollingUpdate would run two writers on the same /data volume
+# (same node) or wedge on Multi-Attach (another node). ARCHITECTURE.md assumes
+# Recreate.
+strategy:
+  type: Recreate
+
+# -- Seconds the pod gets after the preStop hook starts. Must cover
+# preStopSleepSeconds + config.server.shutdown_timeout (in-flight drain,
+# default 15) + 10 (nora's background-scheduler wait) so the audit drain and
+# the token last_used flush run before SIGKILL; the chart refuses to render
+# otherwise.
+terminationGracePeriodSeconds: 40
+
+# -- preStop `sleep` before SIGTERM, so the ingress drops the endpoint before
+# nora stops accepting (no 502s on rollout). The image is alpine and ships
+# `sleep`. 0 disables the hook.
+preStopSleepSeconds: 5
+
+# -- Annotations on the Deployment object itself (e.g.
+# reloader.stakater.com/auto: "true").
+deploymentAnnotations: {}
+
+image:
+  repository: ghcr.io/getnora-io/nora
+  # -- Image tag. Leave empty to use Chart.appVersion (recommended).
+  tag: ""
+  # -- Image digest (`sha256:...`). When set the image is `repository:tag@digest`,
+  # so the pod runs exactly this build whatever the tag points to later.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+
+service:
+  type: ClusterIP
+  port: 4000
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: registry.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: registry-tls
+  #    hosts:
+  #      - registry.example.com
+
+httpRoute:
+  enabled: false
+  annotations: {}
+  labels: {}
+  parentRefs: []
+  #  - name: shared-gateway
+  #    namespace: gateway-system
+  #    sectionName: http
+  hostnames: []
+  #  - registry.example.com
+  extraRules: []
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters: []
+
+# -- /data holds nora's local state in EVERY storage mode: API tokens
+# (auth.token_storage), the digest-quarantine ledger and audit.jsonl (under
+# storage.path) and upload spools. With storage.mode=s3 only artifacts go to
+# the bucket, so keep the volume: an emptyDir loses every API token on each
+# restart. The chart refuses s3 mode without persistence unless
+# allowEphemeral is set.
+persistence:
+  enabled: true
+  allowEphemeral: false
+  size: 10Gi
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  annotations: {}
+
+config:
+  server:
+    host: "0.0.0.0"
+    port: 4000
+    # -- Public URL for UI install commands and auth realm.
+    # Auto-derived from ingress/httpRoute when either is enabled.
+    # REQUIRED (chart fails to render) when ingress AND httpRoute are both
+    # disabled — there is no safe default for a registry's public URL, since a
+    # wrong value would emit broken install commands in the UI. Workaround: set
+    # this explicitly, or enable ingress/httpRoute so it can be derived.
+    # Set explicitly for non-standard setups (CDN, reverse proxy, NodePort).
+    # Example: "https://registry.example.com"
+    public_url: ""
+    # -- Any other [server] key is rendered as is, e.g. body_limit_mb (2048),
+    # shutdown_timeout (15, see terminationGracePeriodSeconds), proxy_coalesce,
+    # trust_upstream_dates.
+    # body_limit_mb: 256
+    # shutdown_timeout: 15
+  registries:
+    enable: "all"
+  storage:
+    mode: local
+    path: /data/storage
+    # -- S3 endpoint URL (required when mode=s3)
+    s3_url: ""
+    # -- S3 bucket name (required when mode=s3)
+    bucket: ""
+    # -- S3 region
+    s3_region: "us-east-1"
+    # -- S3 credentials: env NORA_STORAGE_S3_ACCESS_KEY / NORA_STORAGE_S3_SECRET_KEY
+    # (extraEnv / extraEnvFrom), or, Maestra fork only, files re-read every 60 s
+    # (rotating STS-style keys): a Secret with keys access_key_id,
+    # secret_access_key and optional session_token, mounted at mountPath and
+    # rendered as s3_credentials_dir. Takes precedence over the env keys.
+    s3Credentials:
+      existingSecret: ""
+      mountPath: /etc/nora-s3
+    # -- Explicit s3_credentials_dir when the files come another way
+    # (extraVolumes); ignored when s3Credentials.existingSecret is set.
+    s3_credentials_dir: ""
+  docker:
+    proxy_timeout: 60
+    # -- Docker upstream registries for proxy/cache.
+    # Upstream auth belongs in a Secret (existingSecret / extraEnvFrom with
+    # NORA_DOCKER_PROXIES="url|user:token,..."), not inline here.
+    upstreams: []
+    #  - url: https://registry-1.docker.io
+    #  - url: https://private.registry.io
+    #    auth: "user:token"
+  gc:
+    enabled: true
+    interval: 86400
+  retention:
+    enabled: false
+    interval: 86400
+    rules: []
+
+  # -- Authentication. Maps to [auth] and [auth.oidc] in config.toml.
+  auth:
+    enabled: false
+    # -- Basic auth via htpasswd file. Set explicitly or leave empty when using htpasswd.existingSecret.
+    htpasswd_file: ""
+    # -- Allow unauthenticated read (pull/browse); writes still require auth.
+    anonymous_read: false
+    # -- API token storage path. Keep it on the /data volume (see persistence).
+    token_storage: "/data/tokens"
+    # -- Client IPs/CIDRs whose X-Forwarded-For is honoured (list or
+    # comma-separated string). nora keys the auth lockout and every rate
+    # limiter on the resolved client IP; the default (loopback only) behind an
+    # ingress collapses every client into the ingress IP, so 5 bad logins from
+    # anyone lock everybody out. Set it to the ingress pods'/nodes' addresses.
+    # Empty = nora's default (127.0.0.1, ::1).
+    trusted_proxies: []
+    # -- htpasswd users allowed to mint admin-role API tokens (POST /api/tokens).
+    admin_users: []
+    # -- Optional, rendered only when set (nora defaults in brackets):
+    # docker_anon_pull (false), public_web_ui (false), public_metrics (true),
+    # token_cache_ttl (300).
+    # docker_anon_pull: false
+    # public_web_ui: false
+    # public_metrics: true
+    # token_cache_ttl: 300
+    # -- Mount htpasswd credentials from an existing Secret (recommended).
+    htpasswd:
+      existingSecret: ""
+      # -- Secret key containing the htpasswd file body.
+      secretKey: users.htpasswd
+      # -- Directory where the Secret key is mounted as a file.
+      mountPath: /etc/nora
+    oidc:
+      enabled: false
+      # -- Clock skew tolerance for JWT validation.
+      leeway_secs: 60
+      # -- JWKS key cache TTL.
+      jwks_cache_secs: 300
+      providers: []
+      # Example (GitHub Actions OIDC; set anonymous_read: true for public pulls):
+      #  - name: github-actions
+      #    issuer: https://token.actions.githubusercontent.com
+      #    audience: nora
+      #    algorithms:
+      #      - RS256
+      #      - ES256
+      #    max_token_lifetime_secs: 900
+      #    enabled: true
+      #    # jwks_uri: https://...  # optional JWKS endpoint override
+      #    # What a write identity may publish; ["*"] (nora's default) = anything.
+      #    namespace_scope: ["myorg/**"]
+      #    namespace_scope_enforcement: enforce   # or audit
+      #    role_rules:
+      #      - pattern: "repo:myorg/*:ref:refs/heads/main"
+      #        role: write
+      #      - pattern: "repo:myorg/*:pull_request"
+      #        role: write
+      #        namespace_scope: ["ci-transport/**"]  # narrows the provider scope
+      #      - pattern: "repo:myorg/*"
+      #        role: read
+
+  # -- Audit log: file ({storage.path}/audit.jsonl, append-only, never
+  # rotated), stdout (JSONL to stderr, i.e. the pod log), both, off.
+  # stdout on Kubernetes: the cluster log pipeline keeps it and nothing grows
+  # on the volume. Env NORA_AUDIT_LOG overrides.
+  audit:
+    mode: stdout
+
+  # -- Upstream circuit breaker ([circuit_breaker]): after failure_threshold
+  # consecutive upstream failures a registry's proxy fails fast (503) for
+  # reset_timeout seconds instead of every cache miss waiting out two
+  # proxy_timeout attempts. nora's default is off; on here. Flat keys only
+  # (per-registry `overrides` need a table: use NORA_CB_* env or extend the
+  # chart). Env NORA_CB_ENABLED / NORA_CB_THRESHOLD / NORA_CB_RESET_TIMEOUT
+  # override.
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5
+    reset_timeout: 30
+
+  # -- [nuget] keys, rendered as is: proxy_timeout (artifact download, 30 s
+  # per attempt), metadata_proxy_timeout (registration index / version list,
+  # nora default 2 s, which a large registration index on a busy link
+  # exceeds), metadata_ttl, serve_stale, revalidate, proxy, search_service,
+  # autocomplete. Enable NuGet itself via registries.enable.
+  nuget:
+    proxy_timeout: 30
+    metadata_proxy_timeout: 15
+
+  # -- Rate limiting (token bucket). See https://getnora.dev/configuration/rate-limits/
+  # Env overrides (NORA_RATE_LIMIT_*) still apply if set via extraEnv.
+  rate_limit:
+    enabled: true
+    auth_rps: 1
+    auth_burst: 5
+    upload_rps: 200
+    upload_burst: 500
+    general_rps: 100
+    general_burst: 200
+
+  # -- Curation (blocklist/allowlist, release-age gating). Maps to [curation] in
+  # config.toml. See https://getnora.dev/configuration/curation/
+  # The [curation] section is only rendered when curation is actually configured
+  # (mode != "off", a blocklist/allowlist is mounted, or min_release_age /
+  # require_integrity is set) — default values leave the rendered config unchanged.
+  # Env overrides (NORA_CURATION_*) still apply if set via extraEnv.
+  curation:
+    # -- Curation mode: "off" (default, pass-through), "audit" (evaluate + log,
+    # never block) or "enforce" (block on deny). blocklist/allowlist below take
+    # effect only when mode is "audit" or "enforce".
+    mode: "off"
+    # -- Filter-error behavior: "closed" (fail-safe, block) or "open" (allow).
+    on_failure: "closed"
+    # -- Require integrity metadata (checksums) on allowlisted artifacts.
+    require_integrity: false
+    # -- Minimum release age before an artifact is allowed (e.g. "7d", "24h", "1w").
+    # Empty disables the release-age gate.
+    min_release_age: ""
+    # -- Blocklist JSON. Mount from an existing Secret or ConfigMap (same pattern
+    # as config.auth.htpasswd). When existingSecret/existingConfigMap is set,
+    # blocklist_path is auto-wired to <mountPath>/<key>, so the path is never
+    # specified twice. existingSecret wins if both are set.
+    blocklist:
+      existingSecret: ""
+      existingConfigMap: ""
+      # -- Key inside the Secret/ConfigMap holding the blocklist JSON body.
+      key: blocklist.json
+      # -- Directory the key is mounted into (a sibling of /etc/nora, so it never
+      # collides with the htpasswd mount). The file lands at <mountPath>/<key>.
+      mountPath: /etc/nora-curation/blocklist
+      # -- Explicit blocklist_path, used only when no existingSecret/existingConfigMap
+      # is set (e.g. the file is baked into the image or supplied via extraVolumes).
+      path: ""
+    # -- Allowlist JSON. Same shape as blocklist.
+    allowlist:
+      existingSecret: ""
+      existingConfigMap: ""
+      key: allowlist.json
+      mountPath: /etc/nora-curation/allowlist
+      path: ""
+
+# -- Name of an existing Secret whose keys become env vars (envFrom), e.g.
+# NORA_DOCKER_PROXIES, NORA_NPM_PROXY_AUTH, NORA_STORAGE_S3_ACCESS_KEY /
+# NORA_STORAGE_S3_SECRET_KEY. Keys must be NORA_* variable names: nora reads
+# one config.toml plus NORA_* env and never reads a secrets.toml (older chart
+# versions mounted one at /config/secrets that nothing opened).
+existingSecret: ""
+
+# -- Extra environment variables for the NORA container.
+# Supports full Kubernetes env spec: plain values, secretKeyRef, configMapKeyRef.
+# Example:
+#   extraEnv:
+#     - name: NORA_STORAGE_S3_ACCESS_KEY
+#       valueFrom:
+#         secretKeyRef:
+#           name: my-s3-secret
+#           key: access-key
+#     - name: NORA_AUTH_ENABLED
+#       value: "true"
+extraEnv: []
+
+# -- Additional envFrom entries for the NORA container.
+# Injects all keys from a Secret or ConfigMap as env vars.
+# Example:
+#   extraEnvFrom:
+#     - secretRef:
+#         name: nora-s3-credentials
+extraEnvFrom: []
+
+# -- Extra volumes for the pod and mounts for the NORA container.
+extraVolumes: []
+extraVolumeMounts: []
+
+# -- Memory request == limit (Guaranteed memory, no overcommit OOM kills).
+# nora buffers a proxied artifact and a publish body in RAM (up to ~3x the
+# body), so size memory for the largest package; lower body_limit_mb to match.
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

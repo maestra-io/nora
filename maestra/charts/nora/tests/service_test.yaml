@@ -1,0 +1,43 @@
+suite: service
+templates:
+  - templates/service.yaml
+tests:
+  - it: renders ClusterIP service by default
+    asserts:
+      - isKind:
+          of: Service
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-nora
+      - equal:
+          path: spec.type
+          value: ClusterIP
+      - equal:
+          path: spec.ports[0].port
+          value: 4000
+      - equal:
+          path: spec.ports[0].targetPort
+          value: http
+      - equal:
+          path: spec.selector["app.kubernetes.io/name"]
+          value: nora
+
+  - it: supports NodePort service type
+    set:
+      service.type: NodePort
+      service.port: 8080
+    asserts:
+      - equal:
+          path: spec.type
+          value: NodePort
+      - equal:
+          path: spec.ports[0].port
+          value: 8080
+
+  - it: uses fullnameOverride for resource name
+    set:
+      fullnameOverride: my-registry
+    asserts:
+      - equal:
+          path: metadata.name
+          value: my-registry

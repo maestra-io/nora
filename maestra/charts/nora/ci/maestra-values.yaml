@@ -1,0 +1,113 @@
+# Mirror of the packages.maestra.io HelmRelease (maestra-io/fluxcd
+# iota/us-iota-lw-kube-infra/nora/helm-release.yaml + config.toml, origin/main
+# 11.10.2026) expressed in this chart's values: everything the postRenderer
+# and the separate nora-config-maestra ConfigMap do today. Used by CI
+# (helm lint / template) and as the target values when the HelmRelease moves
+# to this chart.
+replicaCount: 1
+
+deploymentAnnotations:
+  reloader.stakater.com/auto: "true"
+
+image:
+  repository: 515260921971.dkr.ecr.us-west-2.amazonaws.com/nora
+  tag: 1.3.3-maestra.1
+  digest: sha256:4892881d9ad4eea92055dd2178d7ffd6447a1782124510b315ebceac3b75768f
+
+imagePullSecrets:
+  - name: image-pull
+
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClass: local-data
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 2Gi
+  limits:
+    memory: 2Gi
+
+config:
+  server:
+    public_url: https://packages.maestra.io
+    body_limit_mb: 256
+
+  registries:
+    enable: ["nuget", "npm", "pypi"]
+
+  storage:
+    mode: s3
+    path: /data/storage
+    s3_url: https://7409859d029eee9a1aa7b88360259e00.r2.cloudflarestorage.com
+    bucket: nora-packages-iota
+    s3_region: auto
+    s3Credentials:
+      existingSecret: nora-r2-creds   # VaultDynamicSecret, reloader-ignored
+      mountPath: /r2-creds
+
+  # Live config.toml sets no [gc]: nora's default (off). Nothing docker-shaped
+  # to collect here.
+  gc:
+    enabled: false
+    interval: 86400
+
+  auth:
+    enabled: true
+    anonymous_read: false
+    token_storage: /data/tokens
+    htpasswd:
+      existingSecret: nora-htpasswd
+    # traefik-public is hostNetwork: node IPs and, over vxlan, cilium_host
+    # addresses in the pod pool.
+    trusted_proxies:
+      - 10.60.8.0/24
+      - 10.62.0.0/16
+    admin_users:
+      - admin
+    oidc:
+      enabled: true
+      leeway_secs: 60
+      jwks_cache_secs: 300
+      providers:
+        - name: github-actions
+          issuer: https://token.actions.githubusercontent.com
+          audience: packages.maestra.io
+          algorithms: [RS256]
+          max_token_lifetime_secs: 900
+          enabled: true
+          namespace_scope:
+            - "mindbox.*"
+            - "maestra.*"
+            - "@mindbox-cloud/*"
+            - mindbox-ml-commons
+            - python-mindbox-sdk
+            - python-mindbox-chat-ast
+            - mindbox-finance-mcp
+          namespace_scope_enforcement: enforce
+          role_rules:
+            - pattern: "repo:maestra-io/*:ref:refs/heads/main"
+              role: write
+            - pattern: "repo:maestra-io/*:ref:refs/heads/master"
+              role: write
+            - pattern: "repo:maestra-io@180315372/*:ref:refs/heads/main"
+              role: write
+            - pattern: "repo:maestra-io@180315372/*:ref:refs/heads/master"
+              role: write
+            - pattern: "repo:maestra-io/*"
+              role: read
+            - pattern: "repo:maestra-io@180315372/*"
+              role: read
+
+  audit:
+    mode: stdout
+
+  rate_limit:
+    enabled: true
+    auth_rps: 1
+    auth_burst: 5
+    upload_rps: 200
+    upload_burst: 500
+    general_rps: 100
+    general_burst: 200
