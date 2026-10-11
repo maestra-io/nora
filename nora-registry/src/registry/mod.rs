@@ -485,6 +485,68 @@ pub(crate) async fn proxy_fetch(
     .await
 }
 
+/// [`proxy_fetch`] returning the body as one refcounted `Bytes`, so the
+/// response and the cache write can share it instead of each copying it.
+pub(crate) async fn proxy_fetch_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+) -> Result<Bytes, ProxyError> {
+    proxy_fetch_core(
+        client,
+        url,
+        timeout,
+        auth,
+        None,
+        reqwest::Response::bytes,
+        cb,
+        scope,
+    )
+    .await
+}
+
+/// Run a cold-miss artifact `fetch` for storage `key` under single-flight (#595):
+/// concurrent misses share one upstream fetch and one in-memory body. The flag is
+/// true for the caller whose own `fetch` ran — the only one that should cache it.
+pub(crate) async fn proxy_fetch_shared(
+    state: &AppState,
+    key: &str,
+    registry: &'static str,
+    proxy_timeout_secs: u64,
+    fetch: impl std::future::Future<Output = Result<Bytes, ProxyError>>,
+) -> Result<(Bytes, bool), ProxyError> {
+    if !state.config.server.proxy_coalesce {
+        return fetch.await.map(|b| (b, true));
+    }
+    // `fetch` runs at most once per caller: as the leader, or as a follower whose
+    // leader failed. Its own result (error included) wins over a shared one.
+    let mut own = None;
+    let own_slot = &mut own;
+    let shared = state
+        .proxy_coalesce
+        .coalesced(
+            &format!("fetch:{key}"),
+            registry,
+            crate::proxy_coalesce::follower_budget(proxy_timeout_secs),
+            move || async move {
+                let result = fetch.await;
+                let value = result.as_ref().ok().cloned();
+                *own_slot = Some(result);
+                value
+            },
+        )
+        .await;
+    match own {
+        Some(result) => result.map(|b| (b, true)),
+        None => shared
+            .map(|b| (b, false))
+            .ok_or_else(|| ProxyError::Network("coalesced fetch returned nothing".into())),
+    }
+}
+
 /// Fetch text content from upstream proxy with timeout and 1 retry.
 pub(crate) async fn proxy_fetch_text(
     client: &reqwest::Client,
@@ -1160,6 +1222,49 @@ mod tests {
 
     fn noop_cb() -> CircuitBreakerRegistry {
         CircuitBreakerRegistry::new(crate::config::CircuitBreakerConfig::default())
+    }
+
+    /// Concurrent cold misses on one key share one upstream fetch and one body;
+    /// exactly one caller is told it fetched (and so owns the cache write).
+    #[tokio::test]
+    async fn proxy_fetch_shared_coalesces_concurrent_misses() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"artifact".to_vec())
+                    .set_delay(Duration::from_millis(300)),
+            )
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context_with_config(|_| {});
+        let state = &ctx.state;
+        let url = upstream.uri();
+
+        let calls = (0..8).map(|_| {
+            let fetch = proxy_fetch_bytes(
+                &state.http_client,
+                &url,
+                Duration::from_secs(5),
+                None,
+                &state.circuit_breaker,
+                RegistryType::Npm,
+            );
+            proxy_fetch_shared(state, "npm/x/-/x-1.0.0.tgz", "npm", 5, fetch)
+        });
+        let results = futures::future::join_all(calls).await;
+
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+        let mut fetchers = 0;
+        for r in results {
+            let (body, fetched) = r.unwrap();
+            assert_eq!(&body[..], b"artifact");
+            fetchers += usize::from(fetched);
+        }
+        assert_eq!(fetchers, 1, "only the leader owns the cache write");
     }
 
     /// With no stored validators, the conditional fetch sends no `If-None-Match`,

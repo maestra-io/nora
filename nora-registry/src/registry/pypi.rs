@@ -16,7 +16,7 @@ use crate::circuit_breaker::BreakerScope;
 use crate::config::UpstreamAuth;
 use crate::registry::{
     cache_read, circuit_open_response, method_not_allowed, nora_base_url, proxy_error_response,
-    proxy_fetch, proxy_fetch_text,
+    proxy_fetch_bytes, proxy_fetch_shared, proxy_fetch_text,
 };
 use crate::registry_type::RegistryType;
 use crate::ui::components::html_escape;
@@ -549,17 +549,17 @@ async fn download_file(
             continue;
         };
 
-        match proxy_fetch(
+        let fetch = proxy_fetch_bytes(
             &state.http_client,
             &file_url,
             Duration::from_secs(state.config.pypi.proxy_timeout),
             up.auth().map(UpstreamAuth::Basic),
             &state.circuit_breaker,
             BreakerScope::upstream(RegistryType::PyPI, up.url()),
-        )
-        .await
+        );
+        match proxy_fetch_shared(&state, &key, "pypi", state.config.pypi.proxy_timeout, fetch).await
         {
-            Ok(data) => {
+            Ok((data, fetched)) => {
                 // The index published this file's digest: a body that does not match
                 // (truncated, corrupted, tampered) is neither served nor cached.
                 if let Some(expected) = &expected_sha256 {
@@ -591,23 +591,26 @@ async fn download_file(
                     .audit
                     .log(AuditEntry::new("proxy_fetch", "proxy", "", "pypi", ""));
 
-                // Cache in background + compute hash, invalidate AFTER write
-                let storage = state.storage.clone();
-                let key_clone = key.clone();
-                let data_clone = data.clone();
-                let project = normalized.clone();
-                let file_name = filename.clone();
-                let repo_index = Arc::clone(&state.repo_index);
-                tokio::spawn(async move {
-                    if storage.put(&key_clone, &data_clone).await.is_ok() {
+                // Cache in background + compute hash, invalidate AFTER write.
+                // Only the caller that fetched caches; coalesced followers share its body.
+                if fetched {
+                    let storage = state.storage.clone();
+                    let key_clone = key.clone();
+                    let data_clone = data.clone();
+                    let project = normalized.clone();
+                    let file_name = filename.clone();
+                    let repo_index = Arc::clone(&state.repo_index);
+                    tokio::spawn(async move {
                         let hash = hex::encode(sha2::Sha256::digest(&data_clone));
-                        let _ = storage
-                            .put(&format!("{}.sha256", key_clone), hash.as_bytes())
-                            .await;
-                        put_hash_marker(&storage, &project, &file_name, &hash).await;
-                        repo_index.invalidate("pypi");
-                    }
-                });
+                        if storage.put_bytes(&key_clone, data_clone).await.is_ok() {
+                            let _ = storage
+                                .put(&format!("{}.sha256", key_clone), hash.as_bytes())
+                                .await;
+                            put_hash_marker(&storage, &project, &file_name, &hash).await;
+                            repo_index.invalidate("pypi");
+                        }
+                    });
+                }
 
                 if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                     &state.digest_store,
