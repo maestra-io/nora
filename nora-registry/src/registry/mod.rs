@@ -254,7 +254,7 @@ fn transport_error(e: reqwest::Error) -> ProxyError {
 
 /// Classify an upstream 4xx. Only a plain 4xx (404/410…) means "no such artifact";
 /// throttling and auth refusals must not reach clients as a cacheable 404.
-fn upstream_4xx(status: u16, headers: &reqwest::header::HeaderMap) -> ProxyError {
+pub(crate) fn upstream_4xx(status: u16, headers: &reqwest::header::HeaderMap) -> ProxyError {
     match status {
         429 => ProxyError::RateLimited(
             headers
