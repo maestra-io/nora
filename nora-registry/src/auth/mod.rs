@@ -527,6 +527,7 @@ pub async fn auth_middleware(
         }
 
         // 2. Try OIDC JWT validation
+        let mut oidc_key_miss = false;
         if let Some(ref oidc_validator) = state.oidc {
             if oidc_validator.is_active() {
                 match oidc_validator.validate_token(token).await {
@@ -582,13 +583,16 @@ pub async fn auth_middleware(
                             crate::auth::oidc::classify_rejection(&reason),
                         );
                         tracing::warn!(reason = %reason, "OIDC authentication rejected");
+                        oidc_key_miss = crate::auth::oidc::is_key_miss(&reason);
                     }
                 }
             }
         }
 
-        // Both token and OIDC failed
-        if let Some(ip) = client_ip {
+        // Both token and OIDC failed. A JWT whose `kid` is still unknown after the
+        // JWKS refetch is an issuer key rotation, not a guessed credential: it must
+        // not lock the CI runner's IP out (a forged kid verifies nothing either).
+        if let Some(ip) = client_ip.filter(|_| !oidc_key_miss) {
             state.auth_failures.record_failure(ip);
         }
         return unauthorized_response("Invalid or expired token", realm);
@@ -2540,6 +2544,66 @@ Jd74nq6dNCjpWG4drIsyhqX+
             StatusCode::UNAUTHORIZED,
             "HS256 tokens must be rejected for OIDC"
         );
+    }
+
+    /// A JWT whose `kid` is unknown even after the JWKS refetch is an issuer key
+    /// rotation, not a guessed credential: it stays 401 but does not feed the
+    /// per-IP lockout. Wrong audience, expiry and a bad signature still do.
+    #[tokio::test]
+    async fn test_oidc_unknown_kid_does_not_count_toward_lockout() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let issuer = mock_server.uri();
+        let sub = "repo:myorg/app:ref:refs/heads/main";
+        let now = now_secs();
+        let get = |token: String| {
+            let app = &ctx.app;
+            async move {
+                let bearer = format!("Bearer {token}");
+                send_with_headers(
+                    app,
+                    Method::GET,
+                    "/raw/test.txt",
+                    vec![("authorization", &bearer)],
+                    "",
+                )
+                .await
+                .status()
+            }
+        };
+        let ip: std::net::IpAddr = [127, 0, 0, 1].into();
+
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("rotated-key-2".to_string());
+        let claims =
+            json!({"iss": issuer, "sub": sub, "aud": "nora", "iat": now, "exp": now + 600});
+        let key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
+        let unknown_kid = encode(&header, &claims, &key).unwrap();
+        for _ in 0..10 {
+            assert_eq!(get(unknown_kid.clone()).await, StatusCode::UNAUTHORIZED);
+        }
+        assert!(ctx.state.auth_failures.check_blocked(&ip).is_none());
+
+        let valid = make_jwt(&issuer, sub, "nora", now, now + 600);
+        let (signed, _) = valid.rsplit_once('.').unwrap();
+        let bad_signature = format!("{signed}.{}", "A".repeat(342));
+        for token in [
+            make_jwt(&issuer, sub, "wrong-audience", now, now + 600),
+            make_jwt(&issuer, sub, "wrong-audience", now, now + 600),
+            make_jwt(&issuer, sub, "nora", now - 600, now - 120),
+            make_jwt(&issuer, sub, "nora", now - 600, now - 120),
+            bad_signature,
+        ] {
+            assert_eq!(get(token).await, StatusCode::UNAUTHORIZED);
+        }
+        assert!(ctx.state.auth_failures.check_blocked(&ip).is_some());
     }
 }
 
