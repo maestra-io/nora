@@ -174,10 +174,7 @@ impl RepoIndex {
                 RegistryType::PyPI => build_pypi_index(storage).await,
                 RegistryType::Go => build_go_index(storage).await,
                 RegistryType::Raw => build_raw_index(storage).await,
-                RegistryType::Nuget => {
-                    let (p, s) = crate::registry::nuget::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
+                RegistryType::Nuget => build_nuget_index(storage).await,
                 RegistryType::Gems => build_gems_index(storage).await,
                 RegistryType::Terraform => {
                     let (p, s) = crate::registry::terraform::INDEX_PATTERN;
@@ -530,6 +527,30 @@ async fn build_generic_index(
         }
     }
 
+    Some(to_sorted_vec(packages))
+}
+
+/// NuGet: the proxy cache (`nuget/flatcontainer/{id}/{ver}/…`) plus the hosted feed
+/// (`nuget/hosted/{id}/{ver}/…`, maestra fork). Both key by lowercase ID.
+async fn build_nuget_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let (proxy_prefix, suffix) = crate::registry::nuget::INDEX_PATTERN;
+    let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
+    for prefix in [proxy_prefix, "nuget/hosted/"] {
+        for (key, meta) in &list_keys(storage, prefix).await? {
+            let Some(name) = key
+                .strip_prefix(prefix)
+                .filter(|_| key.ends_with(suffix))
+                .and_then(|rest| rest.split('/').next())
+                .filter(|n| !n.is_empty())
+            else {
+                continue;
+            };
+            let entry = packages.entry(name.to_string()).or_insert((0, 0, 0));
+            entry.0 += 1;
+            entry.1 += meta.size;
+            entry.2 = entry.2.max(meta.modified);
+        }
+    }
     Some(to_sorted_vec(packages))
 }
 

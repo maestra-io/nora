@@ -23,6 +23,11 @@
 //! never reads storage. An ID with a state document is owned by this feed: its metadata
 //! and downloads are never proxied upstream. An internal ID that has not been pushed
 //! yet is only kept off nuget.org by `curation.internal_namespaces`.
+//!
+//! Re-pushing an existing version with identical bytes answers 200 and writes nothing;
+//! different bytes answer 409. [`run_retention`] (periodic cleanup pass) expires PR
+//! pre-releases (`X.Y.Z-pr.*`, `[nuget] hosted_pr_*`) and sweeps blob dirs no document
+//! names; [`rebuild`] (`nora nuget rebuild <id>`) rewrites a document from the blobs.
 
 use super::{is_valid_package_id, with_json, with_json_gzip, SearchParams};
 use crate::activity_log::{ActionType, ActivityEntry};
@@ -187,57 +192,174 @@ fn unavailable() -> Response {
 
 // ── In-memory index ────────────────────────────────────────────────────
 
-/// In-memory view of `nuget/hosted-meta/`, keyed by lowercase ID. `None` marks a
-/// document that exists but does not parse (fail closed: 503 for that ID).
+/// In-memory view of `nuget/hosted-meta/`, keyed by lowercase ID.
 ///
 /// Loaded from storage on first use (one LIST, parallel GETs) and updated after every
-/// successful write. nora runs a single writer replica, so nothing invalidates it from
-/// outside; a document written to storage behind nora's back is seen after a restart.
+/// successful write. A failed load leaves no index at all (never an empty or partial
+/// one that would let public namesakes through): every hosted hook answers 503 and the
+/// load is retried on a later request, with backoff. nora runs a single writer replica,
+/// so nothing invalidates the index from outside; a document written behind nora's
+/// back (`nora nuget rebuild`, a restore) is picked up by re-reading a corrupt entry
+/// on access, by the periodic hosted retention pass, or by `POST /api/v1/admin/reindex`.
 #[derive(Default)]
 pub(crate) struct HostedIndex {
-    docs: tokio::sync::OnceCell<RwLock<HashMap<String, Option<Arc<HostedPackage>>>>>,
+    map: arc_swap::ArcSwapOption<IndexMap>,
+    /// Serializes loads; holds the backoff after a failed one.
+    loader: tokio::sync::Mutex<Backoff>,
 }
 
-type IndexMap = RwLock<HashMap<String, Option<Arc<HostedPackage>>>>;
+#[derive(Default)]
+struct Backoff {
+    failures: u32,
+    retry_at: Option<std::time::Instant>,
+}
 
-async fn index(state: &AppState) -> Result<&IndexMap, ()> {
-    state
-        .nuget_hosted
-        .docs
-        .get_or_try_init(|| async {
-            let keys = state.storage.list(META_PREFIX).await.map_err(|e| {
-                tracing::error!(error = %e, "nuget hosted: index listing failed");
-            })?;
-            let ids = keys.into_iter().filter_map(|k| {
-                k.strip_prefix(META_PREFIX)?
-                    .strip_suffix(".json")
-                    .map(str::to_string)
-            });
-            let loaded: Vec<_> = futures::stream::iter(ids)
-                .map(|id| async move {
-                    let doc = load(&state.storage, &id).await;
-                    (id, doc)
-                })
-                .buffer_unordered(LOAD_CONCURRENCY)
-                .collect()
-                .await;
-            let mut map = HashMap::new();
-            for (id, doc) in loaded {
-                match doc {
-                    Ok(Some(pkg)) => {
-                        map.insert(id, Some(Arc::new(pkg)));
-                    }
-                    Ok(None) => {} // deleted between LIST and GET
-                    Err(LoadError::Corrupt) => {
-                        map.insert(id, None);
-                    }
-                    Err(LoadError::Storage) => return Err(()),
-                }
-            }
-            tracing::info!(ids = map.len(), "nuget hosted: index loaded");
-            Ok(RwLock::new(map))
+/// A document that exists but does not parse fails its ID closed (503); it is re-read
+/// on access at most this often, so a repaired document is served without a restart.
+const CORRUPT_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+/// Cap on the retry backoff after a failed index load (1 s, 2 s, 4 s … 60 s).
+const MAX_LOAD_BACKOFF_SECS: u64 = 60;
+
+#[derive(Clone)]
+enum Doc {
+    Ready(Arc<HostedPackage>),
+    /// Unparsable; re-read from storage on access after this instant.
+    Corrupt(std::time::Instant),
+}
+
+type IndexMap = RwLock<HashMap<String, Doc>>;
+
+async fn index(state: &AppState) -> Result<Arc<IndexMap>, ()> {
+    let idx = &state.nuget_hosted;
+    if let Some(map) = idx.map.load_full() {
+        return Ok(map);
+    }
+    let mut backoff = idx.loader.lock().await;
+    if let Some(map) = idx.map.load_full() {
+        return Ok(map);
+    }
+    if backoff
+        .retry_at
+        .is_some_and(|t| std::time::Instant::now() < t)
+    {
+        return Err(());
+    }
+    match load_index(&state.storage).await {
+        Ok(map) => {
+            let map = Arc::new(RwLock::new(map));
+            idx.map.store(Some(map.clone()));
+            *backoff = Backoff::default();
+            Ok(map)
+        }
+        Err(()) => {
+            backoff.failures += 1;
+            let secs = (1u64 << (backoff.failures - 1).min(6)).min(MAX_LOAD_BACKOFF_SECS);
+            backoff.retry_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
+            tracing::warn!(
+                failures = backoff.failures,
+                retry_in_secs = secs,
+                "nuget hosted: index load failed; hosted lookups answer 503 until it loads"
+            );
+            Err(())
+        }
+    }
+}
+
+/// One LIST plus bounded-parallel GETs. Any storage error fails the whole load.
+async fn load_index(storage: &Storage) -> Result<HashMap<String, Doc>, ()> {
+    let keys = storage.list(META_PREFIX).await.map_err(|e| {
+        tracing::error!(error = %e, "nuget hosted: index listing failed");
+    })?;
+    let loaded: Vec<_> = futures::stream::iter(meta_ids(keys))
+        .map(|id| async move {
+            let doc = load(storage, &id).await;
+            (id, doc)
         })
-        .await
+        .buffer_unordered(LOAD_CONCURRENCY)
+        .collect()
+        .await;
+    let mut map = HashMap::new();
+    for (id, doc) in loaded {
+        match doc {
+            Ok(Some(pkg)) => {
+                map.insert(id, Doc::Ready(Arc::new(pkg)));
+            }
+            Ok(None) => {} // deleted between LIST and GET
+            Err(LoadError::Corrupt) => {
+                map.insert(id, Doc::Corrupt(std::time::Instant::now() + CORRUPT_RETRY));
+            }
+            Err(LoadError::Storage) => return Err(()),
+        }
+    }
+    tracing::info!(ids = map.len(), "nuget hosted: index loaded");
+    Ok(map)
+}
+
+fn meta_ids(keys: Vec<String>) -> impl Iterator<Item = String> {
+    keys.into_iter().filter_map(|k| {
+        k.strip_prefix(META_PREFIX)?
+            .strip_suffix(".json")
+            .map(str::to_string)
+    })
+}
+
+/// Re-read one document into the index. The caller holds the ID's publish lock, so no
+/// in-process write can interleave. A storage error leaves the entry as it was.
+async fn reload_locked(
+    storage: &Storage,
+    map: &IndexMap,
+    id_lower: &str,
+) -> Result<Option<Arc<HostedPackage>>, LoadError> {
+    let doc = load(storage, id_lower).await;
+    let mut m = map.write();
+    match doc {
+        Ok(Some(pkg)) => {
+            let pkg = Arc::new(pkg);
+            m.insert(id_lower.to_string(), Doc::Ready(pkg.clone()));
+            Ok(Some(pkg))
+        }
+        Ok(None) => {
+            m.remove(id_lower);
+            Ok(None)
+        }
+        Err(LoadError::Corrupt) => {
+            m.insert(
+                id_lower.to_string(),
+                Doc::Corrupt(std::time::Instant::now() + CORRUPT_RETRY),
+            );
+            Err(LoadError::Corrupt)
+        }
+        Err(LoadError::Storage) => Err(LoadError::Storage),
+    }
+}
+
+/// Re-read every document under the publish locks: picks up documents written behind
+/// nora's back (rebuild CLI, restore). Called by the admin reindex.
+pub(crate) async fn refresh(state: &AppState) {
+    let Ok(map) = index(state).await else {
+        return; // not loaded yet: the next use loads everything fresh
+    };
+    let keys = match state.storage.list(META_PREFIX).await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::warn!(error = %e, "nuget hosted: refresh listing failed");
+            return;
+        }
+    };
+    let mut ids: Vec<String> = meta_ids(keys).collect();
+    ids.extend(map.read().keys().cloned());
+    ids.sort();
+    ids.dedup();
+    let map = &map;
+    futures::stream::iter(ids)
+        .for_each_concurrent(LOAD_CONCURRENCY, |id| async move {
+            let lock = state.publish_lock(&meta_key(&id));
+            let _guard = lock.lock().await;
+            let _ = reload_locked(&state.storage, map, &id).await;
+        })
+        .await;
+    tracing::info!(ids = map.read().len(), "nuget hosted: index refreshed");
 }
 
 enum Lookup {
@@ -250,10 +372,23 @@ async fn lookup(state: &AppState, id_lower: &str) -> Lookup {
     let Ok(map) = index(state).await else {
         return Lookup::Unavailable;
     };
-    match map.read().get(id_lower) {
+    let doc = map.read().get(id_lower).cloned();
+    match doc {
         None => Lookup::NotHosted,
-        Some(Some(pkg)) => Lookup::Hosted(pkg.clone()),
-        Some(None) => Lookup::Unavailable,
+        Some(Doc::Ready(pkg)) => Lookup::Hosted(pkg),
+        Some(Doc::Corrupt(retry_at)) if std::time::Instant::now() < retry_at => Lookup::Unavailable,
+        Some(Doc::Corrupt(_)) => {
+            let lock = state.publish_lock(&meta_key(id_lower));
+            let _guard = lock.lock().await;
+            match reload_locked(&state.storage, &map, id_lower).await {
+                Ok(Some(pkg)) => {
+                    tracing::info!(id = %id_lower, "nuget hosted: repaired state document picked up");
+                    Lookup::Hosted(pkg)
+                }
+                Ok(None) => Lookup::NotHosted,
+                Err(_) => Lookup::Unavailable,
+            }
+        }
     }
 }
 
@@ -371,29 +506,34 @@ async fn push(
         Ok(p) => p.unwrap_or_default(),
         Err(_) => return unavailable(),
     };
+    let dir = format!("{BLOB_PREFIX}{id_lower}/{ver_lower}");
+    let nupkg_key = format!("{dir}/{id_lower}.{ver_lower}.nupkg");
     if pkg
         .versions
         .iter()
         .any(|v| v.version.eq_ignore_ascii_case(&version))
     {
-        return (
-            StatusCode::CONFLICT,
-            format!("{} {} already exists", pkg_id(&pkg, &spec.id), version),
-        )
-            .into_response();
+        let artifact = format!("{} {}", pkg_id(&pkg, &spec.id), version);
+        // Idempotent re-push (a retry after a lost 201): the same bytes are a success
+        // and rewrite nothing; different bytes for an existing version stay a 409.
+        // The NuGet client treats any 2xx as pushed.
+        if state.storage.pin(&nupkg_key).await.as_deref() == Some(sha256.as_str()) {
+            tracing::info!(package = %artifact, "nuget hosted: identical re-push accepted");
+            return (
+                StatusCode::OK,
+                format!("{artifact} already exists (identical)"),
+            )
+                .into_response();
+        }
+        return (StatusCode::CONFLICT, format!("{artifact} already exists")).into_response();
     }
 
     // Blobs first, state document last: the index never names a blob that is not
     // durable. A failure in between leaves an unreferenced blob a retry overwrites;
     // downloads resolve through the state document, so it is never served.
-    let dir = format!("{BLOB_PREFIX}{id_lower}/{ver_lower}");
     if let Err(e) = state
         .storage
-        .put_from_path(
-            &format!("{dir}/{id_lower}.{ver_lower}.nupkg"),
-            &spool.0,
-            Some(&sha256),
-        )
+        .put_from_path(&nupkg_key, &spool.0, Some(&sha256))
         .await
     {
         tracing::error!(error = %e, "nuget hosted: failed to store nupkg");
@@ -428,10 +568,11 @@ async fn push(
     });
     pkg.versions
         .sort_by(|a, b| compare_versions(&a.version, &b.version));
-    if let Err(resp) = save(&state.storage, map, &id_lower, &pkg).await {
+    if let Err(resp) = save(&state.storage, &map, &id_lower, &pkg).await {
         return resp;
     }
 
+    state.repo_index.invalidate("nuget");
     let artifact = format!("{}@{}", pkg.id, version);
     state.metrics.record_upload("nuget");
     state.audit.log(AuditEntry::new(
@@ -532,10 +673,11 @@ async fn set_listed(
         return StatusCode::NOT_FOUND.into_response();
     };
     entry.listed = listed;
-    if let Err(resp) = save(&state.storage, map, &id_lower, &pkg).await {
+    if let Err(resp) = save(&state.storage, &map, &id_lower, &pkg).await {
         return resp;
     }
 
+    state.repo_index.invalidate("nuget");
     let action = if listed { "relist" } else { "unlist" };
     state.audit.log(AuditEntry::new(
         action,
@@ -569,7 +711,7 @@ async fn save(
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })?;
     map.write()
-        .insert(id_lower.to_string(), Some(Arc::new(pkg.clone())));
+        .insert(id_lower.to_string(), Doc::Ready(Arc::new(pkg.clone())));
     Ok(())
 }
 
@@ -928,19 +1070,26 @@ async fn merged_search(
         };
     }
 
-    let hits = match hosted_hits(
-        &state,
-        p.q.as_deref().unwrap_or(""),
-        prerelease,
-        semver2,
-        p.package_type.as_deref(),
-    )
-    .await
-    {
+    let q = p.q.as_deref().unwrap_or("");
+    let hits = match hosted_hits(&state, q, prerelease, semver2, p.package_type.as_deref()).await {
         Ok(h) => h,
         // Fail the query rather than hide hosted IDs behind their public namesakes.
         Err(()) => return unavailable(),
     };
+    // Without a proxy, or for an internal-namespace term, the upstream handler answers
+    // from its local cache index, which lists hosted IDs too (UI) and would cost one
+    // storage miss per matching hosted ID. Hosted IDs are answered here instead.
+    if local_only(&state, q) && (!hits.is_empty() || hosted_name_matches(&state, q).await) {
+        let skip = p.skip.unwrap_or(0);
+        let take = p.take.unwrap_or(20);
+        let page = hits
+            .iter()
+            .skip(skip)
+            .take(take)
+            .map(|h| if names { h["id"].clone() } else { h.clone() })
+            .collect();
+        return with_json(merge_page(&hits, page, &Value::Null, 0));
+    }
     if hits.is_empty() {
         return upstream_search(state, headers, upstream_params(p.skip, p.take), raw, names).await;
     }
@@ -986,6 +1135,24 @@ async fn merged_search(
         header::HeaderValue::from_static("application/json"),
     );
     Response::from_parts(parts, Body::from(body))
+}
+
+/// The upstream search handlers' own condition for answering from the local cache.
+fn local_only(state: &AppState, q: &str) -> bool {
+    state.config.nuget.proxy.is_none()
+        || crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Nuget,
+            q,
+        )
+}
+
+/// Whether the upstream local search's substring filter would pick a hosted ID.
+async fn hosted_name_matches(state: &AppState, q: &str) -> bool {
+    let q = q.to_lowercase();
+    index(state)
+        .await
+        .is_ok_and(|map| map.read().keys().any(|id| id.contains(q.as_str())))
 }
 
 /// Replace `skip`/`take` in a raw query string, keeping every other pair verbatim.
@@ -1057,14 +1224,27 @@ async fn hosted_hits(
         }
     }
     let map = index(state).await?;
+    let matching: Vec<(String, Doc)> = map
+        .read()
+        .iter()
+        .filter(|(id, _)| {
+            exact.iter().all(|e| *id == e) && terms.iter().all(|t| id.contains(t.as_str()))
+        })
+        .map(|(id, doc)| (id.clone(), doc.clone()))
+        .collect();
     let mut pkgs: Vec<(String, Arc<HostedPackage>)> = Vec::new();
-    for (id, doc) in map.read().iter() {
-        if !(exact.iter().all(|e| id == e) && terms.iter().all(|t| id.contains(t.as_str()))) {
-            continue;
-        }
-        // A matching hosted ID we cannot read: fail rather than let its namesake through.
-        let Some(pkg) = doc else { return Err(()) };
-        pkgs.push((id.clone(), pkg.clone()));
+    for (id, doc) in matching {
+        let pkg = match doc {
+            Doc::Ready(pkg) => pkg,
+            // Re-read if due; a matching hosted ID we still cannot read fails the query
+            // rather than let its public namesake through.
+            Doc::Corrupt(_) => match lookup(state, &id).await {
+                Lookup::Hosted(pkg) => pkg,
+                Lookup::NotHosted => continue,
+                Lookup::Unavailable => return Err(()),
+            },
+        };
+        pkgs.push((id, pkg));
     }
     pkgs.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -1121,6 +1301,382 @@ async fn hosted_hits(
         }));
     }
     Ok(out)
+}
+
+// ── Retention / orphan sweep (periodic cleanup pass) ───────────────────
+
+/// Blob dirs the state document does not name are deleted only once their newest file
+/// is older than this (a push that died before its save; pushes hold the ID's publish
+/// lock, so none is in flight while the sweep holds it).
+const ORPHAN_MIN_AGE_SECS: u64 = 3600;
+
+/// `X.Y.Z-pr.<n>…`: the PR pre-release stream the retention pass expires.
+fn is_pr_version(version: &str) -> bool {
+    version
+        .split_once('-')
+        .and_then(|(_, pre)| pre.get(..3))
+        .is_some_and(|p| p.eq_ignore_ascii_case("pr."))
+}
+
+/// PR pre-releases to delete: older than `days` and not among the `keep_last` newest
+/// (by publish time) of the ID. `days == 0` disables expiry. Anything else is kept.
+fn expired_pr_versions(
+    versions: &[HostedVersion],
+    now: chrono::DateTime<chrono::Utc>,
+    days: u32,
+    keep_last: u32,
+) -> Vec<String> {
+    if days == 0 {
+        return Vec::new();
+    }
+    let cutoff = now - chrono::Duration::days(i64::from(days));
+    // An unparsable timestamp counts as new: never delete on a guess.
+    let published = |v: &HostedVersion| {
+        chrono::DateTime::parse_from_rfc3339(&v.published)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .unwrap_or(now)
+    };
+    let mut pr: Vec<&HostedVersion> = versions
+        .iter()
+        .filter(|v| is_pr_version(&v.version))
+        .collect();
+    pr.sort_by(|a, b| {
+        published(b)
+            .cmp(&published(a))
+            .then_with(|| compare_versions(&b.version, &a.version))
+    });
+    pr.into_iter()
+        .skip(keep_last as usize)
+        .filter(|v| published(v) < cutoff)
+        .map(|v| v.version.clone())
+        .collect()
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct RetentionSummary {
+    pub ids: usize,
+    pub expired: usize,
+    pub orphans: usize,
+    pub deleted_keys: usize,
+    pub bytes_freed: u64,
+    pub errors: usize,
+}
+
+/// Periodic hosted-feed pass: per ID, under its publish lock, re-read the state document
+/// into the index (picking up out-of-band writes), expire PR pre-releases per
+/// `[nuget] hosted_pr_*`, then delete their blobs and blob dirs no document names.
+/// `dry_run` only logs. Order per version: document first, then blobs, so the feed
+/// never names a deleted blob.
+pub(crate) async fn run_retention(state: &AppState, dry_run: bool) -> RetentionSummary {
+    let mut sum = RetentionSummary::default();
+    let started = std::time::Instant::now();
+    let Ok(map) = index(state).await else {
+        sum.errors += 1;
+        return sum;
+    };
+    let (metas, blobs) = match (
+        state.storage.list(META_PREFIX).await,
+        state.storage.list_with_meta(BLOB_PREFIX).await,
+    ) {
+        (Ok(m), Ok(b)) => (m, b),
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::warn!(error = %e, "nuget hosted retention: listing failed, skipped");
+            sum.errors += 1;
+            return sum;
+        }
+    };
+    // id → version dir → (keys, newest mtime)
+    type Dirs = HashMap<String, (Vec<(String, u64)>, u64)>;
+    let mut by_id: HashMap<String, Dirs> = HashMap::new();
+    for (key, meta) in blobs {
+        let Some(rest) = key.strip_prefix(BLOB_PREFIX) else {
+            continue;
+        };
+        let mut parts = rest.splitn(3, '/');
+        let (Some(id), Some(ver), Some(_)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let dir = by_id
+            .entry(id.to_string())
+            .or_default()
+            .entry(ver.to_string())
+            .or_default();
+        dir.1 = dir.1.max(meta.modified);
+        dir.0.push((key, meta.size));
+    }
+    let mut ids: Vec<String> = meta_ids(metas).collect();
+    ids.extend(map.read().keys().cloned());
+    ids.extend(by_id.keys().cloned());
+    ids.sort();
+    ids.dedup();
+
+    let cfg = &state.config.nuget;
+    let now = chrono::Utc::now();
+    let now_secs = u64::try_from(now.timestamp()).unwrap_or(0);
+    let mut deleted_any = false;
+    for id in ids {
+        let lock = state.publish_lock(&meta_key(&id));
+        let _guard = lock.lock().await;
+        let mut dirs = by_id.remove(&id).unwrap_or_default();
+        let pkg = match reload_locked(&state.storage, &map, &id).await {
+            Ok(Some(pkg)) => pkg,
+            Ok(None) => {
+                if !dirs.is_empty() {
+                    // Never sweep these: they are what `nora nuget rebuild` restores from.
+                    tracing::warn!(id = %id, dirs = dirs.len(), "nuget hosted: blobs without a state document; run `nora nuget rebuild {id}`");
+                }
+                continue;
+            }
+            Err(_) => {
+                sum.errors += 1;
+                continue;
+            }
+        };
+        sum.ids += 1;
+        let expired = expired_pr_versions(
+            &pkg.versions,
+            now,
+            cfg.hosted_pr_retention_days,
+            cfg.hosted_pr_keep_last,
+        );
+        let named: Vec<String> = pkg
+            .versions
+            .iter()
+            .map(|v| v.version.to_lowercase())
+            .collect();
+        let mut doomed: Vec<(String, &'static str)> = expired
+            .iter()
+            .map(|v| (v.clone(), "pr-prerelease-expired"))
+            .collect();
+        doomed.extend(
+            dirs.iter()
+                .filter(|(ver, (_, newest))| {
+                    !named.contains(ver) && now_secs.saturating_sub(*newest) > ORPHAN_MIN_AGE_SECS
+                })
+                .map(|(ver, _)| (ver.clone(), "orphan-blob-dir")),
+        );
+        sum.expired += expired.len();
+        sum.orphans += doomed.len() - expired.len();
+        if doomed.is_empty() {
+            continue;
+        }
+        if dry_run {
+            for (ver, reason) in &doomed {
+                tracing::info!(id = %pkg.id, version = %ver, reason, "nuget hosted retention (dry-run): would delete");
+            }
+            continue;
+        }
+        if !expired.is_empty() {
+            let mut kept = (*pkg).clone();
+            kept.versions
+                .retain(|v| !expired.iter().any(|e| e == &v.version));
+            if save(&state.storage, &map, &id, &kept).await.is_err() {
+                sum.errors += 1;
+                continue; // document unchanged: keep every blob it names
+            }
+        }
+        for (ver, reason) in doomed {
+            let Some((keys, _)) = dirs.remove(&ver.to_lowercase()) else {
+                continue; // expired version whose blobs are already gone
+            };
+            let mut failed = false;
+            for (key, size) in keys {
+                match state.storage.delete(&key).await {
+                    Ok(()) | Err(StorageError::NotFound) => {
+                        sum.deleted_keys += 1;
+                        sum.bytes_freed += size;
+                    }
+                    Err(e) => {
+                        tracing::warn!(key = %key, error = %e, "nuget hosted retention: delete failed");
+                        failed = true;
+                    }
+                }
+            }
+            sum.errors += usize::from(failed);
+            deleted_any = true;
+            state.audit.log(AuditEntry::new(
+                "retention-delete",
+                "scheduler",
+                &format!("{}@{}", pkg.id, ver),
+                "nuget",
+                reason,
+            ));
+        }
+    }
+    if deleted_any {
+        state.repo_index.invalidate("nuget");
+    }
+    tracing::info!(
+        dry_run,
+        ids = sum.ids,
+        expired = sum.expired,
+        orphans = sum.orphans,
+        deleted_keys = sum.deleted_keys,
+        bytes_freed = sum.bytes_freed,
+        errors = sum.errors,
+        duration_secs = started.elapsed().as_secs_f64(),
+        "nuget hosted retention: done"
+    );
+    sum
+}
+
+// ── Rebuild from stored blobs (`nora nuget rebuild <id>`) ──────────────
+
+/// Rewrite an ID's state document from its stored `.nuspec` blobs (the `.nupkg` when a
+/// nuspec is missing), `published` = the package blob's last-modified time. `listed` is
+/// kept from the current document when it can still be read as JSON (a corrupt
+/// document may be valid JSON of an older shape); otherwise every version is listed.
+/// Offline: it cannot take a running server's in-memory publish lock, so run it when no
+/// push of this ID is in flight (a corrupt document already fails every write with
+/// 503). Returns the rebuilt versions; writes only when `apply`.
+pub(crate) async fn rebuild(
+    storage: &Storage,
+    id: &str,
+    apply: bool,
+) -> Result<Vec<(String, bool)>, String> {
+    let id_lower = id.to_lowercase();
+    if !is_valid_package_id(&id_lower) {
+        return Err(format!("invalid package id '{id}'"));
+    }
+    let mut listed: HashMap<String, bool> = HashMap::new();
+    let mut old_id = None;
+    match storage.get(&meta_key(&id_lower)).await {
+        Ok(data) => {
+            if let Ok(doc) = serde_json::from_slice::<Value>(&data) {
+                old_id = doc["id"].as_str().map(str::to_string);
+                for v in doc["versions"].as_array().into_iter().flatten() {
+                    if let (Some(ver), Some(l)) = (v["version"].as_str(), v["listed"].as_bool()) {
+                        listed.insert(ver.to_lowercase(), l);
+                    }
+                }
+            }
+        }
+        Err(StorageError::NotFound) => {}
+        Err(e) => return Err(format!("cannot read the current state document: {e}")),
+    }
+    let prefix = format!("{BLOB_PREFIX}{id_lower}/");
+    let keys = storage
+        .list_with_meta(&prefix)
+        .await
+        .map_err(|e| format!("cannot list {prefix}: {e}"))?;
+    let mut dirs: Vec<&str> = keys
+        .iter()
+        .filter_map(|(k, _)| k.strip_prefix(&prefix)?.split('/').next())
+        .collect();
+    dirs.sort_unstable();
+    dirs.dedup();
+
+    let mut pkg = HostedPackage::default();
+    for ver_dir in dirs {
+        let nupkg_key = format!("{prefix}{ver_dir}/{id_lower}.{ver_dir}.nupkg");
+        let Some((_, meta)) = keys.iter().find(|(k, _)| *k == nupkg_key) else {
+            tracing::warn!(dir = %ver_dir, "rebuild: no .nupkg, skipped");
+            continue;
+        };
+        let spec = match storage
+            .get(&format!("{prefix}{ver_dir}/{id_lower}.nuspec"))
+            .await
+        {
+            Ok(xml) => parse_nuspec(&String::from_utf8_lossy(&xml)),
+            Err(_) => match storage.get(&nupkg_key).await {
+                Ok(data) => parse_nupkg(std::io::Cursor::new(data)),
+                Err(e) => Err(e.to_string()),
+            },
+        };
+        let spec = match spec {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(dir = %ver_dir, error = %e, "rebuild: unreadable manifest, skipped");
+                continue;
+            }
+        };
+        let Some((version, semver2)) = normalize_version(&spec.version) else {
+            tracing::warn!(dir = %ver_dir, "rebuild: invalid version, skipped");
+            continue;
+        };
+        if spec.id.to_lowercase() != id_lower || version.to_lowercase() != ver_dir {
+            tracing::warn!(dir = %ver_dir, id = %spec.id, version = %version, "rebuild: manifest does not match its path, skipped");
+            continue;
+        }
+        if pkg.id.is_empty() {
+            pkg.id = old_id.clone().unwrap_or_else(|| spec.id.clone());
+        }
+        let published = chrono::DateTime::from_timestamp(meta.modified as i64, 0)
+            .unwrap_or_default()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        pkg.versions.push(HostedVersion {
+            listed: listed.get(ver_dir).copied().unwrap_or(true),
+            version,
+            published,
+            semver2,
+            package_size: meta.size,
+            authors: spec.authors,
+            description: spec.description,
+            title: spec.title,
+            summary: spec.summary,
+            tags: spec.tags,
+            project_url: spec.project_url,
+            dependency_groups: spec.dependency_groups,
+            package_types: spec.package_types,
+        });
+    }
+    if pkg.versions.is_empty() {
+        return Err(format!(
+            "no readable package under {prefix}; nothing written"
+        ));
+    }
+    pkg.versions
+        .sort_by(|a, b| compare_versions(&a.version, &b.version));
+    if apply {
+        let body = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;
+        storage
+            .put(&meta_key(&id_lower), &body)
+            .await
+            .map_err(|e| format!("cannot write the state document: {e}"))?;
+    }
+    Ok(pkg
+        .versions
+        .into_iter()
+        .map(|v| (v.version, v.listed))
+        .collect())
+}
+
+// ── Web UI detail ──────────────────────────────────────────────────────
+
+/// Detail page rows for a hosted ID (newest first, unlisted left out), or `None` when the
+/// ID has no readable state document. Read from storage: the UI has no `AppState` here.
+pub(crate) async fn ui_detail(
+    storage: &Storage,
+    id_lower: &str,
+) -> Option<(
+    Vec<crate::ui::api::VersionInfo>,
+    crate::ui::api::PackageMetadata,
+)> {
+    let pkg = load(storage, id_lower).await.ok()??;
+    let versions = pkg
+        .versions
+        .iter()
+        .rev()
+        .filter(|v| v.listed)
+        .map(|v| crate::ui::api::VersionInfo {
+            version: v.version.clone(),
+            size: v.package_size,
+            published: v.published.split('T').next().unwrap_or("").to_string(),
+            cached: true,
+        })
+        .collect();
+    let latest = pkg.versions.last();
+    let some = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    let metadata = crate::ui::api::PackageMetadata {
+        description: latest.and_then(|v| some(&v.description)),
+        author: latest.and_then(|v| some(&v.authors)),
+        homepage: latest.and_then(|v| some(&v.project_url)),
+        keywords: latest
+            .map(|v| v.tags.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+    Some((versions, metadata))
 }
 
 // ── .nupkg / .nuspec parsing ───────────────────────────────────────────
@@ -1699,6 +2255,43 @@ mod tests {
         assert!(scope_allows(&scoped, "maestra.core"));
         assert!(scope_allows(&scoped, "maestra.core.abstractions"));
         assert!(!scope_allows(&scoped, "newtonsoft.json"));
+    }
+
+    #[test]
+    fn pr_retention_keeps_young_and_newest_pr_versions_only() {
+        let now = chrono::Utc::now();
+        let ago = |d: i64| {
+            (now - chrono::Duration::days(d)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        let v = |version: &str, days: i64| HostedVersion {
+            version: version.into(),
+            published: ago(days),
+            ..Default::default()
+        };
+        let versions = vec![
+            v("1.0.0", 400),       // stable: never
+            v("1.1.0-beta", 400),  // other pre-release: never
+            v("1.1.0-PR.1", 90),   // old PR, 4th newest → expired
+            v("1.1.0-pr.2", 60),   // old PR, 3rd newest → expired
+            v("1.1.0-pr.3", 45),   // old PR, 2nd newest → kept by keep_last=2
+            v("1.2.0-pr.4.5", 1),  // young
+            v("1.2.0-prx.1", 400), // not the pr.* label
+        ];
+        let mut out = expired_pr_versions(&versions, now, 30, 2);
+        out.sort();
+        assert_eq!(out, ["1.1.0-PR.1", "1.1.0-pr.2"]);
+        assert_eq!(expired_pr_versions(&versions, now, 30, 0).len(), 3);
+        assert!(expired_pr_versions(&versions, now, 30, 20).is_empty());
+        assert!(
+            expired_pr_versions(&versions, now, 0, 0).is_empty(),
+            "0 days disables"
+        );
+        let unparsable = [HostedVersion {
+            version: "1.0.0-pr.1".into(),
+            published: "garbage".into(),
+            ..Default::default()
+        }];
+        assert!(expired_pr_versions(&unparsable, now, 1, 0).is_empty());
     }
 }
 
@@ -2434,5 +3027,445 @@ Jd74nq6dNCjpWG4drIsyhqX+
         )
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Round two: idempotent re-push, retention, rebuild, UI, index hardening ──
+
+    /// A retry of the same bytes (lost 201) succeeds without writing anything; other
+    /// bytes for an existing version stay a 409.
+    #[tokio::test]
+    async fn identical_repush_is_idempotent_different_bytes_conflict() {
+        let (storage, ops) = crate::test_helpers::op_counting_storage();
+        let ctx =
+            crate::test_helpers::create_test_context_with_storage_and_config(storage, |cfg| {
+                cfg.nuget.enabled = true;
+                cfg.nuget.proxy = None;
+            });
+        let pkg = nupkg("Maestra.Idem", "1.0.0", "");
+        assert_eq!(push(&ctx.app, &pkg, &[]).await, StatusCode::CREATED);
+        ops.reset();
+        assert_eq!(push(&ctx.app, &pkg, &[]).await, StatusCode::OK);
+        let snap = ops.snapshot();
+        assert!(
+            !snap.contains_key("put") && !snap.contains_key("put_from_path"),
+            "{snap:?}"
+        );
+        let other = nupkg("Maestra.Idem", "1.0.0", "<summary>rebuilt</summary>");
+        assert_eq!(push(&ctx.app, &other, &[]).await, StatusCode::CONFLICT);
+        let (_, idx) = get_json(&ctx.app, "/nuget/v3/flatcontainer/maestra.idem/index.json").await;
+        assert_eq!(idx["versions"], serde_json::json!(["1.0.0"]));
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/flatcontainer/maestra.idem/1.0.0/maestra.idem.1.0.0.nupkg",
+            "",
+        )
+        .await;
+        assert_eq!(&body_bytes(resp).await[..], &pkg[..]);
+    }
+
+    /// Rewrite `published` of the named versions in the stored state document.
+    async fn age_versions(ctx: &crate::test_helpers::TestContext, id: &str, days: &[(&str, i64)]) {
+        let key = format!("nuget/hosted-meta/{id}.json");
+        let mut doc: Value =
+            serde_json::from_slice(&ctx.state.storage.get(&key).await.unwrap()).unwrap();
+        for v in doc["versions"].as_array_mut().unwrap() {
+            if let Some((_, d)) = days.iter().find(|(ver, _)| v["version"] == *ver) {
+                v["published"] = Value::from(
+                    (chrono::Utc::now() - chrono::Duration::days(*d))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                );
+            }
+        }
+        ctx.state
+            .storage
+            .put(&key, &serde_json::to_vec(&doc).unwrap())
+            .await
+            .unwrap();
+    }
+
+    fn set_mtime(ctx: &crate::test_helpers::TestContext, key: &str, ago_secs: u64) {
+        let path = ctx._tempdir.path().join(key);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(ago_secs))
+            .unwrap();
+    }
+
+    /// PR pre-releases past the age and count floor are removed from the document and
+    /// storage; stable/other pre-releases, young or newest PR versions stay. Orphan blob
+    /// dirs older than 1 h go, a fresh one stays. Dry-run touches nothing.
+    #[tokio::test]
+    async fn retention_expires_old_pr_versions_and_sweeps_orphans() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+            cfg.nuget.hosted_pr_retention_days = 30;
+            cfg.nuget.hosted_pr_keep_last = 1;
+        });
+        for v in [
+            "1.0.0",
+            "1.1.0-beta",
+            "1.1.0-pr.1",
+            "1.1.0-pr.2",
+            "1.1.0-pr.3",
+        ] {
+            assert_eq!(
+                push(&ctx.app, &nupkg("Maestra.Ret", v, ""), &[]).await,
+                StatusCode::CREATED
+            );
+        }
+        age_versions(
+            &ctx,
+            "maestra.ret",
+            &[
+                ("1.0.0", 400),
+                ("1.1.0-beta", 400),
+                ("1.1.0-pr.1", 90),
+                ("1.1.0-pr.2", 60),
+                ("1.1.0-pr.3", 40),
+            ],
+        )
+        .await;
+        let st = &ctx.state.storage;
+        let old_orphan = "nuget/hosted/maestra.ret/0.0.1/maestra.ret.0.0.1.nupkg";
+        let new_orphan = "nuget/hosted/maestra.ret/0.0.2/maestra.ret.0.0.2.nupkg";
+        st.put(old_orphan, b"dead push").await.unwrap();
+        st.put(new_orphan, b"in flight").await.unwrap();
+        set_mtime(&ctx, old_orphan, 2 * 3600);
+
+        let dry = super::run_retention(&ctx.state, true).await;
+        assert_eq!((dry.expired, dry.orphans, dry.deleted_keys), (2, 1, 0));
+        assert!(st.get(old_orphan).await.is_ok());
+
+        let sum = super::run_retention(&ctx.state, false).await;
+        assert_eq!((sum.expired, sum.orphans, sum.errors), (2, 1, 0));
+        assert_eq!(
+            sum.deleted_keys, 5,
+            "2 versions × (nupkg + nuspec) + 1 orphan"
+        );
+        let (_, idx) = get_json(&ctx.app, "/nuget/v3/flatcontainer/maestra.ret/index.json").await;
+        assert_eq!(
+            idx["versions"],
+            serde_json::json!(["1.0.0", "1.1.0-beta", "1.1.0-pr.3"])
+        );
+        assert!(st.get(old_orphan).await.is_err());
+        assert!(st.get(new_orphan).await.is_ok());
+        for gone in ["1.1.0-pr.1", "1.1.0-pr.2"] {
+            assert!(st
+                .get(&format!(
+                    "nuget/hosted/maestra.ret/{gone}/maestra.ret.nuspec"
+                ))
+                .await
+                .is_err());
+        }
+        assert!(st
+            .get("nuget/hosted/maestra.ret/1.1.0-pr.3/maestra.ret.1.1.0-pr.3.nupkg")
+            .await
+            .is_ok());
+        // Idempotent: nothing left to do.
+        let again = super::run_retention(&ctx.state, false).await;
+        assert_eq!((again.expired, again.orphans), (0, 0));
+    }
+
+    /// `nora nuget rebuild`: a corrupt document is rewritten from the stored nuspecs,
+    /// `listed` is kept where the old document still reads as JSON, and the running
+    /// server serves the result without a restart.
+    #[tokio::test]
+    async fn rebuild_repairs_document_and_server_picks_it_up() {
+        let ctx = local_ctx();
+        for v in ["1.0.0", "2.0.0-pr.1"] {
+            assert_eq!(
+                push(
+                    &ctx.app,
+                    &nupkg("Maestra.Rb", v, "<summary>s</summary>"),
+                    &[]
+                )
+                .await,
+                StatusCode::CREATED
+            );
+        }
+        let resp = send(
+            &ctx.app,
+            Method::DELETE,
+            "/nuget/v3/package/Maestra.Rb/1.0.0",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let st = &ctx.state.storage;
+        let key = "nuget/hosted-meta/maestra.rb.json";
+        // Valid JSON of a shape the server cannot read (required field missing).
+        let mut doc: Value = serde_json::from_slice(&st.get(key).await.unwrap()).unwrap();
+        for v in doc["versions"].as_array_mut().unwrap() {
+            v.as_object_mut().unwrap().remove("semver2");
+        }
+        st.put(key, &serde_json::to_vec(&doc).unwrap())
+            .await
+            .unwrap();
+        // A fresh server process (same storage): the document fails closed.
+        let fresh =
+            crate::test_helpers::create_test_context_with_storage_and_config(st.clone(), |cfg| {
+                cfg.nuget.enabled = true;
+                cfg.nuget.proxy = None;
+            });
+        let uri = "/nuget/v3/flatcontainer/maestra.rb/index.json";
+        assert_eq!(
+            send(&fresh.app, Method::GET, uri, "").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let plan = super::rebuild(st, "Maestra.Rb", false).await.unwrap();
+        assert_eq!(
+            plan,
+            [
+                ("1.0.0".to_string(), false),
+                ("2.0.0-pr.1".to_string(), true)
+            ]
+        );
+        assert!(
+            serde_json::from_slice::<super::HostedPackage>(&st.get(key).await.unwrap()).is_err(),
+            "dry run writes nothing"
+        );
+        super::rebuild(st, "maestra.rb", true).await.unwrap();
+
+        // The corrupt entry is re-read once its retry time is due.
+        fresh
+            .state
+            .nuget_hosted
+            .map
+            .load_full()
+            .unwrap()
+            .write()
+            .insert(
+                "maestra.rb".into(),
+                super::Doc::Corrupt(std::time::Instant::now()),
+            );
+        let (s, idx) = get_json(&fresh.app, uri).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(idx["versions"], serde_json::json!(["1.0.0", "2.0.0-pr.1"]));
+        let (_, reg) = get_json(&fresh.app, "/nuget/v3/registration/maestra.rb/index.json").await;
+        let leaves = reg["items"][0]["items"].as_array().unwrap();
+        assert_eq!(leaves[0]["catalogEntry"]["listed"], false);
+        assert_eq!(leaves[1]["catalogEntry"]["summary"], "s");
+
+        assert!(super::rebuild(st, "Maestra.None", true).await.is_err());
+    }
+
+    /// A document that appears behind the server's back (rebuild of a lost document,
+    /// restore) is picked up by the admin-reindex refresh.
+    #[tokio::test]
+    async fn refresh_picks_up_out_of_band_documents() {
+        let ctx = local_ctx();
+        assert_eq!(
+            push(&ctx.app, &nupkg("Maestra.Oob", "1.0.0", ""), &[]).await,
+            StatusCode::CREATED
+        );
+        let st = &ctx.state.storage;
+        st.delete("nuget/hosted-meta/maestra.oob.json")
+            .await
+            .unwrap();
+        let fresh =
+            crate::test_helpers::create_test_context_with_storage_and_config(st.clone(), |cfg| {
+                cfg.nuget.enabled = true;
+                cfg.nuget.proxy = None;
+            });
+        let uri = "/nuget/v3/flatcontainer/maestra.oob/index.json";
+        assert_eq!(
+            send(&fresh.app, Method::GET, uri, "").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        super::rebuild(st, "maestra.oob", true).await.unwrap();
+        super::refresh(&fresh.state).await;
+        let (s, idx) = get_json(&fresh.app, uri).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(idx["versions"], serde_json::json!(["1.0.0"]));
+    }
+
+    /// Hosted packages show up in the web UI list (repo index invalidated on push) and
+    /// the detail page reads the state document.
+    #[tokio::test]
+    async fn hosted_packages_are_listed_in_ui() {
+        let ctx = local_ctx();
+        let (_, before) = get_json(&ctx.app, "/api/ui/nuget/list").await;
+        assert_eq!(before, serde_json::json!([]));
+        for v in ["1.0.0", "1.1.0-pr.1"] {
+            assert_eq!(
+                push(
+                    &ctx.app,
+                    &nupkg("Maestra.Ui", v, "<projectUrl>https://x</projectUrl>"),
+                    &[]
+                )
+                .await,
+                StatusCode::CREATED
+            );
+        }
+        let (_, list) = get_json(&ctx.app, "/api/ui/nuget/list").await;
+        assert_eq!(list[0]["name"], "maestra.ui");
+        assert_eq!(list[0]["versions"], 2);
+        let detail = crate::ui::api::get_generic_detail(
+            &ctx.state.storage,
+            "nuget",
+            "Maestra.Ui",
+            true,
+            true,
+        )
+        .await;
+        let versions: Vec<&str> = detail.versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(versions, ["1.1.0-pr.1", "1.0.0"]);
+        assert!(detail.versions[0].size > 0);
+        assert_eq!(detail.metadata.homepage.as_deref(), Some("https://x"));
+        let resp = send(&ctx.app, Method::GET, "/ui/nuget/maestra.ui", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("1.0.0"));
+    }
+
+    /// Hosted IDs are in the repo index (UI), which the upstream handlers' local search
+    /// walks with one storage read per ID. For an internal-namespace term that local path
+    /// is not taken while hosted IDs match: the answer costs no storage read.
+    #[tokio::test]
+    async fn internal_namespace_search_reads_no_storage() {
+        let (storage, ops) = crate::test_helpers::op_counting_storage();
+        let ctx =
+            crate::test_helpers::create_test_context_with_storage_and_config(storage, |cfg| {
+                cfg.nuget.enabled = true;
+                cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+                cfg.nuget.proxy_timeout = 1;
+                cfg.curation.internal_namespaces = vec!["maestra.**".to_string()];
+            });
+        for id in ["Maestra.S1", "Maestra.S2", "Maestra.S3"] {
+            assert_eq!(
+                push(&ctx.app, &nupkg(id, "1.0.0", ""), &[]).await,
+                StatusCode::CREATED
+            );
+        }
+        let (_, list) = get_json(&ctx.app, "/api/ui/nuget/list").await;
+        assert_eq!(list.as_array().unwrap().len(), 3);
+        ops.reset();
+        let (s, hits) = get_json(&ctx.app, "/nuget/v3/query?q=maestra.s&take=2").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(hits["totalHits"], 3);
+        assert_eq!(hits["data"].as_array().unwrap().len(), 2);
+        let (_, names) = get_json(&ctx.app, "/nuget/v3/autocomplete?q=maestra.s").await;
+        assert_eq!(
+            names["data"],
+            serde_json::json!(["Maestra.S1", "Maestra.S2", "Maestra.S3"])
+        );
+        assert_eq!(ops.total(), 0, "{:?}", ops.snapshot());
+    }
+
+    /// Storage whose listings fail while `fail` is set; everything else is in memory.
+    struct FlakyList {
+        inner: crate::storage::ObjectStorage,
+        fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for FlakyList {
+        async fn put(&self, k: &str, d: &[u8], sha: &str) -> crate::storage::Result<()> {
+            self.inner.put(k, d, sha).await
+        }
+        async fn get(
+            &self,
+            k: &str,
+        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+            self.inner.get(k).await
+        }
+        async fn pin(&self, k: &str) -> Option<String> {
+            self.inner.pin(k).await
+        }
+        async fn delete(&self, k: &str) -> crate::storage::Result<()> {
+            self.inner.delete(k).await
+        }
+        async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::storage::StorageError::Network("list refused".into()));
+            }
+            self.inner.list(prefix).await
+        }
+        async fn stat(&self, k: &str) -> Option<crate::storage::FileMeta> {
+            self.inner.stat(k).await
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+        async fn total_size(&self) -> u64 {
+            0
+        }
+        fn backend_name(&self) -> &'static str {
+            "flaky-list-test"
+        }
+        async fn put_from_path(
+            &self,
+            k: &str,
+            src: &std::path::Path,
+            sha: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.put_from_path(k, src, sha).await
+        }
+        async fn copy(&self, a: &str, b: &str, sha: Option<&str>) -> crate::storage::Result<()> {
+            self.inner.copy(a, b, sha).await
+        }
+        async fn get_reader(
+            &self,
+            k: &str,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(k).await
+        }
+    }
+
+    /// A failed initial load leaves no (empty or partial) index: hosted lookups and
+    /// search answer 503 instead of falling through to public namesakes, retries back
+    /// off, and the next attempt after the backoff loads and serves.
+    #[tokio::test]
+    async fn failed_initial_load_fails_closed_then_recovers() {
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let storage = crate::storage::Storage::from_backend(std::sync::Arc::new(FlakyList {
+            inner: crate::storage::ObjectStorage::in_memory(),
+            fail: fail.clone(),
+        }));
+        let cfg = |cfg: &mut crate::config::Config| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.nuget.proxy_timeout = 1;
+            cfg.nuget.metadata_proxy_timeout = 1;
+        };
+        let seed =
+            crate::test_helpers::create_test_context_with_storage_and_config(storage.clone(), cfg);
+        assert_eq!(
+            push(&seed.app, &nupkg("Maestra.Flaky", "1.0.0", ""), &[]).await,
+            StatusCode::CREATED
+        );
+
+        let ctx = crate::test_helpers::create_test_context_with_storage_and_config(storage, cfg);
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let uri = "/nuget/v3/flatcontainer/maestra.flaky/index.json";
+        for u in [uri, "/nuget/v3/query?q=maestra"] {
+            assert_eq!(
+                send(&ctx.app, Method::GET, u, "").await.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{u}"
+            );
+        }
+        assert!(
+            ctx.state.nuget_hosted.map.load_full().is_none(),
+            "no partial index"
+        );
+        // Storage is back, but the retry waits for the backoff.
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            send(&ctx.app, Method::GET, uri, "").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        ctx.state.nuget_hosted.loader.lock().await.retry_at = None;
+        let (s, idx) = get_json(&ctx.app, uri).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(idx["versions"], serde_json::json!(["1.0.0"]));
     }
 }
