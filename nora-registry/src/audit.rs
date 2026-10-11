@@ -10,6 +10,9 @@
 //!   - `both`   — write to file AND stderr
 //!   - `off`    — disable audit logging
 //!
+//! The file is size-rotated (`audit.max_size_mb`, `audit.max_files`):
+//! `audit.jsonl` → `audit.jsonl.1` → … → `audit.jsonl.N`, the oldest dropped.
+//!
 //! Uses a bounded mpsc channel with a single writer task (#543) to avoid
 //! per-entry `spawn_blocking` + Mutex contention under load.
 
@@ -18,7 +21,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -89,6 +92,78 @@ impl AuditEntry {
     }
 }
 
+/// Size-based rotation of the audit file. `max_bytes == 0` never rotates.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Rotation {
+    pub max_bytes: u64,
+    pub keep: u32,
+}
+
+impl From<&crate::config::AuditConfig> for Rotation {
+    fn from(cfg: &crate::config::AuditConfig) -> Self {
+        Self {
+            max_bytes: cfg.max_size_mb.saturating_mul(1024 * 1024),
+            keep: cfg.max_files,
+        }
+    }
+}
+
+/// The open audit file plus what rotation needs to know about it.
+struct FileSink {
+    file: fs::File,
+    path: PathBuf,
+    size: u64,
+    rotation: Rotation,
+}
+
+impl FileSink {
+    fn write_line(&mut self, json: &str) {
+        let len = json.len() as u64 + 1;
+        if self.rotation.max_bytes > 0 && self.size > 0 && self.size + len > self.rotation.max_bytes
+        {
+            self.rotate();
+        }
+        if let Err(e) = writeln!(self.file, "{}", json) {
+            tracing::error!(error = %e, "Audit log write failed");
+        }
+        if let Err(e) = self.file.flush() {
+            tracing::error!(error = %e, "Audit log flush failed");
+        }
+        self.size += len;
+    }
+
+    /// Shift `audit.jsonl.{n}` → `.{n+1}` (the rename over `.{keep}` drops the
+    /// oldest), move the live file to `.1` and reopen. On failure the entry goes
+    /// to the current file and the next attempt waits another `max_bytes`.
+    fn rotate(&mut self) {
+        let numbered = |n: u32| {
+            let mut p = self.path.clone().into_os_string();
+            p.push(format!(".{n}"));
+            PathBuf::from(p)
+        };
+        for n in (1..self.rotation.keep).rev() {
+            let _ = fs::rename(numbered(n), numbered(n + 1));
+        }
+        let moved = if self.rotation.keep == 0 {
+            fs::remove_file(&self.path)
+        } else {
+            fs::rename(&self.path, numbered(1))
+        };
+        let reopened = moved.and_then(|()| open_append(&self.path));
+        match reopened {
+            Ok(f) => self.file = f,
+            Err(e) => {
+                tracing::error!(path = %self.path.display(), error = %e, "Audit log rotation failed")
+            }
+        }
+        self.size = 0;
+    }
+}
+
+fn open_append(path: &Path) -> std::io::Result<fs::File> {
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
 pub struct AuditLog {
     path: PathBuf,
     mode: AuditMode,
@@ -100,7 +175,12 @@ pub struct AuditLog {
 }
 
 impl AuditLog {
+    /// Audit log without file rotation.
     pub fn new(storage_path: &str, mode: AuditMode) -> Self {
+        Self::with_rotation(storage_path, mode, Rotation::default())
+    }
+
+    pub fn with_rotation(storage_path: &str, mode: AuditMode, rotation: Rotation) -> Self {
         let path = PathBuf::from(storage_path).join("audit.jsonl");
 
         if mode == AuditMode::Off {
@@ -118,10 +198,16 @@ impl AuditLog {
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            match OpenOptions::new().create(true).append(true).open(&path) {
-                Ok(f) => {
+            match open_append(&path) {
+                Ok(file) => {
                     info!(path = %path.display(), mode = ?mode, "Audit log initialized");
-                    Some(f)
+                    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+                    Some(FileSink {
+                        file,
+                        path: path.clone(),
+                        size,
+                        rotation,
+                    })
                 }
                 Err(e) => {
                     warn!(path = %path.display(), error = %e, "Failed to open audit log file");
@@ -157,7 +243,7 @@ impl AuditLog {
     /// them to file/stderr. Runs until the channel is closed (all senders dropped).
     fn writer_loop(
         mut rx: mpsc::Receiver<AuditEntry>,
-        mut file: Option<fs::File>,
+        mut file: Option<FileSink>,
         mode: AuditMode,
     ) {
         // blocking_recv() blocks the current thread until an entry arrives
@@ -174,14 +260,14 @@ impl AuditLog {
 
         // Final flush on shutdown
         if let Some(ref mut f) = file {
-            if let Err(e) = f.flush() {
+            if let Err(e) = f.file.flush() {
                 tracing::error!(error = %e, "Audit log final flush failed");
             }
         }
     }
 
     /// Write a single audit entry to file and/or stderr.
-    fn write_entry(entry: &AuditEntry, file: &mut Option<fs::File>, mode: &AuditMode) {
+    fn write_entry(entry: &AuditEntry, file: &mut Option<FileSink>, mode: &AuditMode) {
         let json = match serde_json::to_string(entry) {
             Ok(j) => j,
             Err(e) => {
@@ -192,12 +278,7 @@ impl AuditLog {
 
         if *mode == AuditMode::File || *mode == AuditMode::Both {
             if let Some(ref mut f) = file {
-                if let Err(e) = writeln!(f, "{}", json) {
-                    tracing::error!(error = %e, "Audit log write failed");
-                }
-                if let Err(e) = f.flush() {
-                    tracing::error!(error = %e, "Audit log flush failed");
-                }
+                f.write_line(&json);
             }
         }
 
@@ -363,6 +444,95 @@ mod tests {
             let parsed: AuditMode = s.parse().unwrap();
             assert_eq!(mode, parsed);
         }
+    }
+
+    fn read(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    /// Past `max_bytes` the live file moves to `.1`, older files shift up and
+    /// the one past `keep` is dropped: disk use stays bounded.
+    #[tokio::test]
+    async fn test_audit_log_rotates_by_size_and_keeps_n() {
+        let tmp = TempDir::new().unwrap();
+        let line_len = serde_json::to_string(&AuditEntry::new("push", "u", "a0", "raw", ""))
+            .unwrap()
+            .len() as u64
+            + 1;
+        // Two entries per file.
+        let rotation = Rotation {
+            max_bytes: line_len * 2,
+            keep: 2,
+        };
+        let log = AuditLog::with_rotation(tmp.path().to_str().unwrap(), AuditMode::File, rotation);
+        for i in 0..7 {
+            log.log(AuditEntry::new("push", "u", &format!("a{i}"), "raw", ""));
+        }
+        let path = log.path().clone();
+        log.shutdown().await;
+
+        let live = read(&path);
+        let one = read(&tmp.path().join("audit.jsonl.1"));
+        let two = read(&tmp.path().join("audit.jsonl.2"));
+        assert_eq!(live.lines().count(), 1, "live: {live}");
+        assert!(live.contains(r#""artifact":"a6""#));
+        assert!(one.contains(r#""artifact":"a4""#) && one.contains(r#""artifact":"a5""#));
+        assert!(two.contains(r#""artifact":"a2""#) && two.contains(r#""artifact":"a3""#));
+        assert!(
+            !tmp.path().join("audit.jsonl.3").exists(),
+            "files past max_files must be deleted"
+        );
+        for f in [&live, &one, &two] {
+            assert!(f.len() as u64 <= rotation.max_bytes);
+        }
+    }
+
+    /// The size check counts what is already on disk: a restart does not reset
+    /// the budget of an existing file.
+    #[tokio::test]
+    async fn test_audit_log_rotation_counts_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("audit.jsonl");
+        std::fs::write(&path, "x".repeat(100) + "\n").unwrap();
+        let rotation = Rotation {
+            max_bytes: 120,
+            keep: 1,
+        };
+        let log = AuditLog::with_rotation(tmp.path().to_str().unwrap(), AuditMode::Both, rotation);
+        log.log(AuditEntry::new("push", "u", "after-restart", "raw", ""));
+        log.shutdown().await;
+
+        assert!(read(&tmp.path().join("audit.jsonl.1")).starts_with("xxx"));
+        assert!(read(&path).contains("after-restart"));
+    }
+
+    /// `max_bytes == 0` (and `AuditLog::new`) never rotates.
+    #[tokio::test]
+    async fn test_audit_log_rotation_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let log = AuditLog::with_rotation(
+            tmp.path().to_str().unwrap(),
+            AuditMode::File,
+            Rotation {
+                max_bytes: 0,
+                keep: 3,
+            },
+        );
+        for i in 0..20 {
+            log.log(AuditEntry::new("push", "u", &format!("a{i}"), "raw", ""));
+        }
+        let path = log.path().clone();
+        log.shutdown().await;
+        assert_eq!(read(&path).lines().count(), 20);
+        assert!(!tmp.path().join("audit.jsonl.1").exists());
+    }
+
+    #[test]
+    fn test_rotation_from_config() {
+        let cfg = crate::config::AuditConfig::default();
+        let r = Rotation::from(&cfg);
+        assert_eq!(r.max_bytes, 100 * 1024 * 1024);
+        assert_eq!(r.keep, 5);
     }
 
     #[tokio::test]

@@ -1534,6 +1534,31 @@ proxies = [
     }
 
     #[test]
+    fn test_audit_rotation_defaults_toml_and_env() {
+        let _lock = env_lock();
+        let config: Config = toml::from_str("[storage]\nmode = \"local\"").unwrap();
+        assert_eq!(config.audit.max_size_mb, 100);
+        assert_eq!(config.audit.max_files, 5);
+
+        let mut config: Config =
+            toml::from_str("[audit]\nmode = \"both\"\nmax_size_mb = 0\nmax_files = 2").unwrap();
+        assert_eq!(config.audit.max_size_mb, 0);
+        assert_eq!(config.audit.max_files, 2);
+
+        std::env::set_var("NORA_AUDIT_MAX_SIZE_MB", "7");
+        std::env::set_var("NORA_AUDIT_MAX_FILES", "3");
+        let applied = config.apply_env_overrides();
+        std::env::set_var("NORA_AUDIT_MAX_SIZE_MB", "7MB");
+        let typo = config.clone().apply_env_overrides();
+        std::env::remove_var("NORA_AUDIT_MAX_SIZE_MB");
+        std::env::remove_var("NORA_AUDIT_MAX_FILES");
+        applied.unwrap();
+        assert_eq!(config.audit.max_size_mb, 7);
+        assert_eq!(config.audit.max_files, 3);
+        assert!(typo.unwrap_err().contains("NORA_AUDIT_MAX_SIZE_MB"));
+    }
+
+    #[test]
     fn test_docker_anon_pull_defaults_false() {
         // Fail-closed: absent from config => off, and independent of anonymous_read.
         let toml = r#"

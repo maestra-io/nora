@@ -346,6 +346,17 @@ pub static STORAGE_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("failed to create STORAGE_BYTES metric at startup")
 });
 
+/// Storage reachability as `/ready` sees it: 1 reachable, 0 not (readiness
+/// fails with 503). Set on every readiness check and once a minute by the
+/// maintenance loop, so it is current without a prober.
+pub static STORAGE_REACHABLE: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "nora_storage_reachable",
+        "1 when the storage backend is reachable (readiness passes), 0 when not"
+    )
+    .expect("failed to create STORAGE_REACHABLE metric at startup")
+});
+
 /// Process uptime in seconds (gauge)
 pub static UPTIME_SECONDS: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!("nora_uptime_seconds", "Process uptime in seconds")
@@ -1109,5 +1120,155 @@ mod tests {
             leak_before + 1,
             "a registry proxy response leaking an upstream URL must be flagged"
         );
+    }
+
+    /// Metric name -> "counter" | "gauge" | "histogram", read off every
+    /// `register_*!("nora_...")` in the crate source.
+    fn registered_metrics() -> std::collections::HashMap<String, &'static str> {
+        fn walk(dir: &std::path::Path, out: &mut std::collections::HashMap<String, &'static str>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&path).unwrap();
+                for (i, _) in src.match_indices("register_") {
+                    let rest = &src[i..];
+                    let Some(bang) = rest.find("!(") else {
+                        continue;
+                    };
+                    let kind = &rest[..bang];
+                    let kind = if kind.contains("histogram") {
+                        "histogram"
+                    } else if kind.contains("gauge") {
+                        "gauge"
+                    } else if kind.contains("counter") {
+                        "counter"
+                    } else {
+                        continue;
+                    };
+                    let args = &rest[bang + 2..];
+                    let Some(open) = args.find('"') else { continue };
+                    let name = &args[open + 1..];
+                    let name = &name[..name.find('"').unwrap()];
+                    if name.starts_with("nora_") {
+                        out.insert(name.to_string(), kind);
+                    }
+                }
+            }
+        }
+        let mut out = std::collections::HashMap::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut out,
+        );
+        out
+    }
+
+    fn repo_file(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// `(start offset, name)` of every `nora_*` identifier in `text`.
+    fn metric_tokens(text: &str) -> Vec<(usize, &str)> {
+        let is_ident = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_';
+        text.match_indices("nora_")
+            .filter(|(i, _)| !text[..*i].ends_with(is_ident))
+            .map(|(i, _)| {
+                let end = text[i..]
+                    .find(|c| !is_ident(c))
+                    .map_or(text.len(), |n| i + n);
+                (i, &text[i..end])
+            })
+            .collect()
+    }
+
+    /// The shipped alert rules only use metrics nora registers, with the right
+    /// type: `rate`/`increase` over counters (or histogram series), `_bucket`
+    /// only on histograms. The alerts match the table in MONITORING.md.
+    #[test]
+    fn prometheus_rules_use_registered_metrics() {
+        let registered = registered_metrics();
+        assert!(registered.len() > 20, "source scan found {registered:?}");
+        let rules = repo_file("deploy/prometheus-rules.yml");
+        let tokens = metric_tokens(&rules);
+        assert!(!tokens.is_empty());
+        for (at, name) in tokens {
+            let series = ["_bucket", "_sum", "_count"]
+                .iter()
+                .find_map(|sfx| name.strip_suffix(sfx))
+                .filter(|base| registered.get(*base) == Some(&"histogram"));
+            let kind = match (registered.get(name), series) {
+                (Some(kind), _) => *kind,
+                (None, Some(_)) => "counter", // histogram series are counters
+                (None, None) => panic!("{name} is not a registered metric"),
+            };
+            let before = rules[..at].trim_end();
+            if before.ends_with("rate(") || before.ends_with("increase(") {
+                assert_eq!(kind, "counter", "{name} is a {kind}, not a counter");
+            }
+            if name.ends_with("_bucket") {
+                assert!(series.is_some(), "{name} is not a histogram series");
+            }
+        }
+
+        let alerts = |text: &str, marker: &str| -> Vec<String> {
+            let mut v: Vec<String> = text
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix(marker))
+                .map(|l| {
+                    l.trim()
+                        .trim_matches(|c| c == '`' || c == '|' || c == ' ')
+                        .split(['`', ' '])
+                        .next()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let shipped = alerts(&rules, "- alert:");
+        let documented = alerts(&repo_file("MONITORING.md"), "| `Nora");
+        let documented: Vec<String> = documented.iter().map(|a| format!("Nora{a}")).collect();
+        assert_eq!(
+            shipped, documented,
+            "deploy/prometheus-rules.yml vs MONITORING.md"
+        );
+    }
+
+    /// MONITORING.md states each metric's type; it must be the registered one
+    /// (`nora_artifacts_total` is a gauge, so `rate()` on it is meaningless).
+    #[test]
+    fn monitoring_doc_types_match_registered_metrics() {
+        let registered = registered_metrics();
+        let doc = repo_file("MONITORING.md");
+        let mut rows = 0;
+        for line in doc.lines() {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            let [_, name, kind, ..] = cells[..] else {
+                continue;
+            };
+            let Some(name) = name
+                .strip_prefix("`nora_")
+                .and_then(|n| n.strip_suffix('`'))
+            else {
+                continue;
+            };
+            let name = format!("nora_{name}");
+            let Some(actual) = registered.get(&name) else {
+                panic!("MONITORING.md documents {name}, which is not registered");
+            };
+            assert_eq!(&kind, actual, "MONITORING.md types {name} as {kind}");
+            rows += 1;
+        }
+        assert!(rows > 20, "parsed only {rows} metric rows");
     }
 }

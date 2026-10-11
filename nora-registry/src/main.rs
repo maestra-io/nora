@@ -460,6 +460,14 @@ fn build_http_client(
 /// Both wildcards probe `127.0.0.1`: a `::` server is dual-stack (or falls back
 /// to `0.0.0.0`), so IPv4 loopback reaches it in every case, whereas `::1` would
 /// miss the fallback.
+/// Node-local state `nora backup` / `nora restore` carry next to the artifacts.
+fn local_state(config: &Config) -> backup::LocalState {
+    backup::LocalState {
+        token_dir: PathBuf::from(&config.auth.token_storage),
+        state_dir: PathBuf::from(&config.storage.path),
+    }
+}
+
 fn healthcheck_url(host: &str, port: u16) -> String {
     let h = match host {
         "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
@@ -863,13 +871,13 @@ async fn main() {
             run_server(config, storage).await;
         }
         Some(Commands::Backup { output }) => {
-            if let Err(e) = backup::create_backup(&storage, &output).await {
+            if let Err(e) = backup::create_backup(&storage, &output, &local_state(&config)).await {
                 error!("Backup failed: {}", e);
                 std::process::exit(1);
             }
         }
         Some(Commands::Restore { input }) => {
-            if let Err(e) = backup::restore_backup(&storage, &input).await {
+            if let Err(e) = backup::restore_backup(&storage, &input, &local_state(&config)).await {
                 error!("Restore failed: {}", e);
                 std::process::exit(1);
             }
@@ -1817,6 +1825,7 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     let cb_config = config.circuit_breaker.clone();
     let audit_mode = config.audit.mode.clone();
+    let audit_rotation = audit::Rotation::from(&config.audit);
 
     // Initialize digest quarantine store. Load the durable on-disk store whenever
     // ANY quarantine is effectively active — global OR a per-registry override
@@ -1876,7 +1885,11 @@ async fn run_server(mut config: Config, storage: Storage) {
         tokens,
         metrics: Arc::new(DashboardMetrics::new()),
         activity: Arc::new(ActivityLog::new(50)),
-        audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
+        audit: Arc::new(AuditLog::with_rotation(
+            &storage_path,
+            audit_mode,
+            audit_rotation,
+        )),
         docker_auth: Arc::new(docker_auth),
         repo_index: Arc::new(RepoIndex::new()),
         http_client,
@@ -2160,6 +2173,8 @@ async fn run_server(mut config: Config, storage: Storage) {
             // before the first readiness probe, not 30s in). One HEAD, not a bucket walk.
             if !tick_count.is_multiple_of(2) {
                 metrics_state.storage.refresh_reachability().await;
+                // Samples nora_storage_reachable without waiting for a /ready probe.
+                metrics_state.storage.health_check().await;
                 // Per-registry artifact counts + logical bytes from the cached index,
                 // plus process uptime (#446). The "total" storage_bytes label above is
                 // the full physical footprint; per-registry is summed artifact size.

@@ -23,6 +23,9 @@ use tracing::{error, info, warn};
 use axum::http::{header, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 
+/// Ledger file name under `storage.path`.
+pub const LEDGER_FILE: &str = "quarantine.jsonl";
+
 /// Stale entry TTL: entries older than 90 days are pruned on startup.
 const PRUNE_TTL_SECS: i64 = 90 * 24 * 3600;
 
@@ -130,7 +133,7 @@ impl DigestStore {
     ///
     /// Fail-open: corrupt lines are skipped, missing file → empty store.
     pub fn load(storage_path: &str) -> Self {
-        let path = PathBuf::from(storage_path).join("quarantine.jsonl");
+        let path = PathBuf::from(storage_path).join(LEDGER_FILE);
         let mut entries = HashMap::new();
 
         if path.exists() {
@@ -195,7 +198,7 @@ impl DigestStore {
 
     /// Create an empty store (for tests or when quarantine is off).
     pub fn empty(storage_path: &str) -> Self {
-        let path = PathBuf::from(storage_path).join("quarantine.jsonl");
+        let path = PathBuf::from(storage_path).join(LEDGER_FILE);
         Self {
             entries: RwLock::new(HashMap::new()),
             path,

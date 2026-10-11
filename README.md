@@ -120,7 +120,7 @@ See [full documentation](https://getnora.dev) for all registries.
 - **Curation** — blocklist, allowlist, namespace isolation, integrity verification, min-release-age filter, digest quarantine
 - **Token RBAC** — read/write/admin roles, expiry tracking, deferred last_used flush
 - **Mirror CLI** — offline sync for air-gapped environments (`nora mirror`)
-- **Backup & Restore** — `nora backup` / `nora restore`
+- **Backup & Restore** — `nora backup` / `nora restore`: artifacts plus the node-local API token records and quarantine ledger (the signing key is left out: keep it in a secret store)
 - **S3 Storage** — AWS S3, Ceph RGW, any S3-compatible backend
 - **Prometheus Metrics** — `/metrics` endpoint, [Grafana dashboard](MONITORING.md)
 - **Rate Limiting** — configurable per-endpoint rate limits

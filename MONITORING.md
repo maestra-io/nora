@@ -29,6 +29,7 @@ Import `dist/grafana-dashboard.json` into Grafana (Dashboards > Import > Upload 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `nora_cache_requests_total` | counter | registry, result | Cache lookups (`result`: hit / miss) |
+| `nora_cache_write_errors_total` | counter | registry, operation | Background cache writes that failed: the response was served, nothing was cached |
 
 ### Upstream Proxy
 
@@ -40,7 +41,7 @@ Import `dist/grafana-dashboard.json` into Grafana (Dashboards > Import > Upload 
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `nora_artifacts_total` | counter | registry | Total artifacts stored |
+| `nora_artifacts_total` | gauge | registry | Artifacts stored now (set from the index every 60 s; not a counter, do not `rate()` it) |
 | `nora_downloads_total` | counter | registry | Total artifact downloads |
 | `nora_uploads_total` | counter | registry | Total artifact uploads |
 
@@ -49,6 +50,7 @@ Import `dist/grafana-dashboard.json` into Grafana (Dashboards > Import > Upload 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `nora_storage_bytes` | gauge | registry | Storage size in bytes per registry |
+| `nora_storage_reachable` | gauge | — | 1 when the storage backend is reachable, 0 when `/ready` answers 503 |
 | `nora_storage_operations_total` | counter | operation, status | Every backend round-trip: `put`, `get`, `get_range`, `get_reader`, `copy`, `delete`, `stat`, `pin`, `list`, `list_with_meta`. On an object store each one is a network request, so the rate of this counter against the request rate is what shows a handler paying a round-trip per file. `status="miss"` on `stat`/`pin` is an absent object or an unpinned one — not an error. `status="integrity_fail"`/`"verify_error"` on `operation="get"` mean a stored artifact failed hash-pin verification and was refused (fail-closed, #582) — see [Integrity recovery](#integrity-recovery). |
 
 ### Circuit Breaker
@@ -103,60 +105,19 @@ The dashboard includes a `registry` template variable to filter by specific prot
 
 ## Alerting Recommendations
 
-```yaml
-# alertmanager rules (example)
-groups:
-  - name: nora
-    rules:
-      - alert: NoraHighErrorRate
-        expr: >
-          sum(rate(nora_http_requests_total{status=~"5.."}[5m]))
-          / sum(rate(nora_http_requests_total[5m])) > 0.05
-        for: 5m
-        labels: { severity: warning }
-        annotations:
-          summary: "NORA error rate above 5%"
+[`deploy/prometheus-rules.yml`](deploy/prometheus-rules.yml) ships these alerts ready to load; point Prometheus at it via `rule_files:`.
 
-      - alert: NoraHighLatency
-        expr: >
-          histogram_quantile(0.99, sum(rate(nora_http_request_duration_seconds_bucket[5m])) by (le)) > 5
-        for: 5m
-        labels: { severity: warning }
-        annotations:
-          summary: "NORA p99 latency above 5s"
-
-      - alert: NoraCircuitBreakerOpen
-        expr: nora_circuit_breaker_state == 1
-        for: 1m
-        labels: { severity: critical }
-        annotations:
-          summary: "NORA circuit breaker OPEN for {{ $labels.registry }}"
-
-      - alert: NoraCacheLowHitRate
-        expr: >
-          sum(rate(nora_cache_requests_total{result="hit"}[15m]))
-          / sum(rate(nora_cache_requests_total[15m])) < 0.5
-        for: 15m
-        labels: { severity: warning }
-        annotations:
-          summary: "NORA cache hit rate below 50%"
-
-      - alert: NoraUpstreamUrlLeak
-        expr: sum(rate(nora_response_upstream_url_leak_total[5m])) > 0
-        for: 1m
-        labels: { severity: critical }
-        annotations:
-          summary: "Upstream URL leak detected in NORA responses"
-
-      - alert: NoraIntegrityFailure
-        expr: increase(nora_storage_operations_total{operation="get",status=~"integrity_fail|verify_error"}[5m]) > 0
-        for: 0m
-        labels: { severity: critical }
-        annotations:
-          summary: "NORA refusing to serve an artifact (hash-pin integrity failure)"
-```
-
-A ready-to-load version of these rules ships at [`deploy/prometheus-rules.yml`](deploy/prometheus-rules.yml); point Prometheus at it via `rule_files:`.
+| Alert | Fires when | Severity |
+|-------|------------|----------|
+| `NoraHighErrorRate` | 5xx share of `nora_http_requests_total` above 5% for 5m | warning |
+| `NoraHighLatency` | p99 of `nora_http_request_duration_seconds` above 5s for 5m | warning |
+| `NoraCircuitBreakerOpen` | `nora_circuit_breaker_state == 1` for 1m | critical |
+| `NoraCacheLowHitRate` | hit share of `nora_cache_requests_total` below 50% for 15m | warning |
+| `NoraUpstreamUrlLeak` | any `nora_response_upstream_url_leak_total` increase | critical |
+| `NoraCacheWriteErrors` | any `nora_cache_write_errors_total` increase in 15m | warning |
+| `NoraStorageWriteErrors` | `nora_storage_operations_total{operation=~"put\|copy",status="error"}` increasing for 5m | warning |
+| `NoraStorageUnreachable` | `nora_storage_reachable == 0` for 2m (readiness failing) | critical |
+| `NoraIntegrityFailure` | any `get` with `status=~"integrity_fail\|verify_error"` | critical |
 
 ## Integrity recovery
 

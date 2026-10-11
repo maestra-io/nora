@@ -1,4 +1,4 @@
-# Prometheus alerting rules for NORA.
+# Prometheus alerting rules for NORA — the alerts documented in MONITORING.md.
 #
 # Load alongside your scrape config:
 #
@@ -6,11 +6,84 @@
 #   rule_files:
 #     - /etc/prometheus/prometheus-rules.yml
 #
-# These rules surface the fail-closed integrity path (#582/#601): when a stored
-# artifact's bytes no longer match its hash pin, `Storage::get()` returns 5xx on
-# every read. Without an alert that silently becomes "service down on a hot key"
-# with no diagnosis.
+# Every metric used here is registered by nora-registry; the test
+# `metrics::tests::prometheus_rules_use_registered_metrics` keeps it that way.
 groups:
+  - name: nora
+    rules:
+      - alert: NoraHighErrorRate
+        expr: >-
+          sum(rate(nora_http_requests_total{status=~"5.."}[5m]))
+          / sum(rate(nora_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NORA error rate above 5%"
+
+      - alert: NoraHighLatency
+        expr: >-
+          histogram_quantile(0.99, sum by (le) (rate(nora_http_request_duration_seconds_bucket[5m]))) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NORA p99 latency above 5s"
+
+      - alert: NoraCircuitBreakerOpen
+        expr: nora_circuit_breaker_state == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NORA circuit breaker OPEN for {{ $labels.registry }}"
+
+      - alert: NoraCacheLowHitRate
+        expr: >-
+          sum(rate(nora_cache_requests_total{result="hit"}[15m]))
+          / sum(rate(nora_cache_requests_total[15m])) < 0.5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NORA cache hit rate below 50%"
+
+      - alert: NoraUpstreamUrlLeak
+        expr: sum(rate(nora_response_upstream_url_leak_total[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Upstream URL leak detected in NORA responses"
+
+      - alert: NoraCacheWriteErrors
+        # Background cache writes (proxied artifacts, metadata) failing: requests
+        # still succeed from upstream, but nothing is cached and an upstream
+        # outage then becomes a NORA outage.
+        expr: sum by (registry, operation) (increase(nora_cache_write_errors_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NORA cache writes failing for {{ $labels.registry }} ({{ $labels.operation }})"
+
+      - alert: NoraStorageWriteErrors
+        expr: sum(increase(nora_storage_operations_total{operation=~"put|copy",status="error"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NORA storage writes failing"
+
+      - alert: NoraStorageUnreachable
+        # The readiness verdict: /ready answers 503 while this is 0.
+        expr: nora_storage_reachable == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NORA storage backend unreachable (readiness failing)"
+
   - name: nora-integrity
     rules:
       - alert: NoraIntegrityFailure
