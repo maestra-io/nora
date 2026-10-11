@@ -4120,6 +4120,64 @@ mod integration_tests {
         assert_eq!(left, 0, "no spool file is left behind");
     }
 
+    /// Invariant: an internal-namespace project uploaded here never depends on the
+    /// upstream. With a dead upstream, its simple index (HTML and JSON) and its file
+    /// are 200 and the upstream sees no request at all.
+    #[tokio::test]
+    async fn internal_project_never_touches_a_dead_upstream() {
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxy = Some(uri);
+            cfg.pypi.metadata_ttl = 0;
+            cfg.curation.internal_namespaces = vec!["corp-*".to_string()];
+        });
+        let content = b"sdist-bytes".to_vec();
+        let resp = twine_upload(
+            &ctx.app,
+            &[("name", "corp-lib"), ("version", "1.0")],
+            "corp-lib-1.0.tar.gz",
+            &content,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = send(&ctx.app, Method::GET, "/simple/corp-lib/", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("corp-lib-1.0.tar.gz"));
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/corp-lib/",
+            vec![("accept", "application/vnd.pypi.simple.v1+json")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/corp-lib/corp-lib-1.0.tar.gz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], &content[..]);
+        let seen = upstream.received_requests().await.unwrap();
+        assert!(
+            seen.is_empty(),
+            "upstream contacted: {:?}",
+            seen.iter()
+                .map(|r| r.url.path().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// C44: the uploaded filename must name the form's project and version.
     #[tokio::test]
     async fn upload_rejects_a_filename_of_another_project_or_version() {

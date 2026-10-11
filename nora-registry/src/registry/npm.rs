@@ -4593,6 +4593,52 @@ mod integration_tests {
         assert!(upstream.received_requests().await.unwrap().is_empty());
     }
 
+    /// Invariant: an internal-namespace package published here never depends on the
+    /// upstream. With a dead upstream and every cache hit stale, its packument (full
+    /// and abbreviated) and tarball are 200 and the upstream sees no request at all.
+    #[tokio::test]
+    async fn internal_package_never_touches_a_dead_upstream() {
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 0;
+            cfg.curation.internal_namespaces = vec!["@corp/*".to_string()];
+        });
+        assert_eq!(
+            publish(&ctx.app, "@corp/lib", "1.0.0").await,
+            StatusCode::CREATED
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let resp = send(&ctx.app, Method::GET, "/npm/@corp/lib", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/npm/@corp/lib",
+            vec![("accept", "application/vnd.npm.install-v1+json")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = send(&ctx.app, Method::GET, "/npm/@corp/lib/-/lib-1.0.0.tgz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"tgz");
+        let seen = upstream.received_requests().await.unwrap();
+        assert!(
+            seen.is_empty(),
+            "upstream contacted: {:?}",
+            seen.iter()
+                .map(|r| r.url.path().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// Publishing a name whose packument is a proxy cache (provenance sidecar) must not
     /// adopt the upstream versions as local ones, nor refuse them as already published.
     #[tokio::test]
