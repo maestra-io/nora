@@ -90,12 +90,16 @@ def download(url, workdir):
     hs = [hashlib.sha1(), hashlib.sha256(), hashlib.sha512()]
     fd, path = tempfile.mkstemp(dir=workdir)
     size = 0
-    with os.fdopen(fd, "wb") as f:
-        for chunk in r.iter_content(1 << 20):
-            f.write(chunk)
-            size += len(chunk)
-            for h in hs:
-                h.update(chunk)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            for chunk in r.iter_content(1 << 20):
+                f.write(chunk)
+                size += len(chunk)
+                for h in hs:
+                    h.update(chunk)
+    except BaseException:
+        os.unlink(path)  # a partial download must not keep its disk space (ENOSPC)
+        raise
     return path, size, hs[0].hexdigest(), hs[1].hexdigest(), hs[2].digest()
 
 
