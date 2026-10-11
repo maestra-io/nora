@@ -1,0 +1,39 @@
+suite: httproute
+templates:
+  - templates/httproute.yaml
+tests:
+  - it: does not render when disabled
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders HTTPRoute with hostnames and parentRefs
+    set:
+      httpRoute.enabled: true
+      httpRoute.hostnames:
+        - registry.example.com
+      httpRoute.parentRefs:
+        - name: shared-gateway
+          namespace: gateway-system
+      httpRoute.labels:
+        team: platform
+      httpRoute.annotations:
+        external-dns.alpha.kubernetes.io/hostname: registry.example.com
+    asserts:
+      - isKind:
+          of: HTTPRoute
+      - equal:
+          path: spec.hostnames[0]
+          value: registry.example.com
+      - equal:
+          path: spec.parentRefs[0].name
+          value: shared-gateway
+      - equal:
+          path: metadata.labels.team
+          value: platform
+      - equal:
+          path: spec.rules[0].backendRefs[0].name
+          value: RELEASE-NAME-nora
+      - equal:
+          path: spec.rules[0].backendRefs[0].port
+          value: 4000

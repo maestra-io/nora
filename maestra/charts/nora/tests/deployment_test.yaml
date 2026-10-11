@@ -1,0 +1,371 @@
+suite: deployment
+templates:
+  - templates/deployment.yaml
+  - templates/configmap.yaml
+# public_url is mandatory when ingress and httpRoute are both disabled. These
+# tests render the Deployment (which embeds the configmap checksum) without an
+# ingress, so supply public_url suite-wide. See the accepted note in values.yaml.
+set:
+  config.server.public_url: https://registry.example.com
+tests:
+  - it: renders a Deployment with default volumes
+    template: templates/deployment.yaml
+    asserts:
+      - isKind:
+          of: Deployment
+      - equal:
+          path: spec.template.spec.containers[0].env[0].name
+          value: NORA_CONFIG_PATH
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: config
+            mountPath: /config
+            readOnly: true
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: htpasswd
+
+  - it: mounts htpasswd secret when configured
+    template: templates/deployment.yaml
+    set:
+      config.auth.htpasswd.existingSecret: nora-htpasswd
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: htpasswd
+            mountPath: /etc/nora
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: htpasswd
+            secret:
+              secretName: nora-htpasswd
+              items:
+                - key: users.htpasswd
+                  path: users.htpasswd
+
+  - it: mounts existingSecret for docker upstream credentials
+    template: templates/deployment.yaml
+    set:
+      existingSecret: nora-secrets
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: secrets-config
+            mountPath: /config/secrets
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: secrets-config
+            secret:
+              secretName: nora-secrets
+
+  - it: uses emptyDir for data when persistence is disabled
+    template: templates/deployment.yaml
+    set:
+      persistence.enabled: false
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: data
+            emptyDir: {}
+
+  - it: uses PVC for data when persistence is enabled
+    template: templates/deployment.yaml
+    set:
+      persistence.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: data
+            persistentVolumeClaim:
+              claimName: RELEASE-NAME-nora-data
+
+  - it: uses custom image tag
+    template: templates/deployment.yaml
+    set:
+      image.tag: 0.9.0
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/getnora-io/nora:0.9.0
+
+  - it: uses chart appVersion when image tag is empty
+    template: templates/deployment.yaml
+    chart:
+      appVersion: "9.8.7"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/getnora-io/nora:9.8.7
+
+  - it: sets replicaCount
+    template: templates/deployment.yaml
+    set:
+      replicaCount: 3
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 3
+
+  - it: injects extraEnv and extraEnvFrom
+    template: templates/deployment.yaml
+    set:
+      extraEnv:
+        - name: NORA_AUTH_ENABLED
+          value: "true"
+      extraEnvFrom:
+        - secretRef:
+            name: nora-env
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: NORA_AUTH_ENABLED
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].envFrom
+          content:
+            secretRef:
+              name: nora-env
+
+  - it: applies pod scheduling fields
+    template: templates/deployment.yaml
+    set:
+      nodeSelector:
+        disktype: ssd
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: registry
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution: []
+    asserts:
+      - equal:
+          path: spec.template.spec.nodeSelector.disktype
+          value: ssd
+      - contains:
+          path: spec.template.spec.tolerations
+          content:
+            key: dedicated
+            operator: Equal
+            value: registry
+            effect: NoSchedule
+      - isNotNull:
+          path: spec.template.spec.affinity.podAntiAffinity
+
+  - it: applies security context and probes
+    template: templates/deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.fsGroup
+          value: 1000
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.runAsUser
+          value: 1000
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.httpGet.path
+          value: /health
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /ready
+
+  - it: uses custom server port
+    template: templates/deployment.yaml
+    set:
+      config.server.port: 8080
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].ports[0].containerPort
+          value: 8080
+
+  - it: mounts custom htpasswd secret key
+    template: templates/deployment.yaml
+    set:
+      config.auth.htpasswd.existingSecret: my-htpasswd
+      config.auth.htpasswd.secretKey: htpasswd
+      config.auth.htpasswd.mountPath: /secrets/auth
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: htpasswd
+            secret:
+              secretName: my-htpasswd
+              items:
+                - key: htpasswd
+                  path: htpasswd
+
+  - it: includes config checksum annotation
+    template: templates/deployment.yaml
+    asserts:
+      - isNotEmpty:
+          path: spec.template.metadata.annotations.checksum/config
+
+  - it: uses default service account when create is true
+    template: templates/deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: RELEASE-NAME-nora
+
+  - it: uses custom service account name
+    template: templates/deployment.yaml
+    set:
+      serviceAccount.name: external-sa
+    asserts:
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: external-sa
+
+  - it: applies imagePullSecrets and resources
+    template: templates/deployment.yaml
+    set:
+      imagePullSecrets:
+        - name: ghcr-credentials
+      resources:
+        requests:
+          cpu: 250m
+          memory: 256Mi
+        limits:
+          memory: 1Gi
+    asserts:
+      - equal:
+          path: spec.template.spec.imagePullSecrets[0].name
+          value: ghcr-credentials
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.cpu
+          value: 250m
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 1Gi
+
+  - it: applies pod labels and annotations
+    template: templates/deployment.yaml
+    set:
+      podLabels:
+        app: nora
+      podAnnotations:
+        prometheus.io/scrape: "true"
+    asserts:
+      - equal:
+          path: spec.template.metadata.labels.app
+          value: nora
+      - equal:
+          path: spec.template.metadata.annotations["prometheus.io/scrape"]
+          value: "true"
+
+  - it: mounts htpasswd and secrets together
+    template: templates/deployment.yaml
+    set:
+      config.auth.htpasswd.existingSecret: nora-htpasswd
+      existingSecret: nora-secrets
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: htpasswd
+            mountPath: /etc/nora
+            readOnly: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: secrets-config
+            mountPath: /config/secrets
+            readOnly: true
+
+  - it: does not mount curation volumes by default
+    template: templates/deployment.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: curation-blocklist
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: curation-allowlist
+
+  - it: mounts blocklist from an existing secret
+    template: templates/deployment.yaml
+    set:
+      config.curation.blocklist.existingSecret: nora-blocklist
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: curation-blocklist
+            mountPath: /etc/nora-curation/blocklist
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: curation-blocklist
+            secret:
+              secretName: nora-blocklist
+              items:
+                - key: blocklist.json
+                  path: blocklist.json
+
+  - it: mounts blocklist from an existing configmap
+    template: templates/deployment.yaml
+    set:
+      config.curation.blocklist.existingConfigMap: nora-blocklist-cm
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: curation-blocklist
+            configMap:
+              name: nora-blocklist-cm
+              items:
+                - key: blocklist.json
+                  path: blocklist.json
+
+  - it: mounts allowlist from a secret with custom key and mountPath
+    template: templates/deployment.yaml
+    set:
+      config.curation.allowlist.existingSecret: nora-allow
+      config.curation.allowlist.key: allow.json
+      config.curation.allowlist.mountPath: /opt/al
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: curation-allowlist
+            mountPath: /opt/al
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: curation-allowlist
+            secret:
+              secretName: nora-allow
+              items:
+                - key: allow.json
+                  path: allow.json
+
+  - it: does not create a curation volume for an explicit path
+    template: templates/deployment.yaml
+    set:
+      config.curation.mode: enforce
+      config.curation.blocklist.path: /data/blocklist.json
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: curation-blocklist
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: curation-blocklist

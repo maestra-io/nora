@@ -1,0 +1,378 @@
+suite: configmap
+templates:
+  - templates/configmap.yaml
+# public_url is mandatory when ingress and httpRoute are both disabled. Supply it
+# suite-wide for the cases that don't exercise ingress/httpRoute; the derive cases
+# below reset it to "" so auto-derivation from ingress/httpRoute is still tested.
+set:
+  config.server.public_url: https://registry.example.com
+tests:
+  - it: renders default config without auth section
+    asserts:
+      - isKind:
+          of: ConfigMap
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '^\[server\]'
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: '\[auth\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[rate_limit\]'
+
+  - it: renders auth with htpasswd and anonymous_read
+    set:
+      config.auth.enabled: true
+      config.auth.anonymous_read: true
+      config.auth.htpasswd.existingSecret: nora-htpasswd
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[auth\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'enabled = true'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'htpasswd_file = "/etc/nora/users\.htpasswd"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'token_storage = "data/tokens"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'anonymous_read = true'
+
+  - it: renders explicit htpasswd_file path
+    set:
+      config.auth.enabled: true
+      config.auth.htpasswd_file: /data/users.htpasswd
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'htpasswd_file = "/data/users\.htpasswd"'
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: '/etc/nora/users\.htpasswd'
+
+  - it: renders OIDC providers and role rules
+    set:
+      config.auth.enabled: true
+      config.auth.oidc.enabled: true
+      config.auth.oidc.providers:
+        - name: github-actions
+          issuer: https://token.actions.githubusercontent.com
+          audience: nora
+          algorithms:
+            - RS256
+            - ES256
+          max_token_lifetime_secs: 900
+          enabled: true
+          role_rules:
+            - pattern: "repo:myorg/*:ref:refs/heads/main"
+              role: write
+            - pattern: "repo:myorg/*"
+              role: read
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[auth\.oidc\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'name = "github-actions"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'pattern = "repo:myorg/\*:ref:refs/heads/main"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'role = "write"'
+
+  - it: derives public_url from ingress with TLS
+    set:
+      config.server.public_url: ""
+      ingress.enabled: true
+      ingress.hosts:
+        - host: registry.example.com
+          paths:
+            - path: /
+              pathType: Prefix
+      ingress.tls:
+        - secretName: registry-tls
+          hosts:
+            - registry.example.com
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'public_url = "https://registry\.example\.com"'
+
+  - it: renders registries as a list
+    set:
+      config.registries.enable:
+        - docker
+        - npm
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'enable = \["docker", "npm"\]'
+
+  - it: omits rate limit tuning when disabled
+    set:
+      config.rate_limit.enabled: false
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[rate_limit\]\nenabled = false'
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'auth_rps'
+
+  - it: renders explicit public_url
+    set:
+      config.server.public_url: https://cdn.example.com/registry
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'public_url = "https://cdn\.example\.com/registry"'
+
+  - it: derives public_url from HTTPRoute hostnames
+    set:
+      config.server.public_url: ""
+      httpRoute.enabled: true
+      httpRoute.hostnames:
+        - registry.example.com
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'public_url = "https://registry\.example\.com"'
+
+  - it: derives public_url from ingress without TLS
+    set:
+      config.server.public_url: ""
+      ingress.enabled: true
+      ingress.hosts:
+        - host: registry.local
+          paths:
+            - path: /
+              pathType: Prefix
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'public_url = "http://registry\.local"'
+
+  - it: renders registries enable all string
+    set:
+      config.registries.enable: all
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'enable = "all"'
+
+  - it: renders S3 storage settings
+    set:
+      config.storage.mode: s3
+      config.storage.s3_url: https://s3.amazonaws.com
+      config.storage.bucket: my-bucket
+      config.storage.s3_region: eu-west-1
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'mode = "s3"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 's3_url = "https://s3\.amazonaws\.com"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'bucket = "my-bucket"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 's3_region = "eu-west-1"'
+
+  - it: renders docker upstreams
+    set:
+      config.docker.upstreams:
+        - url: https://registry-1.docker.io
+        - url: https://private.registry.io
+          auth: user:token
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[\[docker\.upstreams\]\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'url = "https://registry-1\.docker\.io"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'auth = "user:token"'
+
+  - it: renders retention rules
+    set:
+      config.retention.enabled: true
+      config.retention.rules:
+        - registry: docker
+          max_age_days: 30
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'enabled = true'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[\[retention\.rules\]\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'registry = "docker"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'max_age_days = "30"'
+
+  - it: renders auth without htpasswd_file when not configured
+    set:
+      config.auth.enabled: true
+      config.auth.anonymous_read: false
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'anonymous_read = false'
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'htpasswd_file'
+
+  - it: renders OIDC jwks_uri override
+    set:
+      config.auth.enabled: true
+      config.auth.oidc.enabled: true
+      config.auth.oidc.providers:
+        - name: custom-idp
+          issuer: https://auth.internal.corp
+          audience: nora
+          algorithms:
+            - RS256
+          max_token_lifetime_secs: 3600
+          jwks_uri: https://auth.internal.corp/keys/jwks.json
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'jwks_uri = "https://auth\.internal\.corp/keys/jwks\.json"'
+
+  - it: renders custom htpasswd secret mount path
+    set:
+      config.auth.enabled: true
+      config.auth.htpasswd.existingSecret: my-htpasswd
+      config.auth.htpasswd.secretKey: htpasswd
+      config.auth.htpasswd.mountPath: /secrets/auth
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'htpasswd_file = "/secrets/auth/htpasswd"'
+
+  - it: renders gc and retention defaults
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[gc\]\nenabled = true\ninterval = 86400'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[retention\]\nenabled = false'
+
+  - it: combines htpasswd and OIDC in one auth block
+    set:
+      config.auth.enabled: true
+      config.auth.htpasswd.existingSecret: nora-htpasswd
+      config.auth.oidc.enabled: true
+      config.auth.oidc.providers:
+        - name: github-actions
+          issuer: https://token.actions.githubusercontent.com
+          audience: nora
+          algorithms:
+            - RS256
+          max_token_lifetime_secs: 900
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'htpasswd_file = "/etc/nora/users\.htpasswd"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[auth\.oidc\]'
+
+  - it: renders rate limit tuning when enabled
+    set:
+      config.rate_limit.enabled: true
+      config.rate_limit.auth_rps: 2
+      config.rate_limit.general_burst: 300
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'auth_rps = 2'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'general_burst = 300'
+
+  - it: omits curation section by default
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: '\[curation\]'
+
+  - it: wires blocklist_path from mounted secret in enforce mode
+    set:
+      config.curation.mode: enforce
+      config.curation.blocklist.existingSecret: nora-blocklist
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[curation\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'mode = "enforce"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'on_failure = "closed"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'blocklist_path = "/etc/nora-curation/blocklist/blocklist\.json"'
+
+  - it: wires allowlist_path from mounted configmap with custom key and mountPath
+    set:
+      config.curation.mode: audit
+      config.curation.allowlist.existingConfigMap: nora-allow
+      config.curation.allowlist.key: allow.json
+      config.curation.allowlist.mountPath: /opt/al
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'mode = "audit"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'allowlist_path = "/opt/al/allow\.json"'
+
+  - it: renders curation section for min_release_age even when mode is off
+    set:
+      config.curation.min_release_age: 7d
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[curation\]\nmode = "off"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'min_release_age = "7d"'
+
+  - it: renders require_integrity and on_failure open
+    set:
+      config.curation.mode: enforce
+      config.curation.on_failure: open
+      config.curation.require_integrity: true
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'on_failure = "open"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'require_integrity = true'
+
+  - it: uses explicit blocklist path when no mount is configured
+    set:
+      config.curation.mode: enforce
+      config.curation.blocklist.path: /data/blocklist.json
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'blocklist_path = "/data/blocklist\.json"'

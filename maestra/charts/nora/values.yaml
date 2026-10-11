@@ -1,0 +1,243 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/getnora-io/nora
+  # -- Image tag. Leave empty to use Chart.appVersion (recommended).
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  fsGroup: 1000
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  readOnlyRootFilesystem: true
+
+service:
+  type: ClusterIP
+  port: 4000
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: registry.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: registry-tls
+  #    hosts:
+  #      - registry.example.com
+
+httpRoute:
+  enabled: false
+  annotations: {}
+  labels: {}
+  parentRefs: []
+  #  - name: shared-gateway
+  #    namespace: gateway-system
+  #    sectionName: http
+  hostnames: []
+  #  - registry.example.com
+  extraRules: []
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters: []
+
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  annotations: {}
+
+config:
+  server:
+    host: "0.0.0.0"
+    port: 4000
+    # -- Public URL for UI install commands and auth realm.
+    # Auto-derived from ingress/httpRoute when either is enabled.
+    # REQUIRED (chart fails to render) when ingress AND httpRoute are both
+    # disabled — there is no safe default for a registry's public URL, since a
+    # wrong value would emit broken install commands in the UI. Workaround: set
+    # this explicitly, or enable ingress/httpRoute so it can be derived.
+    # Set explicitly for non-standard setups (CDN, reverse proxy, NodePort).
+    # Example: "https://registry.example.com"
+    public_url: ""
+  registries:
+    enable: "all"
+  storage:
+    mode: local
+    path: /data/storage
+    # -- S3 endpoint URL (required when mode=s3)
+    s3_url: ""
+    # -- S3 bucket name (required when mode=s3)
+    bucket: ""
+    # -- S3 region
+    s3_region: "us-east-1"
+  docker:
+    proxy_timeout: 60
+    # -- Docker upstream registries for proxy/cache.
+    # Auth credentials should come from existingSecret, not inline here.
+    upstreams: []
+    #  - url: https://registry-1.docker.io
+    #  - url: https://private.registry.io
+    #    auth: "user:token"
+  gc:
+    enabled: true
+    interval: 86400
+  retention:
+    enabled: false
+    interval: 86400
+    rules: []
+
+  # -- Authentication. Maps to [auth] and [auth.oidc] in config.toml.
+  auth:
+    enabled: false
+    # -- Basic auth via htpasswd file. Set explicitly or leave empty when using htpasswd.existingSecret.
+    htpasswd_file: ""
+    # -- Allow unauthenticated read (pull/browse); writes still require auth.
+    anonymous_read: false
+    # -- API token storage path (under /data when relative).
+    token_storage: "data/tokens"
+    # -- Mount htpasswd credentials from an existing Secret (recommended).
+    htpasswd:
+      existingSecret: ""
+      # -- Secret key containing the htpasswd file body.
+      secretKey: users.htpasswd
+      # -- Directory where the Secret key is mounted as a file.
+      mountPath: /etc/nora
+    oidc:
+      enabled: false
+      # -- Clock skew tolerance for JWT validation.
+      leeway_secs: 60
+      # -- JWKS key cache TTL.
+      jwks_cache_secs: 300
+      providers: []
+      # Example (GitHub Actions OIDC; set anonymous_read: true for public pulls):
+      #  - name: github-actions
+      #    issuer: https://token.actions.githubusercontent.com
+      #    audience: nora
+      #    algorithms:
+      #      - RS256
+      #      - ES256
+      #    max_token_lifetime_secs: 900
+      #    enabled: true
+      #    # jwks_uri: https://...  # optional JWKS endpoint override
+      #    role_rules:
+      #      - pattern: "repo:myorg/*:ref:refs/heads/main"
+      #        role: write
+      #      - pattern: "repo:myorg/*"
+      #        role: read
+
+  # -- Rate limiting (token bucket). See https://getnora.dev/configuration/rate-limits/
+  # Env overrides (NORA_RATE_LIMIT_*) still apply if set via extraEnv.
+  rate_limit:
+    enabled: true
+    auth_rps: 1
+    auth_burst: 5
+    upload_rps: 200
+    upload_burst: 500
+    general_rps: 100
+    general_burst: 200
+
+  # -- Curation (blocklist/allowlist, release-age gating). Maps to [curation] in
+  # config.toml. See https://getnora.dev/configuration/curation/
+  # The [curation] section is only rendered when curation is actually configured
+  # (mode != "off", a blocklist/allowlist is mounted, or min_release_age /
+  # require_integrity is set) — default values leave the rendered config unchanged.
+  # Env overrides (NORA_CURATION_*) still apply if set via extraEnv.
+  curation:
+    # -- Curation mode: "off" (default, pass-through), "audit" (evaluate + log,
+    # never block) or "enforce" (block on deny). blocklist/allowlist below take
+    # effect only when mode is "audit" or "enforce".
+    mode: "off"
+    # -- Filter-error behavior: "closed" (fail-safe, block) or "open" (allow).
+    on_failure: "closed"
+    # -- Require integrity metadata (checksums) on allowlisted artifacts.
+    require_integrity: false
+    # -- Minimum release age before an artifact is allowed (e.g. "7d", "24h", "1w").
+    # Empty disables the release-age gate.
+    min_release_age: ""
+    # -- Blocklist JSON. Mount from an existing Secret or ConfigMap (same pattern
+    # as config.auth.htpasswd). When existingSecret/existingConfigMap is set,
+    # blocklist_path is auto-wired to <mountPath>/<key>, so the path is never
+    # specified twice. existingSecret wins if both are set.
+    blocklist:
+      existingSecret: ""
+      existingConfigMap: ""
+      # -- Key inside the Secret/ConfigMap holding the blocklist JSON body.
+      key: blocklist.json
+      # -- Directory the key is mounted into (a sibling of /etc/nora, so it never
+      # collides with the htpasswd mount). The file lands at <mountPath>/<key>.
+      mountPath: /etc/nora-curation/blocklist
+      # -- Explicit blocklist_path, used only when no existingSecret/existingConfigMap
+      # is set (e.g. the file is baked into the image or supplied via extraVolumes).
+      path: ""
+    # -- Allowlist JSON. Same shape as blocklist.
+    allowlist:
+      existingSecret: ""
+      existingConfigMap: ""
+      key: allowlist.json
+      mountPath: /etc/nora-curation/allowlist
+      path: ""
+
+# -- Name of an existing Secret to mount as /config/secrets.toml.
+# Use this to keep registry credentials out of values.yaml.
+# The Secret should contain a key "secrets.toml" with TOML content, e.g.:
+#   [[docker.upstreams]]
+#   url = "https://private.registry.io"
+#   auth = "user:token"
+# These upstreams are merged with config.docker.upstreams (Secret wins for same URL).
+existingSecret: ""
+
+# -- Extra environment variables for the NORA container.
+# Supports full Kubernetes env spec: plain values, secretKeyRef, configMapKeyRef.
+# Example:
+#   extraEnv:
+#     - name: NORA_S3_STORAGE_ACCESS_KEY
+#       valueFrom:
+#         secretKeyRef:
+#           name: my-s3-secret
+#           key: access-key
+#     - name: NORA_AUTH_ENABLED
+#       value: "true"
+extraEnv: []
+
+# -- Additional envFrom entries for the NORA container.
+# Injects all keys from a Secret or ConfigMap as env vars.
+# Example:
+#   extraEnvFrom:
+#     - secretRef:
+#         name: nora-s3-credentials
+extraEnvFrom: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
