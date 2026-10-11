@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use utoipa::ToSchema;
 
-use crate::tokens::Role;
+use crate::audit::AuditEntry;
+use crate::tokens::{Role, MAX_TOKEN_TTL_DAYS};
 use crate::AppState;
 
 use super::resolve_client_ip;
@@ -134,12 +135,23 @@ async fn create_token(
             .into_response();
     }
 
-    match token_store.create_token(&req.username, req.ttl_days, req.description, role) {
-        Ok(token) => Json(CreateTokenResponse {
-            token,
-            expires_in_days: req.ttl_days,
-        })
-        .into_response(),
+    let ttl_days = req.ttl_days.clamp(1, MAX_TOKEN_TTL_DAYS);
+    let detail = format!("role={} ttl_days={}", role, ttl_days);
+    match token_store.create_token(&req.username, ttl_days, req.description, role) {
+        Ok(token) => {
+            state.audit.log(AuditEntry::new(
+                "token_mint",
+                &req.username,
+                &req.username,
+                "api",
+                &detail,
+            ));
+            Json(CreateTokenResponse {
+                token,
+                expires_in_days: ttl_days,
+            })
+            .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
