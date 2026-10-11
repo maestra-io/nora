@@ -361,9 +361,12 @@ pub async fn auth_middleware(
     // works. Safe: the handler (registry/npm.rs) mutates nothing (forwards to the
     // configured upstream, returns advisories), caps the body, strips internal
     // package names under a filter, and never forwards the client credential.
+    // Same for pnpm's `audits` path, and a read-only token may audit too: the
+    // write-method gates below exempt it (#1055 measured pnpm's path).
     let is_npm_audit = *request.method() == axum::http::Method::POST
         && (path == "/npm/-/npm/v1/security/advisories/bulk"
-            || path == "/npm/-/npm/v1/security/audits/quick");
+            || path == "/npm/-/npm/v1/security/audits/quick"
+            || path == "/npm/-/npm/v1/security/audits");
 
     // A request that presents credentials is always validated below (honest
     // `docker login`, correct audit attribution) — never short-circuited to
@@ -444,6 +447,7 @@ pub async fn auth_middleware(
                         || method == axum::http::Method::POST
                         || method == axum::http::Method::DELETE
                         || method == axum::http::Method::PATCH)
+                        && !is_npm_audit
                         && !role.can_write()
                     {
                         return (StatusCode::FORBIDDEN, "Read-only token").into_response();
@@ -497,6 +501,7 @@ pub async fn auth_middleware(
                             || method == axum::http::Method::POST
                             || method == axum::http::Method::DELETE
                             || method == axum::http::Method::PATCH)
+                            && !is_npm_audit
                             && !identity.role.can_write()
                         {
                             return (StatusCode::FORBIDDEN, "Read-only OIDC identity")
@@ -598,6 +603,7 @@ pub async fn auth_middleware(
                 || method == axum::http::Method::POST
                 || method == axum::http::Method::DELETE
                 || method == axum::http::Method::PATCH)
+                && !is_npm_audit
                 && !role.can_write()
             {
                 return (StatusCode::FORBIDDEN, "Read-only token").into_response();
@@ -1353,6 +1359,49 @@ mod integration_tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// `npm install`/`npm audit`/`pnpm audit` POST their audit with the same read
+    /// token they install with; the write-method gate must not refuse it.
+    #[tokio::test]
+    async fn test_read_token_may_post_npm_audit() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let token = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("ci", 30, None, crate::tokens::Role::Read)
+            .unwrap();
+        let bearer = format!("Bearer {token}");
+        let basic = format!("Basic {}", STANDARD.encode(format!("ci:{token}")));
+        for path in [
+            "/npm/-/npm/v1/security/advisories/bulk",
+            "/npm/-/npm/v1/security/audits",
+        ] {
+            for header_val in [&bearer, &basic] {
+                let response = send_with_headers(
+                    &ctx.app,
+                    Method::POST,
+                    path,
+                    vec![("authorization", header_val)],
+                    b"{}".to_vec(),
+                )
+                .await;
+                assert_ne!(response.status(), StatusCode::FORBIDDEN, "{path}");
+                assert_ne!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+            }
+        }
+        // Any other write with the same token is still refused.
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/npm/some-pkg",
+            vec![("authorization", &bearer)],
+            b"{}".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
