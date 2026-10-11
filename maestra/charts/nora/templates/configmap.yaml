@@ -71,40 +71,64 @@ data:
     {{- end }}
 
     {{- if .Values.config.auth.enabled }}
+    {{- $auth := .Values.config.auth }}
     {{- $htpasswdFile := include "nora.auth.htpasswdFile" . }}
 
     [auth]
-    enabled = {{ .Values.config.auth.enabled }}
+    enabled = {{ $auth.enabled }}
     {{- if $htpasswdFile }}
     htpasswd_file = {{ $htpasswdFile | quote }}
     {{- end }}
-    token_storage = {{ .Values.config.auth.token_storage | quote }}
-    anonymous_read = {{ .Values.config.auth.anonymous_read }}
-    {{- if .Values.config.auth.oidc.enabled }}
+    token_storage = {{ $auth.token_storage | quote }}
+    anonymous_read = {{ $auth.anonymous_read }}
+    {{- range $k := list "docker_anon_pull" "public_web_ui" "public_metrics" "token_cache_ttl" }}
+    {{- if hasKey $auth $k }}
+    {{ $k }} = {{ get $auth $k | toJson }}
+    {{- end }}
+    {{- end }}
+    {{- with $auth.trusted_proxies }}
+    trusted_proxies = {{ ternary . (join "," .) (kindIs "string" .) | quote }}
+    {{- end }}
+    {{- with $auth.admin_users }}
+    admin_users = {{ toJson . }}
+    {{- end }}
+    {{- if $auth.oidc.enabled }}
 
     [auth.oidc]
-    enabled = {{ .Values.config.auth.oidc.enabled }}
-    leeway_secs = {{ .Values.config.auth.oidc.leeway_secs }}
-    jwks_cache_secs = {{ .Values.config.auth.oidc.jwks_cache_secs }}
-    {{- range .Values.config.auth.oidc.providers }}
+    enabled = {{ $auth.oidc.enabled }}
+    leeway_secs = {{ $auth.oidc.leeway_secs }}
+    jwks_cache_secs = {{ $auth.oidc.jwks_cache_secs }}
+    {{- range $auth.oidc.providers }}
 
     [[auth.oidc.providers]]
-    name = {{ .name | quote }}
-    issuer = {{ .issuer | quote }}
-    audience = {{ .audience | quote }}
-    {{- if .algorithms }}
-    algorithms = [{{- range $i, $v := .algorithms }}{{- if $i }}, {{ end }}{{ $v | quote }}{{- end }}]
+    name = {{ required "config.auth.oidc.providers[].name is required" .name | quote }}
+    issuer = {{ required "config.auth.oidc.providers[].issuer is required" .issuer | quote }}
+    audience = {{ .audience | default "" | quote }}
+    {{- with .algorithms }}
+    algorithms = {{ toJson . }}
     {{- end }}
+    {{- if hasKey . "max_token_lifetime_secs" }}
     max_token_lifetime_secs = {{ .max_token_lifetime_secs }}
-    enabled = {{ .enabled | default true }}
-    {{- if .jwks_uri }}
-    jwks_uri = {{ .jwks_uri | quote }}
+    {{- end }}
+    {{- /* `default true` would turn an explicit false into true */}}
+    enabled = {{ ternary .enabled true (hasKey . "enabled") }}
+    {{- with .jwks_uri }}
+    jwks_uri = {{ . | quote }}
+    {{- end }}
+    {{- with .namespace_scope }}
+    namespace_scope = {{ toJson . }}
+    {{- end }}
+    {{- with .namespace_scope_enforcement }}
+    namespace_scope_enforcement = {{ . | quote }}
     {{- end }}
     {{- range .role_rules }}
 
     [[auth.oidc.providers.role_rules]]
     pattern = {{ .pattern | quote }}
     role = {{ .role | quote }}
+    {{- if hasKey . "namespace_scope" }}
+    namespace_scope = {{ toJson .namespace_scope }}
+    {{- end }}
     {{- end }}
     {{- end }}
     {{- end }}

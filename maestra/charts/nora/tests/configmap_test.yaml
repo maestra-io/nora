@@ -376,3 +376,95 @@ tests:
       - matchRegex:
           path: data["config.toml"]
           pattern: 'blocklist_path = "/data/blocklist\.json"'
+
+  # Maestra: the whole [auth] section (C05/C06/C47/C57)
+  - it: renders trusted_proxies, admin_users and the optional auth switches
+    set:
+      config.auth.enabled: true
+      config.auth.trusted_proxies:
+        - 10.60.8.0/24
+        - 10.62.0.0/16
+      config.auth.admin_users:
+        - admin
+      config.auth.docker_anon_pull: false
+      config.auth.public_web_ui: true
+      config.auth.public_metrics: false
+      config.auth.token_cache_ttl: 60
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'trusted_proxies = "10\.60\.8\.0/24,10\.62\.0\.0/16"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'admin_users = \["admin"\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'docker_anon_pull = false'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'public_web_ui = true'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'public_metrics = false'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'token_cache_ttl = 60\n'
+
+  - it: accepts trusted_proxies as a comma-separated string
+    set:
+      config.auth.enabled: true
+      config.auth.trusted_proxies: "10.0.0.0/8,::1"
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'trusted_proxies = "10\.0\.0\.0/8,::1"'
+
+  - it: leaves nora defaults for unset optional auth keys
+    set:
+      config.auth.enabled: true
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'trusted_proxies|admin_users|docker_anon_pull|public_web_ui|public_metrics|token_cache_ttl'
+
+  - it: renders OIDC namespace_scope, enforcement and per-rule scope
+    set:
+      config.auth.enabled: true
+      config.auth.oidc.enabled: true
+      config.auth.oidc.providers:
+        - name: github-actions
+          issuer: https://token.actions.githubusercontent.com
+          audience: packages.example.com
+          algorithms: [RS256]
+          max_token_lifetime_secs: 900
+          namespace_scope: ["mindbox.*", "@mindbox-cloud/*"]
+          namespace_scope_enforcement: audit
+          role_rules:
+            - pattern: "repo:myorg/*:ref:refs/heads/main"
+              role: write
+            - pattern: "repo:myorg/*:pull_request"
+              role: write
+              namespace_scope: ["ci-transport/**"]
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'namespace_scope = \["mindbox\.\*","@mindbox-cloud/\*"\]\nnamespace_scope_enforcement = "audit"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'pattern = "repo:myorg/\*:pull_request"\nrole = "write"\nnamespace_scope = \["ci-transport/\*\*"\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'algorithms = \["RS256"\]'
+
+  - it: keeps an explicitly disabled OIDC provider disabled
+    set:
+      config.auth.enabled: true
+      config.auth.oidc.enabled: true
+      config.auth.oidc.providers:
+        - name: disabled-one
+          issuer: https://issuer.example.com
+          enabled: false
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'issuer = "https://issuer\.example\.com"\naudience = ""\nenabled = false'

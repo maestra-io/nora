@@ -138,6 +138,11 @@ The chart mounts the Secret at `/etc/nora/users.htpasswd` and sets `htpasswd_fil
 | `config.auth.htpasswd.existingSecret` | Secret with htpasswd file | `""` |
 | `config.auth.htpasswd.secretKey` | Key in the Secret | `users.htpasswd` |
 | `config.auth.htpasswd.mountPath` | Mount directory | `/etc/nora` |
+| `config.auth.trusted_proxies` | IPs/CIDRs whose `X-Forwarded-For` is honoured (list or comma-separated string) | `[]` (nora: loopback) |
+| `config.auth.admin_users` | htpasswd users allowed to mint admin tokens | `[]` |
+| `config.auth.docker_anon_pull`, `public_web_ui`, `public_metrics`, `token_cache_ttl` | Rendered only when set | nora defaults |
+
+**Behind an ingress set `trusted_proxies`** to the ingress pods'/nodes' addresses. nora keys the brute-force lockout and every rate limiter on the client IP it resolves; with the default (loopback only) every request resolves to the ingress IP, so five bad logins from any client lock out everyone. nora reads `X-Forwarded-For` right to left, so the ingress must not pass client-supplied entries through unchecked.
 
 #### OIDC
 
@@ -175,7 +180,20 @@ config:
 | `config.auth.oidc.jwks_cache_secs` | JWKS cache TTL (seconds) | `300` |
 | `config.auth.oidc.providers` | OIDC provider list | `[]` |
 
-Per provider: `name`, `issuer`, `audience`, `algorithms`, `max_token_lifetime_secs`, `enabled`, optional `jwks_uri`, and `role_rules` (`pattern`, `role`).
+Per provider: `name`, `issuer`, `audience`, `algorithms`, `max_token_lifetime_secs`, `enabled`, optional `jwks_uri`, `namespace_scope`, `namespace_scope_enforcement` (`enforce` | `audit`), and `role_rules` (`pattern`, `role`, optional `namespace_scope` that narrows the provider scope).
+
+Without `namespace_scope` (nora's default `["*"]`) every identity a `write` rule matches can publish any package:
+
+```yaml
+        - name: github-actions
+          # ...
+          namespace_scope: ["mindbox.*", "@mindbox-cloud/*"]
+          namespace_scope_enforcement: enforce
+          role_rules:
+            - pattern: "repo:myorg/*:pull_request"
+              role: write
+              namespace_scope: ["ci-transport/**"]
+```
 
 You can still use `NORA_AUTH_*` env vars via `extraEnv`; they take precedence over `config.toml` when set.
 

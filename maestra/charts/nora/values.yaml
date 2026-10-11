@@ -154,6 +154,22 @@ config:
     anonymous_read: false
     # -- API token storage path (under /data when relative).
     token_storage: "data/tokens"
+    # -- Client IPs/CIDRs whose X-Forwarded-For is honoured (list or
+    # comma-separated string). nora keys the auth lockout and every rate
+    # limiter on the resolved client IP; the default (loopback only) behind an
+    # ingress collapses every client into the ingress IP, so 5 bad logins from
+    # anyone lock everybody out. Set it to the ingress pods'/nodes' addresses.
+    # Empty = nora's default (127.0.0.1, ::1).
+    trusted_proxies: []
+    # -- htpasswd users allowed to mint admin-role API tokens (POST /api/tokens).
+    admin_users: []
+    # -- Optional, rendered only when set (nora defaults in brackets):
+    # docker_anon_pull (false), public_web_ui (false), public_metrics (true),
+    # token_cache_ttl (300).
+    # docker_anon_pull: false
+    # public_web_ui: false
+    # public_metrics: true
+    # token_cache_ttl: 300
     # -- Mount htpasswd credentials from an existing Secret (recommended).
     htpasswd:
       existingSecret: ""
@@ -178,9 +194,15 @@ config:
       #    max_token_lifetime_secs: 900
       #    enabled: true
       #    # jwks_uri: https://...  # optional JWKS endpoint override
+      #    # What a write identity may publish; ["*"] (nora's default) = anything.
+      #    namespace_scope: ["myorg/**"]
+      #    namespace_scope_enforcement: enforce   # or audit
       #    role_rules:
       #      - pattern: "repo:myorg/*:ref:refs/heads/main"
       #        role: write
+      #      - pattern: "repo:myorg/*:pull_request"
+      #        role: write
+      #        namespace_scope: ["ci-transport/**"]  # narrows the provider scope
       #      - pattern: "repo:myorg/*"
       #        role: read
 
