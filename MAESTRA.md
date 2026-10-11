@@ -6,6 +6,7 @@ Real GitHub fork of [getnora-io/nora](https://github.com/getnora-io/nora); track
 - `maestra/main` (default branch) is upstream `main` plus our commits. All our work lands here via PRs.
 
 Maestra-only changes (not upstream):
+- Hosted NuGet feed retention/repair: `[nuget] hosted_pr_retention_days` (`NORA_NUGET_HOSTED_PR_RETENTION_DAYS`, default 30, 0 = keep all) and `hosted_pr_keep_last` (`NORA_NUGET_HOSTED_PR_KEEP_LAST`, default 20) expire `X.Y.Z-pr.*` versions in a periodic pass (retention interval and dry-run) that also sweeps blob dirs no state document names (>1 h old); `nora nuget rebuild <id>` rewrites `nuget/hosted-meta/{id}.json` from the stored nuspecs; `POST /api/v1/admin/reindex` also re-reads hosted state documents.
 - `[storage] s3_credentials_dir` / `NORA_STORAGE_S3_CREDENTIALS_DIR`: S3 credentials (`access_key_id`, `secret_access_key`, optional `session_token`) read from files and re-read every 60 s, for the rotating STS-style R2 creds Vault mints (packages.maestra.io, issues-maestra#1442).
 
 Update from upstream:

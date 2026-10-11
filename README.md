@@ -41,7 +41,7 @@ All endpoints require authentication. Anonymous read is opt-in via `anonymous_re
 | RubyGems | ✅ | ❌ | `rubygems.org` | proxy only — `gem push` not implemented in NORA v1.1.0 |
 | Terraform | ✅ | — | `registry.terraform.io` | proxy only; client configuration notes in COMPAT.md |
 | Ansible Galaxy | ✅ | ❌ | `galaxy.ansible.com` | proxy only — `ansible-galaxy collection publish` not implemented |
-| NuGet | ✅ | ✅ | `api.nuget.org` | hosted + proxy — `dotnet nuget push` / `delete` (unlist); hosted IDs are never proxied, set `curation.internal_namespaces` (lowercase, e.g. `maestra.**`) to cover IDs not pushed yet; `.snupkg` not accepted |
+| NuGet | ✅ | ✅ | `api.nuget.org` | hosted + proxy — `dotnet nuget push` / `delete` (unlist); hosted IDs are never proxied, set `curation.internal_namespaces` (lowercase, e.g. `maestra.**`) to cover IDs not pushed yet; `.snupkg` not accepted; identical re-push → 200; PR pre-releases (`X.Y.Z-pr.*`) expire after `[nuget] hosted_pr_retention_days` (30) unless among the `hosted_pr_keep_last` (20) newest; `nora nuget rebuild <id>` rewrites an ID's state from its blobs |
 | Pub (Dart/Flutter) | ✅ | ❌ | `pub.dev` | proxy only — `dart pub publish` not implemented |
 | CPAN | ✅ | — | `www.cpan.org` | proxy only |
 | Conan (C/C++) | ⚠️ | ❌ | `center2.conan.io` | proxy only; Conan client compatibility tracked in COMPAT.md |
