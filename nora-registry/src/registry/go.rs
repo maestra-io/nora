@@ -200,19 +200,15 @@ async fn handle(
                 // be rehashed, so the serve relies on the go.sum hash the client checks
                 // itself (docker did the same in #657). An absent/malformed range falls
                 // through to the full 200.
-                if let Some(response) = crate::registry::range::range_response(
-                    &state.storage,
-                    &[&storage_key],
+                if let Some(response) = crate::registry::range::range_response_from_bytes(
+                    data,
                     &headers,
-                    data.len() as u64,
                     content_type,
                     &[(
                         header::CACHE_CONTROL,
                         "public, max-age=31536000, immutable".to_string(),
                     )],
-                )
-                .await
-                {
+                ) {
                     return response;
                 }
 

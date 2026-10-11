@@ -10,7 +10,7 @@ use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
 use object_store::CredentialProvider;
 use object_store::{
-    Attribute, AttributeValue, Attributes, GetOptions, ObjectStore, ObjectStoreExt,
+    Attribute, AttributeValue, Attributes, GetOptions, ObjectStore, ObjectStoreExt, PutMode,
     PutMultipartOptions, PutOptions, PutPayload, WriteMultipart,
 };
 use std::pin::Pin;
@@ -35,7 +35,8 @@ fn streaming_client_options() -> object_store::ClientOptions {
 
 /// Bounds for calls that do not stream a body to a client. The client timeout above
 /// is sized for streamed downloads; without these a silently dropped connection holds
-/// a HEAD or a small GET for STREAM_ATTEMPT_TIMEOUT. Request-to-headers / small ops:
+/// a HEAD or a small GET for STREAM_ATTEMPT_TIMEOUT. Request-to-headers / small ops /
+/// each next page of a LIST (see [`idle_bounded`]):
 const METADATA_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Whole in-memory body transfers (`put`, the body of `get`).
 const BODY_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -50,6 +51,32 @@ async fn bounded<T>(
             source: format!("request exceeded {} s", limit.as_secs()).into(),
         })
     })
+}
+
+/// A LIST walk has no fixed size (its cost grows with the prefix), so it gets no total
+/// bound. Each next entry must arrive within `idle` instead: entries come a page at a
+/// time, so this bounds every page request, and a connection that goes silent mid-walk
+/// fails the walk instead of holding it for STREAM_ATTEMPT_TIMEOUT.
+fn idle_bounded<T: Send + 'static>(
+    stream: futures::stream::BoxStream<'static, object_store::Result<T>>,
+    idle: std::time::Duration,
+) -> futures::stream::BoxStream<'static, object_store::Result<T>> {
+    use futures::StreamExt;
+    futures::stream::unfold(Some(stream), move |stream| async move {
+        let mut stream = stream?;
+        match tokio::time::timeout(idle, stream.next()).await {
+            Ok(Some(item)) => Some((item, Some(stream))),
+            Ok(None) => None,
+            Err(_) => Some((
+                Err(object_store::Error::Generic {
+                    store: "object_store",
+                    source: format!("listing made no progress for {} s", idle.as_secs()).into(),
+                }),
+                None,
+            )),
+        }
+    })
+    .boxed()
 }
 
 fn streaming_retry_config() -> object_store::RetryConfig {
@@ -378,15 +405,20 @@ fn encode_object_key_legacy(key: &str) -> String {
 /// third time (`%252540`) and 404'd. Net effect: scoped npm packages (`@scope/name`)
 /// listed as if they had no versions, so scan-regenerate wrote an EMPTY packument on
 /// every publish and `npm install` failed `ENOVERSIONS` (#878, S3/object_store only —
-/// local FS has no `%` re-encoding). Reverse the double form FIRST, then the single
-/// form (a backend that does not re-encode, e.g. an in-memory mock). Non-scoped keys
-/// carry no `%` and are untouched by either replace.
+/// local FS has no `%` re-encoding). Undo `Path`'s encoding first, then our `%40`.
+/// The same round trip broke every other byte `Path` encodes: a listed `raw/a~b` came
+/// back as `raw/a%7Eb` and 404'd on re-read.
 ///
 /// Legacy `_at_` keys from pre-#534 data are still NOT decoded here — they are
 /// handled by fallback reads in `get()`/`stat()`, avoiding the roundtrip collision
 /// where a literal `_at_` (e.g. `cargo/look_at_this/`) would be wrongly decoded.
 fn decode_object_key(key: &str) -> String {
-    key.replace("%2540", "@").replace("%40", "@")
+    // Every `%` in a stored location was written by `Path` itself (it encodes `%` as
+    // `%25`), so one full percent-decode is the exact inverse of `Path`'s encoding of its
+    // whole INVALID set (`~ * ? # [ ] { } ^ | < > " %` ...), not only of our `@`.
+    percent_encoding::percent_decode_str(key)
+        .decode_utf8_lossy()
+        .replace("%40", "@")
 }
 
 /// User-defined object metadata carrying the SHA-256 integrity pin — written
@@ -440,6 +472,30 @@ impl StorageBackend for ObjectStorage {
             .await
             .map_err(map_err)?;
         Ok(())
+    }
+
+    async fn put_if_absent(&self, key: &str, data: Bytes, sha256: &str) -> Result<bool> {
+        // `PutMode::Create` is a conditional PUT (`If-None-Match: *` on S3/R2, a
+        // generation precondition on GCS): the store itself refuses to overwrite.
+        let path = Path::from(encode_object_key(key));
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            attributes: pin_attributes(sha256),
+            ..Default::default()
+        };
+        let payload = PutPayload::from(data.clone());
+        match bounded(BODY_OP_TIMEOUT, self.store.put_opts(&path, payload, opts)).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+            // A store configured without conditional writes: check, then write.
+            Err(object_store::Error::NotImplemented { .. }) => {
+                if self.stat(key).await.is_some() {
+                    return Ok(false);
+                }
+                self.put_bytes(key, data, sha256).await.map(|()| true)
+            }
+            Err(e) => Err(map_err(e)),
+        }
     }
 
     async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
@@ -506,9 +562,7 @@ impl StorageBackend for ObjectStorage {
         };
 
         // Collect all objects from the listing stream.
-        let objects: Vec<_> = self
-            .store
-            .list(list_prefix)
+        let objects: Vec<_> = idle_bounded(self.store.list(list_prefix), METADATA_OP_TIMEOUT)
             .try_collect()
             .await
             .map_err(|e| StorageError::Network(e.to_string()))?;
@@ -531,9 +585,7 @@ impl StorageBackend for ObjectStorage {
             Some(&prefix_path)
         };
 
-        let objects: Vec<_> = self
-            .store
-            .list(list_prefix)
+        let objects: Vec<_> = idle_bounded(self.store.list(list_prefix), METADATA_OP_TIMEOUT)
             .try_collect()
             .await
             .map_err(|e| StorageError::Network(e.to_string()))?;
@@ -635,9 +687,7 @@ impl StorageBackend for ObjectStorage {
 
     async fn refresh_total_size(&self) {
         // Full-bucket walk: runs on its own slow cadence, never on the readiness path.
-        let total = self
-            .store
-            .list(None)
+        let total = idle_bounded(self.store.list(None), METADATA_OP_TIMEOUT)
             .try_fold(0u64, |acc, m| async move {
                 Ok::<_, object_store::Error>(acc + m.size)
             })
@@ -1211,6 +1261,141 @@ mod tests {
             encode_object_key_legacy("npm/chalk/metadata.json"),
             "npm/chalk/metadata.json"
         );
+    }
+
+    fn over(store: impl ObjectStore) -> ObjectStorage {
+        ObjectStorage {
+            store: Box::new(store),
+            name: "s3",
+            cached_total_size: std::sync::atomic::AtomicU64::new(0),
+            size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
+            cached_reachable: std::sync::atomic::AtomicBool::new(true),
+            last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// LIST is bounded per page, not in total: a listing that stops making progress
+    /// fails after METADATA_OP_TIMEOUT with a storage error, while a long listing that
+    /// keeps delivering entries runs to the end (C15).
+    #[tokio::test(start_paused = true)]
+    async fn test_list_is_bounded_per_page_not_in_total() {
+        use object_store::throttle::{ThrottleConfig, ThrottledStore};
+        let inner = || async {
+            let store = object_store::memory::InMemory::new();
+            for i in 0..5 {
+                store
+                    .put(
+                        &Path::from(format!("raw/{i}")),
+                        PutPayload::from_static(b"x"),
+                    )
+                    .await
+                    .unwrap();
+            }
+            store
+        };
+
+        let stalled = over(ThrottledStore::new(
+            inner().await,
+            ThrottleConfig {
+                wait_list_per_call: Duration::from_secs(3600),
+                ..Default::default()
+            },
+        ));
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            stalled.list("raw/").await,
+            Err(StorageError::Network(_))
+        ));
+        assert!(matches!(
+            stalled.list_with_meta("raw/").await,
+            Err(StorageError::Network(_))
+        ));
+        stalled.refresh_total_size().await;
+        assert!(!stalled
+            .size_cache_initialized
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(started.elapsed() < Duration::from_secs(4 * METADATA_OP_TIMEOUT.as_secs()));
+
+        // 5 entries x 20 s = 100 s in total, but never 30 s without progress.
+        let slow = over(ThrottledStore::new(
+            inner().await,
+            ThrottleConfig {
+                wait_list_per_entry: Duration::from_secs(20),
+                ..Default::default()
+            },
+        ));
+        assert_eq!(slow.list("raw/").await.unwrap().len(), 5);
+        assert_eq!(slow.list_with_meta("raw/").await.unwrap().len(), 5);
+    }
+
+    /// Every byte `Path` percent-encodes comes back verbatim from a listing, and the
+    /// listed key reads back: `list` -> `get` is the GC / backup / retention / UI path
+    /// (C20, the #878 bug class beyond `@`).
+    #[tokio::test]
+    async fn listed_keys_round_trip_the_whole_path_invalid_set() {
+        let storage = ObjectStorage::in_memory();
+        let mut keys: Vec<String> = "~*?#[]{}^|<>\"%`\\"
+            .chars()
+            .map(|c| format!("raw/d{c}r/f{c}.txt"))
+            .collect();
+        keys.push("npm/@scope/a~b/tarballs/a~b-1.0.0.tgz".to_string());
+        keys.push("raw/literal_at_/x".to_string());
+        for key in &keys {
+            storage.put(key, key.as_bytes(), "00").await.unwrap();
+        }
+        let mut listed = storage.list("raw/").await.unwrap();
+        listed.extend(storage.list("npm/").await.unwrap());
+        listed.sort();
+        let mut expected = keys.clone();
+        expected.sort();
+        assert_eq!(listed, expected);
+        let mut with_meta: Vec<String> = storage
+            .list_with_meta("")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        with_meta.sort();
+        assert_eq!(with_meta, expected);
+        for key in &listed {
+            let (body, _) = storage.get(key).await.expect(key);
+            assert_eq!(&body[..], key.as_bytes());
+            assert!(storage.stat(key).await.is_some(), "{key}");
+        }
+    }
+
+    /// C53: `put_if_absent` is one conditional PUT: of concurrent writers exactly one
+    /// lands, and a later one leaves the stored body and pin untouched.
+    #[tokio::test]
+    async fn put_if_absent_is_one_conditional_put() {
+        let storage = Arc::new(ObjectStorage::in_memory());
+        let key = "nuget/flatcontainer/a/1.0.0/a.1.0.0.nupkg";
+        let tasks: Vec<_> = (0..8)
+            .map(|i| {
+                let storage = Arc::clone(&storage);
+                tokio::spawn(async move {
+                    storage
+                        .put_if_absent(key, Bytes::from(format!("body-{i}")), &format!("{i}"))
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect();
+        let mut created = 0;
+        for task in tasks {
+            created += usize::from(task.await.unwrap());
+        }
+        assert_eq!(created, 1);
+        let (body, pin) = storage.get(key).await.unwrap();
+        let writer = pin.unwrap();
+        assert_eq!(&body[..], format!("body-{writer}").as_bytes());
+
+        assert!(!storage
+            .put_if_absent(key, Bytes::from_static(b"later"), "x")
+            .await
+            .unwrap());
+        assert_eq!(storage.get(key).await.unwrap(), (body, Some(writer)));
     }
 
     /// A store call that never answers is cut off at its bound and surfaces as a

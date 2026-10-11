@@ -140,6 +140,7 @@ pub async fn run_gc(
     grace_secs: u64,
     npm_is_proxy: bool,
     proxy_cache_max_bytes: u64,
+    curation: &crate::curation::CurationEngine,
 ) -> GcResult {
     let start = Instant::now();
     info!(
@@ -272,15 +273,22 @@ pub async fn run_gc(
         );
     }
 
-    // Proxy-cache eviction (#866): size-based LRU for rpm/deb proxy-cached
-    // files that have no sidecar and are not indexes.
-    let proxy_cache_eviction =
-        evict_proxy_cache(storage, publish_locks, proxy_cache_max_bytes, dry_run).await;
+    // Proxy-cache eviction (#866): size-based LRU for proxy-cached rpm/deb files,
+    // NuGet packages and npm tarballs (see `evict_proxy_cache`).
+    let proxy_cache_eviction = evict_proxy_cache(
+        storage,
+        publish_locks,
+        proxy_cache_max_bytes,
+        dry_run,
+        curation,
+    )
+    .await;
 
     // Detect registries with data but no GC coverage
     // Raw has no version model and no reference graph — nothing to GC by design
-    // Terraform/Pub/Ansible/NuGet store only cached metadata — no orphan graph,
-    // but we track them so the GC report shows data exists outside coverage
+    // Terraform/Pub/Ansible/NuGet have no orphan graph (NuGet's proxy cache is
+    // size-bounded by the eviction above), but we track them so the GC report shows
+    // data exists outside coverage
     let mut uncovered = Vec::new();
     for prefix in [
         "raw/",
@@ -1018,12 +1026,19 @@ fn is_index_file(key: &str) -> bool {
     )
 }
 
-/// Evict proxy-cached artifacts (rpm/deb) when total size exceeds `max_bytes`.
+/// Evict proxy-cached artifacts when their total size exceeds `max_bytes`.
 ///
-/// Proxy-cached files = files under `rpm/` or `deb/` that:
-/// - have NO corresponding `.nora-meta/` sidecar (hosted packages have one)
-/// - are NOT themselves under `.nora-meta/`
-/// - are NOT index files (repodata/, Packages, Release, etc.)
+/// Proxy-cached files are:
+/// - files under `rpm/` or `deb/` that have NO corresponding `.nora-meta/`
+///   sidecar (hosted packages have one), are NOT themselves under `.nora-meta/`
+///   and are NOT index files (repodata/, Packages, Release, etc.);
+/// - NuGet `.nupkg`/`.nuspec` files under `nuget/flatcontainer/` (hosted
+///   packages live under `nuget/hosted/`, never here);
+/// - npm tarballs with a cache provenance sidecar (#1055): only an upstream
+///   fetch writes one, a publish does not.
+///
+/// A package in `curation.internal_namespaces` is never fetched upstream, so a
+/// copy of one is the only copy: it is never evicted.
 ///
 /// Eviction order: oldest by mtime first (LRU approximation; immutable files
 /// are never re-written, so mtime ≈ "least recently cached").
@@ -1032,7 +1047,10 @@ async fn evict_proxy_cache(
     publish_locks: &PublishLocks,
     max_bytes: u64,
     dry_run: bool,
+    curation: &crate::curation::CurationEngine,
 ) -> ProxyCacheEviction {
+    use crate::curation::{is_internal_namespace, RegistryType};
+    use crate::registry::npm::{origin_key, origin_primary};
     if max_bytes == 0 {
         return ProxyCacheEviction::default();
     }
@@ -1080,6 +1098,59 @@ async fn evict_proxy_cache(
         }
     }
 
+    match storage.list_with_meta("nuget/flatcontainer/").await {
+        Ok(entries) => {
+            for (key, meta) in entries {
+                let Some(id) = key
+                    .strip_prefix("nuget/flatcontainer/")
+                    .and_then(|rest| rest.split('/').next())
+                else {
+                    continue;
+                };
+                // index.json and sidecars are metadata, refreshed on their own.
+                let package = key.ends_with(".nupkg") || key.ends_with(".nuspec");
+                if package && !is_internal_namespace(curation, RegistryType::Nuget, id) {
+                    proxy_files.push((key, meta.size, meta.modified));
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("GC proxy-cache: list_with_meta(nuget/flatcontainer/) failed: {e}")
+        }
+    }
+
+    match storage.list_internal(&origin_key("npm/")).await {
+        Ok(sidecars) => {
+            let cached: HashSet<&str> = sidecars
+                .iter()
+                .filter_map(|sidecar| origin_primary(sidecar))
+                .filter(|key| key.contains("/tarballs/"))
+                .collect();
+            if !cached.is_empty() {
+                match storage.list_with_meta("npm/").await {
+                    Ok(entries) => {
+                        for (key, meta) in entries {
+                            let Some(name) = key
+                                .strip_prefix("npm/")
+                                .and_then(|rest| rest.split_once("/tarballs/"))
+                                .map(|(name, _)| name)
+                            else {
+                                continue;
+                            };
+                            if cached.contains(key.as_str())
+                                && !is_internal_namespace(curation, RegistryType::Npm, name)
+                            {
+                                proxy_files.push((key, meta.size, meta.modified));
+                            }
+                        }
+                    }
+                    Err(e) => tracing::error!("GC proxy-cache: list_with_meta(npm/) failed: {e}"),
+                }
+            }
+        }
+        Err(e) => tracing::error!("GC proxy-cache: listing npm provenance sidecars failed: {e}"),
+    }
+
     let total_bytes: u64 = proxy_files.iter().map(|(_, s, _)| s).sum();
 
     if total_bytes <= max_bytes {
@@ -1108,6 +1179,9 @@ async fn evict_proxy_cache(
             let _guard = lock.lock().await;
             if storage.delete(key).await.is_ok() {
                 info!("proxy-cache evicted: {} ({} bytes)", key, size);
+                if key.starts_with("npm/") {
+                    let _ = storage.delete(&origin_key(key)).await;
+                }
             }
         }
         bytes_freed += size;
@@ -1144,6 +1218,10 @@ async fn evict_proxy_cache(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    fn no_curation() -> crate::curation::CurationEngine {
+        crate::curation::CurationEngine::new(crate::config::CurationConfig::default())
+    }
 
     fn test_publish_locks() -> PublishLocks {
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
@@ -1194,7 +1272,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            true,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.total_candidates, 0);
         assert_eq!(result.orphaned, 0);
         assert_eq!(result.deleted, 0);
@@ -1225,7 +1312,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            true,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.orphaned, 0);
     }
 
@@ -1258,7 +1354,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            true,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 0);
         assert!(result.orphan_keys[0].contains("orphan999"));
@@ -1287,7 +1392,16 @@ mod tests {
             .unwrap();
 
         // Generous grace: the orphan is detected but must NOT be deleted.
-        let result = run_gc(&storage, &test_publish_locks(), false, 3600, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            3600,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.orphaned, 1, "orphan should be detected");
         assert_eq!(
             result.deleted, 0,
@@ -1304,7 +1418,16 @@ mod tests {
 
         // Dry-run honors grace too, so the preview matches `--apply`: a
         // protected orphan is reported as skipped, not as "would delete".
-        let preview = run_gc(&storage, &test_publish_locks(), true, 3600, false, 0).await;
+        let preview = run_gc(
+            &storage,
+            &test_publish_locks(),
+            true,
+            3600,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(preview.skipped_recent, 1);
         assert_eq!(
             preview.bytes_freed, 0,
@@ -1312,7 +1435,16 @@ mod tests {
         );
 
         // grace=0 (no concurrent writes): the same orphan is now collected.
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.deleted, 1, "grace=0 deletes the orphan");
         assert!(storage
             .get("docker/test/blobs/sha256:fresh000")
@@ -1344,7 +1476,16 @@ mod tests {
 
         // A short grace: a normal old orphan would be deleted, but a future
         // mtime must still be treated as "too young" and kept.
-        let result = run_gc(&storage, &test_publish_locks(), false, 60, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            60,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(
             result.skipped_recent, 1,
             "future-mtime orphan must be protected (saturating_sub)"
@@ -1365,7 +1506,16 @@ mod tests {
         let key = "maven/com/example/1.0/old.jar.sha256";
         storage.put(key, b"deadbeef").await.unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 3600, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            3600,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.orphaned, 1, "checksum orphan should be detected");
         assert_eq!(
             result.deleted, 0,
@@ -1460,7 +1610,16 @@ mod tests {
 
         // grace=0 would collect any normal orphan; the un-stattable one must
         // still survive because its age is unknown.
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
 
         assert_eq!(result.orphaned, 1, "the blob is detected as an orphan");
         assert_eq!(
@@ -1512,7 +1671,11 @@ mod tests {
             }
         };
 
-        let (_gc, ()) = tokio::join!(run_gc(&storage, &locks, false, 0, false, 0), writer);
+        let curation = no_curation();
+        let (_gc, ()) = tokio::join!(
+            run_gc(&storage, &locks, false, 0, false, 0, &curation),
+            writer
+        );
 
         // Every key is either reaped by GC or present with exactly one of the two
         // intended bodies — atomic writes guarantee no partial/torn content.
@@ -1557,7 +1720,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert!(result.deleted >= 1);
 
         assert!(
@@ -1590,7 +1762,16 @@ mod tests {
             .unwrap();
         storage.put(&live, b"npm:https://r.example").await.unwrap();
 
-        run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
 
         assert!(storage.get(&gone).await.is_err());
         assert!(storage.get(&live).await.is_ok());
@@ -1625,7 +1806,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 1);
         assert!(result.bytes_freed > 0);
@@ -1681,7 +1871,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.deleted, 2);
         assert!(storage.get(&alias_key).await.is_ok());
         assert!(storage.get(&alias_meta_key).await.is_ok());
@@ -1755,7 +1954,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            true,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.orphaned, 0);
     }
 
@@ -2093,7 +2301,16 @@ mod tests {
         // Raw: no GC coverage
         storage.put("raw/some-file.txt", b"raw-data").await.unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            true,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         // Cargo crate without index entry = 1 orphan
         // Go .zip without .info = 1 orphan (incomplete version)
         assert_eq!(result.orphaned, 2);
@@ -2122,7 +2339,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            true,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(
             result.orphaned, 0,
             "complete Go version should have no orphans"
@@ -2140,7 +2366,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            true,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.orphaned, 1);
         assert!(result.orphan_keys[0].ends_with(".mod"));
     }
@@ -2159,7 +2394,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            true,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(
             result.orphaned, 0,
             "cargo with matching index should have no orphans"
@@ -2177,7 +2421,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            true,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.orphaned, 1);
         assert!(result.orphan_keys[0].contains("index"));
     }
@@ -2208,7 +2461,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.orphaned, 2);
         assert_eq!(result.deleted, 2);
         // Non-orphan checksum still exists
@@ -2239,7 +2501,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 1);
         assert!(storage
@@ -2267,7 +2538,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 1);
     }
@@ -2304,7 +2584,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.orphaned, 2); // 1 docker blob + 1 maven checksum
         assert_eq!(result.deleted, 2);
     }
@@ -2335,7 +2624,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            true,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         // 4 checksums scanned, 0 orphans
         assert_eq!(result.total_candidates, 4);
         assert_eq!(result.orphaned, 0);
@@ -2363,7 +2661,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.deleted, 1);
         assert_eq!(result.bytes_freed, 5); // "12345" = 5 bytes
     }
@@ -2392,7 +2699,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            true,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.metadata_phantoms_removed, 0);
     }
 
@@ -2424,7 +2740,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            true,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.metadata_phantoms_removed, 1);
 
         // Dry run: metadata should be unchanged
@@ -2460,7 +2785,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.metadata_phantoms_removed, 1);
 
         // Verify phantom was removed
@@ -2494,7 +2828,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            true,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.metadata_phantoms_removed, 0);
     }
 
@@ -2522,7 +2865,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.metadata_phantoms_removed, 1);
 
         // Verify phantom was removed
@@ -2575,7 +2927,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(result.orphaned, 1); // docker blob
         assert_eq!(result.deleted, 1);
         assert_eq!(result.metadata_phantoms_removed, 1); // npm phantom
@@ -2608,14 +2969,32 @@ mod tests {
             .unwrap();
 
         // Hosted mode: phantom is cleaned
-        let hosted = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
+        let hosted = run_gc(
+            &storage,
+            &test_publish_locks(),
+            true,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(
             hosted.metadata_phantoms_removed, 1,
             "hosted: phantom detected"
         );
 
         // Proxy mode: phantom cleanup is skipped entirely
-        let proxy = run_gc(&storage, &test_publish_locks(), true, 0, true, 0).await;
+        let proxy = run_gc(
+            &storage,
+            &test_publish_locks(),
+            true,
+            0,
+            true,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert_eq!(
             proxy.metadata_phantoms_removed, 0,
             "proxy: npm phantom cleanup must be skipped"
@@ -2648,7 +3027,8 @@ mod tests {
                 .unwrap();
         }
 
-        let result = evict_proxy_cache(&storage, &test_publish_locks(), 300, false).await;
+        let result =
+            evict_proxy_cache(&storage, &test_publish_locks(), 300, false, &no_curation()).await;
         assert_eq!(result.total_bytes, 500);
         assert_eq!(result.evicted_files, 2, "2 oldest files evicted");
         assert_eq!(result.bytes_freed, 200);
@@ -2660,6 +3040,114 @@ mod tests {
         assert!(storage.get("rpm/repo/Packages/2-1.0.rpm").await.is_ok());
         assert!(storage.get("rpm/repo/Packages/3-1.0.rpm").await.is_ok());
         assert!(storage.get("rpm/repo/Packages/4-1.0.rpm").await.is_ok());
+    }
+
+    /// Store `size` bytes at `key` with an mtime that orders it by `age` (0 = oldest).
+    async fn put_aged(storage: &Storage, data: &std::path::Path, key: &str, size: usize, age: u64) {
+        storage.put(key, &vec![0u8; size]).await.unwrap();
+        let mtime =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + age);
+        std::fs::File::options()
+            .write(true)
+            .open(data.join(key))
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    fn curation_with_internal(patterns: &[&str]) -> crate::curation::CurationEngine {
+        let mut engine = no_curation();
+        engine.set_namespace_filter(Box::new(crate::curation::NamespaceFilter::new(
+            patterns.iter().map(|p| p.to_string()).collect(),
+        )));
+        engine
+    }
+
+    /// C22: the NuGet proxy cache is size-bounded like rpm/deb. Only proxied
+    /// `.nupkg`/`.nuspec` count: hosted packages (`nuget/hosted/`), `index.json`
+    /// and internal-namespace IDs (never refetchable) are never evicted.
+    #[tokio::test]
+    async fn test_evict_proxy_cache_nuget_flatcontainer() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let storage = Storage::new_local(data.to_str().unwrap());
+        let kept = [
+            "nuget/flatcontainer/old.pkg/index.json",
+            "nuget/hosted/maestra.lib/1.0.0/maestra.lib.1.0.0.nupkg",
+            "nuget/hosted-meta/maestra.lib.json",
+            "nuget/flatcontainer/maestra.seeded/1.0.0/maestra.seeded.1.0.0.nupkg",
+        ];
+        for key in kept {
+            put_aged(&storage, &data, key, 100, 0).await;
+        }
+        let old = [
+            "nuget/flatcontainer/old.pkg/1.0.0/old.pkg.1.0.0.nupkg",
+            "nuget/flatcontainer/old.pkg/1.0.0/old.pkg.nuspec",
+        ];
+        for (age, key) in old.iter().enumerate() {
+            put_aged(&storage, &data, key, 100, 10 + age as u64).await;
+        }
+        let new = "nuget/flatcontainer/new.pkg/2.0.0/new.pkg.2.0.0.nupkg";
+        put_aged(&storage, &data, new, 100, 100).await;
+
+        let curation = curation_with_internal(&["maestra.*"]);
+        let preview =
+            evict_proxy_cache(&storage, &test_publish_locks(), 100, true, &curation).await;
+        assert_eq!((preview.total_bytes, preview.evicted_files), (300, 2));
+        assert!(
+            storage.stat(old[0]).await.is_some(),
+            "dry run deletes nothing"
+        );
+
+        let result =
+            evict_proxy_cache(&storage, &test_publish_locks(), 100, false, &curation).await;
+        assert_eq!(result.total_bytes, 300);
+        assert_eq!(result.evicted_files, 2);
+        for key in old {
+            assert!(storage.stat(key).await.is_none(), "{key} evicted");
+        }
+        for key in kept.iter().chain([&new]) {
+            assert!(storage.stat(key).await.is_some(), "{key} kept");
+        }
+    }
+
+    /// C22: npm tarballs cached from an upstream (they carry a provenance sidecar,
+    /// #1055) are evicted with their sidecar; published tarballs, packuments and
+    /// internal-namespace packages are not.
+    #[tokio::test]
+    async fn test_evict_proxy_cache_npm_proxied_tarballs_only() {
+        use crate::registry::npm::origin_key;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let storage = Storage::new_local(data.to_str().unwrap());
+        let proxied_old = "npm/lodash/tarballs/lodash-4.17.21.tgz";
+        let proxied_new = "npm/@scope/pkg/tarballs/pkg-1.0.0.tgz";
+        let internal = "npm/@maestra/internal/tarballs/internal-1.0.0.tgz";
+        let packument = "npm/lodash/metadata.json";
+        let published = "npm/mine/tarballs/mine-1.0.0.tgz";
+        for key in [internal, packument, published] {
+            put_aged(&storage, &data, key, 100, 0).await;
+        }
+        put_aged(&storage, &data, proxied_old, 100, 10).await;
+        put_aged(&storage, &data, proxied_new, 100, 100).await;
+        for key in [proxied_old, proxied_new, internal, packument] {
+            storage
+                .put(&origin_key(key), b"npm:https://registry.npmjs.org")
+                .await
+                .unwrap();
+        }
+
+        let curation = curation_with_internal(&["@maestra/*"]);
+        let result =
+            evict_proxy_cache(&storage, &test_publish_locks(), 100, false, &curation).await;
+        assert_eq!(result.total_bytes, 200);
+        assert_eq!(result.evicted_files, 1);
+        assert!(storage.stat(proxied_old).await.is_none());
+        assert!(storage.stat(&origin_key(proxied_old)).await.is_none());
+        for key in [proxied_new, internal, packument, published] {
+            assert!(storage.stat(key).await.is_some(), "{key} kept");
+        }
+        assert!(storage.stat(&origin_key(proxied_new)).await.is_some());
     }
 
     /// Files WITH .nora-meta/ sidecars (hosted packages) must never be evicted.
@@ -2685,7 +3173,8 @@ mod tests {
             .unwrap();
 
         // Cap = 100 → only proxy file can be evicted
-        let result = evict_proxy_cache(&storage, &test_publish_locks(), 100, false).await;
+        let result =
+            evict_proxy_cache(&storage, &test_publish_locks(), 100, false, &no_curation()).await;
         assert_eq!(result.evicted_files, 1);
         // Hosted file must survive
         assert!(storage
@@ -2710,7 +3199,8 @@ mod tests {
             .await
             .unwrap();
 
-        let result = evict_proxy_cache(&storage, &test_publish_locks(), 0, false).await;
+        let result =
+            evict_proxy_cache(&storage, &test_publish_locks(), 0, false, &no_curation()).await;
         assert_eq!(result.evicted_files, 0);
         assert_eq!(result.total_bytes, 0); // disabled returns immediately
         assert!(storage.get("rpm/repo/Packages/big-1.0.rpm").await.is_ok());
@@ -2747,7 +3237,8 @@ mod tests {
             .unwrap();
 
         // Cap = 1 → aggressive, but index files must be immune
-        let result = evict_proxy_cache(&storage, &test_publish_locks(), 1, false).await;
+        let result =
+            evict_proxy_cache(&storage, &test_publish_locks(), 1, false, &no_curation()).await;
         assert_eq!(
             result.evicted_files, 1,
             "only the non-index proxy file evicted"
@@ -2784,7 +3275,8 @@ mod tests {
         }
 
         // Cap = 200 → evict 2 oldest (200 bytes freed)
-        let result = evict_proxy_cache(&storage, &test_publish_locks(), 200, false).await;
+        let result =
+            evict_proxy_cache(&storage, &test_publish_locks(), 200, false, &no_curation()).await;
         assert_eq!(result.total_bytes, 400);
         assert_eq!(result.evicted_files, 2);
         assert_eq!(result.bytes_freed, 200);

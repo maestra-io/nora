@@ -1009,19 +1009,15 @@ async fn flatcontainer_download(
         // hash the client verifies itself (docker did the same in #657). An
         // absent/malformed range falls through to the full 200.
         if ends_with_ci(filename, ".nupkg") {
-            if let Some(response) = crate::registry::range::range_response(
-                &state.storage,
-                &[&storage_key],
+            if let Some(response) = crate::registry::range::range_response_from_bytes(
+                &data,
                 &headers,
-                data.len() as u64,
                 content_type,
                 &[(
                     header::CACHE_CONTROL,
                     "public, max-age=31536000, immutable".to_string(),
                 )],
-            )
-            .await
-            {
+            ) {
                 return response;
             }
         }
@@ -2736,6 +2732,44 @@ mod integration_tests {
             "bytes"
         );
         assert_eq!(&body_bytes(resp).await[..], nupkg);
+    }
+
+    /// A Range request on a cached .nupkg reads the object once: the 206 is cut from
+    /// the body the integrity and quarantine gates already loaded, not a second, ranged
+    /// GET of the same object.
+    #[tokio::test]
+    async fn test_nuget_range_on_cache_hit_reads_storage_once() {
+        use crate::test_helpers::{
+            create_test_context_with_storage_and_config, op_counting_storage, send_with_headers,
+        };
+
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.nuget.enabled = true;
+        });
+        ctx.state
+            .storage
+            .put(
+                "nuget/flatcontainer/rngpkg/1.0.0/rngpkg.1.0.0.nupkg",
+                b"0123456789",
+            )
+            .await
+            .unwrap();
+        let url = "/nuget/v3/flatcontainer/rngpkg/1.0.0/rngpkg.1.0.0.nupkg";
+        // Warm up once (hosted index load), then compare a full and a ranged hit.
+        let _ = send(&ctx.app, Method::GET, url, "").await;
+        ops.reset();
+        let resp = send(&ctx.app, Method::GET, url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let full = ops.snapshot();
+        ops.reset();
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=2-5")], "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body_bytes(resp).await[..], b"2345");
+        let ranged = ops.snapshot();
+        assert_eq!(ranged, full, "a ranged hit must cost what a full hit costs");
+        assert_eq!(ranged.get("get_range"), None, "{ranged:?}");
     }
 
     /// Upstream failures on a cold .nupkg miss: only a 404 stays a 404; an outage is

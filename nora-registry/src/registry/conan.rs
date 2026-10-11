@@ -457,16 +457,12 @@ async fn recipe_file_download(
         // Range request: 206 Partial Content, or 416 when the client asks past the
         // end. The gates above ran on the whole object; the partial body itself
         // cannot be rehashed, so the client's own checksum covers it (#657).
-        if let Some(response) = crate::registry::range::range_response(
-            &state.storage,
-            &[&storage_key],
+        if let Some(response) = crate::registry::range::range_response_from_bytes(
+            &data,
             &headers,
-            data.len() as u64,
             "application/octet-stream",
             &[],
-        )
-        .await
-        {
+        ) {
             if response.status() == StatusCode::PARTIAL_CONTENT {
                 state.metrics.record_download("conan");
                 state.metrics.record_cache_hit("conan");
@@ -888,16 +884,12 @@ async fn package_file_download(
         // Range request: 206 Partial Content, or 416 when the client asks past the
         // end. The gates above ran on the whole object; the partial body itself
         // cannot be rehashed, so the client's own checksum covers it (#657).
-        if let Some(response) = crate::registry::range::range_response(
-            &state.storage,
-            &[&storage_key],
+        if let Some(response) = crate::registry::range::range_response_from_bytes(
+            &data,
             &headers,
-            data.len() as u64,
             "application/octet-stream",
             &[],
-        )
-        .await
-        {
+        ) {
             if response.status() == StatusCode::PARTIAL_CONTENT {
                 state.metrics.record_download("conan");
                 state.metrics.record_cache_hit("conan");

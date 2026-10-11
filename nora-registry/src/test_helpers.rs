@@ -152,6 +152,7 @@ fn build_context_with(
             s3_credentials_dir: None,
             s3_region: String::new(),
             s3_virtual_hosted: false,
+            s3_anonymous: false,
             gcs_service_account_path: None,
             gcs_base_url: None,
         },
@@ -629,6 +630,16 @@ impl crate::storage::StorageBackend for OpCountingBackend {
     async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
         self.counts.hit("put");
         self.inner.put(key, data, sha256).await
+    }
+
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        data: axum::body::Bytes,
+        sha256: &str,
+    ) -> crate::storage::Result<bool> {
+        self.counts.hit("put");
+        self.inner.put_if_absent(key, data, sha256).await
     }
 
     async fn get(&self, key: &str) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {

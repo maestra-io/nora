@@ -887,6 +887,39 @@ impl Config {
             );
         }
 
+        // 3b. s3 mode without credentials signs nothing: a mistyped key variable must
+        // not silently turn every request anonymous (the bucket then answers 403 and
+        // /ready stays 503). An explicit `s3_anonymous` opts in.
+        if self.storage.mode == StorageMode::S3 && !self.storage.s3_anonymous {
+            let has_dir = self
+                .storage
+                .s3_credentials_dir
+                .as_deref()
+                .is_some_and(|d| !d.is_empty());
+            let keys = match (
+                self.storage.s3_access_key.is_some(),
+                self.storage.s3_secret_key.is_some(),
+            ) {
+                (true, true) => None,
+                (true, false) => Some("only storage.s3_access_key is set"),
+                (false, true) => Some("only storage.s3_secret_key is set"),
+                (false, false) => Some("no S3 credentials are set"),
+            };
+            if let (false, Some(what)) = (has_dir, keys) {
+                let msg = format!(
+                    "storage mode is s3 but {what}: requests go unsigned. Set \
+                     NORA_STORAGE_S3_ACCESS_KEY and NORA_STORAGE_S3_SECRET_KEY, or \
+                     storage.s3_credentials_dir, or storage.s3_anonymous = true for a \
+                     public bucket"
+                );
+                if config_strict_from_env() {
+                    errors.push(msg);
+                } else {
+                    warnings.push(msg);
+                }
+            }
+        }
+
         // 4. Rate limit values must be > 0 when rate limiting is enabled
         if self.rate_limit.enabled {
             if self.rate_limit.auth_rps == 0 {
@@ -1700,6 +1733,57 @@ proxies = [
         config.apply_env_overrides().unwrap();
         assert!(config.storage.s3_virtual_hosted);
         std::env::remove_var("NORA_STORAGE_S3_VIRTUAL_HOSTED");
+    }
+
+    /// C71: s3 mode without usable credentials is a warning (an error under
+    /// NORA_CONFIG_STRICT) unless `s3_anonymous` says unsigned requests are intended.
+    #[test]
+    fn test_s3_without_credentials_warns_unless_anonymous() {
+        let _lock = env_lock();
+        std::env::remove_var("NORA_CONFIG_STRICT");
+        let s3 = |customize: &dyn Fn(&mut StorageConfig)| {
+            let mut config = Config::default();
+            config.storage.mode = StorageMode::S3;
+            customize(&mut config.storage);
+            config.validate_with_config_path(None)
+        };
+        let unsigned = |(warnings, errors): (Vec<String>, Vec<String>)| {
+            let hit = |list: &[String]| list.iter().any(|m| m.contains("requests go unsigned"));
+            (hit(&warnings), hit(&errors))
+        };
+
+        assert_eq!(unsigned(s3(&|_| {})), (true, false));
+        assert_eq!(
+            unsigned(s3(&|c| c.s3_access_key = Some(ProtectedString::from("ak")))),
+            (true, false),
+            "one key without the other is the typo case"
+        );
+        assert_eq!(
+            unsigned(s3(&|c| {
+                c.s3_access_key = Some(ProtectedString::from("ak"));
+                c.s3_secret_key = Some(ProtectedString::from("sk"));
+            })),
+            (false, false)
+        );
+        assert_eq!(
+            unsigned(s3(&|c| c.s3_credentials_dir = Some("/creds".into()))),
+            (false, false)
+        );
+        assert_eq!(unsigned(s3(&|c| c.s3_anonymous = true)), (false, false));
+
+        std::env::set_var("NORA_CONFIG_STRICT", "true");
+        let strict = unsigned(s3(&|_| {}));
+        let strict_anonymous = unsigned(s3(&|c| c.s3_anonymous = true));
+        std::env::remove_var("NORA_CONFIG_STRICT");
+        assert_eq!(strict, (false, true), "strict mode refuses");
+        assert_eq!(strict_anonymous, (false, false));
+
+        let mut config = Config::default();
+        std::env::set_var("NORA_STORAGE_S3_ANONYMOUS", "true");
+        let r = config.apply_env_overrides();
+        std::env::remove_var("NORA_STORAGE_S3_ANONYMOUS");
+        r.unwrap();
+        assert!(config.storage.s3_anonymous);
     }
 
     #[test]
@@ -4081,6 +4165,7 @@ proxies = [
             s3_credentials_dir: None,
             s3_region: String::new(),
             s3_virtual_hosted: false,
+            s3_anonymous: false,
             gcs_service_account_path: None,
             gcs_base_url: None,
         };

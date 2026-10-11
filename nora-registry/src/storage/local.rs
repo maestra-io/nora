@@ -440,6 +440,72 @@ impl LocalStorage {
             .map(|staging| staging.dir.clone())
     }
 
+    /// Body of `put` and `put_if_absent`. Returns `Ok(false)` when `create_only` found
+    /// the key already stored and left it as is.
+    ///
+    /// Atomic write: write a temp file in staging, fsync, then publish it under the key,
+    /// so readers never see partial data. `create_only` publishes with a hard link
+    /// instead of a rename: the link fails if the key exists, so the existence check
+    /// and the write are one step, even across processes sharing the directory.
+    async fn write(&self, key: &str, data: &[u8], sha256: &str, create_only: bool) -> Result<bool> {
+        let path = self.key_to_path(key);
+
+        // Create parent directories
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        // Body and pin are published as one critical section (#1041, see commit_lock).
+        let lock = self.commit_lock(key);
+        let _commit = lock.lock().await;
+        if create_only && fs::try_exists(&path).await? {
+            return Ok(false);
+        }
+        let publish = |tmp: &Path| {
+            let (tmp, path) = (tmp.to_path_buf(), path.clone());
+            async move {
+                if create_only {
+                    fs::hard_link(tmp, path).await
+                } else {
+                    fs::rename(tmp, path).await
+                }
+            }
+        };
+        // CANCEL-SAFETY: the guard removes the temp file however the write ends —
+        // error or cancellation at any `.await`, `create_tmp_in` included — until the
+        // rename publishes it.
+        let tmp = self.write_tmp(&path, data, TmpPlace::Staging).await?;
+        let published = match publish(tmp.path()).await {
+            Ok(()) => Ok(tmp),
+            // The key's directory is on another filesystem than staging (a registry
+            // directory mounted on its own): redo the write beside the key, where the
+            // rename cannot cross. The staged copy goes with its guard.
+            Err(e) if e.raw_os_error() == Some(EXDEV) => {
+                drop(tmp);
+                let beside = self.write_tmp(&path, data, TmpPlace::BesideKey).await?;
+                publish(beside.path()).await.map(|()| beside)
+            }
+            Err(e) => Err(e),
+        };
+        let tmp = match published {
+            Ok(tmp) => tmp,
+            Err(e) if create_only && e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Ok(false)
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if create_only {
+            // The link left the temp name behind: the guard removes it.
+            drop(tmp);
+        } else {
+            tmp.published();
+        }
+        // Durability: make the new directory entry survive power-loss.
+        sync_parent_dir(&path).await?;
+        self.record_pin(key, sha256).await?;
+        Ok(true)
+    }
+
     fn key_to_path(&self, key: &str) -> PathBuf {
         self.base_path.join(key)
     }
@@ -515,39 +581,11 @@ impl LocalStorage {
 #[async_trait]
 impl StorageBackend for LocalStorage {
     async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()> {
-        let path = self.key_to_path(key);
+        self.write(key, data, sha256, false).await.map(|_| ())
+    }
 
-        // Create parent directories
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-
-        // Atomic write: write a temp file in staging, fsync, rename into place.
-        // This prevents readers from seeing partial/truncated data during write.
-        // Body and pin are published as one critical section (#1041, see commit_lock).
-        let lock = self.commit_lock(key);
-        let _commit = lock.lock().await;
-        // CANCEL-SAFETY: the guard removes the temp file however the write ends —
-        // error or cancellation at any `.await`, `create_tmp_in` included — until the
-        // rename publishes it.
-        let tmp = self.write_tmp(&path, data, TmpPlace::Staging).await?;
-        let tmp = match fs::rename(tmp.path(), &path).await {
-            Ok(()) => tmp,
-            // The key's directory is on another filesystem than staging (a registry
-            // directory mounted on its own): redo the write beside the key, where the
-            // rename cannot cross. The staged copy goes with its guard.
-            Err(e) if e.raw_os_error() == Some(EXDEV) => {
-                drop(tmp);
-                let beside = self.write_tmp(&path, data, TmpPlace::BesideKey).await?;
-                fs::rename(beside.path(), &path).await?;
-                beside
-            }
-            Err(e) => return Err(e.into()),
-        };
-        tmp.published();
-        // Durability: make the rename's directory entry survive power-loss.
-        sync_parent_dir(&path).await?;
-        self.record_pin(key, sha256).await
+    async fn put_if_absent(&self, key: &str, data: Bytes, sha256: &str) -> Result<bool> {
+        self.write(key, &data, sha256, true).await
     }
 
     async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
@@ -940,6 +978,50 @@ mod tests {
 
     async fn get(storage: &LocalStorage, key: &str) -> Result<Bytes> {
         storage.get(key).await.map(|(data, _pin)| data)
+    }
+
+    /// C53: concurrent create-only writes of one key: exactly one lands, the others see
+    /// the key as present, and the first body keeps its pin. Two backends on one
+    /// directory stand in for two processes, which the in-process commit lock does not
+    /// serialize: the hard link does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn put_if_absent_creates_exactly_once() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let backends = [
+            Arc::new(LocalStorage::new(root)),
+            Arc::new(LocalStorage::new(root)),
+        ];
+        let key = "nuget/flatcontainer/a/1.0.0/a.1.0.0.nupkg";
+        let tasks: Vec<_> = (0..8)
+            .map(|i| {
+                let storage = Arc::clone(&backends[i % 2]);
+                let body = Bytes::from(format!("body-{i}"));
+                tokio::spawn(async move {
+                    let sha = hex::encode(Sha256::digest(&body));
+                    (i, storage.put_if_absent(key, body, &sha).await.unwrap())
+                })
+            })
+            .collect();
+        let mut created = Vec::new();
+        for task in tasks {
+            let (i, wrote) = task.await.unwrap();
+            if wrote {
+                created.push(i);
+            }
+        }
+        assert_eq!(created.len(), 1, "{created:?}");
+        let writer = &backends[created[0] % 2];
+        let (body, pin) = writer.get(key).await.unwrap();
+        assert_eq!(&body[..], format!("body-{}", created[0]).as_bytes());
+        assert_eq!(pin, Some(hex::encode(Sha256::digest(&body))));
+
+        assert!(!writer
+            .put_if_absent(key, Bytes::from_static(b"later"), "00")
+            .await
+            .unwrap());
+        assert_eq!(get(writer, key).await.unwrap(), body);
+        assert!(tmp_leftovers(dir.path()).is_empty());
     }
 
     /// #1041: the body and its hash pin are two separate durable artifacts, so two
