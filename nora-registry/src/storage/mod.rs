@@ -116,6 +116,16 @@ pub trait StorageBackend: Send + Sync {
     async fn put_bytes(&self, key: &str, data: Bytes, sha256: &str) -> Result<()> {
         self.put(key, &data, sha256).await
     }
+    /// [`put_bytes`](Self::put_bytes) only when nothing is stored under `key` yet
+    /// (create-only); `Ok(false)` means the key existed and was left as is. The default
+    /// checks, then writes, which two writers can interleave; backends with a
+    /// conditional write override it to make it one atomic step.
+    async fn put_if_absent(&self, key: &str, data: Bytes, sha256: &str) -> Result<bool> {
+        if self.stat(key).await.is_some() {
+            return Ok(false);
+        }
+        self.put_bytes(key, data, sha256).await.map(|()| true)
+    }
     /// Bytes plus the recorded pin, from ONE backend round-trip. `None` means
     /// the object carries no pin (open-world).
     async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)>;
@@ -278,36 +288,44 @@ impl Storage {
     /// [`put`](Self::put) for a body already held as `Bytes`: it is hashed and
     /// uploaded from that one refcounted buffer, never copied.
     pub async fn put_bytes(&self, key: &str, data: Bytes) -> Result<()> {
+        let hash = Self::hash_for_put(key, &data).await?;
+        let result = self.inner.put_bytes(key, data, &hash).await;
+        Self::count_put(&result);
+        result
+    }
+
+    /// [`put_bytes`](Self::put_bytes) only when nothing is stored under `key` yet, as
+    /// one atomic step where the backend supports it (see
+    /// [`StorageBackend::put_if_absent`]). `Ok(false)`: the key existed, nothing written.
+    pub async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<bool> {
+        let hash = Self::hash_for_put(key, &data).await?;
+        let result = self.inner.put_if_absent(key, data, &hash).await;
+        Self::count_put(&result);
+        result
+    }
+
+    /// Validate `key` and hash a body for a put.
+    async fn hash_for_put(key: &str, data: &Bytes) -> Result<String> {
         validate_storage_key(key)?;
         // A buffered body can be large; hashing it inline would stall the tokio
         // worker for the hash duration, so the digest is computed on the
         // blocking pool. The backend records it together with the bytes, so a
         // completed `put()` is never readable-but-unpinned (#604).
         let buffered = data.clone();
-        let hash = match tokio::task::spawn_blocking(move || sha256_hex(&buffered)).await {
-            Ok(h) => h,
-            Err(e) => {
+        tokio::task::spawn_blocking(move || sha256_hex(&buffered))
+            .await
+            .map_err(|e| {
                 STORAGE_OPERATIONS
                     .with_label_values(&["put", "error"])
                     .inc();
                 tracing::error!(error = %e, key = %key, "hash task for put failed");
-                return Err(StorageError::Io(std::io::Error::other(format!(
-                    "hash task failed: {e}"
-                ))));
-            }
-        };
-        match self.inner.put_bytes(key, data, &hash).await {
-            Ok(()) => {
-                STORAGE_OPERATIONS.with_label_values(&["put", "ok"]).inc();
-                Ok(())
-            }
-            Err(e) => {
-                STORAGE_OPERATIONS
-                    .with_label_values(&["put", "error"])
-                    .inc();
-                Err(e)
-            }
-        }
+                StorageError::Io(std::io::Error::other(format!("hash task failed: {e}")))
+            })
+    }
+
+    fn count_put<T>(result: &Result<T>) {
+        let status = if result.is_ok() { "ok" } else { "error" };
+        STORAGE_OPERATIONS.with_label_values(&["put", status]).inc();
     }
 
     /// Buffered read through the fail-closed integrity gate, returning the bytes

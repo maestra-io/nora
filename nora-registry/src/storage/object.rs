@@ -10,7 +10,7 @@ use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
 use object_store::CredentialProvider;
 use object_store::{
-    Attribute, AttributeValue, Attributes, GetOptions, ObjectStore, ObjectStoreExt,
+    Attribute, AttributeValue, Attributes, GetOptions, ObjectStore, ObjectStoreExt, PutMode,
     PutMultipartOptions, PutOptions, PutPayload, WriteMultipart,
 };
 use std::pin::Pin;
@@ -472,6 +472,30 @@ impl StorageBackend for ObjectStorage {
             .await
             .map_err(map_err)?;
         Ok(())
+    }
+
+    async fn put_if_absent(&self, key: &str, data: Bytes, sha256: &str) -> Result<bool> {
+        // `PutMode::Create` is a conditional PUT (`If-None-Match: *` on S3/R2, a
+        // generation precondition on GCS): the store itself refuses to overwrite.
+        let path = Path::from(encode_object_key(key));
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            attributes: pin_attributes(sha256),
+            ..Default::default()
+        };
+        let payload = PutPayload::from(data.clone());
+        match bounded(BODY_OP_TIMEOUT, self.store.put_opts(&path, payload, opts)).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+            // A store configured without conditional writes: check, then write.
+            Err(object_store::Error::NotImplemented { .. }) => {
+                if self.stat(key).await.is_some() {
+                    return Ok(false);
+                }
+                self.put_bytes(key, data, sha256).await.map(|()| true)
+            }
+            Err(e) => Err(map_err(e)),
+        }
     }
 
     async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
@@ -1339,6 +1363,39 @@ mod tests {
             assert_eq!(&body[..], key.as_bytes());
             assert!(storage.stat(key).await.is_some(), "{key}");
         }
+    }
+
+    /// C53: `put_if_absent` is one conditional PUT: of concurrent writers exactly one
+    /// lands, and a later one leaves the stored body and pin untouched.
+    #[tokio::test]
+    async fn put_if_absent_is_one_conditional_put() {
+        let storage = Arc::new(ObjectStorage::in_memory());
+        let key = "nuget/flatcontainer/a/1.0.0/a.1.0.0.nupkg";
+        let tasks: Vec<_> = (0..8)
+            .map(|i| {
+                let storage = Arc::clone(&storage);
+                tokio::spawn(async move {
+                    storage
+                        .put_if_absent(key, Bytes::from(format!("body-{i}")), &format!("{i}"))
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect();
+        let mut created = 0;
+        for task in tasks {
+            created += usize::from(task.await.unwrap());
+        }
+        assert_eq!(created, 1);
+        let (body, pin) = storage.get(key).await.unwrap();
+        let writer = pin.unwrap();
+        assert_eq!(&body[..], format!("body-{writer}").as_bytes());
+
+        assert!(!storage
+            .put_if_absent(key, Bytes::from_static(b"later"), "x")
+            .await
+            .unwrap());
+        assert_eq!(storage.get(key).await.unwrap(), (body, Some(writer)));
     }
 
     /// A store call that never answers is cut off at its bound and surfaces as a

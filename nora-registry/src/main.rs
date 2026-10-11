@@ -320,17 +320,16 @@ impl AppState {
         );
     }
 
-    /// Like [`spawn_cache`], but skips the write if the key already exists (immutable artifacts).
+    /// Like [`spawn_cache`], but never overwrites an existing key (immutable artifacts).
     pub fn spawn_cache_immutable(&self, registry: &'static str, key: String, data: Bytes) {
         let storage = self.storage.clone();
         let repo_index = Arc::clone(&self.repo_index);
         tokio::spawn(
             std::panic::AssertUnwindSafe(async move {
-                if storage.stat(&key).await.is_some() {
-                    return;
-                }
-                match storage.put_bytes(&key, data).await {
-                    Ok(()) => repo_index.invalidate(registry),
+                // One create-only write: two fills of the same key cannot both land.
+                match storage.put_if_absent(&key, data).await {
+                    Ok(true) => repo_index.invalidate(registry),
+                    Ok(false) => {}
                     Err(e) => record_cache_write_error(registry, &key, &e),
                 }
             })
