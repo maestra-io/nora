@@ -5,13 +5,17 @@ use async_trait::async_trait;
 use axum::body::Bytes;
 use futures::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
+use object_store::aws::AwsCredential;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
+use object_store::CredentialProvider;
 use object_store::{
     Attribute, AttributeValue, Attributes, GetOptions, ObjectStore, ObjectStoreExt,
     PutMultipartOptions, PutOptions, PutPayload, WriteMultipart,
 };
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{FileMeta, Result, StorageBackend, StorageError};
@@ -33,6 +37,109 @@ fn streaming_retry_config() -> object_store::RetryConfig {
     object_store::RetryConfig {
         retry_timeout: STREAM_ATTEMPT_TIMEOUT.saturating_mul(2),
         ..Default::default()
+    }
+}
+
+/// S3 credentials read from files in a directory — `access_key_id`,
+/// `secret_access_key` and optional `session_token`, e.g. a Kubernetes Secret
+/// volume that Vault Secrets Operator rotates in place (Maestra fork: STS-style
+/// R2 temp creds need the session token and expire, so they cannot be frozen
+/// into env at start). Re-read at most every [`DirCredentialProvider::TTL`]; a
+/// failed re-read keeps serving the last good credential.
+#[derive(Debug)]
+pub struct DirCredentialProvider {
+    dir: std::path::PathBuf,
+    ttl: Duration,
+    cached: Mutex<Option<(Instant, Arc<AwsCredential>)>>,
+}
+
+impl DirCredentialProvider {
+    pub const TTL: Duration = Duration::from_secs(60);
+
+    pub fn new(dir: &str) -> Self {
+        Self {
+            dir: dir.into(),
+            ttl: Self::TTL,
+            cached: Mutex::new(None),
+        }
+    }
+
+    fn read(&self) -> std::io::Result<AwsCredential> {
+        use std::io::{Error, ErrorKind};
+        // A Kubernetes Secret volume publishes each generation by swapping the
+        // `..data` symlink; resolve it once so all files come from the same
+        // generation (a plain directory has no `..data` and is read as is).
+        let dir =
+            std::fs::canonicalize(self.dir.join("..data")).unwrap_or_else(|_| self.dir.clone());
+        let file = |name: &str| -> std::io::Result<String> {
+            Ok(std::fs::read_to_string(dir.join(name))?
+                .trim_end()
+                .to_string())
+        };
+        let required = |name: &str| -> std::io::Result<String> {
+            let v = file(name)?;
+            if v.is_empty() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("{name} is empty"),
+                ));
+            }
+            Ok(v)
+        };
+        let token = match file("session_token") {
+            Ok(t) if t.is_empty() => None,
+            // object_store turns the token into a header with unwrap(): reject
+            // what would panic there, keep the last good credential instead.
+            Ok(t) if axum::http::HeaderValue::from_str(&t).is_err() => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "session_token is not a valid header value",
+                ));
+            }
+            Ok(t) => Some(t),
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        Ok(AwsCredential {
+            key_id: required("access_key_id")?,
+            secret_key: required("secret_access_key")?,
+            token,
+        })
+    }
+}
+
+#[async_trait]
+impl CredentialProvider for DirCredentialProvider {
+    type Credential = AwsCredential;
+
+    async fn get_credential(&self) -> object_store::Result<Arc<AwsCredential>> {
+        let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, cred)) = cached.as_ref() {
+            if at.elapsed() < self.ttl {
+                return Ok(Arc::clone(cred));
+            }
+        }
+        match self.read() {
+            Ok(cred) => {
+                let cred = Arc::new(cred);
+                *cached = Some((Instant::now(), Arc::clone(&cred)));
+                Ok(cred)
+            }
+            Err(e) => match cached.take() {
+                Some((_, cred)) => {
+                    tracing::warn!(dir = %self.dir.display(), error = %e, "S3 credentials re-read failed, keeping the last good ones");
+                    // Restart the TTL: a failing re-read is retried once per TTL,
+                    // not on every request.
+                    *cached = Some((Instant::now(), Arc::clone(&cred)));
+                    Ok(cred)
+                }
+                None => Err(object_store::Error::Generic {
+                    store: "S3",
+                    source: format!("reading S3 credentials from {}: {e}", self.dir.display())
+                        .into(),
+                }),
+            },
+        }
     }
 }
 
@@ -74,12 +181,37 @@ impl ObjectStorage {
     /// endpoint VERBATIM (`<endpoint>/<key>`), so the endpoint itself must include the
     /// bucket host (e.g. `https://<bucket>.oss-<region>.aliyuncs.com`). Needed for
     /// providers that reject signed path-style requests, e.g. Alibaba Cloud OSS.
+    // Maestra fork: production goes through `new_s3`; upstream's tests keep this.
+    #[cfg(test)]
     pub fn new(
         s3_url: &str,
         bucket: &str,
         region: &str,
         access_key: Option<&str>,
         secret_key: Option<&str>,
+        virtual_hosted: bool,
+    ) -> Self {
+        Self::new_s3(
+            s3_url,
+            bucket,
+            region,
+            access_key,
+            secret_key,
+            None,
+            virtual_hosted,
+        )
+    }
+
+    /// [`ObjectStorage::new`] plus `credentials_dir` (Maestra fork): when set, the
+    /// S3 credentials are read from files in that directory and re-read as they
+    /// rotate (see [`DirCredentialProvider`]), taking precedence over the static keys.
+    pub fn new_s3(
+        s3_url: &str,
+        bucket: &str,
+        region: &str,
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+        credentials_dir: Option<&str>,
         virtual_hosted: bool,
     ) -> Self {
         let url = s3_url.trim_end_matches('/');
@@ -95,8 +227,13 @@ impl ObjectStorage {
             .with_virtual_hosted_style_request(virtual_hosted)
             .with_retry(streaming_retry_config());
 
-        match (access_key, secret_key) {
-            (Some(ak), Some(sk)) => {
+        // `s3_credentials_dir = ""` in TOML means unset, as the env override does.
+        let credentials_dir = credentials_dir.filter(|d| !d.is_empty());
+        match (credentials_dir, access_key, secret_key) {
+            (Some(dir), _, _) => {
+                builder = builder.with_credentials(Arc::new(DirCredentialProvider::new(dir)));
+            }
+            (None, Some(ak), Some(sk)) => {
                 builder = builder.with_access_key_id(ak).with_secret_access_key(sk);
             }
             _ => {
@@ -566,6 +703,71 @@ mod tests {
             false,
         );
         assert_eq!(storage.backend_name(), "s3");
+    }
+
+    /// Maestra fork: credentials come from files, rotate in place, a failed re-read
+    /// keeps the last good ones, and a dir that never had them is an error.
+    #[tokio::test]
+    async fn test_dir_credential_provider_rotates() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |k: &str, v: &str| std::fs::write(dir.path().join(k), v).unwrap();
+        let mut p = DirCredentialProvider::new(dir.path().to_str().unwrap());
+        assert!(p.get_credential().await.is_err());
+
+        write("access_key_id", "ak1\n");
+        write("secret_access_key", "sk1\n");
+        let c = p.get_credential().await.unwrap();
+        assert_eq!((c.key_id.as_str(), c.secret_key.as_str()), ("ak1", "sk1"));
+        assert_eq!(c.token, None);
+
+        write("access_key_id", "ak2");
+        write("session_token", "tok2\n");
+        // Within the TTL the cached credential is served.
+        assert_eq!(p.get_credential().await.unwrap().key_id, "ak1");
+        p.ttl = Duration::ZERO;
+        let c = p.get_credential().await.unwrap();
+        assert_eq!(c.key_id, "ak2");
+        assert_eq!(c.token.as_deref(), Some("tok2"));
+
+        std::fs::remove_file(dir.path().join("secret_access_key")).unwrap();
+        assert_eq!(p.get_credential().await.unwrap().key_id, "ak2");
+
+        // An empty key or an unsendable token is a failed re-read, not a new pair.
+        write("secret_access_key", "  \n");
+        write("access_key_id", "ak3");
+        assert_eq!(p.get_credential().await.unwrap().key_id, "ak2");
+        write("secret_access_key", "sk3");
+        write("session_token", "tok\nsplit");
+        assert_eq!(p.get_credential().await.unwrap().key_id, "ak2");
+
+        // A failed re-read restarts the TTL: no re-read until it expires again.
+        p.ttl = Duration::from_secs(3600);
+        write("session_token", "tok3");
+        assert_eq!(p.get_credential().await.unwrap().key_id, "ak2");
+        p.ttl = Duration::ZERO;
+        assert_eq!(p.get_credential().await.unwrap().key_id, "ak3");
+
+        // Kubernetes Secret volume layout: files are read through `..data`.
+        let gen = dir.path().join("..2026_10_11_gen1");
+        std::fs::create_dir(&gen).unwrap();
+        for (k, v) in [("access_key_id", "ak4"), ("secret_access_key", "sk4")] {
+            std::fs::write(gen.join(k), v).unwrap();
+        }
+        std::os::unix::fs::symlink(&gen, dir.path().join("..data")).unwrap();
+        let c = p.get_credential().await.unwrap();
+        assert_eq!((c.key_id.as_str(), c.token.as_deref()), ("ak4", None));
+
+        // The builder accepts the provider (no static keys needed).
+        let s = ObjectStorage::new_s3(
+            "http://127.0.0.1:1",
+            "b",
+            "auto",
+            None,
+            None,
+            dir.path().to_str(),
+            false,
+        );
+        assert_eq!(s.backend_name(), "s3");
     }
 
     /// `health_check` is a cached signal (#869): false at construction (probes do no
