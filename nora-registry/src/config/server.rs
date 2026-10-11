@@ -52,6 +52,12 @@ pub struct ServerConfig {
     /// one closes; new clients wait in the listen backlog. Default 4096; 0 = no limit.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+    /// Maximum body in MB of a publish that is buffered in memory (npm, Maven,
+    /// Cargo, deb, rpm); a bigger one is answered 413. Bounded by `body_limit_mb`.
+    /// Streamed uploads (Docker blobs, raw, NuGet push, PyPI upload) have their own
+    /// caps. Default 512.
+    #[serde(default = "default_publish_body_limit_mb")]
+    pub publish_body_limit_mb: usize,
 }
 
 pub(super) fn default_server_host() -> String {
@@ -86,6 +92,10 @@ pub(super) fn default_max_connections() -> usize {
     4096
 }
 
+pub(super) fn default_publish_body_limit_mb() -> usize {
+    512
+}
+
 /// TLS configuration for outbound connections to upstream registries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsConfig {
@@ -106,11 +116,20 @@ impl Default for ServerConfig {
             trust_upstream_dates: default_trust_upstream_dates(),
             header_read_timeout: default_header_read_timeout(),
             max_connections: default_max_connections(),
+            publish_body_limit_mb: default_publish_body_limit_mb(),
         }
     }
 }
 
 impl ServerConfig {
+    /// Byte cap of a buffered publish body: `publish_body_limit_mb`, never above
+    /// the global `body_limit_mb`.
+    pub fn publish_body_limit(&self) -> usize {
+        self.publish_body_limit_mb
+            .min(self.body_limit_mb)
+            .saturating_mul(1024 * 1024)
+    }
+
     /// Format bind address for `TcpListener::bind`.
     ///
     /// IPv6 addresses contain colons and need bracket notation (`[::]:4000`)
@@ -206,6 +225,13 @@ impl ServerConfig {
         if let Ok(val) = env::var("NORA_MAX_CONNECTIONS") {
             super::parse_env_warn("NORA_MAX_CONNECTIONS", &val, &mut self.max_connections);
         }
+        if let Ok(val) = env::var("NORA_PUBLISH_BODY_LIMIT_MB") {
+            super::parse_env_warn(
+                "NORA_PUBLISH_BODY_LIMIT_MB",
+                &val,
+                &mut self.publish_body_limit_mb,
+            );
+        }
         if let Ok(val) = env::var("NORA_TRUST_UPSTREAM_DATES") {
             super::parse_env_warn(
                 "NORA_TRUST_UPSTREAM_DATES",
@@ -246,7 +272,28 @@ mod tests {
         config.apply_env_overrides();
         std::env::remove_var("NORA_HEADER_READ_TIMEOUT");
         std::env::remove_var("NORA_MAX_CONNECTIONS");
-        assert_eq!((config.header_read_timeout, config.max_connections), (5, 10));
+        assert_eq!(
+            (config.header_read_timeout, config.max_connections),
+            (5, 10)
+        );
+    }
+
+    /// The publish cap defaults to 512 MB, follows the env and never exceeds the
+    /// global body limit.
+    #[test]
+    fn publish_body_limit_default_env_override_and_ceiling() {
+        let _lock = crate::test_env::env_lock();
+        assert_eq!(
+            ServerConfig::default().publish_body_limit(),
+            512 * 1024 * 1024
+        );
+        let mut config = ServerConfig::default();
+        std::env::set_var("NORA_PUBLISH_BODY_LIMIT_MB", "64");
+        config.apply_env_overrides();
+        std::env::remove_var("NORA_PUBLISH_BODY_LIMIT_MB");
+        assert_eq!(config.publish_body_limit(), 64 * 1024 * 1024);
+        config.body_limit_mb = 8;
+        assert_eq!(config.publish_body_limit(), 8 * 1024 * 1024);
     }
 
     fn server(host: &str, port: u16) -> ServerConfig {
@@ -260,6 +307,7 @@ mod tests {
             shutdown_timeout: 15,
             header_read_timeout: 30,
             max_connections: 4096,
+            publish_body_limit_mb: 512,
         }
     }
 

@@ -143,6 +143,7 @@ fn build_context_with(
             trust_upstream_dates: true,
             header_read_timeout: 30,
             max_connections: 4096,
+            publish_body_limit_mb: 512,
         },
         storage: StorageConfig {
             mode: StorageMode::Local,

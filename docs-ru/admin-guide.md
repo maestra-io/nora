@@ -98,6 +98,7 @@ docker run -d \
 | `NORA_STORAGE_MODE` | Тип хранилища: `local` или `s3` | `local` |
 | `NORA_BODY_LIMIT_MB` | Максимальный размер тела запроса (МБ) | `2048` |
 | `NORA_SHUTDOWN_TIMEOUT` | Сколько секунд ждать завершения открытых запросов при остановке (`server.shutdown_timeout`) | `15` |
+| `NORA_PUBLISH_BODY_LIMIT_MB` | Максимальный размер тела публикации, которая читается в память целиком: npm, Maven, Cargo, deb, rpm (`server.publish_body_limit_mb`, не больше `NORA_BODY_LIMIT_MB`); больше — `413` | `512` |
 | `NORA_HEADER_READ_TIMEOUT` | Сколько секунд клиент может слать заголовки запроса, потом соединение закрывается (`server.header_read_timeout`, `0` — без ограничения) | `30` |
 | `NORA_MAX_CONNECTIONS` | Сколько клиентских соединений обслуживается одновременно; остальные ждут в очереди `listen` (`server.max_connections`, `0` — без ограничения) | `4096` |
 

@@ -621,7 +621,7 @@ async fn publish(
     State(state): State<AppState>,
     Extension(authority): Extension<NamespaceAuthority>,
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
-    body: Bytes,
+    super::PublishBody(body): super::PublishBody,
 ) -> Response {
     if body.len() < 8 {
         return (StatusCode::BAD_REQUEST, "Payload too small").into_response();
@@ -1174,7 +1174,7 @@ mod integration_tests {
             State(ctx.state.clone()),
             Extension(scoped.clone()),
             None,
-            Bytes::from(payload),
+            crate::registry::PublishBody(Bytes::from(payload)),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1186,7 +1186,7 @@ mod integration_tests {
             State(ctx.state.clone()),
             Extension(scoped),
             None,
-            Bytes::from(payload),
+            crate::registry::PublishBody(Bytes::from(payload)),
         )
         .await;
         assert_ne!(resp.status(), StatusCode::FORBIDDEN);

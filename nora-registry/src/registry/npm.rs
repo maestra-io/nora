@@ -1268,7 +1268,7 @@ async fn handle_publish(
     Path(path): Path<String>,
     Extension(authority): Extension<NamespaceAuthority>,
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
-    body: Bytes,
+    super::PublishBody(body): super::PublishBody,
 ) -> Response {
     if let Some(rest) = path.strip_prefix("-/package/") {
         // `npm dist-tag add`: the body is the version, as a JSON string.
@@ -2420,7 +2420,7 @@ mod integration_tests {
             Path("@other/pkg".to_string()),
             Extension(scoped.clone()),
             None,
-            Bytes::from_static(b"{}"),
+            crate::registry::PublishBody(Bytes::from_static(b"{}")),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -2431,7 +2431,7 @@ mod integration_tests {
             Path("@myorg/pkg".to_string()),
             Extension(scoped),
             None,
-            Bytes::from_static(b"{}"),
+            crate::registry::PublishBody(Bytes::from_static(b"{}")),
         )
         .await;
         assert_ne!(resp.status(), StatusCode::FORBIDDEN);
@@ -2737,7 +2737,7 @@ mod integration_tests {
             Path("@scope/mypkg".to_string()),
             Extension(NamespaceAuthority::Unrestricted),
             None,
-            Bytes::from(body_bytes),
+            crate::registry::PublishBody(Bytes::from(body_bytes)),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CREATED);
