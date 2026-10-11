@@ -874,6 +874,11 @@ async fn main() {
         Some(Commands::Gc { apply }) => {
             let dry_run = !apply;
             let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+            // Proxy-cache eviction must know the internal namespaces it never evicts.
+            let curation = build_curation_engine(&config).unwrap_or_else(|e| {
+                error!("GC: {}", e);
+                std::process::exit(1);
+            });
             // Grace applies to manual GC too: `nora gc --apply` is often run while
             // traffic is live, when in-flight pushes are most likely (#584).
             let result = gc::run_gc(
@@ -883,6 +888,7 @@ async fn main() {
                 config.gc.grace_secs,
                 !config.npm.upstream_urls().is_empty(),
                 config.gc.proxy_cache_max_bytes,
+                &curation,
             )
             .await;
             println!("GC Summary{}:", if dry_run { " (dry-run)" } else { "" });
@@ -1962,15 +1968,18 @@ async fn run_server(mut config: Config, storage: Storage) {
         let grace_secs = state.config.gc.grace_secs;
         let npm_is_proxy = !state.config.npm.upstream_urls().is_empty();
         let proxy_cache_max_bytes = state.config.gc.proxy_cache_max_bytes;
+        let reloadable = Arc::clone(&state.reloadable);
         cleanup_passes.push(cleanup::CleanupPass {
             name: "gc",
             interval: std::time::Duration::from_secs(state.config.gc.interval),
             run: Box::new(move || {
                 let storage = storage.clone();
                 let publish_locks = publish_locks.clone();
+                // The current (SIGHUP-reloadable) internal namespaces, for eviction.
+                let curation = reloadable.load_full();
                 async move {
                     info!("GC scheduler: starting periodic run");
-                    let result = gc::run_gc(&storage, &publish_locks, dry_run, grace_secs, npm_is_proxy, proxy_cache_max_bytes).await;
+                    let result = gc::run_gc(&storage, &publish_locks, dry_run, grace_secs, npm_is_proxy, proxy_cache_max_bytes, &curation.curation_engine).await;
                     info!(
                         "GC scheduler: done in {:.1}s — {} orphans, {} deleted, {} bytes freed, {} metadata phantoms, {} skipped (grace)",
                         result.duration_secs, result.orphaned, result.deleted, result.bytes_freed,

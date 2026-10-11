@@ -26,9 +26,12 @@ pub struct GcConfig {
     /// only during a read-only maintenance window with no concurrent writes.
     #[serde(default = "default_gc_grace")]
     pub grace_secs: u64,
-    /// Maximum bytes for proxy-cached artifacts (rpm/deb). When total proxy
-    /// cache exceeds this cap, GC evicts the oldest files (by mtime) until
-    /// usage is within budget. 0 = disabled (default). Env: `NORA_GC_PROXY_CACHE_MAX_BYTES`.
+    /// Maximum bytes for proxy-cached artifacts: rpm/deb packages, NuGet
+    /// `.nupkg`/`.nuspec` under `nuget/flatcontainer/` and npm tarballs fetched
+    /// from an upstream. When the total exceeds this cap, GC evicts the oldest
+    /// files (by mtime) until usage is within budget; hosted packages and
+    /// `curation.internal_namespaces` are never evicted. 0 = disabled (default).
+    /// Env: `NORA_GC_PROXY_CACHE_MAX_BYTES`.
     #[serde(default)]
     pub proxy_cache_max_bytes: u64,
 }
