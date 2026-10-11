@@ -2158,6 +2158,8 @@ async fn run_server(mut config: Config, storage: Storage) {
             // before the first readiness probe, not 30s in). One HEAD, not a bucket walk.
             if !tick_count.is_multiple_of(2) {
                 metrics_state.storage.refresh_reachability().await;
+                // Samples nora_storage_reachable without waiting for a /ready probe.
+                metrics_state.storage.health_check().await;
                 // Per-registry artifact counts + logical bytes from the cached index,
                 // plus process uptime (#446). The "total" storage_bytes label above is
                 // the full physical footprint; per-registry is summed artifact size.

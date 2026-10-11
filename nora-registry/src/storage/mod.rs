@@ -545,7 +545,9 @@ impl Storage {
     }
 
     pub async fn health_check(&self) -> bool {
-        self.inner.health_check().await
+        let ok = self.inner.health_check().await;
+        crate::metrics::STORAGE_REACHABLE.set(i64::from(ok));
+        ok
     }
 
     pub async fn total_size(&self) -> u64 {
