@@ -32,6 +32,25 @@ pub struct NugetConfig {
     pub search_service: String,
     #[serde(default = "default_nuget_autocomplete")]
     pub autocomplete: String,
+    /// Hosted feed (Maestra fork): PR pre-release versions (`X.Y.Z-pr.*`) older than
+    /// this many days are deleted by the hosted retention pass, unless they are among
+    /// the `hosted_pr_keep_last` newest of their ID. Stable and other pre-release
+    /// versions are never touched. 0 = keep every PR version. Env:
+    /// `NORA_NUGET_HOSTED_PR_RETENTION_DAYS`.
+    #[serde(default = "default_hosted_pr_retention_days")]
+    pub hosted_pr_retention_days: u32,
+    /// Newest PR pre-release versions per ID kept regardless of age. 0 = age alone
+    /// decides. Env: `NORA_NUGET_HOSTED_PR_KEEP_LAST`.
+    #[serde(default = "default_hosted_pr_keep_last")]
+    pub hosted_pr_keep_last: u32,
+}
+
+fn default_hosted_pr_retention_days() -> u32 {
+    30
+}
+
+fn default_hosted_pr_keep_last() -> u32 {
+    20
 }
 
 fn default_nuget_proxy() -> Option<String> {
@@ -63,6 +82,8 @@ impl Default for NugetConfig {
             revalidate: true,
             search_service: default_nuget_search(),
             autocomplete: default_nuget_autocomplete(),
+            hosted_pr_retention_days: default_hosted_pr_retention_days(),
+            hosted_pr_keep_last: default_hosted_pr_keep_last(),
         }
     }
 }
@@ -110,6 +131,20 @@ impl NugetConfig {
             if !val.is_empty() {
                 self.autocomplete = val;
             }
+        }
+        if let Ok(val) = env::var("NORA_NUGET_HOSTED_PR_RETENTION_DAYS") {
+            super::super::parse_env_warn(
+                "NORA_NUGET_HOSTED_PR_RETENTION_DAYS",
+                &val,
+                &mut self.hosted_pr_retention_days,
+            );
+        }
+        if let Ok(val) = env::var("NORA_NUGET_HOSTED_PR_KEEP_LAST") {
+            super::super::parse_env_warn(
+                "NORA_NUGET_HOSTED_PR_KEEP_LAST",
+                &val,
+                &mut self.hosted_pr_keep_last,
+            );
         }
     }
 }

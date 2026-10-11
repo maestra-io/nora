@@ -154,6 +154,11 @@ enum Commands {
         #[command(subcommand)]
         action: import::ImportCommand,
     },
+    /// Hosted NuGet feed maintenance
+    Nuget {
+        #[command(subcommand)]
+        action: NugetCommand,
+    },
     /// Curation tools: validate files, explain decisions
     Curation {
         #[command(subcommand)]
@@ -190,6 +195,20 @@ enum Commands {
         /// Request timeout in seconds.
         #[arg(long, default_value = "5")]
         timeout_secs: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum NugetCommand {
+    /// Rewrite a hosted ID's state document (`nuget/hosted-meta/{id}.json`) from its
+    /// stored .nuspec/.nupkg blobs. `published` = blob last-modified; `listed` is kept
+    /// where the current document still reads as JSON, else every version is listed.
+    Rebuild {
+        /// Package ID (case-insensitive)
+        id: String,
+        /// Write the document. Without this, prints what would be written (dry run).
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -1099,6 +1118,33 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::Nuget {
+            action: NugetCommand::Rebuild { id, yes },
+        }) => match registry::nuget::hosted::rebuild(&storage, &id, yes).await {
+            Ok(versions) => {
+                for (version, listed) in &versions {
+                    println!(
+                        "  {id} {version}{}",
+                        if *listed { "" } else { " (unlisted)" }
+                    );
+                }
+                if yes {
+                    println!(
+                        "Rebuilt {} versions. A running server re-reads a corrupt document on the next request for the ID; otherwise run POST /api/v1/admin/reindex?registry=nuget.",
+                        versions.len()
+                    );
+                } else {
+                    println!(
+                        "Would write {} versions. Re-run with --yes to apply.",
+                        versions.len()
+                    );
+                }
+            }
+            Err(e) => {
+                error!("nuget rebuild failed: {e}");
+                std::process::exit(1);
+            }
+        },
         Some(Commands::Curation { action }) => match action {
             CurationCommand::Validate { file } => {
                 run_curation_validate(&file);
@@ -1954,6 +2000,25 @@ async fn run_server(mut config: Config, storage: Storage) {
             dry_run = state.config.retention.dry_run,
             "Retention scheduler started"
         );
+    }
+
+    // Hosted NuGet feed (maestra fork): PR pre-release expiry per `[nuget] hosted_pr_*`
+    // plus the orphan blob sweep, on the retention interval and dry-run switch. Its own
+    // knobs gate it (`hosted_pr_retention_days = 0` keeps every version), not the rules.
+    if state.config.nuget.enabled {
+        let state = state.clone();
+        let dry_run = state.config.retention.dry_run;
+        cleanup_passes.push(cleanup::CleanupPass {
+            name: "nuget-hosted-retention",
+            interval: std::time::Duration::from_secs(state.config.retention.interval),
+            run: Box::new(move || {
+                let state = state.clone();
+                async move {
+                    registry::nuget::hosted::run_retention(&state, dry_run).await;
+                }
+                .boxed()
+            }),
+        });
     }
 
     if state.config.gc.enabled {

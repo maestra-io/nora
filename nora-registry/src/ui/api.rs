@@ -1132,6 +1132,19 @@ async fn get_nuget_detail(
     show_prerelease: bool,
     show_all: bool,
 ) -> PackageDetail {
+    // Hosted feed (maestra fork): the ID's state document is the whole truth.
+    if let Some((versions, metadata)) =
+        crate::registry::nuget::hosted::ui_detail(storage, name).await
+    {
+        let (versions, prerelease_count, total_stable) =
+            apply_prerelease_filter(versions, show_prerelease, show_all);
+        return PackageDetail {
+            versions,
+            prerelease_count,
+            total_stable,
+            metadata,
+        };
+    }
     // Load registration index for real published dates from upstream metadata
     let reg_key = format!("nuget/registration/{}/index.json", name);
     let reg_meta = load_nuget_registration_meta(storage, &reg_key).await;

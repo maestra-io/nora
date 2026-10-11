@@ -36,7 +36,7 @@ use axum::{
 use serde::Deserialize;
 use std::time::Duration;
 
-mod hosted;
+pub(crate) mod hosted;
 pub(crate) use hosted::HostedIndex;
 
 const UPSTREAM_DEFAULT: &str = "https://api.nuget.org";

@@ -103,6 +103,12 @@ async fn reindex(
 
     let scope = target.map(|rt| rt.as_str().to_string());
 
+    // Hosted NuGet state documents written out-of-band (maestra fork).
+    if matches!(target, None | Some(RegistryType::Nuget)) {
+        let state = state.clone();
+        tokio::spawn(async move { crate::registry::nuget::hosted::refresh(&state).await });
+    }
+
     // Mark dirty: cheap flag flip, the actual rebuild reads disk lazily.
     match target {
         Some(rt) => state.repo_index.invalidate(rt.as_str()),
