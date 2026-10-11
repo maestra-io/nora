@@ -189,14 +189,20 @@ impl RepoIndex {
                     build_generic_index(storage, p, s).await
                 }
                 RegistryType::Conan => build_conan_index(storage).await,
+                #[cfg(feature = "rpm")]
                 RegistryType::Rpm => {
                     let (p, s) = crate::registry::rpm::INDEX_PATTERN;
                     build_generic_index(storage, p, s).await
                 }
+                #[cfg(feature = "deb")]
                 RegistryType::Deb => {
                     let (p, s) = crate::registry::deb::INDEX_PATTERN;
                     build_generic_index(storage, p, s).await
                 }
+                // Compiled out: nothing of that format is served or indexed.
+                #[cfg(not(all(feature = "rpm", feature = "deb")))]
+                #[allow(unreachable_patterns)]
+                RegistryType::Rpm | RegistryType::Deb => Some(Vec::new()),
                 RegistryType::Cpan => {
                     let (p, s) = crate::registry::cpan::INDEX_PATTERN;
                     build_generic_index(storage, p, s).await

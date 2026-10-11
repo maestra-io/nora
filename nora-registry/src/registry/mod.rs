@@ -5,6 +5,7 @@ pub(crate) mod ansible;
 mod cargo_registry;
 mod conan;
 pub(crate) mod cpan;
+#[cfg(feature = "deb")]
 pub(crate) mod deb;
 pub mod docker;
 pub mod docker_auth;
@@ -17,6 +18,7 @@ pub(crate) mod pub_dart;
 mod pypi;
 pub(crate) mod range;
 pub(crate) mod raw;
+#[cfg(feature = "rpm")]
 pub(crate) mod rpm;
 pub(crate) mod terraform;
 
@@ -28,6 +30,7 @@ pub use ansible::routes as ansible_routes;
 pub use cargo_registry::routes as cargo_routes;
 pub use conan::routes as conan_routes;
 pub use cpan::routes as cpan_routes;
+#[cfg(feature = "deb")]
 pub use deb::routes as deb_routes;
 pub use docker::routes as docker_routes;
 pub use docker_auth::DockerAuth;
@@ -52,6 +55,7 @@ pub(crate) use pypi::is_valid_pypi_filename as is_pypi_dist_filename;
 pub(crate) use pypi::version_from_filename as pypi_version_from_filename;
 pub use raw::routes as raw_routes;
 pub(crate) use raw::storage_key as raw_storage_key;
+#[cfg(feature = "rpm")]
 pub use rpm::routes as rpm_routes;
 pub use terraform::routes as terraform_routes;
 
@@ -128,6 +132,7 @@ pub(crate) fn method_not_allowed(allow: &'static str) -> Response {
 /// ~1.7k packages on GCS).
 const SIDECAR_READ_CONCURRENCY: usize = 32;
 
+#[cfg(any(feature = "rpm", feature = "deb"))]
 /// Read and parse every JSON sidecar under `prefix`, fetching concurrently.
 ///
 /// Returns records in arbitrary order — callers sort for deterministic
@@ -182,6 +187,7 @@ pub(crate) async fn read_keyed_blobs(
         .await
 }
 
+#[cfg(any(feature = "rpm", feature = "deb"))]
 /// 409 for a write against a pull-through repo (rpm/deb `proxies` entry) —
 /// its content mirrors the upstream; local publish/delete/reindex would
 /// diverge from (and be clobbered by) the next upstream metadata refresh.
@@ -602,6 +608,7 @@ pub(crate) async fn proxy_fetch_text(
 /// disjoint from hosted repos, so dependency-confusion gating does not apply;
 /// the digest quarantine still gates immutable packages):
 /// fresh-cache serve → upstream fetch → background cache → stale fallback.
+#[cfg(any(feature = "rpm", feature = "deb"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn repo_proxy_download(
     state: &AppState,

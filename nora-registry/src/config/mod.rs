@@ -330,6 +330,9 @@ impl Config {
     /// 1. `NORA_REGISTRIES_ENABLE` env var (highest)
     /// 2. `[registries].enable` from TOML config
     /// 3. Legacy per-registry `enabled` flags (backward compatible)
+    ///
+    /// A format this build was compiled without (cargo features `rpm`/`deb`)
+    /// is dropped with an error log: its routes do not exist.
     pub fn enabled_registries(&self) -> HashSet<RegistryType> {
         // Tier 1: NORA_REGISTRIES_ENABLE env var
         if let Ok(val) = env::var("NORA_REGISTRIES_ENABLE") {
@@ -342,7 +345,7 @@ impl Config {
                             registries = ?set.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
                             "Registry selection from NORA_REGISTRIES_ENABLE"
                         );
-                        return set;
+                        return Self::compiled_in_only(set);
                     }
                     Err(e) => {
                         tracing::error!("NORA_REGISTRIES_ENABLE is invalid: {} — falling back", e);
@@ -361,7 +364,7 @@ impl Config {
                             registries = ?set.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
                             "Registry selection from [registries].enable"
                         );
-                        return set;
+                        return Self::compiled_in_only(set);
                     }
                     Err(e) => {
                         tracing::error!(
@@ -374,7 +377,23 @@ impl Config {
         }
 
         // Tier 3: legacy per-registry enabled flags
-        self.enabled_registries_legacy()
+        Self::compiled_in_only(self.enabled_registries_legacy())
+    }
+
+    fn compiled_in_only(mut set: HashSet<RegistryType>) -> HashSet<RegistryType> {
+        set.retain(|rt| {
+            let on = rt.compiled_in();
+            if !on {
+                tracing::error!(
+                    registry = rt.as_str(),
+                    "registry is enabled in config but this build was compiled without it \
+                     (cargo feature `{}`); not serving it",
+                    rt.as_str()
+                );
+            }
+            on
+        });
+        set
     }
 
     /// Materialize the resolved enable-set into the per-registry `enabled` flags.
@@ -3852,6 +3871,43 @@ proxies = [
         );
     }
 
+    /// C86: a format compiled out of this build (cargo features `rpm`/`deb`,
+    /// default on) is never in the enabled set, whichever tier asked for it, so
+    /// its routes are not mounted and its handler flag is cleared.
+    #[test]
+    fn enabled_registries_drops_compiled_out_formats() {
+        let _lock = env_lock();
+        let base = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+        "#;
+        for extra in [
+            "[registries]\nenable = [\"npm\", \"rpm\", \"deb\"]",
+            "[rpm]\nenabled = true\n[deb]\nenabled = true",
+        ] {
+            let mut config: Config = toml::from_str(&format!("{base}\n{extra}")).unwrap();
+            let set = config.enabled_registries();
+            config.apply_enabled_registries(&set);
+            assert_eq!(
+                set.contains(&RegistryType::Rpm),
+                cfg!(feature = "rpm"),
+                "{extra}"
+            );
+            assert_eq!(
+                set.contains(&RegistryType::Deb),
+                cfg!(feature = "deb"),
+                "{extra}"
+            );
+            assert_eq!(config.rpm.enabled, cfg!(feature = "rpm"), "{extra}");
+            assert_eq!(config.deb.enabled, cfg!(feature = "deb"), "{extra}");
+        }
+    }
+
+    #[cfg(feature = "rpm")]
     #[test]
     fn registries_toml_enable_backpropagates_to_flags() {
         let _lock = env_lock();
@@ -3899,7 +3955,11 @@ proxies = [
 
         let config: Config = toml::from_str(toml).unwrap();
         let set = config.enabled_registries();
-        assert_eq!(set.len(), RegistryType::all().len());
+        let compiled = RegistryType::all()
+            .iter()
+            .filter(|r| r.compiled_in())
+            .count();
+        assert_eq!(set.len(), compiled);
     }
 
     #[test]
@@ -4044,7 +4104,11 @@ proxies = [
 
         let config: Config = toml::from_str(toml).unwrap();
         let set = config.enabled_registries();
-        assert_eq!(set.len(), RegistryType::all().len() - 2);
+        let compiled = RegistryType::all()
+            .iter()
+            .filter(|r| r.compiled_in())
+            .count();
+        assert_eq!(set.len(), compiled - 2);
         assert!(!set.contains(&RegistryType::Maven));
         assert!(!set.contains(&RegistryType::Conan));
         assert!(set.contains(&RegistryType::Docker));

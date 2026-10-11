@@ -43,7 +43,7 @@ bcrypt = "0.19"
 base64 = "0.22"
 prometheus = "0.14"
 utoipa = { version = "5", features = ["axum_extras", "chrono"] }
-utoipa-swagger-ui = { version = "9", features = ["axum", "reqwest"] }
+utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 clap = { version = "4", features = ["derive"] }
 tar = "0.4"
 flate2 = "1.1"
@@ -69,11 +69,12 @@ quick-xml = "0.41"
 zip = { version = "3", default-features = false, features = ["deflate-flate2"] }
 # Dual-stack TCP bind: clear IPV6_V6ONLY so a `::` listener also accepts IPv4 (#574).
 socket2 = "0.6"
-rpm = { version = "0.25", default-features = false }
-ar = "0.9"
-lzma-rs = "0.3"
-ruzstd = "0.8"
-pgp = { version = "0.20", default-features = false }
+# rpm/deb format crates and the OpenPGP index signer: optional, see [features].
+rpm = { version = "0.25", default-features = false, optional = true }
+ar = { version = "0.9", optional = true }
+lzma-rs = { version = "0.3", optional = true }
+ruzstd = { version = "0.8", optional = true }
+pgp = { version = "0.20", default-features = false, optional = true }
 rand = "0.8"
 
 [target.'cfg(unix)'.dependencies]
@@ -104,4 +105,11 @@ workspace = true
 ignored = ["md-5"]
 
 [features]
+default = ["rpm", "deb"]
 demo = []
+# The rpm and deb registries (server, `nora mirror rpm|deb`, retention index
+# rebuilds) with their parsers and the rpgp index signer they share: ~100 crates
+# no other format needs. `--no-default-features` builds without them; a config
+# that enables rpm/deb on such a build logs an error and does not mount them.
+rpm = ["dep:rpm", "dep:pgp", "dep:lzma-rs", "dep:ruzstd"]
+deb = ["dep:ar", "dep:pgp", "dep:lzma-rs", "dep:ruzstd"]

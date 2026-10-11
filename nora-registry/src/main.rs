@@ -49,7 +49,14 @@ mod repo_index;
 mod request_id;
 mod retention;
 mod secrets;
+#[cfg(any(feature = "rpm", feature = "deb"))]
 mod signing;
+/// Without rpm/deb nothing is signed: an uninhabited signer keeps `AppState.signer`
+/// (always `None`) and every `Option<&RepoSigner>` signature unchanged.
+#[cfg(not(any(feature = "rpm", feature = "deb")))]
+mod signing {
+    pub enum RepoSigner {}
+}
 mod storage;
 mod tokens;
 mod ui;
@@ -1378,6 +1385,7 @@ async fn main() {
 /// — there is no local data directory to keep a generated key in). A present
 /// but unreadable/corrupt key is fatal: silently serving unsigned (or with a
 /// silently rotated key) would break every client pinning the public key.
+#[cfg(any(feature = "rpm", feature = "deb"))]
 fn build_signer(
     config: &config::Config,
     enabled: &std::collections::HashSet<RegistryType>,
@@ -1423,6 +1431,14 @@ fn build_signer(
             std::process::exit(1);
         }
     }
+}
+
+#[cfg(not(any(feature = "rpm", feature = "deb")))]
+fn build_signer(
+    _config: &config::Config,
+    _enabled: &std::collections::HashSet<RegistryType>,
+) -> Option<Arc<signing::RepoSigner>> {
+    None
 }
 
 /// Load per-registry min_release_age overrides from CurationConfig into the filter.
@@ -1941,8 +1957,14 @@ async fn run_server(mut config: Config, storage: Storage) {
             RegistryType::Conan => {
                 registry_routes = registry_routes.merge(registry::conan_routes())
             }
+            #[cfg(feature = "rpm")]
             RegistryType::Rpm => registry_routes = registry_routes.merge(registry::rpm_routes()),
+            #[cfg(feature = "deb")]
             RegistryType::Deb => registry_routes = registry_routes.merge(registry::deb_routes()),
+            // Compiled out: `Config::enabled_registries` never returns it.
+            #[cfg(not(all(feature = "rpm", feature = "deb")))]
+            #[allow(unreachable_patterns)]
+            RegistryType::Rpm | RegistryType::Deb => {}
             RegistryType::Cpan => registry_routes = registry_routes.merge(registry::cpan_routes()),
         }
     }

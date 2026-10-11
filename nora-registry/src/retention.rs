@@ -305,6 +305,7 @@ async fn collect_maven_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
 /// each version's keys are the package file and its sidecar. Deleting a
 /// version therefore requires the post-delete index regeneration in
 /// `run_retention`.
+#[cfg(feature = "rpm")]
 async fn collect_rpm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
     collect_sidecar_versions(storage, "rpm", |v| {
         let s = |f: &str| v.get(f).and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -327,6 +328,7 @@ async fn collect_rpm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
 /// (`deb:{repo}/{dist}/{component}/{arch}/{package}`), matching how
 /// `regenerate_indexes` rebuilds one index per distribution × architecture;
 /// flat-root packages group as `deb:{repo}/{arch}/{package}`.
+#[cfg(feature = "deb")]
 async fn collect_deb_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
     collect_sidecar_versions(storage, "deb", |v| {
         let s = |f: &str| v.get(f).and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -347,6 +349,7 @@ async fn collect_deb_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
     .await
 }
 
+#[cfg(any(feature = "rpm", feature = "deb"))]
 struct SidecarVersion {
     package: String,
     version: String,
@@ -366,6 +369,7 @@ struct SidecarVersion {
     placement: Option<String>,
 }
 
+#[cfg(any(feature = "rpm", feature = "deb"))]
 async fn collect_sidecar_versions(
     storage: &Storage,
     registry: &str,
@@ -822,7 +826,9 @@ pub struct RetentionResult {
 pub async fn run_retention(
     storage: &Storage,
     publish_locks: &PublishLocks,
-    signer: Option<&crate::signing::RepoSigner>,
+    #[cfg_attr(not(any(feature = "rpm", feature = "deb")), allow(unused_variables))] signer: Option<
+        &crate::signing::RepoSigner,
+    >,
     rules: &[RetentionRule],
     dry_run: bool,
 ) -> RetentionResult {
@@ -840,7 +846,9 @@ pub async fn run_retention(
     all_groups.extend(collect_pypi_versions(storage).await);
     all_groups.extend(collect_cargo_versions(storage).await);
     all_groups.extend(collect_go_versions(storage).await);
+    #[cfg(feature = "rpm")]
     all_groups.extend(collect_rpm_versions(storage).await);
+    #[cfg(feature = "deb")]
     all_groups.extend(collect_deb_versions(storage).await);
     all_groups.extend(collect_raw_versions(storage).await);
 
@@ -978,10 +986,13 @@ pub async fn run_retention(
         };
         let lock = crate::acquire_publish_lock(publish_locks, &lock_key);
         let _guard = lock.lock().await;
-        let result = if is_rpm {
-            crate::registry::rpm::regenerate_repodata(storage, signer, repo).await
-        } else {
-            crate::registry::deb::regenerate_indexes(storage, signer, repo).await
+        let result: Result<(), String> = match *fmt {
+            #[cfg(feature = "rpm")]
+            "rpm" => crate::registry::rpm::regenerate_repodata(storage, signer, repo).await,
+            #[cfg(feature = "deb")]
+            "deb" => crate::registry::deb::regenerate_indexes(storage, signer, repo).await,
+            // Unreachable in practice: a compiled-out format is never collected above.
+            _ => Err(format!("{fmt} support is not compiled into this build")),
         };
         if let Err(e) = result {
             tracing::error!(registry = %fmt, repo = %repo, error = %e, "retention: index regeneration failed — run -/reindex to heal");
@@ -2024,10 +2035,12 @@ mod format_retention_tests {
         );
     }
 
+    #[cfg(feature = "rpm")]
     fn build_rpm(name: &str, version: &str) -> Vec<u8> {
         build_rpm_arch(name, version, "x86_64")
     }
 
+    #[cfg(feature = "rpm")]
     fn build_rpm_arch(name: &str, version: &str, arch: &str) -> Vec<u8> {
         let pkg = rpm::PackageBuilder::new(name, version, "MIT", arch, "t")
             .release("1")
@@ -2038,6 +2051,7 @@ mod format_retention_tests {
         buf
     }
 
+    #[cfg(feature = "rpm")]
     /// keep_last over an rpm repo: old versions' packages AND sidecars are
     /// deleted, and the repo's indexes are rebuilt + re-signed afterwards —
     /// no ghosts advertised.
@@ -2099,6 +2113,7 @@ mod format_retention_tests {
         assert_eq!(asc.status(), StatusCode::OK);
     }
 
+    #[cfg(feature = "rpm")]
     /// Age-only rule (the dev-repo shape): everything older than the window
     /// goes regardless of count; dry-run touches nothing.
     #[tokio::test]
@@ -2162,6 +2177,7 @@ mod format_retention_tests {
         assert!(!keys.iter().any(|k| k.ends_with(".rpm")), "{keys:?}");
     }
 
+    #[cfg(feature = "deb")]
     /// Deb mirror of the keep_last flow, asserting the Packages index and
     /// signatures follow the deletion.
     #[tokio::test]
@@ -2560,6 +2576,7 @@ mod format_retention_tests {
         assert_eq!(packument_versions(&ctx, "quiet").await, vec!["2.0.0"]);
     }
 
+    #[cfg(feature = "deb")]
     /// an independent APT index, so two architectures of the same
     /// package/version/distribution must not share one `keep_last` budget —
     /// pooling them always evicts an arch once `keep_last < arch count`.
@@ -2611,6 +2628,7 @@ mod format_retention_tests {
         }
     }
 
+    #[cfg(feature = "rpm")]
     /// rpm mirror of the per-architecture scope: one repodata, but `keep_last`
     /// must still not collapse architectures into one budget.
     #[tokio::test]
@@ -2644,6 +2662,7 @@ mod format_retention_tests {
         assert_eq!(keys.iter().filter(|k| k.ends_with(".rpm")).count(), 2);
     }
 
+    #[cfg(feature = "deb")]
     /// `keep_last` counts per distribution, not per repo: a distribution's
     /// sole version must survive even when a sibling distribution holds a
     /// newer version of the same package (each distribution is an

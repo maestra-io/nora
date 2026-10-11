@@ -98,10 +98,10 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --package nora-registry --all-targets -- -D warnings
+        run: cargo clippy --package nora-registry --all-targets --locked -- -D warnings
 
       - name: Run tests
-        run: cargo test --package nora-registry
+        run: cargo test --package nora-registry --locked
 
 
   lint-workflows:
@@ -146,7 +146,7 @@ jobs:
         # must reach the runner. The old `| tee` masked it behind tee's exit 0,
         # so the fail-under floor never failed the build.
         run: |
-          cargo tarpaulin --config tarpaulin.toml
+          cargo tarpaulin --config tarpaulin.toml --locked
           COVERAGE=$(python3 -c "import json; d=json.load(open('coverage/tarpaulin-report.json')); print(f\"{d['coverage']:.1f}\")")
           echo "COVERAGE=$COVERAGE" >> $GITHUB_ENV
           echo "Coverage: $COVERAGE%"
@@ -195,7 +195,7 @@ jobs:
         run: cargo install --locked --version 0.37.2 cargo-tarpaulin
 
       - name: Run coverage
-        run: cargo tarpaulin --config tarpaulin.toml --fail-under 0
+        run: cargo tarpaulin --config tarpaulin.toml --fail-under 0 --locked
 
       - name: Diff-scoped coverage gate
         env:
@@ -236,7 +236,6 @@ jobs:
 
       - name: cargo audit — RustSec advisory database
         run: |
-          # RUSTSEC-2025-0119: unmaintained crate, no fix available, transitive dep
           # RUSTSEC-2023-0071: Marvin Attack (RSA timing side-channel) — not applicable:
           #   NORA uses rsa crate only for JWT signature *verification* via jsonwebtoken.
           #   Marvin Attack targets RSA PKCS#1 v1.5 *decryption*, a different code path.
@@ -247,8 +246,8 @@ jobs:
           #   which is also affected. Exposure is low: the parsed XML comes from the
           #   operator's configured S3 backend, not attacker-controlled input. Remove when
           #   object_store ships a release using quick-xml >=0.41. Tracking: #799
-          cargo audit --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
-          cargo audit --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --json > /tmp/audit.json || true
+          cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+          cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --json > /tmp/audit.json || true
 
       - name: Upload cargo-audit results as SARIF
         if: always()
@@ -330,7 +329,7 @@ jobs:
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Build NORA
-        run: cargo build --release --package nora-registry
+        run: cargo build --release --package nora-registry --locked
 
       - name: Start NORA
         run: |

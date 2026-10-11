@@ -12,6 +12,8 @@ Maestra-only changes (not upstream):
 - An enabled OIDC provider with an empty `audience` is a config warning, and an error under `NORA_CONFIG_STRICT`.
 - `[auth.teleport]` (`nora-registry/src/auth/teleport.rs`): web UI identity from Teleport application access. On UI paths (`/`, `/ui*`, `/api/ui*`, `/api-docs*`) a `Teleport-Jwt-Assertion` from a TCP peer in `trusted_proxies` is verified against `jwks_url` (`iss` = `issuer`, `aud` = `audience`, ES256/RS256, JWKS cached `jwks_cache_secs`, refetched on an unknown `kid`, stale on fetch failure). Identity = the `username` claim; `roles` ∩ `write_roles` → `write`, else `read`; never `admin`. `require_for_ui = true`: UI paths without that identity answer 404, and a 401 to a browser (`Sec-Fetch-Mode`, or `text/html` first in `Accept`) carries no `WWW-Authenticate`, so no password dialog. Registry paths ignore the header. Keys: `enabled`, `jwks_url`, `issuer`, `audience`, `trusted_proxies` (IP/CIDR string), `write_roles`, `require_for_ui`, `leeway_secs` (60), `jwks_cache_secs` (300).
 - `[auth] htpasswd_allowed_peers` / `NORA_AUTH_HTPASSWD_ALLOWED_PEERS`: TCP peers whose htpasswd password is checked (unset = all, as upstream). Any other peer: no bcrypt, `/api/tokens*` → 403, Basic carries only `nra_` tokens and OIDC JWTs.
+- Cargo features `rpm` and `deb` (default on): `--no-default-features` builds without those registries, their parsers and the rpgp index signer; a config enabling them on such a build logs an error and does not mount them. Our release image is built that way (`CARGO_FEATURES=--no-default-features`).
+- Builds are `--locked` (Dockerfile, CI); Swagger UI comes from the `vendored` feature of `utoipa-swagger-ui` (crates.io, checksummed), not a build-time GitHub download.
 
 ### Auth matrix, packages.maestra.io (fluxcd `iota/us-iota-lw-kube-infra/nora/`)
 
@@ -34,8 +36,8 @@ Changes meant for upstream: branch from `main`, cherry-pick, open the PR against
 
 ## CI and releases
 
-- `.github/workflows/maestra-ci.yml`: `cargo test` on PRs into `maestra/main` (RunsOn `pool=build`).
-- `.github/workflows/maestra-release.yml`: tag `v<version>-maestra.<n>` (version = `Cargo.toml`) on `maestra/main` builds the upstream `Dockerfile` and pushes `515260921971.dkr.ecr.us-west-2.amazonaws.com/nora:<version>-maestra.<n>` via the Teleport image-push bot (token `image-push-github-actions-nora`, fluxcd `iota/us-iota-lw-kube-infra/teleport-maestra/operator-crs/image-push-tokens.yaml`). Re-run: `gh workflow run maestra-release.yml -f tag=<tag>`.
+- `.github/workflows/maestra-ci.yml`: on PRs into `maestra/main` (RunsOn `pool=build`): `cargo fmt --check`, clippy `-D warnings` and `cargo test`, all `--locked`, for the default and the release (`--no-default-features`) feature sets; `cargo deny check advisories` against `deny.toml`.
+- `.github/workflows/maestra-release.yml`: tag `v<version>-maestra.<n>` (version = `Cargo.toml`) on `maestra/main` builds the upstream `Dockerfile` with `--build-arg CARGO_FEATURES=--no-default-features` (no rpm/deb) and pushes `515260921971.dkr.ecr.us-west-2.amazonaws.com/nora:<version>-maestra.<n>` via the Teleport image-push bot (token `image-push-github-actions-nora`, fluxcd `iota/us-iota-lw-kube-infra/teleport-maestra/operator-crs/image-push-tokens.yaml`). Re-run: `gh workflow run maestra-release.yml -f tag=<tag>`.
 - Our workflows carry a `maestra-` prefix so upstream merges never conflict on them. Upstream `Release`, `Post-Release Gate` and `PR Image Cleanup` target upstream's ghcr/self-hosted runners and are disabled in this repo (`gh workflow disable`); upstream `Release` would otherwise fire on our `v*` tags.
 
 ## Helm chart

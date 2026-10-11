@@ -12,7 +12,7 @@
 #
 
 # ── Build ──────────────────────────────────────────────────────────────────
-FROM rust:1-alpine3.21@sha256:7dba3db75b0d5861af2e5dcf5b87347411e84403b5c9835be00ef1e72e299d2a AS builder
+FROM rust:1-alpine3.23@sha256:42c2519fdf75d9e34cc61a1aaf34b1a684da9bfd65fe5daefef98d92a801b001 AS builder
 
 RUN apk add --no-cache musl-dev
 
@@ -24,15 +24,17 @@ WORKDIR /build
 COPY rust-toolchain.toml ./
 COPY Cargo.toml Cargo.lock ./
 COPY nora-registry/ nora-registry/
+# The fuzz member's manifest and targets (not its corpus, see .dockerignore) keep
+# the workspace intact so --locked holds; `-p nora-registry` never builds them.
+COPY fuzz/ fuzz/
 
-# Exclude fuzz workspace member (requires C++ libfuzzer, not needed for binary)
-RUN sed -i '/"fuzz"/d' Cargo.toml
-
+# CARGO_FEATURES: extra cargo args, e.g. "--no-default-features" drops the rpm
+# and deb registries (and their rpgp signer).
 ARG CARGO_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --release -p nora-registry $CARGO_FEATURES && \
+    cargo build --release --locked -p nora-registry $CARGO_FEATURES && \
     cp target/release/nora /nora && \
     strip /nora
 
@@ -41,7 +43,7 @@ FROM scratch AS binary
 COPY --from=builder /nora /nora
 
 # ── Cross-compile arm64 (runs natively on x86, no QEMU) ──────────────────
-FROM rust:1-alpine3.21@sha256:7dba3db75b0d5861af2e5dcf5b87347411e84403b5c9835be00ef1e72e299d2a AS cross-arm64
+FROM rust:1-alpine3.23@sha256:42c2519fdf75d9e34cc61a1aaf34b1a684da9bfd65fe5daefef98d92a801b001 AS cross-arm64
 
 RUN apk add --no-cache musl-dev \
     && wget -qO- https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /opt
@@ -57,13 +59,13 @@ RUN rustup target add aarch64-unknown-linux-musl
 
 COPY Cargo.toml Cargo.lock ./
 COPY nora-registry/ nora-registry/
-RUN sed -i '/"fuzz"/d' Cargo.toml
+COPY fuzz/ fuzz/
 
 ARG CARGO_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --release --target aarch64-unknown-linux-musl -p nora-registry $CARGO_FEATURES && \
+    cargo build --release --locked --target aarch64-unknown-linux-musl -p nora-registry $CARGO_FEATURES && \
     cp target/aarch64-unknown-linux-musl/release/nora /nora && \
     aarch64-linux-musl-strip /nora
 
@@ -132,7 +134,7 @@ ENTRYPOINT ["/usr/local/bin/nora"]
 CMD ["serve"]
 
 # ── Alpine (default — must be last) ───────────────────────────────────────
-FROM alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+FROM alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
 
 RUN apk upgrade --no-cache \
     && apk add --no-cache ca-certificates \
