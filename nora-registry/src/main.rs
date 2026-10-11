@@ -458,6 +458,14 @@ fn build_http_client(
 /// Both wildcards probe `127.0.0.1`: a `::` server is dual-stack (or falls back
 /// to `0.0.0.0`), so IPv4 loopback reaches it in every case, whereas `::1` would
 /// miss the fallback.
+/// Node-local state `nora backup` / `nora restore` carry next to the artifacts.
+fn local_state(config: &Config) -> backup::LocalState {
+    backup::LocalState {
+        token_dir: PathBuf::from(&config.auth.token_storage),
+        state_dir: PathBuf::from(&config.storage.path),
+    }
+}
+
 fn healthcheck_url(host: &str, port: u16) -> String {
     let h = match host {
         "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
@@ -861,13 +869,13 @@ async fn main() {
             run_server(config, storage).await;
         }
         Some(Commands::Backup { output }) => {
-            if let Err(e) = backup::create_backup(&storage, &output).await {
+            if let Err(e) = backup::create_backup(&storage, &output, &local_state(&config)).await {
                 error!("Backup failed: {}", e);
                 std::process::exit(1);
             }
         }
         Some(Commands::Restore { input }) => {
-            if let Err(e) = backup::restore_backup(&storage, &input).await {
+            if let Err(e) = backup::restore_backup(&storage, &input, &local_state(&config)).await {
                 error!("Restore failed: {}", e);
                 std::process::exit(1);
             }

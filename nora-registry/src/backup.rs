@@ -4,16 +4,24 @@
 //! Backup and restore functionality for Nora
 //!
 //! Exports all artifacts to a tar.gz file and restores from backups.
+//!
+//! Node-local state that lives outside the storage backend rides along under
+//! [`LOCAL_PREFIX`]: the API token records (Argon2 hashes) and the digest
+//! quarantine ledger. The repository signing key is deliberately left out
+//! (`test_backup_omits_signing_key`): keep it in a secret store.
 
+use crate::digest_quarantine::LEDGER_FILE;
 use crate::storage::Storage;
+use crate::tokens;
 use chrono::{DateTime, Utc};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use tar::{Archive, Builder, Header};
 
@@ -27,12 +35,27 @@ pub struct BackupMetadata {
     pub storage_backend: String,
 }
 
+/// Archive prefix for node-local state. `.nora-` keys are internal, so no
+/// artifact key can collide with it.
+const LOCAL_PREFIX: &str = ".nora-local/";
+const LOCAL_TOKENS: &str = "tokens/";
+
+/// Where node-local state lives on this node: read by backup, written by restore.
+pub struct LocalState {
+    /// `auth.token_storage`: one `<16hex>.json` record per token.
+    pub token_dir: PathBuf,
+    /// `storage.path`: holds the quarantine ledger even when artifacts are in S3.
+    pub state_dir: PathBuf,
+}
+
 /// Statistics returned after backup
 #[derive(Debug)]
 pub struct BackupStats {
     pub artifact_count: usize,
     pub total_bytes: u64,
     pub output_size: u64,
+    /// Token records and the quarantine ledger.
+    pub local_files: usize,
 }
 
 /// Statistics returned after restore
@@ -40,10 +63,15 @@ pub struct BackupStats {
 pub struct RestoreStats {
     pub artifact_count: usize,
     pub total_bytes: u64,
+    pub local_files: usize,
 }
 
 /// Create a backup of all artifacts to a tar.gz file
-pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupStats, String> {
+pub async fn create_backup(
+    storage: &Storage,
+    output: &Path,
+    local: &LocalState,
+) -> Result<BackupStats, String> {
     println!("Creating backup to: {}", output.display());
     println!("Storage backend: {}", storage.backend_name());
 
@@ -62,6 +90,9 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
             .await
             .map_err(|e| format!("storage list failed: {}", e))?,
     );
+    // With local storage the ledger sits at the storage root; it is archived once,
+    // as local state below.
+    keys.retain(|k| k != LEDGER_FILE);
 
     if keys.is_empty() {
         println!("No artifacts found in storage. Creating empty backup.");
@@ -78,8 +109,14 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
         p.push(".tmp");
         PathBuf::from(p)
     };
-    let file =
-        File::create(&tmp_output).map_err(|e| format!("Failed to create output file: {}", e))?;
+    // 0600: the archive carries token hashes.
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp_output)
+        .map_err(|e| format!("Failed to create output file: {}", e))?;
     let encoder = GzEncoder::new(file, Compression::default());
     let mut archive = Builder::new(encoder);
 
@@ -127,6 +164,28 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
         total_bytes += data.len() as u64;
         artifact_count += 1;
         pb.inc(1);
+    }
+
+    let mut local_files = 0;
+    let records = tokens::export_records(&local.token_dir).map_err(|e| {
+        format!(
+            "Failed to read tokens in {}: {}",
+            local.token_dir.display(),
+            e
+        )
+    })?;
+    for (name, data) in records {
+        append_local(&mut archive, &format!("{LOCAL_TOKENS}{name}"), &data)?;
+        local_files += 1;
+    }
+    let ledger = local.state_dir.join(LEDGER_FILE);
+    match fs::read(&ledger) {
+        Ok(data) => {
+            append_local(&mut archive, LEDGER_FILE, &data)?;
+            local_files += 1;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("Failed to read {}: {}", ledger.display(), e)),
     }
 
     // Add metadata.json
@@ -189,11 +248,16 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
         artifact_count,
         total_bytes,
         output_size,
+        local_files,
     };
 
     println!();
     println!("Backup complete:");
     println!("  Artifacts: {}", stats.artifact_count);
+    println!(
+        "  Local state: {} (tokens, quarantine ledger)",
+        stats.local_files
+    );
     println!("  Total data: {} bytes", stats.total_bytes);
     println!("  Backup file: {} bytes", stats.output_size);
     println!(
@@ -208,8 +272,60 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
     Ok(stats)
 }
 
+/// Append a node-local file under [`LOCAL_PREFIX`], 0600.
+fn append_local<W: std::io::Write>(
+    archive: &mut Builder<W>,
+    name: &str,
+    data: &[u8],
+) -> Result<(), String> {
+    let mut header = Header::new_gnu();
+    header.set_size(data.len() as u64);
+    header.set_mode(0o600);
+    header.set_mtime(Utc::now().timestamp().max(0) as u64);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, format!("{LOCAL_PREFIX}{name}"), data)
+        .map_err(|e| format!("Failed to add {} to archive: {}", name, e))
+}
+
+/// Write one node-local entry (`name` is the path after [`LOCAL_PREFIX`]) back
+/// to this node. Anything but a token record or the ledger is refused.
+fn restore_local(local: &LocalState, name: &str, data: Vec<u8>) -> Result<(), String> {
+    if let Some(record) = name.strip_prefix(LOCAL_TOKENS) {
+        return tokens::import_record(&local.token_dir, record, &data);
+    }
+    if name != LEDGER_FILE {
+        return Err(format!("Unknown local-state entry {LOCAL_PREFIX}{name}"));
+    }
+    // DigestStore::load keeps the first record of a digest, so the backup goes
+    // first: its original first-seen time wins over a later re-recording, and
+    // digests recorded since the backup are kept.
+    let path = local.state_dir.join(LEDGER_FILE);
+    let mut merged = data;
+    match fs::read(&path) {
+        Ok(current) => {
+            if !merged.is_empty() && !merged.ends_with(b"\n") {
+                merged.push(b'\n');
+            }
+            merged.extend(current);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("Failed to read {}: {}", path.display(), e)),
+    }
+    fs::create_dir_all(&local.state_dir)
+        .map_err(|e| format!("{}: {}", local.state_dir.display(), e))?;
+    let tmp = path.with_extension("jsonl.restore");
+    fs::write(&tmp, &merged)
+        .and_then(|()| fs::rename(&tmp, &path))
+        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+}
+
 /// Restore artifacts from a backup file
-pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreStats, String> {
+pub async fn restore_backup(
+    storage: &Storage,
+    input: &Path,
+    local: &LocalState,
+) -> Result<RestoreStats, String> {
     println!("Restoring from: {}", input.display());
     println!("Storage backend: {}", storage.backend_name());
 
@@ -270,6 +386,7 @@ pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreSt
 
     let mut total_bytes: u64 = 0;
     let mut artifact_count = 0;
+    let mut local_files = 0;
 
     // Second pass: restore files
     for entry in archive
@@ -294,6 +411,13 @@ pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreSt
             .read_to_end(&mut data)
             .map_err(|e| format!("Failed to read {}: {}", path, e))?;
 
+        if let Some(name) = path.strip_prefix(LOCAL_PREFIX) {
+            restore_local(local, name, data)?;
+            local_files += 1;
+            pb.inc(1);
+            continue;
+        }
+
         // Put to storage
         storage
             .put(&path, &data)
@@ -310,11 +434,16 @@ pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreSt
     let stats = RestoreStats {
         artifact_count,
         total_bytes,
+        local_files,
     };
 
     println!();
     println!("Restore complete:");
     println!("  Artifacts: {}", stats.artifact_count);
+    println!(
+        "  Local state: {} (tokens, quarantine ledger)",
+        stats.local_files
+    );
     println!("  Total data: {} bytes", stats.total_bytes);
 
     Ok(stats)
@@ -324,6 +453,13 @@ pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreSt
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn local(dir: &Path) -> LocalState {
+        LocalState {
+            token_dir: dir.join("tokens"),
+            state_dir: dir.join("data"),
+        }
+    }
 
     #[test]
     fn test_backup_metadata_serialization() {
@@ -378,7 +514,9 @@ mod tests {
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
         let output = dir.path().join("backup.tar.gz");
 
-        let stats = create_backup(&storage, &output).await.unwrap();
+        let stats = create_backup(&storage, &output, &local(dir.path()))
+            .await
+            .unwrap();
         assert_eq!(stats.artifact_count, 0);
         assert_eq!(stats.total_bytes, 0);
         assert!(output.exists());
@@ -407,7 +545,7 @@ mod tests {
         let root = dir.path().join("data");
         let storage = Storage::new_local(root.to_str().unwrap());
 
-        let err = restore_backup(&storage, &archive_path)
+        let err = restore_backup(&storage, &archive_path, &local(dir.path()))
             .await
             .expect_err("an entry in the staging directory must be refused");
         assert!(
@@ -434,12 +572,14 @@ mod tests {
 
         // Create backup
         let backup_file = dir.path().join("backup.tar.gz");
-        let backup_stats = create_backup(&storage, &backup_file).await.unwrap();
+        let backup_stats = create_backup(&storage, &backup_file, &local(dir.path()))
+            .await
+            .unwrap();
         assert_eq!(backup_stats.artifact_count, 2);
 
         // Restore to different storage
         let restore_storage = Storage::new_local(dir.path().join("restored").to_str().unwrap());
-        let restore_stats = restore_backup(&restore_storage, &backup_file)
+        let restore_stats = restore_backup(&restore_storage, &backup_file, &local(dir.path()))
             .await
             .unwrap();
         assert_eq!(restore_stats.artifact_count, 2);
@@ -467,9 +607,13 @@ mod tests {
             .unwrap();
 
         let backup_file = dir.path().join("backup.tar.gz");
-        create_backup(&storage, &backup_file).await.unwrap();
+        create_backup(&storage, &backup_file, &local(dir.path()))
+            .await
+            .unwrap();
         let restored = Storage::new_local(dir.path().join("restored").to_str().unwrap());
-        restore_backup(&restored, &backup_file).await.unwrap();
+        restore_backup(&restored, &backup_file, &local(dir.path()))
+            .await
+            .unwrap();
 
         assert_eq!(
             &restored.get(&origin_key(key)).await.unwrap()[..],
@@ -502,7 +646,9 @@ mod tests {
         std::fs::write(root.join(".signing/nora.key"), b"SECRET-SIGNING-KEY").unwrap();
 
         let output = dir.path().join("backup.tar.gz");
-        let stats = create_backup(&storage, &output).await.unwrap();
+        let stats = create_backup(&storage, &output, &local(dir.path()))
+            .await
+            .unwrap();
 
         // Only the real artifact is backed up, not the key.
         assert_eq!(
@@ -526,5 +672,123 @@ mod tests {
             names.iter().any(|n| n.contains("test.jar")),
             "backup tar must contain the real artifact: {names:?}"
         );
+    }
+
+    /// Tokens and the quarantine ledger live on the node's disk, outside the
+    /// storage backend; a backup must carry them and a restore onto a fresh node
+    /// must bring back tokens that verify.
+    #[tokio::test]
+    async fn test_backup_restore_carries_tokens_and_quarantine_ledger() {
+        use crate::digest_quarantine::{DigestStore, QuarantineStatus};
+        use crate::tokens::{Role, TokenStore};
+        use std::os::unix::fs::PermissionsExt;
+
+        let src = tempfile::tempdir().unwrap();
+        let src_local = local(src.path());
+        let storage = Storage::new_local(src_local.state_dir.to_str().unwrap());
+        storage.put("raw/a/1.bin", b"artifact").await.unwrap();
+        let raw = TokenStore::new(&src_local.token_dir)
+            .create_token("ci", 30, Some("deploy".into()), Role::Write)
+            .unwrap();
+        let ledger = DigestStore::load(src_local.state_dir.to_str().unwrap());
+        let old = chrono::Utc::now().timestamp() - 10 * 86400;
+        ledger.record("docker", "sha256:aa", "registry-1.docker.io", Some(old));
+        drop(ledger);
+        // append_jsonl writes from a blocking task.
+        let ledger_file = src_local.state_dir.join(LEDGER_FILE);
+        for _ in 0..100 {
+            if fs::metadata(&ledger_file).is_ok_and(|m| m.len() > 0) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let backup_file = src.path().join("backup.tar.gz");
+        let stats = create_backup(&storage, &backup_file, &src_local)
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.artifact_count, 1,
+            "ledger must not double as an artifact"
+        );
+        assert_eq!(stats.local_files, 2);
+        let mode = fs::metadata(&backup_file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "archive carries token hashes");
+
+        // Fresh node: empty storage, no token dir. It already re-recorded the
+        // digest with a fresh first-seen and saw one more since the backup.
+        let dst = tempfile::tempdir().unwrap();
+        let dst_local = local(dst.path());
+        let restored = Storage::new_local(dst_local.state_dir.to_str().unwrap());
+        fs::create_dir_all(&dst_local.state_dir).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        fs::write(
+            dst_local.state_dir.join(LEDGER_FILE),
+            format!(
+                "{{\"registry\":\"docker\",\"digest\":\"sha256:aa\",\"first_seen\":{now},\"upstream\":\"u\"}}\n\
+                 {{\"registry\":\"docker\",\"digest\":\"sha256:bb\",\"first_seen\":{now},\"upstream\":\"u\"}}\n"
+            ),
+        )
+        .unwrap();
+        let rstats = restore_backup(&restored, &backup_file, &dst_local)
+            .await
+            .unwrap();
+        assert_eq!(rstats.artifact_count, 1);
+        assert_eq!(rstats.local_files, 2);
+
+        let (user, role) = TokenStore::new(&dst_local.token_dir)
+            .verify_token(&raw)
+            .expect("restored token must verify");
+        assert_eq!((user.as_str(), role), ("ci", Role::Write));
+        for entry in fs::read_dir(&dst_local.token_dir).unwrap() {
+            let mode = entry.unwrap().metadata().unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        let ledger = DigestStore::load(dst_local.state_dir.to_str().unwrap());
+        assert_eq!(
+            ledger.len(),
+            2,
+            "digests recorded since the backup are kept"
+        );
+        assert_eq!(
+            ledger.check("docker", "sha256:aa", 86400),
+            QuarantineStatus::Mature,
+            "the backup's original first-seen wins"
+        );
+    }
+
+    /// Local-state entries come from an archive: only flat token record names
+    /// and the ledger are written, anything else is refused.
+    #[tokio::test]
+    async fn restore_refuses_unexpected_local_state_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            (".nora-local/tokens/not-a-record.json", &b"{}"[..]),
+            (".nora-local/tokens/0123456789abcdef.json", &b"garbage"[..]),
+            (".nora-local/signing/nora.key", &b"key"[..]),
+        ] {
+            let archive_path = dir.path().join("crafted.tar.gz");
+            {
+                let gz =
+                    GzEncoder::new(File::create(&archive_path).unwrap(), Compression::default());
+                let mut tar = tar::Builder::new(gz);
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar.append_data(&mut header, name, body).unwrap();
+                tar.into_inner().unwrap().finish().unwrap();
+            }
+            let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+            restore_backup(&storage, &archive_path, &local(dir.path()))
+                .await
+                .expect_err(name);
+            let written = fs::read_dir(dir.path().join("tokens"))
+                .map(|d| d.count())
+                .unwrap_or(0);
+            assert_eq!(written, 0, "{name} wrote a token record");
+            assert!(storage.list("").await.unwrap().is_empty(), "{name}");
+        }
     }
 }

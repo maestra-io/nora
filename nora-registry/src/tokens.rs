@@ -441,6 +441,44 @@ fn is_valid_hash_prefix(s: &str) -> bool {
     s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Token record files (`<16hex>.json`, Argon2 hashes, never raw tokens) in
+/// `dir`, for `nora backup`. A missing directory has no records.
+pub fn export_records(dir: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if is_record_name(&name) {
+            out.push((name.clone(), fs::read(dir.join(&name))?));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Write a record from a backup into `dir` (0700) as a 0600 file, replacing a
+/// record of the same name. The name and body come from an archive, so both
+/// are checked: a flat `<16hex>.json` name and a parsable [`TokenInfo`].
+pub fn import_record(dir: &Path, name: &str, data: &[u8]) -> Result<(), String> {
+    if !is_record_name(name) {
+        return Err(format!("not a token record name: {name:?}"));
+    }
+    serde_json::from_slice::<TokenInfo>(data)
+        .map_err(|e| format!("token record {name} is not valid: {e}"))?;
+    let json = std::str::from_utf8(data).map_err(|e| format!("token record {name}: {e}"))?;
+    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    write_token_file(&dir.join(name), json).map_err(|e| format!("token record {name}: {e}"))
+}
+
+fn is_record_name(name: &str) -> bool {
+    name.strip_suffix(".json").is_some_and(is_valid_hash_prefix)
+}
+
 /// Hash a token using Argon2id with random salt
 fn hash_token_argon2(token: &str) -> Result<String, TokenError> {
     let salt = SaltString::generate(&mut OsRng);
