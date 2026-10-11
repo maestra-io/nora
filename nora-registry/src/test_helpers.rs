@@ -262,7 +262,13 @@ fn build_context_with(
         let htpasswd_path = tempdir.path().join("users.htpasswd");
         let mut content = String::new();
         for (username, password) in users {
-            let hash = bcrypt::hash(password, 4).expect("bcrypt hash");
+            // A password that is already a bcrypt hash is written verbatim, for
+            // tests that need a pathological cost.
+            let hash = if password.starts_with("$2") {
+                password.to_string()
+            } else {
+                bcrypt::hash(password, 4).expect("bcrypt hash")
+            };
             content.push_str(&format!("{}:{}\n", username, hash));
         }
         std::fs::write(&htpasswd_path, &content).expect("write htpasswd");
