@@ -712,7 +712,7 @@ async fn upload(
     Path(path): Path<String>,
     Extension(authority): Extension<NamespaceAuthority>,
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
-    body: Bytes,
+    super::PublishBody(body): super::PublishBody,
 ) -> Response {
     if !path.is_ascii() || path.contains("..") || path.contains('\0') || path.starts_with('/') {
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
@@ -1705,7 +1705,7 @@ mod integration_tests {
             Path("com/other/lib/1.0/lib-1.0.jar".to_string()),
             Extension(scoped.clone()),
             None,
-            Bytes::from_static(b"x"),
+            crate::registry::PublishBody(Bytes::from_static(b"x")),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1716,7 +1716,7 @@ mod integration_tests {
             Path("foo".to_string()),
             Extension(scoped.clone()),
             None,
-            Bytes::from_static(b"x"),
+            crate::registry::PublishBody(Bytes::from_static(b"x")),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1727,7 +1727,7 @@ mod integration_tests {
             Path("com/myorg/lib/1.0/lib-1.0.jar".to_string()),
             Extension(scoped),
             None,
-            Bytes::from_static(b"x"),
+            crate::registry::PublishBody(Bytes::from_static(b"x")),
         )
         .await;
         assert_ne!(resp.status(), StatusCode::FORBIDDEN);

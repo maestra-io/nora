@@ -56,6 +56,9 @@ parking_lot = "0.12"
 zeroize = { version = "1.8", features = ["derive"] }
 argon2 = { version = "0.5", features = ["std", "rand"] }
 tower-http = { version = "0.6", features = ["set-header", "catch-panic"] }
+# The serve loop (header-read timeout, connection limit); already in the tree via axum.
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
+tower = { version = "0.5", features = ["util"] }
 percent-encoding = "2"
 subtle = "2"
 tokio-util = "0.7"
@@ -87,7 +90,6 @@ proptest = "1"
 tempfile = "3"
 wiremock = "0.6"
 criterion = { version = "0.8", features = ["html_reports"] }
-tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 insta = { version = "1", features = ["json"] }
 

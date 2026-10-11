@@ -32,7 +32,6 @@ use crate::registry::{method_not_allowed, proxied_repo_conflict};
 use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
-    body::Bytes,
     extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
@@ -645,7 +644,7 @@ async fn upload(
     Query(query): Query<PublishQuery>,
     Extension(authority): Extension<NamespaceAuthority>,
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
-    body: Bytes,
+    super::PublishBody(body): super::PublishBody,
 ) -> Response {
     if !state.config.deb.enabled {
         return StatusCode::NOT_FOUND.into_response();
@@ -1609,7 +1608,7 @@ mod integration_tests {
             axum::extract::Query(super::PublishQuery::default()),
             axum::Extension(scoped(ScopeEnforcement::Enforce)),
             None,
-            axum::body::Bytes::from(build_test_deb("x", "1.0")),
+            crate::registry::PublishBody(axum::body::Bytes::from(build_test_deb("x", "1.0"))),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1621,7 +1620,7 @@ mod integration_tests {
             axum::extract::Query(super::PublishQuery::default()),
             axum::Extension(scoped(ScopeEnforcement::Enforce)),
             None,
-            axum::body::Bytes::from(build_test_deb("x", "1.0")),
+            crate::registry::PublishBody(axum::body::Bytes::from(build_test_deb("x", "1.0"))),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CREATED);

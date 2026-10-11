@@ -24,7 +24,6 @@ use crate::registry::{method_not_allowed, proxied_repo_conflict};
 use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
-    body::Bytes,
     extract::{Path, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
@@ -690,7 +689,7 @@ async fn upload(
     Path((repo, path)): Path<(String, String)>,
     Extension(authority): Extension<NamespaceAuthority>,
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
-    body: Bytes,
+    super::PublishBody(body): super::PublishBody,
 ) -> Response {
     if !state.config.rpm.enabled {
         return StatusCode::NOT_FOUND.into_response();
@@ -1693,7 +1692,7 @@ mod integration_tests {
             axum::extract::Path(("otherrepo".to_string(), "x.rpm".to_string())),
             axum::Extension(scoped(ScopeEnforcement::Enforce)),
             None,
-            axum::body::Bytes::from(build_test_rpm("x", "1.0")),
+            crate::registry::PublishBody(axum::body::Bytes::from(build_test_rpm("x", "1.0"))),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1705,7 +1704,7 @@ mod integration_tests {
             axum::extract::Path(("myrepo".to_string(), "x.rpm".to_string())),
             axum::Extension(scoped(ScopeEnforcement::Enforce)),
             None,
-            axum::body::Bytes::from(build_test_rpm("x", "1.0")),
+            crate::registry::PublishBody(axum::body::Bytes::from(build_test_rpm("x", "1.0"))),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CREATED);

@@ -65,6 +65,28 @@ use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use std::time::{Duration, Instant};
 
+/// The body of a publish handler that needs it whole in memory (npm, Maven, Cargo,
+/// deb, rpm), capped at `server.publish_body_limit_mb` instead of the global
+/// `body_limit_mb` that streamed Docker uploads need. A bigger body is a 413 as soon
+/// as the cap is crossed, before it is buffered whole.
+pub(crate) struct PublishBody(pub Bytes);
+
+impl axum::extract::FromRequest<AppState> for PublishBody {
+    type Rejection = Response;
+
+    async fn from_request(req: axum::extract::Request, state: &AppState) -> Result<Self, Response> {
+        let cap = state.config.server.publish_body_limit();
+        match axum::body::to_bytes(req.into_body(), cap).await {
+            Ok(body) => Ok(Self(body)),
+            Err(_) => Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Publish body too large. Max size: {cap} bytes"),
+            )
+                .into_response()),
+        }
+    }
+}
+
 /// Remove the files directly in `dir` whose last write is at least `max_age` ago.
 ///
 /// For the dedicated temp directories of streamed uploads and proxy fetches: a
@@ -1119,6 +1141,33 @@ pub(crate) async fn proxy_fetch_conditional(
 mod tests {
     use super::*;
     use crate::registry_type::RegistryType;
+
+    /// Every publish handler that buffers its body answers 413 once the body passes
+    /// `server.publish_body_limit_mb`, well below the global `body_limit_mb` (C66).
+    #[tokio::test]
+    async fn buffered_publish_bodies_are_capped_at_the_publish_limit() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::Method;
+        let ctx = create_test_context_with_config(|c| {
+            c.server.publish_body_limit_mb = 1;
+            c.deb.enabled = true;
+            c.rpm.enabled = true;
+        });
+        let over = vec![b'x'; 1024 * 1024 + 1];
+        for uri in [
+            "/npm/pkg",
+            "/maven2/com/acme/lib/1.0/lib-1.0.jar",
+            "/cargo/api/v1/crates/new",
+            "/deb/repo/pool/x.deb",
+            "/rpm/repo/x.rpm",
+        ] {
+            let resp = send(&ctx.app, Method::PUT, uri, over.clone()).await;
+            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
+        }
+        // Under the cap the body reaches the handler (here: invalid JSON).
+        let resp = send(&ctx.app, Method::PUT, "/npm/pkg", vec![b'x'; 1024]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 
     #[tokio::test]
     async fn test_proxy_fetch_invalid_url() {
