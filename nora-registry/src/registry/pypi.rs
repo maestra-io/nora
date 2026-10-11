@@ -787,9 +787,14 @@ async fn download_file(
                         } else {
                             None
                         };
-                        if data_clone.cache(&storage, &key_clone, false).await.is_ok() {
+                        // Create-only: a concurrent upload of the same filename wins.
+                        if let Ok(true) = data_clone.cache(&storage, &key_clone, true).await {
                             let _ = storage
                                 .put(&format!("{}.sha256", key_clone), hash.as_bytes())
+                                .await;
+                            // Provenance: cached from upstream, so GC may evict it (C22).
+                            let _ = storage
+                                .put(&proxied_marker_key(&key_clone), hash.as_bytes())
                                 .await;
                             put_hash_marker(&storage, &project, &file_name, &hash).await;
                             if let Some(meta) = core_meta {
@@ -1196,6 +1201,10 @@ pub(crate) async fn store_file(
             format!("File {filename} already exists"),
         ));
     }
+
+    // An upload is never a proxy cache: drop any stale provenance marker, or GC
+    // could evict the only copy (C22).
+    let _ = storage.delete(&proxied_marker_key(&file_key)).await;
 
     // Store file
     if let Err(e) = storage.put_from_path(&file_key, src, Some(sha256)).await {
@@ -1839,6 +1848,13 @@ fn pypi_content_type(filename: &str) -> &'static str {
 pub(crate) const HASH_MARKER_PREFIX: &str = "pypi-sha256/";
 
 /// Key of the marker recording `sha256` for `filename` of `project`.
+/// Provenance marker of a file cached from an upstream (C22): proxied and uploaded
+/// files share `pypi/<project>/<file>` keys, and only a proxied one may be evicted.
+/// It lives under npm's `.nora-origins/` prefix, outside every listing.
+pub(crate) fn proxied_marker_key(key: &str) -> String {
+    crate::registry::npm::origin_key(key)
+}
+
 fn hash_marker_key(project: &str, filename: &str, sha256: &str) -> String {
     format!("{HASH_MARKER_PREFIX}{project}/{filename}/{sha256}")
 }
@@ -3773,6 +3789,26 @@ mod integration_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(cached, "the spooled file is cached pinned");
+        for _ in 0..100 {
+            if ctx
+                .state
+                .storage
+                .get(&super::proxied_marker_key(key))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            ctx.state
+                .storage
+                .get(&super::proxied_marker_key(key))
+                .await
+                .is_ok(),
+            "a file cached from upstream carries the provenance marker (C22)"
+        );
 
         let resp = send(&ctx.app, Method::GET, "/simple/bigpy/bigpy-1.0.tar.gz", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -4147,6 +4183,16 @@ mod integration_tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
 
+        assert!(
+            ctx.state
+                .storage
+                .get(&super::proxied_marker_key(
+                    "pypi/corp-lib/corp-lib-1.0.tar.gz"
+                ))
+                .await
+                .is_err(),
+            "an uploaded file never carries the provenance marker (C22)"
+        );
         let resp = send(&ctx.app, Method::GET, "/simple/corp-lib/", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("corp-lib-1.0.tar.gz"));

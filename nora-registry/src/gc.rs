@@ -1026,6 +1026,29 @@ fn is_index_file(key: &str) -> bool {
     )
 }
 
+/// Remove what a cached PyPI file `key` brings along: its `.sha256`/`.metadata`
+/// sidecars, the hash markers of both (`pypi-sha256/<project>/<file>[.metadata]/`)
+/// and its provenance marker, so neither the index nor the next GC sees it.
+async fn evict_pypi_companions(storage: &Storage, key: &str) {
+    let Some((project, file)) = key.strip_prefix("pypi/").and_then(|r| r.split_once('/')) else {
+        return;
+    };
+    let mut doomed = vec![
+        format!("{key}.sha256"),
+        format!("{key}.metadata"),
+        crate::registry::npm::origin_key(key),
+    ];
+    let markers = crate::registry::PYPI_HASH_MARKER_PREFIX;
+    for marked in [file.to_string(), format!("{file}.metadata")] {
+        if let Ok(keys) = storage.list(&format!("{markers}{project}/{marked}/")).await {
+            doomed.extend(keys);
+        }
+    }
+    for k in doomed {
+        let _ = storage.delete(&k).await;
+    }
+}
+
 /// Evict proxy-cached artifacts when their total size exceeds `max_bytes`.
 ///
 /// Proxy-cached files are:
@@ -1035,7 +1058,9 @@ fn is_index_file(key: &str) -> bool {
 /// - NuGet `.nupkg`/`.nuspec` files under `nuget/flatcontainer/` (hosted
 ///   packages live under `nuget/hosted/`, never here);
 /// - npm tarballs with a cache provenance sidecar (#1055): only an upstream
-///   fetch writes one, a publish does not.
+///   fetch writes one, a publish does not;
+/// - PyPI files with a provenance marker (C22), likewise written only by an
+///   upstream fetch; an uploaded file never has one.
 ///
 /// A package in `curation.internal_namespaces` is never fetched upstream, so a
 /// copy of one is the only copy: it is never evicted.
@@ -1151,6 +1176,34 @@ async fn evict_proxy_cache(
         Err(e) => tracing::error!("GC proxy-cache: listing npm provenance sidecars failed: {e}"),
     }
 
+    // PyPI files cached from an upstream carry a provenance marker (C22); uploaded
+    // files share the key space but never have one.
+    match storage.list_internal(&origin_key("pypi/")).await {
+        Ok(markers) => {
+            let cached: HashSet<&str> = markers
+                .iter()
+                .filter_map(|m| m.strip_prefix(crate::registry::npm::ORIGINS_PREFIX))
+                .filter(|key| key.starts_with("pypi/"))
+                .collect();
+            if !cached.is_empty() {
+                match storage.list_with_meta("pypi/").await {
+                    Ok(entries) => {
+                        for (key, meta) in entries {
+                            let project = key.split('/').nth(1).unwrap_or_default();
+                            if cached.contains(key.as_str())
+                                && !is_internal_namespace(curation, RegistryType::PyPI, project)
+                            {
+                                proxy_files.push((key, meta.size, meta.modified));
+                            }
+                        }
+                    }
+                    Err(e) => tracing::error!("GC proxy-cache: list_with_meta(pypi/) failed: {e}"),
+                }
+            }
+        }
+        Err(e) => tracing::error!("GC proxy-cache: listing pypi provenance markers failed: {e}"),
+    }
+
     let total_bytes: u64 = proxy_files.iter().map(|(_, s, _)| s).sum();
 
     if total_bytes <= max_bytes {
@@ -1181,6 +1234,9 @@ async fn evict_proxy_cache(
                 info!("proxy-cache evicted: {} ({} bytes)", key, size);
                 if key.starts_with("npm/") {
                     let _ = storage.delete(&origin_key(key)).await;
+                }
+                if key.starts_with("pypi/") {
+                    evict_pypi_companions(storage, key).await;
                 }
             }
         }
@@ -3148,6 +3204,61 @@ mod tests {
             assert!(storage.stat(key).await.is_some(), "{key} kept");
         }
         assert!(storage.stat(&origin_key(proxied_new)).await.is_some());
+    }
+
+    /// C22: PyPI files cached from an upstream (provenance marker) are evicted, LRU,
+    /// together with their sidecars and hash markers; uploaded files (no marker) and
+    /// internal-namespace projects never are.
+    #[tokio::test]
+    async fn test_evict_proxy_cache_pypi_proxied_files_only() {
+        use crate::registry::npm::origin_key;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let storage = Storage::new_local(data.to_str().unwrap());
+        let proxied_old = "pypi/requests/requests-2.0.tar.gz";
+        let proxied_new = "pypi/requests/requests-2.1.tar.gz";
+        let internal = "pypi/corp-lib/corp-lib-1.0.tar.gz";
+        let uploaded = "pypi/mine/mine-1.0.tar.gz";
+        put_aged(&storage, &data, uploaded, 100, 0).await;
+        put_aged(&storage, &data, internal, 100, 0).await;
+        put_aged(&storage, &data, proxied_old, 100, 10).await;
+        put_aged(&storage, &data, proxied_new, 100, 100).await;
+        for key in [proxied_old, proxied_new, internal] {
+            storage.put(&origin_key(key), b"sha").await.unwrap();
+        }
+        let marker_root = crate::registry::PYPI_HASH_MARKER_PREFIX;
+        let hash_marker = format!(
+            "{marker_root}requests/requests-2.0.tar.gz/{}",
+            "a".repeat(64)
+        );
+        let companions = [
+            format!("{proxied_old}.sha256"),
+            format!("{proxied_old}.metadata"),
+            hash_marker,
+        ];
+        for key in &companions {
+            storage.put(key, b"x").await.unwrap();
+        }
+
+        let curation = curation_with_internal(&["corp-*"]);
+        let result =
+            evict_proxy_cache(&storage, &test_publish_locks(), 100, false, &curation).await;
+        assert_eq!(
+            result.total_bytes, 200,
+            "uploaded and internal files are not counted"
+        );
+        assert_eq!(result.evicted_files, 1);
+        assert!(storage.stat(proxied_old).await.is_none());
+        assert!(storage.stat(&origin_key(proxied_old)).await.is_none());
+        for key in &companions {
+            assert!(
+                storage.stat(key).await.is_none(),
+                "{key} goes with the file"
+            );
+        }
+        for key in [proxied_new, internal, uploaded] {
+            assert!(storage.stat(key).await.is_some(), "{key} kept");
+        }
     }
 
     /// Files WITH .nora-meta/ sidecars (hosted packages) must never be evicted.
