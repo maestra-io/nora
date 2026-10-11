@@ -32,6 +32,12 @@ pub struct StorageConfig {
     /// S3 secret key (optional, uses anonymous access if not set)
     #[serde(default, skip_serializing)]
     pub s3_secret_key: Option<ProtectedString>,
+    /// Directory with `access_key_id`, `secret_access_key` and optional
+    /// `session_token` files, re-read as they rotate (Maestra fork). Takes
+    /// precedence over `s3_access_key`/`s3_secret_key`.
+    /// ENV: NORA_STORAGE_S3_CREDENTIALS_DIR
+    #[serde(default)]
+    pub s3_credentials_dir: Option<String>,
     /// S3 region (default: us-east-1)
     #[serde(default = "default_s3_region")]
     pub s3_region: String,
@@ -80,6 +86,7 @@ impl Default for StorageConfig {
             bucket: default_bucket(),
             s3_access_key: None,
             s3_secret_key: None,
+            s3_credentials_dir: None,
             s3_region: default_s3_region(),
             s3_virtual_hosted: false,
             gcs_service_account_path: None,
@@ -135,6 +142,9 @@ impl StorageConfig {
                 Some(ProtectedString::new(val))
             };
         }
+        if let Ok(val) = env::var("NORA_STORAGE_S3_CREDENTIALS_DIR") {
+            self.s3_credentials_dir = if val.is_empty() { None } else { Some(val) };
+        }
         if let Ok(val) = env::var("NORA_STORAGE_S3_REGION") {
             self.s3_region = val;
         }
@@ -173,6 +183,21 @@ mod tests {
         assert_eq!(cfg.mode, StorageMode::Gcs);
         assert_eq!(cfg.gcs_service_account_path.as_deref(), Some("/sa.json"));
         assert_eq!(cfg.gcs_base_url.as_deref(), Some("http://127.0.0.1:4443"));
+    }
+
+    #[test]
+    fn test_s3_credentials_dir_from_toml_and_env() {
+        let _lock = crate::test_env::env_lock();
+        let cfg: StorageConfig =
+            toml::from_str("mode = \"s3\"\ns3_credentials_dir = \"/r2-creds\"").unwrap();
+        assert_eq!(cfg.s3_credentials_dir.as_deref(), Some("/r2-creds"));
+
+        let mut cfg = StorageConfig::default();
+        std::env::set_var("NORA_STORAGE_S3_CREDENTIALS_DIR", "/env-creds");
+        let r = cfg.apply_env_overrides();
+        std::env::remove_var("NORA_STORAGE_S3_CREDENTIALS_DIR");
+        r.unwrap();
+        assert_eq!(cfg.s3_credentials_dir.as_deref(), Some("/env-creds"));
     }
 
     #[test]

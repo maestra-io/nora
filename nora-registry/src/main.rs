@@ -733,6 +733,7 @@ async fn main() {
                     bucket = %config.storage.bucket,
                     region = %config.storage.s3_region,
                     has_credentials = config.storage.s3_access_key.is_some(),
+                    credentials_dir = ?config.storage.s3_credentials_dir,
                     virtual_hosted = config.storage.s3_virtual_hosted,
                     "Using S3 storage"
                 );
@@ -743,6 +744,7 @@ async fn main() {
                 &config.storage.s3_region,
                 expose_opt(&config.storage.s3_access_key),
                 expose_opt(&config.storage.s3_secret_key),
+                config.storage.s3_credentials_dir.as_deref(),
                 config.storage.s3_virtual_hosted,
             )
         }
@@ -959,6 +961,7 @@ async fn main() {
                     &config.storage.s3_region,
                     expose_opt(&config.storage.s3_access_key),
                     expose_opt(&config.storage.s3_secret_key),
+                    config.storage.s3_credentials_dir.as_deref(),
                     config.storage.s3_virtual_hosted,
                 ),
                 "gcs" => Storage::new_gcs(
@@ -980,6 +983,7 @@ async fn main() {
                     &config.storage.s3_region,
                     expose_opt(&config.storage.s3_access_key),
                     expose_opt(&config.storage.s3_secret_key),
+                    config.storage.s3_credentials_dir.as_deref(),
                     config.storage.s3_virtual_hosted,
                 ),
                 "gcs" => Storage::new_gcs(

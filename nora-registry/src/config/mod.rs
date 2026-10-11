@@ -3983,6 +3983,7 @@ proxies = [
             s3_secret_key: Some(ProtectedString::from(
                 "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
             )),
+            s3_credentials_dir: None,
             s3_region: String::new(),
             s3_virtual_hosted: false,
             gcs_service_account_path: None,

@@ -225,15 +225,17 @@ impl Storage {
         region: &str,
         access_key: Option<&str>,
         secret_key: Option<&str>,
+        credentials_dir: Option<&str>,
         virtual_hosted: bool,
     ) -> Self {
         Self {
-            inner: Arc::new(ObjectStorage::new(
+            inner: Arc::new(ObjectStorage::new_s3(
                 s3_url,
                 bucket,
                 region,
                 access_key,
                 secret_key,
+                credentials_dir,
                 virtual_hosted,
             )),
         }
