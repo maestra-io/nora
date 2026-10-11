@@ -1597,6 +1597,81 @@ mod integration_tests {
         let tokens = ctx.state.tokens.as_ref().unwrap().list_all_tokens();
         assert_eq!(tokens.len(), 0);
     }
+
+    /// POST a UI token-create form with the given Authorization header.
+    async fn ui_create_token(
+        ctx: &TestContext,
+        authorization: &str,
+        role: &str,
+    ) -> axum::http::Response<axum::body::Body> {
+        send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", authorization),
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("hx-request", "true"),
+            ],
+            format!("description=x&role={}&ttl_days=30", role),
+        )
+        .await
+    }
+
+    /// A write token sent as the Basic password under a made-up username must
+    /// not mint an admin token, and whatever it mints belongs to the token's
+    /// verified owner, not to the Basic username.
+    #[tokio::test]
+    async fn test_token_ui_create_uses_verified_owner_and_refuses_admin() {
+        let ctx = create_test_context_with_auth_and_config(&[("admin", "secret")], |cfg| {
+            cfg.auth.admin_users = vec!["mallory".to_string()];
+        });
+        let store = ctx.state.tokens.as_ref().unwrap();
+        let write_token = store
+            .create_token("ci", 30, None, crate::tokens::Role::Write)
+            .unwrap();
+        let spoofed = format!(
+            "Basic {}",
+            STANDARD.encode(format!("mallory:{}", write_token))
+        );
+
+        let response = ui_create_token(&ctx, &spoofed, "admin").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = ui_create_token(&ctx, &spoofed, "write").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(store.list_tokens("mallory").is_empty());
+        assert_eq!(store.list_tokens("ci").len(), 2);
+
+        // htpasswd identities are Write-role: no admin mint either.
+        let basic = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let response = ui_create_token(&ctx, &basic, "admin").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Admin mint needs an admin-role credential AND an auth.admin_users entry.
+    #[tokio::test]
+    async fn test_token_ui_create_admin_requires_admin_role_and_allowlist() {
+        let ctx = create_test_context_with_auth_and_config(&[("admin", "secret")], |cfg| {
+            cfg.auth.admin_users = vec!["boss".to_string()];
+        });
+        let store = ctx.state.tokens.as_ref().unwrap();
+        let boss = store
+            .create_token("boss", 30, None, crate::tokens::Role::Admin)
+            .unwrap();
+        let eve = store
+            .create_token("eve", 30, None, crate::tokens::Role::Admin)
+            .unwrap();
+
+        let response = ui_create_token(&ctx, &format!("Bearer {}", eve), "admin").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = ui_create_token(&ctx, &format!("Bearer {}", boss), "admin").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let minted = store.list_tokens("boss");
+        assert_eq!(minted.len(), 2);
+        assert!(minted.iter().all(|t| t.role == crate::tokens::Role::Admin));
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -35,6 +35,9 @@ struct CachedToken {
 
 const TOKEN_PREFIX: &str = "nra_";
 
+/// Longest token lifetime any mint path may request (10 years).
+pub const MAX_TOKEN_TTL_DAYS: u64 = 3650;
+
 /// Access role for API tokens
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -140,7 +143,8 @@ impl TokenStore {
         }
     }
 
-    /// Generate a new API token for a user
+    /// Generate a new API token for a user. `ttl_days` is clamped to
+    /// `1..=MAX_TOKEN_TTL_DAYS` for every caller (an unbounded value overflows).
     pub fn create_token(
         &self,
         user: &str,
@@ -163,6 +167,7 @@ impl TokenStore {
             .unwrap_or_default()
             .as_secs();
 
+        let ttl_days = ttl_days.clamp(1, MAX_TOKEN_TTL_DAYS);
         let expires_at = now + (ttl_days * 24 * 60 * 60);
 
         let info = TokenInfo {
@@ -516,6 +521,25 @@ mod tests {
 
         assert!(token.starts_with("nra_"));
         assert_eq!(token.len(), 4 + 32); // prefix + uuid without dashes
+    }
+
+    /// Every mint path goes through `create_token`, so the TTL clamp lives there:
+    /// 0 becomes one day and an overflowing `u64::MAX` becomes 10 years.
+    #[test]
+    fn test_create_token_clamps_ttl() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+        store.create_token("zero", 0, None, Role::Read).unwrap();
+        store
+            .create_token("huge", u64::MAX, None, Role::Read)
+            .unwrap();
+
+        let ttl_of = |user: &str| {
+            let t = &store.list_tokens(user)[0];
+            (t.expires_at - t.created_at) / 86400
+        };
+        assert_eq!(ttl_of("zero"), 1);
+        assert_eq!(ttl_of("huge"), MAX_TOKEN_TTL_DAYS);
     }
 
     /// The verify-cache TTL bounds the cross-replica revocation window. Two
