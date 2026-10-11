@@ -554,16 +554,12 @@ async fn download_archive(
         // Range request: 206 Partial Content, or 416 when the client asks past the
         // end. The gates above ran on the whole object; the partial body itself
         // cannot be rehashed, so the client's own checksum covers it (#657).
-        if let Some(response) = crate::registry::range::range_response(
-            &state.storage,
-            &[&key],
+        if let Some(response) = crate::registry::range::range_response_from_bytes(
+            &data,
             &headers,
-            data.len() as u64,
             PUB_ARCHIVE_CONTENT_TYPE,
             &[],
-        )
-        .await
-        {
+        ) {
             if response.status() == StatusCode::PARTIAL_CONTENT {
                 state.metrics.record_download("pub");
                 state.metrics.record_cache_hit("pub");

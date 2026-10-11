@@ -7,7 +7,7 @@
 //! same everywhere.
 
 use crate::storage::Storage;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use tokio_util::io::ReaderStream;
@@ -122,7 +122,9 @@ fn byte_range_core_is_bounds_safe() {
 }
 
 /// Serve a Range request from the backend's ranged read, trying `keys` in order
-/// (namespaced key first, legacy key second).
+/// (namespaced key first, legacy key second). For streaming callers that have not
+/// read the object; a caller already holding the body uses
+/// [`range_response_from_bytes`] instead of reading it a second time.
 ///
 /// `None` means no usable Range header, or every ranged read failed — the
 /// caller serves the full 200 and must set `Accept-Ranges: bytes` on it. A
@@ -140,19 +142,9 @@ pub(crate) async fn range_response(
     content_type: &str,
     extra: &[(HeaderName, String)],
 ) -> Option<Response> {
-    let (start, end) = match parse_byte_range(headers.get(header::RANGE)?.to_str().ok()?, size) {
-        ParsedRange::Satisfiable(start, end) => (start, end),
-        ParsedRange::Unsatisfiable => {
-            return Some(
-                Response::builder()
-                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                    .header(header::CONTENT_RANGE, format!("bytes */{}", size))
-                    .header(header::ACCEPT_RANGES, "bytes")
-                    .body(Body::empty())
-                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
-            )
-        }
-        ParsedRange::None => return None,
+    let (start, end) = match requested_range(headers, size) {
+        Ok(range) => range,
+        Err(answer) => return answer,
     };
 
     let mut reader = None;
@@ -162,7 +154,58 @@ pub(crate) async fn range_response(
             break;
         }
     }
+    let body = nora_registry::verified::open_world_stream_body(ReaderStream::new(reader?));
+    Some(partial_content(start, end, size, content_type, extra, body))
+}
 
+/// [`range_response`] for a body already in memory (a cache hit that was read whole
+/// for the integrity and quarantine gates): the 206 is a slice of `data`, not a
+/// second, ranged read of the same object from storage.
+pub(crate) fn range_response_from_bytes(
+    data: &Bytes,
+    headers: &HeaderMap,
+    content_type: &str,
+    extra: &[(HeaderName, String)],
+) -> Option<Response> {
+    let size = data.len() as u64;
+    let (start, end) = match requested_range(headers, size) {
+        Ok(range) => range,
+        Err(answer) => return answer,
+    };
+    // `start <= end < size` (see `byte_range_core`), so the slice is in bounds.
+    let body = Body::from(data.slice(start as usize..=end as usize));
+    Some(partial_content(start, end, size, content_type, extra, body))
+}
+
+/// The inclusive range the `Range` header asks for, or the finished answer when there
+/// is nothing to slice: `Err(None)` serves the full 200, `Err(Some(416))`.
+fn requested_range(headers: &HeaderMap, size: u64) -> Result<(u64, u64), Option<Response>> {
+    let Some(value) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) else {
+        return Err(None);
+    };
+    match parse_byte_range(value, size) {
+        ParsedRange::Satisfiable(start, end) => Ok((start, end)),
+        ParsedRange::Unsatisfiable => Err(Some(
+            Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::CONTENT_RANGE, format!("bytes */{}", size))
+                .header(header::ACCEPT_RANGES, "bytes")
+                .body(Body::empty())
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        )),
+        ParsedRange::None => Err(None),
+    }
+}
+
+/// The 206 for bytes `start..=end` of a `size`-byte object.
+fn partial_content(
+    start: u64,
+    end: u64,
+    size: u64,
+    content_type: &str,
+    extra: &[(HeaderName, String)],
+    body: Body,
+) -> Response {
     let mut response = Response::builder()
         .status(StatusCode::PARTIAL_CONTENT)
         .header(header::CONTENT_TYPE, content_type)
@@ -175,13 +218,9 @@ pub(crate) async fn range_response(
     for (name, value) in extra {
         response = response.header(name, value.as_str());
     }
-    Some(
-        response
-            .body(nora_registry::verified::open_world_stream_body(
-                ReaderStream::new(reader?),
-            ))
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
-    )
+    response
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 #[cfg(test)]
@@ -209,6 +248,45 @@ mod tests {
         // and the suffix form against an empty object.
         assert_eq!(parse_byte_range("bytes=5-5", 10), Satisfiable(5, 5)); // single byte (kills `>`→`>=`)
         assert_eq!(parse_byte_range("bytes=-5", 0), Unsatisfiable); // suffix + empty
+    }
+
+    /// The in-memory path answers exactly like the storage-backed one: 206 with the
+    /// slice and its Content-Range, 416 past the end, `None` (full 200) without a range.
+    #[tokio::test]
+    async fn test_range_response_from_bytes() {
+        use super::range_response_from_bytes;
+        use axum::body::Bytes;
+        use axum::http::{header, HeaderMap, StatusCode};
+
+        let data = Bytes::from_static(b"0123456789");
+        let ranged = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::RANGE, value.parse().unwrap());
+            range_response_from_bytes(&data, &headers, "application/octet-stream", &[])
+        };
+
+        for (value, range, body) in [
+            ("bytes=2-5", "bytes 2-5/10", &b"2345"[..]),
+            ("bytes=-3", "bytes 7-9/10", b"789"),
+            ("bytes=8-100", "bytes 8-9/10", b"89"),
+        ] {
+            let resp = ranged(value).unwrap();
+            assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(resp.headers()[header::CONTENT_RANGE], range);
+            assert_eq!(
+                resp.headers()[header::CONTENT_LENGTH],
+                body.len().to_string()
+            );
+            let got = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&got[..], body, "{value}");
+        }
+        let resp = ranged("bytes=10-").unwrap();
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(resp.headers()[header::CONTENT_RANGE], "bytes */10");
+        assert!(ranged("bytes=0-1,4-5").is_none());
+        assert!(range_response_from_bytes(&data, &HeaderMap::new(), "x", &[]).is_none());
     }
 
     proptest::proptest! {

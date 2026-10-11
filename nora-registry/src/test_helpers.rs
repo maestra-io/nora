@@ -618,6 +618,16 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         self.inner.put(key, data, sha256).await
     }
 
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        data: axum::body::Bytes,
+        sha256: &str,
+    ) -> crate::storage::Result<bool> {
+        self.counts.hit("put");
+        self.inner.put_if_absent(key, data, sha256).await
+    }
+
     async fn get(&self, key: &str) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
         self.counts.hit("get");
         self.inner.get(key).await
