@@ -203,6 +203,7 @@ async fn package_versions(
                 local_files.push(FileEntry {
                     filename: filename.to_string(),
                     sha256,
+                    ..Default::default()
                 });
             }
         }
@@ -524,7 +525,7 @@ async fn download_file(
         };
 
         // The file may live on a later upstream — keep walking the list.
-        let Some(file_url) = find_file_url(&html, &filename, &page_url) else {
+        let Some((file_url, expected_sha256)) = find_file_url(&html, &filename, &page_url) else {
             continue;
         };
 
@@ -539,6 +540,25 @@ async fn download_file(
         .await
         {
             Ok(data) => {
+                // The index published this file's digest: a body that does not match
+                // (truncated, corrupted, tampered) is neither served nor cached.
+                if let Some(expected) = &expected_sha256 {
+                    let actual = hex::encode(sha2::Sha256::digest(&data));
+                    if &actual != expected {
+                        tracing::warn!(package = %normalized, filename = %filename, upstream = %up.url(), %expected, %actual, "PyPI upstream file does not match the index sha256, refusing it");
+                        return StatusCode::BAD_GATEWAY.into_response();
+                    }
+                }
+                // Curation integrity runs on the first serve too, not only on cache hits.
+                if let Some(response) = crate::curation::verify_integrity(
+                    &state.curation().curation_engine,
+                    crate::curation::RegistryType::PyPI,
+                    &normalized,
+                    version.as_deref(),
+                    &data,
+                ) {
+                    return response;
+                }
                 state.metrics.record_download("pypi");
                 state.metrics.record_cache_miss("pypi");
                 state.activity.push(ActivityEntry::new(
@@ -760,9 +780,14 @@ async fn upload(
 // PEP 691 JSON responses — typed structs per spec
 // ============================================================================
 
+#[derive(Default)]
 struct FileEntry {
     filename: String,
     sha256: Option<String>,
+    /// PEP 503 `data-requires-python`, unescaped (e.g. `>=3.8`).
+    requires_python: Option<String>,
+    /// PEP 592 `data-yanked`: `Some("")` is yanked without a reason.
+    yanked: Option<String>,
 }
 
 /// PEP 691 top-level response — typed to prevent field-name drift.
@@ -795,6 +820,11 @@ struct Pep691File {
     /// PEP 700 file size in bytes, when the artifact is stored locally.
     #[serde(skip_serializing_if = "Option::is_none")]
     size: Option<u64>,
+    #[serde(rename = "requires-python", skip_serializing_if = "Option::is_none")]
+    requires_python: Option<String>,
+    /// PEP 691: `true`, or the yank reason as a string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    yanked: Option<serde_json::Value>,
 }
 
 #[derive(serde::Serialize)]
@@ -826,6 +856,14 @@ fn versions_json_response(
                     .map(|h| Pep691Hashes { sha256: h.clone() }),
                 upload_time,
                 size,
+                requires_python: f.requires_python.clone(),
+                yanked: f.yanked.as_ref().map(|r| {
+                    if r.is_empty() {
+                        serde_json::Value::Bool(true)
+                    } else {
+                        serde_json::Value::String(r.clone())
+                    }
+                }),
             }
         })
         .collect();
@@ -921,13 +959,21 @@ fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str)
             .as_ref()
             .map(|h| format!("#sha256={}", h))
             .unwrap_or_default();
+        let mut attrs = String::new();
+        if let Some(rp) = &f.requires_python {
+            let _ = write!(attrs, " data-requires-python=\"{}\"", html_escape(rp));
+        }
+        if let Some(reason) = &f.yanked {
+            let _ = write!(attrs, " data-yanked=\"{}\"", html_escape(reason));
+        }
         let _ = writeln!(
             html,
-            "<a href=\"{}/simple/{}/{}{}\">{}</a><br>",
+            "<a href=\"{}/simple/{}/{}{}\"{}>{}</a><br>",
             base,
             normalized,
             html_escape(&f.filename),
             hash_fragment,
+            attrs,
             html_escape(&f.filename)
         );
     }
@@ -1037,9 +1083,20 @@ async fn ensure_pypi_dates_cached(
     map
 }
 
-/// Normalize package name according to PEP 503.
+/// Normalize package name according to PEP 503: lowercase, and every run of
+/// `-`, `_`, `.` becomes a single `-` (`re.sub(r"[-_.]+", "-", name).lower()`).
 fn normalize_name(name: &str) -> String {
-    name.to_lowercase().replace(['-', '_', '.'], "-")
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if matches!(c, '-' | '_' | '.') {
+            if !out.ends_with('-') {
+                out.push('-');
+            }
+        } else {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
 }
 
 /// Check Accept header for PEP 691 JSON.
@@ -1177,26 +1234,70 @@ fn extract_filename(url: &str) -> Option<&str> {
 
 /// Parse upstream PyPI simple index HTML into file entries.
 ///
-/// Extracts filenames and optional `#sha256=` fragments from `<a href="...">` links.
+/// Extracts filenames, optional `#sha256=` fragments and the PEP 503/592
+/// `data-requires-python` / `data-yanked` attributes from `<a href="...">` links.
+/// Filenames are percent-decoded (`%2B` -> `+`), the form the download route sees.
 fn parse_upstream_files(html: &str) -> Vec<FileEntry> {
     let mut files = Vec::new();
-    let mut remaining = html;
+    let mut offset = 0;
 
-    while let Some(href_start) = remaining.find("href=\"") {
-        remaining = &remaining[href_start + 6..];
-        if let Some(href_end) = remaining.find('"') {
-            let url = &remaining[..href_end];
-            if let Some(filename) = extract_filename(url) {
-                let sha256 = url.find("#sha256=").map(|pos| url[pos + 8..].to_string());
-                files.push(FileEntry {
-                    filename: filename.to_string(),
-                    sha256,
-                });
-            }
-            remaining = &remaining[href_end..];
+    while let Some(href_start) = html[offset..].find("href=\"") {
+        let value_start = offset + href_start + 6;
+        let Some(href_len) = html[value_start..].find('"') else {
+            break;
+        };
+        let url = &html[value_start..value_start + href_len];
+        offset = value_start + href_len;
+        if let Some(filename) = extract_filename(url) {
+            // The anchor's attributes: from its `<a` to the first `>` outside quotes
+            // (some mirrors leave `data-requires-python=">=3.8"` unescaped).
+            let tag_start = html[..value_start].rfind("<a").unwrap_or(0);
+            let mut quoted = false;
+            let tag_end = html[offset + 1..]
+                .char_indices()
+                .find(|&(_, c)| {
+                    quoted ^= c == '"';
+                    c == '>' && !quoted
+                })
+                .map_or(html.len(), |(e, _)| offset + 1 + e);
+            let tag = &html[tag_start..tag_end];
+            files.push(FileEntry {
+                filename: percent_encoding::percent_decode_str(filename)
+                    .decode_utf8_lossy()
+                    .into_owned(),
+                sha256: url.find("#sha256=").map(|pos| url[pos + 8..].to_string()),
+                requires_python: html_attr(tag, "data-requires-python").map(html_unescape),
+                yanked: html_attr(tag, "data-yanked").map(html_unescape),
+            });
         }
     }
     files
+}
+
+/// Value of a double-quoted attribute `name="..."` inside an HTML tag, raw (still escaped).
+fn html_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("{name}=\"");
+    let mut from = 0;
+    while let Some(pos) = tag[from..].find(&needle) {
+        let start = from + pos;
+        from = start + needle.len();
+        // Whole attribute name only: `data-yanked` must not match `xdata-yanked`.
+        if tag[..start].ends_with(|c: char| c.is_ascii_whitespace()) {
+            let end = tag[from..].find('"')?;
+            return Some(&tag[from..from + end]);
+        }
+    }
+    None
+}
+
+/// Reverse the entity escaping index pages apply to attribute values.
+fn html_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&amp;", "&")
 }
 
 /// Merge upstream and local file lists.
@@ -1215,6 +1316,8 @@ fn merge_file_lists(upstream: Vec<FileEntry>, local: &[FileEntry]) -> Vec<FileEn
             result.push(FileEntry {
                 filename: f.filename.clone(),
                 sha256: f.sha256.clone(),
+                requires_python: f.requires_python.clone(),
+                yanked: f.yanked.clone(),
             });
         }
     }
@@ -1226,17 +1329,27 @@ fn merge_file_lists(upstream: Vec<FileEntry>, local: &[FileEntry]) -> Vec<FileEn
     for f in upstream {
         if seen.insert(f.filename.clone()) {
             result.push(f);
+        } else if let Some(cached) = result.iter_mut().find(|r| r.filename == f.filename) {
+            // A proxied file cached locally keeps the upstream's PEP 503/592
+            // metadata: local storage does not record it.
+            cached.requires_python = cached.requires_python.take().or(f.requires_python);
+            cached.yanked = cached.yanked.take().or(f.yanked);
         }
     }
 
     result
 }
 
-/// Find the download URL for a specific file in the HTML.
+/// Find the download URL for a specific file in the HTML, with the `#sha256=`
+/// digest the index publishes for it, if any.
 ///
 /// `page_url` is the simple-index page URL used to resolve relative hrefs
 /// returned by some mirrors (Tsinghua, USTC, Aliyun) (#877).
-fn find_file_url(html: &str, target_filename: &str, page_url: &str) -> Option<String> {
+fn find_file_url(
+    html: &str,
+    target_filename: &str,
+    page_url: &str,
+) -> Option<(String, Option<String>)> {
     let mut remaining = html;
 
     while let Some(href_start) = remaining.find("href=\"") {
@@ -1253,15 +1366,19 @@ fn find_file_url(html: &str, target_filename: &str, page_url: &str) -> Option<St
                 let decoded = percent_encoding::percent_decode_str(filename).decode_utf8_lossy();
                 if decoded.as_ref() == target_filename {
                     let raw = url.split('#').next().unwrap_or(url).to_string();
+                    let sha256 = url
+                        .find("#sha256=")
+                        .map(|pos| url[pos + 8..].to_ascii_lowercase());
                     // Resolve relative URLs against the page URL (#877).
                     if raw.starts_with("http://") || raw.starts_with("https://") {
-                        return Some(raw);
+                        return Some((raw, sha256));
                     }
-                    return reqwest::Url::parse(page_url)
+                    let resolved = reqwest::Url::parse(page_url)
                         .ok()
                         .and_then(|base| base.join(&raw).ok())
                         .map(|u| u.to_string())
-                        .or(Some(raw));
+                        .unwrap_or(raw);
+                    return Some((resolved, sha256));
                 }
             }
 
@@ -1281,6 +1398,10 @@ fn find_file_url(html: &str, target_filename: &str, page_url: &str) -> Option<St
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn find_url(html: &str, target: &str, page_url: &str) -> Option<String> {
+        find_file_url(html, target, page_url).map(|(url, _)| url)
+    }
 
     proptest! {
         #[test]
@@ -1349,7 +1470,7 @@ mod tests {
             r#"torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl</a>"#,
         );
         assert_eq!(
-            find_file_url(html, "torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl", "https://pypi.org/simple/torch/").as_deref(),
+            find_url(html, "torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl", "https://pypi.org/simple/torch/").as_deref(),
             Some(
                 "https://download.pytorch.org/whl/cu124/torch-2.4.0%2Bcu124-cp310-cp310-linux_x86_64.whl"
             )
@@ -1357,7 +1478,7 @@ mod tests {
         // A plain filename (no encoding) still matches.
         let plain = r#"<a href="https://x/torch-0.1.10-cp36-cp36m-macosx.whl">x</a>"#;
         assert_eq!(
-            find_file_url(
+            find_url(
                 plain,
                 "torch-0.1.10-cp36-cp36m-macosx.whl",
                 "https://pypi.org/simple/torch/"
@@ -1457,7 +1578,7 @@ mod tests {
     #[test]
     fn test_find_file_url_found() {
         let html = r#"<a href="https://files.pythonhosted.org/packages/aa/bb/flask-2.0.tar.gz#sha256=abc">flask-2.0.tar.gz</a>"#;
-        let result = find_file_url(html, "flask-2.0.tar.gz", "https://pypi.org/simple/flask/");
+        let result = find_url(html, "flask-2.0.tar.gz", "https://pypi.org/simple/flask/");
         assert_eq!(
             result,
             Some("https://files.pythonhosted.org/packages/aa/bb/flask-2.0.tar.gz".to_string())
@@ -1467,15 +1588,18 @@ mod tests {
     #[test]
     fn test_find_file_url_not_found() {
         let html = r#"<a href="https://example.com/other-1.0.tar.gz">other</a>"#;
-        let result = find_file_url(html, "flask-2.0.tar.gz", "https://pypi.org/simple/flask/");
+        let result = find_url(html, "flask-2.0.tar.gz", "https://pypi.org/simple/flask/");
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_find_file_url_strips_hash() {
-        let html = r#"<a href="https://example.com/pkg-1.0.whl#sha256=deadbeef">pkg</a>"#;
-        let result = find_file_url(html, "pkg-1.0.whl", "https://pypi.org/simple/pkg/");
+        let html = r#"<a href="https://example.com/pkg-1.0.whl#sha256=DEADBEEF">pkg</a>"#;
+        let result = find_url(html, "pkg-1.0.whl", "https://pypi.org/simple/pkg/");
         assert_eq!(result, Some("https://example.com/pkg-1.0.whl".to_string()));
+        let (_, sha256) =
+            find_file_url(html, "pkg-1.0.whl", "https://pypi.org/simple/pkg/").unwrap();
+        assert_eq!(sha256.as_deref(), Some("deadbeef"));
     }
 
     // -- #877: relative URL resolution --
@@ -1483,7 +1607,7 @@ mod tests {
     #[test]
     fn test_find_file_url_relative() {
         let html = r#"<a href="../../packages/torch-2.4.0.whl#sha256=abc">torch-2.4.0.whl</a>"#;
-        let result = find_file_url(
+        let result = find_url(
             html,
             "torch-2.4.0.whl",
             "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/torch/",
@@ -1500,7 +1624,7 @@ mod tests {
     #[test]
     fn test_find_file_url_absolute_unchanged() {
         let html = r#"<a href="https://files.pythonhosted.org/packages/ab/cd/pkg-1.0.whl">pkg-1.0.whl</a>"#;
-        let result = find_file_url(
+        let result = find_url(
             html,
             "pkg-1.0.whl",
             "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/pkg/",
@@ -1514,7 +1638,7 @@ mod tests {
     #[test]
     fn test_find_file_url_path_only() {
         let html = r#"<a href="/packages/pkg-1.0.whl#sha256=ff">pkg-1.0.whl</a>"#;
-        let result = find_file_url(html, "pkg-1.0.whl", "https://pypi.example.com/simple/pkg/");
+        let result = find_url(html, "pkg-1.0.whl", "https://pypi.example.com/simple/pkg/");
         assert_eq!(
             result,
             Some("https://pypi.example.com/packages/pkg-1.0.whl".to_string())
@@ -1600,10 +1724,12 @@ mod tests {
         let upstream = vec![FileEntry {
             filename: "pkg-1.0-cp314-cp314-linux_x86_64.whl".to_string(),
             sha256: Some("uuu".to_string()),
+            ..Default::default()
         }];
         let local = vec![FileEntry {
             filename: "pkg-1.0-cp310-cp310-linux_x86_64.whl".to_string(),
             sha256: Some("lll".to_string()),
+            ..Default::default()
         }];
         let merged = merge_file_lists(upstream, &local);
         assert_eq!(merged.len(), 2);
@@ -1617,10 +1743,12 @@ mod tests {
         let upstream = vec![FileEntry {
             filename: "pkg-1.0.tar.gz".to_string(),
             sha256: Some("upstream-hash".to_string()),
+            ..Default::default()
         }];
         let local = vec![FileEntry {
             filename: "pkg-1.0.tar.gz".to_string(),
             sha256: Some("local-verified-hash".to_string()),
+            ..Default::default()
         }];
         let merged = merge_file_lists(upstream, &local);
         assert_eq!(merged.len(), 1);
@@ -1632,6 +1760,7 @@ mod tests {
         let local = vec![FileEntry {
             filename: "pkg-1.0.tar.gz".to_string(),
             sha256: None,
+            ..Default::default()
         }];
         let merged = merge_file_lists(vec![], &local);
         assert_eq!(merged.len(), 1);
@@ -1642,6 +1771,7 @@ mod tests {
         let upstream = vec![FileEntry {
             filename: "pkg-1.0.tar.gz".to_string(),
             sha256: Some("hash".to_string()),
+            ..Default::default()
         }];
         let merged = merge_file_lists(upstream, &[]);
         assert_eq!(merged.len(), 1);
@@ -1662,14 +1792,17 @@ mod tests {
             FileEntry {
                 filename: "torch-1.0.whl".to_string(),
                 sha256: Some("from-A".to_string()),
+                ..Default::default()
             },
             FileEntry {
                 filename: "torch-1.0.whl".to_string(),
                 sha256: Some("from-B".to_string()),
+                ..Default::default()
             },
             FileEntry {
                 filename: "torchvision-1.0.whl".to_string(),
                 sha256: Some("from-B".to_string()),
+                ..Default::default()
             },
         ];
         let merged = merge_file_lists(upstream, &[]);
@@ -1698,11 +1831,11 @@ mod tests {
         ) {
             let upstream: Vec<FileEntry> = upstream_names
                 .iter()
-                .map(|n| FileEntry { filename: n.clone(), sha256: None })
+                .map(|n| FileEntry { filename: n.clone(), sha256: None, ..Default::default() })
                 .collect();
             let local: Vec<FileEntry> = local_names
                 .iter()
-                .map(|n| FileEntry { filename: n.clone(), sha256: Some("L".to_string()) })
+                .map(|n| FileEntry { filename: n.clone(), sha256: Some("L".to_string()), ..Default::default() })
                 .collect();
             let merged = merge_file_lists(upstream, &local);
             // No filename appears twice.
@@ -1717,6 +1850,116 @@ mod tests {
                 prop_assert_eq!(e.unwrap().sha256.as_deref(), Some("L"));
             }
         }
+    }
+
+    // --- PEP 503 / 592 attributes on the proxied index ---
+
+    #[test]
+    fn test_normalize_name_collapses_separator_runs() {
+        assert_eq!(normalize_name("foo__bar"), "foo-bar");
+        assert_eq!(normalize_name("Foo.-Bar"), "foo-bar");
+        assert_eq!(normalize_name("a._-b"), "a-b");
+        assert_eq!(normalize_name("zope.interface"), "zope-interface");
+    }
+
+    #[test]
+    fn test_parse_upstream_files_keeps_requires_python_and_yanked() {
+        let html = concat!(
+            r#"<a href="https://f/pkg-1.0.tar.gz#sha256=aa" data-requires-python="&gt;=3.8,&lt;4">pkg-1.0.tar.gz</a>"#,
+            "\n",
+            r#"<a data-yanked="" href="https://f/pkg-1.1.tar.gz#sha256=bb">pkg-1.1.tar.gz</a>"#,
+            "\n",
+            r#"<a href="https://f/pkg-1.2.tar.gz" data-yanked="broken &amp; bad">pkg-1.2.tar.gz</a>"#,
+            "\n",
+            r#"<a href="https://f/torch-2.4.0%2Bcu124-cp310-none-any.whl">x</a>"#,
+            "\n",
+            r#"<a data-requires-python="<4" href="https://f/pkg-2.0.tar.gz" data-yanked=">old">x</a>"#,
+        );
+        let files = parse_upstream_files(html);
+        assert_eq!(files.len(), 5);
+        // Unescaped `<` / `>` inside attribute values (lenient mirrors).
+        assert_eq!(files[4].requires_python.as_deref(), Some("<4"));
+        assert_eq!(files[4].yanked.as_deref(), Some(">old"));
+        assert_eq!(files[0].requires_python.as_deref(), Some(">=3.8,<4"));
+        assert_eq!(files[0].yanked, None);
+        // An attribute before href belongs to the same anchor.
+        assert_eq!(files[1].yanked.as_deref(), Some(""));
+        assert_eq!(files[1].sha256.as_deref(), Some("bb"));
+        assert_eq!(files[2].yanked.as_deref(), Some("broken & bad"));
+        assert_eq!(files[2].requires_python, None);
+        // #664: the index lists the decoded name, the one the download route matches.
+        assert_eq!(files[3].filename, "torch-2.4.0+cu124-cp310-none-any.whl");
+    }
+
+    #[test]
+    fn test_index_attributes_round_trip_html_and_json() {
+        let files = vec![
+            FileEntry {
+                filename: "pkg-1.0.tar.gz".into(),
+                sha256: Some("aa".into()),
+                requires_python: Some(">=3.8".into()),
+                yanked: None,
+            },
+            FileEntry {
+                filename: "pkg-1.1.tar.gz".into(),
+                yanked: Some(String::new()),
+                ..Default::default()
+            },
+            FileEntry {
+                filename: "pkg-1.2.tar.gz".into(),
+                yanked: Some("bad \"build\"".into()),
+                ..Default::default()
+            },
+        ];
+        let body = |r: Response| {
+            futures::executor::block_on(axum::body::to_bytes(r.into_body(), 1 << 20)).unwrap()
+        };
+
+        let html = body(versions_html_response("pkg", &files, "http://nora"));
+        let html = std::str::from_utf8(&html).unwrap();
+        assert!(
+            html.contains(r#"data-requires-python="&gt;=3.8""#),
+            "{html}"
+        );
+        let parsed = parse_upstream_files(html);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].requires_python.as_deref(), Some(">=3.8"));
+        assert_eq!(parsed[0].sha256.as_deref(), Some("aa"));
+        assert_eq!(parsed[1].yanked.as_deref(), Some(""));
+        assert_eq!(parsed[2].yanked.as_deref(), Some("bad \"build\""));
+
+        let json = body(versions_json_response(
+            "pkg",
+            &files,
+            "http://nora",
+            &Default::default(),
+        ));
+        let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(json["files"][0]["requires-python"], ">=3.8");
+        assert!(json["files"][0].get("yanked").is_none());
+        assert_eq!(json["files"][1]["yanked"], true);
+        assert_eq!(json["files"][2]["yanked"], "bad \"build\"");
+        assert!(json["files"][1].get("requires-python").is_none());
+    }
+
+    #[test]
+    fn test_merge_cached_file_keeps_upstream_attributes() {
+        let upstream = vec![FileEntry {
+            filename: "pkg-1.0.whl".into(),
+            sha256: Some("up".into()),
+            requires_python: Some(">=3.9".into()),
+            yanked: Some("cve".into()),
+        }];
+        let local = vec![FileEntry {
+            filename: "pkg-1.0.whl".into(),
+            sha256: Some("local".into()),
+            ..Default::default()
+        }];
+        let merged = merge_file_lists(upstream, &local);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].sha256.as_deref(), Some("local"));
+        assert_eq!(merged[0].requires_python.as_deref(), Some(">=3.9"));
+        assert_eq!(merged[0].yanked.as_deref(), Some("cve"));
     }
 }
 
@@ -2613,6 +2856,81 @@ mod integration_tests {
              1-file and a 100-file index — {small} vs {large} means the cost scales with N"
         );
     }
+
+    /// A proxied file whose bytes do not match the index `#sha256` is refused with
+    /// 502 and never cached; a matching one is served.
+    #[tokio::test]
+    async fn test_pypi_proxy_rejects_sha256_mismatch() {
+        use crate::test_helpers::create_test_context_with_config;
+        use sha2::Digest;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let good = hex::encode(sha2::Sha256::digest(b"good-bytes"));
+        let index = format!(
+            r#"<a href="{0}/files/pkg-1.0.tar.gz#sha256={1}">a</a><a href="{0}/files/pkg-1.1.tar.gz#sha256={1}">b</a>"#,
+            upstream.uri(),
+            good
+        );
+        Mock::given(method("GET"))
+            .and(path("/pkg/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(index))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/files/pkg-1.0.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(&b"tampered"[..]))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/files/pkg-1.1.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(&b"good-bytes"[..]))
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.pypi.proxy = Some(upstream.uri());
+        });
+
+        let bad = send(&ctx.app, Method::GET, "/simple/pkg/pkg-1.0.tar.gz", "").await;
+        assert_eq!(bad.status(), StatusCode::BAD_GATEWAY);
+        let ok = send(&ctx.app, Method::GET, "/simple/pkg/pkg-1.1.tar.gz", "").await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(body_bytes(ok).await.as_ref(), b"good-bytes");
+
+        // Let the background cache write of the good file land, then check neither
+        // the bad file nor its sidecar was stored.
+        for _ in 0..50 {
+            if ctx
+                .state
+                .storage
+                .stat("pypi/pkg/pkg-1.1.tar.gz")
+                .await
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ctx
+            .state
+            .storage
+            .stat("pypi/pkg/pkg-1.1.tar.gz")
+            .await
+            .is_some());
+        assert!(ctx
+            .state
+            .storage
+            .stat("pypi/pkg/pkg-1.0.tar.gz")
+            .await
+            .is_none());
+        assert!(ctx
+            .state
+            .storage
+            .stat("pypi/pkg/pkg-1.0.tar.gz.sha256")
+            .await
+            .is_none());
+    }
 }
 
 // ============================================================================
@@ -2630,6 +2948,7 @@ mod spec_conformance_tests {
         let files = vec![FileEntry {
             filename: "pkg-1.0.tar.gz".into(),
             sha256: Some("abcdef1234567890".into()),
+            ..Default::default()
         }];
         let response =
             versions_json_response("pkg", &files, "http://nora:4000", &Default::default());
@@ -2655,6 +2974,7 @@ mod spec_conformance_tests {
         let files = vec![FileEntry {
             filename: "pkg-1.0.tar.gz".into(),
             sha256: None,
+            ..Default::default()
         }];
         let response =
             versions_json_response("pkg", &files, "http://nora:4000", &Default::default());
@@ -2694,6 +3014,7 @@ mod spec_conformance_tests {
         let files = vec![FileEntry {
             filename: "pkg-1.0.tar.gz".into(),
             sha256: None,
+            ..Default::default()
         }];
         let response =
             versions_json_response("pkg", &files, "http://nora:4000", &Default::default());
@@ -2730,10 +3051,12 @@ mod spec_conformance_tests {
             FileEntry {
                 filename: "pkg-1.0.tar.gz".into(),
                 sha256: Some("aaa".into()),
+                ..Default::default()
             },
             FileEntry {
                 filename: "pkg-2.0.whl".into(),
                 sha256: Some("bbb".into()),
+                ..Default::default()
             },
         ];
         let response =
@@ -2763,10 +3086,12 @@ mod spec_conformance_tests {
             FileEntry {
                 filename: "requests-2.31.0.tar.gz".into(),
                 sha256: Some("aaa111".into()),
+                ..Default::default()
             },
             FileEntry {
                 filename: "requests-2.31.0-py3-none-any.whl".into(),
                 sha256: Some("bbb222".into()),
+                ..Default::default()
             },
         ];
         let response = versions_html_response("requests", &files, "http://nora:4000");
@@ -2796,6 +3121,7 @@ mod spec_conformance_tests {
         let files = vec![FileEntry {
             filename: "pkg-1.0.tar.gz".into(),
             sha256: Some("abc".into()),
+            ..Default::default()
         }];
         let response =
             versions_json_response("pkg", &files, "http://nora:4000/", &Default::default());
@@ -2848,6 +3174,7 @@ mod spec_conformance_tests {
         let files = vec![FileEntry {
             filename: "pkg-1.0.tar.gz".into(),
             sha256: Some("abc123".into()),
+            ..Default::default()
         }];
         let response =
             versions_json_response("pkg", &files, "http://nora:4000", &Default::default());
