@@ -9,8 +9,9 @@ use crate::config::npm_scope_of;
 use crate::metrics::{METADATA_CORRUPT_TOTAL, PACKUMENT_REBUILT_TOTAL};
 use crate::registry::{
     cache_read, circuit_open_response, method_not_allowed, nora_base_url, proxy_error_response,
-    proxy_fetch, proxy_fetch_conditional, proxy_forward_post, read_validators, validators_key,
-    write_validators, ProxyError, Revalidation, Validators,
+    proxy_fetch, proxy_fetch_bytes, proxy_fetch_conditional, proxy_fetch_shared,
+    proxy_forward_post, read_validators, validators_key, write_validators, ProxyError,
+    Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::AppState;
@@ -835,30 +836,31 @@ async fn handle_request(
         let proxy_url = upstream.url;
         let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
 
-        match proxy_fetch(
+        let fetch = proxy_fetch_bytes(
             &state.http_client,
             &url,
             Duration::from_secs(state.config.npm.proxy_timeout),
             upstream.auth,
             &state.circuit_breaker,
             BreakerScope::upstream(RegistryType::Npm, upstream.url),
-        )
-        .await
-        {
-            Ok(data) => {
+        );
+        match proxy_fetch_shared(&state, &key, "npm", state.config.npm.proxy_timeout, fetch).await {
+            Ok((data, fetched)) => {
                 let data_to_cache;
                 let data_to_serve;
 
                 if is_tarball {
                     // Compute and store sha256
-                    let hash = hex::encode(sha2::Sha256::digest(&data));
-                    let hash_key = format!("{}.sha256", key);
-                    let storage = state.storage.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = storage.put(&hash_key, hash.as_bytes()).await {
-                            tracing::warn!(key = %hash_key, error = ?e, "npm proxy: failed to cache hash sidecar");
-                        }
-                    });
+                    if fetched {
+                        let hash = hex::encode(sha2::Sha256::digest(&data));
+                        let hash_key = format!("{}.sha256", key);
+                        let storage = state.storage.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = storage.put(&hash_key, hash.as_bytes()).await {
+                                tracing::warn!(key = %hash_key, error = ?e, "npm proxy: failed to cache hash sidecar");
+                            }
+                        });
+                    }
 
                     state.metrics.record_download("npm");
                     state.metrics.record_cache_miss("npm");
@@ -888,6 +890,7 @@ async fn handle_request(
                             replace_upstream_bytes(&data, upstream_trimmed, &nora_npm_base)
                         });
 
+                    let rewritten = Bytes::from(rewritten);
                     data_to_cache = rewritten.clone();
                     data_to_serve = rewritten;
                 }
@@ -903,7 +906,9 @@ async fn handle_request(
                 // still served for this request; only the write is skipped, so the next
                 // request retries the rebuild instead of finding a wrong document cached.
                 let owns_key_locally = !is_tarball && local_versions;
-                if owns_key_locally {
+                if !fetched {
+                    // A concurrent request fetched these bytes and caches them.
+                } else if owns_key_locally {
                     tracing::warn!(
                         registry = "npm",
                         key = %key,
@@ -925,7 +930,7 @@ async fn handle_request(
                     let origin = origin_of(proxy_url);
                     tokio::spawn(async move {
                         if let Err(e) =
-                            put_with_origin(&storage, &key_clone, &data_to_cache, &origin).await
+                            put_with_origin(&storage, &key_clone, data_to_cache, &origin).await
                         {
                             tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache artifact");
                         } else if invalidate_npm {
@@ -960,9 +965,9 @@ async fn handle_request(
                     }
                 }
                 if is_tarball {
-                    return with_content_type(true, data_to_serve.into()).into_response();
+                    return with_content_type(true, data_to_serve).into_response();
                 }
-                return packument_response(&headers, data_to_serve.into());
+                return packument_response(&headers, data_to_serve);
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
             // The upstream answered "no such package": a real 404.
@@ -1009,11 +1014,12 @@ fn origin_of(upstream_url: &str) -> String {
 async fn put_with_origin(
     storage: &crate::Storage,
     key: &str,
-    data: &[u8],
+    data: impl Into<Bytes>,
     origin: &str,
 ) -> Result<(), crate::storage::StorageError> {
-    storage.put(key, data).await?;
-    let record = provenance_record(origin, data);
+    let data = data.into();
+    let record = provenance_record(origin, &data);
+    storage.put_bytes(key, data).await?;
     if let Err(e) = storage.put(&origin_key(key), record.as_bytes()).await {
         tracing::warn!(key = %key, error = ?e, "npm: failed to record cache provenance");
     }
@@ -1175,7 +1181,7 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
                     let body = cached.clone();
                     let origin = origin_of(proxy_url);
                     tokio::spawn(async move {
-                        let _ = put_with_origin(&storage, &key_clone, &body, &origin).await;
+                        let _ = put_with_origin(&storage, &key_clone, body, &origin).await;
                     });
                     Some(cached.to_vec())
                 }
@@ -1219,7 +1225,7 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
             tokio::spawn(async move {
                 // Body first; the validator sidecar must never advertise
                 // freshness for a body that isn't there (#596).
-                if let Err(e) = put_with_origin(&storage, &key_clone, &cache_data, &origin).await {
+                if let Err(e) = put_with_origin(&storage, &key_clone, cache_data, &origin).await {
                     tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache metadata");
                     return;
                 }
@@ -1857,7 +1863,7 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
             let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
             replace_upstream_bytes(&data, upstream_trimmed, &nora_npm_base)
         });
-        let _ = put_with_origin(&state.storage, &key, &rewritten, &origin_of(proxy_url)).await;
+        let _ = put_with_origin(&state.storage, &key, rewritten, &origin_of(proxy_url)).await;
     }
 }
 

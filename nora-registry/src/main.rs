@@ -306,7 +306,7 @@ impl AppState {
         let repo_index = Arc::clone(&self.repo_index);
         tokio::spawn(
             std::panic::AssertUnwindSafe(async move {
-                match storage.put(&key, &data).await {
+                match storage.put_bytes(&key, data).await {
                     Ok(()) => repo_index.invalidate(registry),
                     Err(e) => record_cache_write_error(registry, &key, &e),
                 }
@@ -329,7 +329,7 @@ impl AppState {
                 if storage.stat(&key).await.is_some() {
                     return;
                 }
-                match storage.put(&key, &data).await {
+                match storage.put_bytes(&key, data).await {
                     Ok(()) => repo_index.invalidate(registry),
                     Err(e) => record_cache_write_error(registry, &key, &e),
                 }

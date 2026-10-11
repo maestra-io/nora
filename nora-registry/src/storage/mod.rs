@@ -111,6 +111,11 @@ pub trait StorageBackend: Send + Sync {
     /// Store `data` under `key`, pinned to `sha256`. Fails closed: a body whose
     /// pin cannot be recorded is reported as a failed write (#582/#604).
     async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()>;
+    /// [`put`](Self::put) taking ownership of the body, so a backend that
+    /// uploads `Bytes` as-is (object stores) needs no copy.
+    async fn put_bytes(&self, key: &str, data: Bytes, sha256: &str) -> Result<()> {
+        self.put(key, &data, sha256).await
+    }
     /// Bytes plus the recorded pin, from ONE backend round-trip. `None` means
     /// the object carries no pin (open-world).
     async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)>;
@@ -267,12 +272,18 @@ impl Storage {
     }
 
     pub async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.put_bytes(key, Bytes::copy_from_slice(data)).await
+    }
+
+    /// [`put`](Self::put) for a body already held as `Bytes`: it is hashed and
+    /// uploaded from that one refcounted buffer, never copied.
+    pub async fn put_bytes(&self, key: &str, data: Bytes) -> Result<()> {
         validate_storage_key(key)?;
         // A buffered body can be large; hashing it inline would stall the tokio
         // worker for the hash duration, so the digest is computed on the
         // blocking pool. The backend records it together with the bytes, so a
         // completed `put()` is never readable-but-unpinned (#604).
-        let buffered = data.to_vec();
+        let buffered = data.clone();
         let hash = match tokio::task::spawn_blocking(move || sha256_hex(&buffered)).await {
             Ok(h) => h,
             Err(e) => {
@@ -285,7 +296,7 @@ impl Storage {
                 ))));
             }
         };
-        match self.inner.put(key, data, &hash).await {
+        match self.inner.put_bytes(key, data, &hash).await {
             Ok(()) => {
                 STORAGE_OPERATIONS.with_label_values(&["put", "ok"]).inc();
                 Ok(())

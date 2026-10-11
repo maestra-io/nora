@@ -17,8 +17,9 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::config::UpstreamAuth;
 use crate::registry::{
-    cache_read, nora_base_url, proxy_error_response, proxy_fetch, proxy_fetch_conditional,
-    proxy_fetch_text, read_validators, write_validators, ProxyError, Revalidation, Validators,
+    cache_read, nora_base_url, proxy_error_response, proxy_fetch_bytes, proxy_fetch_conditional,
+    proxy_fetch_shared, proxy_fetch_text, read_validators, write_validators, ProxyError,
+    Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -1030,7 +1031,7 @@ async fn flatcontainer_download(
                 (header::CONTENT_TYPE, content_type),
                 (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
             ],
-            data.to_vec(),
+            data,
         )
             .into_response();
         if ends_with_ci(filename, ".nupkg") {
@@ -1061,17 +1062,24 @@ async fn flatcontainer_download(
         filename.to_lowercase()
     );
 
-    match proxy_fetch(
+    let fetch = proxy_fetch_bytes(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.nuget.proxy_timeout),
         expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Nuget,
+    );
+    match proxy_fetch_shared(
+        &state,
+        &storage_key,
+        "nuget",
+        state.config.nuget.proxy_timeout,
+        fetch,
     )
     .await
     {
-        Ok(bytes) => {
+        Ok((bytes, fetched)) => {
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
@@ -1084,7 +1092,9 @@ async fn flatcontainer_download(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "proxy", "", "nuget", ""));
 
-            state.spawn_cache_immutable("nuget", storage_key, Bytes::from(bytes.clone()));
+            if fetched {
+                state.spawn_cache_immutable("nuget", storage_key, bytes.clone());
+            }
 
             // Best-effort: fetch flatcontainer index.json if missing (for local search)
             if ends_with_ci(filename, ".nupkg") {
@@ -1149,7 +1159,7 @@ async fn flatcontainer_download(
                     (header::CONTENT_TYPE, content_type),
                     (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
                 ],
-                bytes.to_vec(),
+                bytes,
             )
                 .into_response()
         }
@@ -1948,6 +1958,53 @@ mod tests {
 mod integration_tests {
     use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
     use axum::http::{Method, StatusCode};
+
+    /// N concurrent restores of an uncached .nupkg: one upstream download, every
+    /// client gets the package, and it is cached.
+    #[tokio::test]
+    async fn test_concurrent_cold_nupkg_misses_fetch_once() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"nupkg-bytes".to_vec())
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(upstream.uri());
+        });
+        let uri = "/nuget/v3/flatcontainer/coldpkg/1.0.0/coldpkg.1.0.0.nupkg";
+
+        let resps =
+            futures::future::join_all((0..6).map(|_| send(&ctx.app, Method::GET, uri, ""))).await;
+        for resp in resps {
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(&body_bytes(resp).await[..], b"nupkg-bytes");
+        }
+        let nupkg_fetches = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with(".nupkg"))
+            .count();
+        assert_eq!(nupkg_fetches, 1);
+
+        let key = "nuget/flatcontainer/coldpkg/1.0.0/coldpkg.1.0.0.nupkg";
+        for _ in 0..50 {
+            if ctx.state.storage.stat(key).await.is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("nupkg was not cached");
+    }
 
     #[tokio::test]
     async fn test_nuget_disabled_returns_404() {
