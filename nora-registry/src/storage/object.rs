@@ -424,9 +424,14 @@ fn map_err(e: object_store::Error) -> StorageError {
 #[async_trait]
 impl StorageBackend for ObjectStorage {
     async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()> {
+        self.put_bytes(key, Bytes::copy_from_slice(data), sha256)
+            .await
+    }
+
+    async fn put_bytes(&self, key: &str, data: Bytes, sha256: &str) -> Result<()> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
-        let payload = PutPayload::from(data.to_vec());
+        let payload = PutPayload::from(data);
         let opts = PutOptions {
             attributes: pin_attributes(sha256),
             ..Default::default()
@@ -689,6 +694,9 @@ impl StorageBackend for ObjectStorage {
             if n == 0 {
                 break;
             }
+            // Backpressure: without this the read loop outruns the upload and
+            // queues the whole file as in-flight parts in RAM.
+            writer.wait_for_capacity(8).await.map_err(map_err)?;
             writer.write(&buf[..n]);
         }
         writer.finish().await.map_err(map_err)?;
@@ -767,6 +775,41 @@ impl StorageBackend for ObjectStorage {
 mod tests {
     use super::*;
     use sha2::Digest;
+
+    /// `put_bytes` uploads the caller's buffer as-is and records the pin; `put`
+    /// (slice) goes through it, so both read back identically.
+    #[tokio::test]
+    async fn test_put_bytes_roundtrip_with_pin() {
+        let storage = ObjectStorage::in_memory();
+        let data = Bytes::from_static(b"package-bytes");
+        storage
+            .put_bytes("a/b.tgz", data.clone(), "abc")
+            .await
+            .unwrap();
+        storage.put("a/c.tgz", &data, "def").await.unwrap();
+        let (got, pin) = storage.get("a/b.tgz").await.unwrap();
+        assert_eq!((got, pin.as_deref()), (data.clone(), Some("abc")));
+        let (got, pin) = storage.get("a/c.tgz").await.unwrap();
+        assert_eq!((got, pin.as_deref()), (data, Some("def")));
+    }
+
+    /// A file spanning many multipart parts uploads whole now that the read loop
+    /// waits for part capacity instead of queueing every part in RAM.
+    #[tokio::test]
+    async fn test_put_from_path_multipart_roundtrip() {
+        let storage = ObjectStorage::in_memory();
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("big.bin");
+        let data: Vec<u8> = (0..23 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        tokio::fs::write(&src, &data).await.unwrap();
+        storage
+            .put_from_path("raw/big.bin", &src, None)
+            .await
+            .unwrap();
+        let (got, _) = storage.get("raw/big.bin").await.unwrap();
+        assert_eq!(got.len(), data.len());
+        assert!(got == data);
+    }
 
     #[test]
     fn test_backend_name() {
