@@ -42,6 +42,7 @@ pub use npm::routes as npm_routes;
 pub(crate) use maven::storage_key as maven_storage_key;
 pub use nuget::alias_routes as nuget_alias_routes;
 pub use nuget::routes as nuget_routes;
+pub(crate) use nuget::HostedIndex as NugetHostedIndex;
 pub use pub_dart::routes as pub_dart_routes;
 pub use pypi::routes as pypi_routes;
 // Retention retires a PyPI file's hash markers together with the file.

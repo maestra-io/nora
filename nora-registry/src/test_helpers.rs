@@ -323,6 +323,13 @@ fn build_context_with(
     } else {
         None
     };
+    // OIDC-enabled configs get a live validator (the JWKS is fetched lazily).
+    let oidc = config.auth.oidc.is_active().then(|| {
+        Arc::new(crate::auth::OidcValidator::new(
+            config.auth.oidc.clone(),
+            reqwest::Client::new(),
+        ))
+    });
     let state = AppState {
         storage,
         config: Arc::new(config),
@@ -341,7 +348,7 @@ fn build_context_with(
         publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         reloadable,
         auth_failures: Arc::new(crate::auth::AuthFailureTracker::new(5, 900)),
-        oidc: None,
+        oidc,
         circuit_breaker: Arc::new(crate::circuit_breaker::CircuitBreakerRegistry::new(
             cb_config,
         )),
@@ -351,6 +358,7 @@ fn build_context_with(
         signer,
         leak_finders,
         cancel_token: tokio_util::sync::CancellationToken::new(),
+        nuget_hosted: Default::default(),
     };
 
     // Build router identical to run_server() but without TcpListener / rate-limiting
