@@ -1,18 +1,22 @@
 name: Maestra CI
 
 # fmt, clippy, cargo test, RustSec advisories and the vendored chart on PRs into
-# our default branch. Upstream's CI only targets main, which in this fork is the
-# untouched upstream mirror (see MAESTRA.md).
+# our default branch, and on pushes to it so a red merge commit is visible.
+# Upstream's CI only targets main, which in this fork is the untouched upstream
+# mirror (see MAESTRA.md).
 
 on:
   pull_request:
+    branches: [maestra/main]
+  push:
     branches: [maestra/main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: maestra-ci-${{ github.ref }}
+  # Per commit on main (each merge gets its own result), per ref on PRs.
+  group: maestra-ci-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: true
 
 jobs:
