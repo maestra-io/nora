@@ -33,13 +33,16 @@ impl HtpasswdAuth {
         }
     }
 
-    /// Verify username and password
-    pub fn authenticate(&self, username: &str, password: &str) -> bool {
-        if let Some(hash) = self.users.get(username) {
-            bcrypt::verify(password, hash).unwrap_or(false)
-        } else {
-            false
-        }
+    /// Verify username and password. bcrypt runs on the blocking pool: at the
+    /// default cost a verify is ~250 ms of CPU, which would stall a tokio worker.
+    pub async fn authenticate(&self, username: &str, password: &str) -> bool {
+        let Some(hash) = self.users.get(username).cloned() else {
+            return false;
+        };
+        let password = password.to_string();
+        tokio::task::spawn_blocking(move || bcrypt::verify(password, &hash).unwrap_or(false))
+            .await
+            .unwrap_or(false)
     }
 
     /// Get list of usernames
@@ -96,27 +99,27 @@ mod tests {
         assert_eq!(auth.list_users().len(), 1);
     }
 
-    #[test]
-    fn test_authenticate_valid() {
+    #[tokio::test]
+    async fn test_authenticate_valid() {
         let file = create_test_htpasswd(&[("test", "secret")]);
         let auth = HtpasswdAuth::from_file(file.path()).unwrap();
 
-        assert!(auth.authenticate("test", "secret"));
+        assert!(auth.authenticate("test", "secret").await);
     }
 
-    #[test]
-    fn test_authenticate_invalid_password() {
+    #[tokio::test]
+    async fn test_authenticate_invalid_password() {
         let file = create_test_htpasswd(&[("test", "secret")]);
         let auth = HtpasswdAuth::from_file(file.path()).unwrap();
 
-        assert!(!auth.authenticate("test", "wrong"));
+        assert!(!auth.authenticate("test", "wrong").await);
     }
 
-    #[test]
-    fn test_authenticate_unknown_user() {
+    #[tokio::test]
+    async fn test_authenticate_unknown_user() {
         let file = create_test_htpasswd(&[("test", "secret")]);
         let auth = HtpasswdAuth::from_file(file.path()).unwrap();
 
-        assert!(!auth.authenticate("unknown", "secret"));
+        assert!(!auth.authenticate("unknown", "secret").await);
     }
 }

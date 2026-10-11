@@ -274,27 +274,37 @@ pub async fn auth_middleware(
         let open = is_public_path(path)
             || (is_web_surface(path) && (config.anonymous_read || config.public_web_ui))
             || (path == "/metrics" && config.public_metrics);
+        // Probes and metrics never validate credentials: a Basic header there
+        // would buy any client an unlimited, unauthenticated bcrypt per request.
+        let is_probe = matches!(path, "/health" | "/ready" | "/metrics");
         if open {
             // Opportunistic auth: if the caller provided credentials on an
             // open path, try to validate them so downstream handlers can
             // distinguish "anonymous browse" from "authenticated browse"
             // (e.g. to gate proxy_upstreams disclosure). If validation fails
             // we fall through to anonymous — the path is open regardless.
+            let client_ip = extract_client_ip(&request, &state.config.auth.trusted_proxies);
+            let blocked =
+                client_ip.is_some_and(|ip| state.auth_failures.check_blocked(&ip).is_some());
             if let Some(auth_val) = request
                 .headers()
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|h| h.to_str().ok())
+                .filter(|_| !is_probe && !blocked)
             {
                 if let Some(encoded) = auth_val.strip_prefix("Basic ") {
-                    if let Some(username) = try_basic_auth(encoded, state.auth.as_deref()) {
+                    if let Some((username, role)) = try_basic_auth(encoded, &state).await {
                         request
                             .extensions_mut()
                             .insert(NamespaceAuthority::Unrestricted);
                         request.extensions_mut().insert(AuthenticatedUser(username));
-                        request
-                            .extensions_mut()
-                            .insert(AuthenticatedRole(crate::tokens::Role::Write));
+                        request.extensions_mut().insert(AuthenticatedRole(role));
                         return next.run(request).await;
+                    }
+                    // A wrong Basic credential counts toward lockout here too,
+                    // or the open path is an unthrottled password oracle.
+                    if let Some(ip) = client_ip {
+                        state.auth_failures.record_failure(ip);
                     }
                 } else if let Some(token) = auth_val.strip_prefix("Bearer ") {
                     if let Some(ref token_store) = state.tokens {
@@ -557,11 +567,11 @@ pub async fn auth_middleware(
         return unauthorized_response("Basic or Bearer authentication required", realm);
     }
 
-    // htpasswd provider required for Basic auth
-    let auth = match &state.auth {
-        Some(auth) => auth,
-        None => return unauthorized_response("Basic auth not configured", realm),
-    };
+    // Basic carries either an htpasswd password or an API token (#736): it is
+    // unusable only when neither store is configured.
+    if state.auth.is_none() && state.tokens.is_none() {
+        return unauthorized_response("Basic auth not configured", realm);
+    }
 
     let encoded = &auth_header[6..];
     let decoded = match STANDARD.decode(encoded) {
@@ -583,7 +593,10 @@ pub async fn auth_middleware(
     // token (`nra_…`). Docker, twine and Maven send the token as the Basic-auth
     // password and never use Bearer (the `/v2/` challenge is Basic), so the Basic
     // path must fall through to token verification for token auth to work at all. (#736)
-    if !auth.authenticate(username, password) {
+    // A token-shaped password goes to the token store first: CI sending
+    // `<htpasswd user>:nra_…` must not pay a bcrypt on every request.
+    let token_first = password.starts_with("nra_");
+    if token_first || !htpasswd_ok(state.auth.as_deref(), username, password).await {
         let token_result = state.tokens.as_ref().map(|ts| ts.verify_token(password));
         // Same fail-closed rule as the Bearer path: a store I/O/parse failure is
         // not "wrong password". A 401 here makes valid token creds flap and feeds
@@ -625,10 +638,12 @@ pub async fn auth_middleware(
             request.extensions_mut().insert(AuthenticatedRole(role));
             return next.run(request).await;
         }
-        if let Some(ip) = client_ip {
-            state.auth_failures.record_failure(ip);
+        if !(token_first && htpasswd_ok(state.auth.as_deref(), username, password).await) {
+            if let Some(ip) = client_ip {
+                state.auth_failures.record_failure(ip);
+            }
+            return unauthorized_response("Invalid username or password", realm);
         }
-        return unauthorized_response("Invalid username or password", realm);
     }
 
     // Auth successful — clear failure counter
@@ -671,21 +686,32 @@ fn basic_token_as_bearer(headers: &HeaderMap) -> Option<axum::http::HeaderValue>
     axum::http::HeaderValue::from_str(&format!("Bearer {password}")).ok()
 }
 
+async fn htpasswd_ok(auth: Option<&HtpasswdAuth>, username: &str, password: &str) -> bool {
+    match auth {
+        Some(auth) => auth.authenticate(username, password).await,
+        None => false,
+    }
+}
+
 /// Attempt to validate a Base64-encoded Basic auth credential against the
-/// htpasswd store. Returns the username on success, `None` on any failure.
+/// token store (`nra_` passwords) and the htpasswd store. Returns the
+/// identity and role on success, `None` on any failure.
 /// Used by the opportunistic-auth path on open web surfaces so that
 /// authenticated users get their real identity even on publicly browsable
 /// pages.
-fn try_basic_auth(encoded: &str, auth: Option<&HtpasswdAuth>) -> Option<String> {
+async fn try_basic_auth(encoded: &str, state: &AppState) -> Option<(String, crate::tokens::Role)> {
     use base64::{engine::general_purpose::STANDARD, Engine};
     let decoded = String::from_utf8(STANDARD.decode(encoded).ok()?).ok()?;
     let (username, password) = decoded.split_once(':')?;
-    let htpasswd = auth?;
-    if htpasswd.authenticate(username, password) {
-        Some(username.to_string())
-    } else {
-        None
+    // An API token as the password is checked first, without paying a bcrypt.
+    if password.starts_with("nra_") {
+        if let Some(Ok(identity)) = state.tokens.as_ref().map(|ts| ts.verify_token(password)) {
+            return Some(identity);
+        }
     }
+    htpasswd_ok(state.auth.as_deref(), username, password)
+        .await
+        .then(|| (username.to_string(), crate::tokens::Role::Write))
 }
 
 fn unauthorized_response(message: &str, realm: &str) -> Response {
@@ -2452,43 +2478,166 @@ mod web_surface_gating_tests {
     // -- #934: opportunistic auth on open web surfaces --
 
     /// try_basic_auth returns the username for valid htpasswd credentials.
-    #[test]
-    fn test_try_basic_auth_valid() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("htpasswd");
-        let hash = bcrypt::hash("secret", 4).unwrap();
-        std::fs::write(&path, format!("admin:{hash}\n")).unwrap();
-        let htpasswd = super::HtpasswdAuth::from_file(&path).unwrap();
+    #[tokio::test]
+    async fn test_try_basic_auth_valid() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
         let encoded = STANDARD.encode("admin:secret");
         assert_eq!(
-            super::try_basic_auth(&encoded, Some(&htpasswd)),
-            Some("admin".to_string())
+            super::try_basic_auth(&encoded, &ctx.state).await,
+            Some(("admin".to_string(), crate::tokens::Role::Write))
         );
     }
 
     /// try_basic_auth returns None for wrong password.
-    #[test]
-    fn test_try_basic_auth_wrong_password() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("htpasswd");
-        let hash = bcrypt::hash("secret", 4).unwrap();
-        std::fs::write(&path, format!("admin:{hash}\n")).unwrap();
-        let htpasswd = super::HtpasswdAuth::from_file(&path).unwrap();
+    #[tokio::test]
+    async fn test_try_basic_auth_wrong_password() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
         let encoded = STANDARD.encode("admin:wrong");
-        assert_eq!(super::try_basic_auth(&encoded, Some(&htpasswd)), None);
+        assert_eq!(super::try_basic_auth(&encoded, &ctx.state).await, None);
     }
 
     /// try_basic_auth returns None when no htpasswd store is available.
-    #[test]
-    fn test_try_basic_auth_no_store() {
+    #[tokio::test]
+    async fn test_try_basic_auth_no_store() {
+        let ctx = create_test_context_with_auth(&[]);
         let encoded = STANDARD.encode("admin:secret");
-        assert_eq!(super::try_basic_auth(&encoded, None), None);
+        assert_eq!(super::try_basic_auth(&encoded, &ctx.state).await, None);
     }
 
     /// try_basic_auth returns None for garbage base64.
+    #[tokio::test]
+    async fn test_try_basic_auth_invalid_base64() {
+        let ctx = create_test_context_with_auth(&[]);
+        assert_eq!(
+            super::try_basic_auth("%%%not-base64%%%", &ctx.state).await,
+            None
+        );
+    }
+
+    /// A bcrypt hash at cost 31: verifying it takes days, so any test that
+    /// finishes while this user is in htpasswd proves bcrypt never ran.
+    fn unverifiable_hash() -> String {
+        bcrypt::hash("irrelevant", 4)
+            .unwrap()
+            .replacen("$04$", "$31$", 1)
+    }
+
+    /// Run `f` on its own runtime with a deadline; on timeout the runtime is
+    /// abandoned instead of joined, so a stray bcrypt fails the test, not hangs it.
+    fn within_deadline<F: std::future::Future<Output = ()>>(f: F) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt
+            .block_on(async { tokio::time::timeout(std::time::Duration::from_secs(10), f).await });
+        rt.shutdown_background();
+        assert!(res.is_ok(), "request ran an htpasswd bcrypt verify");
+    }
+
+    /// An `nra_` token as the Basic password works when no htpasswd is loaded
+    /// (missing or empty file): the token store does not depend on htpasswd.
+    #[tokio::test]
+    async fn test_basic_api_token_without_htpasswd() {
+        let ctx = create_test_context_with_auth(&[]);
+        assert!(ctx.state.auth.is_none());
+        let token = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("ci", 30, None, crate::tokens::Role::Write)
+            .unwrap();
+        let good = format!("Basic {}", STANDARD.encode(format!("token:{token}")));
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/t.txt",
+            vec![("authorization", &good)],
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bad = format!("Basic {}", STANDARD.encode("token:nra_bogus"));
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/t.txt",
+            vec![("authorization", &bad)],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `<htpasswd user>:nra_…` (a nuget.config/pip.conf with username `admin`)
+    /// is checked against the token store first and never pays a bcrypt.
     #[test]
-    fn test_try_basic_auth_invalid_base64() {
-        assert_eq!(super::try_basic_auth("%%%not-base64%%%", None), None);
+    fn test_basic_api_token_skips_bcrypt_for_htpasswd_user() {
+        let hash = unverifiable_hash();
+        let ctx = create_test_context_with_auth(&[("admin", hash.as_str())]);
+        let token = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("admin", 30, None, crate::tokens::Role::Write)
+            .unwrap();
+        let header_val = format!("Basic {}", STANDARD.encode(format!("admin:{token}")));
+        within_deadline(async {
+            for path in ["/raw/t.txt", "/"] {
+                let resp = send_with_headers(
+                    &ctx.app,
+                    Method::PUT,
+                    path,
+                    vec![("authorization", &header_val)],
+                    b"x".to_vec(),
+                )
+                .await;
+                assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+            }
+        });
+    }
+
+    /// Probes never validate a Basic header: no bcrypt, no lockout bookkeeping.
+    #[test]
+    fn test_probe_ignores_basic_credentials() {
+        let hash = unverifiable_hash();
+        let ctx = create_test_context_with_auth(&[("admin", hash.as_str())]);
+        let header_val = format!("Basic {}", STANDARD.encode("admin:wrong"));
+        within_deadline(async {
+            for _ in 0..6 {
+                let resp = send_with_headers(
+                    &ctx.app,
+                    Method::GET,
+                    "/health",
+                    vec![("authorization", &header_val)],
+                    "",
+                )
+                .await;
+                assert_eq!(resp.status(), StatusCode::OK);
+            }
+        });
+        let ip: std::net::IpAddr = [127, 0, 0, 1].into();
+        assert!(ctx.state.auth_failures.check_blocked(&ip).is_none());
+    }
+
+    /// A wrong Basic credential on an open path counts toward the lockout, and
+    /// once locked the open path stops validating (no more bcrypt) but stays open.
+    #[tokio::test]
+    async fn test_open_path_bad_basic_counts_toward_lockout() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let header_val = format!("Basic {}", STANDARD.encode("admin:wrong"));
+        for _ in 0..5 {
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/",
+                vec![("authorization", &header_val)],
+                "",
+            )
+            .await;
+            assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+        let ip: std::net::IpAddr = [127, 0, 0, 1].into();
+        assert!(ctx.state.auth_failures.check_blocked(&ip).is_some());
     }
 
     /// On an open web surface (anonymous_read=true), valid Basic credentials
