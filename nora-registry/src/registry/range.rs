@@ -143,8 +143,9 @@ pub(crate) async fn range_response(
     extra: &[(HeaderName, String)],
 ) -> Option<Response> {
     let (start, end) = match requested_range(headers, size) {
-        Ok(range) => range,
-        Err(answer) => return answer,
+        ParsedRange::Satisfiable(start, end) => (start, end),
+        ParsedRange::Unsatisfiable => return Some(range_not_satisfiable(size)),
+        ParsedRange::None => return None,
     };
 
     let mut reader = None;
@@ -169,32 +170,31 @@ pub(crate) fn range_response_from_bytes(
 ) -> Option<Response> {
     let size = data.len() as u64;
     let (start, end) = match requested_range(headers, size) {
-        Ok(range) => range,
-        Err(answer) => return answer,
+        ParsedRange::Satisfiable(start, end) => (start, end),
+        ParsedRange::Unsatisfiable => return Some(range_not_satisfiable(size)),
+        ParsedRange::None => return None,
     };
     // `start <= end < size` (see `byte_range_core`), so the slice is in bounds.
     let body = Body::from(data.slice(start as usize..=end as usize));
     Some(partial_content(start, end, size, content_type, extra, body))
 }
 
-/// The inclusive range the `Range` header asks for, or the finished answer when there
-/// is nothing to slice: `Err(None)` serves the full 200, `Err(Some(416))`.
-fn requested_range(headers: &HeaderMap, size: u64) -> Result<(u64, u64), Option<Response>> {
-    let Some(value) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) else {
-        return Err(None);
-    };
-    match parse_byte_range(value, size) {
-        ParsedRange::Satisfiable(start, end) => Ok((start, end)),
-        ParsedRange::Unsatisfiable => Err(Some(
-            Response::builder()
-                .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                .header(header::CONTENT_RANGE, format!("bytes */{}", size))
-                .header(header::ACCEPT_RANGES, "bytes")
-                .body(Body::empty())
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
-        )),
-        ParsedRange::None => Err(None),
+/// The `Range` header of `headers` matched against an object of `size` bytes.
+fn requested_range(headers: &HeaderMap, size: u64) -> ParsedRange {
+    match headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
+        Some(value) => parse_byte_range(value, size),
+        None => ParsedRange::None,
     }
+}
+
+/// The 416 for a range that starts past the end of a `size`-byte object.
+fn range_not_satisfiable(size: u64) -> Response {
+    Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(header::CONTENT_RANGE, format!("bytes */{}", size))
+        .header(header::ACCEPT_RANGES, "bytes")
+        .body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// The 206 for bytes `start..=end` of a `size`-byte object.

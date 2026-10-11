@@ -201,7 +201,7 @@ async fn handle(
                 // itself (docker did the same in #657). An absent/malformed range falls
                 // through to the full 200.
                 if let Some(response) = crate::registry::range::range_response_from_bytes(
-                    &data,
+                    data,
                     &headers,
                     content_type,
                     &[(
