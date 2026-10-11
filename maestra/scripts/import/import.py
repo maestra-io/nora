@@ -90,12 +90,16 @@ def download(url, workdir):
     hs = [hashlib.sha1(), hashlib.sha256(), hashlib.sha512()]
     fd, path = tempfile.mkstemp(dir=workdir)
     size = 0
-    with os.fdopen(fd, "wb") as f:
-        for chunk in r.iter_content(1 << 20):
-            f.write(chunk)
-            size += len(chunk)
-            for h in hs:
-                h.update(chunk)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            for chunk in r.iter_content(1 << 20):
+                f.write(chunk)
+                size += len(chunk)
+                for h in hs:
+                    h.update(chunk)
+    except BaseException:
+        os.unlink(path)  # a partial download must not keep its disk space (ENOSPC)
+        raise
     return path, size, hs[0].hexdigest(), hs[1].hexdigest(), hs[2].digest()
 
 
@@ -155,7 +159,7 @@ def nuget_pkg(p, st, a):
                     raise Failed(f"unlist HTTP {r.status_code} {r.text[:200]}")
                 st.put(key + ":unlisted", "pushed")
                 log("nuget", p["id"], ver, "unlisted")
-        except Failed as e:
+        except (Failed, OSError) as e:
             st.put(key, "failed", reason=str(e))
             log("nuget", p["id"], ver, "failed", 0, time.monotonic() - t0, str(e))
 
@@ -200,7 +204,7 @@ def npm_pkg(p, st, a):
                 os.unlink(path)
             st.put(key, status, size=size)
             log("npm", name, ver, status, size, time.monotonic() - t0, short)
-        except Failed as e:
+        except (Failed, OSError) as e:
             st.put(key, "failed", reason=str(e))
             log("npm", name, ver, "failed", 0, time.monotonic() - t0, str(e))
     if a.dry_run:
@@ -242,7 +246,7 @@ def pypi_pkg(p, st, a):
                 os.unlink(path)
             st.put(key, status, size=size)
             log("pypi", p["name"], v["filename"], status, size, time.monotonic() - t0)
-        except Failed as e:
+        except (Failed, OSError) as e:
             st.put(key, "failed", reason=str(e))
             log("pypi", p["name"], v["filename"], "failed", 0, time.monotonic() - t0, str(e))
 
