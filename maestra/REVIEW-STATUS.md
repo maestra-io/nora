@@ -2,12 +2,12 @@
 
 Contract for the second review round: every confirmed finding of the two round-one reviews and where it stands on `maestra/main`.
 
-- **C01–C88**: codebase review of upstream nora. **N01–N23**: review of our hosted NuGet feed (#1). PR bodies #3–#12 number findings from 0, so `#k` there is `C(k+1)` / `N(k+1)` here.
+- **C01–C88**: codebase review of upstream nora. **N01–N23**: review of our hosted NuGet feed (#1). **Q01–Q03**: quarantine/cooldown live test on 11.10.2026. PR bodies #3–#12 number findings from 0, so `#k` there is `C(k+1)` / `N(k+1)` here.
 - **Status**: `fixed #N` (merged PR), `partial #N → r2/<area>` (what remains is in Notes), `open → r2/<area>` (round-two branch), `not-applicable` (reason in Notes).
-- Round-two branches: `r2/auth`, `r2/storage`, `r2/npm`, `r2/pypi`, `r2/proxy`, `r2/http`, `r2/ops`, `r2/supply`, `r2/nuget-hosted`, `r2/chart` (vendored Helm chart under `maestra/charts/nora`).
+- Round-two branches: `r2/auth`, `r2/storage`, `r2/npm`, `r2/pypi`, `r2/proxy`, `r2/http`, `r2/ops`, `r2/supply`, `r2/nuget-hosted`, `r2/curation`, `r2/chart` (vendored Helm chart under `maestra/charts/nora`).
 - The last round-two PR updates this file so every row is `fixed` or `not-applicable`.
 
-Counts: fixed 47, partial 22, open 40, not-applicable 2 (total 111).
+Counts: fixed 47, partial 22, open 43, not-applicable 2 (total 114).
 
 ## Codebase review (88)
 
@@ -61,7 +61,7 @@ Counts: fixed 47, partial 22, open 40, not-applicable 2 (total 111).
 | C46 | critical | proxy | NuGet cold cache miss turns any upstream failure (5xx/timeout/network) into 404; metadata fetches get a 2 s total timeout with no retry (`nora-registry/src/registry/nuget.rs:1152`) | partial #12 → r2/proxy | 5xx mapping and stale-on-error done. Remains: retry in `proxy_fetch_conditional`, 2 s default `metadata_proxy_timeout`. |
 | C47 | critical | proxy | Helm chart never renders auth.trusted_proxies: behind traefik every client shares one rate-limit bucket and one auth-lockout bucket (`nora-registry/src/rate_limit.rs:51`) | partial #7 → r2/chart | Code keying + WARN done; env tested. Remains: chart renders `trusted_proxies`. |
 | C48 | major | proxy | No single-flight on cold misses for NuGet/npm/PyPI artifacts: N concurrent restores = N upstream fetches, each body held 3x in RAM (`nora-registry/src/registry/nuget.rs:1046`) | partial #5 → r2/proxy | Artifacts single-flight. Remains: NuGet registration/version-list metadata cold misses. |
-| C49 | major | proxy | Cache mtime is used as the 'publish date' for quarantine and min-release-age when trust_upstream_dates=false, contradicting the documented invariant (`nora-registry/src/registry/nuget.rs:1216`) | open → r2/proxy | With `trust_upstream_dates=false`, cache mtime must not be the publish date. |
+| C49 | major | proxy | Cache mtime is used as the 'publish date' for quarantine and min-release-age when trust_upstream_dates=false, contradicting the documented invariant (`nora-registry/src/registry/nuget.rs:1216`) | open → r2/curation | With `trust_upstream_dates=false`, cache mtime must not be the publish date (prioritized with Q01–Q03). |
 | C50 | major | proxy | Every upstream 4xx (incl. 429/401/403) is collapsed into NotFound → client 404; NuGet metadata handlers then discard a perfectly good stale cache (`nora-registry/src/registry/mod.rs:328`) | fixed #12 | `RateLimited`/`Denied` variants; NuGet metadata serves stale. |
 | C51 | major | proxy | npm packument cache stores the URL-rewritten body with public_url baked in; a 304 re-serves it forever after public_url changes (`nora-registry/src/registry/npm.rs:847`) | open → r2/npm | Deferred in #11. Proxied packument cache must not bake `public_url`. |
 | C52 | major | proxy | Circuit breaker is off by default and the HTTP client has no connect timeout: a black-holed upstream costs 2×proxy_timeout+1 s per cache miss with no fast-fail (`nora-registry/src/config/circuit_breaker.rs:10`) | partial #12 → r2/proxy, r2/chart | connect_timeout 10 s added. Remains: `pool_idle_timeout`; breaker enabled in our chart values. |
@@ -129,3 +129,11 @@ Counts: fixed 47, partial 22, open 40, not-applicable 2 (total 111).
 | N21 | minor | security | Dependency-confusion protection only starts after an ID's first push; nothing in the PR covers the migration window (`nora-registry/src/registry/nuget/hosted.rs:19`) | fixed #4 | `curation.internal_namespaces` documented and tested (403 before first push). |
 | N22 | minor | security | Changelog fragment and README row are keyed to an OPEN upstream issue and will add/add-conflict when upstream ships its own push support (`changelog.d/983.added.md:1`) | fixed #4 | Fragment renamed to `changelog.d/1.added.md`. |
 | N23 | minor | security | Every proxied NuGet request now pays 1-2 extra object-storage round trips before reaching the cache/upstream path (`nora-registry/src/registry/nuget/hosted.rs:416`) | fixed #4 | Same as N08. |
+
+## Quarantine live test, 11.10.2026 (3)
+
+| ID | Sev | Lens | Finding | Status | Notes |
+|---|---|---|---|---|---|
+| Q01 | major | curation | NuGet: the `dotnet restore` path (flat-container) never caches the registration index, so no publish date is known and `min_release_age` is not enforced: a package <1 h old passed with 200; same for IDs with >128 versions (paged registration, e.g. AWSSDK.Core) | open → r2/curation | Fetch/cache the registration dates (or the catalog entry `published`) on the flat-container path and enforce the cooldown there. |
+| Q02 | major | curation | PyPI: `dates.json` is cached once and never refreshed, so versions published after the first fetch bypass the cooldown | open → r2/pypi | Refresh with the simple index (metadata TTL / ETag). |
+| Q03 | major | curation | No per-version bypass: `X-Nora-Bypass-Token` is global and npm/pip/dotnet cannot send headers | open → r2/curation | Config allowlist `curation.allow = ["name@version", ...]` per format exempting exact versions from `min_release_age`; hot-reloadable from the ConfigMap if cheap, else documented restart. |
