@@ -56,7 +56,7 @@ use crate::config::UpstreamAuth;
 use crate::metrics::{UPSTREAM_POLICY_BLOCKED_TOTAL, UPSTREAM_REQUEST_DURATION};
 use crate::AppState;
 use axum::body::{Body, Bytes};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use std::time::{Duration, Instant};
@@ -203,6 +203,104 @@ pub(crate) enum ProxyError {
     Upstream(u16),
     Network(String),
     CircuitOpen(String),
+    /// The request (connect, headers or body) exceeded its timeout.
+    Timeout(String),
+    /// Upstream answered 429; carries its `Retry-After` value, if any.
+    RateLimited(Option<String>),
+    /// Upstream answered 401/403: a credential or policy refusal, not a missing artifact.
+    Denied(u16),
+}
+
+/// Classify a transport-level reqwest failure.
+fn transport_error(e: reqwest::Error) -> ProxyError {
+    if e.is_timeout() {
+        ProxyError::Timeout(e.to_string())
+    } else {
+        ProxyError::Network(e.to_string())
+    }
+}
+
+/// Classify an upstream 4xx. Only a plain 4xx (404/410…) means "no such artifact";
+/// throttling and auth refusals must not reach clients as a cacheable 404.
+fn upstream_4xx(status: u16, headers: &reqwest::header::HeaderMap) -> ProxyError {
+    match status {
+        429 => ProxyError::RateLimited(
+            headers
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+        ),
+        401 | 403 => ProxyError::Denied(status),
+        _ => ProxyError::NotFound,
+    }
+}
+
+/// Client response for an upstream fetch that failed with nothing cached to fall
+/// back on. Only an upstream not-found is a 404: NuGet, npm and pip treat 404 as
+/// "package does not exist" and do not retry, while they retry 502/503/504.
+pub(crate) fn proxy_error_response(registry: &str, url: &str, err: &ProxyError) -> Response {
+    let status = match err {
+        ProxyError::NotFound => return StatusCode::NOT_FOUND.into_response(),
+        ProxyError::CircuitOpen(reg) => return circuit_open_response(reg),
+        ProxyError::RateLimited(retry_after) => {
+            tracing::warn!(
+                registry,
+                url,
+                ?retry_after,
+                "upstream rate-limited the request, returning 503"
+            );
+            let value = retry_after
+                .as_deref()
+                .and_then(|v| HeaderValue::from_str(v).ok())
+                .unwrap_or_else(|| HeaderValue::from_static("30"));
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, value)],
+                format!("upstream {registry} rate limited"),
+            )
+                .into_response();
+        }
+        ProxyError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+        ProxyError::Denied(_) | ProxyError::Upstream(_) | ProxyError::Network(_) => {
+            StatusCode::BAD_GATEWAY
+        }
+    };
+    tracing::warn!(registry, url, error = ?err, status = status.as_u16(), "upstream fetch failed");
+    status.into_response()
+}
+
+/// Outcome of a cache read on a proxy path: `Ok(Some)` hit, `Ok(None)` go upstream,
+/// `Err` respond now. A storage fault is a retryable 503, never a 404; a cached
+/// object failing its pin is refetched, except for an internal (never proxied) name.
+#[allow(clippy::result_large_err)] // the Err is the response returned at once
+pub(crate) fn cache_read<T>(
+    result: crate::storage::Result<T>,
+    registry: &str,
+    key: &str,
+    internal: bool,
+) -> Result<Option<T>, Response> {
+    use crate::storage::StorageError;
+    match result {
+        Ok(v) => Ok(Some(v)),
+        Err(StorageError::NotFound) => Ok(None),
+        Err(StorageError::IntegrityViolation) => {
+            tracing::warn!(registry, key, "cached object failed integrity verification");
+            if internal {
+                Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            } else {
+                Ok(None)
+            }
+        }
+        Err(e) => {
+            tracing::warn!(registry, key, error = %e, "cache read failed, returning 503");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, HeaderValue::from_static("10"))],
+                "storage temporarily unavailable",
+            )
+                .into_response())
+        }
+    }
 }
 
 /// The `Authorization` value for an upstream request, built before the breaker is
@@ -284,9 +382,7 @@ where
                     UPSTREAM_REQUEST_DURATION
                         .with_label_values(&[registry_str, "2xx"])
                         .observe(elapsed);
-                    let result = extract(response)
-                        .await
-                        .map_err(|e| ProxyError::Network(e.to_string()));
+                    let result = extract(response).await.map_err(transport_error);
                     if result.is_ok() {
                         cb.record_success(&cb_key, probe);
                     } else {
@@ -316,16 +412,21 @@ where
                             url,
                             status,
                             reason,
-                            "upstream returned a policy/geo block, relayed as 404 (not a genuine not-found) — check egress/region"
+                            "upstream returned a policy/geo block (not a genuine not-found) — check egress/region"
                         );
                     }
                     // A 4xx means the upstream is alive and answered — not an
                     // availability failure. `record_alive` closes the breaker
                     // from HalfOpen (so it recovers instead of slow-probing) but
                     // is a no-op in Closed, so a 4xx never clears a real failure
-                    // tally (#606).
-                    cb.record_alive(&cb_key, probe);
-                    return Err(ProxyError::NotFound);
+                    // tally (#606). A 429 is the exception: back off.
+                    let err = upstream_4xx(status, response.headers());
+                    if matches!(err, ProxyError::RateLimited(_)) {
+                        cb.record_failure(&cb_key, probe);
+                    } else {
+                        cb.record_alive(&cb_key, probe);
+                    }
+                    return Err(err);
                 }
                 if attempt == 0 {
                     UPSTREAM_REQUEST_DURATION
@@ -353,7 +454,7 @@ where
                     continue;
                 }
                 cb.record_failure(&cb_key, probe);
-                return Err(ProxyError::Network(e.to_string()));
+                return Err(transport_error(e));
             }
         }
     }
@@ -669,7 +770,7 @@ pub(crate) async fn proxy_forward_post(
                     continue;
                 }
                 cb.record_failure(&cb_key, probe);
-                return Err(ProxyError::Network(e.to_string()));
+                return Err(transport_error(e));
             }
         }
     }
@@ -922,7 +1023,7 @@ pub(crate) async fn proxy_fetch_conditional(
                         // proxy_fetch_core; unreported, a half-open probe would
                         // hold its slot until the #585 stall recovery.
                         cb.record_failure(&cb_key, probe);
-                        Err(ProxyError::Network(e.to_string()))
+                        Err(transport_error(e))
                     }
                 };
             }
@@ -930,15 +1031,20 @@ pub(crate) async fn proxy_fetch_conditional(
             if (400..500).contains(&code) {
                 // 4xx — upstream alive; recover the breaker without clearing a
                 // real failure tally, consistent with proxy_fetch_core (#606).
-                cb.record_alive(&cb_key, probe);
-                return Err(ProxyError::NotFound);
+                let err = upstream_4xx(code, response.headers());
+                if matches!(err, ProxyError::RateLimited(_)) {
+                    cb.record_failure(&cb_key, probe);
+                } else {
+                    cb.record_alive(&cb_key, probe);
+                }
+                return Err(err);
             }
             cb.record_failure(&cb_key, probe);
             Err(ProxyError::Upstream(code))
         }
         Err(e) => {
             cb.record_failure(&cb_key, probe);
-            Err(ProxyError::Network(e.to_string()))
+            Err(transport_error(e))
         }
     }
 }
@@ -1394,5 +1500,116 @@ mod tests {
         assert!(read_validators(&storage, "npm/x/metadata.json")
             .await
             .is_none());
+    }
+
+    /// Throttling, auth refusals and timeouts are not "no such artifact": each gets
+    /// its own error so handlers never answer them with a cacheable 404.
+    #[tokio::test]
+    async fn test_proxy_fetch_classifies_upstream_failures() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        for (p, resp) in [
+            ("/gone", ResponseTemplate::new(404)),
+            (
+                "/throttled",
+                ResponseTemplate::new(429).insert_header("retry-after", "7"),
+            ),
+            ("/denied", ResponseTemplate::new(401)),
+            ("/forbidden", ResponseTemplate::new(403)),
+            (
+                "/slow",
+                ResponseTemplate::new(200).set_delay(Duration::from_secs(3)),
+            ),
+        ] {
+            Mock::given(path(p))
+                .respond_with(resp)
+                .mount(&upstream)
+                .await;
+        }
+        let client = reqwest::Client::new();
+        let cb = crate::circuit_breaker::CircuitBreakerRegistry::new(
+            crate::config::CircuitBreakerConfig::default(),
+        );
+        let fetch = |p: &'static str| {
+            let url = format!("{}{p}", upstream.uri());
+            let (client, cb) = (&client, &cb);
+            async move {
+                proxy_fetch(
+                    client,
+                    &url,
+                    Duration::from_secs(1),
+                    None,
+                    cb,
+                    RegistryType::Npm,
+                )
+                .await
+            }
+        };
+
+        assert!(matches!(fetch("/gone").await, Err(ProxyError::NotFound)));
+        assert!(matches!(
+            fetch("/throttled").await,
+            Err(ProxyError::RateLimited(Some(ref v))) if v == "7"
+        ));
+        assert!(matches!(
+            fetch("/denied").await,
+            Err(ProxyError::Denied(401))
+        ));
+        assert!(matches!(
+            fetch("/forbidden").await,
+            Err(ProxyError::Denied(403))
+        ));
+        assert!(matches!(fetch("/slow").await, Err(ProxyError::Timeout(_))));
+
+        let resp = proxy_error_response("npm", "u", &ProxyError::RateLimited(Some("7".into())));
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()[header::RETRY_AFTER], "7");
+        for (err, want) in [
+            (ProxyError::NotFound, StatusCode::NOT_FOUND),
+            (ProxyError::Upstream(500), StatusCode::BAD_GATEWAY),
+            (ProxyError::Network("x".into()), StatusCode::BAD_GATEWAY),
+            (ProxyError::Denied(403), StatusCode::BAD_GATEWAY),
+            (ProxyError::Timeout("x".into()), StatusCode::GATEWAY_TIMEOUT),
+        ] {
+            assert_eq!(proxy_error_response("npm", "u", &err).status(), want);
+        }
+    }
+
+    /// A storage fault on a cache read is a retryable 503, never a fall-through to a
+    /// 404; a pin mismatch refetches a proxied artifact but fails an internal one.
+    #[test]
+    fn test_cache_read_maps_storage_errors() {
+        use crate::storage::StorageError;
+        let ok: Result<Option<u8>, _> = cache_read(Ok(1u8), "npm", "k", false);
+        assert!(matches!(ok, Ok(Some(1))));
+        assert!(matches!(
+            cache_read::<u8>(Err(StorageError::NotFound), "npm", "k", true),
+            Ok(None)
+        ));
+        let status = |r: Result<Option<u8>, Response>| r.err().map(|resp| resp.status());
+        assert_eq!(
+            status(cache_read(
+                Err(StorageError::Network("r2".into())),
+                "npm",
+                "k",
+                false
+            )),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert!(matches!(
+            cache_read::<u8>(Err(StorageError::IntegrityViolation), "npm", "k", false),
+            Ok(None)
+        ));
+        assert_eq!(
+            status(cache_read(
+                Err(StorageError::IntegrityViolation),
+                "npm",
+                "k",
+                true
+            )),
+            Some(StatusCode::INTERNAL_SERVER_ERROR)
+        );
     }
 }

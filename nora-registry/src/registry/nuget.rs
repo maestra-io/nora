@@ -17,8 +17,8 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::config::UpstreamAuth;
 use crate::registry::{
-    circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_conditional, proxy_fetch_text,
-    read_validators, write_validators, ProxyError, Revalidation, Validators,
+    cache_read, nora_base_url, proxy_error_response, proxy_fetch, proxy_fetch_conditional,
+    proxy_fetch_text, read_validators, write_validators, ProxyError, Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -294,7 +294,7 @@ async fn search_query(
             with_json(rewritten.into_bytes())
         }
         Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
-        Err(ProxyError::CircuitOpen(_) | ProxyError::Network(_) | ProxyError::Upstream(_)) => {
+        Err(_) => {
             if !state.config.nuget.serve_stale {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
@@ -387,7 +387,7 @@ async fn autocomplete_query(
             with_json(rewritten.into_bytes())
         }
         Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
-        Err(ProxyError::CircuitOpen(_) | ProxyError::Network(_) | ProxyError::Upstream(_)) => {
+        Err(_) => {
             if !state.config.nuget.serve_stale {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
@@ -510,13 +510,14 @@ async fn registration_index(
         Ok(Revalidation::NotModified) => {
             let body = match state.storage.get(&storage_key).await {
                 Ok(b) => b,
-                Err(_) => {
+                Err(e) => {
                     let rewrite = Some((upstream.as_str(), base_url.as_str()));
-                    return serve_stale_or_not_found(
+                    return serve_stale_or_error(
                         &state,
                         cached_data,
                         "registration_index",
                         rewrite,
+                        &ProxyError::Network(format!("cached body unreadable: {e}")),
                     );
                 }
             };
@@ -569,7 +570,6 @@ async fn registration_index(
             with_json_gzip(rewritten.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             if had_validators {
                 crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
@@ -578,7 +578,7 @@ async fn registration_index(
             }
             tracing::debug!(error = ?e, "NuGet registration error");
             let rewrite = Some((upstream.as_str(), base_url.as_str()));
-            serve_stale_or_not_found(&state, cached_data, "registration_index", rewrite)
+            serve_stale_or_error(&state, cached_data, "registration_index", rewrite, &e)
         }
     }
 }
@@ -681,11 +681,10 @@ async fn registration_page(
             with_json_gzip(rewritten.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "NuGet registration page error");
             let rewrite = Some((upstream.as_str(), base_url.as_str()));
-            serve_stale_or_not_found(&state, cached_data, "registration_page", rewrite)
+            serve_stale_or_error(&state, cached_data, "registration_page", rewrite, &e)
         }
     }
 }
@@ -790,8 +789,14 @@ async fn version_list(state: AppState, id: &str) -> Response {
         Ok(Revalidation::NotModified) => {
             let body = match state.storage.get(&storage_key).await {
                 Ok(b) => b,
-                Err(_) => {
-                    return serve_stale_or_not_found(&state, cached_data, "version_list", None)
+                Err(e) => {
+                    return serve_stale_or_error(
+                        &state,
+                        cached_data,
+                        "version_list",
+                        None,
+                        &ProxyError::Network(format!("cached body unreadable: {e}")),
+                    )
                 }
             };
             crate::metrics::PROXY_UPSTREAM_304_TOTAL
@@ -838,7 +843,6 @@ async fn version_list(state: AppState, id: &str) -> Response {
             with_json(raw.to_vec())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             if had_validators {
                 crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
@@ -846,7 +850,7 @@ async fn version_list(state: AppState, id: &str) -> Response {
                     .inc();
             }
             tracing::debug!(error = ?e, "NuGet version list error");
-            serve_stale_or_not_found(&state, cached_data, "version_list", None)
+            serve_stale_or_error(&state, cached_data, "version_list", None, &e)
         }
     }
 }
@@ -916,7 +920,16 @@ async fn flatcontainer_download(
 
     // Immutable cache. get_verified discharges the integrity witness at serve
     // (compile-time guarantee — see crate::verified).
-    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+    let cached = match cache_read(
+        state.storage.get_verified(&storage_key).await,
+        "nuget",
+        &storage_key,
+        internal,
+    ) {
+        Ok(cached) => cached,
+        Err(resp) => return resp,
+    };
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -1145,27 +1158,25 @@ async fn flatcontainer_download(
             )
                 .into_response()
         }
-        Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
-        Err(e) => {
-            tracing::debug!(error = ?e, "NuGet download error");
-            // Binary was not cached and upstream is unreachable — package not available here.
-            StatusCode::NOT_FOUND.into_response()
-        }
+        // Not cached and upstream failed: only an upstream not-found is a 404 (NU1101,
+        // never retried); an outage is a 5xx that NuGet's HttpRetryHandler retries.
+        Err(e) => proxy_error_response("nuget", &url, &e),
     }
 }
 
 // ── Stale-while-error helper ──────────────────────────────────────────
 
-/// Serve stale cached metadata when upstream is unreachable, or 404 if no cache.
+/// Serve stale cached metadata when upstream failed, else answer for the upstream
+/// error (`proxy_error_response`: 5xx for an outage, never a 404).
 ///
 /// If `rewrite_ctx` is `Some((upstream, base_url))`, registration URL rewriting
 /// is applied to the stale response (for registration endpoints).
-fn serve_stale_or_not_found(
+fn serve_stale_or_error(
     state: &AppState,
     cached: Option<Bytes>,
     label: &str,
     rewrite_ctx: Option<(&str, &str)>,
+    err: &ProxyError,
 ) -> Response {
     if let Some(data) = cached {
         if state.config.nuget.serve_stale {
@@ -1201,8 +1212,8 @@ fn serve_stale_or_not_found(
                 .into_response();
         }
     }
-    // No cached data or serve_stale disabled — package not available here.
-    StatusCode::NOT_FOUND.into_response()
+    // No cached data or serve_stale disabled.
+    proxy_error_response("nuget", label, err)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -1967,8 +1978,9 @@ mod integration_tests {
         assert_eq!(&body[..], b"nupkg-data");
     }
 
+    /// No cache + unreachable upstream → 502: an outage, not a missing package
+    /// (a 404 is NU1101, which NuGet never retries).
     #[tokio::test]
-    #[doc = "No cache + unreachable upstream → 404 (not 502) since #410"]
     async fn test_nuget_unreachable_proxy() {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.nuget.enabled = true;
@@ -1982,7 +1994,7 @@ mod integration_tests {
             "",
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     /// Stale cache + unreachable upstream + serve_stale=true → 200 with X-Nora-Stale header (#409)
@@ -2019,9 +2031,9 @@ mod integration_tests {
         assert!(body.starts_with(b"{\"versions\""));
     }
 
-    /// Stale cache + unreachable upstream + serve_stale=false → 404 (#409)
+    /// Stale cache + unreachable upstream + serve_stale=false → 502, no stale body (#409)
     #[tokio::test]
-    async fn test_serve_stale_disabled_returns_404() {
+    async fn test_serve_stale_disabled_returns_502() {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.nuget.enabled = true;
             cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
@@ -2046,13 +2058,14 @@ mod integration_tests {
             "",
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert!(resp.headers().get("x-nora-stale").is_none());
     }
 
-    /// Uncached .nupkg + unreachable upstream → 404 (not 502) (#410)
+    /// Uncached .nupkg + unreachable upstream → 502, which NuGet retries; a 404
+    /// would be NU1101 "package not found", failing the restore outright.
     #[tokio::test]
-    async fn test_uncached_nupkg_returns_404_not_502() {
+    async fn test_uncached_nupkg_unreachable_upstream_returns_502() {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.nuget.enabled = true;
             cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
@@ -2065,7 +2078,7 @@ mod integration_tests {
             "",
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     /// Stale registration index is served with URL rewriting (#409)
@@ -2517,8 +2530,8 @@ mod integration_tests {
         assert_ne!(resp.status(), StatusCode::OK);
     }
 
+    /// No cache + unreachable upstream → 502 (an outage, not a missing package)
     #[tokio::test]
-    #[doc = "No cache + unreachable upstream → 404 (not 502) since #410"]
     async fn test_registration_page_unreachable_upstream() {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.nuget.enabled = true;
@@ -2533,7 +2546,7 @@ mod integration_tests {
             "",
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     /// Search fallback adds X-Nora-Stale header when upstream is unreachable (#422)
@@ -2659,6 +2672,96 @@ mod integration_tests {
             "bytes"
         );
         assert_eq!(&body_bytes(resp).await[..], nupkg);
+    }
+
+    /// Upstream failures on a cold .nupkg miss: only a 404 stays a 404; an outage is
+    /// 502, a timeout 504, throttling 503 with the upstream Retry-After, and an auth
+    /// refusal 502 — none of them may reach `dotnet restore` as NU1101.
+    #[tokio::test]
+    async fn test_cold_miss_upstream_errors_map_to_5xx() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        for (name, resp) in [
+            ("gone", ResponseTemplate::new(404)),
+            ("down", ResponseTemplate::new(503)),
+            (
+                "throttled",
+                ResponseTemplate::new(429).insert_header("retry-after", "7"),
+            ),
+            ("denied", ResponseTemplate::new(403)),
+            (
+                "slow",
+                ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(3)),
+            ),
+        ] {
+            Mock::given(path(format!(
+                "/v3-flatcontainer/{name}/1.0.0/{name}.1.0.0.nupkg"
+            )))
+            .respond_with(resp)
+            .mount(&upstream)
+            .await;
+        }
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.nuget.proxy_timeout = 1;
+        });
+
+        for (name, want) in [
+            ("gone", StatusCode::NOT_FOUND),
+            ("down", StatusCode::BAD_GATEWAY),
+            ("throttled", StatusCode::SERVICE_UNAVAILABLE),
+            ("denied", StatusCode::BAD_GATEWAY),
+            ("slow", StatusCode::GATEWAY_TIMEOUT),
+        ] {
+            let url = format!("/nuget/v3/flatcontainer/{name}/1.0.0/{name}.1.0.0.nupkg");
+            let resp = send(&ctx.app, Method::GET, &url, "").await;
+            assert_eq!(resp.status(), want, "{name}");
+            if name == "throttled" {
+                assert_eq!(resp.headers()["retry-after"], "7");
+            }
+        }
+    }
+
+    /// A stale cached registration survives an upstream 429: it used to be collapsed
+    /// into a 404 that discarded the cache.
+    #[tokio::test]
+    async fn test_registration_upstream_429_serves_stale_cache() {
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.nuget.metadata_ttl = 0;
+            cfg.nuget.serve_stale = true;
+        });
+        ctx.state
+            .storage
+            .put(
+                "nuget/registration/test-package/index.json",
+                br#"{"count":0,"items":[]}"#,
+            )
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/test-package/index.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["x-nora-stale"], "true");
     }
 }
 

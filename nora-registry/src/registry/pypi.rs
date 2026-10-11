@@ -15,7 +15,8 @@ use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::circuit_breaker::BreakerScope;
 use crate::config::UpstreamAuth;
 use crate::registry::{
-    circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_text,
+    cache_read, circuit_open_response, method_not_allowed, nora_base_url, proxy_error_response,
+    proxy_fetch, proxy_fetch_text,
 };
 use crate::registry_type::RegistryType;
 use crate::ui::components::html_escape;
@@ -246,6 +247,7 @@ async fn package_versions(
 
     let upstreams = state.config.pypi.upstreams();
     let mut circuit_open = false;
+    let mut upstream_err: Option<(String, crate::registry::ProxyError)> = None;
     if !is_internal && !upstreams.is_empty() {
         let mut upstream_files: Vec<FileEntry> = Vec::new();
         for up in &upstreams {
@@ -266,8 +268,10 @@ async fn package_versions(
                     circuit_open = true;
                     continue;
                 }
+                Err(crate::registry::ProxyError::NotFound) => continue,
                 Err(e) => {
                     tracing::debug!(error = ?e, package = %normalized, upstream = %up.url(), "PyPI upstream index fetch failed, skipping");
+                    upstream_err = Some((url, e));
                     continue;
                 }
             }
@@ -311,6 +315,10 @@ async fn package_versions(
     // pip's negative cache.
     if circuit_open {
         return circuit_open_response(RegistryType::PyPI.as_str());
+    }
+    // An upstream failed (not "not found"): a 5xx pip retries, not a 404 it trusts.
+    if let Some((url, e)) = upstream_err {
+        return proxy_error_response("pypi", &url, &e);
     }
 
     StatusCode::NOT_FOUND.into_response()
@@ -430,7 +438,16 @@ async fn download_file(
 
     // Try local storage first. get_verified discharges the integrity witness at
     // the serve site (compile-time guarantee — see crate::verified).
-    if let Ok(outcome) = state.storage.get_verified(&key).await {
+    let cached = match cache_read(
+        state.storage.get_verified(&key).await,
+        "pypi",
+        &key,
+        internal,
+    ) {
+        Ok(cached) => cached,
+        Err(resp) => return resp,
+    };
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -498,6 +515,7 @@ async fn download_file(
     // serves it, fetched from that same upstream with that upstream's auth. One
     // upstream's failure or open breaker skips to the next rather than failing (#663).
     let mut circuit_open = false;
+    let mut upstream_err: Option<(String, crate::registry::ProxyError)> = None;
     for up in &state.config.pypi.upstreams() {
         let page_url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
 
@@ -517,8 +535,10 @@ async fn download_file(
                 circuit_open = true;
                 continue;
             }
+            Err(crate::registry::ProxyError::NotFound) => continue,
             Err(e) => {
                 tracing::debug!(error = ?e, package = %normalized, upstream = %up.url(), "PyPI page proxy fetch failed, trying next upstream");
+                upstream_err = Some((page_url, e));
                 continue;
             }
         };
@@ -589,8 +609,10 @@ async fn download_file(
                 circuit_open = true;
                 continue;
             }
+            Err(crate::registry::ProxyError::NotFound) => continue,
             Err(e) => {
                 tracing::debug!(error = ?e, package = %normalized, filename = %filename, upstream = %up.url(), "PyPI file proxy fetch failed, trying next upstream");
+                upstream_err = Some((file_url, e));
                 continue;
             }
         }
@@ -600,6 +622,10 @@ async fn download_file(
     // rather than 404, which would poison pip's negative cache.
     if circuit_open {
         return circuit_open_response(RegistryType::PyPI.as_str());
+    }
+    // An upstream failed (not "not found"): a 5xx pip retries, not a 404 it trusts.
+    if let Some((url, e)) = upstream_err {
+        return proxy_error_response("pypi", &url, &e);
     }
 
     StatusCode::NOT_FOUND.into_response()
@@ -2612,6 +2638,39 @@ mod integration_tests {
             "#969: rendering the simple JSON must cost the same storage round-trips for a \
              1-file and a 100-file index — {small} vs {large} means the cost scales with N"
         );
+    }
+
+    /// An upstream outage with nothing local is a 502 (pip retries it), and a real
+    /// upstream 404 stays a 404 — before, both were a 404 pip cached as "no such project".
+    #[tokio::test]
+    async fn test_pypi_upstream_outage_is_502_not_404() {
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(path("/down/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        Mock::given(path("/gone/"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxy = Some(uri);
+        });
+
+        for (uri, want) in [
+            ("/simple/down/", StatusCode::BAD_GATEWAY),
+            ("/simple/gone/", StatusCode::NOT_FOUND),
+            ("/simple/down/down-1.0.tar.gz", StatusCode::BAD_GATEWAY),
+            ("/simple/gone/gone-1.0.tar.gz", StatusCode::NOT_FOUND),
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), want, "{uri}");
+        }
     }
 }
 
