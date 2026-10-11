@@ -272,6 +272,8 @@ pub struct AppState {
     /// Shared shutdown signal so on-demand background tasks (e.g. the admin
     /// reindex warm-up) stop promptly on SIGTERM/SIGINT (#306).
     pub cancel_token: tokio_util::sync::CancellationToken,
+    /// In-memory index of hosted NuGet packages (maestra fork).
+    pub(crate) nuget_hosted: Arc<registry::NugetHostedIndex>,
 }
 
 impl AppState {
@@ -1777,6 +1779,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         signer,
         leak_finders,
         cancel_token: cancel_token.clone(),
+        nuget_hosted: Default::default(),
     };
 
     // Initialize circuit breaker gauge to 0 (Closed) for every breaker key (#441)

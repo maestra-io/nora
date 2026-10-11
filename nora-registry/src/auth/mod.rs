@@ -253,6 +253,13 @@ pub async fn auth_middleware(
             request.headers_mut().insert(header::AUTHORIZATION, bearer);
         }
     }
+    // Workload identity over Basic: NuGet `packageSourceCredentials`, BuildKit secrets,
+    // twine and docker only speak Basic. A Basic password that is an API token or a JWT
+    // is verified exactly as the same credential sent as Bearer (same role_rules,
+    // namespace_scope and audit identity); the Basic username is ignored.
+    if let Some(bearer) = basic_token_as_bearer(request.headers()) {
+        request.headers_mut().insert(header::AUTHORIZATION, bearer);
+    }
 
     // Skip auth for public endpoints
     {
@@ -644,6 +651,24 @@ pub async fn auth_middleware(
         .extensions_mut()
         .insert(AuthenticatedRole(crate::tokens::Role::Write));
     next.run(request).await
+}
+
+/// `Authorization: Basic` whose password is an `nra_` API token or a JWT (three
+/// dot-separated segments, JSON header), rewritten as `Bearer <password>`. Any other
+/// Basic credential (an htpasswd password) is left alone.
+fn basic_token_as_bearer(headers: &HeaderMap) -> Option<axum::http::HeaderValue> {
+    let encoded = headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Basic ")?;
+    let decoded = String::from_utf8(STANDARD.decode(encoded.trim()).ok()?).ok()?;
+    let (_, password) = decoded.split_once(':')?;
+    let is_jwt = password.starts_with("eyJ") && password.split('.').count() == 3;
+    if !(password.starts_with("nra_") || is_jwt) {
+        return None;
+    }
+    axum::http::HeaderValue::from_str(&format!("Bearer {password}")).ok()
 }
 
 /// Attempt to validate a Base64-encoded Basic auth credential against the
@@ -1778,6 +1803,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             signer: ctx.state.signer.clone(),
             leak_finders: ctx.state.leak_finders.clone(),
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            nuget_hosted: Default::default(),
         };
 
         // Rebuild router with new state

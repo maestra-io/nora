@@ -36,6 +36,7 @@ use serde::Deserialize;
 use std::time::Duration;
 
 mod hosted;
+pub(crate) use hosted::HostedIndex;
 
 const UPSTREAM_DEFAULT: &str = "https://api.nuget.org";
 const SEARCH_TIMEOUT_SECS: u64 = 5;
@@ -182,10 +183,10 @@ pub fn alias_routes() -> Router<AppState> {
 fn routes_with_prefix(prefix: &str) -> Router<AppState> {
     Router::new()
         .route(&format!("/{prefix}/v3/index.json"), get(service_index))
-        .route(&format!("/{prefix}/v3/query"), get(search_query))
+        .route(&format!("/{prefix}/v3/query"), get(hosted::search_query))
         .route(
             &format!("/{prefix}/v3/autocomplete"),
-            get(autocomplete_query),
+            get(hosted::autocomplete_query),
         )
         .route(
             &format!("/{prefix}/v3/registration/{{id}}/index.json"),
@@ -232,14 +233,6 @@ async fn search_query(
     let take = params.take.unwrap_or(20);
     let prerelease = params.prerelease.unwrap_or(false);
     let sem_ver_level = params.sem_ver_level;
-    let hosted_hits = hosted::search(
-        &state,
-        &query,
-        prerelease,
-        sem_ver_level.as_deref() == Some("2.0.0"),
-    )
-    .await;
-    let merge = |body: Vec<u8>| hosted::merge_search(&hosted_hits, body, skip, take, false);
 
     // No upstream proxy configured → local search directly
     if state.config.nuget.proxy.is_none() {
@@ -252,7 +245,7 @@ async fn search_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(merge(data));
+        return with_json(data);
     }
 
     // #68 namespace isolation: never forward a search term that matches an internal
@@ -271,7 +264,7 @@ async fn search_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(merge(data));
+        return with_json(data);
     }
 
     // Try upstream with short timeout (UX-critical path)
@@ -301,9 +294,9 @@ async fn search_query(
                 crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
-            with_json(merge(rewritten.into_bytes()))
+            with_json(rewritten.into_bytes())
         }
-        Err(ProxyError::NotFound) => with_json(merge(br#"{"totalHits":0,"data":[]}"#.to_vec())),
+        Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
         Err(ProxyError::CircuitOpen(_) | ProxyError::Network(_) | ProxyError::Upstream(_)) => {
             if !state.config.nuget.serve_stale {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -318,7 +311,7 @@ async fn search_query(
                 sem_ver_level.as_deref(),
             )
             .await;
-            with_json_stale(merge(data))
+            with_json_stale(data)
         }
     }
 }
@@ -335,14 +328,6 @@ async fn autocomplete_query(
     let take = params.take.unwrap_or(20);
     let prerelease = params.prerelease.unwrap_or(false);
     let sem_ver_level = params.sem_ver_level;
-    let hosted_hits = hosted::search(
-        &state,
-        &query,
-        prerelease,
-        sem_ver_level.as_deref() == Some("2.0.0"),
-    )
-    .await;
-    let merge = |body: Vec<u8>| hosted::merge_search(&hosted_hits, body, skip, take, true);
 
     // No upstream proxy configured → local autocomplete from cache
     if state.config.nuget.proxy.is_none() {
@@ -355,7 +340,7 @@ async fn autocomplete_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(merge(data));
+        return with_json(data);
     }
 
     // #68 namespace isolation: don't forward an internal-namespace autocomplete term.
@@ -373,7 +358,7 @@ async fn autocomplete_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(merge(data));
+        return with_json(data);
     }
 
     let qs = raw_query.0.unwrap_or_default();
@@ -402,9 +387,9 @@ async fn autocomplete_query(
                 crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
-            with_json(merge(rewritten.into_bytes()))
+            with_json(rewritten.into_bytes())
         }
-        Err(ProxyError::NotFound) => with_json(merge(br#"{"totalHits":0,"data":[]}"#.to_vec())),
+        Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
         Err(ProxyError::CircuitOpen(_) | ProxyError::Network(_) | ProxyError::Upstream(_)) => {
             if !state.config.nuget.serve_stale {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -419,7 +404,7 @@ async fn autocomplete_query(
                 sem_ver_level.as_deref(),
             )
             .await;
-            with_json_stale(merge(data))
+            with_json_stale(data)
         }
     }
 }
