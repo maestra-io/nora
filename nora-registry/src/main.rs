@@ -1692,20 +1692,27 @@ async fn run_server(mut config: Config, storage: Storage) {
         .merge(ui::routes())
         .merge(openapi::routes());
 
+    // Keyed limiter state, pruned by the maintenance tick below.
+    let mut rate_limiter_states = Vec::new();
     let app_routes = if rate_limit_enabled {
-        // Create rate limiters before moving config to state
-        let auth_limiter =
-            rate_limit::auth_rate_limiter(&config.rate_limit, config.auth.trusted_proxies.clone());
-        let upload_limiter = rate_limit::upload_rate_limiter(&config.rate_limit);
-        let general_limiter = rate_limit::general_rate_limiter(&config.rate_limit);
+        // Create rate limiters before moving config to state. All tiers key on the
+        // client IP resolved through auth.trusted_proxies, like the auth lockout.
+        let proxies = &config.auth.trusted_proxies;
+        let (auth_limiter, auth_state) =
+            rate_limit::auth_rate_limiter(&config.rate_limit, proxies.clone());
+        let (upload_limiter, upload_state) =
+            rate_limit::upload_rate_limiter(&config.rate_limit, proxies.clone());
+        let (general_limiter, general_state) =
+            rate_limit::general_rate_limiter(&config.rate_limit, proxies.clone());
+        rate_limiter_states = vec![auth_state, upload_state, general_state];
 
         // Auth routes: auth_limiter (strict 1rps) + general_limiter
         let auth_routes = auth::token_routes()
             .layer(auth_limiter)
             .layer(general_limiter);
-        // Registry routes: upload_limiter only (200rps/500burst)
-        // No general_limiter — avoids double-limiting that causes 429
-        // during cache warming (dotnet restore with many packages)
+        // Registry routes: upload_limiter only (200rps/500burst), write methods only.
+        // Reads are not limited here: a warm-cache dotnet restore / npm ci of a large
+        // project exceeds any per-IP read budget and NuGet reports 429 as a failure.
         let limited_registry = registry_routes.layer(upload_limiter);
 
         Router::new().merge(auth_routes).merge(limited_registry)
@@ -2023,6 +2030,9 @@ async fn run_server(mut config: Config, storage: Storage) {
             }
             registry::docker::cleanup_expired_sessions(&metrics_state.upload_sessions);
             metrics_state.auth_failures.cleanup();
+            for limiter in &rate_limiter_states {
+                limiter.retain_recent();
+            }
 
             // Every 60s (odd ticks — the interval's first tick fires immediately, so the
             // boot pass runs right away: object-store reachability (#869) and the storage

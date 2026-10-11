@@ -1725,6 +1725,20 @@ proxies = [
     }
 
     #[test]
+    fn test_env_override_trusted_proxies_cidr_list() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_AUTH_TRUSTED_PROXIES", "10.60.8.0/24, 10.62.0.0/16");
+        config.apply_env_overrides().unwrap();
+        std::env::remove_var("NORA_AUTH_TRUSTED_PROXIES");
+        let proxies = &config.auth.trusted_proxies;
+        assert!(proxies.contains("10.60.8.3".parse().unwrap()));
+        assert!(proxies.contains("10.62.2.17".parse().unwrap()));
+        assert!(!proxies.contains("10.60.9.1".parse().unwrap()));
+        assert!(!proxies.contains("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
     fn test_env_override_maven_proxies() {
         let _lock = env_lock();
         let mut config = Config::default();
