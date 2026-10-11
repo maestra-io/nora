@@ -35,6 +35,8 @@ use axum::{
 use serde::Deserialize;
 use std::time::Duration;
 
+mod hosted;
+
 const UPSTREAM_DEFAULT: &str = "https://api.nuget.org";
 const SEARCH_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_SEARCH: &str = "https://azuresearch-usnc.nuget.org/query";
@@ -166,7 +168,7 @@ pub async fn discover_search_endpoints(
 }
 
 pub fn routes() -> Router<AppState> {
-    routes_with_prefix("nuget")
+    routes_with_prefix("nuget").merge(hosted::routes())
 }
 
 /// Alias routes for Chocolatey and PowerShell Gallery clients.
@@ -230,6 +232,14 @@ async fn search_query(
     let take = params.take.unwrap_or(20);
     let prerelease = params.prerelease.unwrap_or(false);
     let sem_ver_level = params.sem_ver_level;
+    let hosted_hits = hosted::search(
+        &state,
+        &query,
+        prerelease,
+        sem_ver_level.as_deref() == Some("2.0.0"),
+    )
+    .await;
+    let merge = |body: Vec<u8>| hosted::merge_search(&hosted_hits, body, skip, take, false);
 
     // No upstream proxy configured → local search directly
     if state.config.nuget.proxy.is_none() {
@@ -242,7 +252,7 @@ async fn search_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(data);
+        return with_json(merge(data));
     }
 
     // #68 namespace isolation: never forward a search term that matches an internal
@@ -261,7 +271,7 @@ async fn search_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(data);
+        return with_json(merge(data));
     }
 
     // Try upstream with short timeout (UX-critical path)
@@ -291,9 +301,9 @@ async fn search_query(
                 crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
-            with_json(rewritten.into_bytes())
+            with_json(merge(rewritten.into_bytes()))
         }
-        Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
+        Err(ProxyError::NotFound) => with_json(merge(br#"{"totalHits":0,"data":[]}"#.to_vec())),
         Err(ProxyError::CircuitOpen(_) | ProxyError::Network(_) | ProxyError::Upstream(_)) => {
             if !state.config.nuget.serve_stale {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -308,7 +318,7 @@ async fn search_query(
                 sem_ver_level.as_deref(),
             )
             .await;
-            with_json_stale(data)
+            with_json_stale(merge(data))
         }
     }
 }
@@ -325,6 +335,14 @@ async fn autocomplete_query(
     let take = params.take.unwrap_or(20);
     let prerelease = params.prerelease.unwrap_or(false);
     let sem_ver_level = params.sem_ver_level;
+    let hosted_hits = hosted::search(
+        &state,
+        &query,
+        prerelease,
+        sem_ver_level.as_deref() == Some("2.0.0"),
+    )
+    .await;
+    let merge = |body: Vec<u8>| hosted::merge_search(&hosted_hits, body, skip, take, true);
 
     // No upstream proxy configured → local autocomplete from cache
     if state.config.nuget.proxy.is_none() {
@@ -337,7 +355,7 @@ async fn autocomplete_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(data);
+        return with_json(merge(data));
     }
 
     // #68 namespace isolation: don't forward an internal-namespace autocomplete term.
@@ -355,7 +373,7 @@ async fn autocomplete_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(data);
+        return with_json(merge(data));
     }
 
     let qs = raw_query.0.unwrap_or_default();
@@ -384,9 +402,9 @@ async fn autocomplete_query(
                 crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
-            with_json(rewritten.into_bytes())
+            with_json(merge(rewritten.into_bytes()))
         }
-        Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
+        Err(ProxyError::NotFound) => with_json(merge(br#"{"totalHits":0,"data":[]}"#.to_vec())),
         Err(ProxyError::CircuitOpen(_) | ProxyError::Network(_) | ProxyError::Upstream(_)) => {
             if !state.config.nuget.serve_stale {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -401,7 +419,7 @@ async fn autocomplete_query(
                 sem_ver_level.as_deref(),
             )
             .await;
-            with_json_stale(data)
+            with_json_stale(merge(data))
         }
     }
 }
@@ -416,6 +434,9 @@ async fn registration_index(
     let id_lower = id.to_lowercase();
     if !is_valid_package_id(&id_lower) {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Some(resp) = hosted::registration_index(&state, &id_lower).await {
+        return resp;
     }
 
     // Curation check. #733 serve-local: an internal-namespace package is operator-owned — skip
@@ -600,6 +621,9 @@ async fn registration_page(
     if !is_valid_version(&lower) || !is_valid_version(&upper) {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    if let Some(resp) = hosted::registration_page(&state, &id_lower, &lower, &upper).await {
+        return resp;
+    }
 
     let base_url = nora_base_url(&state);
     let upstream = upstream_url(&state);
@@ -716,6 +740,9 @@ async fn version_list(state: AppState, id: &str) -> Response {
     let id_lower = id.to_lowercase();
     if !is_valid_package_id(&id_lower) {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Some(resp) = hosted::version_list(&state, &id_lower).await {
+        return resp;
     }
 
     let storage_key = format!("nuget/flatcontainer/{}/index.json", id_lower);
@@ -871,6 +898,9 @@ async fn flatcontainer_download(
     }
 
     let id_lower = id.to_lowercase();
+    if let Some(resp) = hosted::download(&state, path, &id_lower).await {
+        return resp;
+    }
 
     // #733 serve-local: an internal-namespace package is operator-owned — skip curation and serve
     // any local copy below; block the upstream branch separately. (.nupkg only; .nuspec is uncurated.)
@@ -1536,6 +1566,16 @@ fn generate_service_index(base_url: &str) -> String {
                 "@id": format!("{}/v3/autocomplete", nora_nuget),
                 "@type": "SearchAutocompleteService",
                 "comment": "NuGet autocomplete endpoint"
+            },
+            {
+                "@id": format!("{}/v3/query", nora_nuget),
+                "@type": "SearchQueryService/3.5.0",
+                "comment": "NuGet search endpoint (hosted packages first)"
+            },
+            {
+                "@id": format!("{}/v3/package", nora_nuget),
+                "@type": "PackagePublish/2.0.0",
+                "comment": "Push, unlist (DELETE) and relist (POST) hosted packages"
             }
         ]
     });
@@ -1734,7 +1774,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["version"], "3.0.0");
         let resources = json["resources"].as_array().unwrap();
-        assert_eq!(resources.len(), 4);
+        assert_eq!(resources.len(), 6);
         assert!(result.contains("http://nora:4000/nuget/v3/flatcontainer/"));
         assert!(result.contains("http://nora:4000/nuget/v3/registration/"));
         assert!(result.contains("http://nora:4000/nuget/v3/query"));
@@ -1773,6 +1813,8 @@ mod tests {
         assert!(types.contains(&"RegistrationsBaseUrl/3.6.0"));
         assert!(types.contains(&"SearchQueryService"));
         assert!(types.contains(&"SearchAutocompleteService"));
+        assert!(types.contains(&"SearchQueryService/3.5.0"));
+        assert!(types.contains(&"PackagePublish/2.0.0"));
         // Must NOT include unimplemented resources
         assert!(!types.iter().any(|t| t.contains("Catalog")));
         assert!(!types.iter().any(|t| t.contains("RepositorySignatures")));

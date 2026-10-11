@@ -239,6 +239,21 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
+    // NuGet clients send the push/delete credential as `X-NuGet-ApiKey`, never as
+    // Authorization (#983): verify it as a Bearer credential (nra_ token or OIDC JWT).
+    if request.uri().path().starts_with("/nuget/")
+        && !request.headers().contains_key(header::AUTHORIZATION)
+    {
+        if let Some(bearer) = request
+            .headers()
+            .get("x-nuget-apikey")
+            .and_then(|k| k.to_str().ok())
+            .and_then(|k| axum::http::HeaderValue::from_str(&format!("Bearer {}", k.trim())).ok())
+        {
+            request.headers_mut().insert(header::AUTHORIZATION, bearer);
+        }
+    }
+
     // Skip auth for public endpoints
     {
         let path = request.uri().path();
