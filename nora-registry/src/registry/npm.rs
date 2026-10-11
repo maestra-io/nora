@@ -9,9 +9,9 @@ use crate::config::npm_scope_of;
 use crate::metrics::{METADATA_CORRUPT_TOTAL, PACKUMENT_REBUILT_TOTAL};
 use crate::registry::{
     cache_read, circuit_open_response, method_not_allowed, nora_base_url, proxy_error_response,
-    proxy_fetch, proxy_fetch_bytes, proxy_fetch_conditional, proxy_fetch_shared,
-    proxy_forward_post, read_validators, validators_key, write_validators, ProxyError,
-    Revalidation, Validators,
+    proxy_fetch, proxy_fetch_artifact, proxy_fetch_bytes, proxy_fetch_conditional,
+    proxy_fetch_shared, proxy_forward_post, read_cached_artifact, read_validators, validators_key,
+    write_validators, CachedArtifact, ProxyBody, ProxyError, Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::AppState;
@@ -745,29 +745,50 @@ async fn handle_request(
             crate::curation::RegistryType::Npm,
             &package_name,
         );
-        match cache_read(
-            state.storage.get_verified(&key).await,
-            "npm",
-            &key,
-            internal,
-        ) {
-            Ok(cached) => cached,
-            Err(resp) => return resp,
+        if is_tarball {
+            // A tarball above `server.stream_threshold_mb` streams from storage (C17).
+            match read_cached_artifact(&state, "npm", &key, internal).await {
+                Ok(Some(CachedArtifact::Buffered(data))) => Some(data),
+                Ok(Some(streamed)) => {
+                    let gates = TarballGates {
+                        package_name: &package_name,
+                        version: tarball_version.as_deref(),
+                        q_mode: &q_mode,
+                        q_secs,
+                        publish_date,
+                    };
+                    return serve_streamed_tarball(&state, &key, streamed, internal, gates).await;
+                }
+                Ok(None) => None,
+                Err(resp) => return resp,
+            }
+        } else {
+            match cache_read(
+                state.storage.get_verified(&key).await,
+                "npm",
+                &key,
+                internal,
+            ) {
+                Ok(cached) => cached.map(|outcome| {
+                    use nora_registry::verified::{verified_body, GateOutcome};
+                    match outcome {
+                        GateOutcome::Verified(blob) => verified_body(blob),
+                        GateOutcome::Unpinned(blob) => blob.into_inner(),
+                    }
+                }),
+                Err(resp) => return resp,
+            }
         }
     } else {
         None
     };
-    if let Some(outcome) = cached {
-        use nora_registry::verified::{verified_body, GateOutcome};
-        let data = match outcome {
-            GateOutcome::Verified(blob) => verified_body(blob),
-            GateOutcome::Unpinned(blob) => blob.into_inner(),
-        };
+    if let Some(data) = cached {
         // Metadata TTL: if stale, try to refetch from upstream
         if !is_tarball {
             let ttl = state.config.npm.metadata_ttl;
             if let Some(meta) = state.storage.stat(&key).await {
-                if !crate::registry::fresh_within_ttl(&state.storage, &key, meta.modified, ttl).await
+                if !crate::registry::fresh_within_ttl(&state.storage, &key, meta.modified, ttl)
+                    .await
                 {
                     // #68 namespace isolation: a stale internal-namespace package must
                     // NOT be revalidated upstream (dependency confusion) — refetch_metadata
@@ -979,16 +1000,49 @@ async fn handle_request(
         let proxy_url = upstream.url;
         let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
 
-        let fetch = proxy_fetch_bytes(
-            &state.http_client,
-            &url,
-            Duration::from_secs(state.config.npm.proxy_timeout),
-            upstream.auth,
-            &state.circuit_breaker,
-            BreakerScope::upstream(RegistryType::Npm, upstream.url),
-        );
-        match proxy_fetch_shared(&state, &key, "npm", state.config.npm.proxy_timeout, fetch).await {
-            Ok((data, fetched)) => {
+        let timeout = state.config.npm.proxy_timeout;
+        let scope = BreakerScope::upstream(RegistryType::Npm, upstream.url);
+        let result = if is_tarball {
+            // A tarball above `server.stream_threshold_mb` is spooled to disk (C17).
+            proxy_fetch_artifact(&state, &key, "npm", &url, timeout, upstream.auth, scope).await
+        } else {
+            let fetch = proxy_fetch_bytes(
+                &state.http_client,
+                &url,
+                Duration::from_secs(timeout),
+                upstream.auth,
+                &state.circuit_breaker,
+                scope,
+            );
+            proxy_fetch_shared(&state, &key, "npm", timeout, fetch)
+                .await
+                .map(|(data, fetched)| (ProxyBody::Mem(data), fetched))
+        };
+        match result {
+            Ok((spooled @ ProxyBody::File(_), fetched)) => {
+                let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                    state.config.curation.npm.quarantine.as_ref().or(state
+                        .config
+                        .curation
+                        .quarantine
+                        .as_ref()),
+                    state.config.curation.npm.quarantine_ttl.as_deref().or(state
+                        .config
+                        .curation
+                        .quarantine_ttl
+                        .as_deref()),
+                );
+                let gates = TarballGates {
+                    package_name: &package_name,
+                    version: tarball_version.as_deref(),
+                    q_mode: &q_mode,
+                    q_secs,
+                    publish_date,
+                };
+                let origin = fetched.then(|| origin_of(proxy_url));
+                return serve_spooled_tarball(&state, &key, &url, spooled, origin, gates).await;
+            }
+            Ok((ProxyBody::Mem(data), fetched)) => {
                 let data_to_cache;
                 let data_to_serve;
 
@@ -1178,6 +1232,166 @@ async fn put_with_origin(
         tracing::warn!(key = %key, error = ?e, "npm: failed to record cache provenance");
     }
     Ok(())
+}
+
+/// Inputs of the tarball gates (curation integrity, digest quarantine).
+struct TarballGates<'a> {
+    package_name: &'a str,
+    version: Option<&'a str>,
+    q_mode: &'a crate::digest_quarantine::QuarantineMode,
+    q_secs: i64,
+    publish_date: Option<i64>,
+}
+
+impl TarballGates<'_> {
+    /// Curation integrity, then the digest quarantine, on the tarball's digest.
+    fn check(&self, state: &AppState, digest: &str, upstream: &str) -> Option<Response> {
+        let engine = &state.curation().curation_engine;
+        if engine.is_active() {
+            if let Some(response) = crate::curation::verify_integrity_by_hash(
+                engine,
+                crate::curation::RegistryType::Npm,
+                self.package_name,
+                self.version,
+                digest,
+            ) {
+                return Some(response);
+            }
+        }
+        crate::digest_quarantine::proxy_gate_digest(
+            &state.digest_store,
+            "npm",
+            digest,
+            self.q_mode,
+            self.q_secs,
+            upstream,
+            self.publish_date,
+        )
+    }
+}
+
+/// A tarball response with a streamed body of `len` bytes.
+fn tarball_stream_response(body: axum::body::Body, len: u64) -> Response {
+    let mut response = (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/octet-stream"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        body,
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response
+}
+
+/// Cache hit on a tarball too big to buffer (C17): the gates run on its pin, and the
+/// body streams from storage, checked against the pin as it goes.
+async fn serve_streamed_tarball(
+    state: &AppState,
+    key: &str,
+    cached: CachedArtifact,
+    internal: bool,
+    gates: TarballGates<'_>,
+) -> Response {
+    let digest = cached.digest();
+    // The legacy .sha256 sidecar must agree with the pin the stream is checked against.
+    if let Ok(stored_hash) = state.storage.get(&format!("{key}.sha256")).await {
+        if digest.strip_prefix("sha256:") != Some(String::from_utf8_lossy(&stored_hash).as_ref()) {
+            tracing::error!(key = %key, "SECURITY: npm tarball integrity check FAILED — possible tampering");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Integrity check failed").into_response();
+        }
+    }
+    if let Some(response) = gates.check(state, &digest, "cache") {
+        return response;
+    }
+    state.metrics.record_download("npm");
+    state.metrics.record_cache_hit("npm");
+    state.activity.push(ActivityEntry::new(
+        ActionType::CacheHit,
+        gates.package_name.to_string(),
+        crate::registry_type::RegistryType::Npm,
+        "CACHE",
+    ));
+    state
+        .audit
+        .log(AuditEntry::new("cache_hit", "proxy", "", "npm", ""));
+    let len = cached.len();
+    tarball_stream_response(cached.into_body(state, key, internal), len)
+}
+
+/// Cold miss on a tarball spooled to disk (C17). `origin` is set for the caller
+/// that fetched it, which caches it with its `.sha256` and provenance sidecars.
+async fn serve_spooled_tarball(
+    state: &AppState,
+    key: &str,
+    url: &str,
+    body: ProxyBody,
+    origin: Option<String>,
+    gates: TarballGates<'_>,
+) -> Response {
+    let digest = body.digest();
+    let engine = &state.curation().curation_engine;
+    if engine.is_active() {
+        if let Some(response) = crate::curation::verify_integrity_by_hash(
+            engine,
+            crate::curation::RegistryType::Npm,
+            gates.package_name,
+            gates.version,
+            &digest,
+        ) {
+            return response;
+        }
+    }
+    if let Some(origin) = origin {
+        let storage = state.storage.clone();
+        let repo_index = Arc::clone(&state.repo_index);
+        let (key, body, sha) = (key.to_string(), body.clone(), body.sha256());
+        tokio::spawn(async move {
+            if let Err(e) = body.cache(&storage, &key, false).await {
+                tracing::warn!(key = %key, error = ?e, "npm proxy: failed to cache artifact");
+                return;
+            }
+            let _ = storage.put(&format!("{key}.sha256"), sha.as_bytes()).await;
+            let record = format!("{origin}\n{sha}");
+            if let Err(e) = storage.put(&origin_key(&key), record.as_bytes()).await {
+                tracing::warn!(key = %key, error = ?e, "npm: failed to record cache provenance");
+            }
+            repo_index.invalidate("npm");
+        });
+    }
+    state.metrics.record_download("npm");
+    state.metrics.record_cache_miss("npm");
+    state.activity.push(ActivityEntry::new(
+        ActionType::ProxyFetch,
+        gates.package_name.to_string(),
+        crate::registry_type::RegistryType::Npm,
+        "PROXY",
+    ));
+    state
+        .audit
+        .log(AuditEntry::new("proxy_fetch", "proxy", "", "npm", ""));
+    if let Some(response) = crate::digest_quarantine::proxy_gate_digest(
+        &state.digest_store,
+        "npm",
+        &digest,
+        gates.q_mode,
+        gates.q_secs,
+        url,
+        gates.publish_date,
+    ) {
+        return response;
+    }
+    let len = body.len();
+    match body.into_body(key).await {
+        Ok(body) => tarball_stream_response(body, len),
+        Err(e) => {
+            tracing::warn!(key = %key, error = %e, "npm: spooled tarball unreadable");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// The provenance record of `data` cached from `origin`: the upstream identity, then
@@ -3375,6 +3589,72 @@ mod integration_tests {
     // request, so metadata.json is uncached. ensure_npm_metadata_cached fetches
     // the packument upstream and caches it (rewritten to NORA URLs) so the
     // per-version `time[version]` date is readable on the same request.
+
+    /// C17: a tarball above `server.stream_threshold_mb` is spooled on the cold miss
+    /// and cached with its `.sha256` and provenance sidecars; the next request
+    /// streams it from storage without touching the upstream.
+    #[tokio::test]
+    async fn test_large_tarball_spooled_then_streamed_from_cache() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tarball: Vec<u8> = (0..(2 * 1024 * 1024 + 3))
+            .map(|i| (i % 249) as u8)
+            .collect();
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bigpkg/-/bigpkg-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.server.stream_threshold_mb = 1;
+        });
+        let uri = "/npm/bigpkg/-/bigpkg-1.0.0.tgz";
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_bytes(resp).await[..] == tarball[..]);
+
+        use sha2::Digest;
+        let key = "npm/bigpkg/tarballs/bigpkg-1.0.0.tgz";
+        let sha = hex::encode(sha2::Sha256::digest(&tarball));
+        let mut cached = false;
+        for _ in 0..100 {
+            if ctx.state.storage.get(&super::origin_key(key)).await.is_ok() {
+                cached = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(cached, "tarball and provenance are cached");
+        assert_eq!(
+            ctx.state.storage.pin(key).await.as_deref(),
+            Some(sha.as_str())
+        );
+        assert_eq!(
+            &ctx.state
+                .storage
+                .get(&format!("{key}.sha256"))
+                .await
+                .unwrap()[..],
+            sha.as_bytes()
+        );
+
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_bytes(resp).await[..] == tarball[..]);
+        let tarball_fetches = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with(".tgz"))
+            .count();
+        assert_eq!(tarball_fetches, 1, "the hit is served from storage");
+    }
 
     /// Happy path: tarball cache-miss → ensure_npm_metadata_cached fetches and
     /// caches the packument; tarball is also proxied and served. The cached

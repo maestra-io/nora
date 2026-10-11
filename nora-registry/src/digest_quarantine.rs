@@ -360,8 +360,34 @@ pub fn proxy_gate_dated(
     }
     use sha2::Digest;
     let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
-    store.record(registry, &digest, upstream, trusted_first_seen);
-    let status = store.check(registry, &digest, quarantine_secs);
+    proxy_gate_digest(
+        store,
+        registry,
+        &digest,
+        mode,
+        quarantine_secs,
+        upstream,
+        trusted_first_seen,
+    )
+}
+
+/// [`proxy_gate_dated`] for an artifact whose `sha256:<hex>` digest is already
+/// known — a body streamed from a spool file or from storage, never held whole.
+#[must_use = "the returned response blocks a quarantined artifact; dropping it serves the artifact"]
+pub fn proxy_gate_digest(
+    store: &DigestStore,
+    registry: &str,
+    digest: &str,
+    mode: &QuarantineMode,
+    quarantine_secs: i64,
+    upstream: &str,
+    trusted_first_seen: Option<i64>,
+) -> Option<Response> {
+    if matches!(mode, QuarantineMode::Off) {
+        return None;
+    }
+    store.record(registry, digest, upstream, trusted_first_seen);
+    let status = store.check(registry, digest, quarantine_secs);
     if matches!(status, QuarantineStatus::Mature) {
         return None;
     }
@@ -387,7 +413,7 @@ pub fn proxy_gate_dated(
     if matches!(mode, QuarantineMode::Enforce) {
         Some(quarantine_forbidden(
             registry,
-            &digest,
+            digest,
             &status,
             quarantine_secs,
         ))

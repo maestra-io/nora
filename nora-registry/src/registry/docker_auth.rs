@@ -146,7 +146,11 @@ fn token_lifetime(json: &serde_json::Value, now: chrono::DateTime<chrono::Utc>) 
         .get("issued_at")
         .and_then(|v| v.as_str())
         .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        .map(|issued| (now - issued.with_timezone(&chrono::Utc)).num_seconds().max(0) as u64)
+        .map(|issued| {
+            (now - issued.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .max(0) as u64
+        })
         .unwrap_or(0);
     Duration::from_secs(expires_in.saturating_sub(age))
 }
@@ -236,7 +240,10 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
         let life = |j: serde_json::Value| token_lifetime(&j, now).as_secs();
-        assert_eq!(life(serde_json::json!({"token": "t", "expires_in": 300})), 300);
+        assert_eq!(
+            life(serde_json::json!({"token": "t", "expires_in": 300})),
+            300
+        );
         assert_eq!(life(serde_json::json!({"token": "t"})), 60, "spec default");
         assert_eq!(
             life(serde_json::json!({"expires_in": 300, "issued_at": "2026-10-11T11:59:00Z"})),
@@ -259,9 +266,11 @@ mod tests {
         for (expires_in, cached) in [(30u64, true), (5, false)] {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(
-                    serde_json::json!({"token": "tok", "expires_in": expires_in}),
-                ))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"token": "tok", "expires_in": expires_in}),
+                    ),
+                )
                 .mount(&server)
                 .await;
             let auth = DockerAuth::default();

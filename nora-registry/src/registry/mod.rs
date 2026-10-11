@@ -578,6 +578,360 @@ pub(crate) async fn proxy_fetch_shared(
     }
 }
 
+// ============================================================================
+// Bounded-memory proxied artifacts (C17/C74)
+// ============================================================================
+
+/// Temp directory of spooled proxy downloads, under `{storage.path}`.
+const PROXY_SPOOL_SUBDIR: &str = "tmp/proxy-spool";
+
+/// Spool files older than this are orphans (crash, OOM) and reaped: a download in
+/// progress keeps writing, and a served one is unlinked when its last reader ends.
+const PROXY_SPOOL_MAX_AGE: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// Remove orphaned proxy spool files (startup and the periodic maintenance tick).
+pub(crate) fn cleanup_proxy_spool_dir(data_dir: &str) {
+    let dir = std::path::Path::new(data_dir).join(PROXY_SPOOL_SUBDIR);
+    let removed = remove_stale_temp_files(&dir, PROXY_SPOOL_MAX_AGE);
+    if removed > 0 {
+        tracing::info!(removed, dir = %dir.display(), "Cleaned up stale proxy spool files");
+    }
+}
+
+/// An upstream body spooled to a temp file with its SHA-256 computed on the way in.
+/// The file is removed when the last holder (response, follower, cache write) drops.
+#[derive(Debug)]
+pub(crate) struct SpoolFile {
+    path: std::path::PathBuf,
+    sha256: String,
+    len: u64,
+}
+
+impl Drop for SpoolFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A proxied artifact body: in memory, or spooled to disk when it is larger than
+/// `server.stream_threshold_mb`. Cloning is O(1) either way.
+#[derive(Clone, Debug)]
+pub(crate) enum ProxyBody {
+    Mem(Bytes),
+    File(std::sync::Arc<SpoolFile>),
+}
+
+/// Read an upstream response body: whole into memory up to `threshold` bytes, else
+/// to a spool file in `dir` with a running SHA-256, never holding more than one
+/// chunk of it. A transport error is the outer `Err` (an upstream failure for the
+/// breaker); a local disk error the inner one.
+async fn read_or_spool(
+    mut response: reqwest::Response,
+    dir: &std::path::Path,
+    threshold: u64,
+) -> Result<std::io::Result<ProxyBody>, reqwest::Error> {
+    use sha2::Digest;
+    use tokio::io::AsyncWriteExt;
+    if threshold == 0 || response.content_length().is_some_and(|n| n <= threshold) {
+        return response.bytes().await.map(|b| Ok(ProxyBody::Mem(b)));
+    }
+    // Unknown or too big a length: buffer until the threshold, then spill.
+    let mut head = Vec::new();
+    loop {
+        let Some(chunk) = response.chunk().await? else {
+            return Ok(Ok(ProxyBody::Mem(Bytes::from(head))));
+        };
+        if (head.len() + chunk.len()) as u64 > threshold {
+            head.extend_from_slice(&chunk);
+            break;
+        }
+        head.extend_from_slice(&chunk);
+    }
+    let path = dir.join(uuid::Uuid::new_v4().to_string());
+    let mut guard = TempFileGuard::new(path.clone());
+    let mut file = match tokio::fs::create_dir_all(dir).await {
+        Ok(()) => match tokio::fs::File::create(&path).await {
+            Ok(f) => f,
+            Err(e) => return Ok(Err(e)),
+        },
+        Err(e) => return Ok(Err(e)),
+    };
+    let mut hasher = sha2::Sha256::new();
+    let mut len = head.len() as u64;
+    hasher.update(&head);
+    if let Err(e) = file.write_all(&head).await {
+        return Ok(Err(e));
+    }
+    drop(head);
+    while let Some(chunk) = response.chunk().await? {
+        hasher.update(&chunk);
+        len += chunk.len() as u64;
+        if let Err(e) = file.write_all(&chunk).await {
+            return Ok(Err(e));
+        }
+    }
+    // Durable before the cache write renames a link to it into place (local backend).
+    if let Err(e) = file.sync_all().await {
+        return Ok(Err(e));
+    }
+    guard.disarm();
+    Ok(Ok(ProxyBody::File(std::sync::Arc::new(SpoolFile {
+        path,
+        sha256: hex::encode(hasher.finalize()),
+        len,
+    }))))
+}
+
+/// Cold-miss fetch of a proxied artifact (NuGet `.nupkg`, npm tarball, PyPI file)
+/// for storage `key`, with bounded memory and under single-flight (#595).
+///
+/// A body above `server.stream_threshold_mb` is spooled to disk instead of
+/// buffered; concurrent misses on one key share one upstream fetch and one body
+/// (the same spool file). The flag is true for the caller whose own fetch ran —
+/// the only one that should cache it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn proxy_fetch_artifact(
+    state: &AppState,
+    key: &str,
+    registry: &'static str,
+    url: &str,
+    timeout_secs: u64,
+    auth: Option<UpstreamAuth<'_>>,
+    scope: impl Into<BreakerScope<'_>>,
+) -> Result<(ProxyBody, bool), ProxyError> {
+    let dir = std::path::Path::new(&state.config.storage.path).join(PROXY_SPOOL_SUBDIR);
+    let threshold = state.config.server.stream_threshold();
+    let dir = dir.as_path();
+    let fetch = async {
+        proxy_fetch_core(
+            &state.http_client,
+            url,
+            Duration::from_secs(timeout_secs),
+            auth,
+            None,
+            |r| read_or_spool(r, dir, threshold),
+            &state.circuit_breaker,
+            scope,
+        )
+        .await?
+        .map_err(|e| ProxyError::Network(format!("proxy spool: {e}")))
+    };
+    if !state.config.server.proxy_coalesce {
+        return fetch.await.map(|b| (b, true));
+    }
+    // As `proxy_fetch_shared`: the caller's own result (error included) wins.
+    let mut own = None;
+    let own_slot = &mut own;
+    let shared = state
+        .artifact_flights
+        .coalesced(
+            &format!("fetch:{key}"),
+            registry,
+            crate::proxy_coalesce::follower_budget(timeout_secs),
+            move || async move {
+                let result = fetch.await;
+                let value = result.as_ref().ok().cloned();
+                *own_slot = Some(result);
+                value
+            },
+        )
+        .await;
+    match own {
+        Some(result) => result.map(|b| (b, true)),
+        None => shared
+            .map(|b| (b, false))
+            .ok_or_else(|| ProxyError::Network("coalesced fetch returned nothing".into())),
+    }
+}
+
+impl ProxyBody {
+    /// Lowercase hex SHA-256 of the body (computed now for an in-memory one).
+    pub(crate) fn sha256(&self) -> String {
+        use sha2::Digest;
+        match self {
+            ProxyBody::Mem(b) => hex::encode(sha2::Sha256::digest(b)),
+            ProxyBody::File(f) => f.sha256.clone(),
+        }
+    }
+
+    /// `sha256:<hex>`, the form the digest gates take.
+    pub(crate) fn digest(&self) -> String {
+        format!("sha256:{}", self.sha256())
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        match self {
+            ProxyBody::Mem(b) => b.len() as u64,
+            ProxyBody::File(f) => f.len,
+        }
+    }
+
+    /// Response body: the buffer itself, or the spool file streamed through an EOF
+    /// check against the digest taken while spooling.
+    pub(crate) async fn into_body(self, key: &str) -> std::io::Result<Body> {
+        match self {
+            ProxyBody::Mem(b) => Ok(Body::from(b)),
+            ProxyBody::File(spool) => {
+                // Open while holding the Arc: once open, the data outlives the unlink.
+                let file = tokio::fs::File::open(&spool.path).await?;
+                let stream = raw::verify_while_streaming(
+                    Box::pin(file),
+                    Some(spool.sha256.clone()),
+                    key.to_string(),
+                    None,
+                );
+                Ok(nora_registry::verified::stream_body(stream))
+            }
+        }
+    }
+
+    /// Cache the body at `key`; when `immutable`, only if nothing is stored there
+    /// yet. A spool file goes in through `put_from_path`, pinned to its digest, from a
+    /// hard link (or a copy) of the spool, because the backend consumes its source
+    /// while followers may still be reading the spool. Returns whether it wrote.
+    pub(crate) async fn cache(
+        &self,
+        storage: &crate::Storage,
+        key: &str,
+        immutable: bool,
+    ) -> crate::storage::Result<bool> {
+        let spool = match self {
+            ProxyBody::Mem(b) if immutable => return storage.put_if_absent(key, b.clone()).await,
+            ProxyBody::Mem(b) => return storage.put_bytes(key, b.clone()).await.map(|()| true),
+            ProxyBody::File(spool) => spool,
+        };
+        // ponytail: stat-then-put, not create-only like put_if_absent; two fills of
+        // one key both write the same verified bytes.
+        if immutable && storage.stat(key).await.is_some() {
+            return Ok(false);
+        }
+        let src = spool.path.with_extension("put");
+        let mut guard = TempFileGuard::new(src.clone());
+        if tokio::fs::hard_link(&spool.path, &src).await.is_err() {
+            tokio::fs::copy(&spool.path, &src).await?;
+        }
+        storage
+            .put_from_path(key, &src, Some(&spool.sha256))
+            .await?;
+        guard.disarm();
+        Ok(true)
+    }
+}
+
+/// [`ProxyBody::cache`] (immutable) in the background, as `spawn_cache_immutable`
+/// does for a buffer: index invalidated after the write, failures counted.
+pub(crate) fn spawn_cache_body(
+    state: &AppState,
+    registry: &'static str,
+    key: String,
+    body: ProxyBody,
+) {
+    let storage = state.storage.clone();
+    let repo_index = std::sync::Arc::clone(&state.repo_index);
+    tokio::spawn(async move {
+        match body.cache(&storage, &key, true).await {
+            Ok(true) => repo_index.invalidate(registry),
+            Ok(false) => {}
+            Err(e) => crate::record_cache_write_error(registry, &key, &e),
+        }
+    });
+}
+
+/// A cached proxied artifact: read whole and gated, or (above
+/// `server.stream_threshold_mb`) an open reader to stream with its pin.
+pub(crate) enum CachedArtifact {
+    Buffered(Bytes),
+    Streamed {
+        len: u64,
+        sha256: String,
+        reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+    },
+}
+
+impl CachedArtifact {
+    /// `sha256:<hex>` of the artifact: the verified pin, or hashed now.
+    pub(crate) fn digest(&self) -> String {
+        use sha2::Digest;
+        match self {
+            CachedArtifact::Buffered(b) => {
+                format!("sha256:{}", hex::encode(sha2::Sha256::digest(b)))
+            }
+            CachedArtifact::Streamed { sha256, .. } => format!("sha256:{sha256}"),
+        }
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        match self {
+            CachedArtifact::Buffered(b) => b.len() as u64,
+            CachedArtifact::Streamed { len, .. } => *len,
+        }
+    }
+
+    /// Response body. A streamed one is checked against its pin as it goes: a
+    /// mismatch aborts the body one frame short and, for a proxied key, deletes the
+    /// bad copy so the next request refetches it (C54).
+    pub(crate) fn into_body(self, state: &AppState, key: &str, internal: bool) -> Body {
+        match self {
+            CachedArtifact::Buffered(b) => Body::from(b),
+            CachedArtifact::Streamed { sha256, reader, .. } => {
+                let heal: Option<Box<dyn FnOnce() + Send + Sync>> = (!internal).then(|| {
+                    let storage = state.storage.clone();
+                    let key = key.to_string();
+                    Box::new(move || {
+                        tokio::spawn(async move {
+                            let _ = storage.delete(&key).await;
+                        });
+                    }) as Box<dyn FnOnce() + Send + Sync>
+                });
+                nora_registry::verified::stream_body(raw::verify_while_streaming(
+                    reader,
+                    Some(sha256),
+                    key.to_string(),
+                    heal,
+                ))
+            }
+        }
+    }
+}
+
+/// Cache read of a proxied artifact with bounded memory: [`cache_read`] over
+/// `Storage::get_verified_bounded`. A copy failing its integrity pin is deleted
+/// when it is a proxied (non-internal) one, so the refetch that follows can cache
+/// the upstream bytes again — the immutable write never overwrites a key (C54).
+pub(crate) async fn read_cached_artifact(
+    state: &AppState,
+    registry: &str,
+    key: &str,
+    internal: bool,
+) -> Result<Option<CachedArtifact>, Response> {
+    use crate::storage::{BoundedRead, StorageError};
+    let read = state
+        .storage
+        .get_verified_bounded(key, state.config.server.stream_threshold())
+        .await;
+    if matches!(read, Err(StorageError::IntegrityViolation)) && !internal {
+        if let Err(e) = state.storage.delete(key).await {
+            tracing::warn!(registry, key, error = %e, "could not drop a cached copy failing integrity");
+        }
+    }
+    Ok(
+        cache_read(read, registry, key, internal)?.map(|read| match read {
+            BoundedRead::Buffered(outcome) => {
+                use nora_registry::verified::{verified_body, GateOutcome};
+                CachedArtifact::Buffered(match outcome {
+                    GateOutcome::Verified(blob) => verified_body(blob),
+                    GateOutcome::Unpinned(blob) => blob.into_inner(),
+                })
+            }
+            BoundedRead::Streamed { len, pin, reader } => CachedArtifact::Streamed {
+                len,
+                sha256: pin,
+                reader,
+            },
+        }),
+    )
+}
+
 /// Fetch text content from upstream proxy with timeout and 1 retry.
 pub(crate) async fn proxy_fetch_text(
     client: &reqwest::Client,
@@ -1057,14 +1411,16 @@ pub(crate) async fn write_validators(storage: &crate::Storage, key: &str, v: &Va
 /// body to bump its mtime cost one full object PUT per key per TTL window (C56).
 pub(crate) async fn mark_revalidated(storage: &crate::Storage, registry: &str, key: &str) {
     let sidecar = validators_key(key);
-    let mut doc = match storage.get(&sidecar).await.ok().map(|d| serde_json::from_slice(&d)) {
+    let mut doc = match storage
+        .get(&sidecar)
+        .await
+        .ok()
+        .map(|d| serde_json::from_slice(&d))
+    {
         Some(Ok(serde_json::Value::Object(map))) => map,
         _ => serde_json::Map::new(),
     };
-    doc.insert(
-        "validated_at".into(),
-        crate::cache_ttl::now_unix().into(),
-    );
+    doc.insert("validated_at".into(), crate::cache_ttl::now_unix().into());
     let data = serde_json::Value::Object(doc).to_string();
     if let Err(e) = storage.put(&sidecar, data.as_bytes()).await {
         crate::record_cache_write_error(registry, &sidecar, &e);
@@ -1386,6 +1742,75 @@ mod tests {
             fetchers += usize::from(fetched);
         }
         assert_eq!(fetchers, 1, "only the leader owns the cache write");
+    }
+
+    /// C17: the artifact fetch keeps a body up to `server.stream_threshold_mb` in
+    /// memory and spools a bigger one to disk with its digest — the large body is
+    /// never one in-memory buffer.
+    #[tokio::test]
+    async fn proxy_fetch_artifact_spools_bodies_above_the_threshold() {
+        use sha2::Digest;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let big: Vec<u8> = (0..(2 * 1024 * 1024 + 5))
+            .map(|i| (i % 253) as u8)
+            .collect();
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/big"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(big.clone()))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/small"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"small".to_vec()))
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.server.stream_threshold_mb = 1;
+        });
+        let state = &ctx.state;
+
+        let url = format!("{}/big", upstream.uri());
+        let (body, fetched) = proxy_fetch_artifact(
+            state,
+            "npm/b/-/b-1.tgz",
+            "npm",
+            &url,
+            5,
+            None,
+            RegistryType::Npm,
+        )
+        .await
+        .unwrap();
+        assert!(fetched);
+        let ProxyBody::File(spool) = &body else {
+            panic!("a body above the threshold must be spooled, got {body:?}");
+        };
+        assert_eq!(spool.len, big.len() as u64);
+        assert_eq!(spool.sha256, hex::encode(sha2::Sha256::digest(&big)));
+        assert_eq!(std::fs::read(&spool.path).unwrap(), big);
+        let path_on_disk = spool.path.clone();
+        drop(body);
+        assert!(
+            !path_on_disk.exists(),
+            "the spool file goes with its last holder"
+        );
+
+        let url = format!("{}/small", upstream.uri());
+        let (body, _) = proxy_fetch_artifact(
+            state,
+            "npm/s/-/s-1.tgz",
+            "npm",
+            &url,
+            5,
+            None,
+            RegistryType::Npm,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(body, ProxyBody::Mem(ref b) if &b[..] == b"small"));
     }
 
     /// With no stored validators, the conditional fetch sends no `If-None-Match`,
@@ -1762,7 +2187,11 @@ mod tests {
             !fresh_within_ttl(&storage, key, modified, 0).await,
             "ttl 0 is always stale"
         );
-        assert_eq!(read_validators(&storage, key).await, Some(v), "validators kept");
+        assert_eq!(
+            read_validators(&storage, key).await,
+            Some(v),
+            "validators kept"
+        );
         assert_eq!(
             storage.stat(key).await.unwrap().modified,
             modified,

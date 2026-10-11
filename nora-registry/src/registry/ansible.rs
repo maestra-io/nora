@@ -519,7 +519,9 @@ async fn proxy_json(
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(cache_key).await {
             let ttl = state.config.ansible.metadata_ttl;
-            if crate::registry::fresh_within_ttl(&state.storage, cache_key, meta.modified, ttl).await {
+            if crate::registry::fresh_within_ttl(&state.storage, cache_key, meta.modified, ttl)
+                .await
+            {
                 state.metrics.record_download("ansible");
                 state.metrics.record_cache_hit("ansible");
                 let text = String::from_utf8_lossy(data);
