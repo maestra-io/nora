@@ -440,3 +440,47 @@ tests:
       - equal:
           path: metadata.annotations["reloader.stakater.com/auto"]
           value: "true"
+
+  # Maestra: s3 mode keeps the /data volume (C12/C72)
+  - it: refuses s3 mode without persistence
+    template: templates/deployment.yaml
+    set:
+      config.storage.mode: s3
+      persistence.enabled: false
+    asserts:
+      - failedTemplate:
+          errorPattern: "persistence.enabled=false with config.storage.mode=s3"
+
+  - it: allows s3 mode on an emptyDir only when explicitly accepted
+    template: templates/deployment.yaml
+    set:
+      config.storage.mode: s3
+      persistence.enabled: false
+      persistence.allowEphemeral: true
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: data
+            emptyDir: {}
+
+  - it: mounts the rotating S3 credentials Secret as a whole directory
+    template: templates/deployment.yaml
+    set:
+      config.storage.mode: s3
+      config.storage.s3Credentials.existingSecret: nora-r2-creds
+      config.storage.s3Credentials.mountPath: /r2-creds
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: s3-credentials
+            mountPath: /r2-creds
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: s3-credentials
+            secret:
+              secretName: nora-r2-creds
+              defaultMode: 288

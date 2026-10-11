@@ -5,6 +5,9 @@ kind: Deployment
 {{- if lt (int .Values.terminationGracePeriodSeconds) $needed }}
 {{- fail (printf "terminationGracePeriodSeconds (%d) must cover preStopSleepSeconds (%d) + config.server.shutdown_timeout (%d) + 10 s scheduler wait = %d, or the kubelet SIGKILLs nora before it drains audit and flushes tokens" (int .Values.terminationGracePeriodSeconds) (int .Values.preStopSleepSeconds) $drain $needed) }}
 {{- end }}
+{{- if and (eq .Values.config.storage.mode "s3") (not .Values.persistence.enabled) (not .Values.persistence.allowEphemeral) }}
+{{- fail "persistence.enabled=false with config.storage.mode=s3 puts /data on an emptyDir: API tokens (auth.token_storage), the quarantine ledger and the audit file live there, not in the bucket, and every pod restart deletes them. Keep persistence.enabled=true, or set persistence.allowEphemeral=true to accept that." }}
+{{- end }}
 metadata:
   name: {{ include "nora.fullname" . }}
   labels:
@@ -107,6 +110,13 @@ spec:
               mountPath: {{ .Values.config.auth.htpasswd.mountPath }}
               readOnly: true
             {{- end }}
+            {{- if .Values.config.storage.s3Credentials.existingSecret }}
+            # Whole-directory mount, no subPath: the kubelet swaps rotated
+            # keys in place and nora re-reads them every 60 s.
+            - name: s3-credentials
+              mountPath: {{ .Values.config.storage.s3Credentials.mountPath }}
+              readOnly: true
+            {{- end }}
             {{- if or .Values.config.curation.blocklist.existingSecret .Values.config.curation.blocklist.existingConfigMap }}
             - name: curation-blocklist
               mountPath: {{ .Values.config.curation.blocklist.mountPath }}
@@ -137,6 +147,12 @@ spec:
             items:
               - key: {{ .Values.config.auth.htpasswd.secretKey }}
                 path: {{ .Values.config.auth.htpasswd.secretKey }}
+        {{- end }}
+        {{- if .Values.config.storage.s3Credentials.existingSecret }}
+        - name: s3-credentials
+          secret:
+            secretName: {{ .Values.config.storage.s3Credentials.existingSecret }}
+            defaultMode: 0440
         {{- end }}
         {{- $blocklist := .Values.config.curation.blocklist }}
         {{- if $blocklist.existingSecret }}

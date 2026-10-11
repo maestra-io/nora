@@ -112,3 +112,16 @@ Resolved curation allowlist_path for config.toml. Mirrors blocklistPath.
 {{- $al.path -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+Resolved [storage] s3_credentials_dir (Maestra fork): the Secret mount when
+s3Credentials.existingSecret is set, otherwise the explicit value.
+*/}}
+{{- define "nora.storage.s3CredentialsDir" -}}
+{{- $st := .Values.config.storage -}}
+{{- if $st.s3Credentials.existingSecret -}}
+{{- $st.s3Credentials.mountPath -}}
+{{- else if $st.s3_credentials_dir -}}
+{{- $st.s3_credentials_dir -}}
+{{- end -}}
+{{- end }}

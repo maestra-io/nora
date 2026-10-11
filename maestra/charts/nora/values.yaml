@@ -97,8 +97,15 @@ httpRoute:
             value: /
       filters: []
 
+# -- /data holds nora's local state in EVERY storage mode: API tokens
+# (auth.token_storage), the digest-quarantine ledger and audit.jsonl (under
+# storage.path) and upload spools. With storage.mode=s3 only artifacts go to
+# the bucket, so keep the volume: an emptyDir loses every API token on each
+# restart. The chart refuses s3 mode without persistence unless
+# allowEphemeral is set.
 persistence:
   enabled: true
+  allowEphemeral: false
   size: 10Gi
   storageClass: ""
   accessModes:
@@ -129,6 +136,17 @@ config:
     bucket: ""
     # -- S3 region
     s3_region: "us-east-1"
+    # -- S3 credentials: env NORA_STORAGE_S3_ACCESS_KEY / NORA_STORAGE_S3_SECRET_KEY
+    # (extraEnv / extraEnvFrom), or, Maestra fork only, files re-read every 60 s
+    # (rotating STS-style keys): a Secret with keys access_key_id,
+    # secret_access_key and optional session_token, mounted at mountPath and
+    # rendered as s3_credentials_dir. Takes precedence over the env keys.
+    s3Credentials:
+      existingSecret: ""
+      mountPath: /etc/nora-s3
+    # -- Explicit s3_credentials_dir when the files come another way
+    # (extraVolumes); ignored when s3Credentials.existingSecret is set.
+    s3_credentials_dir: ""
   docker:
     proxy_timeout: 60
     # -- Docker upstream registries for proxy/cache.
@@ -152,8 +170,8 @@ config:
     htpasswd_file: ""
     # -- Allow unauthenticated read (pull/browse); writes still require auth.
     anonymous_read: false
-    # -- API token storage path (under /data when relative).
-    token_storage: "data/tokens"
+    # -- API token storage path. Keep it on the /data volume (see persistence).
+    token_storage: "/data/tokens"
     # -- Client IPs/CIDRs whose X-Forwarded-For is honoured (list or
     # comma-separated string). nora keys the auth lockout and every rate
     # limiter on the resolved client IP; the default (loopback only) behind an
@@ -271,7 +289,7 @@ existingSecret: ""
 # Supports full Kubernetes env spec: plain values, secretKeyRef, configMapKeyRef.
 # Example:
 #   extraEnv:
-#     - name: NORA_S3_STORAGE_ACCESS_KEY
+#     - name: NORA_STORAGE_S3_ACCESS_KEY
 #       valueFrom:
 #         secretKeyRef:
 #           name: my-s3-secret

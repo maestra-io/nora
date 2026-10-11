@@ -38,6 +38,9 @@ data:
     s3_url = {{ .Values.config.storage.s3_url | quote }}
     bucket = {{ .Values.config.storage.bucket | quote }}
     s3_region = {{ .Values.config.storage.s3_region | default "us-east-1" | quote }}
+    {{- with include "nora.storage.s3CredentialsDir" . }}
+    s3_credentials_dir = {{ . | quote }}
+    {{- end }}
     {{- end }}
 
     {{- if or .Values.config.docker.upstreams .Values.config.docker.proxy_timeout }}

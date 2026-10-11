@@ -67,8 +67,9 @@ No PodDisruptionBudget: with one replica, `minAvailable: 1` / `maxUnavailable: 0
 | `persistence.size` | PVC size | `10Gi` |
 | `persistence.storageClass` | Storage class | `""` |
 | `persistence.accessModes` | Access modes | `[ReadWriteOnce]` |
+| `persistence.allowEphemeral` | Allow `storage.mode: s3` without a PVC | `false` |
 
-Set `persistence.enabled: false` when using S3 storage. An emptyDir volume is used for `/data/` regardless, so audit log and metrics work in both modes.
+Keep persistence on in every storage mode. `/data` holds nora's local state even with S3: API tokens (`auth.token_storage`), the digest-quarantine ledger and the audit file (under `storage.path`) and upload spools. Only artifacts go to the bucket. With `persistence.enabled: false` `/data` is an emptyDir and every pod restart deletes all API tokens, so the chart refuses `storage.mode: s3` without persistence unless `persistence.allowEphemeral: true`.
 
 ### NORA Configuration
 
@@ -121,7 +122,7 @@ kubectl create secret generic nora-htpasswd \
 config:
   auth:
     enabled: true
-    token_storage: data/tokens
+    token_storage: /data/tokens
     anonymous_read: false
     htpasswd:
       existingSecret: nora-htpasswd
@@ -134,7 +135,7 @@ The chart mounts the Secret at `/etc/nora/users.htpasswd` and sets `htpasswd_fil
 | `config.auth.enabled` | Enable authentication | `false` |
 | `config.auth.htpasswd_file` | Explicit htpasswd path in the container | `""` (auto when Secret is set) |
 | `config.auth.anonymous_read` | Allow unauthenticated reads | `false` |
-| `config.auth.token_storage` | API token storage path | `data/tokens` |
+| `config.auth.token_storage` | API token storage path (keep it on the `/data` volume) | `/data/tokens` |
 | `config.auth.htpasswd.existingSecret` | Secret with htpasswd file | `""` |
 | `config.auth.htpasswd.secretKey` | Key in the Secret | `users.htpasswd` |
 | `config.auth.htpasswd.mountPath` | Mount directory | `/etc/nora` |
@@ -326,7 +327,8 @@ resources:
 
 ```yaml
 persistence:
-  enabled: false
+  enabled: true      # tokens, quarantine ledger, audit file: see Persistence
+  size: 1Gi
 
 config:
   storage:
@@ -348,7 +350,20 @@ extraEnv:
         key: secret-key
 ```
 
-> **Note:** Audit log is written to `/data/` (emptyDir when `persistence.enabled: false`). Audit data is ephemeral without persistence. For production with S3, consider a log aggregator (Fluentd/Promtail) to capture audit events from pod logs. Single replica recommended when using emptyDir for audit storage.
+Without both keys nora sends unsigned requests and the bucket answers 403; check the boot log for `has_credentials=true`.
+
+Rotating credentials (Maestra fork, `[storage] s3_credentials_dir`): a Secret with keys `access_key_id`, `secret_access_key` and optional `session_token` (e.g. written by a VaultDynamicSecret) is mounted as a directory and re-read every 60 s, so a rotation needs no restart. Exclude that Secret from reloader.
+
+```yaml
+config:
+  storage:
+    mode: s3
+    s3Credentials:
+      existingSecret: nora-r2-creds
+      mountPath: /etc/nora-s3     # rendered as s3_credentials_dir
+```
+
+Audit: see `config.audit.mode`.
 
 ## Registries
 

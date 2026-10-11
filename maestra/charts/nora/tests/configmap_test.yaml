@@ -38,7 +38,7 @@ tests:
           pattern: 'htpasswd_file = "/etc/nora/users\.htpasswd"'
       - matchRegex:
           path: data["config.toml"]
-          pattern: 'token_storage = "data/tokens"'
+          pattern: 'token_storage = "/data/tokens"'
       - matchRegex:
           path: data["config.toml"]
           pattern: 'anonymous_read = true'
@@ -468,3 +468,33 @@ tests:
       - matchRegex:
           path: data["config.toml"]
           pattern: 'issuer = "https://issuer\.example\.com"\naudience = ""\nenabled = false'
+
+  # Maestra: s3_credentials_dir (fork-only [storage] key)
+  - it: renders s3_credentials_dir from the mounted Secret
+    set:
+      config.storage.mode: s3
+      config.storage.s3_url: https://r2.example.com
+      config.storage.bucket: b
+      config.storage.s3Credentials.existingSecret: nora-r2-creds
+      config.storage.s3Credentials.mountPath: /r2-creds
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 's3_credentials_dir = "/r2-creds"'
+
+  - it: renders an explicit s3_credentials_dir
+    set:
+      config.storage.mode: s3
+      config.storage.s3_credentials_dir: /creds
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 's3_credentials_dir = "/creds"'
+
+  - it: renders no s3_credentials_dir by default
+    set:
+      config.storage.mode: s3
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 's3_credentials_dir'
