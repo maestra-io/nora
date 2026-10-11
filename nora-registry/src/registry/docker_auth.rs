@@ -59,16 +59,17 @@ impl DockerAuth {
 
         // Need to fetch a new token
         let www_auth = www_authenticate?;
-        let token = self.fetch_token(www_auth, name, basic_auth).await?;
+        let (token, lifetime) = self.fetch_token(www_auth, name, basic_auth).await?;
 
-        // Cache the token (default 5 minute expiry)
-        {
+        // Cache the token for the lifetime the token server gave it, less a margin
+        // for the request that will carry it.
+        if let Some(ttl) = lifetime.checked_sub(TOKEN_EXPIRY_MARGIN) {
             let mut tokens = self.tokens.write();
             tokens.insert(
                 cache_key,
                 CachedToken {
                     token: token.clone(),
-                    expires_at: Instant::now() + Duration::from_secs(300),
+                    expires_at: Instant::now() + ttl,
                 },
             );
         }
@@ -78,12 +79,14 @@ impl DockerAuth {
 
     /// Parse Www-Authenticate header and fetch token from auth server
     /// Format: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/alpine:pull"
+    ///
+    /// Returns the token and its remaining lifetime (see [`token_lifetime`]).
     async fn fetch_token(
         &self,
         www_authenticate: &str,
         name: &str,
         basic_auth: Option<&str>,
-    ) -> Option<String> {
+    ) -> Option<(String, Duration)> {
         let params = parse_www_authenticate(www_authenticate)?;
 
         let realm = params.get("realm")?;
@@ -118,11 +121,38 @@ impl DockerAuth {
         let json: serde_json::Value = response.json().await.ok()?;
 
         // Docker Hub returns "token", some registries return "access_token"
-        json.get("token")
+        let token = json
+            .get("token")
             .or_else(|| json.get("access_token"))
             .and_then(|v| v.as_str())
-            .map(String::from)
+            .map(String::from)?;
+        Some((token, token_lifetime(&json, chrono::Utc::now())))
     }
+}
+
+/// Subtracted from a token's lifetime before caching it, so a cached token is not
+/// sent in the last seconds of its validity.
+const TOKEN_EXPIRY_MARGIN: Duration = Duration::from_secs(10);
+
+/// Remaining lifetime of a token response at `now`, per the Docker token spec:
+/// `expires_in` seconds (60 when absent) counted from `issued_at` (now when absent
+/// or unparsable). A token issued with a 60 s lifetime must not be cached for 300 s.
+fn token_lifetime(json: &serde_json::Value, now: chrono::DateTime<chrono::Utc>) -> Duration {
+    let expires_in = json
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(60);
+    let age = json
+        .get("issued_at")
+        .and_then(|v| v.as_str())
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|issued| {
+            (now - issued.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .max(0) as u64
+        })
+        .unwrap_or(0);
+    Duration::from_secs(expires_in.saturating_sub(age))
 }
 
 impl Default for DockerAuth {
@@ -201,6 +231,64 @@ mod tests {
             Some(&"https://example.com/token".to_string())
         );
         assert!(!params.contains_key("service"));
+    }
+
+    /// C55: the cache lifetime comes from `expires_in`/`issued_at`, not a fixed 300 s.
+    #[test]
+    fn test_token_lifetime_honours_expires_in_and_issued_at() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-11T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let life = |j: serde_json::Value| token_lifetime(&j, now).as_secs();
+        assert_eq!(
+            life(serde_json::json!({"token": "t", "expires_in": 300})),
+            300
+        );
+        assert_eq!(life(serde_json::json!({"token": "t"})), 60, "spec default");
+        assert_eq!(
+            life(serde_json::json!({"expires_in": 300, "issued_at": "2026-10-11T11:59:00Z"})),
+            240,
+            "counted from issued_at"
+        );
+        assert_eq!(
+            life(serde_json::json!({"expires_in": 60, "issued_at": "2026-10-11T11:00:00Z"})),
+            0,
+            "already expired"
+        );
+    }
+
+    /// A token server answering a 30 s `expires_in` is cached for 20 s (margin 10 s),
+    /// and a lifetime within the margin is not cached at all.
+    #[tokio::test]
+    async fn test_get_token_caches_for_the_token_lifetime() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for (expires_in, cached) in [(30u64, true), (5, false)] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"token": "tok", "expires_in": expires_in}),
+                    ),
+                )
+                .mount(&server)
+                .await;
+            let auth = DockerAuth::default();
+            let header = format!(r#"Bearer realm="{}/token",service="s""#, server.uri());
+            let token = auth
+                .get_token("https://r.example", "lib/x", Some(&header), None)
+                .await;
+            assert_eq!(token.as_deref(), Some("tok"));
+            let tokens = auth.tokens.read();
+            match tokens.get("https://r.example:lib/x") {
+                Some(t) => {
+                    assert!(cached, "expires_in {expires_in} must not be cached");
+                    let left = t.expires_at.saturating_duration_since(Instant::now());
+                    assert!(left <= Duration::from_secs(20) && left > Duration::from_secs(15));
+                }
+                None => assert!(!cached, "expires_in {expires_in} must be cached"),
+            }
+        }
     }
 
     #[test]

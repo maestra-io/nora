@@ -17,9 +17,10 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::config::UpstreamAuth;
 use crate::registry::{
-    cache_read, nora_base_url, proxy_error_response, proxy_fetch_bytes, proxy_fetch_conditional,
-    proxy_fetch_shared, proxy_fetch_text, read_validators, write_validators, ProxyError,
-    Revalidation, Validators,
+    fresh_within_ttl, mark_revalidated, nora_base_url, proxy_error_response, proxy_fetch_artifact,
+    proxy_fetch_conditional, proxy_fetch_shared, proxy_fetch_text, read_cached_artifact,
+    read_validators, spawn_cache_body, write_validators, CachedArtifact, ProxyError, Revalidation,
+    Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -462,7 +463,8 @@ async fn registration_index(
     // TTL cache — rewrite URLs on read (cache may contain pre-fix entries)
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, state.config.nuget.metadata_ttl) {
+            let ttl = state.config.nuget.metadata_ttl;
+            if fresh_within_ttl(&state.storage, &storage_key, meta.modified, ttl).await {
                 state.metrics.record_download("nuget");
                 state.metrics.record_cache_hit("nuget");
                 let text = String::from_utf8_lossy(data);
@@ -495,103 +497,16 @@ async fn registration_index(
         id_lower
     );
 
-    // Revalidate stale metadata with a conditional request when enabled (a cheap
-    // 304 — nuget.org returns validators) and fall back to a full fetch otherwise.
-    let validators = if state.config.nuget.revalidate {
-        read_validators(&state.storage, &storage_key)
-            .await
-            .unwrap_or_default()
-    } else {
-        Validators::default()
-    };
-    let had_validators = validators.is_some();
-
-    match proxy_fetch_conditional(
-        &state.http_client,
-        &url,
-        Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
-        expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
-        &validators,
-        &state.circuit_breaker,
-        RegistryType::Nuget,
-    )
-    .await
-    {
-        // Upstream unchanged — serve the cached body (rewritten on read) and bump
-        // its freshness so we do not revalidate again until the next TTL window.
-        Ok(Revalidation::NotModified) => {
-            let body = match state.storage.get(&storage_key).await {
-                Ok(b) => b,
-                Err(e) => {
-                    let rewrite = Some((upstream.as_str(), base_url.as_str()));
-                    return serve_stale_or_error(
-                        &state,
-                        cached_data,
-                        "registration_index",
-                        rewrite,
-                        &ProxyError::Network(format!("cached body unreadable: {e}")),
-                    );
-                }
-            };
-            crate::metrics::PROXY_UPSTREAM_304_TOTAL
-                .with_label_values(&["nuget"])
-                .inc();
-            crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
-                .with_label_values(&["nuget"])
-                .inc_by(body.len() as u64);
-            state.metrics.record_download("nuget");
-            state.metrics.record_cache_hit("nuget");
-            let storage = state.storage.clone();
-            let key_clone = storage_key.clone();
-            let bump = body.clone();
-            tokio::spawn(async move {
-                if let Err(e) = storage.put(&key_clone, &bump).await {
-                    crate::record_cache_write_error("nuget", &key_clone, &e);
-                }
-            });
-            let text = String::from_utf8_lossy(&body);
-            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
-            with_json_gzip(rewritten.into_bytes())
-        }
-        // New body — cache the raw bytes first, then persist the fresh validators,
-        // and serve the rewritten form.
-        Ok(Revalidation::Modified { body, validators }) => {
-            state.metrics.record_download("nuget");
-            state.metrics.record_cache_miss("nuget");
-            state.activity.push(ActivityEntry::new(
-                ActionType::ProxyFetch,
-                id_lower.clone(),
-                crate::registry_type::RegistryType::Nuget,
-                "PROXY",
-            ));
-            state
-                .audit
-                .log(AuditEntry::new("proxy_fetch", "proxy", "", "nuget", ""));
-
-            let raw = Bytes::from(body);
-            let storage = state.storage.clone();
-            let key_clone = storage_key.clone();
-            let raw_for_cache = raw.clone();
-            tokio::spawn(async move {
-                if let Err(e) = storage.put(&key_clone, &raw_for_cache).await {
-                    tracing::warn!(key = %key_clone, error = ?e, "nuget proxy: failed to cache registration");
-                    return;
-                }
-                write_validators(&storage, &key_clone, &validators).await;
-            });
+    let rewrite = Some((upstream.as_str(), base_url.as_str()));
+    match refresh_metadata(&state, &storage_key, &url, id_lower.clone()).await {
+        Ok(raw) => {
             let text = String::from_utf8_lossy(&raw);
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
             with_json_gzip(rewritten.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            if had_validators {
-                crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
-                    .with_label_values(&["nuget"])
-                    .inc();
-            }
             tracing::debug!(error = ?e, "NuGet registration error");
-            let rewrite = Some((upstream.as_str(), base_url.as_str()));
             serve_stale_or_error(&state, cached_data, "registration_index", rewrite, &e)
         }
     }
@@ -672,7 +587,8 @@ async fn registration_page(
         upper
     );
 
-    match proxy_fetch_text(
+    // Single-flight (C48): concurrent misses on one page make one upstream request.
+    let fetch = proxy_fetch_text(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
@@ -680,20 +596,32 @@ async fn registration_page(
         None,
         &state.circuit_breaker,
         RegistryType::Nuget,
+    );
+    let fetch = async { fetch.await.map(Bytes::from) };
+    match proxy_fetch_shared(
+        &state,
+        &storage_key,
+        "nuget",
+        state.config.nuget.metadata_proxy_timeout,
+        fetch,
     )
     .await
     {
-        Ok(text) => {
+        Ok((raw, fetched)) => {
             state.metrics.record_download("nuget");
-            state.metrics.record_cache_miss("nuget");
-            state.activity.push(ActivityEntry::new(
-                ActionType::ProxyFetch,
-                format!("{}/page/{}/{}", id_lower, lower, upper),
-                crate::registry_type::RegistryType::Nuget,
-                "PROXY",
-            ));
-
-            state.spawn_cache("nuget", storage_key, Bytes::from(text.clone()));
+            if fetched {
+                state.metrics.record_cache_miss("nuget");
+                state.activity.push(ActivityEntry::new(
+                    ActionType::ProxyFetch,
+                    format!("{}/page/{}/{}", id_lower, lower, upper),
+                    crate::registry_type::RegistryType::Nuget,
+                    "PROXY",
+                ));
+                state.spawn_cache("nuget", storage_key, raw.clone());
+            } else {
+                state.metrics.record_cache_hit("nuget");
+            }
+            let text = String::from_utf8_lossy(&raw);
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
             with_json_gzip(rewritten.into_bytes())
         }
@@ -745,7 +673,8 @@ async fn version_list(state: AppState, id: &str) -> Response {
     // TTL cache
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, state.config.nuget.metadata_ttl) {
+            let ttl = state.config.nuget.metadata_ttl;
+            if fresh_within_ttl(&state.storage, &storage_key, meta.modified, ttl).await {
                 state.metrics.record_download("nuget");
                 state.metrics.record_cache_hit("nuget");
                 return with_json(data.to_vec());
@@ -780,101 +709,124 @@ async fn version_list(state: AppState, id: &str) -> Response {
         id_lower
     );
 
-    // Revalidate stale metadata with a conditional request when enabled (a cheap
-    // 304 — nuget.org returns validators) and fall back to a full fetch otherwise.
-    // Empty validators ⇒ no conditional headers ⇒ always a 200, which is also how
-    // the first fetch captures validators for next time.
-    let validators = if state.config.nuget.revalidate {
-        read_validators(&state.storage, &storage_key)
-            .await
-            .unwrap_or_default()
-    } else {
-        Validators::default()
-    };
-    let had_validators = validators.is_some();
-
-    match proxy_fetch_conditional(
-        &state.http_client,
-        &url,
-        Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
-        expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
-        &validators,
-        &state.circuit_breaker,
-        RegistryType::Nuget,
-    )
-    .await
-    {
-        // Upstream unchanged — serve the cached body and bump its freshness so we
-        // do not revalidate again until the next TTL window. No body downloaded.
-        Ok(Revalidation::NotModified) => {
-            let body = match state.storage.get(&storage_key).await {
-                Ok(b) => b,
-                Err(e) => {
-                    return serve_stale_or_error(
-                        &state,
-                        cached_data,
-                        "version_list",
-                        None,
-                        &ProxyError::Network(format!("cached body unreadable: {e}")),
-                    )
-                }
-            };
-            crate::metrics::PROXY_UPSTREAM_304_TOTAL
-                .with_label_values(&["nuget"])
-                .inc();
-            crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
-                .with_label_values(&["nuget"])
-                .inc_by(body.len() as u64);
-            state.metrics.record_download("nuget");
-            state.metrics.record_cache_hit("nuget");
-            let storage = state.storage.clone();
-            let key_clone = storage_key.clone();
-            let bump = body.clone();
-            tokio::spawn(async move {
-                if let Err(e) = storage.put(&key_clone, &bump).await {
-                    crate::record_cache_write_error("nuget", &key_clone, &e);
-                }
-            });
-            with_json(body.to_vec())
-        }
-        // New body — cache the raw bytes first, then persist the fresh validators.
-        Ok(Revalidation::Modified { body, validators }) => {
-            state.metrics.record_download("nuget");
-            state.metrics.record_cache_miss("nuget");
-            state.activity.push(ActivityEntry::new(
-                ActionType::ProxyFetch,
-                format!("{}/versions", id_lower),
-                crate::registry_type::RegistryType::Nuget,
-                "PROXY",
-            ));
-            state
-                .audit
-                .log(AuditEntry::new("proxy_fetch", "proxy", "", "nuget", ""));
-
-            let raw = Bytes::from(body);
-            let storage = state.storage.clone();
-            let key_clone = storage_key.clone();
-            let raw_for_cache = raw.clone();
-            tokio::spawn(async move {
-                if let Err(e) = storage.put(&key_clone, &raw_for_cache).await {
-                    tracing::warn!(key = %key_clone, error = ?e, "nuget proxy: failed to cache version list");
-                    return;
-                }
-                write_validators(&storage, &key_clone, &validators).await;
-            });
-            with_json(raw.to_vec())
-        }
+    match refresh_metadata(&state, &storage_key, &url, format!("{}/versions", id_lower)).await {
+        Ok(raw) => with_json(raw.to_vec()),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            if had_validators {
-                crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
-                    .with_label_values(&["nuget"])
-                    .inc();
-            }
             tracing::debug!(error = ?e, "NuGet version list error");
             serve_stale_or_error(&state, cached_data, "version_list", None, &e)
         }
     }
+}
+
+/// Refresh the cached metadata document at `storage_key` (registration index or
+/// version list) from `url`, returning its raw (not yet rewritten) body.
+///
+/// Stale metadata is revalidated with a conditional request when enabled (a cheap
+/// 304 — nuget.org returns validators); without stored validators the request is a
+/// plain fetch, which is also how the first fetch captures them. Runs under
+/// single-flight (C48): concurrent cold misses and revalidations of one document make
+/// one upstream request, and only that request writes the cache.
+async fn refresh_metadata(
+    state: &AppState,
+    storage_key: &str,
+    url: &str,
+    activity: String,
+) -> Result<Bytes, ProxyError> {
+    let fetch = async {
+        let validators = if state.config.nuget.revalidate {
+            read_validators(&state.storage, storage_key)
+                .await
+                .unwrap_or_default()
+        } else {
+            Validators::default()
+        };
+        let had_validators = validators.is_some();
+        match proxy_fetch_conditional(
+            &state.http_client,
+            url,
+            Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
+            expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
+            &validators,
+            &state.circuit_breaker,
+            RegistryType::Nuget,
+        )
+        .await
+        {
+            // Upstream unchanged — serve the cached body and record the revalidation
+            // so we do not revalidate again until the next TTL window. No body is
+            // downloaded, and none is re-uploaded (C56).
+            Ok(Revalidation::NotModified) => {
+                let body = state
+                    .storage
+                    .get(storage_key)
+                    .await
+                    .map_err(|e| ProxyError::Network(format!("cached body unreadable: {e}")))?;
+                crate::metrics::PROXY_UPSTREAM_304_TOTAL
+                    .with_label_values(&["nuget"])
+                    .inc();
+                crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
+                    .with_label_values(&["nuget"])
+                    .inc_by(body.len() as u64);
+                state.metrics.record_download("nuget");
+                state.metrics.record_cache_hit("nuget");
+                let storage = state.storage.clone();
+                let key_clone = storage_key.to_string();
+                tokio::spawn(async move {
+                    mark_revalidated(&storage, "nuget", &key_clone).await;
+                });
+                Ok(body)
+            }
+            // New body — cache the raw bytes first, then persist the fresh validators.
+            Ok(Revalidation::Modified { body, validators }) => {
+                state.metrics.record_download("nuget");
+                state.metrics.record_cache_miss("nuget");
+                state.activity.push(ActivityEntry::new(
+                    ActionType::ProxyFetch,
+                    activity,
+                    crate::registry_type::RegistryType::Nuget,
+                    "PROXY",
+                ));
+                state
+                    .audit
+                    .log(AuditEntry::new("proxy_fetch", "proxy", "", "nuget", ""));
+                let raw = Bytes::from(body);
+                let storage = state.storage.clone();
+                let key_clone = storage_key.to_string();
+                let raw_for_cache = raw.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = storage.put_bytes(&key_clone, raw_for_cache).await {
+                        crate::record_cache_write_error("nuget", &key_clone, &e);
+                        return;
+                    }
+                    write_validators(&storage, &key_clone, &validators).await;
+                });
+                Ok(raw)
+            }
+            Err(e) => {
+                if had_validators && !matches!(e, ProxyError::NotFound) {
+                    crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
+                        .with_label_values(&["nuget"])
+                        .inc();
+                }
+                Err(e)
+            }
+        }
+    };
+    let (body, fetched) = proxy_fetch_shared(
+        state,
+        storage_key,
+        "nuget",
+        state.config.nuget.metadata_proxy_timeout,
+        fetch,
+    )
+    .await?;
+    if !fetched {
+        // A coalesced follower: served the leader's in-memory result.
+        state.metrics.record_download("nuget");
+        state.metrics.record_cache_hit("nuget");
+    }
+    Ok(body)
 }
 
 // ── Flatcontainer download (nupkg/nuspec, immutable) ───────────────────
@@ -947,30 +899,37 @@ async fn flatcontainer_download(
         "application/octet-stream"
     };
 
-    // Immutable cache. get_verified discharges the integrity witness at serve
-    // (compile-time guarantee — see crate::verified).
-    let cached = match cache_read(
-        state.storage.get_verified(&storage_key).await,
-        "nuget",
-        &storage_key,
-        internal,
-    ) {
+    let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+        state.config.curation.nuget.quarantine.as_ref().or(state
+            .config
+            .curation
+            .quarantine
+            .as_ref()),
+        state
+            .config
+            .curation
+            .nuget
+            .quarantine_ttl
+            .as_deref()
+            .or(state.config.curation.quarantine_ttl.as_deref()),
+    );
+    let quarantine_on = !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off);
+
+    // Immutable cache, integrity-gated: read whole and verified, or above
+    // `server.stream_threshold_mb` streamed with its pin checked as it streams.
+    let cached = match read_cached_artifact(&state, "nuget", &storage_key, internal).await {
         Ok(cached) => cached,
         Err(resp) => return resp,
     };
-    if let Some(outcome) = cached {
-        use nora_registry::verified::{verified_body, GateOutcome};
-        let data = match outcome {
-            GateOutcome::Verified(blob) => verified_body(blob),
-            GateOutcome::Unpinned(blob) => blob.into_inner(),
-        };
-        if ends_with_ci(filename, ".nupkg") {
-            if let Some(response) = crate::curation::verify_integrity(
-                &state.curation().curation_engine,
+    if let Some(cached) = cached {
+        let engine = &state.curation().curation_engine;
+        if ends_with_ci(filename, ".nupkg") && engine.is_active() {
+            if let Some(response) = crate::curation::verify_integrity_by_hash(
+                engine,
                 crate::curation::RegistryType::Nuget,
                 &id_lower,
                 Some(ver),
-                &data,
+                &cached.digest(),
             ) {
                 return response;
             }
@@ -985,30 +944,18 @@ async fn flatcontainer_download(
             "CACHE",
         ));
 
-        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-            state.config.curation.nuget.quarantine.as_ref().or(state
-                .config
-                .curation
-                .quarantine
-                .as_ref()),
-            state
-                .config
-                .curation
-                .nuget
-                .quarantine_ttl
-                .as_deref()
-                .or(state.config.curation.quarantine_ttl.as_deref()),
-        );
-        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
-            &state.digest_store,
-            "nuget",
-            &data,
-            &q_mode,
-            q_secs,
-            "cache",
-            publish_date,
-        ) {
-            return resp;
+        if quarantine_on {
+            if let Some(resp) = crate::digest_quarantine::proxy_gate_digest(
+                &state.digest_store,
+                "nuget",
+                &cached.digest(),
+                &q_mode,
+                q_secs,
+                "cache",
+                publish_date,
+            ) {
+                return resp;
+            }
         }
 
         // Resume support: 206 for a `Range` request, 416 when the client asks past the
@@ -1018,27 +965,48 @@ async fn flatcontainer_download(
         // hash the client verifies itself (docker did the same in #657). An
         // absent/malformed range falls through to the full 200.
         if ends_with_ci(filename, ".nupkg") {
-            if let Some(response) = crate::registry::range::range_response_from_bytes(
-                &data,
-                &headers,
-                content_type,
-                &[(
-                    header::CACHE_CONTROL,
-                    "public, max-age=31536000, immutable".to_string(),
-                )],
-            ) {
+            let extra = [(
+                header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable".to_string(),
+            )];
+            let ranged = match &cached {
+                CachedArtifact::Buffered(data) => {
+                    crate::registry::range::range_response_from_bytes(
+                        data,
+                        &headers,
+                        content_type,
+                        &extra,
+                    )
+                }
+                CachedArtifact::Streamed { len, .. } => {
+                    crate::registry::range::range_response(
+                        &state.storage,
+                        &[&storage_key],
+                        &headers,
+                        *len,
+                        content_type,
+                        &extra,
+                    )
+                    .await
+                }
+            };
+            if let Some(response) = ranged {
                 return response;
             }
         }
+        let len = cached.len();
         let mut response = (
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, content_type),
                 (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
             ],
-            data,
+            cached.into_body(&state, &storage_key, internal),
         )
             .into_response();
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
         if ends_with_ci(filename, ".nupkg") {
             response
                 .headers_mut()
@@ -1067,24 +1035,18 @@ async fn flatcontainer_download(
         filename.to_lowercase()
     );
 
-    let fetch = proxy_fetch_bytes(
-        &state.http_client,
-        &url,
-        Duration::from_secs(state.config.nuget.proxy_timeout),
-        expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
-        &state.circuit_breaker,
-        RegistryType::Nuget,
-    );
-    match proxy_fetch_shared(
+    match proxy_fetch_artifact(
         &state,
         &storage_key,
         "nuget",
+        &url,
         state.config.nuget.proxy_timeout,
-        fetch,
+        expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
+        RegistryType::Nuget,
     )
     .await
     {
-        Ok((bytes, fetched)) => {
+        Ok((body, fetched)) => {
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
@@ -1098,7 +1060,7 @@ async fn flatcontainer_download(
                 .log(AuditEntry::new("proxy_fetch", "proxy", "", "nuget", ""));
 
             if fetched {
-                state.spawn_cache_immutable("nuget", storage_key, bytes.clone());
+                spawn_cache_body(&state, "nuget", storage_key.clone(), body.clone());
             }
 
             // Best-effort: fetch flatcontainer index.json if missing (for local search)
@@ -1133,38 +1095,35 @@ async fn flatcontainer_download(
                     }
                 });
             }
-            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                state.config.curation.nuget.quarantine.as_ref().or(state
-                    .config
-                    .curation
-                    .quarantine
-                    .as_ref()),
-                state
-                    .config
-                    .curation
-                    .nuget
-                    .quarantine_ttl
-                    .as_deref()
-                    .or(state.config.curation.quarantine_ttl.as_deref()),
-            );
-            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
-                &state.digest_store,
-                "nuget",
-                &bytes,
-                &q_mode,
-                q_secs,
-                &url,
-                publish_date,
-            ) {
-                return resp;
+            if quarantine_on {
+                if let Some(resp) = crate::digest_quarantine::proxy_gate_digest(
+                    &state.digest_store,
+                    "nuget",
+                    &body.digest(),
+                    &q_mode,
+                    q_secs,
+                    &url,
+                    publish_date,
+                ) {
+                    return resp;
+                }
             }
+            let len = body.len();
+            let body = match body.into_body(&storage_key).await {
+                Ok(body) => body,
+                Err(e) => {
+                    tracing::warn!(key = %storage_key, error = %e, "nuget: spooled package unreadable");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
             (
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, content_type),
                     (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+                    (header::CONTENT_LENGTH, &len.to_string()),
                 ],
-                bytes,
+                body,
             )
                 .into_response()
         }
@@ -2369,6 +2328,206 @@ mod integration_tests {
     use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
     use axum::http::{Method, StatusCode};
 
+    /// A body of `len` bytes that is not one repeated byte (so a splice shows).
+    fn big_body(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// C17: a .nupkg above `server.stream_threshold_mb` is spooled on a cold miss:
+    /// six concurrent restores make one upstream fetch, all get the full package from
+    /// the leader's spool file, and it lands in storage pinned to its digest.
+    #[tokio::test]
+    async fn test_large_cold_nupkg_is_spooled_and_shared() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let nupkg = big_body(3 * 1024 * 1024 + 17);
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(nupkg.clone())
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(upstream.uri());
+            cfg.server.stream_threshold_mb = 1;
+        });
+        let uri = "/nuget/v3/flatcontainer/bigpkg/1.0.0/bigpkg.1.0.0.nupkg";
+        let resps =
+            futures::future::join_all((0..6).map(|_| send(&ctx.app, Method::GET, uri, ""))).await;
+        for resp in resps {
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()["content-length"],
+                nupkg.len().to_string().as_str()
+            );
+            assert!(body_bytes(resp).await[..] == nupkg[..]);
+        }
+        let fetches = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with(".nupkg"))
+            .count();
+        assert_eq!(fetches, 1);
+
+        let key = "nuget/flatcontainer/bigpkg/1.0.0/bigpkg.1.0.0.nupkg";
+        let want = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&nupkg))
+        };
+        for _ in 0..100 {
+            if ctx.state.storage.pin(key).await.as_deref() == Some(want.as_str()) {
+                // Every holder dropped: the spool files are gone.
+                let spool =
+                    std::path::Path::new(&ctx.state.config.storage.path).join("tmp/proxy-spool");
+                for _ in 0..100 {
+                    if std::fs::read_dir(&spool).map_or(0, |d| d.count()) == 0 {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                panic!("spool files left behind");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("large nupkg was not cached with its pin");
+    }
+
+    /// C17: a cached .nupkg above the threshold streams from storage (no upstream),
+    /// whole and with its length; a Range request on it is served from storage too.
+    #[tokio::test]
+    async fn test_large_cached_nupkg_streams() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".into());
+            cfg.server.stream_threshold_mb = 1;
+        });
+        let nupkg = big_body(2 * 1024 * 1024);
+        let key = "nuget/flatcontainer/bighit/1.0.0/bighit.1.0.0.nupkg";
+        ctx.state.storage.put(key, &nupkg).await.unwrap();
+        let uri = "/nuget/v3/flatcontainer/bighit/1.0.0/bighit.1.0.0.nupkg";
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()["content-length"],
+            nupkg.len().to_string().as_str()
+        );
+        assert!(body_bytes(resp).await[..] == nupkg[..]);
+
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            Method::GET,
+            uri,
+            vec![("range", "bytes=10-19")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body_bytes(resp).await[..], &nupkg[10..20]);
+    }
+
+    /// C17 + C54: a streamed cache hit whose bytes no longer match the pin is cut off
+    /// before the last frame (the client never gets a complete download), the bad
+    /// copy is dropped, and the next request refetches and re-caches the package.
+    #[tokio::test]
+    async fn test_large_tampered_nupkg_aborts_then_self_heals() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let nupkg = big_body(2 * 1024 * 1024);
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(nupkg.clone()))
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(upstream.uri());
+            cfg.server.stream_threshold_mb = 1;
+        });
+        let key = "nuget/flatcontainer/tamper/1.0.0/tamper.1.0.0.nupkg";
+        ctx.state.storage.put(key, &nupkg).await.unwrap();
+        // Corrupt the bytes at rest; the recorded pin stays.
+        let mut bad = nupkg.clone();
+        bad[1_500_000] ^= 0xff;
+        std::fs::write(
+            std::path::Path::new(&ctx.state.config.storage.path).join(key),
+            &bad,
+        )
+        .unwrap();
+
+        let uri = "/nuget/v3/flatcontainer/tamper/1.0.0/tamper.1.0.0.nupkg";
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "headers go out before EOF");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+        assert!(body.is_err(), "a pin mismatch must abort the body");
+
+        let mut healed = false;
+        for _ in 0..100 {
+            if ctx.state.storage.stat(key).await.is_none() {
+                healed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(healed, "the bad copy is dropped");
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_bytes(resp).await[..] == nupkg[..]);
+        for _ in 0..100 {
+            if let Ok(data) = ctx.state.storage.get(key).await {
+                assert!(data[..] == nupkg[..]);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the refetched package was not re-cached");
+    }
+
+    /// C54: a small cached .nupkg failing its pin is refetched and the cache repaired
+    /// (the immutable write used to skip the existing bad key forever).
+    #[tokio::test]
+    async fn test_tampered_cached_nupkg_is_repaired() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"good-nupkg".to_vec()))
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(upstream.uri());
+        });
+        let key = "nuget/flatcontainer/fixme/1.0.0/fixme.1.0.0.nupkg";
+        ctx.state.storage.put(key, b"good-nupkg").await.unwrap();
+        std::fs::write(
+            std::path::Path::new(&ctx.state.config.storage.path).join(key),
+            b"evil-nupkg",
+        )
+        .unwrap();
+
+        let uri = "/nuget/v3/flatcontainer/fixme/1.0.0/fixme.1.0.0.nupkg";
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"good-nupkg");
+        for _ in 0..100 {
+            if let Ok(data) = ctx.state.storage.get(key).await {
+                assert_eq!(&data[..], b"good-nupkg");
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the cache was not repaired");
+    }
+
     /// N concurrent restores of an uncached .nupkg: one upstream download, every
     /// client gets the package, and it is cached.
     #[tokio::test]
@@ -2414,6 +2573,57 @@ mod integration_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("nupkg was not cached");
+    }
+
+    /// C48: concurrent cold misses on the registration index, a registration page and
+    /// the version list each make one upstream request; every client gets the body.
+    #[tokio::test]
+    async fn test_concurrent_cold_metadata_misses_fetch_once() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"versions":["1.0.0"],"items":[]}"#)
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(upstream.uri());
+        });
+        for (uri, upstream_suffix) in [
+            (
+                "/nuget/v3/registration/meta.pkg/index.json",
+                "/registration5-gz-semver2/meta.pkg/index.json",
+            ),
+            (
+                "/nuget/v3/registration/meta.pkg/page/1.0.0/2.0.0.json",
+                "/registration5-gz-semver2/meta.pkg/page/1.0.0/2.0.0.json",
+            ),
+            (
+                "/nuget/v3/flatcontainer/meta.pkg/index.json",
+                "/v3-flatcontainer/meta.pkg/index.json",
+            ),
+        ] {
+            let resps =
+                futures::future::join_all((0..6).map(|_| send(&ctx.app, Method::GET, uri, "")))
+                    .await;
+            for resp in resps {
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            }
+            let fetches = upstream
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path().ends_with(upstream_suffix))
+                .count();
+            assert_eq!(fetches, 1, "{uri}");
+        }
     }
 
     #[tokio::test]
@@ -4124,6 +4334,64 @@ mod spec_conformance_tests {
             cache_control.contains("immutable"),
             "nupkg must have immutable cache-control, got: {}",
             cache_control
+        );
+    }
+
+    /// C56: an upstream 304 writes only the small `.meta` sidecar (one PUT carrying
+    /// `validated_at`), never the cached body again.
+    #[tokio::test]
+    async fn test_nuget_304_writes_only_the_sidecar() {
+        use crate::registry::{validators_key, write_validators, Validators};
+        use crate::test_helpers::{
+            create_test_context_with_storage_and_config, op_counting_storage, send,
+        };
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(upstream.uri());
+            cfg.nuget.metadata_ttl = 0; // always stale → always revalidate
+        });
+        let key = "nuget/flatcontainer/sidecar-pkg/index.json";
+        ctx.state
+            .storage
+            .put(key, br#"{"versions":["1.0.0"]}"#)
+            .await
+            .unwrap();
+        let v = Validators {
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+        };
+        write_validators(&ctx.state.storage, key, &v).await;
+        ops.reset();
+
+        let uri = "/nuget/v3/flatcontainer/sidecar-pkg/index.json";
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut stamped = false;
+        for _ in 0..100 {
+            let sidecar = ctx.state.storage.get(&validators_key(key)).await.unwrap();
+            if String::from_utf8_lossy(&sidecar).contains("validated_at") {
+                stamped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stamped, "the 304 is recorded in the sidecar");
+        assert_eq!(
+            ops.snapshot().get("put"),
+            Some(&1),
+            "only the sidecar is written: {:?}",
+            ops.snapshot()
         );
     }
 

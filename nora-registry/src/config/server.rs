@@ -58,6 +58,13 @@ pub struct ServerConfig {
     /// caps. Default 512.
     #[serde(default = "default_publish_body_limit_mb")]
     pub publish_body_limit_mb: usize,
+    /// Proxied NuGet/npm/PyPI artifacts larger than this many MB are never held in
+    /// memory whole: a cold miss is spooled to a temp file under `{storage.path}/tmp/`
+    /// and served from it, a cache hit is streamed from storage with its digest
+    /// checked as it streams. Smaller ones are buffered as before. Default 16;
+    /// 0 buffers everything.
+    #[serde(default = "default_stream_threshold_mb")]
+    pub stream_threshold_mb: u64,
 }
 
 pub(super) fn default_server_host() -> String {
@@ -96,6 +103,10 @@ pub(super) fn default_publish_body_limit_mb() -> usize {
     512
 }
 
+pub(super) fn default_stream_threshold_mb() -> u64 {
+    16
+}
+
 /// TLS configuration for outbound connections to upstream registries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsConfig {
@@ -117,6 +128,7 @@ impl Default for ServerConfig {
             header_read_timeout: default_header_read_timeout(),
             max_connections: default_max_connections(),
             publish_body_limit_mb: default_publish_body_limit_mb(),
+            stream_threshold_mb: default_stream_threshold_mb(),
         }
     }
 }
@@ -128,6 +140,11 @@ impl ServerConfig {
         self.publish_body_limit_mb
             .min(self.body_limit_mb)
             .saturating_mul(1024 * 1024)
+    }
+
+    /// `stream_threshold_mb` in bytes; 0 = never stream.
+    pub fn stream_threshold(&self) -> u64 {
+        self.stream_threshold_mb.saturating_mul(1024 * 1024)
     }
 
     /// Format bind address for `TcpListener::bind`.
@@ -225,6 +242,13 @@ impl ServerConfig {
         if let Ok(val) = env::var("NORA_MAX_CONNECTIONS") {
             super::parse_env_warn("NORA_MAX_CONNECTIONS", &val, &mut self.max_connections);
         }
+        if let Ok(val) = env::var("NORA_STREAM_THRESHOLD_MB") {
+            super::parse_env_warn(
+                "NORA_STREAM_THRESHOLD_MB",
+                &val,
+                &mut self.stream_threshold_mb,
+            );
+        }
         if let Ok(val) = env::var("NORA_PUBLISH_BODY_LIMIT_MB") {
             super::parse_env_warn(
                 "NORA_PUBLISH_BODY_LIMIT_MB",
@@ -308,6 +332,7 @@ mod tests {
             header_read_timeout: 30,
             max_connections: 4096,
             publish_body_limit_mb: 512,
+            stream_threshold_mb: 16,
         }
     }
 

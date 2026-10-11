@@ -144,6 +144,7 @@ fn build_context_with(
             header_read_timeout: 30,
             max_connections: 4096,
             publish_body_limit_mb: 512,
+            stream_threshold_mb: 16,
         },
         storage: StorageConfig {
             mode: StorageMode::Local,
@@ -389,6 +390,7 @@ fn build_context_with(
             cb_config,
         )),
         proxy_coalesce: crate::proxy_coalesce::InflightMap::new(),
+        artifact_flights: crate::proxy_coalesce::InflightMap::new(),
         blob_flights: crate::proxy_coalesce::InflightMap::new(),
         digest_store: Arc::new(crate::digest_quarantine::DigestStore::empty(&storage_path)),
         signer,

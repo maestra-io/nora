@@ -2529,6 +2529,44 @@ mod integration_tests {
         ));
     }
 
+    /// Invariant: a hosted package never depends on the upstream. With a dead
+    /// upstream and every metadata hit stale, push and every restore endpoint are
+    /// 200/201 and the upstream sees no request at all.
+    #[tokio::test]
+    async fn hosted_package_never_touches_a_dead_upstream() {
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.nuget.metadata_ttl = 0;
+        });
+        let pkg = nupkg("Corp.Lib", "1.0.0", "");
+        assert_eq!(push(&ctx.app, &pkg, &[]).await, StatusCode::CREATED);
+        for uri in [
+            "/nuget/v3/flatcontainer/corp.lib/index.json",
+            "/nuget/v3/registration/corp.lib/index.json",
+            "/nuget/v3/flatcontainer/corp.lib/1.0.0/corp.lib.1.0.0.nupkg",
+            "/nuget/v3/flatcontainer/corp.lib/1.0.0/corp.lib.nuspec",
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        }
+        let seen = upstream.received_requests().await.unwrap();
+        assert!(
+            seen.is_empty(),
+            "upstream contacted: {:?}",
+            seen.iter()
+                .map(|r| r.url.path().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn push_rejects_invalid_packages() {
         let ctx = ctx();

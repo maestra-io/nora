@@ -177,7 +177,7 @@ async fn download(
             }
             builder
                 .body(nora_registry::verified::stream_body(
-                    verify_while_streaming(reader, pin, key.clone()),
+                    verify_while_streaming(reader, pin, key.clone(), None),
                 ))
                 .expect("valid response")
                 .into_response()
@@ -196,7 +196,7 @@ async fn download(
 /// tampered object can never arrive at the client as a complete download.
 /// (The streaming counterpart of the buffered `get_verified` gate; see the
 /// serve site above.)
-struct VerifyingStream {
+pub(crate) struct VerifyingStream {
     frames:
         tokio_util::io::ReaderStream<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>>,
     /// Expected pin + running hash; `None` = unpinned key, no check.
@@ -205,6 +205,8 @@ struct VerifyingStream {
     /// One-frame holdback buffer (only used while `hashing` is active).
     held: Option<axum::body::Bytes>,
     done: bool,
+    /// Run once on a digest mismatch (a proxy cache drops the bad copy, C54).
+    on_mismatch: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl futures::Stream for VerifyingStream {
@@ -249,6 +251,9 @@ impl futures::Stream for VerifyingStream {
                                 computed = %computed,
                                 "SECURITY: integrity pin mismatch on streamed read — aborting body"
                             );
+                            if let Some(heal) = self.on_mismatch.take() {
+                                heal();
+                            }
                             return Poll::Ready(Some(Err(std::io::Error::other(
                                 "integrity pin mismatch",
                             ))));
@@ -264,10 +269,11 @@ impl futures::Stream for VerifyingStream {
     }
 }
 
-fn verify_while_streaming(
+pub(crate) fn verify_while_streaming(
     reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
     pin: Option<String>,
     key: String,
+    on_mismatch: Option<Box<dyn FnOnce() + Send + Sync>>,
 ) -> VerifyingStream {
     use sha2::Digest;
     VerifyingStream {
@@ -276,6 +282,7 @@ fn verify_while_streaming(
         key,
         held: None,
         done: false,
+        on_mismatch,
     }
 }
 

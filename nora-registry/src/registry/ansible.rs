@@ -518,7 +518,10 @@ async fn proxy_json(
     // TTL check — serve fresh cache without hitting upstream.
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(cache_key).await {
-            if crate::cache_ttl::is_within_ttl(meta.modified, state.config.ansible.metadata_ttl) {
+            let ttl = state.config.ansible.metadata_ttl;
+            if crate::registry::fresh_within_ttl(&state.storage, cache_key, meta.modified, ttl)
+                .await
+            {
                 state.metrics.record_download("ansible");
                 state.metrics.record_cache_hit("ansible");
                 let text = String::from_utf8_lossy(data);
@@ -600,12 +603,11 @@ async fn proxy_json(
                 .inc_by(cached.len() as u64);
             state.metrics.record_download("ansible");
             state.metrics.record_cache_hit("ansible");
-            // Re-put bumps the file mtime (the freshness source) without download.
+            // Record the revalidation in the `.meta` sidecar; no body re-upload (C56).
             let storage = state.storage.clone();
             let key_clone = cache_key.to_string();
-            let body = cached.clone();
             tokio::spawn(async move {
-                let _ = storage.put(&key_clone, &body).await;
+                crate::registry::mark_revalidated(&storage, "ansible", &key_clone).await;
             });
             let text = String::from_utf8_lossy(&cached);
             let rewritten = rewrite_ansible_urls(&text, &upstream, &base_url);

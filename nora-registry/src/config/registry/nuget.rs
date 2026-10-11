@@ -15,6 +15,8 @@ pub struct NugetConfig {
     pub proxy_auth: Option<ProtectedString>,
     #[serde(default = "super::super::default_timeout")]
     pub proxy_timeout: u64,
+    /// Per-attempt timeout (seconds, connect to last body byte) for the registration
+    /// index/page and the version list. One retry follows a 5xx or transport error.
     #[serde(default = "default_nuget_metadata_timeout")]
     pub metadata_proxy_timeout: u64,
     #[serde(default = "super::super::default_metadata_ttl")]
@@ -65,8 +67,10 @@ fn default_nuget_autocomplete() -> String {
     "https://azuresearch-usnc.nuget.org/autocomplete".to_string()
 }
 
+/// 10 s: a large registration index (hundreds of versions) on a busy link takes
+/// longer than the former 2 s, and every timeout on a cold key is a failed restore.
 fn default_nuget_metadata_timeout() -> u64 {
-    2
+    10
 }
 
 impl Default for NugetConfig {
@@ -76,7 +80,7 @@ impl Default for NugetConfig {
             proxy: default_nuget_proxy(),
             proxy_auth: None,
             proxy_timeout: 30,
-            metadata_proxy_timeout: 2,
+            metadata_proxy_timeout: default_nuget_metadata_timeout(),
             metadata_ttl: 300,
             serve_stale: true,
             revalidate: true,

@@ -100,6 +100,19 @@ pub enum RepinOutcome {
     DiskMismatch { disk: String, expected: String },
 }
 
+/// Outcome of [`Storage::get_verified_bounded`].
+pub enum BoundedRead {
+    /// Read whole and gated, as [`Storage::get_verified`].
+    Buffered(nora_registry::verified::GateOutcome),
+    /// Bigger than the buffer bound and pinned: the bytes are NOT verified yet; the
+    /// caller checks them against `pin` as they stream.
+    Streamed {
+        len: u64,
+        pin: String,
+        reader: Pin<Box<dyn AsyncRead + Send + Unpin>>,
+    },
+}
+
 /// Storage backend trait.
 ///
 /// Every backend owns the SHA-256 integrity pin of the artifacts it stores and
@@ -342,6 +355,16 @@ impl Storage {
             }
         };
         STORAGE_OPERATIONS.with_label_values(&["get", "ok"]).inc();
+        Self::verify_pinned(key, data, pin).await
+    }
+
+    /// The fail-closed gate of [`get_pinned`](Self::get_pinned) on a body already read:
+    /// `Ok` only after a digest match, or for an open-world (unpinned) key.
+    async fn verify_pinned(
+        key: &str,
+        data: Bytes,
+        pin: Option<String>,
+    ) -> Result<(Bytes, Option<String>)> {
         let label = registry_label(key);
         STORAGE_GET_BYTES
             .with_label_values(&[label])
@@ -436,10 +459,16 @@ impl Storage {
         // a choke point that does not depend on the transitive get() validation
         // below surviving a future refactor (trust-boundary invariant).
         validate_storage_key(key)?;
-        use nora_registry::verified::{Blob, GateOutcome};
         // Reuse the fail-closed gate: it returns Ok only after a digest match or
         // on the open-world / no-pin branch.
         let (data, pin) = self.get_pinned(key).await?;
+        Self::witness(data, pin)
+    }
+
+    /// Mint the [`GateOutcome`](nora_registry::verified::GateOutcome) for bytes that
+    /// passed [`verify_pinned`](Self::verify_pinned).
+    fn witness(data: Bytes, pin: Option<String>) -> Result<nora_registry::verified::GateOutcome> {
+        use nora_registry::verified::{Blob, GateOutcome};
         match pin {
             Some(pin) => match Blob::verify(data, &pin) {
                 Ok(blob) => Ok(GateOutcome::Verified(blob)),
@@ -450,6 +479,34 @@ impl Storage {
             },
             None => Ok(GateOutcome::Unpinned(Blob::raw(data))),
         }
+    }
+
+    /// [`get_verified`](Self::get_verified) for objects up to `max_buffered` bytes; a
+    /// bigger pinned object comes back as an open reader instead, never in memory
+    /// (C17), for the caller to stream through an EOF digest check against `pin`
+    /// (raw's `verify_while_streaming`). One backend round-trip either way.
+    /// `max_buffered == 0` is exactly `get_verified`.
+    // ponytail: a big UNPINNED object is still buffered — with no recorded digest
+    // there is nothing to gate it on before the first byte goes out; stream-hash it
+    // in a first pass if such objects ever matter.
+    pub async fn get_verified_bounded(&self, key: &str, max_buffered: u64) -> Result<BoundedRead> {
+        validate_storage_key(key)?;
+        if max_buffered == 0 {
+            return self.get_verified(key).await.map(BoundedRead::Buffered);
+        }
+        let (len, pin, mut reader) = self.get_reader(key).await?;
+        if let Some(pin) = pin.as_ref().filter(|_| len > max_buffered) {
+            return Ok(BoundedRead::Streamed {
+                len,
+                pin: pin.clone(),
+                reader,
+            });
+        }
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+        reader.read_to_end(&mut buf).await?;
+        let (data, pin) = Self::verify_pinned(key, Bytes::from(buf), pin).await?;
+        Self::witness(data, pin).map(BoundedRead::Buffered)
     }
 
     pub async fn delete(&self, key: &str) -> Result<()> {
@@ -751,6 +808,45 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    /// C17: `get_verified_bounded` hands a pinned object above the bound back as a
+    /// reader (never buffered) and gates a smaller one exactly like `get_verified`,
+    /// failing closed on a mismatch.
+    #[tokio::test]
+    async fn get_verified_bounded_streams_big_pinned_objects() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage.put("raw/big.bin", &[7u8; 4096]).await.unwrap();
+        storage.put("raw/small.bin", b"tiny").await.unwrap();
+
+        match storage
+            .get_verified_bounded("raw/big.bin", 1024)
+            .await
+            .unwrap()
+        {
+            BoundedRead::Streamed { len, pin, .. } => {
+                assert_eq!(len, 4096);
+                assert_eq!(pin, sha256_hex(&[7u8; 4096]));
+            }
+            BoundedRead::Buffered(_) => panic!("a big pinned object must not be buffered"),
+        }
+        match storage
+            .get_verified_bounded("raw/small.bin", 1024)
+            .await
+            .unwrap()
+        {
+            BoundedRead::Buffered(outcome) => {
+                assert!(outcome.is_verified());
+                assert_eq!(&outcome.accept_open_world()[..], b"tiny");
+            }
+            BoundedRead::Streamed { .. } => panic!("a small object is read whole"),
+        }
+        std::fs::write(dir.path().join("raw/small.bin"), b"evil").unwrap();
+        assert!(matches!(
+            storage.get_verified_bounded("raw/small.bin", 1024).await,
+            Err(StorageError::IntegrityViolation)
+        ));
+    }
 
     /// The GCS wrapper constructs without credentials or network.
     #[test]

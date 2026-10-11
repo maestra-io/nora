@@ -208,7 +208,10 @@ async fn recipe_latest(
     let cached_data = state.storage.get(&storage_key).await.ok();
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
+            let ttl = state.config.conan.metadata_ttl;
+            if crate::registry::fresh_within_ttl(&state.storage, &storage_key, meta.modified, ttl)
+                .await
+            {
                 state.metrics.record_download("conan");
                 state.metrics.record_cache_hit("conan");
                 return with_json(data.to_vec());
@@ -263,7 +266,10 @@ async fn recipe_revisions(
     let cached_data = state.storage.get(&storage_key).await.ok();
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
+            let ttl = state.config.conan.metadata_ttl;
+            if crate::registry::fresh_within_ttl(&state.storage, &storage_key, meta.modified, ttl)
+                .await
+            {
                 state.metrics.record_download("conan");
                 state.metrics.record_cache_hit("conan");
                 return with_json(data.to_vec());
@@ -593,7 +599,10 @@ async fn package_latest(
     let cached_data = state.storage.get(&storage_key).await.ok();
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
+            let ttl = state.config.conan.metadata_ttl;
+            if crate::registry::fresh_within_ttl(&state.storage, &storage_key, meta.modified, ttl)
+                .await
+            {
                 state.metrics.record_download("conan");
                 state.metrics.record_cache_hit("conan");
                 return with_json(data.to_vec());
@@ -666,7 +675,10 @@ async fn package_revisions(
     let cached_data = state.storage.get(&storage_key).await.ok();
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
+            let ttl = state.config.conan.metadata_ttl;
+            if crate::registry::fresh_within_ttl(&state.storage, &storage_key, meta.modified, ttl)
+                .await
+            {
                 state.metrics.record_download("conan");
                 state.metrics.record_cache_hit("conan");
                 return with_json(data.to_vec());
@@ -1042,12 +1054,11 @@ async fn fetch_and_cache_json(
                 .inc_by(body.len() as u64);
             state.metrics.record_download("conan");
             state.metrics.record_cache_hit("conan");
-            // Re-put bumps the file mtime (the freshness source) without download.
+            // Record the revalidation in the `.meta` sidecar; no body re-upload (C56).
             let storage = state.storage.clone();
             let key_clone = storage_key.to_string();
-            let bump = body.clone();
             tokio::spawn(async move {
-                let _ = storage.put(&key_clone, &bump).await;
+                crate::registry::mark_revalidated(&storage, "conan", &key_clone).await;
             });
             with_json(body.to_vec())
         }
@@ -1205,8 +1216,6 @@ fn upstream_url(state: &AppState) -> String {
         .unwrap_or_else(|| UPSTREAM_DEFAULT.to_string())
 }
 
-use crate::cache_ttl::is_within_ttl;
-
 fn with_json(data: Vec<u8>) -> Response {
     (
         StatusCode::OK,
@@ -1282,6 +1291,7 @@ fn is_valid_filename(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache_ttl::is_within_ttl;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]

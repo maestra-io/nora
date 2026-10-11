@@ -291,6 +291,8 @@ pub struct AppState {
     /// thundering herd of concurrent requests for the same key into one
     /// upstream fetch (#595). In-memory and rebuildable (empty after restart).
     pub(crate) proxy_coalesce: proxy_coalesce::InflightMap<Bytes>,
+    /// Single-flight of proxied artifact cold misses, whose body may be spooled to disk.
+    pub(crate) artifact_flights: proxy_coalesce::InflightMap<registry::ProxyBody>,
     /// Docker blob fills in flight, shared by every request for the blob (#1003).
     pub(crate) blob_flights: proxy_coalesce::InflightMap<registry::docker::SpoolShare>,
     pub digest_store: Arc<digest_quarantine::DigestStore>,
@@ -444,9 +446,13 @@ fn build_http_client(
 ) -> reqwest::Client {
     // A black-holed upstream fails the connect in seconds instead of eating the
     // whole per-request timeout (twice, with the proxy retry).
+    // Idle pooled connections are dropped after 30 s, before the usual 60 s idle
+    // cut of upstream load balancers/CDNs: reusing one they already closed fails the
+    // request (reqwest's default keeps them 90 s).
     let mut builder = reqwest::ClientBuilder::new()
         .user_agent(USER_AGENT)
-        .connect_timeout(std::time::Duration::from_secs(10));
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .pool_idle_timeout(std::time::Duration::from_secs(30));
 
     if let Some(t) = timeout {
         builder = builder.timeout(t);
@@ -2102,6 +2108,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         teleport: teleport_validator,
         circuit_breaker: Arc::new(circuit_breaker::CircuitBreakerRegistry::new(cb_config)),
         proxy_coalesce: proxy_coalesce::InflightMap::new(),
+        artifact_flights: proxy_coalesce::InflightMap::new(),
         blob_flights: proxy_coalesce::InflightMap::new(),
         digest_store,
         signer,
@@ -2314,6 +2321,8 @@ async fn run_server(mut config: Config, storage: Storage) {
         registry::docker::cleanup_upload_temp_dir(&state.config.storage.path);
         registry::docker::cleanup_proxy_temp_dir(&state.config.storage.path);
     }
+    // Proxied artifacts spooled to disk by an instance that died mid-download.
+    registry::cleanup_proxy_spool_dir(&state.config.storage.path);
     // ...and streamed raw uploads a crash cut off mid-request.
     if state.config.raw.enabled {
         registry::raw::cleanup_upload_temp_dir(&state.config.storage.path);
@@ -2430,6 +2439,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                     // so in-progress uploads are never reaped.
                     registry::docker::cleanup_upload_temp_dir(&storage_path);
                     registry::raw::cleanup_upload_temp_dir(&storage_path);
+                    registry::cleanup_proxy_spool_dir(&storage_path);
                 });
             }
         }

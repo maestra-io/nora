@@ -1951,6 +1951,8 @@ async fn upload_blob(
 ///
 /// Returns `Some(Response)` on first successful upstream (or quarantine block),
 /// `None` if all upstreams failed.
+/// `rate_limited` is set to the upstream `Retry-After` (if any) when an upstream
+/// answered 429, so the caller can report throttling rather than a missing manifest.
 async fn try_fetch_and_cache(
     state: &AppState,
     upstreams: &[&crate::config::DockerUpstream],
@@ -1958,6 +1960,7 @@ async fn try_fetch_and_cache(
     name: &str,
     reference: &str,
     cache_key: &str,
+    rate_limited: &mut Option<Option<String>>,
 ) -> Option<Response> {
     for upstream in upstreams {
         tracing::debug!(upstream_url = %upstream.url, upstream_name = %upstream_name, "Trying upstream");
@@ -2095,6 +2098,9 @@ async fn try_fetch_and_cache(
             }
             Err(ProxyError::CircuitOpen(reg)) => return Some(circuit_open_response(&reg)),
             Err(e) => {
+                if let ProxyError::RateLimited(retry_after) = &e {
+                    *rate_limited = Some(retry_after.clone());
+                }
                 tracing::debug!(error = ?e, upstream = %upstream.url, name = %upstream_name, reference = %reference, "Docker manifest proxy fetch failed, trying next");
                 continue;
             }
@@ -2264,8 +2270,17 @@ async fn get_manifest(
         upstreams_count = upstreams_to_try.len(),
         "Trying upstream proxies"
     );
-    if let Some(response) =
-        try_fetch_and_cache(&state, &upstreams_to_try, &name, &name, &reference, &key).await
+    let mut rate_limited = None;
+    if let Some(response) = try_fetch_and_cache(
+        &state,
+        &upstreams_to_try,
+        &name,
+        &name,
+        &reference,
+        &key,
+        &mut rate_limited,
+    )
+    .await
     {
         return response;
     }
@@ -2281,6 +2296,7 @@ async fn get_manifest(
             &name,
             &reference,
             &key,
+            &mut rate_limited,
         )
         .await
         {
@@ -2309,6 +2325,27 @@ async fn get_manifest(
             );
             return response;
         }
+    }
+
+    // Throttled upstream (Docker Hub pull-rate limit): 429 TOOMANYREQUESTS with its
+    // Retry-After, which docker/containerd report as such — not MANIFEST_UNKNOWN.
+    if let Some(retry_after) = rate_limited {
+        tracing::warn!(registry = "docker", name = %name, reference = %reference, ?retry_after, "upstream rate-limited the manifest pull, returning 429");
+        let retry_after = retry_after
+            .as_deref()
+            .and_then(|v| axum::http::HeaderValue::from_str(v).ok())
+            .unwrap_or_else(|| axum::http::HeaderValue::from_static("60"));
+        let body = serde_json::json!({"errors": [{
+            "code": "TOOMANYREQUESTS",
+            "message": "upstream registry rate limit exceeded",
+            "detail": {"name": name, "reference": reference},
+        }]});
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after)],
+            axum::Json(body),
+        )
+            .into_response();
     }
 
     if !state.config.docker.upstreams.is_empty() {
@@ -3923,6 +3960,12 @@ pub async fn fetch_manifest_from_upstream(
     if !response.status().is_success() {
         let status = response.status().as_u16();
         tracing::warn!(status = %response.status(), "Upstream returned non-success status");
+        if status == 429 {
+            // Docker Hub pull-rate limit: back off, and tell the client so (C55)
+            // instead of letting it read as a missing manifest.
+            cb.record_failure(&cb_key, probe);
+            return Err(crate::registry::upstream_4xx(status, response.headers()));
+        }
         if (400..500).contains(&status) {
             // 4xx — upstream is alive and answered (e.g. manifest not found);
             // recover the breaker rather than counting it as a failure (#606).
@@ -4786,6 +4829,41 @@ mod integration_tests {
         assert_eq!(get_digest, digest_header);
         let body = body_bytes(get_resp).await;
         assert_eq!(body.as_ref(), manifest_bytes.as_slice());
+    }
+
+    /// C55: Docker Hub pull-rate limiting (429) reaches the client as 429
+    /// TOOMANYREQUESTS with the upstream Retry-After, not as 404 MANIFEST_UNKNOWN.
+    #[tokio::test]
+    async fn test_upstream_429_is_429_not_404() {
+        use crate::config::DockerUpstream;
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "42"))
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: upstream.uri(),
+                auth: None,
+                namespace: None,
+                prefix: None,
+            }];
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/limited/manifests/latest",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "42");
+        let body = body_bytes(resp).await;
+        assert!(String::from_utf8_lossy(&body).contains("TOOMANYREQUESTS"));
     }
 
     /// A locally pushed manifest is authoritative: with global pull-through upstreams

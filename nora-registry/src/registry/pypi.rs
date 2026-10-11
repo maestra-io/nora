@@ -16,7 +16,8 @@ use crate::circuit_breaker::BreakerScope;
 use crate::config::UpstreamAuth;
 use crate::registry::{
     cache_read, circuit_open_response, method_not_allowed, nora_base_url, proxy_error_response,
-    proxy_fetch_bytes, proxy_fetch_shared, proxy_fetch_text, TempFileGuard,
+    proxy_fetch_artifact, proxy_fetch_bytes, proxy_fetch_text, read_cached_artifact, ProxyBody,
+    TempFileGuard,
 };
 use crate::registry_type::RegistryType;
 use crate::ui::components::html_escape;
@@ -596,32 +597,27 @@ async fn download_file(
         }
     }
 
-    // Try local storage first. get_verified discharges the integrity witness at
-    // the serve site (compile-time guarantee — see crate::verified).
-    let cached = match cache_read(
-        state.storage.get_verified(&key).await,
-        "pypi",
-        &key,
-        internal,
-    ) {
+    let engine = &state.curation().curation_engine;
+    let quarantine_on = !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off);
+
+    // Try local storage first, integrity-gated: read whole and verified, or above
+    // `server.stream_threshold_mb` streamed with its pin checked as it streams.
+    let cached = match read_cached_artifact(&state, "pypi", &key, internal).await {
         Ok(cached) => cached,
         Err(resp) => return resp,
     };
-    if let Some(outcome) = cached {
-        use nora_registry::verified::{verified_body, GateOutcome};
-        let data = match outcome {
-            GateOutcome::Verified(blob) => verified_body(blob),
-            GateOutcome::Unpinned(blob) => blob.into_inner(),
-        };
+    if let Some(cached) = cached {
         // Curation integrity verification (issue #189)
-        if let Some(response) = crate::curation::verify_integrity(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::PyPI,
-            &normalized,
-            version.as_deref(),
-            &data,
-        ) {
-            return response;
+        if engine.is_active() {
+            if let Some(response) = crate::curation::verify_integrity_by_hash(
+                engine,
+                crate::curation::RegistryType::PyPI,
+                &normalized,
+                version.as_deref(),
+                &cached.digest(),
+            ) {
+                return response;
+            }
         }
 
         state.metrics.record_download("pypi");
@@ -636,27 +632,31 @@ async fn download_file(
             .audit
             .log(AuditEntry::new("cache_hit", "proxy", "", "pypi", ""));
 
-        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
-            &state.digest_store,
-            "pypi",
-            &data,
-            &q_mode,
-            q_secs,
-            "cache",
-            publish_date,
-        ) {
-            return resp;
+        if quarantine_on {
+            if let Some(resp) = crate::digest_quarantine::proxy_gate_digest(
+                &state.digest_store,
+                "pypi",
+                &cached.digest(),
+                &q_mode,
+                q_secs,
+                "cache",
+                publish_date,
+            ) {
+                return resp;
+            }
         }
 
         let content_type = pypi_content_type(&filename);
+        let len = cached.len().to_string();
         return (
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, content_type),
                 (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
                 (header::ACCEPT_RANGES, "bytes"),
+                (header::CONTENT_LENGTH, &len),
             ],
-            data,
+            cached.into_body(&state, &key, internal),
         )
             .into_response();
     }
@@ -708,35 +708,41 @@ async fn download_file(
             continue;
         };
 
-        let fetch = proxy_fetch_bytes(
-            &state.http_client,
+        // A file above `server.stream_threshold_mb` is spooled to disk (C17).
+        match proxy_fetch_artifact(
+            &state,
+            &key,
+            "pypi",
             &file_url,
-            Duration::from_secs(state.config.pypi.proxy_timeout),
+            state.config.pypi.proxy_timeout,
             up.auth().map(UpstreamAuth::Basic),
-            &state.circuit_breaker,
             BreakerScope::upstream(RegistryType::PyPI, up.url()),
-        );
-        match proxy_fetch_shared(&state, &key, "pypi", state.config.pypi.proxy_timeout, fetch).await
+        )
+        .await
         {
             Ok((data, fetched)) => {
+                // Hashed once (a spooled body already carries it).
+                let sha256 = data.sha256();
                 // The index published this file's digest: a body that does not match
                 // (truncated, corrupted, tampered) is neither served nor cached.
                 if let Some(expected) = &expected_sha256 {
-                    let actual = hex::encode(sha2::Sha256::digest(&data));
-                    if &actual != expected {
+                    let actual = &sha256;
+                    if actual != expected {
                         tracing::warn!(package = %normalized, filename = %filename, upstream = %up.url(), %expected, %actual, "PyPI upstream file does not match the index sha256, refusing it");
                         return StatusCode::BAD_GATEWAY.into_response();
                     }
                 }
                 // Curation integrity runs on the first serve too, not only on cache hits.
-                if let Some(response) = crate::curation::verify_integrity(
-                    &state.curation().curation_engine,
-                    crate::curation::RegistryType::PyPI,
-                    &normalized,
-                    version.as_deref(),
-                    &data,
-                ) {
-                    return response;
+                if engine.is_active() {
+                    if let Some(response) = crate::curation::verify_integrity_by_hash(
+                        engine,
+                        crate::curation::RegistryType::PyPI,
+                        &normalized,
+                        version.as_deref(),
+                        &format!("sha256:{sha256}"),
+                    ) {
+                        return response;
+                    }
                 }
                 state.metrics.record_download("pypi");
                 state.metrics.record_cache_miss("pypi");
@@ -759,16 +765,36 @@ async fn download_file(
                     let project = normalized.clone();
                     let file_name = filename.clone();
                     let repo_index = Arc::clone(&state.repo_index);
+                    let hash = sha256.clone();
                     tokio::spawn(async move {
-                        let hash = hex::encode(sha2::Sha256::digest(&data_clone));
                         let core_meta = if ends_with_ci(&file_name, ".whl") {
-                            wheel_core_metadata(std::io::Cursor::new(&data_clone[..]))
+                            match &data_clone {
+                                ProxyBody::Mem(b) => {
+                                    wheel_core_metadata(std::io::Cursor::new(&b[..]))
+                                }
+                                ProxyBody::File(spool) => {
+                                    let spool = Arc::clone(spool);
+                                    tokio::task::spawn_blocking(move || {
+                                        std::fs::File::open(&spool.path)
+                                            .ok()
+                                            .and_then(wheel_core_metadata)
+                                    })
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                }
+                            }
                         } else {
                             None
                         };
-                        if storage.put_bytes(&key_clone, data_clone).await.is_ok() {
+                        // Create-only: a concurrent upload of the same filename wins.
+                        if let Ok(true) = data_clone.cache(&storage, &key_clone, true).await {
                             let _ = storage
                                 .put(&format!("{}.sha256", key_clone), hash.as_bytes())
+                                .await;
+                            // Provenance: cached from upstream, so GC may evict it (C22).
+                            let _ = storage
+                                .put(&proxied_marker_key(&key_clone), hash.as_bytes())
                                 .await;
                             put_hash_marker(&storage, &project, &file_name, &hash).await;
                             if let Some(meta) = core_meta {
@@ -779,21 +805,37 @@ async fn download_file(
                     });
                 }
 
-                if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
-                    &state.digest_store,
-                    "pypi",
-                    &data,
-                    &q_mode,
-                    q_secs,
-                    &file_url,
-                    publish_date,
-                ) {
-                    return resp;
+                if quarantine_on {
+                    if let Some(resp) = crate::digest_quarantine::proxy_gate_digest(
+                        &state.digest_store,
+                        "pypi",
+                        &format!("sha256:{sha256}"),
+                        &q_mode,
+                        q_secs,
+                        &file_url,
+                        publish_date,
+                    ) {
+                        return resp;
+                    }
                 }
 
                 let content_type = pypi_content_type(&filename);
-                return (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data)
-                    .into_response();
+                let len = data.len().to_string();
+                return match data.into_body(&key).await {
+                    Ok(body) => (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, content_type),
+                            (header::CONTENT_LENGTH, &len),
+                        ],
+                        body,
+                    )
+                        .into_response(),
+                    Err(e) => {
+                        tracing::warn!(key = %key, error = %e, "pypi: spooled file unreadable");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                };
             }
             Err(crate::registry::ProxyError::CircuitOpen(_)) => {
                 circuit_open = true;
@@ -1159,6 +1201,10 @@ pub(crate) async fn store_file(
             format!("File {filename} already exists"),
         ));
     }
+
+    // An upload is never a proxy cache: drop any stale provenance marker, or GC
+    // could evict the only copy (C22).
+    let _ = storage.delete(&proxied_marker_key(&file_key)).await;
 
     // Store file
     if let Err(e) = storage.put_from_path(&file_key, src, Some(sha256)).await {
@@ -1802,6 +1848,13 @@ fn pypi_content_type(filename: &str) -> &'static str {
 pub(crate) const HASH_MARKER_PREFIX: &str = "pypi-sha256/";
 
 /// Key of the marker recording `sha256` for `filename` of `project`.
+/// Provenance marker of a file cached from an upstream (C22): proxied and uploaded
+/// files share `pypi/<project>/<file>` keys, and only a proxied one may be evicted.
+/// It lives under npm's `.nora-origins/` prefix, outside every listing.
+pub(crate) fn proxied_marker_key(key: &str) -> String {
+    crate::registry::npm::origin_key(key)
+}
+
 fn hash_marker_key(project: &str, filename: &str, sha256: &str) -> String {
     format!("{HASH_MARKER_PREFIX}{project}/{filename}/{sha256}")
 }
@@ -3679,6 +3732,97 @@ mod integration_tests {
             .is_none());
     }
 
+    /// C17: a file above `server.stream_threshold_mb` is spooled on the cold miss,
+    /// checked against the index `#sha256` by the digest taken while spooling (a
+    /// mismatch is a 502), cached pinned, then streamed from storage on the next hit.
+    #[tokio::test]
+    async fn test_large_file_spooled_then_streamed_from_cache() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config};
+        use sha2::Digest;
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let file: Vec<u8> = (0..(2 * 1024 * 1024 + 9))
+            .map(|i| (i % 241) as u8)
+            .collect();
+        let sha = hex::encode(sha2::Sha256::digest(&file));
+        let upstream = MockServer::start().await;
+        let page = format!(
+            r#"<a href="{0}/files/bigpy-1.0.tar.gz#sha256={sha}">bigpy-1.0.tar.gz</a>
+<a href="{0}/files/bigpy-2.0.tar.gz#sha256={1}">bigpy-2.0.tar.gz</a>"#,
+            upstream.uri(),
+            "0".repeat(64),
+        );
+        Mock::given(path("/bigpy/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(page))
+            .mount(&upstream)
+            .await;
+        for f in ["bigpy-1.0.tar.gz", "bigpy-2.0.tar.gz"] {
+            Mock::given(path(format!("/files/{f}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(file.clone()))
+                .mount(&upstream)
+                .await;
+        }
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxy = Some(uri);
+            cfg.server.stream_threshold_mb = 1;
+        });
+
+        let resp = send(&ctx.app, Method::GET, "/simple/bigpy/bigpy-2.0.tar.gz", "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "index sha256 mismatch"
+        );
+
+        let resp = send(&ctx.app, Method::GET, "/simple/bigpy/bigpy-1.0.tar.gz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_bytes(resp).await[..] == file[..]);
+        let key = "pypi/bigpy/bigpy-1.0.tar.gz";
+        let mut cached = false;
+        for _ in 0..100 {
+            if ctx.state.storage.pin(key).await.as_deref() == Some(sha.as_str()) {
+                cached = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(cached, "the spooled file is cached pinned");
+        for _ in 0..100 {
+            if ctx
+                .state
+                .storage
+                .get(&super::proxied_marker_key(key))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            ctx.state
+                .storage
+                .get(&super::proxied_marker_key(key))
+                .await
+                .is_ok(),
+            "a file cached from upstream carries the provenance marker (C22)"
+        );
+
+        let resp = send(&ctx.app, Method::GET, "/simple/bigpy/bigpy-1.0.tar.gz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_bytes(resp).await[..] == file[..]);
+        let fetches = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/files/bigpy-1.0.tar.gz")
+            .count();
+        assert_eq!(fetches, 1, "the hit is served from storage");
+    }
+
     /// An upstream outage with nothing local is a 502 (pip retries it), and a real
     /// upstream 404 stays a 404 — before, both were a 404 pip cached as "no such project".
     #[tokio::test]
@@ -4010,6 +4154,74 @@ mod integration_tests {
             .is_none());
         let left = std::fs::read_dir(&spool).map(|d| d.count()).unwrap_or(0);
         assert_eq!(left, 0, "no spool file is left behind");
+    }
+
+    /// Invariant: an internal-namespace project uploaded here never depends on the
+    /// upstream. With a dead upstream, its simple index (HTML and JSON) and its file
+    /// are 200 and the upstream sees no request at all.
+    #[tokio::test]
+    async fn internal_project_never_touches_a_dead_upstream() {
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxy = Some(uri);
+            cfg.pypi.metadata_ttl = 0;
+            cfg.curation.internal_namespaces = vec!["corp-*".to_string()];
+        });
+        let content = b"sdist-bytes".to_vec();
+        let resp = twine_upload(
+            &ctx.app,
+            &[("name", "corp-lib"), ("version", "1.0")],
+            "corp-lib-1.0.tar.gz",
+            &content,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(
+            ctx.state
+                .storage
+                .get(&super::proxied_marker_key(
+                    "pypi/corp-lib/corp-lib-1.0.tar.gz"
+                ))
+                .await
+                .is_err(),
+            "an uploaded file never carries the provenance marker (C22)"
+        );
+        let resp = send(&ctx.app, Method::GET, "/simple/corp-lib/", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("corp-lib-1.0.tar.gz"));
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/corp-lib/",
+            vec![("accept", "application/vnd.pypi.simple.v1+json")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/corp-lib/corp-lib-1.0.tar.gz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], &content[..]);
+        let seen = upstream.received_requests().await.unwrap();
+        assert!(
+            seen.is_empty(),
+            "upstream contacted: {:?}",
+            seen.iter()
+                .map(|r| r.url.path().to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// C44: the uploaded filename must name the form's project and version.
