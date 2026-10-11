@@ -33,7 +33,8 @@ pub fn routes() -> Router<AppState> {
         get(handle_request)
             .put(handle_publish)
             .post(handle_npm_post)
-            .fallback(|| async { method_not_allowed("GET, PUT, POST") }),
+            .delete(handle_npm_delete)
+            .fallback(|| async { method_not_allowed("GET, PUT, POST, DELETE") }),
     )
 }
 
@@ -418,6 +419,29 @@ async fn handle_request(
     if path == "-/whoami" {
         return handle_whoami(&user).await;
     }
+    // `npm dist-tag ls`: answered from local versions only, never proxied (the name
+    // would leak upstream).
+    if let Some(name) = path
+        .strip_prefix("-/package/")
+        .and_then(|rest| rest.strip_suffix("/dist-tags"))
+    {
+        let packument = state
+            .storage
+            .get(&format!("npm/{name}/metadata.json"))
+            .await;
+        let tags = match packument {
+            Ok(data) if has_local_versions(&state.storage, name).await => {
+                serde_json::from_slice::<serde_json::Value>(&data)
+                    .ok()
+                    .and_then(|p| p.get("dist-tags").cloned())
+            }
+            _ => None,
+        };
+        return match tags {
+            Some(tags) => axum::Json(tags).into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
 
     let github_packages = github_packages_tarball(&path);
     let is_tarball = github_packages.is_some() || path.contains("/-/");
@@ -593,6 +617,15 @@ async fn handle_request(
                     // proxies the name. Serve the cached copy already in hand instead; an
                     // internal package is owned/hosted locally, never upstream-refreshed.
                     // (The cache-miss proxy path is guarded separately below.)
+                    // The same holds for any package published here, internal
+                    // namespace or not: an upstream copy must never replace it.
+                    if has_local_versions(&state.storage, &package_name).await {
+                        let base = nora_base_url(&state);
+                        return packument_response(
+                            &headers,
+                            rebase_hosted_tarballs(data, &base, &package_name),
+                        );
+                    }
                     if crate::curation::is_internal_namespace(
                         &state.curation().curation_engine,
                         crate::curation::RegistryType::Npm,
@@ -728,16 +761,10 @@ async fn handle_request(
     // Whether this package has locally published versions. Read once here and kept
     // for the proxy branch below, which must not cache an upstream packument over a
     // key that a local rebuild owns (#975).
-    let mut has_local_versions = false;
+    let mut local_versions = false;
     if !is_tarball {
-        let versions_prefix = format!("npm/{}/versions/", package_name);
-        let has_versions = !state
-            .storage
-            .list(&versions_prefix)
-            .await
-            .unwrap_or_default()
-            .is_empty();
-        has_local_versions = has_versions;
+        let has_versions = has_local_versions(&state.storage, &package_name).await;
+        local_versions = has_versions;
 
         if has_versions {
             // Same lock the publish path takes: a CI fleet stampeding one package
@@ -769,7 +796,11 @@ async fn handle_request(
                     "Rebuilt packument from per-version keys"
                 );
                 state.metrics.record_cache_hit("npm");
-                return packument_response(&headers, data);
+                let base = nora_base_url(&state);
+                return packument_response(
+                    &headers,
+                    rebase_hosted_tarballs(data, &base, &package_name),
+                );
             }
         }
     }
@@ -858,7 +889,7 @@ async fn handle_request(
                 // so a concurrent publish could be overwritten. The upstream bytes are
                 // still served for this request; only the write is skipped, so the next
                 // request retries the rebuild instead of finding a wrong document cached.
-                let owns_key_locally = !is_tarball && has_local_versions;
+                let owns_key_locally = !is_tarball && local_versions;
                 if owns_key_locally {
                     tracing::warn!(
                         registry = "npm",
@@ -1041,6 +1072,50 @@ async fn cached_copy_trusted(
     origin == origin_of(owner.url) && state.storage.pin(key).await.as_deref() == Some(digest)
 }
 
+/// Whether `name` has versions published here. Such a packument is owned locally:
+/// it is never revalidated against, or overwritten by, an upstream document.
+async fn has_local_versions(storage: &crate::Storage, name: &str) -> bool {
+    !storage
+        .list(&format!("npm/{name}/versions/"))
+        .await
+        .unwrap_or_default()
+        .is_empty()
+}
+
+/// Point every `dist.tarball` of a hosted packument at the current `public_url`:
+/// publish stores the URL absolute, so a host/scheme/prefix change would strand it.
+fn rebase_hosted_tarballs(data: Bytes, nora_base: &str, name: &str) -> Bytes {
+    let Ok(mut packument) = serde_json::from_slice::<serde_json::Value>(&data) else {
+        return data;
+    };
+    let prefix = format!("{}/npm/{name}/-/", nora_base.trim_end_matches('/'));
+    let mut changed = false;
+    let versions = packument
+        .get_mut("versions")
+        .and_then(|v| v.as_object_mut());
+    for version in versions.into_iter().flat_map(|v| v.values_mut()) {
+        let Some(tarball) = version.pointer_mut("/dist/tarball") else {
+            continue;
+        };
+        let Some(file) = tarball
+            .as_str()
+            .and_then(|t| t.rsplit_once("/-/"))
+            .map(|(_, f)| f)
+        else {
+            continue;
+        };
+        let rebased = format!("{prefix}{file}");
+        if tarball.as_str() != Some(rebased.as_str()) {
+            *tarball = serde_json::Value::String(rebased);
+            changed = true;
+        }
+    }
+    match changed.then(|| serde_json::to_vec(&packument)) {
+        Some(Ok(bytes)) => Bytes::from(bytes),
+        _ => data,
+    }
+}
+
 /// Refetch metadata from upstream, rewrite URLs, update cache.
 /// Returns None if upstream is unavailable (caller serves stale cache).
 async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec<u8>> {
@@ -1110,6 +1185,11 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
         }
         // New body — rewrite, cache it, then persist the fresh validators.
         Ok(Revalidation::Modified { body, validators }) => {
+            // A publish may have landed since the caller checked: never let the
+            // upstream document replace a packument this registry owns.
+            if has_local_versions(&state.storage, path).await {
+                return None;
+            }
             let nora_base = nora_base_url(state);
             let rewritten =
                 rewrite_tarball_urls(&body, &nora_base, proxy_url).unwrap_or_else(|()| {
@@ -1174,6 +1254,17 @@ async fn handle_publish(
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
     body: Bytes,
 ) -> Response {
+    if let Some(rest) = path.strip_prefix("-/package/") {
+        // `npm dist-tag add`: the body is the version, as a JSON string.
+        let Ok(version) = serde_json::from_slice::<String>(&body) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                "dist-tag body must be a JSON string",
+            )
+                .into_response();
+        };
+        return set_dist_tag(&state, &authority, &user, rest, Some(&version)).await;
+    }
     let package_name = path;
 
     // Enforce OIDC namespace_scope on the package coordinate (#583).
@@ -1211,8 +1302,12 @@ async fn handle_publish(
     }
 
     let attachments = match payload.get("_attachments").and_then(|a| a.as_object()) {
-        Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, "Missing _attachments").into_response(),
+        Some(a) if !a.is_empty() => a,
+        // `npm deprecate` PUTs the packument back without attachments.
+        _ if has_local_versions(&state.storage, &package_name).await => {
+            return deprecate_versions(&state, &user, &package_name, &payload).await;
+        }
+        _ => return (StatusCode::BAD_REQUEST, "Missing _attachments").into_response(),
     };
 
     let new_versions = match payload.get("versions").and_then(|v| v.as_object()) {
@@ -1230,7 +1325,15 @@ async fn handle_publish(
     // are NOT merged into it: each is written to its own immutable key and the packument is
     // regenerated by listing those keys, so concurrent publishers never read-modify-write the same
     // shared file (the multi-replica lost-update of #39).
+    // A packument with a provenance sidecar is a proxy cache of an upstream document,
+    // not local state: its versions are neither local nor immutable here (#27).
+    let proxied = state
+        .storage
+        .stat(&origin_key(&metadata_key))
+        .await
+        .is_some();
     let existing_meta: Option<serde_json::Value> = match state.storage.get(&metadata_key).await {
+        Ok(_) if proxied => None,
         Ok(existing) => match serde_json::from_slice::<serde_json::Value>(&existing) {
             Ok(val) => Some(val),
             Err(e) => {
@@ -1394,6 +1497,11 @@ async fn handle_publish(
         tracing::error!(package = %package_name, "npm publish: failed to regenerate packument");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    if proxied {
+        // The packument is local now: drop what described the upstream copy.
+        let _ = state.storage.delete(&origin_key(&metadata_key)).await;
+        let _ = state.storage.delete(&validators_key(&metadata_key)).await;
+    }
 
     // Fail-closed (#878): a 201 MUST mean the published version is actually visible in
     // the packument. scan-regenerate derives `versions` by LISTING the per-version keys
@@ -1439,6 +1547,128 @@ async fn handle_publish(
     state.repo_index.invalidate("npm");
 
     StatusCode::CREATED.into_response()
+}
+
+/// `DELETE /-/package/<name>/dist-tags/<tag>` (`npm dist-tag rm`). Unpublish is not
+/// supported: versions are immutable.
+async fn handle_npm_delete(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Extension(authority): Extension<NamespaceAuthority>,
+    user: Option<Extension<crate::auth::AuthenticatedUser>>,
+) -> Response {
+    match path.strip_prefix("-/package/") {
+        Some(rest) => set_dist_tag(&state, &authority, &user, rest, None).await,
+        None => method_not_allowed("GET, PUT, POST"),
+    }
+}
+
+/// Point (`Some(version)`) or remove (`None`) a dist-tag of a package published here.
+async fn set_dist_tag(
+    state: &AppState,
+    authority: &NamespaceAuthority,
+    user: &Option<Extension<crate::auth::AuthenticatedUser>>,
+    rest: &str,
+    version: Option<&str>,
+) -> Response {
+    let Some((name, tag)) = rest.rsplit_once("/dist-tags/") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if enforce_namespace_scope(authority, name).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    // npm refuses to remove `latest`; the tag is a storage key segment.
+    if !is_valid_attachment_name(tag) || (tag == "latest" && version.is_none()) {
+        return (StatusCode::BAD_REQUEST, "Invalid dist-tag").into_response();
+    }
+    let lock = state.publish_lock(&format!("npm/{name}/metadata.json"));
+    let _guard = lock.lock().await;
+    let tag_key = format!("npm/{name}/dist-tags/{tag}");
+    let written = match version {
+        Some(v)
+            if state
+                .storage
+                .stat(&format!("npm/{name}/versions/{v}.json"))
+                .await
+                .is_some() =>
+        {
+            state.storage.put(&tag_key, v.as_bytes()).await
+        }
+        None if state.storage.stat(&tag_key).await.is_some() => {
+            state.storage.delete(&tag_key).await
+        }
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    if written.is_err() || regenerate_packument(&state.storage, name).await.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let action = if version.is_some() {
+        "dist_tag_add"
+    } else {
+        "dist_tag_rm"
+    };
+    let actor = crate::auth::audit_actor(user);
+    state
+        .audit
+        .log(AuditEntry::new(action, actor, name, "npm", tag));
+    axum::Json(serde_json::json!({})).into_response()
+}
+
+/// `npm deprecate`: apply only the `deprecated` field of each version published here
+/// (`""` clears it); every other difference in the PUT packument is ignored.
+async fn deprecate_versions(
+    state: &AppState,
+    user: &Option<Extension<crate::auth::AuthenticatedUser>>,
+    name: &str,
+    payload: &serde_json::Value,
+) -> Response {
+    let Some(versions) = payload.get("versions").and_then(|v| v.as_object()) else {
+        return (StatusCode::BAD_REQUEST, "Missing versions").into_response();
+    };
+    let lock = state.publish_lock(&format!("npm/{name}/metadata.json"));
+    let _guard = lock.lock().await;
+    for (ver, data) in versions {
+        let key = format!("npm/{name}/versions/{ver}.json");
+        let Ok(stored) = state.storage.get(&key).await else {
+            continue;
+        };
+        let Ok(mut stored) = serde_json::from_slice::<serde_json::Value>(&stored) else {
+            continue;
+        };
+        let wanted = data
+            .get("deprecated")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        let current = stored
+            .get("deprecated")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        if wanted == current {
+            continue;
+        }
+        let Some(obj) = stored.as_object_mut() else {
+            continue;
+        };
+        if wanted.is_empty() {
+            obj.remove("deprecated");
+        } else {
+            obj.insert("deprecated".into(), wanted.into());
+        }
+        let Ok(bytes) = serde_json::to_vec(&stored) else {
+            continue;
+        };
+        if state.storage.put(&key, &bytes).await.is_err() {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    if regenerate_packument(&state.storage, name).await.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let actor = crate::auth::audit_actor(user);
+    state
+        .audit
+        .log(AuditEntry::new("deprecate", actor, name, "npm", ""));
+    axum::Json(serde_json::json!({})).into_response()
 }
 
 // ============================================================================
@@ -1579,12 +1809,14 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
     {
         return;
     }
-    // #68: never fetch an internal-namespace package's metadata upstream.
+    // #68: never fetch an internal-namespace package's metadata upstream, nor
+    // cache one over a package published here.
     if crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
         crate::curation::RegistryType::Npm,
         package_name,
-    ) {
+    ) || has_local_versions(&state.storage, package_name).await
+    {
         return;
     }
     let Some(upstream) = state.config.npm.route(package_name) else {
@@ -1878,6 +2110,24 @@ mod tests {
             "https://registry.npmjs.org"
         )
         .is_err());
+    }
+
+    #[test]
+    fn rebase_hosted_tarballs_follows_public_url() {
+        let stored = serde_json::json!({ "versions": {
+            "1.0.0": { "dist": { "tarball": "http://old:4000/npm/@s/p/-/p-1.0.0.tgz" } },
+            "2.0.0": { "dist": {} }
+        } });
+        let data = Bytes::from(serde_json::to_vec(&stored).unwrap());
+        let out = rebase_hosted_tarballs(data, "https://new.example/", "@s/p");
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            json["versions"]["1.0.0"]["dist"]["tarball"],
+            "https://new.example/npm/@s/p/-/p-1.0.0.tgz"
+        );
+        // Already current: bytes untouched.
+        let again = rebase_hosted_tarballs(out.clone(), "https://new.example", "@s/p");
+        assert_eq!(again, out);
     }
 
     #[test]
@@ -3508,6 +3758,170 @@ mod integration_tests {
         let json: serde_json::Value = serde_json::from_slice(&packument).unwrap();
         let versions = json["versions"].as_object().expect("versions object");
         assert_eq!(versions.len(), 8, "all versions assembled: {versions:?}");
+    }
+
+    async fn publish(app: &axum::Router, name: &str, ver: &str) -> StatusCode {
+        let short = name.rsplit('/').next().unwrap();
+        let payload = serde_json::json!({
+            "name": name,
+            "versions": { ver: { "name": name, "version": ver, "dist": {} } },
+            "_attachments": { format!("{short}-{ver}.tgz"): {
+                "data": base64::engine::general_purpose::STANDARD.encode(b"tgz")
+            } },
+        });
+        let body = Body::from(serde_json::to_vec(&payload).unwrap());
+        send(app, Method::PUT, &format!("/npm/{name}"), body)
+            .await
+            .status()
+    }
+
+    async fn packument(app: &axum::Router, name: &str) -> serde_json::Value {
+        let resp = send(app, Method::GET, &format!("/npm/{name}"), "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        serde_json::from_slice(&body_bytes(resp).await).unwrap()
+    }
+
+    /// A package published here, outside any internal namespace, is never
+    /// revalidated upstream once its packument is stale: an upstream squatter of the
+    /// same name must not replace it, and the name must not leak upstream.
+    #[tokio::test]
+    async fn hosted_packument_is_never_revalidated_upstream() {
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "corp-pkg", "versions": { "9.9.9": { "dist": {} } },
+                "dist-tags": { "latest": "9.9.9" }
+            })))
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 0; // every cache hit is stale
+        });
+        assert_eq!(
+            publish(&ctx.app, "corp-pkg", "1.0.0").await,
+            StatusCode::CREATED
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let json = packument(&ctx.app, "corp-pkg").await;
+        assert!(json["versions"].get("1.0.0").is_some(), "{json}");
+        assert!(json["versions"].get("9.9.9").is_none(), "{json}");
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    /// Publishing a name whose packument is a proxy cache (provenance sidecar) must not
+    /// adopt the upstream versions as local ones, nor refuse them as already published.
+    #[tokio::test]
+    async fn publish_over_proxied_packument_does_not_adopt_upstream_versions() {
+        let ctx = create_test_context();
+        let key = "npm/adopted/metadata.json";
+        let upstream_doc = serde_json::json!({
+            "name": "adopted",
+            "versions": { "1.0.0": { "dist": {} }, "2.0.0": { "dist": {} } }
+        });
+        let doc = serde_json::to_vec(&upstream_doc).unwrap();
+        ctx.state.storage.put(key, &doc).await.unwrap();
+        let sidecar = super::origin_key(key);
+        ctx.state
+            .storage
+            .put(&sidecar, b"npm:x\nabc")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            publish(&ctx.app, "adopted", "1.0.0").await,
+            StatusCode::CREATED
+        );
+        let stored = ctx.state.storage.get(key).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(json["versions"].as_object().unwrap().len(), 1, "{json}");
+        assert!(ctx
+            .state
+            .storage
+            .stat("npm/adopted/versions/2.0.0.json")
+            .await
+            .is_none());
+        assert!(ctx.state.storage.stat(&sidecar).await.is_none());
+    }
+
+    /// `npm dist-tag add|ls|rm` on a hosted package; `ls` is never proxied.
+    #[tokio::test]
+    async fn dist_tag_add_ls_rm() {
+        let ctx = create_test_context();
+        assert_eq!(
+            publish(&ctx.app, "@corp/tagged", "1.0.0").await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            publish(&ctx.app, "@corp/tagged", "2.0.0").await,
+            StatusCode::CREATED
+        );
+        let tag_url = "/npm/-/package/@corp/tagged/dist-tags/beta";
+        let ls_url = "/npm/-/package/@corp/tagged/dist-tags";
+
+        let resp = send(&ctx.app, Method::PUT, tag_url, "\"1.0.0\"").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let tags: serde_json::Value = serde_json::from_slice(
+            &body_bytes(send(&ctx.app, Method::GET, ls_url, "").await).await,
+        )
+        .unwrap();
+        assert_eq!(tags["beta"], "1.0.0");
+        assert_eq!(tags["latest"], "2.0.0");
+        assert_eq!(
+            packument(&ctx.app, "@corp/tagged").await["dist-tags"]["beta"],
+            "1.0.0"
+        );
+
+        // Unknown version, removing `latest`, unknown package: refused.
+        let resp = send(&ctx.app, Method::PUT, tag_url, "\"3.0.0\"").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let latest = "/npm/-/package/@corp/tagged/dist-tags/latest";
+        let resp = send(&ctx.app, Method::DELETE, latest, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = send(&ctx.app, Method::GET, "/npm/-/package/nope/dist-tags", "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = send(&ctx.app, Method::DELETE, tag_url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(packument(&ctx.app, "@corp/tagged").await["dist-tags"]
+            .get("beta")
+            .is_none());
+    }
+
+    /// `npm deprecate` PUTs the packument back without attachments; only the
+    /// `deprecated` field is applied, and `""` clears it.
+    #[tokio::test]
+    async fn deprecate_sets_and_clears() {
+        let ctx = create_test_context();
+        assert_eq!(
+            publish(&ctx.app, "old-pkg", "1.0.0").await,
+            StatusCode::CREATED
+        );
+        let put = |msg: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "name": "old-pkg",
+                "versions": { "1.0.0": { "deprecated": msg, "description": "ignored" } }
+            }))
+            .unwrap()
+        };
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/npm/old-pkg",
+            Body::from(put("use v2")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = packument(&ctx.app, "old-pkg").await;
+        assert_eq!(json["versions"]["1.0.0"]["deprecated"], "use v2");
+        assert!(json["versions"]["1.0.0"].get("description").is_none());
+
+        let resp = send(&ctx.app, Method::PUT, "/npm/old-pkg", Body::from(put(""))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = packument(&ctx.app, "old-pkg").await;
+        assert!(json["versions"]["1.0.0"].get("deprecated").is_none());
     }
 }
 
