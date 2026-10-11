@@ -220,7 +220,7 @@ Caching proxy for api.nuget.org. Service index URLs are rewritten to point throu
 | Service index (`/v3/index.json`) | Full | `@id` URLs rewritten to NORA |
 | Registration index | Full | TTL-cached |
 | Version list (flat container) | Full | TTL-cached |
-| `.nupkg` download | Full | Immutable cache |
+| `.nupkg` download | Full | Immutable cache; with `server.trust_upstream_dates` the publish date for `curation.min_release_age` comes from the registration (index, or the page holding the version), fetched and cached on demand so a flat-container-only `dotnet restore` is dated too |
 | `.nuspec` download | Full | Immutable cache |
 | Package push | — | Proxy-only (read) |
 | Search | — | Not implemented |
