@@ -55,7 +55,7 @@ governor = "0.10"
 parking_lot = "0.12"
 zeroize = { version = "1.8", features = ["derive"] }
 argon2 = { version = "0.5", features = ["std", "rand"] }
-tower-http = { version = "0.6", features = ["set-header"] }
+tower-http = { version = "0.6", features = ["set-header", "catch-panic"] }
 percent-encoding = "2"
 subtle = "2"
 tokio-util = "0.7"

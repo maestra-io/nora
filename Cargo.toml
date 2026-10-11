@@ -45,7 +45,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 debug = false
 strip = true
 codegen-units = 4
-panic = "abort"
+# Unwind (the default), not abort: the catch_unwind guards on background tasks and
+# CatchPanicLayer only work with unwinding, so one panic is a 500, not a dead process.
 lto = "thin"
 
 # Maximum optimization for GitHub Releases and published binaries
