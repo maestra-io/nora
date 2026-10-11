@@ -76,6 +76,7 @@ def call(sess, limiter, method, url, ok=(200, 201, 204), tries=5, **kw):
             err = f"HTTP {r.status_code}"
         except requests.RequestException as e:
             err = type(e).__name__
+        print(f"{now()} retry {i + 1}/{tries} {method} {url.split('?')[0]}: {err}", file=sys.stderr, flush=True)
         time.sleep(min(60, 2 ** i * 2))
     raise Failed(f"{method} {url.split('?')[0]}: {err} after {tries} tries")
 
@@ -134,10 +135,12 @@ def nuget_pkg(p, st, a):
                     if a.dry_run:
                         status = "verified"
                     else:
+                        # Bytes, not the file object: a retry must resend the whole package.
                         with open(path, "rb") as f:
-                            r = call(nora, nora_lim, "PUT", f"{NORA}/nuget/v3/package/",
-                                     headers={"X-NuGet-ApiKey": a.token},
-                                     files={"package": (f"{idl}.{ver}.nupkg", f, "application/octet-stream")})
+                            pkg = f.read()
+                        r = call(nora, nora_lim, "PUT", f"{NORA}/nuget/v3/package/",
+                                 headers={"X-NuGet-ApiKey": a.token},
+                                 files={"package": (f"{idl}.{ver}.nupkg", pkg, "application/octet-stream")})
                         if r.status_code not in (201, 202, 409):
                             raise Failed(f"push HTTP {r.status_code} {r.text[:200]}")
                         status = "exists" if r.status_code == 409 else "pushed"
