@@ -152,6 +152,7 @@ fn build_context_with(
             s3_credentials_dir: None,
             s3_region: String::new(),
             s3_virtual_hosted: false,
+            s3_anonymous: false,
             gcs_service_account_path: None,
             gcs_base_url: None,
         },

@@ -48,6 +48,13 @@ pub struct StorageConfig {
     /// Cloud OSS answers them with 403 `SecondLevelDomainForbidden`.
     #[serde(default)]
     pub s3_virtual_hosted: bool,
+    /// Send unsigned S3 requests on purpose (a public or emulator bucket). Without
+    /// it, s3 mode with no credentials (no `s3_credentials_dir`, not both keys) is a
+    /// startup warning, and an error under `NORA_CONFIG_STRICT`: a mistyped key
+    /// variable otherwise just turns every request unsigned.
+    /// ENV: NORA_STORAGE_S3_ANONYMOUS
+    #[serde(default)]
+    pub s3_anonymous: bool,
     /// GCS: path to a service-account JSON key file. Unset = ambient
     /// credentials (GOOGLE_* env, then the instance metadata server — GKE
     /// Workload Identity / GCE service accounts need no key material).
@@ -89,6 +96,7 @@ impl Default for StorageConfig {
             s3_credentials_dir: None,
             s3_region: default_s3_region(),
             s3_virtual_hosted: false,
+            s3_anonymous: false,
             gcs_service_account_path: None,
             gcs_base_url: None,
         }
@@ -150,6 +158,9 @@ impl StorageConfig {
         }
         if let Ok(val) = env::var("NORA_STORAGE_S3_VIRTUAL_HOSTED") {
             self.s3_virtual_hosted = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_STORAGE_S3_ANONYMOUS") {
+            self.s3_anonymous = val.to_lowercase() == "true" || val == "1";
         }
 
         Ok(())
