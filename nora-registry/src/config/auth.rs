@@ -102,6 +102,11 @@ impl TrustedProxies {
         })
     }
 
+    /// No entries: nothing matches.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Returns true if any entry uses prefix /0 (matches all addresses in its family).
     pub fn has_prefix_zero(&self) -> bool {
         self.entries.iter().any(|(_, prefix)| *prefix == 0)
@@ -229,6 +234,84 @@ pub struct AuthConfig {
     /// ENV: NORA_AUTH_READ_ONLY_USERS=viewer,auditor
     #[serde(default)]
     pub read_only_users: Vec<String>,
+    /// Maestra fork: TCP peers (IPs/CIDRs) whose htpasswd (password) credentials
+    /// are checked. Unset (default) = every peer, as upstream. Set, a password
+    /// from any other peer is never checked (no bcrypt), `/api/tokens*` answers
+    /// 403, and Basic still carries `nra_` tokens and OIDC JWTs. Matched on the
+    /// TCP peer only, never on X-Forwarded-For.
+    /// ENV: NORA_AUTH_HTPASSWD_ALLOWED_PEERS=127.0.0.1,::1
+    #[serde(default)]
+    pub htpasswd_allowed_peers: Option<TrustedProxies>,
+    /// Maestra fork: web UI identity from Teleport application access.
+    #[serde(default)]
+    pub teleport: TeleportConfig,
+}
+
+/// Maestra fork: identity from the `Teleport-Jwt-Assertion` header that a
+/// Teleport application agent adds to every request it proxies.
+///
+/// ```toml
+/// [auth.teleport]
+/// enabled = true
+/// jwks_url = "https://teleport.example.com/.well-known/jwks.json"
+/// issuer = "teleport.example.com"                      # the cluster name
+/// audience = "http://nora-teleport.nora.svc.cluster.local:80"   # the app's URI
+/// trusted_proxies = "10.62.0.0/16"                     # the app agent pods
+/// write_roles = ["apps"]                               # Teleport roles -> write
+/// require_for_ui = true
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeleportConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The proxy's JWKS (`https://<proxy>/.well-known/jwks.json`).
+    #[serde(default)]
+    pub jwks_url: String,
+    /// Expected `iss`: the Teleport cluster name.
+    #[serde(default)]
+    pub issuer: String,
+    /// Expected `aud`: the app's `uri` as registered in Teleport (internal URL).
+    #[serde(default)]
+    pub audience: String,
+    /// TCP peers allowed to present the header (the app agent). Default: none.
+    #[serde(default = "no_peers")]
+    pub trusted_proxies: TrustedProxies,
+    /// Teleport roles that map to nora `write`; any other identity is `read`.
+    #[serde(default)]
+    pub write_roles: Vec<String>,
+    /// UI paths (`/`, `/ui*`, `/api/ui*`, `/api-docs*`) answer 404 without a
+    /// valid Teleport identity, and a 401 to a browser carries no Basic
+    /// challenge (no password dialog).
+    #[serde(default)]
+    pub require_for_ui: bool,
+    #[serde(default = "default_oidc_leeway")]
+    pub leeway_secs: u64,
+    #[serde(default = "default_teleport_jwks_cache_secs")]
+    pub jwks_cache_secs: u64,
+}
+
+impl Default for TeleportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            jwks_url: String::new(),
+            issuer: String::new(),
+            audience: String::new(),
+            trusted_proxies: no_peers(),
+            write_roles: Vec::new(),
+            require_for_ui: false,
+            leeway_secs: default_oidc_leeway(),
+            jwks_cache_secs: default_teleport_jwks_cache_secs(),
+        }
+    }
+}
+
+fn no_peers() -> TrustedProxies {
+    TrustedProxies::parse("")
+}
+
+fn default_teleport_jwks_cache_secs() -> u64 {
+    300
 }
 
 /// OIDC configuration — multiple providers for workload identity auth.
@@ -458,6 +541,8 @@ impl Default for AuthConfig {
             oidc: OidcConfig::default(),
             admin_users: Vec::new(),
             read_only_users: Vec::new(),
+            htpasswd_allowed_peers: None,
+            teleport: TeleportConfig::default(),
         }
     }
 }
@@ -514,6 +599,9 @@ impl AuthConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
+        }
+        if let Ok(val) = env::var("NORA_AUTH_HTPASSWD_ALLOWED_PEERS") {
+            self.htpasswd_allowed_peers = Some(TrustedProxies::parse(&val));
         }
         if let Ok(val) = env::var("NORA_AUTH_OIDC_ENABLED") {
             self.oidc.enabled = val.to_lowercase() == "true" || val == "1";

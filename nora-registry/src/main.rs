@@ -257,6 +257,8 @@ pub struct AppState {
     pub auth_failures: Arc<auth::AuthFailureTracker>,
     /// OIDC validator for workload identity (CI/CD)
     pub oidc: Option<Arc<auth::OidcValidator>>,
+    /// Maestra fork: Teleport app-access identity for the web UI.
+    pub teleport: Option<Arc<auth::TeleportValidator>>,
     pub(crate) circuit_breaker: Arc<circuit_breaker::CircuitBreakerRegistry>,
     /// Single-flight coalescer for the proxy cache-miss path: collapses a
     /// thundering herd of concurrent requests for the same key into one
@@ -1838,6 +1840,18 @@ async fn run_server(mut config: Config, storage: Storage) {
         None
     };
 
+    let teleport_validator = if config.auth.teleport.enabled {
+        match auth::TeleportValidator::new(config.auth.teleport.clone(), http_client.clone()) {
+            Ok(v) => Some(Arc::new(v)),
+            Err(e) => {
+                error!("{}", e);
+                std::process::exit(config::EXIT_CONFIG);
+            }
+        }
+    } else {
+        None
+    };
+
     let bypass_token = config.curation.bypass_token.clone();
     let reloadable = Arc::new(ArcSwap::from_pointee(ReloadableConfig {
         curation_engine,
@@ -1871,6 +1885,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         reloadable,
         auth_failures: Arc::new(auth::AuthFailureTracker::new(5, 900)),
         oidc: oidc_validator.map(Arc::new),
+        teleport: teleport_validator,
         circuit_breaker: Arc::new(circuit_breaker::CircuitBreakerRegistry::new(cb_config)),
         proxy_coalesce: proxy_coalesce::InflightMap::new(),
         blob_flights: proxy_coalesce::InflightMap::new(),
