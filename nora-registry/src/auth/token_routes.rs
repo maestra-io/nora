@@ -117,6 +117,15 @@ async fn create_token(
                 .into_response()
         }
     };
+    // A token never outranks the account that mints it: a read-only htpasswd
+    // account (auth.read_only_users) mints read tokens only.
+    if role.can_write() && !state.config.auth.htpasswd_role(&req.username).can_write() {
+        return (
+            StatusCode::FORBIDDEN,
+            "role exceeds this account's own role (auth.read_only_users)",
+        )
+            .into_response();
+    }
     // Block role self-escalation: an admin token may be minted via this public
     // route only by an account listed in auth.admin_users. Read/write are
     // unaffected (GHSA-78cx-cfhm-rgmx).

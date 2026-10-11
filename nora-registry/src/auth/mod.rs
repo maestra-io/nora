@@ -23,8 +23,9 @@ pub use token_routes::{token_routes, TokenListItem, TokenListResponse};
 pub struct AuthenticatedUser(pub String);
 
 /// The verified role carried in request extensions after successful auth.
-/// Basic-auth (htpasswd) identities have no role concept and are recorded as
-/// `Write` (never admin), so role-gated owner-scope treats them as non-admin.
+/// Basic-auth (htpasswd) identities are recorded as `Write`, or `Read` when
+/// listed in `auth.read_only_users`, never admin, so role-gated owner-scope
+/// treats them as non-admin.
 #[derive(Clone, Debug)]
 pub struct AuthenticatedRole(pub crate::tokens::Role);
 
@@ -527,6 +528,7 @@ pub async fn auth_middleware(
         }
 
         // 2. Try OIDC JWT validation
+        let mut oidc_key_miss = false;
         if let Some(ref oidc_validator) = state.oidc {
             if oidc_validator.is_active() {
                 match oidc_validator.validate_token(token).await {
@@ -582,13 +584,16 @@ pub async fn auth_middleware(
                             crate::auth::oidc::classify_rejection(&reason),
                         );
                         tracing::warn!(reason = %reason, "OIDC authentication rejected");
+                        oidc_key_miss = crate::auth::oidc::is_key_miss(&reason);
                     }
                 }
             }
         }
 
-        // Both token and OIDC failed
-        if let Some(ip) = client_ip {
+        // Both token and OIDC failed. A JWT whose `kid` is still unknown after the
+        // JWKS refetch is an issuer key rotation, not a guessed credential: it must
+        // not lock the CI runner's IP out (a forged kid verifies nothing either).
+        if let Some(ip) = client_ip.filter(|_| !oidc_key_miss) {
             state.auth_failures.record_failure(ip);
         }
         return unauthorized_response("Invalid or expired token", realm);
@@ -688,6 +693,17 @@ pub async fn auth_middleware(
     if is_admin {
         return (StatusCode::FORBIDDEN, "Admin role required").into_response();
     }
+    let role = state.config.auth.htpasswd_role(username);
+    let method = request.method().clone();
+    if (method == axum::http::Method::PUT
+        || method == axum::http::Method::POST
+        || method == axum::http::Method::DELETE
+        || method == axum::http::Method::PATCH)
+        && !is_npm_audit
+        && !role.can_write()
+    {
+        return (StatusCode::FORBIDDEN, "Read-only account").into_response();
+    }
     // Basic-auth identities are not namespace-scoped (#583 is OIDC-only).
     request
         .extensions_mut()
@@ -695,9 +711,7 @@ pub async fn auth_middleware(
     request
         .extensions_mut()
         .insert(AuthenticatedUser(username.to_string()));
-    request
-        .extensions_mut()
-        .insert(AuthenticatedRole(crate::tokens::Role::Write));
+    request.extensions_mut().insert(AuthenticatedRole(role));
     next.run(request).await
 }
 
@@ -744,7 +758,12 @@ async fn try_basic_auth(encoded: &str, state: &AppState) -> Option<(String, crat
     }
     htpasswd_ok(state.auth.as_deref(), username, password)
         .await
-        .then(|| (username.to_string(), crate::tokens::Role::Write))
+        .then(|| {
+            (
+                username.to_string(),
+                state.config.auth.htpasswd_role(username),
+            )
+        })
 }
 
 fn unauthorized_response(message: &str, realm: &str) -> Response {
@@ -1833,6 +1852,89 @@ mod integration_tests {
         assert_eq!(minted.len(), 2);
         assert!(minted.iter().all(|t| t.role == crate::tokens::Role::Admin));
     }
+
+    /// An htpasswd account in auth.read_only_users authenticates as Read: it
+    /// pulls but cannot push; other htpasswd accounts keep Write.
+    #[tokio::test]
+    async fn test_htpasswd_read_only_user_cannot_write() {
+        let ctx = create_test_context_with_auth_and_config(
+            &[("admin", "secret"), ("viewer", "pw")],
+            |cfg| cfg.auth.read_only_users = vec!["viewer".to_string()],
+        );
+        let admin = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let viewer = format!("Basic {}", STANDARD.encode("viewer:pw"));
+        let app = &ctx.app;
+        let put = |auth: String| async move {
+            send_with_headers(
+                app,
+                Method::PUT,
+                "/raw/test.txt",
+                vec![("authorization", &auth)],
+                b"data".to_vec(),
+            )
+            .await
+            .status()
+        };
+        assert_eq!(put(viewer.clone()).await, StatusCode::FORBIDDEN);
+        assert_eq!(put(admin).await, StatusCode::OK);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/test.txt",
+            vec![("authorization", &viewer)],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// No self-service mint outranks the caller: a read-only htpasswd account
+    /// gets read tokens only from POST /api/tokens, and a read credential
+    /// cannot mint write through the UI. Write accounts are unchanged.
+    #[tokio::test]
+    async fn test_token_mint_capped_at_caller_role() {
+        let ctx = create_test_context_with_auth_and_config(
+            &[("admin", "secret"), ("viewer", "pw")],
+            |cfg| cfg.auth.read_only_users = vec!["viewer".to_string()],
+        );
+        let store = ctx.state.tokens.as_ref().unwrap();
+        let app = &ctx.app;
+        let api_mint = |user: &'static str, pass: &'static str, role: &'static str| async move {
+            send_with_headers(
+                app,
+                Method::POST,
+                "/api/tokens",
+                vec![("content-type", "application/json")],
+                format!(r#"{{"username":"{user}","password":"{pass}","role":"{role}"}}"#),
+            )
+            .await
+            .status()
+        };
+        assert_eq!(
+            api_mint("viewer", "pw", "write").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            api_mint("viewer", "pw", "admin").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(api_mint("viewer", "pw", "read").await, StatusCode::OK);
+        let minted = store.list_tokens("viewer");
+        assert_eq!(minted.len(), 1);
+        assert_eq!(minted[0].role, crate::tokens::Role::Read);
+        assert_eq!(api_mint("admin", "secret", "write").await, StatusCode::OK);
+
+        let viewer = format!("Basic {}", STANDARD.encode("viewer:pw"));
+        let response = ui_create_token(&ctx, &viewer, "write").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let read_token = store
+            .create_token("ro", 30, None, crate::tokens::Role::Read)
+            .unwrap();
+        let response = ui_create_token(&ctx, &format!("Bearer {read_token}"), "write").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(store.list_tokens("viewer").len(), 1);
+        assert_eq!(store.list_tokens("ro").len(), 1);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2540,6 +2642,66 @@ Jd74nq6dNCjpWG4drIsyhqX+
             StatusCode::UNAUTHORIZED,
             "HS256 tokens must be rejected for OIDC"
         );
+    }
+
+    /// A JWT whose `kid` is unknown even after the JWKS refetch is an issuer key
+    /// rotation, not a guessed credential: it stays 401 but does not feed the
+    /// per-IP lockout. Wrong audience, expiry and a bad signature still do.
+    #[tokio::test]
+    async fn test_oidc_unknown_kid_does_not_count_toward_lockout() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let issuer = mock_server.uri();
+        let sub = "repo:myorg/app:ref:refs/heads/main";
+        let now = now_secs();
+        let get = |token: String| {
+            let app = &ctx.app;
+            async move {
+                let bearer = format!("Bearer {token}");
+                send_with_headers(
+                    app,
+                    Method::GET,
+                    "/raw/test.txt",
+                    vec![("authorization", &bearer)],
+                    "",
+                )
+                .await
+                .status()
+            }
+        };
+        let ip: std::net::IpAddr = [127, 0, 0, 1].into();
+
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("rotated-key-2".to_string());
+        let claims =
+            json!({"iss": issuer, "sub": sub, "aud": "nora", "iat": now, "exp": now + 600});
+        let key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
+        let unknown_kid = encode(&header, &claims, &key).unwrap();
+        for _ in 0..10 {
+            assert_eq!(get(unknown_kid.clone()).await, StatusCode::UNAUTHORIZED);
+        }
+        assert!(ctx.state.auth_failures.check_blocked(&ip).is_none());
+
+        let valid = make_jwt(&issuer, sub, "nora", now, now + 600);
+        let (signed, _) = valid.rsplit_once('.').unwrap();
+        let bad_signature = format!("{signed}.{}", "A".repeat(342));
+        for token in [
+            make_jwt(&issuer, sub, "wrong-audience", now, now + 600),
+            make_jwt(&issuer, sub, "wrong-audience", now, now + 600),
+            make_jwt(&issuer, sub, "nora", now - 600, now - 120),
+            make_jwt(&issuer, sub, "nora", now - 600, now - 120),
+            bad_signature,
+        ] {
+            assert_eq!(get(token).await, StatusCode::UNAUTHORIZED);
+        }
+        assert!(ctx.state.auth_failures.check_blocked(&ip).is_some());
     }
 }
 

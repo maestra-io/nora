@@ -7,6 +7,8 @@ Real GitHub fork of [getnora-io/nora](https://github.com/getnora-io/nora); track
 
 Maestra-only changes (not upstream):
 - `[storage] s3_credentials_dir` / `NORA_STORAGE_S3_CREDENTIALS_DIR`: S3 credentials (`access_key_id`, `secret_access_key`, optional `session_token`) read from files and re-read every 60 s, for the rotating STS-style R2 creds Vault mints (packages.maestra.io, issues-maestra#1442).
+- `[auth] read_only_users` / `NORA_AUTH_READ_ONLY_USERS`: htpasswd accounts that authenticate as `read` (pull only, read tokens only); every self-service token mint is capped at the caller's own role.
+- An enabled OIDC provider with an empty `audience` is a config warning, and an error under `NORA_CONFIG_STRICT`.
 
 Update from upstream:
 ```sh

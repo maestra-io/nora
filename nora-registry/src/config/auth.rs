@@ -223,6 +223,12 @@ pub struct AuthConfig {
     /// ENV: NORA_AUTH_ADMIN_USERS=alice,ops
     #[serde(default)]
     pub admin_users: Vec<String>,
+    /// htpasswd usernames that authenticate with the `read` role instead of
+    /// `write`: they can pull but not push, and may mint only read tokens.
+    /// Empty (default) keeps every htpasswd account at `write`.
+    /// ENV: NORA_AUTH_READ_ONLY_USERS=viewer,auditor
+    #[serde(default)]
+    pub read_only_users: Vec<String>,
 }
 
 /// OIDC configuration — multiple providers for workload identity auth.
@@ -335,7 +341,10 @@ pub struct OidcProvider {
     /// JWKS endpoint doesn't follow the standard `/.well-known/jwks.json` path.
     #[serde(default)]
     pub jwks_uri: Option<String>,
-    /// Expected audience (`aud` claim). If empty, audience is not validated.
+    /// Expected audience (`aud` claim). If empty, audience is not validated: a
+    /// token this issuer minted for any other service (e.g. `sts.amazonaws.com`)
+    /// is accepted if its `sub` matches a role rule. Config validation warns
+    /// about an enabled provider without one, and `NORA_CONFIG_STRICT` refuses it.
     #[serde(default)]
     pub audience: String,
     /// Allowed JWT algorithms (default: RS256, ES256). Reject all others.
@@ -448,11 +457,22 @@ impl Default for AuthConfig {
             trusted_proxies: TrustedProxies::default_loopback(),
             oidc: OidcConfig::default(),
             admin_users: Vec::new(),
+            read_only_users: Vec::new(),
         }
     }
 }
 
 impl AuthConfig {
+    /// Role of an htpasswd account: `read` if listed in `read_only_users`, else `write`.
+    /// htpasswd never yields `admin` (admin paths need an admin token).
+    pub fn htpasswd_role(&self, username: &str) -> crate::tokens::Role {
+        if self.read_only_users.iter().any(|u| u == username) {
+            crate::tokens::Role::Read
+        } else {
+            crate::tokens::Role::Write
+        }
+    }
+
     /// Apply environment variable overrides for auth config.
     pub(super) fn apply_env_overrides(&mut self) {
         if let Ok(val) = env::var("NORA_AUTH_PUBLIC_WEB_UI") {
@@ -488,6 +508,13 @@ impl AuthConfig {
                 .filter(|s| !s.is_empty())
                 .collect();
         }
+        if let Ok(val) = env::var("NORA_AUTH_READ_ONLY_USERS") {
+            self.read_only_users = val
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
         if let Ok(val) = env::var("NORA_AUTH_OIDC_ENABLED") {
             self.oidc.enabled = val.to_lowercase() == "true" || val == "1";
         }
@@ -500,6 +527,18 @@ impl AuthConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_users_from_env_set_htpasswd_role() {
+        let _lock = crate::test_env::env_lock();
+        std::env::set_var("NORA_AUTH_READ_ONLY_USERS", " viewer, auditor ,");
+        let mut cfg = AuthConfig::default();
+        cfg.apply_env_overrides();
+        std::env::remove_var("NORA_AUTH_READ_ONLY_USERS");
+        assert_eq!(cfg.read_only_users, ["viewer", "auditor"]);
+        assert_eq!(cfg.htpasswd_role("viewer"), crate::tokens::Role::Read);
+        assert_eq!(cfg.htpasswd_role("admin"), crate::tokens::Role::Write);
+    }
 
     #[test]
     fn oidc_config_is_active_only_with_enabled_and_a_provider() {
