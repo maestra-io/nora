@@ -170,17 +170,28 @@ pub(crate) fn resolve_client_ip(
     trusted_proxies: &crate::config::TrustedProxies,
 ) -> IpAddr {
     if !trusted_proxies.contains(peer) {
+        if headers.contains_key("x-forwarded-for") {
+            warn_untrusted_forwarded_once(peer);
+        }
         return peer;
     }
 
-    // Try X-Forwarded-For first (first IP in chain is the client)
-    if let Some(xff) = headers.get("x-forwarded-for") {
-        if let Ok(s) = xff.to_str() {
-            if let Some(first) = s.split(',').next() {
-                if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                    return ip;
-                }
+    // X-Forwarded-For: walk from the right past our own proxies. Entries left of the
+    // first untrusted hop are client-supplied whenever a proxy appends rather than
+    // overwrites, so the leftmost entry must not pick the lockout/rate-limit key.
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        let mut client = None;
+        for hop in xff.rsplit(',') {
+            let Ok(ip) = hop.trim().parse::<IpAddr>() else {
+                break;
+            };
+            client = Some(ip);
+            if !trusted_proxies.contains(ip) {
+                break;
             }
+        }
+        if let Some(ip) = client {
+            return ip;
         }
     }
     // Try X-Real-IP
@@ -193,6 +204,22 @@ pub(crate) fn resolve_client_ip(
     }
     // No forwarding headers — use peer IP
     peer
+}
+
+/// Warn once per process when a peer outside `trusted_proxies` sends X-Forwarded-For.
+///
+/// Behind a reverse proxy that is not listed, every client shares the proxy's IP for
+/// the auth lockout and the rate limiters; this is the only signal of that misconfig.
+fn warn_untrusted_forwarded_once(peer: IpAddr) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            peer = %peer,
+            "X-Forwarded-For from a peer outside auth.trusted_proxies is ignored: auth lockout \
+             and rate limits key on the peer IP. If NORA runs behind a reverse proxy, add it to \
+             NORA_AUTH_TRUSTED_PROXIES, or every client shares one lockout/rate-limit bucket"
+        );
+    });
 }
 
 fn extract_client_ip(
@@ -822,6 +849,25 @@ mod tests {
             .unwrap();
         request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
             "127.0.0.1".parse().unwrap(),
+            1234,
+        )));
+        let ip = extract_client_ip(&request, &proxies);
+        assert_eq!(ip, Some("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_xff_ignores_client_supplied_entries_left_of_trusted_hops() {
+        use crate::config::TrustedProxies;
+        // An appending proxy chain: the client spoofed "9.9.9.9", the edge proxy
+        // (trusted 10.60.8.1) appended the real client 1.2.3.4.
+        let proxies = TrustedProxies::parse("10.60.8.0/24");
+        let mut request = Request::builder()
+            .uri("/test")
+            .header("x-forwarded-for", "9.9.9.9, 1.2.3.4, 10.60.8.2")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            "10.60.8.1".parse().unwrap(),
             1234,
         )));
         let ip = extract_client_ip(&request, &proxies);

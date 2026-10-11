@@ -10,10 +10,11 @@
 
 use crate::auth::resolve_client_ip;
 use crate::config::{RateLimitConfig, TrustedProxies};
+use axum::http::Method;
 use std::net::IpAddr;
 use tower_governor::errors::GovernorError;
 use tower_governor::governor::GovernorConfigBuilder;
-use tower_governor::key_extractor::{KeyExtractor, SmartIpKeyExtractor};
+use tower_governor::key_extractor::KeyExtractor;
 
 /// Convert a "requests per second" value to a replenishment period.
 ///
@@ -66,6 +67,45 @@ impl KeyExtractor for TrustedProxyKeyExtractor {
     }
 }
 
+/// A built rate-limit tier: the layer to mount plus a handle to its keyed state.
+pub type RateLimiterLayer = tower_governor::GovernorLayer<
+    TrustedProxyKeyExtractor,
+    governor::middleware::StateInformationMiddleware,
+    axum::body::Body,
+>;
+
+/// Shared keyed state of one tier; call `retain_recent()` periodically so entries for
+/// clients that went quiet are dropped instead of accumulating for the process lifetime.
+pub type RateLimiterState = tower_governor::governor::SharedRateLimiter<
+    IpAddr,
+    governor::middleware::StateInformationMiddleware,
+>;
+
+/// Every tier keys on the client IP resolved through `trusted_proxies`, the same key
+/// the auth lockout uses, so X-Forwarded-For is honoured only from configured proxies.
+fn build_tier(
+    rps: u64,
+    burst: u32,
+    trusted_proxies: TrustedProxies,
+    methods: Option<Vec<Method>>,
+    name: &str,
+) -> (RateLimiterLayer, RateLimiterState) {
+    let mut builder = GovernorConfigBuilder::default();
+    builder
+        .per_millisecond(rps_to_period(rps))
+        .burst_size(burst);
+    if let Some(methods) = methods {
+        builder.methods(methods);
+    }
+    let gov_config = builder
+        .key_extractor(TrustedProxyKeyExtractor::new(trusted_proxies))
+        .use_headers()
+        .finish()
+        .unwrap_or_else(|| panic!("failed to build {name} rate limiter: invalid RateLimitConfig"));
+    let state = gov_config.limiter().clone();
+    (tower_governor::GovernorLayer::new(gov_config), state)
+}
+
 /// Create rate limiter layer for auth endpoints (strict protection against brute-force).
 ///
 /// Uses [`TrustedProxyKeyExtractor`] to resolve real client IPs, preventing
@@ -73,60 +113,51 @@ impl KeyExtractor for TrustedProxyKeyExtractor {
 pub fn auth_rate_limiter(
     config: &RateLimitConfig,
     trusted_proxies: TrustedProxies,
-) -> tower_governor::GovernorLayer<
-    TrustedProxyKeyExtractor,
-    governor::middleware::StateInformationMiddleware,
-    axum::body::Body,
-> {
-    let gov_config = GovernorConfigBuilder::default()
-        .key_extractor(TrustedProxyKeyExtractor::new(trusted_proxies))
-        .per_millisecond(rps_to_period(config.auth_rps))
-        .burst_size(config.auth_burst)
-        .use_headers()
-        .finish()
-        .expect("failed to build auth rate limiter: invalid RateLimitConfig");
-
-    tower_governor::GovernorLayer::new(gov_config)
+) -> (RateLimiterLayer, RateLimiterState) {
+    build_tier(
+        config.auth_rps,
+        config.auth_burst,
+        trusted_proxies,
+        None,
+        "auth",
+    )
 }
 
 /// Create rate limiter layer for upload endpoints
 ///
-/// High limits to accommodate Docker client's aggressive parallel layer uploads
+/// High limits to accommodate Docker client's aggressive parallel layer uploads.
+/// Applies to write methods only: reads (GET/HEAD) pass through, so a large
+/// `dotnet restore`/`npm ci` against a warm cache is never answered 429.
 pub fn upload_rate_limiter(
     config: &RateLimitConfig,
-) -> tower_governor::GovernorLayer<
-    SmartIpKeyExtractor,
-    governor::middleware::StateInformationMiddleware,
-    axum::body::Body,
-> {
-    let gov_config = GovernorConfigBuilder::default()
-        .key_extractor(SmartIpKeyExtractor)
-        .per_millisecond(rps_to_period(config.upload_rps))
-        .burst_size(config.upload_burst)
-        .use_headers()
-        .finish()
-        .expect("failed to build upload rate limiter: invalid RateLimitConfig");
-
-    tower_governor::GovernorLayer::new(gov_config)
+    trusted_proxies: TrustedProxies,
+) -> (RateLimiterLayer, RateLimiterState) {
+    build_tier(
+        config.upload_rps,
+        config.upload_burst,
+        trusted_proxies,
+        Some(vec![
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ]),
+        "upload",
+    )
 }
 
 /// Create rate limiter layer for general endpoints (lenient)
 pub fn general_rate_limiter(
     config: &RateLimitConfig,
-) -> tower_governor::GovernorLayer<
-    SmartIpKeyExtractor,
-    governor::middleware::StateInformationMiddleware,
-    axum::body::Body,
-> {
-    let gov_config = GovernorConfigBuilder::default()
-        .key_extractor(SmartIpKeyExtractor)
-        .per_millisecond(rps_to_period(config.general_rps))
-        .burst_size(config.general_burst)
-        .use_headers()
-        .finish()
-        .expect("failed to build general rate limiter: invalid RateLimitConfig");
-
-    tower_governor::GovernorLayer::new(gov_config)
+    trusted_proxies: TrustedProxies,
+) -> (RateLimiterLayer, RateLimiterState) {
+    build_tier(
+        config.general_rps,
+        config.general_burst,
+        trusted_proxies,
+        None,
+        "general",
+    )
 }
 
 #[cfg(test)]
@@ -153,13 +184,13 @@ mod tests {
     #[test]
     fn test_upload_rate_limiter_creation() {
         let config = RateLimitConfig::default();
-        let _limiter = upload_rate_limiter(&config);
+        let _limiter = upload_rate_limiter(&config, TrustedProxies::default_loopback());
     }
 
     #[test]
     fn test_general_rate_limiter_creation() {
         let config = RateLimitConfig::default();
-        let _limiter = general_rate_limiter(&config);
+        let _limiter = general_rate_limiter(&config, TrustedProxies::default_loopback());
     }
 
     #[test]
@@ -174,8 +205,8 @@ mod tests {
             general_burst: 400,
         };
         let _auth = auth_rate_limiter(&config, TrustedProxies::default_loopback());
-        let _upload = upload_rate_limiter(&config);
-        let _general = general_rate_limiter(&config);
+        let _upload = upload_rate_limiter(&config, TrustedProxies::default_loopback());
+        let _general = general_rate_limiter(&config, TrustedProxies::default_loopback());
     }
 
     #[test]
@@ -235,6 +266,43 @@ mod tests {
 
         let key = extractor.extract(&req).unwrap();
         assert_eq!(key, IpAddr::from([5, 6, 7, 8]));
+    }
+
+    #[tokio::test]
+    async fn test_upload_tier_limits_writes_not_reads() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        let config = RateLimitConfig {
+            upload_rps: 1,
+            upload_burst: 1,
+            ..RateLimitConfig::default()
+        };
+        let (layer, state) = upload_rate_limiter(&config, TrustedProxies::default_loopback());
+        let app = Router::new()
+            .route("/x", get(|| async { "ok" }).put(|| async { "ok" }))
+            .layer(layer);
+        let send = |method: &str| {
+            let mut req = Request::builder()
+                .method(method)
+                .uri("/x")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(SocketAddr::from((
+                    [192, 168, 1, 1],
+                    1234,
+                ))));
+            app.clone().oneshot(req)
+        };
+
+        assert_eq!(send("PUT").await.unwrap().status(), 200);
+        assert_eq!(send("PUT").await.unwrap().status(), 429);
+        for _ in 0..5 {
+            assert_eq!(send("GET").await.unwrap().status(), 200);
+        }
+        assert_eq!(state.len(), 1);
+        state.retain_recent();
     }
 
     #[test]
