@@ -2,12 +2,24 @@
 //! into NORA's storage. Stateless, filesystem-resumable, single static binary (#599).
 //!
 //! Migration-only: this module never serves requests. It touches the rest of
-//! NORA only through three deliberate seams — the [`StorageBackend`](crate::storage)
-//! trait, the [`CurationEngine`](crate::curation), and each format handler's
-//! `pub(crate)` **storage-key builder** (`registry::{maven,raw}::storage_key`) —
+//! NORA only through four deliberate seams — the [`StorageBackend`](crate::storage)
+//! trait, the [`CurationEngine`](crate::curation), each format handler's
+//! `pub(crate)` **storage-key builder** (`registry::{maven,raw}::storage_key`), and
+//! the storage half of the npm / NuGet / PyPI **publish paths** ([`publish`]) —
 //! never registry protocol logic. The key-builder seam is load-bearing (review
 //! R7): reusing the handler's own key function is what keeps imported keys
-//! byte-identical to served keys, so GC/retention/UI browse see them. The
+//! byte-identical to served keys, so GC/retention/UI browse see them. A published
+//! format is more than one key (npm version documents and packument, the NuGet
+//! hosted state document, PyPI hash markers and core metadata), so for those the
+//! import calls the publish internals themselves (C73).
+//!
+//! npm, PyPI and NuGet imports write state a running server caches: run
+//! `nora import` against the storage with the server stopped or not publishing
+//! the imported packages. NuGet hosted state is read on the server's first index
+//! load; a server that was running during the import picks it up on
+//! `POST /api/v1/admin/reindex` (or its periodic hosted retention pass).
+//! `curation.internal_namespaces` does not apply to an import, which copies hosted
+//! content as a publish does; every other curation rule runs. The
 //! transfer step ([`transfer`]) reuses the crash-safe *core* of the proxy blob
 //! path — a `TempFileGuard` RAII + incremental Sha256, streamed to a temp file
 //! with a per-read stall timeout (client `read_timeout`, not a total cap) — plus
@@ -27,7 +39,8 @@
 //!   oracle + a content-addressed fast-path (ADR-2) — review R5, contract
 //!   `import-resume-journal-authoritative`.
 //! - **every written key passes `validate_storage_key`** and is built by the
-//!   same key-functions the format handlers use — review R7, contract
+//!   same key-functions (or, for npm/NuGet/PyPI, the same publish code) the
+//!   format handlers use — review R7, contract
 //!   `import-key-format-equals-handler-key-format`.
 //! - **SSRF guard** on the source URL and every redirect hop (DNS-pinned) —
 //!   review R2, contract `import-ssrf-per-redirect-hop`.
@@ -39,6 +52,7 @@ use futures::stream::BoxStream;
 pub mod http;
 pub mod layout;
 pub mod permissions;
+mod publish;
 pub mod resume;
 pub mod source;
 pub mod transfer;
@@ -248,7 +262,7 @@ async fn assess(args: AssessArgs, config: &crate::config::Config) -> Result<()> 
                 }
                 let note = match c {
                     layout::Compat::Full => "",
-                    layout::Compat::Partial => "tarballs only; metadata regenerated",
+                    layout::Compat::Partial => layout::note(rt),
                     layout::Compat::Unsupported => "no NORA import layout — will be skipped",
                 };
                 (format!("{c:?}"), note)
@@ -304,7 +318,11 @@ async fn run_import(
 
     let on_s3 = storage.backend_name() == "s3";
 
-    let curation = crate::build_curation_engine(config)?;
+    let curation = import_curation_engine(config)?;
+    // `nora import` writes the storage directly; within this process the publish
+    // locks serialize the metadata of one package. Run it with the server stopped
+    // (or not publishing the imported packages) — see `import::publish`.
+    let locks: crate::PublishLocks = Default::default();
     let source = source::build_source(
         args.source,
         &args.url,
@@ -344,6 +362,7 @@ async fn run_import(
             rt,
             &host,
             storage,
+            &locks,
             &curation,
             &temp_dir,
             &resume,
@@ -378,6 +397,7 @@ async fn import_repo(
     rt: crate::registry_type::RegistryType,
     host: &str,
     storage: &crate::storage::Storage,
+    locks: &crate::PublishLocks,
     curation: &crate::curation::CurationEngine,
     temp_dir: &std::path::Path,
     resume: &resume::ResumeStore,
@@ -419,13 +439,19 @@ async fn import_repo(
                 if prior.contains(&key) {
                     return Item::ResumeSkip;
                 }
-                // Fast-path only on local (per-object HEAD on S3 = $$ + latency, R5).
-                if !on_s3 && storage.stat(&key).await.is_some() {
+                // Fast-path only on local (per-object HEAD on S3 = $$ + latency, R5),
+                // and only where the key alone is the import: a published format is
+                // more than one key (an npm tarball without its version document is
+                // not served), so its publish path decides what is already hosted.
+                if !on_s3
+                    && layout::compat(rt) == layout::Compat::Full
+                    && storage.stat(&key).await.is_some()
+                {
                     return Item::CasSkip { key };
                 }
                 let cname = curation_name(rt, &art);
                 let outcome = transfer::transfer_artifact(
-                    source, &art, &key, rt, &cname, host, storage, curation, temp_dir, opts,
+                    source, &art, &key, rt, &cname, host, storage, locks, curation, temp_dir, opts,
                 )
                 .await;
                 Item::Done { key, outcome }
@@ -513,6 +539,20 @@ enum Item {
         key: String,
         outcome: transfer::Outcome,
     },
+}
+
+/// The curation engine for an import: the configured one minus
+/// `curation.internal_namespaces`. Namespace isolation keeps internal names from
+/// being fetched from a public upstream; an import copies them from a hosted
+/// (local) repo of the old registry — the adapters list no remote/proxy repo —
+/// as a publish would, which namespace isolation never blocks. Every other rule
+/// still runs (review R1).
+fn import_curation_engine(
+    config: &crate::config::Config,
+) -> Result<crate::curation::CurationEngine> {
+    let mut config = config.clone();
+    config.curation.internal_namespaces.clear();
+    crate::build_curation_engine(&config)
 }
 
 /// Best-effort curation "name" per format (namespace-isolation and blocklist
@@ -626,6 +666,7 @@ mod integration_tests {
 
     struct Harness {
         storage: crate::storage::Storage,
+        locks: crate::PublishLocks,
         curation: crate::curation::CurationEngine,
         temp_dir: std::path::PathBuf,
         resume: resume::ResumeStore,
@@ -642,6 +683,7 @@ mod integration_tests {
         let resume = resume::ResumeStore::open(&root, source_host).await.unwrap();
         Harness {
             storage,
+            locks: Default::default(),
             curation,
             temp_dir,
             resume,
@@ -748,6 +790,7 @@ mod integration_tests {
             rt,
             "art",
             &h.storage,
+            &h.locks,
             &h.curation,
             &h.temp_dir,
             &h.resume,
@@ -778,6 +821,7 @@ mod integration_tests {
             rt,
             "art",
             &h.storage,
+            &h.locks,
             &h.curation,
             &h.temp_dir,
             &h.resume,
@@ -817,6 +861,7 @@ mod integration_tests {
             rt,
             "art",
             &h.storage,
+            &h.locks,
             &h.curation,
             &h.temp_dir,
             &h.resume,
@@ -862,6 +907,7 @@ mod integration_tests {
             rt,
             "art",
             &h.storage,
+            &h.locks,
             &h.curation,
             &h.temp_dir,
             &h.resume,
@@ -937,6 +983,7 @@ mod integration_tests {
             rt,
             "nexus",
             &h.storage,
+            &h.locks,
             &h.curation,
             &h.temp_dir,
             &h.resume,
@@ -1013,6 +1060,7 @@ mod integration_tests {
             rt,
             "art",
             &h.storage,
+            &h.locks,
             &h.curation,
             &h.temp_dir,
             &h.resume,
@@ -1045,6 +1093,7 @@ mod integration_tests {
             rt,
             "art",
             &h2.storage,
+            &h2.locks,
             &h2.curation,
             &h2.temp_dir,
             &h2.resume,
@@ -1123,6 +1172,7 @@ mod integration_tests {
             rt,
             "art",
             &h.storage,
+            &h.locks,
             &h.curation,
             &h.temp_dir,
             &h.resume,
@@ -1258,6 +1308,7 @@ mod integration_tests {
             rt,
             "host",
             &h.storage,
+            &h.locks,
             &h.curation,
             &h.temp_dir,
             &h.resume,
@@ -1359,6 +1410,7 @@ mod integration_tests {
             crate::registry_type::RegistryType::Maven,
             "host",
             &h.storage,
+            &h.locks,
             &h.curation,
             &h.temp_dir,
             &fresh,
@@ -1463,5 +1515,322 @@ mod integration_tests {
         report_result(&r, false, true); // json
         report_result(&r, true, false); // human dry-run
         report_result(&r, false, false); // human normal
+    }
+
+    // ── C73: npm / NuGet / PyPI imports are served like uploads ─────────
+
+    /// One Artifactory hosted repo of `package_type` holding `files` (`(dir, name,
+    /// bytes)`, dir `.` = repo root), each advertised with its sha256.
+    async fn mount_repo(
+        server: &MockServer,
+        repo: &str,
+        package_type: &str,
+        files: &[(&str, &str, Vec<u8>)],
+    ) {
+        Mock::given(method("GET"))
+            .and(path("/api/repositories"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"key": repo, "type": "LOCAL", "packageType": package_type}
+            ])))
+            .mount(server)
+            .await;
+        let rows: Vec<_> = files
+            .iter()
+            .map(|(dir, name, body)| {
+                json!({"repo": repo, "path": dir, "name": name, "size": body.len(),
+                       "sha256": hex::encode(Sha256::digest(body))})
+            })
+            .collect();
+        Mock::given(method("POST"))
+            .and(path("/api/search/aql"))
+            .and(body_string_contains("offset(0)"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "results": rows })))
+            .mount(server)
+            .await;
+        for (dir, name, body) in files {
+            let url = if *dir == "." {
+                format!("/{repo}/{name}")
+            } else {
+                format!("/{repo}/{dir}/{name}")
+            };
+            Mock::given(method("GET"))
+                .and(path(url))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+                .mount(server)
+                .await;
+        }
+    }
+
+    /// `nora import run` of every repo on `server` into the storage of `ctx`, as a
+    /// separate process would (own locks, journal named after `run`).
+    async fn import_into(
+        server: &MockServer,
+        ctx: &crate::test_helpers::TestContext,
+        run: &str,
+    ) -> ImportResult {
+        let root = ctx._tempdir.path();
+        let source = source::build_source(
+            SourceKind::Artifactory,
+            &server.uri(),
+            loopback_client(),
+            None,
+            true,
+        )
+        .unwrap();
+        let resume = resume::ResumeStore::open(root, run).await.unwrap();
+        let curation =
+            crate::curation::CurationEngine::new(crate::config::CurationConfig::default());
+        let locks = crate::PublishLocks::default();
+        let mut total = ImportResult::default();
+        for repo in source.list_repositories().await.unwrap() {
+            let rt = layout::normalize_format(&repo.format).unwrap();
+            let res = import_repo(
+                source.as_ref(),
+                &repo,
+                rt,
+                "art",
+                &ctx.state.storage,
+                &locks,
+                &curation,
+                &root.join(".nora-import").join("tmp"),
+                &resume,
+                opts(false),
+                4,
+                false,
+            )
+            .await
+            .unwrap();
+            total.merge(&res);
+        }
+        total
+    }
+
+    /// GET through the router; a gzip-encoded body (NuGet registration) is decoded.
+    async fn get(ctx: &crate::test_helpers::TestContext, uri: &str) -> (u16, Vec<u8>) {
+        let resp = crate::test_helpers::send(&ctx.app, axum::http::Method::GET, uri, "").await;
+        let status = resp.status().as_u16();
+        let gz = resp.headers().get("content-encoding").is_some();
+        let raw = crate::test_helpers::body_bytes(resp).await;
+        if !gz {
+            return (status, raw.to_vec());
+        }
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&raw[..]), &mut out).unwrap();
+        (status, out)
+    }
+
+    fn npm_tgz(name: &str, version: &str) -> Vec<u8> {
+        publish::fixtures::tgz(&[
+            (
+                "package/package.json",
+                &format!(
+                    r#"{{"name":"{name}","version":"{version}","description":"d","main":"index.js"}}"#
+                ),
+            ),
+            ("package/index.js", "module.exports = 1;"),
+        ])
+    }
+
+    #[tokio::test]
+    async fn npm_import_serves_packument_and_tarball() {
+        let ctx = crate::test_helpers::create_test_context();
+        let release = npm_tgz("@acme/ui", "1.0.0");
+        let files = vec![
+            (
+                "@acme/ui/-/@acme",
+                "ui-0.9.0.tgz",
+                npm_tgz("@acme/ui", "0.9.0"),
+            ),
+            ("@acme/ui/-/@acme", "ui-1.0.0.tgz", release.clone()),
+            (
+                "@acme/ui/-/@acme",
+                "ui-2.0.0-pr.1.tgz",
+                npm_tgz("@acme/ui", "2.0.0-pr.1"),
+            ),
+            // Artifactory's own metadata: skipped, the packument is rebuilt.
+            (".npm/@acme/ui", "package.json", b"{}".to_vec()),
+            // package.json naming another package: refused, nothing stored.
+            (
+                "@acme/ui/-/@acme",
+                "ui-3.0.0.tgz",
+                npm_tgz("@acme/other", "3.0.0"),
+            ),
+        ];
+        let server = MockServer::start().await;
+        mount_repo(&server, "npm-local", "npm", &files).await;
+
+        let res = import_into(&server, &ctx, "npm-1").await;
+        assert_eq!((res.imported, res.skipped, res.failed), (3, 1, 1));
+
+        let (status, body) = get(&ctx, "/npm/@acme/ui").await;
+        assert_eq!(status, 200);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let versions = doc["versions"].as_object().unwrap();
+        let mut names: Vec<_> = versions.keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, ["0.9.0", "1.0.0", "2.0.0-pr.1"]);
+        // `latest` is the highest release, never the PR prerelease.
+        assert_eq!(doc["dist-tags"]["latest"], "1.0.0");
+        assert!(doc["time"]["1.0.0"].is_string());
+        let v = &doc["versions"]["1.0.0"];
+        assert_eq!(v["_id"], "@acme/ui@1.0.0");
+        assert_eq!(v["main"], "index.js");
+        assert_eq!(
+            v["dist"]["shasum"],
+            hex::encode(sha1::Sha1::digest(&release))
+        );
+        let tarball = v["dist"]["tarball"].as_str().unwrap();
+        assert!(
+            tarball.ends_with("/npm/@acme/ui/-/ui-1.0.0.tgz"),
+            "{tarball}"
+        );
+
+        let (status, body) = get(&ctx, "/npm/@acme/ui/-/ui-1.0.0.tgz").await;
+        assert_eq!(status, 200);
+        assert_eq!(&body[..], &release[..]);
+
+        // A rerun that lost its journal skips what is hosted; nothing fails.
+        let res = import_into(&server, &ctx, "npm-2").await;
+        assert_eq!((res.imported, res.failed), (0, 1));
+        assert_eq!(res.skipped, 4);
+    }
+
+    #[tokio::test]
+    async fn nuget_import_lands_in_the_hosted_feed() {
+        use crate::registry::nuget::hosted::test_support::nupkg;
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.nuget.proxy_timeout = 1;
+            cfg.nuget.metadata_proxy_timeout = 1;
+        });
+        // The server's hosted index is already loaded (it is running).
+        let (status, _) = get(&ctx, "/nuget/v3/flatcontainer/mindbox.lib/index.json").await;
+        assert_ne!(status, 200);
+
+        let pkg = nupkg(
+            "Mindbox.Lib",
+            "1.2.0",
+            r#"<dependencies><dependency id="Mindbox.Core" version="2.0.0"/></dependencies>"#,
+        );
+        let files = vec![
+            (".", "Mindbox.Lib.1.2.0.nupkg", pkg.clone()),
+            (".", "Mindbox.Lib.1.2.0.snupkg", b"symbols".to_vec()),
+        ];
+        let server = MockServer::start().await;
+        mount_repo(&server, "nuget-local", "nuget", &files).await;
+        let res = import_into(&server, &ctx, "nuget-1").await;
+        assert_eq!((res.imported, res.skipped, res.failed), (1, 1, 0));
+
+        // Written behind the running server: served after the admin reindex.
+        let (status, _) = get(&ctx, "/nuget/v3/flatcontainer/mindbox.lib/index.json").await;
+        assert_ne!(status, 200, "stale index until reindex");
+        crate::registry::nuget::hosted::refresh(&ctx.state).await;
+
+        let (status, body) = get(&ctx, "/nuget/v3/flatcontainer/mindbox.lib/index.json").await;
+        assert_eq!(status, 200);
+        let idx: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(idx["versions"], json!(["1.2.0"]));
+        let (status, body) = get(
+            &ctx,
+            "/nuget/v3/flatcontainer/mindbox.lib/1.2.0/mindbox.lib.1.2.0.nupkg",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(&body[..], &pkg[..]);
+        let (status, body) = get(&ctx, "/nuget/v3/registration/Mindbox.Lib/index.json").await;
+        assert_eq!(status, 200);
+        let reg: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entry = &reg["items"][0]["items"][0]["catalogEntry"];
+        assert_eq!(entry["id"], "Mindbox.Lib");
+        assert_eq!(entry["version"], "1.2.0");
+        assert_eq!(
+            entry["dependencyGroups"][0]["dependencies"][0]["id"],
+            "Mindbox.Core"
+        );
+
+        // Re-import of the same bytes: an identical re-push, skipped.
+        let res = import_into(&server, &ctx, "nuget-2").await;
+        assert_eq!((res.imported, res.failed), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn pypi_import_serves_index_files_and_core_metadata() {
+        let ctx = crate::test_helpers::create_test_context();
+        let metadata = "Metadata-Version: 2.1\nName: mindbox-sdk\nVersion: 1.0\nRequires-Python: >=3.9\n\nlong description\n";
+        let wheel = publish::fixtures::zip(&[
+            ("mindbox_sdk/__init__.py", ""),
+            ("mindbox_sdk-1.0.dist-info/METADATA", metadata),
+        ]);
+        let sdist = publish::fixtures::tgz(&[
+            (
+                "mindbox_sdk-1.0/PKG-INFO",
+                "Metadata-Version: 2.1\nName: mindbox-sdk\nVersion: 1.0\nRequires-Python: >=3.8\n",
+            ),
+            ("mindbox_sdk-1.0/setup.py", ""),
+        ]);
+        let files = vec![
+            (
+                "mindbox-sdk/1.0",
+                "mindbox_sdk-1.0-py3-none-any.whl",
+                wheel.clone(),
+            ),
+            ("mindbox-sdk/1.0", "mindbox_sdk-1.0.tar.gz", sdist.clone()),
+            (".pypi", "mindbox-sdk.html", b"<html/>".to_vec()),
+        ];
+        let server = MockServer::start().await;
+        mount_repo(&server, "pypi-local", "pypi", &files).await;
+        let res = import_into(&server, &ctx, "pypi-1").await;
+        assert_eq!((res.imported, res.skipped, res.failed), (2, 1, 0));
+
+        let (status, body) = get(&ctx, "/simple/mindbox-sdk/").await;
+        assert_eq!(status, 200);
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("mindbox_sdk-1.0-py3-none-any.whl"), "{html}");
+        assert!(html.contains("mindbox_sdk-1.0.tar.gz"), "{html}");
+        assert!(
+            html.contains(&hex::encode(Sha256::digest(&wheel))),
+            "{html}"
+        );
+        assert!(html.contains("data-requires-python=\"&gt;=3.9\""), "{html}");
+        assert!(html.contains("data-requires-python=\"&gt;=3.8\""), "{html}");
+        assert!(html.contains("data-core-metadata"), "{html}");
+
+        let (status, body) = get(&ctx, "/simple/mindbox-sdk/mindbox_sdk-1.0.tar.gz").await;
+        assert_eq!(status, 200);
+        assert_eq!(&body[..], &sdist[..]);
+        let (status, body) = get(
+            &ctx,
+            "/simple/mindbox-sdk/mindbox_sdk-1.0-py3-none-any.whl.metadata",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(&body[..], metadata.as_bytes());
+    }
+
+    #[test]
+    fn import_curation_ignores_internal_namespaces_only() {
+        let mut config = crate::config::Config::default();
+        config.curation.internal_namespaces = vec!["@acme/*".to_string()];
+        let engine = import_curation_engine(&config).unwrap();
+        let req = crate::curation::FilterRequest {
+            registry: crate::registry_type::RegistryType::Npm,
+            upstream: Some("art".into()),
+            name: "@acme/ui".into(),
+            version: crate::curation::RequestVersion::Unspecified,
+            integrity: None,
+            bypass: false,
+            publish_date: None,
+        };
+        assert!(matches!(
+            engine.evaluate(&req).decision,
+            crate::curation::Decision::Allow
+        ));
+        // The server's own engine still isolates the namespace.
+        let served = crate::build_curation_engine(&config).unwrap();
+        assert!(matches!(
+            served.evaluate(&req).decision,
+            crate::curation::Decision::Block { .. }
+        ));
     }
 }

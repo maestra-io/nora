@@ -183,11 +183,14 @@ async fn load(storage: &Storage, id_lower: &str) -> Result<Option<HostedPackage>
 }
 
 fn unavailable() -> Response {
+    unavailable_err().into_response()
+}
+
+fn unavailable_err() -> (StatusCode, String) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        "hosted package state unavailable",
+        "hosted package state unavailable".to_string(),
     )
-        .into_response()
 }
 
 // ── In-memory index ────────────────────────────────────────────────────
@@ -467,49 +470,123 @@ async fn push(
     let sha256 = hex::encode(hasher.finalize());
 
     let path = spool.0.clone();
-    let spec = match tokio::task::spawn_blocking(move || {
-        std::fs::File::open(&path)
-            .map_err(|e| format!("cannot reopen package: {e}"))
-            .and_then(parse_nupkg)
-    })
-    .await
-    {
-        Ok(Ok(s)) => s,
+    let parsed = match tokio::task::spawn_blocking(move || parse_package(&path)).await {
+        Ok(Ok(p)) => p,
         Ok(Err(e)) => return bad_request(e),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    if spec
-        .package_types
-        .iter()
-        .any(|t| t.eq_ignore_ascii_case("SymbolsPackage"))
-    {
-        return bad_request(
-            "symbol packages (.snupkg) are not accepted by this feed; push the .nupkg only",
-        );
-    }
-    let id_lower = spec.id.to_lowercase();
-    if spec.id.len() > MAX_ID_LEN || !is_valid_package_id(&id_lower) {
-        return bad_request(format!("invalid package id '{}'", spec.id));
-    }
-    let Some((version, semver2)) = normalize_version(&spec.version) else {
-        return bad_request(format!("invalid package version '{}'", spec.version));
-    };
-    if !scope_allows(&authority, &id_lower) {
+    if !scope_allows(&authority, &parsed.id_lower) {
         return StatusCode::FORBIDDEN.into_response();
     }
     // Loaded before the write, so the update below cannot race the initial load.
     let Ok(map) = index(&state).await else {
         return unavailable();
     };
+    let stored = store(
+        &state.storage,
+        &state.publish_locks,
+        Some(&map),
+        parsed,
+        &spool.0,
+        &sha256,
+        size,
+    )
+    .await;
+    let artifact = match stored {
+        Ok(Stored::Created(artifact)) => artifact,
+        Ok(Stored::Identical(msg)) => return (StatusCode::OK, msg).into_response(),
+        Err(e) => return e.into_response(),
+    };
 
+    state.repo_index.invalidate("nuget");
+    state.metrics.record_upload("nuget");
+    state.audit.log(AuditEntry::new(
+        "push",
+        crate::auth::audit_actor(&user),
+        &artifact,
+        "nuget",
+        "",
+    ));
+    state.activity.push(ActivityEntry::new(
+        ActionType::Push,
+        artifact,
+        RegistryType::Nuget,
+        "LOCAL",
+    ));
+    StatusCode::CREATED.into_response()
+}
+
+/// A `.nupkg` that passed [`parse_package`]: its manifest, lowercase ID and
+/// normalized version.
+pub(crate) struct Parsed {
+    spec: Nuspec,
+    id_lower: String,
+    version: String,
+    semver2: bool,
+}
+
+/// Read and validate a `.nupkg` (blocking: unzips it): exactly one root nuspec, not a
+/// symbol package, a valid ID and version.
+pub(crate) fn parse_package(path: &std::path::Path) -> Result<Parsed, String> {
+    let spec = std::fs::File::open(path)
+        .map_err(|e| format!("cannot reopen package: {e}"))
+        .and_then(parse_nupkg)?;
+    if spec
+        .package_types
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case("SymbolsPackage"))
+    {
+        return Err(
+            "symbol packages (.snupkg) are not accepted by this feed; push the .nupkg only".into(),
+        );
+    }
+    let id_lower = spec.id.to_lowercase();
+    if spec.id.len() > MAX_ID_LEN || !is_valid_package_id(&id_lower) {
+        return Err(format!("invalid package id '{}'", spec.id));
+    }
+    let Some((version, semver2)) = normalize_version(&spec.version) else {
+        return Err(format!("invalid package version '{}'", spec.version));
+    };
+    Ok(Parsed {
+        spec,
+        id_lower,
+        version,
+        semver2,
+    })
+}
+
+/// What [`store`] did; both carry the `id@version` / message for the caller.
+pub(crate) enum Stored {
+    Created(String),
+    /// The version exists with the same bytes: nothing written.
+    Identical(String),
+}
+
+/// Store a parsed package under its ID's publish lock: blobs first, the state
+/// document last, then the in-memory index when `map` is given. An existing version
+/// with identical bytes is [`Stored::Identical`]; different bytes are a 409.
+async fn store(
+    storage: &Storage,
+    locks: &crate::PublishLocks,
+    map: Option<&IndexMap>,
+    parsed: Parsed,
+    src: &std::path::Path,
+    sha256: &str,
+    size: u64,
+) -> Result<Stored, (StatusCode, String)> {
+    let Parsed {
+        spec,
+        id_lower,
+        version,
+        semver2,
+    } = parsed;
     let ver_lower = version.to_lowercase();
-    let key = meta_key(&id_lower);
-    let lock = state.publish_lock(&key);
+    let lock = crate::acquire_publish_lock(locks, &meta_key(&id_lower));
     let _guard = lock.lock().await;
 
-    let mut pkg = match load(&state.storage, &id_lower).await {
+    let mut pkg = match load(storage, &id_lower).await {
         Ok(p) => p.unwrap_or_default(),
-        Err(_) => return unavailable(),
+        Err(_) => return Err(unavailable_err()),
     };
     let dir = format!("{BLOB_PREFIX}{id_lower}/{ver_lower}");
     let nupkg_key = format!("{dir}/{id_lower}.{ver_lower}.nupkg");
@@ -522,35 +599,34 @@ async fn push(
         // Idempotent re-push (a retry after a lost 201): the same bytes are a success
         // and rewrite nothing; different bytes for an existing version stay a 409.
         // The NuGet client treats any 2xx as pushed.
-        if state.storage.pin(&nupkg_key).await.as_deref() == Some(sha256.as_str()) {
+        if storage.pin(&nupkg_key).await.as_deref() == Some(sha256) {
             tracing::info!(package = %artifact, "nuget hosted: identical re-push accepted");
-            return (
-                StatusCode::OK,
-                format!("{artifact} already exists (identical)"),
-            )
-                .into_response();
+            return Ok(Stored::Identical(format!(
+                "{artifact} already exists (identical)"
+            )));
         }
-        return (StatusCode::CONFLICT, format!("{artifact} already exists")).into_response();
+        return Err((StatusCode::CONFLICT, format!("{artifact} already exists")));
     }
 
     // Blobs first, state document last: the index never names a blob that is not
     // durable. A failure in between leaves an unreferenced blob a retry overwrites;
     // downloads resolve through the state document, so it is never served.
-    if let Err(e) = state
-        .storage
-        .put_from_path(&nupkg_key, &spool.0, Some(&sha256))
-        .await
-    {
+    let internal = |what: &str| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to store {what}"),
+        )
+    };
+    if let Err(e) = storage.put_from_path(&nupkg_key, src, Some(sha256)).await {
         tracing::error!(error = %e, "nuget hosted: failed to store nupkg");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return Err(internal("nupkg"));
     }
-    if let Err(e) = state
-        .storage
+    if let Err(e) = storage
         .put(&format!("{dir}/{id_lower}.nuspec"), spec.raw.as_bytes())
         .await
     {
         tracing::error!(error = %e, "nuget hosted: failed to store nuspec");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return Err(internal("nuspec"));
     }
 
     if pkg.id.is_empty() {
@@ -573,27 +649,23 @@ async fn push(
     });
     pkg.versions
         .sort_by(|a, b| compare_versions(&a.version, &b.version));
-    if let Err(resp) = save(&state.storage, &map, &id_lower, &pkg).await {
-        return resp;
-    }
+    save(storage, map, &id_lower, &pkg).await?;
+    Ok(Stored::Created(format!("{}@{}", pkg.id, version)))
+}
 
-    state.repo_index.invalidate("nuget");
-    let artifact = format!("{}@{}", pkg.id, version);
-    state.metrics.record_upload("nuget");
-    state.audit.log(AuditEntry::new(
-        "push",
-        crate::auth::audit_actor(&user),
-        &artifact,
-        "nuget",
-        "",
-    ));
-    state.activity.push(ActivityEntry::new(
-        ActionType::Push,
-        artifact,
-        RegistryType::Nuget,
-        "LOCAL",
-    ));
-    StatusCode::CREATED.into_response()
+/// `nora import`: store a package offline, as a push would. There is no server index
+/// to update here: a running server picks the document up on `POST
+/// /api/v1/admin/reindex` or its periodic retention pass, a stopped one on its first
+/// index load.
+pub(crate) async fn import_package(
+    storage: &Storage,
+    locks: &crate::PublishLocks,
+    parsed: Parsed,
+    src: &std::path::Path,
+    sha256: &str,
+    size: u64,
+) -> Result<Stored, (StatusCode, String)> {
+    store(storage, locks, None, parsed, src, sha256, size).await
 }
 
 /// OIDC `namespace_scope` for NuGet: IDs are case-insensitive, so the lowercase ID is
@@ -678,8 +750,8 @@ async fn set_listed(
         return StatusCode::NOT_FOUND.into_response();
     };
     entry.listed = listed;
-    if let Err(resp) = save(&state.storage, &map, &id_lower, &pkg).await {
-        return resp;
+    if let Err(e) = save(&state.storage, Some(&map), &id_lower, &pkg).await {
+        return e.into_response();
     }
 
     state.repo_index.invalidate("nuget");
@@ -699,24 +771,31 @@ async fn set_listed(
     }
 }
 
-/// Write the state document, then publish it to the in-memory index. Called under the
+/// Write the state document, then publish it to the in-memory index (if given). Called under the
 /// ID's publish lock.
 async fn save(
     storage: &Storage,
-    map: &IndexMap,
+    map: Option<&IndexMap>,
     id_lower: &str,
     pkg: &HostedPackage,
-) -> Result<(), Response> {
-    let body =
-        serde_json::to_vec(pkg).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+) -> Result<(), (StatusCode, String)> {
+    let failed = || {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to write hosted package state".to_string(),
+        )
+    };
+    let body = serde_json::to_vec(pkg).map_err(|_| failed())?;
     let key = meta_key(id_lower);
     // Local backend: temp file + rename; S3: single-object PUT — both atomic.
     storage.put(&key, &body).await.map_err(|e| {
         tracing::error!(key = %key, error = %e, "nuget hosted: failed to write state document");
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        failed()
     })?;
-    map.write()
-        .insert(id_lower.to_string(), Doc::Ready(Arc::new(pkg.clone())));
+    if let Some(map) = map {
+        map.write()
+            .insert(id_lower.to_string(), Doc::Ready(Arc::new(pkg.clone())));
+    }
     Ok(())
 }
 
@@ -1475,7 +1554,7 @@ pub(crate) async fn run_retention(state: &AppState, dry_run: bool) -> RetentionS
             let mut kept = (*pkg).clone();
             kept.versions
                 .retain(|v| !expired.iter().any(|e| e == &v.version));
-            if save(&state.storage, &map, &id, &kept).await.is_err() {
+            if save(&state.storage, Some(&map), &id, &kept).await.is_err() {
                 sum.errors += 1;
                 continue; // document unchanged: keep every blob it names
             }
@@ -2301,7 +2380,7 @@ mod tests {
 }
 
 #[cfg(test)]
-pub(super) mod test_support {
+pub(crate) mod test_support {
     use std::io::Write;
 
     pub fn zip(entries: &[(&str, &str)]) -> Vec<u8> {
