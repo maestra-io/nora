@@ -48,18 +48,18 @@ tests:
                 - key: users.htpasswd
                   path: users.htpasswd
 
-  - it: mounts existingSecret for docker upstream credentials
+  # Maestra (C76): nora never reads a secrets.toml; existingSecret is envFrom.
+  - it: injects existingSecret as envFrom and mounts nothing for it
     template: templates/deployment.yaml
     set:
       existingSecret: nora-secrets
     asserts:
       - contains:
-          path: spec.template.spec.containers[0].volumeMounts
+          path: spec.template.spec.containers[0].envFrom
           content:
-            name: secrets-config
-            mountPath: /config/secrets
-            readOnly: true
-      - contains:
+            secretRef:
+              name: nora-secrets
+      - notContains:
           path: spec.template.spec.volumes
           content:
             name: secrets-config
@@ -265,11 +265,14 @@ tests:
           path: spec.template.metadata.annotations["prometheus.io/scrape"]
           value: "true"
 
-  - it: mounts htpasswd and secrets together
+  - it: mounts htpasswd and injects existingSecret together with extraEnvFrom
     template: templates/deployment.yaml
     set:
       config.auth.htpasswd.existingSecret: nora-htpasswd
       existingSecret: nora-secrets
+      extraEnvFrom:
+        - configMapRef:
+            name: nora-env
     asserts:
       - contains:
           path: spec.template.spec.containers[0].volumeMounts
@@ -277,11 +280,37 @@ tests:
             name: htpasswd
             mountPath: /etc/nora
             readOnly: true
+      - equal:
+          path: spec.template.spec.containers[0].envFrom
+          value:
+            - secretRef:
+                name: nora-secrets
+            - configMapRef:
+                name: nora-env
+
+  - it: adds extraVolumes and extraVolumeMounts
+    template: templates/deployment.yaml
+    set:
+      extraVolumes:
+        - name: ca
+          configMap:
+            name: corp-ca
+      extraVolumeMounts:
+        - name: ca
+          mountPath: /etc/ssl/corp
+          readOnly: true
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: ca
+            configMap:
+              name: corp-ca
       - contains:
           path: spec.template.spec.containers[0].volumeMounts
           content:
-            name: secrets-config
-            mountPath: /config/secrets
+            name: ca
+            mountPath: /etc/ssl/corp
             readOnly: true
 
   - it: does not mount curation volumes by default

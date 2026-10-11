@@ -150,7 +150,8 @@ config:
   docker:
     proxy_timeout: 60
     # -- Docker upstream registries for proxy/cache.
-    # Auth credentials should come from existingSecret, not inline here.
+    # Upstream auth belongs in a Secret (existingSecret / extraEnvFrom with
+    # NORA_DOCKER_PROXIES="url|user:token,..."), not inline here.
     upstreams: []
     #  - url: https://registry-1.docker.io
     #  - url: https://private.registry.io
@@ -276,13 +277,11 @@ config:
       mountPath: /etc/nora-curation/allowlist
       path: ""
 
-# -- Name of an existing Secret to mount as /config/secrets.toml.
-# Use this to keep registry credentials out of values.yaml.
-# The Secret should contain a key "secrets.toml" with TOML content, e.g.:
-#   [[docker.upstreams]]
-#   url = "https://private.registry.io"
-#   auth = "user:token"
-# These upstreams are merged with config.docker.upstreams (Secret wins for same URL).
+# -- Name of an existing Secret whose keys become env vars (envFrom), e.g.
+# NORA_DOCKER_PROXIES, NORA_NPM_PROXY_AUTH, NORA_STORAGE_S3_ACCESS_KEY /
+# NORA_STORAGE_S3_SECRET_KEY. Keys must be NORA_* variable names: nora reads
+# one config.toml plus NORA_* env and never reads a secrets.toml (older chart
+# versions mounted one at /config/secrets that nothing opened).
 existingSecret: ""
 
 # -- Extra environment variables for the NORA container.
@@ -305,6 +304,10 @@ extraEnv: []
 #     - secretRef:
 #         name: nora-s3-credentials
 extraEnvFrom: []
+
+# -- Extra volumes for the pod and mounts for the NORA container.
+extraVolumes: []
+extraVolumeMounts: []
 
 # -- Memory request == limit (Guaranteed memory, no overcommit OOM kills).
 # nora buffers a proxied artifact and a publish body in RAM (up to ~3x the

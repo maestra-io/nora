@@ -294,21 +294,24 @@ extraEnvFrom:
       name: nora-s3-credentials
 ```
 
-### Docker Upstream Credentials
+### Secrets as environment
 
-Use `existingSecret` for upstream registry auth:
+nora reads one `config.toml` plus `NORA_*` environment variables; it has no secrets file. Put credentials in a Secret whose keys are `NORA_*` names and reference it with `existingSecret` (shorthand for one `envFrom` entry) or `extraEnvFrom`:
 
 ```yaml
 existingSecret: my-nora-upstreams
 ```
 
-The Secret should contain a key `secrets.toml` with TOML content:
-
-```toml
-[[docker.upstreams]]
-url = "https://private.registry.io"
-auth = "user:token"
+```bash
+kubectl create secret generic my-nora-upstreams \
+  --from-literal=NORA_DOCKER_PROXIES='https://private.registry.io|user:token'
 ```
+
+Older chart versions mounted `existingSecret` as `/config/secrets/secrets.toml`, which nora never opened: upstream auth placed there was silently ignored.
+
+### Extra volumes
+
+`extraVolumes` / `extraVolumeMounts` add pod volumes and container mounts (CA bundles, curation files, credential files).
 
 ### Resources
 

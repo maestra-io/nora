@@ -92,19 +92,20 @@ spec:
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- with .Values.extraEnvFrom }}
+          {{- if or .Values.existingSecret .Values.extraEnvFrom }}
           envFrom:
+            {{- with .Values.existingSecret }}
+            - secretRef:
+                name: {{ . }}
+            {{- end }}
+            {{- with .Values.extraEnvFrom }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
           volumeMounts:
             - name: config
               mountPath: /config
               readOnly: true
-            {{- if .Values.existingSecret }}
-            - name: secrets-config
-              mountPath: /config/secrets
-              readOnly: true
-            {{- end }}
             {{- if .Values.config.auth.htpasswd.existingSecret }}
             - name: htpasswd
               mountPath: {{ .Values.config.auth.htpasswd.mountPath }}
@@ -131,15 +132,13 @@ spec:
               mountPath: /data
             - name: tmp
               mountPath: /tmp
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
       volumes:
         - name: config
           configMap:
             name: {{ include "nora.fullname" . }}-config
-        {{- if .Values.existingSecret }}
-        - name: secrets-config
-          secret:
-            secretName: {{ .Values.existingSecret }}
-        {{- end }}
         {{- if .Values.config.auth.htpasswd.existingSecret }}
         - name: htpasswd
           secret:
@@ -195,6 +194,9 @@ spec:
           {{- end }}
         - name: tmp
           emptyDir: {}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
