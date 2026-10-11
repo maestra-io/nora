@@ -1,0 +1,73 @@
+name: Maestra release
+
+# Builds the upstream Dockerfile (default Alpine target) from a maestra tag and
+# pushes 515260921971.dkr.ecr.us-west-2.amazonaws.com/nora:<version>-maestra.N
+# (tag without the leading v) for packages.maestra.io on us-iota-lw-kube-infra
+# (maestra-io/issues-maestra#1442, W0a). Upstream's own Release workflow also
+# matches v* tags; it is disabled in this fork (see MAESTRA.md).
+
+concurrency: release-nora
+
+on:
+  push:
+    tags: ['v*-maestra.*']
+  # Re-run a failed push without retagging.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)release, e.g. v1.3.3-maestra.1"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write  # GitHub OIDC -> Teleport image-push bot -> AWS STS
+
+jobs:
+  image:
+    name: Build & push image to ECR
+    runs-on: runs-on=${{ github.run_id }}/pool=build
+    env:
+      GIT_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: runs-on/action@v2
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: refs/tags/${{ env.GIT_TAG }}
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          case "$GIT_TAG" in
+            v*-maestra.*) ;;
+            *) echo "::error::${GIT_TAG} is not a v<version>-maestra.<n> tag"; exit 1 ;;
+          esac
+          tag="${GIT_TAG#v}"
+          cargo_version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          if [ "${tag%-maestra.*}" != "$cargo_version" ]; then
+            echo "::error::tag ${GIT_TAG} does not match Cargo.toml version ${cargo_version}"
+            exit 1
+          fi
+          echo "value=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+        run: docker build --pull -t "local/nora:${TAG}" .
+
+      - name: Push to ECR us-west-2
+        uses: maestra-io/github-actions/push-to-aws-ecr-repository@main
+        with:
+          awsRegion: us-west-2
+          repositories: nora
+          localTag: ${{ steps.tag.outputs.value }}
+          targetTag: ${{ steps.tag.outputs.value }}
+
+      - name: Report digest
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          digest=$(aws ecr describe-images --region us-west-2 --repository-name nora \
+            --image-ids imageTag="${TAG}" --query 'imageDetails[0].imageDigest' --output text)
+          echo "515260921971.dkr.ecr.us-west-2.amazonaws.com/nora:${TAG}@${digest}" | tee -a "$GITHUB_STEP_SUMMARY"
