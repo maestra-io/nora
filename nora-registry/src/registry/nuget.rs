@@ -35,7 +35,8 @@ use axum::{
     Router,
 };
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) mod hosted;
@@ -498,7 +499,7 @@ async fn registration_index(
     );
 
     let rewrite = Some((upstream.as_str(), base_url.as_str()));
-    match refresh_metadata(&state, &storage_key, &url, id_lower.clone()).await {
+    match refresh_metadata(&state, &storage_key, &url, Some(id_lower.clone())).await {
         Ok(raw) => {
             let text = String::from_utf8_lossy(&raw);
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
@@ -543,10 +544,11 @@ async fn registration_page(
     // Read cache eagerly so stale data is available on upstream failure.
     let cached_data = state.storage.get(&storage_key).await.ok();
 
-    // TTL cache
+    // TTL cache (a 304 revalidation keeps a page fresh without re-uploading it, C56)
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, state.config.nuget.metadata_ttl) {
+            let ttl = state.config.nuget.metadata_ttl;
+            if fresh_within_ttl(&state.storage, &storage_key, meta.modified, ttl).await {
                 state.metrics.record_download("nuget");
                 state.metrics.record_cache_hit("nuget");
                 let text = String::from_utf8_lossy(data);
@@ -587,40 +589,10 @@ async fn registration_page(
         upper
     );
 
-    // Single-flight (C48): concurrent misses on one page make one upstream request.
-    let fetch = proxy_fetch_text(
-        &state.http_client,
-        &url,
-        Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
-        expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
-        None,
-        &state.circuit_breaker,
-        RegistryType::Nuget,
-    );
-    let fetch = async { fetch.await.map(Bytes::from) };
-    match proxy_fetch_shared(
-        &state,
-        &storage_key,
-        "nuget",
-        state.config.nuget.metadata_proxy_timeout,
-        fetch,
-    )
-    .await
-    {
-        Ok((raw, fetched)) => {
-            state.metrics.record_download("nuget");
-            if fetched {
-                state.metrics.record_cache_miss("nuget");
-                state.activity.push(ActivityEntry::new(
-                    ActionType::ProxyFetch,
-                    format!("{}/page/{}/{}", id_lower, lower, upper),
-                    crate::registry_type::RegistryType::Nuget,
-                    "PROXY",
-                ));
-                state.spawn_cache("nuget", storage_key, raw.clone());
-            } else {
-                state.metrics.record_cache_hit("nuget");
-            }
+    // Single-flight (C48) and conditional revalidation (C56), as the index.
+    let activity = Some(format!("{}/page/{}/{}", id_lower, lower, upper));
+    match refresh_metadata(&state, &storage_key, &url, activity).await {
+        Ok(raw) => {
             let text = String::from_utf8_lossy(&raw);
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
             with_json_gzip(rewritten.into_bytes())
@@ -709,7 +681,8 @@ async fn version_list(state: AppState, id: &str) -> Response {
         id_lower
     );
 
-    match refresh_metadata(&state, &storage_key, &url, format!("{}/versions", id_lower)).await {
+    let activity = Some(format!("{}/versions", id_lower));
+    match refresh_metadata(&state, &storage_key, &url, activity).await {
         Ok(raw) => with_json(raw.to_vec()),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
@@ -720,19 +693,25 @@ async fn version_list(state: AppState, id: &str) -> Response {
 }
 
 /// Refresh the cached metadata document at `storage_key` (registration index or
-/// version list) from `url`, returning its raw (not yet rewritten) body.
+/// page, version list) from `url`, returning its raw (not yet rewritten) body.
 ///
 /// Stale metadata is revalidated with a conditional request when enabled (a cheap
 /// 304 — nuget.org returns validators); without stored validators the request is a
 /// plain fetch, which is also how the first fetch captures them. Runs under
 /// single-flight (C48): concurrent cold misses and revalidations of one document make
-/// one upstream request, and only that request writes the cache.
+/// one upstream request, and only that request writes the cache, before the flight
+/// ends, so the next reader finds the new copy (or the 304 stamp) in storage.
+///
+/// `activity` names a client request for the download metrics and the activity log;
+/// `None` is nora's own read (the Q01/Q04 registration lookups), which counts as
+/// neither.
 async fn refresh_metadata(
     state: &AppState,
     storage_key: &str,
     url: &str,
-    activity: String,
+    activity: Option<String>,
 ) -> Result<Bytes, ProxyError> {
+    let client = activity.is_some();
     let fetch = async {
         let validators = if state.config.nuget.revalidate {
             read_validators(&state.storage, storage_key)
@@ -768,39 +747,33 @@ async fn refresh_metadata(
                 crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
                     .with_label_values(&["nuget"])
                     .inc_by(body.len() as u64);
-                state.metrics.record_download("nuget");
-                state.metrics.record_cache_hit("nuget");
-                let storage = state.storage.clone();
-                let key_clone = storage_key.to_string();
-                tokio::spawn(async move {
-                    mark_revalidated(&storage, "nuget", &key_clone).await;
-                });
+                if client {
+                    state.metrics.record_download("nuget");
+                    state.metrics.record_cache_hit("nuget");
+                }
+                mark_revalidated(&state.storage, "nuget", storage_key).await;
                 Ok(body)
             }
             // New body — cache the raw bytes first, then persist the fresh validators.
             Ok(Revalidation::Modified { body, validators }) => {
-                state.metrics.record_download("nuget");
-                state.metrics.record_cache_miss("nuget");
-                state.activity.push(ActivityEntry::new(
-                    ActionType::ProxyFetch,
-                    activity,
-                    crate::registry_type::RegistryType::Nuget,
-                    "PROXY",
-                ));
-                state
-                    .audit
-                    .log(AuditEntry::new("proxy_fetch", "proxy", "", "nuget", ""));
+                if let Some(activity) = activity {
+                    state.metrics.record_download("nuget");
+                    state.metrics.record_cache_miss("nuget");
+                    state.activity.push(ActivityEntry::new(
+                        ActionType::ProxyFetch,
+                        activity,
+                        crate::registry_type::RegistryType::Nuget,
+                        "PROXY",
+                    ));
+                    state
+                        .audit
+                        .log(AuditEntry::new("proxy_fetch", "proxy", "", "nuget", ""));
+                }
                 let raw = Bytes::from(body);
-                let storage = state.storage.clone();
-                let key_clone = storage_key.to_string();
-                let raw_for_cache = raw.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = storage.put_bytes(&key_clone, raw_for_cache).await {
-                        crate::record_cache_write_error("nuget", &key_clone, &e);
-                        return;
-                    }
-                    write_validators(&storage, &key_clone, &validators).await;
-                });
+                match state.storage.put_bytes(storage_key, raw.clone()).await {
+                    Ok(()) => write_validators(&state.storage, storage_key, &validators).await,
+                    Err(e) => crate::record_cache_write_error("nuget", storage_key, &e),
+                }
                 Ok(raw)
             }
             Err(e) => {
@@ -821,7 +794,7 @@ async fn refresh_metadata(
         fetch,
     )
     .await?;
-    if !fetched {
+    if !fetched && client {
         // A coalesced follower: served the leader's in-memory result.
         state.metrics.record_download("nuget");
         state.metrics.record_cache_hit("nuget");
@@ -849,35 +822,27 @@ async fn flatcontainer_download(
     }
 
     let id_lower = id.to_lowercase();
-    if let Some(resp) = hosted::download(&state, path, &id_lower).await {
+    if let Some(resp) = hosted::download(&state, &headers, path, &id_lower).await {
         return resp;
     }
+    let nupkg = ends_with_ci(filename, ".nupkg");
 
     // #733 serve-local: an internal-namespace package is operator-owned — skip curation and serve
-    // any local copy below; block the upstream branch separately. (.nupkg only; .nuspec is uncurated.)
-    let internal = ends_with_ci(filename, ".nupkg")
-        && crate::curation::is_internal_namespace(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Nuget,
-            &id_lower,
-        );
+    // any local copy below; block the upstream branch separately, for the .nuspec as for the
+    // .nupkg (R2-42: either request would name the ID upstream).
+    let internal = crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Nuget,
+        &id_lower,
+    );
 
     // Hoisted to function scope for the digest-quarantine serve gate (#750).
     let mut publish_date: Option<i64> = None;
-    // Curation check for .nupkg downloads
-    if ends_with_ci(filename, ".nupkg") && !internal {
-        // Q01: a flat-container restore never requests the registration, so prime it
-        // here; without it the version had no date and min-release-age never fired.
-        if state.config.server.trust_upstream_dates {
-            ensure_nuget_registration_cached(&state, &id_lower, ver).await;
-        }
-        publish_date = extract_nuget_publish_date(
-            &state.storage,
-            &id_lower,
-            ver,
-            state.config.server.trust_upstream_dates,
-        )
-        .await;
+    // Curation check for .nupkg downloads (.nuspec is uncurated)
+    if nupkg && !internal {
+        // Q01: a flat-container restore never requests the registration, so the date
+        // comes from the registration this primes.
+        publish_date = nuget_publish_date(&state, &id_lower, ver).await;
 
         if let Some(response) = crate::curation::check_download(
             &state.curation().curation_engine,
@@ -893,10 +858,10 @@ async fn flatcontainer_download(
     }
 
     let storage_key = format!("nuget/flatcontainer/{}", path.to_lowercase());
-    let content_type = if ends_with_ci(filename, ".nuspec") {
-        "application/xml"
-    } else {
+    let content_type = if nupkg {
         "application/octet-stream"
+    } else {
+        "application/xml"
     };
 
     let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
@@ -915,6 +880,15 @@ async fn flatcontainer_download(
     );
     let quarantine_on = !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off);
 
+    // A Range request on a large cached package: one ranged read, never a streaming read
+    // of the whole object opened first (R2-13). The quarantine needs the whole object.
+    if nupkg && !quarantine_on {
+        let integrity = Some((id_lower.as_str(), ver));
+        if let Some(resp) = ranged_large_nupkg(&state, &headers, &storage_key, integrity).await {
+            return resp;
+        }
+    }
+
     // Immutable cache, integrity-gated: read whole and verified, or above
     // `server.stream_threshold_mb` streamed with its pin checked as it streams.
     let cached = match read_cached_artifact(&state, "nuget", &storage_key, internal).await {
@@ -923,7 +897,7 @@ async fn flatcontainer_download(
     };
     if let Some(cached) = cached {
         let engine = &state.curation().curation_engine;
-        if ends_with_ci(filename, ".nupkg") && engine.is_active() {
+        if nupkg && engine.is_active() {
             if let Some(response) = crate::curation::verify_integrity_by_hash(
                 engine,
                 crate::curation::RegistryType::Nuget,
@@ -958,64 +932,10 @@ async fn flatcontainer_download(
             }
         }
 
-        // Resume support: 206 for a `Range` request, 416 when the client asks past the
-        // end. Only the .nupkg package — the .nuspec manifest is a metadata read. It
-        // sits after the gates above because the quarantine digest check needs the whole
-        // object. A partial body cannot be rehashed, so the serve relies on the package
-        // hash the client verifies itself (docker did the same in #657). An
-        // absent/malformed range falls through to the full 200.
-        if ends_with_ci(filename, ".nupkg") {
-            let extra = [(
-                header::CACHE_CONTROL,
-                "public, max-age=31536000, immutable".to_string(),
-            )];
-            let ranged = match &cached {
-                CachedArtifact::Buffered(data) => {
-                    crate::registry::range::range_response_from_bytes(
-                        data,
-                        &headers,
-                        content_type,
-                        &extra,
-                    )
-                }
-                CachedArtifact::Streamed { len, .. } => {
-                    crate::registry::range::range_response(
-                        &state.storage,
-                        &[&storage_key],
-                        &headers,
-                        *len,
-                        content_type,
-                        &extra,
-                    )
-                    .await
-                }
-            };
-            if let Some(response) = ranged {
-                return response;
-            }
-        }
-        let len = cached.len();
-        let mut response = (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, content_type),
-                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
-            ],
-            cached.into_body(&state, "nuget", &storage_key, internal),
-        )
-            .into_response();
-        response
-            .headers_mut()
-            .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
-        if ends_with_ci(filename, ".nupkg") {
-            response
-                .headers_mut()
-                .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-        }
-        return response;
+        return serve_artifact(&state, &headers, &storage_key, cached, nupkg, internal).await;
     }
 
-    // #733: an internal-namespace .nupkg with no local copy is never proxied upstream.
+    // #733: an internal-namespace .nupkg or .nuspec with no local copy is never proxied upstream.
     if internal {
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
@@ -1064,7 +984,7 @@ async fn flatcontainer_download(
             }
 
             // Best-effort: fetch flatcontainer index.json if missing (for local search)
-            if ends_with_ci(filename, ".nupkg") {
+            if nupkg {
                 let index_key = format!("nuget/flatcontainer/{}/index.json", id_lower);
                 let state2 = state.clone();
                 let proxy_url2 = proxy_url.clone();
@@ -1131,6 +1051,127 @@ async fn flatcontainer_download(
         // never retried); an outage is a 5xx that NuGet's HttpRetryHandler retries.
         Err(e) => proxy_error_response("nuget", &url, &e),
     }
+}
+
+const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
+/// The 200 for a stored `.nupkg` / `.nuspec` read by [`read_cached_artifact`] (cached
+/// or hosted), or for a `.nupkg` Range request its 206/416. The range sits after the
+/// caller's gates because the quarantine digest check needs the whole object; a
+/// partial body cannot be rehashed, so it relies on the package hash the client
+/// verifies itself (docker did the same in #657). An absent/malformed range falls
+/// through to the full 200. The .nuspec manifest is a metadata read, never ranged.
+async fn serve_artifact(
+    state: &AppState,
+    headers: &HeaderMap,
+    key: &str,
+    cached: CachedArtifact,
+    nupkg: bool,
+    internal: bool,
+) -> Response {
+    let content_type = if nupkg {
+        "application/octet-stream"
+    } else {
+        "application/xml"
+    };
+    if nupkg {
+        let extra = [(header::CACHE_CONTROL, IMMUTABLE.to_string())];
+        let ranged = match &cached {
+            // C23: a 206 cut from the body already read, not a second read.
+            CachedArtifact::Buffered(data) => crate::registry::range::range_response_from_bytes(
+                data,
+                headers,
+                content_type,
+                &extra,
+            ),
+            CachedArtifact::Streamed { len, .. } => {
+                crate::registry::range::range_response(
+                    &state.storage,
+                    &[key],
+                    headers,
+                    *len,
+                    content_type,
+                    &extra,
+                )
+                .await
+            }
+        };
+        if let Some(response) = ranged {
+            return response;
+        }
+    }
+    let len = cached.len();
+    let mut response = (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, IMMUTABLE),
+        ],
+        cached.into_body(state, "nuget", key, internal),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    if nupkg {
+        response
+            .headers_mut()
+            .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    }
+    response
+}
+
+/// R2-13: a `.nupkg` Range request for a stored object above `server.stream_threshold_mb`
+/// served by `stat` plus one ranged read, as npm and PyPI do; [`read_cached_artifact`]
+/// would open a streaming read of the whole object first and drop it unread. `None`
+/// (no Range header, no such object, a small one, or no range served): the caller
+/// reads the object as usual, a small one whole and sliced in memory (C23).
+/// `integrity` (`id`, `version`) is set for a proxied package: its curation integrity
+/// check runs against the stored pin, as on the streamed path; no pin, no shortcut.
+async fn ranged_large_nupkg(
+    state: &AppState,
+    headers: &HeaderMap,
+    key: &str,
+    integrity: Option<(&str, &str)>,
+) -> Option<Response> {
+    if !headers.contains_key(header::RANGE) {
+        return None;
+    }
+    let threshold = state.config.server.stream_threshold();
+    let size = state.storage.stat(key).await?.size;
+    if threshold == 0 || size <= threshold {
+        return None;
+    }
+    if let Some((id, ver)) = integrity {
+        let engine = &state.curation().curation_engine;
+        if engine.is_active() {
+            let pin = state.storage.pin(key).await?;
+            if let Some(response) = crate::curation::verify_integrity_by_hash(
+                engine,
+                crate::curation::RegistryType::Nuget,
+                id,
+                Some(ver),
+                &format!("sha256:{pin}"),
+            ) {
+                return Some(response);
+            }
+        }
+    }
+    let extra = [(header::CACHE_CONTROL, IMMUTABLE.to_string())];
+    let response = crate::registry::range::range_response(
+        &state.storage,
+        &[key],
+        headers,
+        size,
+        "application/octet-stream",
+        &extra,
+    )
+    .await?;
+    if response.status() == StatusCode::PARTIAL_CONTENT {
+        state.metrics.record_download("nuget");
+        state.metrics.record_cache_hit("nuget");
+    }
+    Some(response)
 }
 
 // ── Stale-while-error helper ──────────────────────────────────────────
@@ -1262,9 +1303,10 @@ fn registration_page_key(id: &str, lower: &str, upper: &str) -> String {
     format!("nuget/registration/{id}/page/{lower}/{upper}.json")
 }
 
-/// Fetch a registration document upstream and cache it under the key its proxy
-/// handler serves it from (TTL'd there by `nuget.metadata_ttl`). Synchronous `put`
-/// so the date is readable on the same request. Best-effort: `None` on any failure.
+/// Refresh a registration document (index or page) from upstream into the key its
+/// proxy handler serves it from, through [`refresh_metadata`]: one flight with the
+/// handler and every other caller (C48), a conditional request against the stored
+/// validators (C56), persisted before it returns. Best-effort: `None` on any failure.
 async fn fetch_registration_doc(
     state: &AppState,
     key: &str,
@@ -1274,65 +1316,18 @@ async fn fetch_registration_doc(
         "{}/v3/registration5-gz-semver2/{upstream_path}",
         upstream_url(state).trim_end_matches('/')
     );
-    let text = proxy_fetch_text(
-        &state.http_client,
-        &url,
-        Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
-        expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
-        None,
-        &state.circuit_breaker,
-        RegistryType::Nuget,
-    )
-    .await
-    .ok()?;
-    let doc = serde_json::from_str(&text).ok()?;
-    if let Err(e) = state.storage.put(key, text.as_bytes()).await {
-        crate::record_cache_write_error("nuget", key, &e);
-    }
-    Some(doc)
+    let raw = refresh_metadata(state, key, &url, None).await.ok()?;
+    serde_json::from_slice(&raw).ok()
 }
 
-/// Self-prime the registration data that dates `id`/`version` (Q01).
+/// Publish date of `id`/`version` from its registration, primed here (Q01).
 ///
 /// `dotnet restore` reads only the flat container (`{id}/index.json`, then the
 /// `.nupkg`), so the registration index — the carrier of `catalogEntry.published` —
-/// was never cached on that path and min-release-age had no date to judge. Fetch the
-/// index when the cached copy does not place the version (missing, or older than the
-/// version), then the page that holds it when the index does not inline its pages.
-/// A cached document that already dates the version is reused: a publish date does
-/// not change. Callers gate this on `server.trust_upstream_dates`; an internal or
-/// hosted ID never reaches it (both return before curation).
-async fn ensure_nuget_registration_cached(state: &AppState, id: &str, version: &str) {
-    let index_key = registration_key(id);
-    let cached = read_json(&state.storage, &index_key).await;
-    let hit = match cached.and_then(|doc| registration_hit(&doc, version)) {
-        Some(hit) => hit,
-        None => {
-            let upstream_path = format!("{id}/index.json");
-            let Some(doc) = fetch_registration_doc(state, &index_key, &upstream_path).await else {
-                return;
-            };
-            let Some(hit) = registration_hit(&doc, version) else {
-                return;
-            };
-            hit
-        }
-    };
-    if let RegistrationHit::Page(lower, upper) = hit {
-        let page_key = registration_page_key(id, &lower, &upper);
-        let page_has_version = read_json(&state.storage, &page_key)
-            .await
-            .and_then(|p| leaf_published(p.get("items")?.as_array()?, version))
-            .is_some();
-        if !page_has_version {
-            let upstream_path = format!("{id}/page/{lower}/{upper}.json");
-            let _ = fetch_registration_doc(state, &page_key, &upstream_path).await;
-        }
-    }
-}
-
-/// Publish date of `id`/`version` from the cached registration index, following a
-/// non-inlined page to its cached page document.
+/// is never requested on that path. The cached index is used when it places the
+/// version (a publish date does not change); otherwise it is refreshed (missing, or
+/// older than the version). A version on a non-inlined page is dated from the cached
+/// page, else the refreshed one. Each document is read once (R2-43).
 ///
 /// NuGet registration index JSON has nested items:
 /// ```json
@@ -1342,24 +1337,31 @@ async fn ensure_nuget_registration_cached(state: &AppState, id: &str, version: &
 /// and nora's cache mtime is no publish date either (C49: every metadata refresh
 /// re-dated every version to now, and an old index matured a new version in the
 /// quarantine at once). Min-release-age then defers to the quarantine's own clock.
-async fn extract_nuget_publish_date(
-    storage: &crate::storage::Storage,
-    id: &str,
-    version: &str,
-    trust_upstream: bool,
-) -> Option<i64> {
-    if !trust_upstream {
+/// An internal or hosted ID never reaches it (both return before curation).
+async fn nuget_publish_date(state: &AppState, id: &str, version: &str) -> Option<i64> {
+    if !state.config.server.trust_upstream_dates {
         return None;
     }
-    let id = id.to_lowercase();
-    let index = read_json(storage, &registration_key(&id)).await?;
-    match registration_hit(&index, version)? {
-        RegistrationHit::Published(date) => date,
-        RegistrationHit::Page(lower, upper) => {
-            let page = read_json(storage, &registration_page_key(&id, &lower, &upper)).await?;
-            leaf_published(page.get("items")?.as_array()?, version)?
+    let index_key = registration_key(id);
+    let cached = read_json(&state.storage, &index_key).await;
+    let hit = match cached.and_then(|doc| registration_hit(&doc, version)) {
+        Some(hit) => hit,
+        None => {
+            let doc = fetch_registration_doc(state, &index_key, &format!("{id}/index.json")).await;
+            registration_hit(&doc?, version)?
         }
+    };
+    let (lower, upper) = match hit {
+        RegistrationHit::Published(date) => return date,
+        RegistrationHit::Page(lower, upper) => (lower, upper),
+    };
+    let page_key = registration_page_key(id, &lower, &upper);
+    let date = |page: serde_json::Value| leaf_published(page.get("items")?.as_array()?, version);
+    if let Some(date) = read_json(&state.storage, &page_key).await.and_then(date) {
+        return date;
     }
+    let upstream_path = format!("{id}/page/{lower}/{upper}.json");
+    date(fetch_registration_doc(state, &page_key, &upstream_path).await?)?
 }
 
 // ── Q04: hide young versions from proxied metadata ─────────────────────
@@ -1428,17 +1430,72 @@ fn filter_registration(
     changed.then(|| serde_json::to_vec(&doc).ok()).flatten()
 }
 
+/// Q04 hidden-version sets of proxied IDs by (ID, `last_page_only`), each kept for
+/// `nuget.metadata_ttl` (R2-30): a restore asks for the flat `index.json` of every
+/// package and searches repeat, and a set costs the registration index and pages.
+/// An entry is tied to the curation config it was computed under, so a SIGHUP reload
+/// (allow list, min age) applies at once; a version maturing meanwhile shows up when
+/// its entry expires.
+#[derive(Default)]
+pub(crate) struct HiddenMemo(parking_lot::Mutex<HashMap<(String, bool), HiddenEntry>>);
+
+struct HiddenEntry {
+    at: std::time::Instant,
+    curation: usize,
+    hidden: Arc<HashSet<String>>,
+}
+
+/// Memo entries kept before expired ones are dropped.
+// ponytail: whole-map prune at the cap, an LRU if the restored-ID set gets that big.
+const HIDDEN_MEMO_MAX: usize = 4096;
+
+/// [`compute_hidden_versions`], memoized in [`HiddenMemo`].
+async fn hidden_versions(state: &AppState, id: &str, last_page_only: bool) -> Arc<HashSet<String>> {
+    let ttl = std::time::Duration::from_secs(state.config.nuget.metadata_ttl.max(0) as u64);
+    let curation = Arc::as_ptr(&*state.curation()) as usize;
+    let memo = &state.nuget_hosted.hidden.0;
+    let key = (id.to_string(), last_page_only);
+    if let Some(e) = memo.lock().get(&key) {
+        if e.curation == curation && e.at.elapsed() < ttl {
+            return e.hidden.clone();
+        }
+    }
+    let hidden = Arc::new(compute_hidden_versions(state, id, last_page_only).await);
+    if !ttl.is_zero() {
+        let mut memo = memo.lock();
+        if memo.len() >= HIDDEN_MEMO_MAX {
+            memo.retain(|_, e| e.at.elapsed() < ttl);
+            if memo.len() >= HIDDEN_MEMO_MAX {
+                memo.clear();
+            }
+        }
+        let entry = HiddenEntry {
+            at: std::time::Instant::now(),
+            curation,
+            hidden: hidden.clone(),
+        };
+        memo.insert(key, entry);
+    }
+    hidden
+}
+
 /// The versions of a proxied `id` metadata must hide, from its registration: the
-/// index (cached within `metadata_ttl`, else refetched) and, for an ID whose pages
-/// are not inlined, the page documents (cached by their bounds, fetched once,
-/// concurrently). `last_page_only` reads only the newest page: search results show
-/// many IDs at once, and a fresh version almost always lands there.
-async fn hidden_versions(state: &AppState, id: &str, last_page_only: bool) -> HashSet<String> {
+/// index (fresh within `metadata_ttl` or revalidated within it, else refreshed through
+/// [`refresh_metadata`]) and, for an ID whose pages are not inlined, the page
+/// documents (cached by their bounds, fetched once, concurrently). `last_page_only`
+/// reads only the newest page: search results show many IDs at once, and a fresh
+/// version almost always lands there.
+async fn compute_hidden_versions(
+    state: &AppState,
+    id: &str,
+    last_page_only: bool,
+) -> HashSet<String> {
     let curation = state.curation();
     let engine = &curation.curation_engine;
     let index_key = registration_key(id);
+    let ttl = state.config.nuget.metadata_ttl;
     let fresh = match state.storage.stat(&index_key).await {
-        Some(m) if is_within_ttl(m.modified, state.config.nuget.metadata_ttl) => {
+        Some(m) if fresh_within_ttl(&state.storage, &index_key, m.modified, ttl).await => {
             read_json(&state.storage, &index_key).await
         }
         _ => None,
@@ -1595,7 +1652,7 @@ async fn filter_search_results(state: &AppState, body: String) -> Vec<u8> {
         if filters_metadata(state, id).await {
             hidden_versions(state, id, true).await
         } else {
-            HashSet::new()
+            Arc::default()
         }
     }))
     .await;
@@ -1657,8 +1714,6 @@ fn strip_url_path(url: &str) -> String {
         url.to_string()
     }
 }
-
-use crate::cache_ttl::is_within_ttl;
 
 fn with_json(data: Vec<u8>) -> Response {
     (
@@ -2798,10 +2853,20 @@ mod integration_tests {
         );
     }
 
+    /// A NuGet proxy whose upstream refuses connections: dates come from the cache only.
+    fn date_ctx(trust: bool) -> crate::test_helpers::TestContext {
+        create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.nuget.metadata_proxy_timeout = 1;
+            cfg.server.trust_upstream_dates = trust;
+        })
+    }
+
     #[tokio::test]
-    async fn test_extract_nuget_publish_date_found() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+    async fn test_nuget_publish_date_found() {
+        let ctx = date_ctx(true);
+        let storage = &ctx.state.storage;
         let meta = serde_json::json!({
             "items": [{
                 "items": [{
@@ -2820,15 +2885,14 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let result =
-            super::extract_nuget_publish_date(&storage, "newtonsoft.json", "6.0.0", true).await;
+        let result = super::nuget_publish_date(&ctx.state, "newtonsoft.json", "6.0.0").await;
         assert!(result.is_some());
     }
 
     #[tokio::test]
-    async fn test_extract_nuget_publish_date_version_not_found() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+    async fn test_nuget_publish_date_version_not_found() {
+        let ctx = date_ctx(true);
+        let storage = &ctx.state.storage;
         let meta = serde_json::json!({
             "items": [{"items": [{"catalogEntry": {"version": "1.0.0", "published": "2023-01-01T00:00:00Z"}}]}]
         });
@@ -2840,26 +2904,24 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let result = super::extract_nuget_publish_date(&storage, "test", "9.9.9", true).await;
+        let result = super::nuget_publish_date(&ctx.state, "test", "9.9.9").await;
         assert!(result.is_none());
     }
 
     #[tokio::test]
-    async fn test_extract_nuget_publish_date_no_metadata() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+    async fn test_nuget_publish_date_no_metadata() {
+        let ctx = date_ctx(true);
 
-        let result =
-            super::extract_nuget_publish_date(&storage, "nonexistent", "1.0.0", true).await;
+        let result = super::nuget_publish_date(&ctx.state, "nonexistent", "1.0.0").await;
         assert!(result.is_none());
     }
 
     /// Regression test for #535: pages without inline items must not abort
     /// date extraction for subsequent pages.
     #[tokio::test]
-    async fn test_extract_nuget_publish_date_sparse_pages() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+    async fn test_nuget_publish_date_sparse_pages() {
+        let ctx = date_ctx(true);
+        let storage = &ctx.state.storage;
         // Page 0: non-inline (only @id, no items array).
         // Page 1: inline with the target version.
         let meta = serde_json::json!({
@@ -2884,7 +2946,7 @@ mod integration_tests {
             .unwrap();
 
         // Before #535 fix: this returned None because page 0 had no "items".
-        let result = super::extract_nuget_publish_date(&storage, "sparse-pkg", "2.0.0", true).await;
+        let result = super::nuget_publish_date(&ctx.state, "sparse-pkg", "2.0.0").await;
         assert!(result.is_some(), "date must be found despite sparse page 0");
     }
 
@@ -3106,9 +3168,9 @@ mod integration_tests {
     /// C49: with `trust_upstream_dates = false` the cache mtime is no publish date:
     /// a freshly cached registration index yields no date at all.
     #[tokio::test]
-    async fn test_extract_nuget_publish_date_untrusted_ignores_mtime() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+    async fn test_nuget_publish_date_untrusted_ignores_mtime() {
+        let untrusted = date_ctx(false);
+        let storage = &untrusted.state.storage;
         let meta =
             serde_json::json!({ "items": [{ "items": [leaf("1.0.0", "2020-01-01T00:00:00Z")] }] });
         storage
@@ -3119,14 +3181,18 @@ mod integration_tests {
             .await
             .unwrap();
         assert_eq!(
-            super::extract_nuget_publish_date(&storage, "pkg", "1.0.0", false).await,
+            super::nuget_publish_date(&untrusted.state, "pkg", "1.0.0").await,
             None
         );
-        assert!(
-            super::extract_nuget_publish_date(&storage, "pkg", "1.0.0", true)
-                .await
-                .is_some()
+        let trusted = crate::test_helpers::create_test_context_with_storage_and_config(
+            storage.clone(),
+            |cfg| {
+                cfg.server.trust_upstream_dates = true;
+            },
         );
+        assert!(super::nuget_publish_date(&trusted.state, "pkg", "1.0.0")
+            .await
+            .is_some());
     }
 
     /// C49: untrusted dates + quarantine — an old cached registration index no longer
@@ -3216,6 +3282,258 @@ mod integration_tests {
     async fn flat_versions(ctx: &crate::test_helpers::TestContext, id: &str) -> serde_json::Value {
         let uri = format!("/nuget/v3/flatcontainer/{id}/index.json");
         json_body(send(&ctx.app, Method::GET, &uri, "").await).await["versions"].clone()
+    }
+
+    /// Storage `get`s of one warm `.nupkg` download (its second request).
+    async fn nupkg_gets(
+        ctx: &crate::test_helpers::TestContext,
+        ops: &crate::test_helpers::OpCounts,
+        uri: &str,
+    ) -> usize {
+        let _ = send(&ctx.app, Method::GET, uri, "").await;
+        ops.reset();
+        assert_eq!(
+            send(&ctx.app, Method::GET, uri, "").await.status(),
+            StatusCode::OK
+        );
+        ops.snapshot().get("get").copied().unwrap_or(0)
+    }
+
+    /// R2-43: dating a `.nupkg` (trusted upstream dates) reads each registration
+    /// document once: the index, plus the page for a paged ID.
+    #[tokio::test]
+    async fn test_nupkg_download_reads_each_registration_doc_once() {
+        use crate::test_helpers::{
+            create_test_context_with_storage_and_config, op_counting_storage,
+        };
+        let (storage, ops) = op_counting_storage();
+        let old = iso_ago(30 * 86400);
+        let docs = [
+            (
+                "nuget/registration/dated.pkg/index.json",
+                serde_json::json!({ "items": [{ "items": [leaf("1.0.0", &old)] }] }),
+            ),
+            (
+                "nuget/registration/paged.pkg/index.json",
+                serde_json::json!({ "items": [{ "lower": "1.0.0", "upper": "2.0.0" }] }),
+            ),
+            (
+                "nuget/registration/paged.pkg/page/1.0.0/2.0.0.json",
+                serde_json::json!({ "items": [leaf("1.0.0", &old)] }),
+            ),
+        ];
+        for (key, doc) in docs {
+            storage.put(key, doc.to_string().as_bytes()).await.unwrap();
+        }
+        for id in ["dated.pkg", "paged.pkg"] {
+            let key = format!("nuget/flatcontainer/{id}/1.0.0/{id}.1.0.0.nupkg");
+            storage.put(&key, b"nupkg").await.unwrap();
+        }
+        let ctx = |trust: bool| {
+            create_test_context_with_storage_and_config(storage.clone(), move |cfg| {
+                cfg.nuget.enabled = true;
+                cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+                cfg.server.trust_upstream_dates = trust;
+            })
+        };
+        let (plain, trusted) = (ctx(false), ctx(true));
+        for (id, docs) in [("dated.pkg", 1), ("paged.pkg", 2)] {
+            let uri = nupkg_uri(id, "1.0.0");
+            let base = nupkg_gets(&plain, &ops, &uri).await;
+            let dated = nupkg_gets(&trusted, &ops, &uri).await;
+            assert_eq!(dated - base, docs, "{id}");
+        }
+    }
+
+    /// R2-12: concurrent cold `.nupkg` downloads of one ID prime its registration with
+    /// one upstream request (the proxy handlers' single-flight), and the prime stores
+    /// the upstream validators with the body before the download answers.
+    #[tokio::test]
+    async fn test_registration_prime_is_single_flight_with_validators() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (upstream, ctx) = cooldown_upstream(true, &[], false).await;
+        let index =
+            serde_json::json!({ "items": [{ "items": [leaf("1.0.0", &iso_ago(30 * 86400))] }] });
+        Mock::given(method("GET"))
+            .and(path("/v3/registration5-gz-semver2/prime.pkg/index.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"r1\"")
+                    .set_body_json(index)
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&upstream)
+            .await;
+        let uri = nupkg_uri("prime.pkg", "1.0.0");
+        let all =
+            futures::future::join_all((0..4).map(|_| send(&ctx.app, Method::GET, &uri, ""))).await;
+        assert!(all.iter().all(|r| r.status() == StatusCode::OK));
+        let fetches = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().contains("/registration"))
+            .count();
+        assert_eq!(fetches, 1);
+        let key = "nuget/registration/prime.pkg/index.json";
+        let v = crate::registry::read_validators(&ctx.state.storage, key).await;
+        assert_eq!(v.and_then(|v| v.etag).as_deref(), Some("\"r1\""));
+    }
+
+    /// R2-30/R2-37: the Q04 filter refreshes a stale registration index with a
+    /// conditional request (304: only the sidecar is stamped, the body is not
+    /// re-uploaded), under the handlers' single-flight.
+    #[tokio::test]
+    async fn test_q04_stale_registration_revalidates_once_conditionally() {
+        use crate::registry::{validators_key, write_validators, Validators};
+        use crate::test_helpers::{
+            create_test_context_with_storage_and_config, op_counting_storage,
+        };
+        use wiremock::matchers::{header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        let reg = "/v3/registration5-gz-semver2/small.pkg/index.json";
+        Mock::given(method("GET"))
+            .and(path(reg))
+            .and(header_exists("if-none-match"))
+            .respond_with(
+                ResponseTemplate::new(304).set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&upstream)
+            .await;
+        mount_json(
+            &upstream,
+            "/v3-flatcontainer/small.pkg/index.json",
+            serde_json::json!({ "versions": ["1.0.0", "1.1.0"] }),
+        )
+        .await;
+        let (storage, ops) = op_counting_storage();
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.nuget.metadata_ttl = 0; // always stale, no memo
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+        });
+        let key = "nuget/registration/small.pkg/index.json";
+        let index = serde_json::json!({ "items": [{ "items": [
+            leaf("1.0.0", &iso_ago(30 * 86400)), leaf("1.1.0", &iso_ago(600))
+        ] }] });
+        let st = &ctx.state.storage;
+        st.put(key, index.to_string().as_bytes()).await.unwrap();
+        let v = Validators {
+            etag: Some("\"r1\"".to_string()),
+            last_modified: None,
+        };
+        write_validators(st, key, &v).await;
+        ops.reset();
+
+        let (a, b) = tokio::join!(
+            flat_versions(&ctx, "small.pkg"),
+            flat_versions(&ctx, "small.pkg")
+        );
+        assert_eq!(a, serde_json::json!(["1.0.0"]));
+        assert_eq!(b, a);
+        let reg_requests: Vec<_> = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path() == reg)
+            .collect();
+        assert_eq!(reg_requests.len(), 1, "one flight for both requests");
+        assert!(reg_requests[0].headers.contains_key("if-none-match"));
+        let sidecar = st.get(&validators_key(key)).await.unwrap();
+        assert!(String::from_utf8_lossy(&sidecar).contains("validated_at"));
+        // Puts: the flat index (fetched once, coalesced) and the 304 stamp. Never the
+        // registration body.
+        assert_eq!(ops.snapshot().get("put"), Some(&2), "{:?}", ops.snapshot());
+    }
+
+    /// R2-30: within `metadata_ttl` a proxied ID's hidden versions are not recomputed
+    /// per request: the second flat `index.json` reads no registration document.
+    #[tokio::test]
+    async fn test_q04_hidden_versions_memoized_within_ttl() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.nuget.metadata_proxy_timeout = 1;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+        });
+        let st = &ctx.state.storage;
+        let reg = "nuget/registration/memo.pkg/index.json";
+        let index = serde_json::json!({ "items": [{ "items": [
+            leaf("1.0.0", &iso_ago(30 * 86400)), leaf("1.1.0", &iso_ago(600))
+        ] }] });
+        st.put(reg, index.to_string().as_bytes()).await.unwrap();
+        st.put(
+            "nuget/flatcontainer/memo.pkg/index.json",
+            br#"{"versions":["1.0.0","1.1.0"]}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            flat_versions(&ctx, "memo.pkg").await,
+            serde_json::json!(["1.0.0"])
+        );
+        st.delete(reg).await.unwrap();
+        assert_eq!(
+            flat_versions(&ctx, "memo.pkg").await,
+            serde_json::json!(["1.0.0"]),
+            "served from the memo, not recomputed from the (now missing) registration"
+        );
+    }
+
+    /// R2-46: a stale registration page is revalidated like the index: a conditional
+    /// request, and on 304 only the sidecar is written.
+    #[tokio::test]
+    async fn test_registration_page_revalidates_with_304() {
+        use crate::registry::{validators_key, write_validators, Validators};
+        use crate::test_helpers::{
+            create_test_context_with_storage_and_config, op_counting_storage,
+        };
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+        let (storage, ops) = op_counting_storage();
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.nuget.metadata_ttl = 0;
+        });
+        let key = "nuget/registration/pg.pkg/page/1.0.0/2.0.0.json";
+        let page =
+            serde_json::json!({ "count": 1, "items": [leaf("1.0.0", "2020-01-01T00:00:00Z")] });
+        let st = &ctx.state.storage;
+        st.put(key, page.to_string().as_bytes()).await.unwrap();
+        let v = Validators {
+            etag: Some("\"p1\"".to_string()),
+            last_modified: None,
+        };
+        write_validators(st, key, &v).await;
+        ops.reset();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/pg.pkg/page/1.0.0/2.0.0.json",
+            "",
+        )
+        .await;
+        assert_eq!(json_body(resp).await["count"], 1);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+        let sidecar = st.get(&validators_key(key)).await.unwrap();
+        assert!(String::from_utf8_lossy(&sidecar).contains("validated_at"));
+        assert_eq!(ops.snapshot().get("put"), Some(&1), "{:?}", ops.snapshot());
     }
 
     /// Q04: `dotnet restore` resolves ranges against the flat-container version list:
@@ -3895,7 +4213,8 @@ mod integration_tests {
 
     /// A Range request on a cached .nupkg reads the object once: the 206 is cut from
     /// the body the integrity and quarantine gates already loaded, not a second, ranged
-    /// GET of the same object.
+    /// GET of the same object. The one extra round-trip is the `stat` (a HEAD, no body)
+    /// that tells a small object from a large one (R2-13).
     #[tokio::test]
     async fn test_nuget_range_on_cache_hit_reads_storage_once() {
         use crate::test_helpers::{
@@ -3926,9 +4245,50 @@ mod integration_tests {
             send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=2-5")], "").await;
         assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(&body_bytes(resp).await[..], b"2345");
-        let ranged = ops.snapshot();
-        assert_eq!(ranged, full, "a ranged hit must cost what a full hit costs");
+        let mut ranged = ops.snapshot();
+        assert_eq!(ranged.remove("stat"), Some(1), "{ranged:?}");
+        assert_eq!(ranged, full, "a ranged hit must read what a full hit reads");
         assert_eq!(ranged.get("get_range"), None, "{ranged:?}");
+    }
+
+    /// R2-13: a Range request on a cached .nupkg above `stream_threshold_mb` is one
+    /// `stat` and one ranged read: the whole object is never opened for streaming first.
+    #[tokio::test]
+    async fn test_nuget_range_on_large_cache_hit_opens_one_ranged_read() {
+        use crate::test_helpers::{
+            create_test_context_with_storage_and_config, op_counting_storage, send_with_headers,
+        };
+
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.server.stream_threshold_mb = 1;
+        });
+        let nupkg: Vec<u8> = (0..(2 * 1024 * 1024 + 7))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let key = "nuget/flatcontainer/bigpkg/1.0.0/bigpkg.1.0.0.nupkg";
+        ctx.state.storage.put(key, &nupkg).await.unwrap();
+        let url = "/nuget/v3/flatcontainer/bigpkg/1.0.0/bigpkg.1.0.0.nupkg";
+        let _ = send(&ctx.app, Method::GET, url, "").await; // hosted index load
+        ops.reset();
+        let range = vec![("range", "bytes=1048576-1048585")];
+        let resp = send_with_headers(&ctx.app, Method::GET, url, range, "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body_bytes(resp).await[..], &nupkg[1048576..=1048585]);
+        let ranged = ops.snapshot();
+        assert_eq!(ranged.get("get_reader"), None, "{ranged:?}");
+        assert_eq!(ranged.get("get_range"), Some(&1), "{ranged:?}");
+        assert_eq!(ranged.get("stat"), Some(&1), "{ranged:?}");
+
+        // The full download still streams it, with its length.
+        let resp = send(&ctx.app, Method::GET, url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()["content-length"],
+            nupkg.len().to_string().as_str()
+        );
+        assert_eq!(body_bytes(resp).await.len(), nupkg.len());
     }
 
     /// Upstream failures on a cold .nupkg miss: only a 404 stays a 404; an outage is
