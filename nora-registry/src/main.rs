@@ -307,6 +307,9 @@ pub struct AppState {
     pub cancel_token: tokio_util::sync::CancellationToken,
     /// In-memory index of hosted NuGet packages (maestra fork).
     pub(crate) nuget_hosted: Arc<registry::NugetHostedIndex>,
+    /// Maestra fork: unix seconds of the maintenance loop's last tick (0 = not
+    /// started). `/health` fails once it is stale.
+    pub(crate) maintenance_heartbeat: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AppState {
@@ -2118,6 +2121,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         leak_finders,
         cancel_token: cancel_token.clone(),
         nuget_hosted: Default::default(),
+        maintenance_heartbeat: Default::default(),
     };
 
     // Initialize circuit breaker gauge to 0 (Closed) for every breaker key (#441)
@@ -2395,6 +2399,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         loop {
             interval.tick().await;
             tick_count += 1;
+            health::record_maintenance_tick(&metrics_state);
             if let Some(ref token_store) = metrics_state.tokens {
                 token_store.flush_last_used().await;
             }

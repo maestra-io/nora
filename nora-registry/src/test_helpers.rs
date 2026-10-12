@@ -401,6 +401,7 @@ fn build_context_with(
         leak_finders,
         cancel_token: tokio_util::sync::CancellationToken::new(),
         nuget_hosted: Default::default(),
+        maintenance_heartbeat: Default::default(),
     };
 
     // Build router identical to run_server() but without TcpListener / rate-limiting

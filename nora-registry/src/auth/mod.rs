@@ -2243,6 +2243,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             leak_finders: ctx.state.leak_finders.clone(),
             cancel_token: tokio_util::sync::CancellationToken::new(),
             nuget_hosted: Default::default(),
+            maintenance_heartbeat: Default::default(),
         };
 
         // Rebuild router with new state
