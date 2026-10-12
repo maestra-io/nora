@@ -41,13 +41,14 @@ class Limiter:
 
 def art_session():
     s = requests.Session()
-    s.headers["Authorization"] = "Bearer " + env("ART_TOKEN")
     # Read-only on Artifactory: refuse anything but GET/HEAD at the session level.
     orig = s.request
 
     def guarded(method, url, *a, **kw):
         if method.upper() not in ("GET", "HEAD"):
             raise RuntimeError(f"refusing {method} to Artifactory")
+        # ART_TOKEN is read on first use: a nuget.org-only run (--nuget-org-ids) needs none.
+        s.headers["Authorization"] = "Bearer " + env("ART_TOKEN")
         return orig(method, url, *a, **kw)
 
     s.request = guarded
