@@ -1049,6 +1049,7 @@ async fn tokens_create(
             (StatusCode::OK, Html(html))
         }
         Err(e) => {
+            tracing::error!(user = %user, error = %e, "UI token mint failed: cannot store the token record");
             let html = format!(
                 r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Error: {}</div>"##,
                 components::html_escape(&e.to_string())

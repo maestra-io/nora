@@ -163,7 +163,11 @@ async fn create_token(
             })
             .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            // e.g. a read-only token_storage: the client only sees the 500.
+            tracing::error!(user = %req.username, error = %e, "token mint failed: cannot store the token record");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 

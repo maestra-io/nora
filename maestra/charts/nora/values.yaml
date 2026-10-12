@@ -477,6 +477,8 @@ backup:
   prefix: ".nora-backup/"
   # -- Archives kept (older ones deleted after each upload).
   keep: 14
+  # -- Job deadline (seconds), including waiting for the data volume to mount.
+  activeDeadlineSeconds: 900
   # -- Uploader image: anything with `aws` and /bin/sh; the tar runs in the
   # nora image. 2.22.x: before aws-cli 2.23 made checksum trailers the
   # default, which some S3-compatible stores reject (the script also sets
