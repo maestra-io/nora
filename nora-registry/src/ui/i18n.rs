@@ -46,6 +46,7 @@ pub struct Translations {
     // Navigation
     pub nav_dashboard: &'static str,
     pub nav_registries: &'static str,
+    pub nav_setup: &'static str,
 
     // Dashboard
     pub dashboard_title: &'static str,
@@ -164,6 +165,7 @@ pub static TRANSLATIONS_EN: Translations = Translations {
     // Navigation
     nav_dashboard: "Dashboard",
     nav_registries: "Registries",
+    nav_setup: "Developer setup",
 
     // Dashboard
     dashboard_title: "Dashboard",
@@ -274,6 +276,7 @@ pub static TRANSLATIONS_RU: Translations = Translations {
     // Navigation
     nav_dashboard: "Панель",
     nav_registries: "Реестры",
+    nav_setup: "Настройка окружения",
 
     // Dashboard
     dashboard_title: "Панель управления",
@@ -384,6 +387,7 @@ pub static TRANSLATIONS_ZH: Translations = Translations {
     // Navigation
     nav_dashboard: "仪表盘",
     nav_registries: "注册表",
+    nav_setup: "开发者设置",
 
     // Dashboard
     dashboard_title: "仪表盘",
