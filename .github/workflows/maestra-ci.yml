@@ -22,7 +22,7 @@ concurrency:
 jobs:
   test:
     name: cargo test
-    runs-on: runs-on=${{ github.run_id }}/pool=build
+    runs-on: runs-on=${{ github.run_id }}-test/pool=build
     steps:
       - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 
@@ -57,7 +57,7 @@ jobs:
   # Vendored Helm chart (maestra/charts/nora, see its MAESTRA-CHART.md).
   chart:
     name: helm chart
-    runs-on: runs-on=${{ github.run_id }}/pool=build
+    runs-on: runs-on=${{ github.run_id }}-chart/pool=build
     steps:
       - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 
@@ -96,7 +96,7 @@ jobs:
 
   advisories:
     name: cargo deny advisories
-    runs-on: runs-on=${{ github.run_id }}/pool=build
+    runs-on: runs-on=${{ github.run_id }}-advisories/pool=build
     steps:
       - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 
