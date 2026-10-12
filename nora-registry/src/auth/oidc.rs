@@ -32,11 +32,6 @@ const JWKS_KID_MISS_REFETCH: Duration = Duration::from_secs(60);
 /// Prefix of the rejection for a `kid` absent from the JWKS even after the refetch.
 const KEY_MISS: &str = "No matching key";
 
-/// The rejection is an unknown `kid`, not a bad signature, audience or expiry.
-pub fn is_key_miss(reason: &str) -> bool {
-    reason.starts_with(KEY_MISS)
-}
-
 /// Result of a successful OIDC authentication.
 #[derive(Debug, Clone)]
 pub struct OidcIdentity {
