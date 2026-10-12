@@ -24,6 +24,7 @@ set -euo pipefail
 #  [x] Service index @type versions spec-correct
 #  [x] All service index @id URLs point to Nora
 #  [x] Flatcontainer version normalization (lowercase)
+#  [x] dotnet package search resolves the search service
 #
 # ── What this polygon does NOT prove ─────────────────────────────────────
 #  [ ] dotnet SDK telemetry/DNS: <clear/> removes NuGet sources but does NOT
@@ -187,7 +188,7 @@ cat > "$SCRIPT_DIR/NuGet.Config" <<NUGETCFG
 <configuration>
   <packageSources>
     <clear />
-    <add key="nora" value="$BASE/nuget/v3/index.json" />
+    <add key="nora" value="$BASE/nuget/v3/index.json" allowInsecureConnections="true" />
   </packageSources>
 </configuration>
 NUGETCFG
@@ -546,6 +547,16 @@ if [ "$SEARCH_NO_SVL" = "200" ] && [ "$SEARCH_SVL" = "200" ]; then
     pass "search with/without semVerLevel both return 200"
 else
     fail "search semVerLevel: without=$SEARCH_NO_SVL, with=$SEARCH_SVL (both expected 200)"
+fi
+
+# 4.11 dotnet package search finds the search service (SearchQueryService/3.0.0-beta);
+# it exits 0 even on "The source does not have a Search service!", so match the result.
+if SEARCH_OUT=$("$DOTNET" package search Newtonsoft.Json --exact-match \
+    --configfile "$SCRIPT_DIR/NuGet.Config" --source nora 2>&1) \
+    && echo "$SEARCH_OUT" | grep -qi 'newtonsoft.json'; then
+    pass "dotnet package search returns results"
+else
+    fail "dotnet package search: $SEARCH_OUT"
 fi
 
 echo ""

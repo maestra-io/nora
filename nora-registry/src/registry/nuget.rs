@@ -2007,43 +2007,44 @@ async fn local_autocomplete_results(
 /// `base_url` is the full NORA base URL including scheme (e.g. `https://artifact.company.local`).
 fn generate_service_index(base_url: &str) -> String {
     let nora_nuget = format!("{}/nuget", base_url.trim_end_matches('/'));
+    let query = format!("{}/v3/query", nora_nuget);
+    let autocomplete = format!("{}/v3/autocomplete", nora_nuget);
 
-    let index = serde_json::json!({
-        "version": "3.0.0",
-        "resources": [
-            {
-                "@id": format!("{}/v3/flatcontainer/", nora_nuget),
-                "@type": "PackageBaseAddress/3.0.0",
-                "comment": "Base URL of NuGet package storage"
-            },
-            {
-                "@id": format!("{}/v3/registration/", nora_nuget),
-                "@type": "RegistrationsBaseUrl/3.6.0",
-                "comment": "Base URL of NuGet package registration info"
-            },
-            {
-                "@id": format!("{}/v3/query", nora_nuget),
-                "@type": "SearchQueryService",
-                "comment": "NuGet search endpoint"
-            },
-            {
-                "@id": format!("{}/v3/autocomplete", nora_nuget),
-                "@type": "SearchAutocompleteService",
-                "comment": "NuGet autocomplete endpoint"
-            },
-            {
-                "@id": format!("{}/v3/query", nora_nuget),
-                "@type": "SearchQueryService/3.5.0",
-                "comment": "NuGet search endpoint (hosted packages first)"
-            },
-            {
-                "@id": format!("{}/v3/package", nora_nuget),
-                "@type": "PackagePublish/2.0.0",
-                "comment": "Push, unlist (DELETE) and relist (POST) hosted packages"
-            }
-        ]
-    });
+    let mut resources = vec![
+        serde_json::json!({
+            "@id": format!("{}/v3/flatcontainer/", nora_nuget),
+            "@type": "PackageBaseAddress/3.0.0",
+            "comment": "Base URL of NuGet package storage"
+        }),
+        serde_json::json!({
+            "@id": format!("{}/v3/registration/", nora_nuget),
+            "@type": "RegistrationsBaseUrl/3.6.0",
+            "comment": "Base URL of NuGet package registration info"
+        }),
+        serde_json::json!({
+            "@id": format!("{}/v3/package", nora_nuget),
+            "@type": "PackagePublish/2.0.0",
+            "comment": "Push, unlist (DELETE) and relist (POST) hosted packages"
+        }),
+    ];
+    // Same @type set as api.nuget.org. The NuGet client resolves search only via
+    // `/Versioned`, `/3.4.0` or `/3.0.0-beta` (autocomplete: `/Versioned`, `/3.0.0-beta`):
+    // the bare and `/3.5.0` types alone make `dotnet package search` report
+    // "The source does not have a Search service!".
+    for version in ["", "/3.0.0-beta", "/3.0.0-rc", "/3.5.0"] {
+        resources.push(serde_json::json!({
+            "@id": query,
+            "@type": format!("SearchQueryService{version}"),
+            "comment": "NuGet search endpoint (hosted packages first)"
+        }));
+        resources.push(serde_json::json!({
+            "@id": autocomplete,
+            "@type": format!("SearchAutocompleteService{version}"),
+            "comment": "NuGet autocomplete endpoint"
+        }));
+    }
 
+    let index = serde_json::json!({ "version": "3.0.0", "resources": resources });
     serde_json::to_string_pretty(&index).expect("static JSON serialization cannot fail")
 }
 
@@ -2238,7 +2239,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["version"], "3.0.0");
         let resources = json["resources"].as_array().unwrap();
-        assert_eq!(resources.len(), 6);
+        assert_eq!(resources.len(), 11);
         assert!(result.contains("http://nora:4000/nuget/v3/flatcontainer/"));
         assert!(result.contains("http://nora:4000/nuget/v3/registration/"));
         assert!(result.contains("http://nora:4000/nuget/v3/query"));
@@ -2732,6 +2733,37 @@ mod integration_tests {
                 .filter(|r| r.url.path().ends_with(upstream_suffix))
                 .count();
             assert_eq!(fetches, 1, "{uri}");
+        }
+    }
+
+    /// `dotnet package search` resolves search only via `SearchQueryService/3.0.0-beta`
+    /// (or `/3.4.0`, `/Versioned`); without it: "The source does not have a Search service!".
+    #[tokio::test]
+    async fn test_service_index_advertises_search_types_from_public_url() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.server.public_url = Some("https://packages.example.com/".to_string());
+        });
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/index.json", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let ids: std::collections::HashMap<&str, &str> = json["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["@type"].as_str().unwrap(), r["@id"].as_str().unwrap()))
+            .collect();
+        for v in ["", "/3.0.0-beta", "/3.0.0-rc", "/3.5.0"] {
+            assert_eq!(
+                ids.get(format!("SearchQueryService{v}").as_str()),
+                Some(&"https://packages.example.com/nuget/v3/query"),
+                "SearchQueryService{v}"
+            );
+            assert_eq!(
+                ids.get(format!("SearchAutocompleteService{v}").as_str()),
+                Some(&"https://packages.example.com/nuget/v3/autocomplete"),
+                "SearchAutocompleteService{v}"
+            );
         }
     }
 
