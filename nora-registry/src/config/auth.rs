@@ -86,7 +86,13 @@ impl TrustedProxies {
 
     /// Check if an IP address is within the trusted proxy list.
     pub fn contains(&self, ip: std::net::IpAddr) -> bool {
-        let ip = canonical_ip(ip);
+        // A mapped peer matches as IPv4, and still as IPv6 for a v6 entry wider
+        // than /96 that covers ::ffff:0:0/96 (e.g. `::/0`).
+        let canonical = canonical_ip(ip);
+        self.contains_exact(canonical) || (canonical != ip && self.contains_exact(ip))
+    }
+
+    fn contains_exact(&self, ip: std::net::IpAddr) -> bool {
         self.entries.iter().any(|(network, prefix)| {
             match (network, ip) {
                 (std::net::IpAddr::V4(net), std::net::IpAddr::V4(addr)) => {

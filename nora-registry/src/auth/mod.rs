@@ -1120,6 +1120,12 @@ mod tests {
         assert!(mapped_cfg.contains("10.62.9.9".parse().unwrap()));
         assert!(mapped_cfg.contains("127.0.0.1".parse().unwrap()));
         assert!(!mapped_cfg.contains("10.63.0.1".parse().unwrap()));
+        // A v6 CIDR wider than /96 keeps covering mapped peers (CodeRabbit #44).
+        let wide = TrustedProxies::parse("::ffff:0:0/95");
+        assert!(wide.contains("::ffff:10.62.2.90".parse().unwrap()));
+        let all_v6 = TrustedProxies::parse("::/0");
+        assert!(all_v6.contains("::ffff:10.62.2.90".parse().unwrap()));
+        assert!(!all_v6.contains("10.62.2.90".parse().unwrap()));
     }
 
     #[test]
