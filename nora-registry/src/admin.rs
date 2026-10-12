@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::audit::AuditEntry;
 use crate::auth::AuthenticatedUser;
 use crate::registry_type::RegistryType;
-use crate::tokens::Role;
+use crate::tokens::{Role, MAX_TOKEN_TTL_DAYS};
 use crate::AppState;
 
 /// Minimum seconds between two accepted reindex calls. A reindex flips dirty
@@ -220,6 +220,8 @@ async fn admin_create_token(
     if req.ttl_days == 0 {
         return (StatusCode::BAD_REQUEST, "ttl_days must be > 0").into_response();
     }
+    // The store clamps too; clamp here so the response and audit report the real TTL.
+    let ttl_days = req.ttl_days.min(MAX_TOKEN_TTL_DAYS);
 
     let Some(token_store) = &state.tokens else {
         return (
@@ -230,10 +232,10 @@ async fn admin_create_token(
     };
 
     let role_label = role.to_string();
-    match token_store.create_token(&req.username, req.ttl_days, req.description, role) {
+    match token_store.create_token(&req.username, ttl_days, req.description, role) {
         Ok(token) => {
             // Audit the mint with actor + target + role + ttl (never the token itself).
-            let detail = format!("role={} ttl_days={}", role_label, req.ttl_days);
+            let detail = format!("role={} ttl_days={}", role_label, ttl_days);
             state.audit.log(AuditEntry::new(
                 "admin_token_mint",
                 &caller.0,
@@ -243,7 +245,7 @@ async fn admin_create_token(
             ));
             Json(AdminCreateTokenResponse {
                 token,
-                expires_in_days: req.ttl_days,
+                expires_in_days: ttl_days,
             })
             .into_response()
         }
@@ -522,5 +524,29 @@ mod tests {
             .await,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    /// An over-long ttl_days is clamped before the mint, and the response echoes
+    /// the clamped value, not the request (R2-04).
+    #[tokio::test]
+    async fn admin_mint_echoes_clamped_ttl() {
+        use crate::test_helpers::body_bytes;
+        let ctx = create_test_context_with_auth(&[]);
+        let tok = mint(&ctx, Role::Admin);
+        let auth = format!("Bearer {tok}");
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            TOK_URI,
+            vec![
+                ("Authorization", &auth),
+                ("Content-Type", "application/json"),
+            ],
+            r#"{"username":"svc","role":"read","ttl_days":10000}"#.to_string(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json["expires_in_days"], crate::tokens::MAX_TOKEN_TTL_DAYS);
     }
 }

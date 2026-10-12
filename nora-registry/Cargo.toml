@@ -58,6 +58,8 @@ argon2 = { version = "0.5", features = ["std", "rand"] }
 tower-http = { version = "0.6", features = ["set-header", "catch-panic"] }
 # The serve loop (header-read timeout, connection limit); already in the tree via axum.
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
+# `rt::Timer` for the per-connection head timer of the serve loop; already in the tree.
+hyper = { version = "1", default-features = false }
 tower = { version = "0.5", features = ["util"] }
 percent-encoding = "2"
 subtle = "2"

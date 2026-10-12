@@ -133,6 +133,10 @@ config:
     # spool), proxy_max_artifact_mb (2048).
     # body_limit_mb: 256
     # shutdown_timeout: 15
+    # -- internal_port: detailed /health and /metrics move to this port, exposed
+    # as containerPort and Service port `internal` (scrape it; never route it).
+    # The probes stay on `http`, whose /health then reports the status only.
+    # internal_port: 9100
   registries:
     enable: "all"
   storage:

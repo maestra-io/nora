@@ -189,6 +189,22 @@ tests:
           path: spec.template.spec.containers[0].ports[0].containerPort
           value: 8080
 
+  # Maestra
+  - it: exposes the internal port and keeps the probes on http
+    template: templates/deployment.yaml
+    set:
+      config.server.internal_port: 9100
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: internal
+            containerPort: 9100
+            protocol: TCP
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.port
+          value: http
+
   - it: mounts custom htpasswd secret key
     template: templates/deployment.yaml
     set:

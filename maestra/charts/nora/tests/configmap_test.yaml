@@ -534,6 +534,15 @@ tests:
           path: data["config.toml"]
           pattern: 'public_url = "https://registry\.example\.com"\nbody_limit_mb = 256\nshutdown_timeout = 20\n'
 
+  # Maestra
+  - it: renders server.internal_port
+    set:
+      config.server.internal_port: 9100
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\ninternal_port = 9100\n'
+
   - it: refuses a table where the chart renders scalars
     set:
       config.circuit_breaker.overrides:

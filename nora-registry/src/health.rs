@@ -4,6 +4,7 @@
 use axum::{extract::State, http::StatusCode, response::Json, routing::get, Router};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use utoipa::ToSchema;
 
 use crate::circuit_breaker::UpstreamHealth;
@@ -30,17 +31,68 @@ pub struct StorageHealth {
     pub total_size_bytes: u64,
 }
 
+/// Seconds without a maintenance tick (every 30 s) after which `/health` answers
+/// 503. Readiness trusts the storage verdict only that loop refreshes, so a loop
+/// that panicked or hung leaves the pod NotReady forever; failing liveness lets
+/// the kubelet restart it (Maestra fork).
+const MAINTENANCE_STALE_SECS: u64 = 300;
+
+/// Called by the maintenance loop at the start of every tick.
+pub fn record_maintenance_tick(state: &AppState) {
+    state
+        .maintenance_heartbeat
+        .store(unix_now(), Ordering::Relaxed);
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The loop ticked once and not within `MAINTENANCE_STALE_SECS` since (a wall-clock
+/// step back reads as fresh).
+fn maintenance_stalled(state: &AppState) -> bool {
+    let beat = state.maintenance_heartbeat.load(Ordering::Relaxed);
+    beat != 0 && unix_now().saturating_sub(beat) > MAINTENANCE_STALE_SECS
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health_check))
         .route("/ready", get(readiness_check))
 }
 
+/// Probe and metrics routes of the main listener. With `server.internal_port` set
+/// the detailed `/health` and `/metrics` live on the internal listener only, and the
+/// public hostname gets the verdicts alone: status and code, nothing to fingerprint.
+pub fn public_routes(internal_port: Option<u16>) -> Router<AppState> {
+    match internal_port {
+        None => routes().merge(crate::metrics::routes()),
+        Some(_) => Router::new()
+            .route("/health", get(health_status_only))
+            .route("/ready", get(readiness_check)),
+    }
+}
+
+/// The internal listener's routes (`server.internal_port`).
+pub fn internal_routes() -> Router<AppState> {
+    routes().merge(crate::metrics::routes())
+}
+
+async fn health_status_only(state: State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let (code, Json(health)) = health_check(state).await;
+    (code, Json(serde_json::json!({ "status": health.status })))
+}
+
 async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<HealthStatus>) {
     let storage_reachable = check_storage_reachable(&state).await;
     let total_size = state.storage.total_size().await;
 
-    let status = if storage_reachable {
+    let stalled = maintenance_stalled(&state);
+    let status = if stalled {
+        "stalled"
+    } else if storage_reachable {
         "healthy"
     } else {
         "degraded"
@@ -69,12 +121,17 @@ async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<Health
         upstreams,
     };
 
-    // Always 200: /health is a liveness signal — the process is up and serving.
-    // Storage reachability is informational (`status: degraded`); gating liveness
-    // or the LB on it turns a storage blip into a restart loop / full 502 outage
-    // for every route, storage-backed or not (#869). Readiness (`/ready`) is the
-    // storage gate.
-    (StatusCode::OK, Json(health))
+    // 200 unless the maintenance loop is dead: /health is a liveness signal — the
+    // process is up and serving. Storage reachability is informational (`status:
+    // degraded`); gating liveness or the LB on it turns a storage blip into a
+    // restart loop / full 502 outage for every route, storage-backed or not (#869).
+    // Readiness (`/ready`) is the storage gate.
+    let code = if stalled {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (code, Json(health))
 }
 
 async fn readiness_check(State(state): State<AppState>) -> StatusCode {
@@ -212,6 +269,62 @@ mod tests {
         let mut perms = std::fs::metadata(dir).unwrap().permissions();
         perms.set_mode(0o700);
         std::fs::set_permissions(dir, perms).unwrap();
+    }
+
+    /// A maintenance loop that stopped ticking fails liveness, so the kubelet
+    /// restarts the pod instead of leaving it NotReady forever (R2-49).
+    #[tokio::test]
+    async fn test_health_503_when_maintenance_loop_stalls() {
+        use std::sync::atomic::Ordering;
+        let ctx = create_test_context();
+        let beat = &ctx.state.maintenance_heartbeat;
+        // Not started yet (tests, boot): healthy.
+        assert_eq!(
+            send(&ctx.app, Method::GET, "/health", "").await.status(),
+            StatusCode::OK
+        );
+        super::record_maintenance_tick(&ctx.state);
+        assert_eq!(
+            send(&ctx.app, Method::GET, "/health", "").await.status(),
+            StatusCode::OK
+        );
+        // Last tick longer ago than the stale window: the loop is dead.
+        beat.store(
+            super::unix_now() - super::MAINTENANCE_STALE_SECS - 30,
+            Ordering::Relaxed,
+        );
+        let resp = send(&ctx.app, Method::GET, "/health", "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json["status"], "stalled");
+    }
+
+    /// With an internal port the public listener's /health carries the status only
+    /// and /metrics is not served there; the internal routes keep both (R2-53).
+    #[tokio::test]
+    async fn test_internal_port_moves_details_off_the_public_routes() {
+        let ctx = create_test_context();
+        let public = super::public_routes(Some(9100)).with_state(ctx.state.clone());
+        let resp = send(&public, Method::GET, "/health", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json, serde_json::json!({ "status": "healthy" }));
+        let ready = send(&public, Method::GET, "/ready", "").await;
+        assert_eq!(ready.status(), StatusCode::OK);
+        let metrics = send(&public, Method::GET, "/metrics", "").await;
+        assert_eq!(metrics.status(), StatusCode::NOT_FOUND);
+
+        let internal = super::internal_routes().with_state(ctx.state.clone());
+        let resp = send(&internal, Method::GET, "/health", "").await;
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert!(json.get("version").is_some() && json.get("upstreams").is_some());
+        let metrics = send(&internal, Method::GET, "/metrics", "").await;
+        assert_eq!(metrics.status(), StatusCode::OK);
+
+        // Unset: everything on the main listener, as upstream.
+        let all = super::public_routes(None).with_state(ctx.state.clone());
+        let metrics = send(&all, Method::GET, "/metrics", "").await;
+        assert_eq!(metrics.status(), StatusCode::OK);
     }
 
     #[tokio::test]

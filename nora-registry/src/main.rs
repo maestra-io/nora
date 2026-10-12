@@ -73,6 +73,7 @@ use axum::{body::Bytes, extract::DefaultBodyLimit, http::HeaderValue, middleware
 use clap::{Parser, Subcommand};
 use log_redact::RedactUserinfo;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::signal;
@@ -307,6 +308,9 @@ pub struct AppState {
     pub cancel_token: tokio_util::sync::CancellationToken,
     /// In-memory index of hosted NuGet packages (maestra fork).
     pub(crate) nuget_hosted: Arc<registry::NugetHostedIndex>,
+    /// Maestra fork: unix seconds of the maintenance loop's last tick (0 = not
+    /// started). `/health` fails once it is stale.
+    pub(crate) maintenance_heartbeat: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AppState {
@@ -746,6 +750,7 @@ mod shutdown_drain_tests {
             drain,
             ConnLimits {
                 header_read_timeout: Some(Duration::from_secs(30)),
+                keep_alive_timeout: Some(Duration::from_secs(120)),
                 max_connections: 64,
             },
         ));
@@ -862,6 +867,7 @@ mod conn_limit_tests {
     async fn slow_header_client_is_disconnected() {
         let (addr, _stop) = start(ConnLimits {
             header_read_timeout: Some(Duration::from_millis(300)),
+            keep_alive_timeout: Some(Duration::from_secs(120)),
             max_connections: 16,
         })
         .await;
@@ -896,11 +902,69 @@ mod conn_limit_tests {
         );
     }
 
+    /// An idle keep-alive connection outlives the header-read timeout (traefik reuses
+    /// it for 90 s) and closes after `keep_alive_timeout`; a later request on it that
+    /// trickles its head is still cut at the header-read timeout (R2-52).
+    #[tokio::test]
+    async fn idle_keep_alive_is_not_cut_at_the_header_timeout() {
+        let (addr, _stop) = start(ConnLimits {
+            header_read_timeout: Some(Duration::from_millis(300)),
+            keep_alive_timeout: Some(Duration::from_millis(1500)),
+            max_connections: 16,
+        })
+        .await;
+        const REQ: &[u8] = b"GET /peer HTTP/1.1\r\nHost: x\r\n\r\n";
+        async fn exchange(c: &mut tokio::net::TcpStream) -> String {
+            c.write_all(REQ).await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = c.read(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        }
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert!(exchange(&mut c).await.starts_with("HTTP/1.1 200"));
+        tokio::time::sleep(Duration::from_millis(900)).await; // 3x the header timeout
+        let resp = exchange(&mut c).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "idle connection reused: {resp:?}"
+        );
+
+        // Idle past keep_alive_timeout: the server closes it.
+        let idle = Instant::now();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut rest))
+            .await
+            .expect("closed after the keep-alive timeout")
+            .unwrap();
+        assert!(
+            idle.elapsed() >= Duration::from_millis(1200),
+            "{:?}",
+            idle.elapsed()
+        );
+
+        // A later head that starts but never ends gets only the header timeout.
+        let mut slow = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert!(exchange(&mut slow).await.starts_with("HTTP/1.1 200"));
+        slow.write_all(b"GET /peer HTTP/1.1\r\n").await.unwrap();
+        let started = Instant::now();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), slow.read_to_end(&mut rest))
+            .await
+            .expect("a stalled head is closed")
+            .ok();
+        assert!(
+            started.elapsed() < Duration::from_millis(1200),
+            "cut near the 300 ms header timeout, not the keep-alive one: {:?}",
+            started.elapsed()
+        );
+    }
+
     /// Past `max_connections` new clients wait unserved until a connection closes.
     #[tokio::test]
     async fn connections_past_the_limit_wait_for_a_free_slot() {
         let (addr, _stop) = start(ConnLimits {
             header_read_timeout: Some(Duration::from_secs(30)),
+            keep_alive_timeout: Some(Duration::from_secs(120)),
             max_connections: 1,
         })
         .await;
@@ -1994,8 +2058,7 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     // Routes WITHOUT rate limiting (health, metrics, UI)
     let public_routes = Router::new()
-        .merge(health::routes())
-        .merge(metrics::routes())
+        .merge(health::public_routes(config.server.internal_port))
         .merge(ui::routes())
         .merge(openapi::routes());
 
@@ -2118,6 +2181,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         leak_finders,
         cancel_token: cancel_token.clone(),
         nuget_hosted: Default::default(),
+        maintenance_heartbeat: Default::default(),
     };
 
     // Initialize circuit breaker gauge to 0 (Closed) for every breaker key (#441)
@@ -2395,6 +2459,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         loop {
             interval.tick().await;
             tick_count += 1;
+            health::record_maintenance_tick(&metrics_state);
             if let Some(ref token_store) = metrics_state.tokens {
                 token_store.flush_last_used().await;
             }
@@ -2470,9 +2535,25 @@ async fn run_server(mut config: Config, storage: Storage) {
         });
     }
 
+    let limits = ConnLimits::from_config(&state.config.server);
+    // Maestra: detailed /health and /metrics on an internal port, off the public hostname.
+    if let Some(port) = state.config.server.internal_port {
+        let internal_listener = bind_listener(&state.config.server.host, port)
+            .await
+            .expect("Failed to bind server.internal_port");
+        info!(port, "Internal listener: /health, /ready, /metrics");
+        let internal = health::internal_routes().with_state(state.clone());
+        tokio::spawn(serve_with_drain(
+            internal_listener,
+            internal,
+            cancel_token.clone().cancelled_owned(),
+            std::time::Duration::from_secs(1),
+            limits,
+        ));
+    }
+
     // Graceful shutdown on SIGTERM/SIGINT, draining for at most `shutdown_timeout` (#1016)
     let drain = std::time::Duration::from_secs(state.config.server.shutdown_timeout);
-    let limits = ConnLimits::from_config(&state.config.server);
     match serve_with_drain(listener, app, shutdown_signal(), drain, limits).await {
         ServeEnd::Drained => {}
         ServeEnd::DeadlinePassed => warn!(
@@ -2525,15 +2606,18 @@ enum ServeEnd {
 struct ConnLimits {
     /// Time a client gets to send request headers; `None` disables it.
     header_read_timeout: Option<std::time::Duration>,
+    /// Time an idle keep-alive connection waits for its next request; `None` = forever.
+    keep_alive_timeout: Option<std::time::Duration>,
     /// Connections served at once.
     max_connections: usize,
 }
 
 impl ConnLimits {
     fn from_config(server: &config::ServerConfig) -> Self {
+        let secs = |s: u64| (s > 0).then(|| std::time::Duration::from_secs(s));
         Self {
-            header_read_timeout: (server.header_read_timeout > 0)
-                .then(|| std::time::Duration::from_secs(server.header_read_timeout)),
+            header_read_timeout: secs(server.header_read_timeout),
+            keep_alive_timeout: secs(server.keep_alive_timeout),
             max_connections: match server.max_connections {
                 0 => tokio::sync::Semaphore::MAX_PERMITS,
                 n => n,
@@ -2542,12 +2626,154 @@ impl ConnLimits {
     }
 }
 
+/// HTTP/1 head timer of one connection, given to hyper as its `Timer`.
+///
+/// hyper has one timer per connection, the header-read timeout, and arms it whenever
+/// it waits for a request head, also on an idle keep-alive connection: a 30 s header
+/// timeout closed every idle backend connection after 30 s while traefik reuses them
+/// for 90 s, and a request sent on a connection being closed got a 502. Here a wait
+/// for a later head that has no byte yet gets `keep_alive_timeout`; the first head of
+/// a connection, and a later one from its first byte on, get `header_read_timeout`.
+#[derive(Clone)]
+struct HeadTimer {
+    limits: ConnLimits,
+    state: Arc<HeadState>,
+}
+
+#[derive(Default)]
+struct HeadState {
+    /// A byte arrived since hyper started waiting for the current head.
+    got_bytes: std::sync::atomic::AtomicBool,
+    /// hyper waited for a head before: later waits are keep-alive waits.
+    armed_before: std::sync::atomic::AtomicBool,
+}
+
+/// Deadline `timeout` from now; `None` = never.
+fn head_deadline(timeout: Option<std::time::Duration>) -> tokio::time::Instant {
+    const NEVER: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
+    tokio::time::Instant::now() + timeout.unwrap_or(NEVER)
+}
+
+impl hyper::rt::Timer for HeadTimer {
+    fn sleep(&self, duration: std::time::Duration) -> Pin<Box<dyn hyper::rt::Sleep>> {
+        self.sleep_until(std::time::Instant::now() + duration)
+    }
+
+    /// hyper starts waiting for a request head (its own deadline is ignored).
+    fn sleep_until(&self, _deadline: std::time::Instant) -> Pin<Box<dyn hyper::rt::Sleep>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let idle = self.state.armed_before.swap(true, Relaxed);
+        self.state.got_bytes.store(false, Relaxed);
+        let timeout = match idle {
+            true => self.limits.keep_alive_timeout,
+            false => self.limits.header_read_timeout,
+        };
+        Box::pin(HeadSleep {
+            state: Arc::clone(&self.state),
+            header_read_timeout: self.limits.header_read_timeout,
+            idle,
+            sleep: Box::pin(tokio::time::sleep_until(head_deadline(timeout))),
+        })
+    }
+}
+
+struct HeadSleep {
+    state: Arc<HeadState>,
+    header_read_timeout: Option<std::time::Duration>,
+    /// Still a keep-alive wait: no byte of the head yet.
+    idle: bool,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl std::future::Future for HeadSleep {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        let this = self.get_mut();
+        // hyper polls this right after a read left the head incomplete.
+        if this.idle
+            && this
+                .state
+                .got_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            this.idle = false;
+            let deadline = head_deadline(this.header_read_timeout);
+            this.sleep.as_mut().reset(deadline);
+        }
+        this.sleep.as_mut().poll(cx)
+    }
+}
+
+impl hyper::rt::Sleep for HeadSleep {}
+
+/// A connection's socket that tells its [`HeadTimer`] when bytes arrive.
+struct HeadIo {
+    io: tokio::net::TcpStream,
+    state: Arc<HeadState>,
+}
+
+impl tokio::io::AsyncRead for HeadIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut this.io).poll_read(cx, buf);
+        if buf.filled().len() > before {
+            this.state
+                .got_bytes
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        polled
+    }
+}
+
+impl tokio::io::AsyncWrite for HeadIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+}
+
 /// Serve `app` until `shutdown` resolves, then give in-flight requests `drain` to finish.
 ///
 /// The accept loop is hyper-util's, not `axum::serve`: axum sets no hyper timer, so
 /// hyper's header-read timeout was silently off and a client that never finished its
 /// headers held a task and a socket forever. Here HTTP/1 header reads are bounded by
-/// `limits.header_read_timeout`, HTTP/2 connections are pinged and dropped when the
+/// `limits.header_read_timeout` and idle keep-alive waits by `limits.keep_alive_timeout`
+/// ([`HeadTimer`]), HTTP/2 connections are pinged and dropped when the
 /// peer is gone, and at most `limits.max_connections` are served at once: past it the
 /// loop stops accepting and new clients wait in the listen backlog. Request bodies
 /// and responses are not time-bounded, so slow Docker pushes and long downloads work.
@@ -2570,10 +2796,13 @@ where
     use hyper_util::server::conn::auto::Builder;
 
     let mut builder = Builder::new(TokioExecutor::new());
-    builder
-        .http1()
-        .timer(TokioTimer::new())
-        .header_read_timeout(limits.header_read_timeout);
+    // Arms hyper's head timer; the per-connection HeadTimer picks the actual timeout.
+    let head_timeout = limits
+        .header_read_timeout
+        .or(limits.keep_alive_timeout)
+        .is_some()
+        .then_some(std::time::Duration::from_secs(1));
+    builder.http1().header_read_timeout(head_timeout);
     builder
         .http2()
         .timer(TokioTimer::new())
@@ -2617,9 +2846,15 @@ where
                     .insert(axum::extract::ConnectInfo(remote));
                 req
             });
+        let state = Arc::new(HeadState::default());
+        let mut builder = builder.clone();
+        builder.http1().timer(HeadTimer {
+            limits,
+            state: Arc::clone(&state),
+        });
         let conn = builder
             .serve_connection_with_upgrades(
-                TokioIo::new(io),
+                TokioIo::new(HeadIo { io, state }),
                 hyper_util::service::TowerToHyperService::new(service),
             )
             .into_owned();

@@ -2286,6 +2286,7 @@ dependencies = [
  "governor",
  "hex",
  "http-body-util",
+ "hyper",
  "hyper-util",
  "indicatif",
  "insta",

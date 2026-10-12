@@ -56,13 +56,20 @@ pub fn audit_actor(user: &Option<axum::Extension<AuthenticatedUser>>) -> &str {
     }
 }
 
-/// Tracks failed authentication attempts per IP for brute-force protection.
+/// Tracks failed password attempts per client IP and username for brute-force
+/// protection.
 ///
-/// After `max_failures` consecutive failures, the IP is locked out with
-/// exponential backoff: 2^(failures - max_failures) seconds, capped at 15 minutes.
+/// After `max_failures` consecutive failures, that username from that IP is locked
+/// out with exponential backoff: 2^(failures - max_failures) seconds, capped at 15
+/// minutes. Keyed per username so one stale password behind a shared NAT or SNAT-ed
+/// runner pool never locks out the other users behind it. Only guessable
+/// credentials (htpasswd passwords) are tracked: an `nra_` token or a JWT cannot be
+/// brute-forced, so a Bearer credential is never refused by the lockout.
 pub struct AuthFailureTracker {
-    /// IP -> (consecutive failures, last failure time)
-    entries: parking_lot::Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    /// (IP, username hash) -> (consecutive failures, last failure time). The hash
+    /// keeps an entry fixed-size whatever username a client sends.
+    entries: parking_lot::Mutex<HashMap<(IpAddr, u64), (u32, Instant)>>,
+    user_hasher: std::collections::hash_map::RandomState,
     /// Number of failures before lockout kicks in (default: 5)
     max_failures: u32,
     /// Maximum lockout duration in seconds (default: 900 = 15 minutes)
@@ -73,15 +80,22 @@ impl AuthFailureTracker {
     pub fn new(max_failures: u32, max_lockout_secs: u64) -> Self {
         Self {
             entries: parking_lot::Mutex::new(HashMap::new()),
+            user_hasher: Default::default(),
             max_failures,
             max_lockout_secs,
         }
     }
 
-    /// Check if IP is currently locked out. Returns remaining lockout seconds if blocked.
-    pub fn check_blocked(&self, ip: &IpAddr) -> Option<u64> {
+    fn key(&self, ip: IpAddr, user: &str) -> (IpAddr, u64) {
+        use std::hash::BuildHasher;
+        (ip, self.user_hasher.hash_one(user))
+    }
+
+    /// Check if `user` from `ip` is currently locked out. Returns remaining lockout
+    /// seconds if blocked.
+    pub fn check_blocked(&self, ip: &IpAddr, user: &str) -> Option<u64> {
         let entries = self.entries.lock();
-        let (failures, last_failure) = entries.get(ip)?;
+        let (failures, last_failure) = entries.get(&self.key(*ip, user))?;
         if *failures < self.max_failures {
             return None;
         }
@@ -95,18 +109,20 @@ impl AuthFailureTracker {
         }
     }
 
-    /// Record a failed auth attempt for an IP.
-    pub fn record_failure(&self, ip: IpAddr) {
+    /// Record a failed auth attempt of `user` from `ip`.
+    pub fn record_failure(&self, ip: IpAddr, user: &str) {
         let mut entries = self.entries.lock();
-        let entry = entries.entry(ip).or_insert_with(|| (0, Instant::now()));
+        let entry = entries
+            .entry(self.key(ip, user))
+            .or_insert_with(|| (0, Instant::now()));
         entry.0 += 1;
         entry.1 = Instant::now();
     }
 
-    /// Clear failure count on successful auth.
-    pub fn record_success(&self, ip: &IpAddr) {
+    /// Clear the failure count of `user` from `ip` on successful auth.
+    pub fn record_success(&self, ip: &IpAddr, user: &str) {
         let mut entries = self.entries.lock();
-        entries.remove(ip);
+        entries.remove(&self.key(*ip, user));
     }
 
     /// Remove entries older than max_lockout_secs (call periodically).
@@ -376,17 +392,23 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
             // (e.g. to gate proxy_upstreams disclosure). If validation fails
             // we fall through to anonymous — the path is open regardless.
             let client_ip = extract_client_ip(&request, &state.config.auth.trusted_proxies);
-            let blocked =
-                client_ip.is_some_and(|ip| state.auth_failures.check_blocked(&ip).is_some());
             if let Some(auth_val) = request
                 .headers()
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|h| h.to_str().ok())
-                .filter(|_| !is_probe && !blocked)
+                .filter(|_| !is_probe)
             {
                 if let Some(encoded) = auth_val.strip_prefix("Basic ") {
-                    if let Some((username, role)) = try_basic_auth(encoded, &state, htpasswd).await
-                    {
+                    // A locked-out username is not validated (no bcrypt) on the open path.
+                    let lockout_key = client_ip.zip(basic_username(encoded));
+                    let blocked = lockout_key.as_ref().is_some_and(|(ip, user)| {
+                        state.auth_failures.check_blocked(ip, user).is_some()
+                    });
+                    let identity = match blocked {
+                        true => None,
+                        false => try_basic_auth(encoded, &state, htpasswd).await,
+                    };
+                    if let Some((username, role)) = identity {
                         request
                             .extensions_mut()
                             .insert(NamespaceAuthority::Unrestricted);
@@ -396,8 +418,8 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
                     }
                     // A wrong Basic credential counts toward lockout here too,
                     // or the open path is an unthrottled password oracle.
-                    if let Some(ip) = client_ip {
-                        state.auth_failures.record_failure(ip);
+                    if let Some((ip, user)) = lockout_key.filter(|_| !blocked) {
+                        state.auth_failures.record_failure(ip, &user);
                     }
                 } else if let Some(token) = auth_val.strip_prefix("Bearer ") {
                     if let Some(ref token_store) = state.tokens {
@@ -513,24 +535,8 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
     // Compute realm from public_url for WWW-Authenticate header
     let realm = state.config.server.public_url.as_deref().unwrap_or("Nora");
 
-    // Check if client IP is blocked due to too many failed attempts
+    // The brute-force lockout applies to Basic passwords only (see AuthFailureTracker).
     let client_ip = extract_client_ip(&request, &state.config.auth.trusted_proxies);
-    if let Some(ip) = client_ip {
-        if let Some(retry_after) = state.auth_failures.check_blocked(&ip) {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [
-                    (header::RETRY_AFTER, retry_after.to_string()),
-                    (header::CONTENT_TYPE, "application/json".to_string()),
-                ],
-                format!(
-                    r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
-                    retry_after
-                ),
-            )
-                .into_response();
-        }
-    }
 
     // Extract Authorization header
     let auth_header = request
@@ -549,9 +555,6 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
         if let Some(ref token_store) = state.tokens {
             match token_store.verify_token(token) {
                 Ok((user, role)) => {
-                    if let Some(ip) = client_ip {
-                        state.auth_failures.record_success(&ip);
-                    }
                     let method = request.method().clone();
                     if (method == axum::http::Method::PUT
                         || method == axum::http::Method::POST
@@ -593,20 +596,26 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
         }
 
         // 2. Try OIDC JWT validation
-        let mut oidc_key_miss = false;
         if let Some(ref oidc_validator) = state.oidc {
             if oidc_validator.is_active() {
                 match oidc_validator.validate_token(token).await {
                     Ok(identity) => {
-                        if let Some(ip) = client_ip {
-                            state.auth_failures.record_success(&ip);
-                        }
                         tracing::debug!(
                             provider = %identity.provider,
                             subject = %identity.subject,
                             role = ?identity.role,
                             "OIDC authentication successful"
                         );
+                        // Maestra (R2-01): a workload identity (short-lived, namespace-
+                        // scoped CI JWT) must not exchange itself for a long-lived,
+                        // unscoped nra_ token; token management is for people only.
+                        if is_token_management {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                "Workload identities cannot manage API tokens",
+                            )
+                                .into_response();
+                        }
                         let method = request.method().clone();
                         if (method == axum::http::Method::PUT
                             || method == axum::http::Method::POST
@@ -649,18 +658,14 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
                             crate::auth::oidc::classify_rejection(&reason),
                         );
                         tracing::warn!(reason = %reason, "OIDC authentication rejected");
-                        oidc_key_miss = crate::auth::oidc::is_key_miss(&reason);
                     }
                 }
             }
         }
 
-        // Both token and OIDC failed. A JWT whose `kid` is still unknown after the
-        // JWKS refetch is an issuer key rotation, not a guessed credential: it must
-        // not lock the CI runner's IP out (a forged kid verifies nothing either).
-        if let Some(ip) = client_ip.filter(|_| !oidc_key_miss) {
-            state.auth_failures.record_failure(ip);
-        }
+        // Both token and OIDC failed. Not counted toward the lockout: an nra_ token
+        // or a signed JWT cannot be guessed, and counting a stale token or an expired
+        // JWT would only lock out the valid credentials sharing its egress IP.
         return unauthorized_response("Invalid or expired token", realm);
     }
 
@@ -691,6 +696,24 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
         None => return unauthorized_response("Invalid credentials format", realm),
     };
 
+    // Brute-force lockout of this username from this client IP.
+    if let Some(retry_after) =
+        client_ip.and_then(|ip| state.auth_failures.check_blocked(&ip, username))
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                (header::RETRY_AFTER, retry_after.to_string()),
+                (header::CONTENT_TYPE, "application/json".to_string()),
+            ],
+            format!(
+                r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
+                retry_after
+            ),
+        )
+            .into_response();
+    }
+
     // Verify credentials. htpasswd first; if that fails, the password may be an API
     // token (`nra_…`). Docker, twine and Maven send the token as the Basic-auth
     // password and never use Bearer (the `/v2/` challenge is Basic), so the Basic
@@ -713,7 +736,7 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
         }
         if let Some(Ok((token_user, role))) = token_result {
             if let Some(ip) = client_ip {
-                state.auth_failures.record_success(&ip);
+                state.auth_failures.record_success(&ip, username);
             }
             let method = request.method().clone();
             if (method == axum::http::Method::PUT
@@ -743,7 +766,7 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
         }
         if !(token_first && htpasswd_ok(htpasswd, username, password).await) {
             if let Some(ip) = client_ip {
-                state.auth_failures.record_failure(ip);
+                state.auth_failures.record_failure(ip, username);
             }
             return unauthorized_response("Invalid username or password", realm);
         }
@@ -751,7 +774,7 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
 
     // Auth successful — clear failure counter
     if let Some(ip) = client_ip {
-        state.auth_failures.record_success(&ip);
+        state.auth_failures.record_success(&ip, username);
     }
     // Basic-auth carries no role, so it can never satisfy an admin path: deny
     // fail-closed (403 — authenticated but not authorized).
@@ -796,6 +819,12 @@ fn basic_token_as_bearer(headers: &HeaderMap) -> Option<axum::http::HeaderValue>
         return None;
     }
     axum::http::HeaderValue::from_str(&format!("Bearer {password}")).ok()
+}
+
+/// The username of an `Authorization: Basic` credential (the lockout key).
+fn basic_username(encoded: &str) -> Option<String> {
+    let decoded = String::from_utf8(STANDARD.decode(encoded.trim()).ok()?).ok()?;
+    decoded.split_once(':').map(|(user, _)| user.to_string())
 }
 
 async fn htpasswd_ok(auth: Option<&HtpasswdAuth>, username: &str, password: &str) -> bool {
@@ -1079,9 +1108,9 @@ mod tests {
         let tracker = AuthFailureTracker::new(5, 900);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         for _ in 0..4 {
-            tracker.record_failure(ip);
+            tracker.record_failure(ip, "u");
         }
-        assert!(tracker.check_blocked(&ip).is_none());
+        assert!(tracker.check_blocked(&ip, "u").is_none());
     }
 
     #[test]
@@ -1089,9 +1118,9 @@ mod tests {
         let tracker = AuthFailureTracker::new(5, 900);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         for _ in 0..5 {
-            tracker.record_failure(ip);
+            tracker.record_failure(ip, "u");
         }
-        assert!(tracker.check_blocked(&ip).is_some());
+        assert!(tracker.check_blocked(&ip, "u").is_some());
     }
 
     #[test]
@@ -1099,11 +1128,11 @@ mod tests {
         let tracker = AuthFailureTracker::new(5, 900);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         for _ in 0..10 {
-            tracker.record_failure(ip);
+            tracker.record_failure(ip, "u");
         }
-        assert!(tracker.check_blocked(&ip).is_some());
-        tracker.record_success(&ip);
-        assert!(tracker.check_blocked(&ip).is_none());
+        assert!(tracker.check_blocked(&ip, "u").is_some());
+        tracker.record_success(&ip, "u");
+        assert!(tracker.check_blocked(&ip, "u").is_none());
     }
 
     #[test]
@@ -1112,10 +1141,10 @@ mod tests {
         let ip1: IpAddr = "10.0.0.1".parse().unwrap();
         let ip2: IpAddr = "10.0.0.2".parse().unwrap();
         for _ in 0..3 {
-            tracker.record_failure(ip1);
+            tracker.record_failure(ip1, "u");
         }
-        assert!(tracker.check_blocked(&ip1).is_some());
-        assert!(tracker.check_blocked(&ip2).is_none());
+        assert!(tracker.check_blocked(&ip1, "u").is_some());
+        assert!(tracker.check_blocked(&ip2, "u").is_none());
     }
 
     #[test]
@@ -1123,12 +1152,12 @@ mod tests {
         let tracker = AuthFailureTracker::new(3, 1); // 1 sec max lockout
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         for _ in 0..5 {
-            tracker.record_failure(ip);
+            tracker.record_failure(ip, "u");
         }
         // Cleanup should remove entries older than 2x max_lockout_secs
         std::thread::sleep(std::time::Duration::from_secs(3));
         tracker.cleanup();
-        assert!(tracker.check_blocked(&ip).is_none());
+        assert!(tracker.check_blocked(&ip, "u").is_none());
     }
 
     #[test]
@@ -1137,9 +1166,9 @@ mod tests {
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         // 5 failures = threshold, lockout = 2^0 = 1 sec
         for _ in 0..5 {
-            tracker.record_failure(ip);
+            tracker.record_failure(ip, "u");
         }
-        let retry1 = tracker.check_blocked(&ip).unwrap();
+        let retry1 = tracker.check_blocked(&ip, "u").unwrap();
         assert!(
             retry1 <= 1,
             "first lockout should be ~1 sec, got {}",
@@ -1147,8 +1176,8 @@ mod tests {
         );
 
         // 6 failures = 2^1 = 2 sec
-        tracker.record_failure(ip);
-        let retry2 = tracker.check_blocked(&ip).unwrap();
+        tracker.record_failure(ip, "u");
+        let retry2 = tracker.check_blocked(&ip, "u").unwrap();
         assert!(
             retry2 <= 2,
             "second lockout should be ~2 sec, got {}",
@@ -1156,8 +1185,8 @@ mod tests {
         );
 
         // 7 failures = 2^2 = 4 sec
-        tracker.record_failure(ip);
-        let retry3 = tracker.check_blocked(&ip).unwrap();
+        tracker.record_failure(ip, "u");
+        let retry3 = tracker.check_blocked(&ip, "u").unwrap();
         assert!(
             retry3 <= 4,
             "third lockout should be ~4 sec, got {}",
@@ -1425,6 +1454,56 @@ mod integration_tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// R2-48: the lockout is per client IP and username, and never refuses a Bearer
+    /// credential. Five wrong passwords for alice lock out alice only; bob behind the
+    /// same IP and a valid API token from it still authenticate (404 = past auth).
+    #[tokio::test]
+    async fn test_lockout_is_per_user_and_skips_bearer() {
+        let ctx = create_test_context_with_auth(&[("alice", "pw-a"), ("bob", "pw-b")]);
+        let get = |auth: String| {
+            let app = &ctx.app;
+            async move {
+                send_with_headers(
+                    app,
+                    Method::GET,
+                    "/raw/missing.txt",
+                    vec![("authorization", &auth)],
+                    "",
+                )
+                .await
+                .status()
+            }
+        };
+        let basic = |cred: &str| format!("Basic {}", STANDARD.encode(cred));
+        for _ in 0..5 {
+            assert_eq!(get(basic("alice:wrong")).await, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(
+            get(basic("alice:pw-a")).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "alice is locked out, even with her password"
+        );
+        assert_eq!(get(basic("bob:pw-b")).await, StatusCode::NOT_FOUND);
+        let token = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("ci", 30, None, crate::tokens::Role::Write)
+            .unwrap();
+        for _ in 0..10 {
+            assert_eq!(
+                get("Bearer nra_stale".to_string()).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(get(format!("Bearer {token}")).await, StatusCode::NOT_FOUND);
+        assert_eq!(
+            get(basic(&format!("ci:{token}"))).await,
+            StatusCode::NOT_FOUND
+        );
     }
 
     /// #736: an API token presented as the Basic-auth password (any username) must
@@ -1846,7 +1925,7 @@ mod integration_tests {
     }
 
     /// POST a UI token-create form with the given Authorization header.
-    async fn ui_create_token(
+    pub(super) async fn ui_create_token(
         ctx: &TestContext,
         authorization: &str,
         role: &str,
@@ -2172,6 +2251,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             leak_finders: ctx.state.leak_finders.clone(),
             cancel_token: tokio_util::sync::CancellationToken::new(),
             nuget_hosted: Default::default(),
+            maintenance_heartbeat: Default::default(),
         };
 
         // Rebuild router with new state
@@ -2714,11 +2794,12 @@ Jd74nq6dNCjpWG4drIsyhqX+
         );
     }
 
-    /// A JWT whose `kid` is unknown even after the JWKS refetch is an issuer key
-    /// rotation, not a guessed credential: it stays 401 but does not feed the
-    /// per-IP lockout. Wrong audience, expiry and a bad signature still do.
+    /// A rejected JWT (unknown `kid` after the JWKS refetch, wrong audience, expiry,
+    /// bad signature) stays 401 but never feeds the lockout (R2-48): a JWT cannot
+    /// be guessed, so a stream of stale ones from a shared CI egress IP must not
+    /// lock out the valid JWT that follows from the same IP.
     #[tokio::test]
-    async fn test_oidc_unknown_kid_does_not_count_toward_lockout() {
+    async fn test_oidc_rejected_jwts_never_lock_out_a_valid_one() {
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/.well-known/jwks.json"))
@@ -2746,7 +2827,6 @@ Jd74nq6dNCjpWG4drIsyhqX+
                 .status()
             }
         };
-        let ip: std::net::IpAddr = [127, 0, 0, 1].into();
 
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("rotated-key-2".to_string());
@@ -2757,7 +2837,6 @@ Jd74nq6dNCjpWG4drIsyhqX+
         for _ in 0..10 {
             assert_eq!(get(unknown_kid.clone()).await, StatusCode::UNAUTHORIZED);
         }
-        assert!(ctx.state.auth_failures.check_blocked(&ip).is_none());
 
         let valid = make_jwt(&issuer, sub, "nora", now, now + 600);
         let (signed, _) = valid.rsplit_once('.').unwrap();
@@ -2771,7 +2850,74 @@ Jd74nq6dNCjpWG4drIsyhqX+
         ] {
             assert_eq!(get(token).await, StatusCode::UNAUTHORIZED);
         }
-        assert!(ctx.state.auth_failures.check_blocked(&ip).is_some());
+        assert_eq!(
+            get(valid).await,
+            StatusCode::NOT_FOUND,
+            "valid JWT authenticates"
+        );
+    }
+
+    /// R2-01: a workload identity (CI OIDC JWT, 15-min, namespace-scoped) must not
+    /// exchange itself for a long-lived, unscoped nra_ token, nor list/revoke tokens.
+    #[tokio::test]
+    async fn test_oidc_identity_cannot_manage_api_tokens() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+        let jwt = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:ref:refs/heads/main",
+            "nora",
+            now,
+            now + 600,
+        );
+        let bearer = format!("Bearer {jwt}");
+        let basic = format!(
+            "Basic {}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                format!("x:{jwt}")
+            )
+        );
+        for auth in [&bearer, &basic] {
+            let resp = super::integration_tests::ui_create_token(&ctx, auth, "write").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "mint via {auth:.6}");
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/api/ui/tokens/list",
+                vec![("authorization", auth)],
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::POST,
+                "/api/ui/tokens/0123456789abcdef/revoke",
+                vec![("authorization", auth), ("hx-request", "true")],
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+        // The same JWT still writes to the registry.
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/ci.txt",
+            vec![("authorization", &bearer)],
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
 
@@ -3024,7 +3170,11 @@ mod web_surface_gating_tests {
             }
         });
         let ip: std::net::IpAddr = [127, 0, 0, 1].into();
-        assert!(ctx.state.auth_failures.check_blocked(&ip).is_none());
+        assert!(ctx
+            .state
+            .auth_failures
+            .check_blocked(&ip, "admin")
+            .is_none());
     }
 
     /// A wrong Basic credential on an open path counts toward the lockout, and
@@ -3045,7 +3195,11 @@ mod web_surface_gating_tests {
             assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
         }
         let ip: std::net::IpAddr = [127, 0, 0, 1].into();
-        assert!(ctx.state.auth_failures.check_blocked(&ip).is_some());
+        assert!(ctx
+            .state
+            .auth_failures
+            .check_blocked(&ip, "admin")
+            .is_some());
     }
 
     /// On an open web surface (anonymous_read=true), valid Basic credentials

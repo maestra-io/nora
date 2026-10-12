@@ -34,6 +34,26 @@ tests:
           path: spec.ports[0].port
           value: 8080
 
+  # Maestra
+  - it: adds the internal port when config.server.internal_port is set
+    set:
+      config.server.internal_port: 9100
+    asserts:
+      - equal:
+          path: spec.ports[1]
+          value:
+            port: 9100
+            targetPort: internal
+            protocol: TCP
+            name: internal
+
+  # Maestra
+  - it: has only the http port by default
+    asserts:
+      - lengthEqual:
+          path: spec.ports
+          count: 1
+
   - it: uses fullnameOverride for resource name
     set:
       fullnameOverride: my-registry

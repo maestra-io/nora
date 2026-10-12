@@ -69,7 +69,7 @@ async fn create_token(
     Json(req): Json<CreateTokenRequest>,
 ) -> Response {
     let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.auth.trusted_proxies);
-    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip) {
+    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip, &req.username) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [(header::RETRY_AFTER, retry_after.to_string())],
@@ -88,11 +88,13 @@ async fn create_token(
     };
 
     if !auth.authenticate(&req.username, &req.password).await {
-        state.auth_failures.record_failure(client_ip);
+        state.auth_failures.record_failure(client_ip, &req.username);
         return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
     }
 
-    state.auth_failures.record_success(&client_ip);
+    state
+        .auth_failures
+        .record_success(&client_ip, &req.username);
 
     let token_store = match &state.tokens {
         Some(ts) => ts,
@@ -173,7 +175,7 @@ async fn list_tokens(
     Json(req): Json<CreateTokenRequest>,
 ) -> Response {
     let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.auth.trusted_proxies);
-    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip) {
+    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip, &req.username) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [(header::RETRY_AFTER, retry_after.to_string())],
@@ -191,11 +193,13 @@ async fn list_tokens(
     };
 
     if !auth.authenticate(&req.username, &req.password).await {
-        state.auth_failures.record_failure(client_ip);
+        state.auth_failures.record_failure(client_ip, &req.username);
         return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
     }
 
-    state.auth_failures.record_success(&client_ip);
+    state
+        .auth_failures
+        .record_success(&client_ip, &req.username);
 
     let token_store = match &state.tokens {
         Some(ts) => ts,
@@ -239,7 +243,7 @@ async fn revoke_token(
     Json(req): Json<RevokeRequest>,
 ) -> Response {
     let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.auth.trusted_proxies);
-    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip) {
+    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip, &req.username) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [(header::RETRY_AFTER, retry_after.to_string())],
@@ -257,11 +261,13 @@ async fn revoke_token(
     };
 
     if !auth.authenticate(&req.username, &req.password).await {
-        state.auth_failures.record_failure(client_ip);
+        state.auth_failures.record_failure(client_ip, &req.username);
         return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
     }
 
-    state.auth_failures.record_success(&client_ip);
+    state
+        .auth_failures
+        .record_success(&client_ip, &req.username);
 
     let token_store = match &state.tokens {
         Some(ts) => ts,
