@@ -129,7 +129,11 @@ tampering) and `Storage::get()` returns 5xx on every read (fail-closed, #582).
 The offending key is in the `integrity violation` error log line.
 
 - **Cache/proxy artifacts** self-heal: the next request treats the failure as a
-  cache miss, re-fetches from upstream, and re-pins.
+  cache miss, re-fetches from upstream, and re-pins. Only a provable proxy copy is
+  dropped: a NuGet flat-container package, or an npm tarball / PyPI file whose
+  provenance record (`.nora-origins/<key>`) carries the object's pin. A published,
+  uploaded or imported npm tarball or PyPI file is kept and answers 500 (error log
+  `hosted artifact failed integrity verification`); restore it as below.
 - **Locally-authored artifacts** (e.g. uploaded `raw` blobs) have no upstream.
   Verify the on-disk bytes against a hash you trust, then:
 
