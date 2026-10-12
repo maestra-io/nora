@@ -29,6 +29,7 @@ groups:
           severity: warning
         annotations:
           summary: "NORA p99 latency above 5s"
+          runbook_url: "https://github.com/maestra-io/nora/blob/maestra/main/maestra/runbooks/NoraHighLatency.md"
 
       - alert: NoraCircuitBreakerOpen
         expr: nora_circuit_breaker_state == 1

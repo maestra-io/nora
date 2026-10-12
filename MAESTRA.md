@@ -59,3 +59,7 @@ Changes meant for upstream: branch from `main`, cherry-pick, open the PR against
 ## Helm chart
 
 `maestra/charts/nora`: upstream getnora-io/helm-charts `charts/nora` vendored with our fixes (Recreate, full `[auth]` incl. Teleport, full `[curation]`, PVC-safe S3 mode, `s3_credentials_dir`, envFrom secrets, network policy, ServiceMonitor/PrometheusRule, token backup CronJob). Provenance, differences and re-sync: `maestra/charts/nora/MAESTRA-CHART.md`.
+
+## Runbooks
+
+`maestra/runbooks/<Alertname>.md`: agent-executable runbooks for packages.maestra.io, linked from the alert's `runbook_url` in `deploy/prometheus-rules.yml` (and its chart copy). The cluster's PrometheusRule picks up a new `runbook_url` only with the next chart release and fluxcd version bump.
