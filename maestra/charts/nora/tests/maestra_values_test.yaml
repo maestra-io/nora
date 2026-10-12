@@ -4,14 +4,18 @@
 suite: maestra values
 templates:
   - templates/configmap.yaml
+  - templates/servicemonitor.yaml
+  - templates/networkpolicy.yaml
+  - templates/deployment.yaml
 values:
   - ../ci/maestra-values.yaml
 tests:
   - it: renders every live config.toml key
+    template: templates/configmap.yaml
     asserts:
       - matchRegex:
           path: data["config.toml"]
-          pattern: '\[server\]\nhost = "0\.0\.0\.0"\nport = 4000\npublic_url = "https://packages\.maestra\.io"\nbody_limit_mb = 256\nspool_dir = "/spool"\nspool_max_mb = 3584\ntrust_upstream_dates = true\n'
+          pattern: '\[server\]\nhost = "0\.0\.0\.0"\nport = 4000\npublic_url = "https://packages\.maestra\.io"\nbody_limit_mb = 256\ninternal_port = 9100\nspool_dir = "/spool"\nspool_max_mb = 3584\ntrust_upstream_dates = true\n'
       - matchRegex:
           path: data["config.toml"]
           pattern: '\[registries\]\nenable = \["nuget", "npm", "pypi"\]\n'
@@ -42,3 +46,42 @@ tests:
       - matchRegex:
           path: data["config.toml"]
           pattern: '\[curation\]\nmode = "audit"\non_failure = "closed"\nmin_release_age = "7d"\nquarantine = "observe"\nquarantine_ttl = "7d"\ninternal_namespaces = \["maestra\.\*","@mindbox-cloud/\*","mindbox-ml-commons","python-mindbox-sdk","python-mindbox-chat-ast","mindbox-finance-mcp"\]\n\n\[curation\.nuget\]\nmin_release_age = "3d"\nquarantine_ttl = "3d"\n'
+
+  - it: scrapes /metrics on the internal port (R2-53)
+    template: templates/servicemonitor.yaml
+    asserts:
+      - equal:
+          path: spec.endpoints[0].port
+          value: internal
+
+  - it: admits vmagent on the internal port only, probes and proxies stay on 4000
+    template: templates/networkpolicy.yaml
+    asserts:
+      - equal:
+          path: spec.ingress[0].toPorts[0].ports[0].port
+          value: "4000"
+      - equal:
+          path: spec.ingress[1].toPorts[0].ports[0].port
+          value: "4000"
+      - equal:
+          path: spec.ingress[2].fromEndpoints[0].matchLabels["app.kubernetes.io/name"]
+          value: vmagent
+      - equal:
+          path: spec.ingress[2].toPorts[0].ports[0].port
+          value: "9100"
+
+  - it: keeps kubelet probes on the public port
+    template: templates/deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.port
+          value: http
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.port
+          value: http
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: internal
+            containerPort: 9100
+            protocol: TCP

@@ -41,6 +41,19 @@ tests:
             interval: 30s
             scrapeTimeout: 10s
 
+  - it: scrapes the internal port when server.internal_port is set (R2-53)
+    set:
+      metrics.serviceMonitor.enabled: true
+      config.server.internal_port: 9100
+    template: templates/servicemonitor.yaml
+    asserts:
+      - equal:
+          path: spec.endpoints[0].port
+          value: internal
+      - equal:
+          path: spec.endpoints[0].path
+          value: /metrics
+
   - it: renders every alert of the rules file with the extra labels
     set:
       metrics.prometheusRule.enabled: true
