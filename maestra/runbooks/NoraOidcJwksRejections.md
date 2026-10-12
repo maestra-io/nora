@@ -25,8 +25,11 @@ change with a fluxcd PR only. The HelmRelease has
 `kustomize.toolkit.fluxcd.io/substitute: disabled`, so `{{ $value }}` is safe there.
 
 The only OIDC provider is `github-actions` (issuer
-`https://token.actions.githubusercontent.com`, audience `packages.maestra.io`), so a
-firing alert means **GitHub Actions restores/publishes with OIDC are failing**.
+`https://token.actions.githubusercontent.com`, audience `packages.maestra.io`), so the
+alert means **OIDC key-validation failures for tokens claiming that issuer**. It is not
+proof that CI is broken: a token with that issuer and an unknown `kid` counts too (a
+different issuer is `no_provider`). Say CI is affected only after confirming real
+GitHub Actions jobs fail on packages.maestra.io (12.10: they did).
 
 `classify_rejection` maps **any reason containing `JWK`** to `jwks`. Possible reasons
 (`nora-registry/src/auth/oidc.rs`):
@@ -46,8 +49,9 @@ does not fire this alert: client-side expired tokens, not an incident.
 How keys are fetched (since `1.3.4-maestra.1`, maestra-io/nora#54): cache TTL
 `jwks_cache_secs: 300`; one refresh at a time (`refresh_lock`); a failed fetch is
 remembered for 5 s; on failure an expired cache is served (`JWKS fetch failed, serving
-stale keys`), so only a **cold cache** (fresh start) turns a fetch failure into
-rejections. URI order: explicit `jwks_uri` (pinned in fluxcd to
+stale keys`). A fetch failure therefore becomes rejections on a **cold cache** (fresh
+start), or on a warm cache when a token's `kid` is missing from the stale set (GitHub
+rotated keys while refreshes keep failing). URI order: explicit `jwks_uri` (pinned in fluxcd to
 `https://token.actions.githubusercontent.com/.well-known/jwks`, fluxcd#22246) >
 discovered URI (cached) > fallback `{issuer}/.well-known/jwks.json`, which **GitHub
 answers 404**.
@@ -111,7 +115,7 @@ Expected (17:08 UTC 12.10.2026): `200` openid-configuration, `200` `/jwks`, **`4
 | `JWKS endpoint returned 404` with `jwks_uri` pinned to `/jwks`, and Step 3 workstation probe of `/jwks` is 404 too | GitHub moved the JWKS | update `jwks_uri` in fluxcd from the `openid-configuration` `jwks_uri` |
 | `error sending request` / timeouts, pod `wget` fails while the workstation probe is 200 | egress from the pod (CiliumNetworkPolicy `nora`, DNS, node) | `kubectl --context "$CTX" -n nora get ciliumnetworkpolicy nora -o yaml`; fix the policy in fluxcd |
 | errors from both workstation and pod, `githubstatus.com` shows an Actions incident | GitHub outage | nothing to fix; stale keys cover a warm pod, so avoid restarting nora meanwhile |
-| `No matching key (kid=…)` with a kid that is in Step 3's kid list | cached set older than the rotation; refetch should cure it within 60 s | if it persists, the cache never refreshes: open an issue in maestra-io/nora with the log |
+| `No matching key (kid=…)` with a kid that is in Step 3's kid list | cached set older than the rotation; refetch should cure it within 60 s | if it persists, look for `JWKS fetch failed, serving stale keys` in the log and run the pod egress probe (Step 3): refreshes failing → egress/GitHub rows above; refreshes succeeding → open an issue in maestra-io/nora with the log |
 | `No matching key (kid=…)` with a kid absent from GitHub's list | foreign or forged token, not GitHub Actions | find the caller (audit log by time); nothing to fix in nora |
 | only `previous fetch failed, retrying shortly` | backoff after a failed fetch | read the earlier reason; it is the real one |
 
