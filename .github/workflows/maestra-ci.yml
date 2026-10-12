@@ -1,7 +1,8 @@
 name: Maestra CI
 
 # fmt, clippy, cargo test, RustSec advisories and the vendored chart on PRs into
-# our default branch, and on pushes to it so a red merge commit is visible.
+# our default branch, and on pushes to it so a red merge commit is visible. A PR
+# changing only *.md files skips the Rust jobs (see `changes`); the chart always runs.
 # Upstream's CI only targets main, which in this fork is the untouched upstream
 # mirror (see MAESTRA.md).
 
@@ -20,8 +21,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # A PR touching only Markdown (runbooks, MAESTRA.md, CHANGELOG) skips the Rust jobs:
+  # no source embeds a .md file. Pushes to maestra/main always run everything.
+  changes:
+    name: changes
+    runs-on: runs-on=${{ github.run_id }}-changes/pool=small
+    outputs:
+      rust: ${{ steps.diff.outputs.rust }}
+    steps:
+      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Anything besides Markdown?
+        id: diff
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          other=$(git diff --name-only "${BASE}" HEAD | grep -vE '\.md$' || true)
+          printf 'non-Markdown changes:\n%s\n' "${other:-(none)}"
+          echo "rust=$([ -n "${other}" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
   test:
     name: cargo test
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: runs-on=${{ github.run_id }}-test/pool=build
     steps:
       - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
@@ -96,6 +127,8 @@ jobs:
 
   advisories:
     name: cargo deny advisories
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: runs-on=${{ github.run_id }}-advisories/pool=build
     steps:
       - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
