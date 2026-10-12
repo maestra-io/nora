@@ -46,6 +46,9 @@ config:
     body_limit_mb: 256
     # Cooldown age = the upstream publish date, not nora's cache mtime (C49).
     trust_upstream_dates: true
+    # Detailed /health and /metrics only on this port (R2-53): the ServiceMonitor
+    # scrapes it, the vmagent ingress rule below admits it; probes stay on 4000.
+    internal_port: 9100
 
   registries:
     enable: ["nuget", "npm", "pypi"]
@@ -200,7 +203,7 @@ networkPolicy:
             app.kubernetes.io/name: vmagent
       toPorts:
         - ports:
-            - port: "4000"
+            - port: "9100"
               protocol: TCP
   egress:
     - toEndpoints:

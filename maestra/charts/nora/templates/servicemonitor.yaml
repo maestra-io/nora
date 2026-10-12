@@ -17,7 +17,8 @@ spec:
     matchLabels:
       {{- include "nora.selectorLabels" $ | nindent 6 }}
   endpoints:
-    - port: http
+    # With server.internal_port the public port answers /metrics with 404 (R2-53).
+    - port: {{ if $.Values.config.server.internal_port }}internal{{ else }}http{{ end }}
       path: /metrics
       interval: {{ .interval }}
       scrapeTimeout: {{ .scrapeTimeout }}
