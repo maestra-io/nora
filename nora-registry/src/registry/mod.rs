@@ -1149,7 +1149,7 @@ impl CachedArtifact {
         match self {
             CachedArtifact::Buffered(b) => Body::from(b),
             CachedArtifact::Streamed { sha256, reader, .. } => {
-                let storage = state.storage.clone();
+                let state = state.clone();
                 let heal_key = key.to_string();
                 let heal: Box<dyn FnOnce() + Send + Sync> = Box::new(move || {
                     crate::metrics::STORAGE_OPERATIONS
@@ -1157,7 +1157,7 @@ impl CachedArtifact {
                         .inc();
                     if !internal {
                         tokio::spawn(async move {
-                            drop_proxied_copy(&storage, registry, &heal_key).await;
+                            drop_proxied_copy(&state, registry, &heal_key).await;
                         });
                     }
                 });
@@ -1195,8 +1195,14 @@ pub(crate) async fn is_proxied_copy(storage: &crate::Storage, key: &str) -> bool
 /// can cache the upstream bytes again — the immutable write never overwrites a key
 /// (C54). Only a provable proxy copy ([`is_proxied_copy`]): anything else may be the
 /// only copy of a published or uploaded artifact, so it is kept (and answered with a
-/// 500) for an operator to restore. Returns whether it was dropped.
-async fn drop_proxied_copy(storage: &crate::Storage, registry: &str, key: &str) -> bool {
+/// 500) for an operator to restore. Check and delete run under the key's publish
+/// lock, which every writer that can replace the object (npm publish, PyPI upload,
+/// an immutable cache fill) holds, so a replacement landing in between is never the
+/// one deleted. Returns whether it was dropped.
+async fn drop_proxied_copy(state: &AppState, registry: &str, key: &str) -> bool {
+    let storage = &state.storage;
+    let lock = state.publish_lock(key);
+    let _guard = lock.lock().await;
     if !is_proxied_copy(storage, key).await {
         tracing::error!(
             registry,
@@ -1228,7 +1234,7 @@ pub(crate) async fn read_cached_artifact(
         .await;
     let fail_closed = internal
         || (matches!(read, Err(StorageError::IntegrityViolation))
-            && !drop_proxied_copy(&state.storage, registry, key).await);
+            && !drop_proxied_copy(state, registry, key).await);
     Ok(
         cache_read(read, registry, key, fail_closed)?.map(|read| match read {
             BoundedRead::Buffered(outcome) => {

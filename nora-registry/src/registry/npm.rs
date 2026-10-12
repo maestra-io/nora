@@ -1751,7 +1751,15 @@ async fn handle_publish(
     // Lock per package to serialize the packument regeneration within one process.
     let lock = state.publish_lock(&format!("npm/{}/metadata.json", package_name));
     let _guard = lock.lock().await;
-    if let Err(e) = publish_versions(&state.storage, &package_name, &payload, tarballs).await {
+    if let Err(e) = publish_versions(
+        &state.storage,
+        &state.publish_locks,
+        &package_name,
+        &payload,
+        tarballs,
+    )
+    .await
+    {
         return e.into_response();
     }
 
@@ -1781,6 +1789,7 @@ async fn handle_publish(
 /// the new versions. The caller holds the package's publish lock.
 pub(crate) async fn publish_versions(
     storage: &crate::storage::Storage,
+    locks: &crate::PublishLocks,
     package_name: &str,
     payload: &serde_json::Value,
     tarballs: Vec<(String, Bytes)>,
@@ -1867,12 +1876,24 @@ pub(crate) async fn publish_versions(
         let tarball_key = format!("npm/{}/tarballs/{}", package_name, name);
         let hash = hex::encode(sha2::Sha256::digest(&tarball_bytes));
         // A publish is never a proxy cache: drop the provenance of a proxied copy it
-        // replaces, or GC and the integrity heal would treat it as one (C54).
-        let _ = storage.delete(&origin_key(&tarball_key)).await;
+        // replaces, or GC and the integrity heal would treat it as one (C54). Under the
+        // tarball's publish lock, so the heal of a failing proxied copy and a cache fill
+        // of the same key serialise with the replacement; a provenance that cannot be
+        // removed aborts the publish (same bytes would keep it valid for the new pin).
+        let lock = crate::acquire_publish_lock(locks, &tarball_key);
+        let guard = lock.lock().await;
+        match storage.delete(&origin_key(&tarball_key)).await {
+            Ok(()) | Err(crate::storage::StorageError::NotFound) => {}
+            Err(e) => {
+                tracing::error!(key = %tarball_key, error = ?e, "npm publish: failed to remove stale provenance");
+                return Err(internal_error());
+            }
+        }
         if let Err(e) = storage.put_bytes(&tarball_key, tarball_bytes).await {
             tracing::error!(key = %tarball_key, error = ?e, "npm publish: failed to store tarball");
             return Err(internal_error());
         }
+        drop(guard);
 
         // Store sha256
         let hash_key = format!("{}.sha256", tarball_key);
