@@ -29,6 +29,10 @@ use crate::tokens::Role;
 /// On an unknown `kid`, refetch the JWKS if the cached set is older than this.
 const JWKS_KID_MISS_REFETCH: Duration = Duration::from_secs(60);
 
+/// After a failed JWKS fetch with no stale keys to serve, requests fail fast for
+/// this long instead of each one calling the issuer again.
+const JWKS_FAILURE_BACKOFF: Duration = Duration::from_secs(5);
+
 /// Prefix of the rejection for a `kid` absent from the JWKS even after the refetch.
 const KEY_MISS: &str = "No matching key";
 
@@ -104,6 +108,15 @@ pub struct OidcValidator {
     http_client: Client,
     /// issuer URL → cached JWKS
     jwks_cache: RwLock<HashMap<String, CachedJwks>>,
+    /// issuer URL → JWKS URI from a successful discovery (never the fallback)
+    discovered_jwks_uri: RwLock<HashMap<String, String>>,
+    /// issuer URL → time of the last failed fetch
+    jwks_failed_at: RwLock<HashMap<String, Instant>>,
+    /// Single-flight for JWKS refreshes: on a cold start under load, one request
+    /// fetches and the rest wait for its result instead of each calling the issuer.
+    /// ponytail: one lock for all providers, per-issuer locks if several issuers
+    /// refresh at once.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 /// Per-request timeout for OIDC HTTP calls (discovery + JWKS fetch).
@@ -119,6 +132,9 @@ impl OidcValidator {
             config,
             http_client,
             jwks_cache: RwLock::new(HashMap::new()),
+            discovered_jwks_uri: RwLock::new(HashMap::new()),
+            jwks_failed_at: RwLock::new(HashMap::new()),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -255,46 +271,72 @@ impl OidcValidator {
         provider: &OidcProvider,
         cache_ttl: Duration,
     ) -> Result<JwkSet, String> {
-        // Try cache first
-        {
-            let cache = self.jwks_cache.read();
-            if let Some(cached) = cache.get(&provider.issuer) {
-                if cached.fetched_at.elapsed() < cache_ttl {
-                    return Ok(cached.jwks.clone());
-                }
-            }
+        if let Some(jwks) = self.cached_jwks(&provider.issuer, cache_ttl) {
+            return Ok(jwks);
         }
 
-        // Resolve JWKS URI: explicit config > OIDC discovery > legacy fallback
-        let jwks_uri = self.resolve_jwks_uri(provider).await?;
+        // One refresh at a time; whoever waited re-reads what it fetched.
+        let _refresh = self.refresh_lock.lock().await;
+        if let Some(jwks) = self.cached_jwks(&provider.issuer, cache_ttl) {
+            return Ok(jwks);
+        }
 
-        match self.fetch_jwks(&jwks_uri).await {
+        let failed_recently = self
+            .jwks_failed_at
+            .read()
+            .get(&provider.issuer)
+            .is_some_and(|t| t.elapsed() < JWKS_FAILURE_BACKOFF);
+        let fetched = if failed_recently {
+            Err("previous fetch failed, retrying shortly".to_string())
+        } else {
+            // Resolve JWKS URI: explicit config > OIDC discovery > legacy fallback
+            let jwks_uri = self.resolve_jwks_uri(provider).await?;
+            self.fetch_jwks(&jwks_uri).await
+        };
+
+        match fetched {
             Ok(jwks) => {
-                let mut cache = self.jwks_cache.write();
-                cache.insert(
+                self.jwks_cache.write().insert(
                     provider.issuer.clone(),
                     CachedJwks {
                         jwks: jwks.clone(),
                         fetched_at: Instant::now(),
                     },
                 );
+                self.jwks_failed_at.write().remove(&provider.issuer);
                 Ok(jwks)
             }
             Err(e) => {
+                if !failed_recently {
+                    self.jwks_failed_at
+                        .write()
+                        .insert(provider.issuer.clone(), Instant::now());
+                }
                 // Stale fallback: return expired cache if available
                 let cache = self.jwks_cache.read();
                 if let Some(cached) = cache.get(&provider.issuer) {
-                    tracing::warn!(
-                        provider = %provider.name,
-                        error = %e,
-                        stale_age_secs = cached.fetched_at.elapsed().as_secs(),
-                        "JWKS fetch failed, serving stale keys"
-                    );
+                    if !failed_recently {
+                        tracing::warn!(
+                            provider = %provider.name,
+                            error = %e,
+                            stale_age_secs = cached.fetched_at.elapsed().as_secs(),
+                            "JWKS fetch failed, serving stale keys"
+                        );
+                    }
                     return Ok(cached.jwks.clone());
                 }
                 Err(format!("JWKS fetch failed for {}: {}", provider.name, e))
             }
         }
+    }
+
+    /// Cached JWKS for an issuer if younger than `ttl`.
+    fn cached_jwks(&self, issuer: &str, ttl: Duration) -> Option<JwkSet> {
+        self.jwks_cache
+            .read()
+            .get(issuer)
+            .filter(|c| c.fetched_at.elapsed() < ttl)
+            .map(|c| c.jwks.clone())
     }
 
     /// Resolve the JWKS URI for a provider using (in order):
@@ -304,6 +346,9 @@ impl OidcValidator {
     async fn resolve_jwks_uri(&self, provider: &OidcProvider) -> Result<String, String> {
         // 1. Explicit override
         if let Some(ref uri) = provider.jwks_uri {
+            return Ok(uri.clone());
+        }
+        if let Some(uri) = self.discovered_jwks_uri.read().get(&provider.issuer) {
             return Ok(uri.clone());
         }
 
@@ -328,6 +373,9 @@ impl OidcValidator {
                             jwks_uri = %config.jwks_uri,
                             "Discovered JWKS URI via openid-configuration"
                         );
+                        self.discovered_jwks_uri
+                            .write()
+                            .insert(provider.issuer.clone(), config.jwks_uri.clone());
                         return Ok(config.jwks_uri);
                     }
                 }
@@ -675,5 +723,134 @@ mod tests {
         let aged = primed(120);
         assert!(aged.validate_token(&token).await.is_ok());
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// A provider on a mock issuer plus a valid token for it.
+    async fn mock_issuer(
+        jwks_uri: Option<&str>,
+        jwks_cache_secs: u64,
+    ) -> (wiremock::MockServer, OidcConfig, String) {
+        use crate::auth::oidc_integration_tests::TEST_RSA_PRIVATE_KEY;
+        use jsonwebtoken::{encode, EncodingKey, Header};
+
+        let server = wiremock::MockServer::start().await;
+        let issuer = server.uri();
+        let config = OidcConfig {
+            enabled: true,
+            jwks_cache_secs,
+            providers: vec![OidcProvider {
+                name: "ci".to_string(),
+                issuer: issuer.clone(),
+                jwks_uri: jwks_uri.map(|p| format!("{issuer}{p}")),
+                audience: "nora".to_string(),
+                algorithms: vec!["RS256".to_string()],
+                max_token_lifetime_secs: 900,
+                namespace_scope: vec!["*".to_string()],
+                namespace_scope_enforcement: crate::config::ScopeEnforcement::Enforce,
+                enabled: true,
+                role_rules: vec![OidcRoleRule {
+                    pattern: "repo:myorg/*".to_string(),
+                    role: "read".to_string(),
+                    namespace_scope: None,
+                }],
+            }],
+            ..OidcConfig::default()
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-key-1".to_string());
+        let claims = serde_json::json!({
+            "iss": issuer, "sub": "repo:myorg/app", "aud": "nora", "iat": now, "exp": now + 600,
+        });
+        let key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
+        (server, config, encode(&header, &claims, &key).unwrap())
+    }
+
+    /// Cold start under load: concurrent requests share one JWKS fetch.
+    #[tokio::test]
+    async fn test_cold_start_fetches_jwks_once() {
+        use crate::auth::oidc_integration_tests::TEST_JWKS_JSON;
+        use wiremock::{matchers::path, Mock, ResponseTemplate};
+
+        let (server, config, token) = mock_issuer(Some("/jwks"), 300).await;
+        Mock::given(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(TEST_JWKS_JSON, "application/json")
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
+        let v = std::sync::Arc::new(OidcValidator::new(config, Client::new()));
+
+        let tasks: Vec<_> = (0..50)
+            .map(|_| {
+                let (v, t) = (v.clone(), token.clone());
+                tokio::spawn(async move { v.validate_token(&t).await })
+            })
+            .collect();
+        for t in tasks {
+            assert!(t.await.unwrap().is_ok());
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// A failed fetch with nothing cached fails the requests behind it fast
+    /// instead of each one calling the issuer again.
+    #[tokio::test]
+    async fn test_failed_fetch_backs_off() {
+        use wiremock::{matchers::path, Mock, ResponseTemplate};
+
+        let (server, config, token) = mock_issuer(Some("/jwks"), 300).await;
+        Mock::given(path("/jwks"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let v = std::sync::Arc::new(OidcValidator::new(config, Client::new()));
+
+        let tasks: Vec<_> = (0..20)
+            .map(|_| {
+                let (v, t) = (v.clone(), token.clone());
+                tokio::spawn(async move { v.validate_token(&t).await })
+            })
+            .collect();
+        for t in tasks {
+            let err = t.await.unwrap().unwrap_err();
+            assert_eq!(classify_rejection(&err), "jwks", "{err}");
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// The JWKS URI from discovery is kept: a later refresh does not depend on
+    /// discovery succeeding again (a failed one falls back to jwks.json).
+    #[tokio::test]
+    async fn test_discovered_jwks_uri_is_cached() {
+        use crate::auth::oidc_integration_tests::TEST_JWKS_JSON;
+        use wiremock::{matchers::path, Mock, ResponseTemplate};
+
+        // jwks_cache_secs 0: every validation refreshes the JWKS.
+        let (server, config, token) = mock_issuer(None, 0).await;
+        let discovery = serde_json::json!({ "jwks_uri": format!("{}/keys", server.uri()) });
+        Mock::given(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(discovery))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/keys"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .expect(3)
+            .mount(&server)
+            .await;
+        let v = OidcValidator::new(config, Client::new());
+
+        for _ in 0..3 {
+            assert!(v.validate_token(&token).await.is_ok());
+        }
+        server.verify().await;
     }
 }
