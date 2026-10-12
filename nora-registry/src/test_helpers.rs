@@ -581,15 +581,45 @@ const COUNTED_METHODS: [&str; 11] = [
 #[derive(Default)]
 pub struct OpCounts {
     counts: [AtomicUsize; COUNTED_METHODS.len()],
+    /// Puts to keys ending with this fail (see [`fail_puts_ending`](Self::fail_puts_ending)).
+    failing_puts: std::sync::Mutex<Option<String>>,
+    /// Every counted call as (method, key or prefix), for [`calls`](Self::calls).
+    log: std::sync::Mutex<Vec<(&'static str, String)>>,
 }
 
 impl OpCounts {
-    fn hit(&self, method: &'static str) {
+    /// Calls of `method` on exactly `key` since the last reset.
+    pub fn calls(&self, method: &str, key: &str) -> usize {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, k)| *m == method && k == key)
+            .count()
+    }
+
+    /// Make every put to a key ending with `suffix` fail (`None`: none), to drive a
+    /// handler's storage-failure branch.
+    pub fn fail_puts_ending(&self, suffix: Option<&str>) {
+        *self.failing_puts.lock().unwrap() = suffix.map(str::to_string);
+    }
+
+    fn put_refused(&self, key: &str) -> crate::storage::Result<()> {
+        match &*self.failing_puts.lock().unwrap() {
+            Some(suffix) if key.ends_with(suffix.as_str()) => Err(
+                crate::storage::StorageError::Network("put refused by the test".into()),
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    fn hit(&self, method: &'static str, key: &str) {
         let slot = COUNTED_METHODS
             .iter()
             .position(|counted| *counted == method)
             .expect("every counted backend method is listed in COUNTED_METHODS");
         self.counts[slot].fetch_add(1, Ordering::Relaxed);
+        self.log.lock().unwrap().push((method, key.to_string()));
     }
 
     /// Forget everything counted so far. Call it after seeding, right before the
@@ -598,6 +628,7 @@ impl OpCounts {
         for count in &self.counts {
             count.store(0, Ordering::Relaxed);
         }
+        self.log.lock().unwrap().clear();
     }
 
     /// Round-trips counted since the last [`reset`](Self::reset).
@@ -648,7 +679,8 @@ pub fn op_counting_storage() -> (Storage, Arc<OpCounts>) {
 #[async_trait::async_trait]
 impl crate::storage::StorageBackend for OpCountingBackend {
     async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
-        self.counts.hit("put");
+        self.counts.hit("put", key);
+        self.counts.put_refused(key)?;
         self.inner.put(key, data, sha256).await
     }
 
@@ -658,32 +690,33 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         data: axum::body::Bytes,
         sha256: &str,
     ) -> crate::storage::Result<bool> {
-        self.counts.hit("put");
+        self.counts.hit("put", key);
+        self.counts.put_refused(key)?;
         self.inner.put_if_absent(key, data, sha256).await
     }
 
     async fn get(&self, key: &str) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
-        self.counts.hit("get");
+        self.counts.hit("get", key);
         self.inner.get(key).await
     }
 
     async fn pin(&self, key: &str) -> Option<String> {
-        self.counts.hit("pin");
+        self.counts.hit("pin", key);
         self.inner.pin(key).await
     }
 
     async fn delete(&self, key: &str) -> crate::storage::Result<()> {
-        self.counts.hit("delete");
+        self.counts.hit("delete", key);
         self.inner.delete(key).await
     }
 
     async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
-        self.counts.hit("list");
+        self.counts.hit("list", prefix);
         self.inner.list(prefix).await
     }
 
     async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
-        self.counts.hit("stat");
+        self.counts.hit("stat", key);
         self.inner.stat(key).await
     }
 
@@ -691,7 +724,7 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         &self,
         prefix: &str,
     ) -> crate::storage::Result<Vec<(String, crate::storage::FileMeta)>> {
-        self.counts.hit("list_with_meta");
+        self.counts.hit("list_with_meta", prefix);
         self.inner.list_with_meta(prefix).await
     }
 
@@ -721,12 +754,12 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         src: &std::path::Path,
         sha256: Option<&str>,
     ) -> crate::storage::Result<()> {
-        self.counts.hit("put_from_path");
+        self.counts.hit("put_from_path", key);
         self.inner.put_from_path(key, src, sha256).await
     }
 
     async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> crate::storage::Result<()> {
-        self.counts.hit("copy");
+        self.counts.hit("copy", src);
         self.inner.copy(src, dst, sha256).await
     }
 
@@ -738,7 +771,7 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         Option<String>,
         std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
     )> {
-        self.counts.hit("get_reader");
+        self.counts.hit("get_reader", key);
         self.inner.get_reader(key).await
     }
 
@@ -751,7 +784,7 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         u64,
         std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
     )> {
-        self.counts.hit("get_range");
+        self.counts.hit("get_range", key);
         self.inner.get_range(key, start, end).await
     }
 }

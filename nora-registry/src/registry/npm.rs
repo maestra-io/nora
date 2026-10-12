@@ -31,7 +31,7 @@ use std::time::Duration;
 pub fn routes() -> Router<AppState> {
     Router::new().route(
         "/npm/{*path}",
-        get(handle_get)
+        get(handle_request)
             .put(handle_publish)
             .post(handle_npm_post)
             .delete(handle_npm_delete)
@@ -152,7 +152,7 @@ async fn handle_npm_post(
                 )
             }
         };
-        match strip_internal_bulk(&plain, engine, &owned_scopes) {
+        match strip_internal_bulk(&state.storage, &plain, engine, &owned_scopes).await {
             Some(stripped) => stripped,
             None => {
                 return audit_refused(
@@ -272,15 +272,18 @@ fn audit_refused(status: StatusCode, reason: &str) -> Response {
         .into_response()
 }
 
-/// Strip internal-namespace and private-scope package keys from an npm7 bulk-advisories body
-/// (`{"<pkg>":[…]}`). `Some(bytes)` = the (possibly unchanged) body safe to forward;
-/// `None` = the body is NOT the expected JSON object, so the caller must fail closed
-/// under an active namespace filter (we could not verify no internal name is present).
-fn strip_internal_bulk(
+/// Strip internal-namespace, private-scope and published-here (C24/R2-20) package keys
+/// from an npm7 bulk-advisories body (`{"<pkg>":[…]}`). `Some(bytes)` = the (possibly
+/// unchanged) body safe to forward; `None` = the body is NOT the expected JSON object,
+/// so the caller must fail closed under an active namespace filter (we could not verify
+/// no internal name is present).
+async fn strip_internal_bulk(
+    storage: &crate::Storage,
     body: &[u8],
     engine: &crate::curation::CurationEngine,
     owned_scopes: &[&str],
 ) -> Option<Vec<u8>> {
+    use futures::StreamExt;
     let mut map =
         serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(body).ok()?;
     let before = map.len();
@@ -293,6 +296,15 @@ fn strip_internal_bulk(
                 k,
             )
     });
+    // One listing per remaining name, concurrently, as a packument rebuild reads.
+    let names: Vec<String> = map.keys().cloned().collect();
+    let hosted: std::collections::HashSet<String> = futures::stream::iter(names)
+        .map(|name| async move { has_local_versions(storage, &name).await.then_some(name) })
+        .buffer_unordered(super::SIDECAR_READ_CONCURRENCY)
+        .filter_map(|name| async move { name })
+        .collect()
+        .await;
+    map.retain(|k, _| !hosted.contains(k));
     if map.len() == before {
         Some(body.to_vec())
     } else {
@@ -466,56 +478,11 @@ async fn handle_search(state: &AppState, query: &str) -> Response {
     }
 }
 
-/// Q04: a proxied packument is served without versions younger than
-/// `min_release_age` (see `crate::metadata_filter`); everything else as is.
-async fn handle_get(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Path(path): Path<String>,
-    query: RawQuery,
-    user: Extension<AuthenticatedUser>,
-) -> Response {
-    let resp = handle_request(
-        State(state.clone()),
-        headers,
-        Path(path.clone()),
-        query,
-        user,
-    )
-    .await;
-    let packument = !path.starts_with("-/")
-        && !path.contains("/-/")
-        && github_packages_tarball(&path).is_none();
-    let curation = state.curation();
-    let engine = &curation.curation_engine;
-    if !packument
-        || resp.status() != StatusCode::OK
-        || !engine.metadata_filter_active()
-        || crate::curation::is_internal_namespace(engine, RegistryType::Npm, &path)
-        || has_local_versions(&state.storage, &path).await
-    {
-        return resp;
-    }
-    // The abbreviated form carries no `time`: date it from the cached full packument
-    // (written in the background on a cold miss, so prime it here if it is not yet).
-    let meta_key = format!("npm/{path}/metadata.json");
-    if state.storage.stat(&meta_key).await.is_none() {
-        ensure_npm_metadata_cached(&state, &path).await;
-    }
-    let stored: Option<serde_json::Value> = state
-        .storage
-        .get(&meta_key)
-        .await
-        .ok()
-        .and_then(|d| serde_json::from_slice(&d).ok());
-    let stored_time = stored.as_ref().and_then(|d| d.get("time")?.as_object());
-    crate::metadata_filter::rewrite_body(resp, |body| {
-        crate::metadata_filter::npm_packument(engine, &path, body, stored_time)
-    })
-    .await
-}
-
 // LOCK-SAFE: cache-through proxy — get miss → fetch upstream → put; no RMW race
+//
+// Q04: a proxied packument is served without versions younger than `min_release_age`
+// (see `crate::metadata_filter`), filtered on the full document in hand before it is
+// abbreviated (`packument_body`); hosted and internal-namespace packuments as is.
 async fn handle_request(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -600,54 +567,49 @@ async fn handle_request(
         None
     };
 
-    // Extract publish date from cached metadata (npm `time` field). Hoisted to
-    // function scope so the digest-quarantine serve gate below can seed first_seen
-    // from a trusted upstream release date (#750). Non-tarball requests have no
-    // version, so this is `None` without any extra storage read.
-    let publish_date = if let Some(ref ver) = tarball_version {
-        let meta_key = format!("npm/{}/metadata.json", package_name);
-        // #748: a tarball download may arrive without a prior packument request
-        // (direct/locked fetch), so `metadata.json` (the carrier of per-version
-        // `time[version]`) would never be cached and the quarantine would fall
-        // back to NORA's own clock. Self-prime the metadata here (synchronously,
-        // so the date is readable on this same request) — gated on trust,
-        // namespace-safe, best-effort. Mirrors Cargo's `ensure_cargo_metadata_cached`
-        // and PyPI's `ensure_pypi_dates_cached`.
-        if state.config.server.trust_upstream_dates {
-            ensure_npm_metadata_cached(&state, &package_name).await;
-        }
-        extract_npm_publish_date(
-            &state.storage,
-            &meta_key,
-            ver,
-            state.config.server.trust_upstream_dates,
-        )
-        .await
-    } else {
-        None
+    let internal = crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Npm,
+        &package_name,
+    );
+    // A hosted tarball (internal namespace, or this version published here) is our
+    // own publish, not a new upstream artifact: neither curation nor the quarantine
+    // holds it (R2-18: its `time` is the local publish time, not an upstream release
+    // date), as NuGet's hosted downloads.
+    let hosted = is_tarball
+        && (internal
+            || match tarball_version.as_deref() {
+                Some(v) => state
+                    .storage
+                    .stat(&format!("npm/{package_name}/versions/{v}.json"))
+                    .await
+                    .is_some(),
+                None => false,
+            });
+
+    // Upstream release date of the tarball's version, for curation and to seed the
+    // digest quarantine's first_seen (#750). Packuments have no version: `None`
+    // without any storage read.
+    let publish_date = match tarball_version.as_deref() {
+        Some(ver) if !hosted => npm_publish_date(&state, &package_name, ver).await,
+        _ => None,
     };
 
-    // Curation check — tarball downloads only (metadata passes through)
-    if is_tarball {
-        // #733: an internal-namespace package is operator-owned — skip curation; the cache-hit
-        // serve below handles a locally-published tarball, and the namespace guard at the
-        // cache-miss boundary (below) blocks the upstream branch for internal names.
-        if !crate::curation::is_internal_namespace(
+    // Curation check — upstream tarball downloads only (metadata passes through).
+    // #733: an internal-namespace package is operator-owned — the cache-hit serve below
+    // handles a locally-published tarball, and the namespace guard at the cache-miss
+    // boundary (below) blocks the upstream branch for internal names.
+    if is_tarball && !hosted {
+        if let Some(response) = crate::curation::check_download(
             &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
             crate::curation::RegistryType::Npm,
             &package_name,
+            crate::curation::RequestVersion::of_artifact(tarball_version.as_deref()),
+            publish_date,
         ) {
-            if let Some(response) = crate::curation::check_download(
-                &state.curation().curation_engine,
-                state.bypass_token().as_deref(),
-                &headers,
-                crate::curation::RegistryType::Npm,
-                &package_name,
-                crate::curation::RequestVersion::of_artifact(tarball_version.as_deref()),
-                publish_date,
-            ) {
-                return response;
-            }
+            return response;
         }
     }
 
@@ -665,24 +627,8 @@ async fn handle_request(
                 .quarantine_ttl
                 .as_deref()),
         );
-    // A hosted tarball (internal namespace, or this version published here) is our
-    // own publish, not a new upstream artifact: never held by the quarantine.
-    if is_tarball && !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
-        let hosted = crate::curation::is_internal_namespace(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Npm,
-            &package_name,
-        ) || match tarball_version.as_deref() {
-            Some(v) => state
-                .storage
-                .stat(&format!("npm/{package_name}/versions/{v}.json"))
-                .await
-                .is_some(),
-            None => false,
-        };
-        if hosted {
-            q_mode = crate::digest_quarantine::QuarantineMode::Off;
-        }
+    if hosted {
+        q_mode = crate::digest_quarantine::QuarantineMode::Off;
     }
 
     // Resumable download (#657): serve the requested bytes from the backend and skip
@@ -740,11 +686,6 @@ async fn handle_request(
     // .sha256 sidecar check below stays: it is the integrity check on S3 (storage
     // pins are local-only).
     let cached = if cache_trusted {
-        let internal = crate::curation::is_internal_namespace(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Npm,
-            &package_name,
-        );
         if is_tarball {
             // A tarball above `server.stream_threshold_mb` streams from storage (C17).
             match read_cached_artifact(&state, "npm", &key, internal).await {
@@ -802,14 +743,11 @@ async fn handle_request(
                             &headers,
                             rebase_hosted_tarballs(data, PUBLIC_BASE, &package_name),
                             &base,
+                            None,
                         );
                     }
-                    if crate::curation::is_internal_namespace(
-                        &state.curation().curation_engine,
-                        crate::curation::RegistryType::Npm,
-                        &package_name,
-                    ) {
-                        return packument_response(&headers, data, &base);
+                    if internal {
+                        return packument_response(&headers, data, &base, None);
                     }
                     // Single-flight: when a popular packument expires and a CI
                     // fleet stampedes the same key, one request revalidates
@@ -820,14 +758,18 @@ async fn handle_request(
                         state
                             .proxy_coalesce
                             .coalesced(&key, "npm", budget, || async {
-                                refetch_metadata(&state, &path, &key).await.map(Bytes::from)
+                                refetch_metadata(&state, &path, &key).await
                             })
                             .await
                     } else {
-                        refetch_metadata(&state, &path, &key).await.map(Bytes::from)
+                        refetch_metadata(&state, &path, &key).await
                     };
+                    // Filtered on this fresh document, `time` included: the cached
+                    // copy may predate the version it brings (R2-16).
+                    let curation = state.curation();
+                    let hide = Some((&curation.curation_engine, path.as_str()));
                     if let Some(fresh) = fresh {
-                        return packument_response(&headers, fresh, &base);
+                        return packument_response(&headers, fresh, &base, hide);
                     }
                     // Upstream failed — serve stale if configured, otherwise 502
                     if state.config.npm.serve_stale {
@@ -838,7 +780,7 @@ async fn handle_request(
                         );
                         // Degraded, but still the representation that was asked
                         // for: body and Content-Type must agree here too.
-                        let (stale_body, stale_type) = packument_body(&headers, data, &base);
+                        let (stale_body, stale_type) = packument_body(&headers, data, &base, hide);
                         return (
                             StatusCode::OK,
                             [
@@ -865,7 +807,14 @@ async fn handle_request(
                     return StatusCode::BAD_GATEWAY.into_response();
                 }
             }
-            return packument_response(&headers, data, &base);
+            // Fresh: a proxied packument is filtered; one published here is not.
+            let hosted_packument = !internal
+                && state.curation().curation_engine.metadata_filter_active()
+                && has_local_versions(&state.storage, &package_name).await;
+            let curation = state.curation();
+            let hide = (!internal && !hosted_packument)
+                .then_some((&curation.curation_engine, path.as_str()));
+            return packument_response(&headers, data, &base, hide);
         }
 
         // Tarball: integrity check if hash exists
@@ -978,6 +927,7 @@ async fn handle_request(
                     &headers,
                     rebase_hosted_tarballs(data, PUBLIC_BASE, &package_name),
                     &base,
+                    None,
                 );
             }
         }
@@ -993,6 +943,12 @@ async fn handle_request(
         &package_name,
     ) {
         return response;
+    }
+    // C24/R2-20: a package published here owns its name. A tarball of a version it
+    // does not have is not fetched upstream, where the name may be someone else's
+    // (and would learn of ours).
+    if is_tarball && (hosted || has_local_versions(&state.storage, &package_name).await) {
+        return StatusCode::NOT_FOUND.into_response();
     }
 
     // --- Proxy fetch path ---
@@ -1122,18 +1078,26 @@ async fn handle_request(
                         key = %key,
                         "serving upstream packument without caching: local versions own this key"
                     );
+                } else if !is_tarball {
+                    // LOCK-SAFE: `!has_local_versions` here, so the `publish_lock` above
+                    // was never taken on this path.
+                    //
+                    // Awaited, not spawned: the tarball requests that follow date their
+                    // version from this document, and a write still in flight sent each
+                    // of them upstream for the packument again (R2-11, R2-40).
+                    if let Err(e) =
+                        cache_packument(&state.storage, &path, data_to_cache, &origin_of(proxy_url))
+                            .await
+                    {
+                        tracing::warn!(key = %key, error = ?e, "npm proxy: failed to cache metadata");
+                    }
                 } else {
-                    // LOCK-SAFE: this write cannot race the `publish_lock` taken above,
-                    // because it only runs when `owns_key_locally` is false — that is,
-                    // `is_tarball` (the `if !is_tarball` block was never entered) or
-                    // `!has_local_versions` (the `if has_versions` block was never
-                    // entered). Either way the guard was never taken on this path, so
-                    // there is nothing for it to have dropped before.
+                    // LOCK-SAFE: a tarball; the `publish_lock` above guards packuments
+                    // only and was never taken on this path.
                     //
                     // Cache in background, invalidate index AFTER write completes
                     let storage = state.storage.clone();
                     let key_clone = key.clone();
-                    let invalidate_npm = is_tarball;
                     let repo_index = Arc::clone(&state.repo_index);
                     let origin = origin_of(proxy_url);
                     tokio::spawn(async move {
@@ -1141,7 +1105,7 @@ async fn handle_request(
                             put_with_origin(&storage, &key_clone, data_to_cache, &origin).await
                         {
                             tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache artifact");
-                        } else if invalidate_npm {
+                        } else {
                             repo_index.invalidate("npm");
                         }
                     });
@@ -1175,7 +1139,9 @@ async fn handle_request(
                 if is_tarball {
                     return with_content_type(true, data_to_serve).into_response();
                 }
-                return packument_response(&headers, data_to_serve, &base);
+                let curation = state.curation();
+                let hide = (!local_versions).then_some((&curation.curation_engine, path.as_str()));
+                return packument_response(&headers, data_to_serve, &base, hide);
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
             // The upstream answered "no such package": a real 404.
@@ -1508,7 +1474,7 @@ fn rebase_tarball(version: &mut serde_json::Value, prefix: &str) -> bool {
 
 /// Refetch metadata from upstream, rewrite URLs, update cache.
 /// Returns None if upstream is unavailable (caller serves stale cache).
-async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec<u8>> {
+async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Bytes> {
     let upstream = state.config.npm.route(path)?;
     let proxy_url = upstream.url;
     let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
@@ -1561,7 +1527,7 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
                     tokio::spawn(async move {
                         crate::registry::mark_revalidated(&storage, "npm", &key_clone).await;
                     });
-                    Some(cached.to_vec())
+                    Some(cached)
                 }
                 Err(_) => {
                     // Body gone (GC, retention, corruption). Delete the stale
@@ -1596,19 +1562,23 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
                     replace_upstream_bytes(&body, upstream_trimmed, &nora_npm_base)
                 });
 
-            let storage = state.storage.clone();
-            let key_clone = key.to_string();
-            let cache_data = rewritten.clone();
-            let origin = origin_of(proxy_url);
-            tokio::spawn(async move {
-                // Body first; the validator sidecar must never advertise
-                // freshness for a body that isn't there (#596).
-                if let Err(e) = put_with_origin(&storage, &key_clone, cache_data, &origin).await {
-                    tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache metadata");
-                    return;
+            let rewritten = Bytes::from(rewritten);
+            // Awaited: the tarball requests that follow date their version from the
+            // cached document (R2-16). Body first; the validator sidecar must never
+            // advertise freshness for a body that isn't there (#596).
+            match cache_packument(
+                &state.storage,
+                path,
+                rewritten.clone(),
+                &origin_of(proxy_url),
+            )
+            .await
+            {
+                Ok(()) => write_validators(&state.storage, key, &validators).await,
+                Err(e) => {
+                    tracing::warn!(key = %key, error = ?e, "npm proxy: failed to cache metadata")
                 }
-                write_validators(&storage, &key_clone, &validators).await;
-            });
+            }
 
             Some(rewritten)
         }
@@ -1786,7 +1756,8 @@ async fn handle_publish(
 /// packument or a version that exists or existed, then write the tarballs (attachment
 /// name, bytes), each new version as its own key with its publish time, the dist-tags
 /// and package fields of `payload`, regenerate the packument and check that it lists
-/// the new versions. The caller holds the package's publish lock.
+/// the new versions; on a failure after the first write, undo them (R2-21). The
+/// caller holds the package's publish lock.
 pub(crate) async fn publish_versions(
     storage: &crate::storage::Storage,
     locks: &crate::PublishLocks,
@@ -1794,12 +1765,6 @@ pub(crate) async fn publish_versions(
     payload: &serde_json::Value,
     tarballs: Vec<(String, Bytes)>,
 ) -> Result<(), (StatusCode, String)> {
-    let internal_error = || {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "npm publish failed".to_string(),
-        )
-    };
     let new_versions = match payload.get("versions").and_then(|v| v.as_object()) {
         Some(v) => v,
         None => return Err((StatusCode::BAD_REQUEST, "Missing versions".to_string())),
@@ -1865,33 +1830,155 @@ pub(crate) async fn publish_versions(
         }
     }
 
+    // R2-19: one tarball per new version, named as its `dist.tarball` below. An
+    // attachment named for any other file would overwrite another version's bytes.
+    let short_name = package_name.split('/').next_back().unwrap_or(package_name);
+    let mut expected: Vec<String> = new_versions
+        .keys()
+        .map(|ver| format!("{short_name}-{ver}.tgz"))
+        .collect();
+    let mut given: Vec<&str> = tarballs.iter().map(|(name, _)| name.as_str()).collect();
+    expected.sort_unstable();
+    given.sort_unstable();
+    if given != expected {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("each version needs exactly one attachment, named {short_name}-<version>.tgz"),
+        ));
+    }
+
     // Lazily migrate an old embedded-packument package to per-version keys BEFORE writing the new
     // version, so the regenerate below lists both the migrated and the new versions (no loss).
     if let Some(existing) = &existing_meta {
         migrate_embedded_packument(storage, package_name, existing).await;
     }
 
-    // Store tarballs
+    let mut writes = PublishWrites::default();
+    match write_publish(storage, locks, package_name, payload, tarballs, &mut writes).await {
+        Ok(()) => {}
+        Err(e) => {
+            writes.undo(storage, package_name).await;
+            return Err(e);
+        }
+    }
+    if proxied {
+        // The packument is local now: drop what described the upstream copy.
+        let _ = storage.delete(&origin_key(&metadata_key)).await;
+        let _ = storage.delete(&validators_key(&metadata_key)).await;
+    }
+    Ok(())
+}
+
+/// What a publish has written so far, undone when it fails (R2-21): a retry must find
+/// the version unpublished, not a 409 for a version the packument never listed.
+#[derive(Default)]
+struct PublishWrites {
+    /// Keys this publish created.
+    created: Vec<String>,
+    /// Dist-tag pointers it moved, with the target they had.
+    tags: Vec<(String, Option<Bytes>)>,
+}
+
+impl PublishWrites {
+    /// Best-effort: delete what was created, point the tags back, and bring the
+    /// packument back to the versions left (none: removed, as an unpublish does).
+    async fn undo(self, storage: &crate::Storage, package_name: &str) {
+        for key in self.created.iter().rev() {
+            let _ = storage.delete(key).await;
+        }
+        for (key, old) in self.tags {
+            let _ = match old {
+                Some(target) => storage.put_bytes(&key, target).await,
+                None => storage.delete(&key).await,
+            };
+        }
+        if has_local_versions(storage, package_name).await {
+            let _ = regenerate_packument(storage, package_name).await;
+        } else {
+            let _ = storage
+                .delete(&format!("npm/{package_name}/pkg.json"))
+                .await;
+            let _ = storage
+                .delete(&format!("npm/{package_name}/metadata.json"))
+                .await;
+        }
+        tracing::warn!(package = %package_name, "npm publish failed; its writes were rolled back");
+    }
+}
+
+/// The writes of [`publish_versions`] once its checks passed, each recorded in
+/// `writes` so the caller can undo them.
+async fn write_publish(
+    storage: &crate::storage::Storage,
+    locks: &crate::PublishLocks,
+    package_name: &str,
+    payload: &serde_json::Value,
+    tarballs: Vec<(String, Bytes)>,
+    writes: &mut PublishWrites,
+) -> Result<(), (StatusCode, String)> {
+    let internal_error = || {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "npm publish failed".to_string(),
+        )
+    };
+    let new_versions = payload
+        .get("versions")
+        .and_then(|v| v.as_object())
+        .ok_or_else(internal_error)?;
+    let metadata_key = format!("npm/{}/metadata.json", package_name);
+
+    // Store tarballs.
     for (name, tarball_bytes) in tarballs {
         let tarball_key = format!("npm/{}/tarballs/{}", package_name, name);
         let hash = hex::encode(sha2::Sha256::digest(&tarball_bytes));
-        // A publish is never a proxy cache: drop the provenance of a proxied copy it
-        // replaces, or GC and the integrity heal would treat it as one (C54). Under the
-        // tarball's publish lock, so the heal of a failing proxied copy and a cache fill
-        // of the same key serialise with the replacement; a provenance that cannot be
-        // removed aborts the publish (same bytes would keep it valid for the new pin).
+        // A proxied copy (provenance recorded) is a cache of an upstream file, not a
+        // publish: it is replaced, and its provenance dropped first, or GC and the
+        // integrity heal would treat the publish as one (C54); a provenance that cannot
+        // be removed aborts the publish. Anything else under this name was published
+        // here and is never replaced (R2-19): the same bytes are a retry of an
+        // interrupted publish, different ones a 409. Under the tarball's publish lock,
+        // so the heal of a failing proxied copy and a cache fill of the same key
+        // serialise with the replacement.
         let lock = crate::acquire_publish_lock(locks, &tarball_key);
         let guard = lock.lock().await;
-        match storage.delete(&origin_key(&tarball_key)).await {
-            Ok(()) | Err(crate::storage::StorageError::NotFound) => {}
-            Err(e) => {
-                tracing::error!(key = %tarball_key, error = ?e, "npm publish: failed to remove stale provenance");
-                return Err(internal_error());
+        let proxied_copy = storage.stat(&origin_key(&tarball_key)).await.is_some();
+        if proxied_copy {
+            match storage.delete(&origin_key(&tarball_key)).await {
+                Ok(()) | Err(crate::storage::StorageError::NotFound) => {}
+                Err(e) => {
+                    tracing::error!(key = %tarball_key, error = ?e, "npm publish: failed to remove stale provenance");
+                    return Err(internal_error());
+                }
             }
         }
-        if let Err(e) = storage.put_bytes(&tarball_key, tarball_bytes).await {
-            tracing::error!(key = %tarball_key, error = ?e, "npm publish: failed to store tarball");
-            return Err(internal_error());
+        let written = if proxied_copy {
+            storage
+                .put_bytes(&tarball_key, tarball_bytes)
+                .await
+                .map(|()| true)
+        } else {
+            storage.put_if_absent(&tarball_key, tarball_bytes).await
+        };
+        match written {
+            Ok(true) => writes.created.push(tarball_key.clone()),
+            Ok(false) => {
+                let same = storage
+                    .get(&tarball_key)
+                    .await
+                    .is_ok_and(|stored| hex::encode(sha2::Sha256::digest(&stored)) == hash);
+                if !same {
+                    tracing::warn!(key = %tarball_key, "npm publish refused: a different tarball is stored under this name");
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!("{name} already exists with different contents"),
+                    ));
+                }
+            }
+            Err(e) => {
+                tracing::error!(key = %tarball_key, error = ?e, "npm publish: failed to store tarball");
+                return Err(internal_error());
+            }
         }
         drop(guard);
 
@@ -1900,6 +1987,7 @@ pub(crate) async fn publish_versions(
         if let Err(e) = storage.put(&hash_key, hash.as_bytes()).await {
             tracing::warn!(key = %hash_key, error = ?e, "npm publish: failed to store hash sidecar");
         }
+        writes.created.push(hash_key);
     }
 
     // Write each new version as its OWN immutable key, with the tarball URL rewritten to point at
@@ -1923,6 +2011,7 @@ pub(crate) async fn publish_versions(
         let version_key = format!("npm/{}/versions/{}.json", package_name, ver);
         match serde_json::to_vec(&vd) {
             Ok(bytes) => {
+                writes.created.push(version_key.clone());
                 if let Err(e) = storage.put(&version_key, &bytes).await {
                     tracing::error!(key = %version_key, error = ?e, "npm publish: failed to store version");
                     return Err(internal_error());
@@ -1930,6 +2019,7 @@ pub(crate) async fn publish_versions(
                 // The packument's `time[<ver>]`; best-effort, an unpublish writes it
                 // if missing.
                 let key = time_key(package_name, ver);
+                writes.created.push(key.clone());
                 if let Err(e) = storage.put(&key, now.as_bytes()).await {
                     tracing::warn!(key = %key, error = ?e, "npm publish: failed to store publish time");
                 }
@@ -1947,9 +2037,11 @@ pub(crate) async fn publish_versions(
         for (tag, ver) in new_dist_tags {
             if let Some(ver_str) = ver.as_str() {
                 let tag_key = format!("npm/{}/dist-tags/{}", package_name, tag);
+                let old = storage.get(&tag_key).await.ok();
                 if let Err(e) = storage.put(&tag_key, ver_str.as_bytes()).await {
                     tracing::warn!(key = %tag_key, error = ?e, "npm publish: failed to store dist-tag");
                 }
+                writes.tags.push((tag_key, old));
             }
         }
     }
@@ -1972,11 +2064,6 @@ pub(crate) async fn publish_versions(
     if regenerate_packument(storage, package_name).await.is_err() {
         tracing::error!(package = %package_name, "npm publish: failed to regenerate packument");
         return Err(internal_error());
-    }
-    if proxied {
-        // The packument is local now: drop what described the upstream copy.
-        let _ = storage.delete(&origin_key(&metadata_key)).await;
-        let _ = storage.delete(&validators_key(&metadata_key)).await;
     }
 
     // Fail-closed (#878): a 201 MUST mean the published version is actually visible in
@@ -2484,90 +2571,142 @@ pub(crate) fn semver_key(v: &str) -> (u64, u64, u64, bool) {
     (n(it.next()), n(it.next()), n(it.next()), !v.contains('-'))
 }
 
-/// Self-prime `npm/{name}/metadata.json` so the release-age date (#748) is
-/// available on the tarball download path itself.
-///
-/// A locked/direct tarball fetch (`/npm/{name}/-/{name}-{version}.tgz`) may
-/// arrive without a prior packument request, so `metadata.json` (the carrier of
-/// the per-version `time[version]`) would never be cached and the quarantine
-/// would always fall back to NORA's own clock — a provably-old npm artifact is
-/// then held for the full TTL as "new to this mirror". Without this, the
-/// release-age maturation never fires for npm. Synchronous `put` (not
-/// `spawn_cache`) so the date is readable on the same request. Best-effort: any
-/// failure leaves the date `None` (fail-safe — the package is held as new).
-/// Namespace-safe: an internal-namespace package is never fetched upstream
-/// (#68). Mirrors Cargo's `ensure_cargo_metadata_cached` and PyPI's
-/// `ensure_pypi_dates_cached`.
-async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
-    let key = format!("npm/{}/metadata.json", package_name);
-    if state.storage.get(&key).await.is_ok()
-        && cached_copy_trusted(state, package_name, &key, package_name, None).await
-    {
-        return;
+/// `npm/{name}/dates.json`: the `time` map (version → ISO 8601) of the cached proxied
+/// packument, written with it. The tarball gates date a version from this, not from a
+/// packument that runs to megabytes (R2-17), as PyPI does with its `dates.json`.
+fn dates_key(name: &str) -> String {
+    format!("npm/{name}/dates.json")
+}
+
+/// The `time` map of a packument, scanned without building the whole document.
+fn packument_times(data: &[u8]) -> serde_json::Map<String, serde_json::Value> {
+    #[derive(serde::Deserialize)]
+    struct Times {
+        #[serde(default)]
+        time: serde_json::Map<String, serde_json::Value>,
     }
-    // #68: never fetch an internal-namespace package's metadata upstream, nor
-    // cache one over a package published here.
+    serde_json::from_slice::<Times>(data)
+        .map(|t| t.time)
+        .unwrap_or_default()
+}
+
+/// Cache a proxied packument (already rewritten to [`PUBLIC_BASE`]) with its
+/// provenance and its [`dates_key`] companion. A failed companion write only costs
+/// a read of the packument later.
+async fn cache_packument(
+    storage: &crate::Storage,
+    name: &str,
+    data: Bytes,
+    origin: &str,
+) -> Result<(), crate::storage::StorageError> {
+    let times = packument_times(&data);
+    put_with_origin(storage, &format!("npm/{name}/metadata.json"), data, origin).await?;
+    write_dates(storage, name, &times).await;
+    Ok(())
+}
+
+async fn write_dates(
+    storage: &crate::Storage,
+    name: &str,
+    times: &serde_json::Map<String, serde_json::Value>,
+) {
+    let key = dates_key(name);
+    if let Ok(bytes) = serde_json::to_vec(times) {
+        if let Err(e) = storage.put(&key, &bytes).await {
+            tracing::warn!(key = %key, error = ?e, "npm: failed to cache release dates");
+        }
+    }
+}
+
+/// The upstream release date of `name@version` for the tarball gates, or `None`.
+///
+/// #513: untrusted upstream dates → no date: never the (spoofable) upstream date, nor
+/// the cache mtime (refreshed with the metadata, not a release date).
+///
+/// #748: a tarball download may arrive without a prior packument request
+/// (direct/locked fetch), so the packument is self-primed here, synchronously, so
+/// the date is readable on this same request; it joins a packument fetch already in
+/// flight for the same name. Best-effort: any failure leaves the date `None`
+/// (fail-safe — the package is held as new). Namespace-safe: an internal-namespace
+/// package, or one published here, is never fetched upstream (#68). Mirrors Cargo's
+/// `ensure_cargo_metadata_cached` and PyPI's `ensure_pypi_dates_cached`.
+async fn npm_publish_date(state: &AppState, name: &str, version: &str) -> Option<i64> {
+    if !state.config.server.trust_upstream_dates {
+        return None;
+    }
+    let times = npm_release_times(state, name).await?;
+    crate::curation::parse_iso8601_to_unix(times.get(version)?.as_str()?)
+}
+
+/// The `time` map of `name`: its [`dates_key`], else the cached packument's (stored
+/// as the companion for next time), else the packument fetched upstream and cached.
+async fn npm_release_times(
+    state: &AppState,
+    name: &str,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let key = format!("npm/{name}/metadata.json");
+    // #1055: inside a scope owned by a private upstream, only the owner's copy counts.
+    if cached_copy_trusted(state, name, &key, name, None).await {
+        if let Ok(dates) = state.storage.get(&dates_key(name)).await {
+            if let Ok(times) = serde_json::from_slice(&dates) {
+                return Some(times);
+            }
+        }
+        // Cached before the companion existed.
+        if let Ok(data) = state.storage.get(&key).await {
+            let times = packument_times(&data);
+            write_dates(&state.storage, name, &times).await;
+            return Some(times);
+        }
+    }
     if crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
         crate::curation::RegistryType::Npm,
-        package_name,
-    ) || has_local_versions(&state.storage, package_name).await
+        name,
+    ) || has_local_versions(&state.storage, name).await
     {
-        return;
+        return None;
     }
-    let Some(upstream) = state.config.npm.route(package_name) else {
-        return;
-    };
+    let upstream = state.config.npm.route(name)?;
     let proxy_url = upstream.url;
-    let url = format!("{}/{}", proxy_url.trim_end_matches('/'), package_name);
-    if let Ok(data) = proxy_fetch(
+    let url = format!("{}/{}", proxy_url.trim_end_matches('/'), name);
+    let timeout = state.config.npm.proxy_timeout;
+    let fetch = proxy_fetch_bytes(
         &state.http_client,
         &url,
-        Duration::from_secs(state.config.npm.proxy_timeout),
+        Duration::from_secs(timeout),
         upstream.auth,
         &state.circuit_breaker,
         BreakerScope::upstream(RegistryType::Npm, upstream.url),
-    )
-    .await
-    {
+    );
+    // The packument request's own key: a concurrent cold miss on it fetches once.
+    let (data, fetched) = proxy_fetch_shared(state, &key, "npm", timeout, fetch)
+        .await
+        .ok()?;
+    let times = packument_times(&data);
+    if fetched {
         // Rewrite tarball URLs to point at NORA, exactly as the proxy path and
         // refetch_metadata do, so a subsequent client reading the cached
         // packument is not sent back to the upstream.
         let nora_base = PUBLIC_BASE;
         let rewritten = rewrite_tarball_urls(&data, nora_base, proxy_url).unwrap_or_else(|()| {
             tracing::warn!(
-                package = %package_name,
+                package = %name,
                 "npm metadata self-prime: JSON parse failed, using byte-level URL rewrite",
             );
             let upstream_trimmed = proxy_url.trim_end_matches('/');
             let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
             replace_upstream_bytes(&data, upstream_trimmed, &nora_npm_base)
         });
-        let _ = put_with_origin(&state.storage, &key, rewritten, &origin_of(proxy_url)).await;
+        let _ = cache_packument(
+            &state.storage,
+            name,
+            rewritten.into(),
+            &origin_of(proxy_url),
+        )
+        .await;
     }
-}
-
-/// Extract publish date for a specific version from cached npm metadata.
-///
-/// npm metadata JSON has a `time` object mapping versions to ISO 8601 dates:
-/// ```json
-/// { "time": { "1.0.0": "2024-01-15T10:30:00.000Z" } }
-/// ```
-async fn extract_npm_publish_date(
-    storage: &crate::storage::Storage,
-    metadata_key: &str,
-    version: &str,
-    trust_upstream: bool,
-) -> Option<i64> {
-    // #513: untrusted upstream dates → no date: never the (spoofable) upstream
-    // date, nor the cache mtime (refreshed with the metadata, not a release date).
-    if !trust_upstream {
-        return None;
-    }
-    let data = storage.get(metadata_key).await.ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
-    let date_str = json.get("time")?.get(version)?.as_str()?;
-    crate::curation::parse_iso8601_to_unix(date_str)
+    Some(times)
 }
 
 /// npm's abbreviated packument — `application/vnd.npm.install-v1+json`, the
@@ -2614,10 +2753,9 @@ fn wants_install_v1(headers: &HeaderMap) -> bool {
         .is_some_and(|accept| accept.contains(NPM_INSTALL_V1))
 }
 
-/// Project a full packument down to the abbreviated form. `None` when the body
-/// is not a packument we can parse — the caller then serves it unchanged.
-fn abbreviate_packument(full: &[u8]) -> Option<Vec<u8>> {
-    let doc: serde_json::Value = serde_json::from_slice(full).ok()?;
+/// Project a full packument down to the abbreviated form. `None` when the document
+/// is not an object — the caller then serves the body unchanged.
+fn abbreviate_packument(doc: &serde_json::Value) -> Option<Vec<u8>> {
     let obj = doc.as_object()?;
 
     let mut out = serde_json::Map::new();
@@ -2647,27 +2785,62 @@ fn abbreviate_packument(full: &[u8]) -> Option<Vec<u8>> {
     serde_json::to_vec(&serde_json::Value::Object(out)).ok()
 }
 
+/// Q04 filter of a proxied packument: the curation engine and the package name.
+type HideYoung<'a> = Option<(&'a crate::curation::CurationEngine, &'a str)>;
+
 /// Serve a packument, honouring the abbreviated form when the client asks for it.
+/// `hide`: a proxied packument, filtered by `min_release_age` (Q04) on the full
+/// document before it is abbreviated. The body is parsed at most once.
 ///
 /// `Vary: Accept` is not decoration here: the body depends on a request header
 /// and NORA marks metadata `Cache-Control: public`, so without it a shared cache
 /// can hand the abbreviated document to a client that asked for the full one.
-fn packument_body(headers: &HeaderMap, data: Bytes, nora_base: &str) -> (Bytes, &'static str) {
-    let (body, content_type) = if !wants_install_v1(headers) {
-        (data, "application/json")
+fn packument_body(
+    headers: &HeaderMap,
+    data: Bytes,
+    nora_base: &str,
+    hide: HideYoung<'_>,
+) -> (Bytes, &'static str) {
+    let install_v1 = wants_install_v1(headers);
+    let hide = hide.filter(|(engine, _)| engine.metadata_filter_active());
+    let parsed = if install_v1 || hide.is_some() {
+        serde_json::from_slice::<serde_json::Value>(&data).ok()
     } else {
-        match abbreviate_packument(&data) {
-            Some(short) => (Bytes::from(short), NPM_INSTALL_V1),
-            // Unparsable body: serve it unchanged. The client asked for a
-            // projection of this document, not for an error.
-            None => (data, "application/json"),
+        None
+    };
+    // Unparsable body: serve it unchanged. The client asked for a projection of
+    // this document, not for an error.
+    let (body, content_type) = match parsed {
+        None => (data, "application/json"),
+        Some(mut doc) => {
+            let hidden = hide.is_some_and(|(engine, name)| {
+                crate::metadata_filter::npm_packument(engine, name, &mut doc)
+            });
+            if install_v1 {
+                match abbreviate_packument(&doc) {
+                    Some(short) => (Bytes::from(short), NPM_INSTALL_V1),
+                    None => (data, "application/json"),
+                }
+            } else if hidden {
+                match serde_json::to_vec(&doc) {
+                    Ok(filtered) => (Bytes::from(filtered), "application/json"),
+                    Err(_) => (data, "application/json"),
+                }
+            } else {
+                (data, "application/json")
+            }
         }
     };
     (with_public_base(body, nora_base), content_type)
 }
 
-fn packument_response(headers: &HeaderMap, data: Bytes, nora_base: &str) -> Response {
-    let (body, content_type) = packument_body(headers, data, nora_base);
+fn packument_response(
+    headers: &HeaderMap,
+    data: Bytes,
+    nora_base: &str,
+    hide: HideYoung<'_>,
+) -> Response {
+    let (body, content_type) = packument_body(headers, data, nora_base, hide);
 
     (
         StatusCode::OK,
@@ -3762,14 +3935,16 @@ mod integration_tests {
             "tarball URL not rewritten to NORA"
         );
 
-        // The publish date must now be resolvable from the cached packument.
-        let date = super::extract_npm_publish_date(
-            &ctx.state.storage,
-            "npm/testpkg/metadata.json",
-            "1.0.0",
-            true,
-        )
-        .await;
+        // The release dates are cached beside it, and the date resolves from them.
+        let dates = ctx
+            .state
+            .storage
+            .get("npm/testpkg/dates.json")
+            .await
+            .unwrap();
+        let dates: serde_json::Value = serde_json::from_slice(&dates).unwrap();
+        assert_eq!(dates["1.0.0"], "2020-01-15T10:30:00.000Z");
+        let date = super::npm_publish_date(&ctx.state, "testpkg", "1.0.0").await;
         assert_eq!(
             date,
             Some(1579084200),
@@ -3781,18 +3956,15 @@ mod integration_tests {
     /// (moved to now by every metadata refresh) is a publish date.
     #[tokio::test]
     async fn test_extract_npm_publish_date_untrusted_ignores_mtime() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::storage::Storage::new_local(dir.path().to_str().unwrap());
-        let meta = serde_json::json!({ "time": { "1.0.0": "2020-01-15T10:30:00.000Z" } });
-        storage
-            .put("npm/p/metadata.json", meta.to_string().as_bytes())
-            .await
-            .unwrap();
-        let date = |trust| {
-            super::extract_npm_publish_date(&storage, "npm/p/metadata.json", "1.0.0", trust)
-        };
-        assert_eq!(date(false).await, None);
-        assert_eq!(date(true).await, Some(1579084200));
+        for trust in [false, true] {
+            let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+                cfg.server.trust_upstream_dates = trust;
+            });
+            let meta = serde_json::json!({ "time": { "1.0.0": "2020-01-15T10:30:00.000Z" } });
+            ctx_seed_metadata(&ctx, "p", &meta).await;
+            let date = super::npm_publish_date(&ctx.state, "p", "1.0.0").await;
+            assert_eq!(date, trust.then_some(1579084200), "trust={trust}");
+        }
     }
 
     /// Cached metadata short-circuits ensure_npm_metadata_cached — no upstream
@@ -4859,8 +5031,7 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
-    /// Hosted packuments carry `time` (per version, `created`, `modified`), and the
-    /// release-age date of a hosted version is read from it.
+    /// Hosted packuments carry `time` (per version, `created`, `modified`).
     #[tokio::test]
     async fn hosted_packument_has_time_map() {
         let ctx = create_test_context();
@@ -4876,15 +5047,162 @@ mod integration_tests {
         let time = &json["time"];
         assert_eq!(time["created"], time["1.0.0"], "{json}");
         assert_eq!(time["modified"], time["1.1.0"], "{json}");
-        let date = super::extract_npm_publish_date(
-            &ctx.state.storage,
-            "npm/timed/metadata.json",
-            "1.0.0",
-            true,
+    }
+
+    fn iso_ago(secs: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::seconds(secs))
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    }
+
+    /// R2-18: with the npm cooldown enforced on trusted dates, a version published
+    /// here (outside any internal namespace) downloads at once — its `time` is the
+    /// local publish time — while an upstream version that young is still refused.
+    #[tokio::test]
+    async fn hosted_version_is_exempt_from_min_release_age() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/young"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "young", "dist-tags": { "latest": "1.0.0" },
+                "versions": { "1.0.0": { "dist": {} } },
+                "time": { "1.0.0": iso_ago(3600) }
+            })))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/young/-/young-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tgz".to_vec()))
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+            cfg.server.trust_upstream_dates = true;
+        });
+        assert_eq!(
+            publish(&ctx.app, "ours", "1.0.0").await,
+            StatusCode::CREATED
+        );
+        let resp = send(&ctx.app, Method::GET, "/npm/ours/-/ours-1.0.0.tgz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "our own publish is not held");
+        assert_eq!(&body_bytes(resp).await[..], b"tgz");
+
+        let resp = send(&ctx.app, Method::GET, "/npm/young/-/young-1.0.0.tgz", "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "upstream cooldown stays"
+        );
+    }
+
+    /// R2-19: an attachment named for another version's tarball is refused, and the
+    /// bytes already published under that name are left alone; a different tarball
+    /// stored (not proxied) under a new version's name is a 409.
+    #[tokio::test]
+    async fn publish_cannot_overwrite_another_tarball() {
+        let ctx = create_test_context();
+        assert_eq!(publish(&ctx.app, "imm", "1.0.0").await, StatusCode::CREATED);
+        let key = "npm/imm/tarballs/imm-1.0.0.tgz";
+        let before = ctx.state.storage.get(key).await.unwrap();
+
+        let payload = serde_json::json!({
+            "name": "imm",
+            "versions": { "1.0.1": { "name": "imm", "version": "1.0.1", "dist": {} } },
+            "_attachments": { "imm-1.0.0.tgz": {
+                "data": base64::engine::general_purpose::STANDARD.encode(b"evil")
+            } },
+        });
+        let body = Body::from(serde_json::to_vec(&payload).unwrap());
+        let resp = send(&ctx.app, Method::PUT, "/npm/imm", body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(ctx.state.storage.get(key).await.unwrap(), before);
+        assert!(ctx
+            .state
+            .storage
+            .stat("npm/imm/versions/1.0.1.json")
+            .await
+            .is_none());
+
+        // A tarball already cached under the name of a version now published here.
+        ctx.state
+            .storage
+            .put("npm/imm/tarballs/imm-2.0.0.tgz", b"upstream bytes")
+            .await
+            .unwrap();
+        assert_eq!(
+            publish(&ctx.app, "imm", "2.0.0").await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            &ctx.state
+                .storage
+                .get("npm/imm/tarballs/imm-2.0.0.tgz")
+                .await
+                .unwrap()[..],
+            b"upstream bytes"
+        );
+    }
+
+    /// R2-20: a package published here never fetches a tarball it does not have from
+    /// the upstream, and its name is kept out of the audit forwarded there.
+    #[tokio::test]
+    async fn hosted_package_never_reaches_upstream() {
+        use wiremock::matchers::{any, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/-/npm/v1/security/advisories/bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&upstream)
+            .await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"squatted".to_vec()))
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.internal_namespaces = vec!["@corp/*".to_string()];
+        });
+        assert_eq!(
+            publish(&ctx.app, "owned", "1.0.0").await,
+            StatusCode::CREATED
+        );
+
+        let resp = send(&ctx.app, Method::GET, "/npm/owned/-/owned-0.9.0.tgz", "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = send(&ctx.app, Method::GET, "/npm/owned/-/owned-1.0.0.tgz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let audit = serde_json::json!({ "owned": ["1.0.0"], "lodash": ["4.17.20"] });
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/advisories/bulk",
+            audit.to_string(),
         )
         .await;
-        let now = chrono::Utc::now().timestamp();
-        assert!(date.is_some_and(|d| (now - d).abs() < 60), "{date:?}");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let requests = upstream.received_requests().await.unwrap();
+        assert!(
+            requests.iter().all(|r| !r.url.path().contains("owned")),
+            "no request for the hosted name: {:?}",
+            requests.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+        );
+        let forwarded: serde_json::Value = serde_json::from_slice(
+            &requests
+                .iter()
+                .find(|r| r.method.as_str() == "POST")
+                .expect("the audit was forwarded")
+                .body,
+        )
+        .unwrap();
+        assert_eq!(forwarded, serde_json::json!({ "lodash": ["4.17.20"] }));
     }
 
     /// Tarball URLs follow the current `public_url` on every serve path: a fresh
@@ -6369,7 +6687,9 @@ mod spec_conformance_tests {
 #[allow(clippy::unwrap_used)]
 mod index_cost_tests {
     //! Serving a stored packument must cost the same storage round-trips for 1 and 100 versions.
-    use crate::test_helpers::{create_test_context_with_storage, op_counting_storage, send};
+    use crate::test_helpers::{
+        create_test_context_with_storage, op_counting_storage, send, send_with_headers,
+    };
     use axum::http::{Method, StatusCode};
 
     async fn packument_ops(n: usize) -> (usize, String) {
@@ -6406,6 +6726,158 @@ mod index_cost_tests {
         let resp = send(&ctx.app, Method::GET, "/npm/costpkg", "").await;
         assert_eq!(resp.status(), StatusCode::OK, "packument with {n} versions");
         (ops.total(), format!("{:?}", ops.snapshot()))
+    }
+
+    fn iso_ago(secs: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::seconds(secs))
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    }
+
+    /// R2-11/R2-17/R2-40: with the Q04 filter on, a cold packument miss fetches the
+    /// upstream document once and writes it once, before the response; a warm GET
+    /// reads it once; a tarball download dates its version from the small
+    /// `dates.json`, never from the packument.
+    #[tokio::test]
+    async fn npm_packument_and_tarball_fetch_and_read_once() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_storage_and_config};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let v = |n: &str| serde_json::json!({ "name": "pkg", "version": n, "dist": {} });
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "pkg",
+                "dist-tags": { "latest": "1.1.0" },
+                "versions": { "1.0.0": v("1.0.0"), "1.1.0": v("1.1.0") },
+                "time": { "1.0.0": iso_ago(30 * 86400), "1.1.0": iso_ago(3600) }
+            })))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pkg/-/pkg-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tgz".to_vec()))
+            .mount(&upstream)
+            .await;
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+            cfg.server.trust_upstream_dates = true;
+        });
+        let packument_fetches = || async {
+            upstream
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path() == "/pkg")
+                .count()
+        };
+        let meta = "npm/pkg/metadata.json";
+        let corgi = vec![("accept", "application/vnd.npm.install-v1+json")];
+
+        let resp = send_with_headers(&ctx.app, Method::GET, "/npm/pkg", corgi.clone(), "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let short: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert!(short["versions"].get("1.1.0").is_none(), "{short}");
+        assert_eq!(short["dist-tags"]["latest"], "1.0.0");
+        assert_eq!(packument_fetches().await, 1, "one upstream fetch");
+        assert_eq!(ops.calls("put", meta), 1, "one write: {:?}", ops.snapshot());
+        assert_eq!(ops.calls("put", "npm/pkg/dates.json"), 1);
+
+        ops.reset();
+        let resp = send_with_headers(&ctx.app, Method::GET, "/npm/pkg", corgi, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(ops.calls("get", meta), 1, "one read: {:?}", ops.snapshot());
+
+        ops.reset();
+        let resp = send(&ctx.app, Method::GET, "/npm/pkg/-/pkg-1.0.0.tgz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(packument_fetches().await, 1, "the tarball reuses the cache");
+        assert_eq!(ops.calls("get", meta), 0, "{:?}", ops.snapshot());
+        assert_eq!(ops.calls("get", "npm/pkg/dates.json"), 1);
+    }
+
+    /// R2-21: a publish that fails after its first write leaves nothing behind —
+    /// version, publish time, tarball, moved dist-tag — so the retry succeeds.
+    #[tokio::test]
+    async fn failed_publish_is_rolled_back_and_retried() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_storage};
+        use base64::Engine;
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage(storage);
+        let publish = |ver: &str| {
+            let payload = serde_json::json!({
+                "name": "atom",
+                "dist-tags": { "latest": ver },
+                "versions": { ver: { "name": "atom", "version": ver, "dist": {} } },
+                "_attachments": { format!("atom-{ver}.tgz"): {
+                    "data": base64::engine::general_purpose::STANDARD.encode(ver)
+                } },
+            });
+            send(
+                &ctx.app,
+                Method::PUT,
+                "/npm/atom",
+                serde_json::to_vec(&payload).unwrap(),
+            )
+        };
+        assert_eq!(publish("1.0.0").await.status(), StatusCode::CREATED);
+
+        ops.fail_puts_ending(Some("metadata.json"));
+        assert_eq!(
+            publish("1.1.0").await.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        ops.fail_puts_ending(None);
+        for gone in [
+            "npm/atom/versions/1.1.0.json",
+            "npm/atom/time/1.1.0",
+            "npm/atom/tarballs/atom-1.1.0.tgz",
+        ] {
+            assert!(
+                ctx.state.storage.stat(gone).await.is_none(),
+                "{gone} left behind"
+            );
+        }
+        let latest = ctx.state.storage.get("npm/atom/dist-tags/latest").await;
+        assert_eq!(&latest.unwrap()[..], b"1.0.0", "tag pointed back");
+
+        assert_eq!(publish("1.1.0").await.status(), StatusCode::CREATED);
+        let resp = send(&ctx.app, Method::GET, "/npm/atom", "").await;
+        let doc: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert!(doc["versions"].get("1.1.0").is_some(), "{doc}");
+        assert_eq!(doc["dist-tags"]["latest"], "1.1.0");
+
+        // A failed first publish leaves no packument for a package with no version.
+        ops.fail_puts_ending(Some("metadata.json"));
+        let payload = serde_json::json!({
+            "name": "first",
+            "versions": { "1.0.0": { "name": "first", "version": "1.0.0", "dist": {} } },
+            "_attachments": { "first-1.0.0.tgz": {
+                "data": base64::engine::general_purpose::STANDARD.encode(b"tgz")
+            } },
+        });
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/npm/first",
+            serde_json::to_vec(&payload).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        ops.fail_puts_ending(None);
+        assert!(ctx
+            .state
+            .storage
+            .list("npm/first/")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
