@@ -360,6 +360,13 @@ fn with_public_base(data: Bytes, nora_base: &str) -> Bytes {
     ))
 }
 
+/// Upstream URL paths a proxied packument keeps on purpose: Sigstore provenance
+/// (`versions.*.dist.attestations.url`, `/-/npm/v1/attestations/<pkg>@<ver>`) has no
+/// NORA handler, so `npm audit signatures` fetches it from the upstream directly.
+/// One list for the leak detector (`metrics::UPSTREAM_PASSTHROUGH`) and the air-gap
+/// invariant test.
+pub(crate) const UPSTREAM_PASSTHROUGH_PATHS: &[&str] = &["/-/npm/v1/attestations/"];
+
 /// Rewrite tarball URLs in npm metadata to point to NORA.
 ///
 /// Replaces upstream registry URLs (e.g. `https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz`)
@@ -5567,10 +5574,17 @@ mod spec_conformance_tests {
 
     const NPM_UPSTREAM_DOMAIN: &str = "registry.npmjs.org";
 
-    /// Assert that no upstream URLs remain in rewritten response body.
+    /// Assert that no upstream URLs remain in rewritten response body, apart from
+    /// the intentional pass-throughs (`UPSTREAM_PASSTHROUGH_PATHS`).
     fn assert_no_upstream_urls(body: &str, context: &str) {
+        let leaked = body.match_indices(NPM_UPSTREAM_DOMAIN).any(|(at, _)| {
+            let rest = &body[at + NPM_UPSTREAM_DOMAIN.len()..];
+            !UPSTREAM_PASSTHROUGH_PATHS
+                .iter()
+                .any(|p| rest.starts_with(p))
+        });
         assert!(
-            !body.contains(NPM_UPSTREAM_DOMAIN),
+            !leaked,
             "upstream domain '{}' leaked in {}: {}",
             NPM_UPSTREAM_DOMAIN,
             context,
@@ -5584,6 +5598,19 @@ mod spec_conformance_tests {
     }
 
     // ── Regular package rewrite ──
+
+    #[test]
+    fn attestations_url_passes_through_and_tarball_is_rewritten() {
+        let packument = br#"{"name":"vite-node","versions":{"1.0.0":{"dist":{"tarball":"https://registry.npmjs.org/vite-node/-/vite-node-1.0.0.tgz","attestations":{"url":"https://registry.npmjs.org/-/npm/v1/attestations/vite-node@1.0.0"}}}}}"#;
+        let body = String::from_utf8(
+            rewrite_tarball_urls(packument, "http://nora:4000", "https://registry.npmjs.org")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(body.contains("http://nora:4000/npm/vite-node/-/vite-node-1.0.0.tgz"));
+        assert!(body.contains("https://registry.npmjs.org/-/npm/v1/attestations/vite-node@1.0.0"));
+        assert_no_upstream_urls(&body, "attestations pass-through");
+    }
 
     #[test]
     fn test_regular_package_golden_no_upstream_leak() {

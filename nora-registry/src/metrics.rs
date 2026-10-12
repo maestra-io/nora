@@ -499,14 +499,21 @@ struct LeakFinderEntry {
     passthrough: Vec<String>,
 }
 
-/// Upstream URL paths a registry's rewriter leaves in its responses on purpose.
-/// npm and PyPI have none: npm rewrites tarball links and leaves other mentions of
-/// the upstream (a readme) untouched as text, PyPI rewrites every file URL.
+/// Upstream URL paths each registry's rewriter leaves in its responses on purpose,
+/// one entry per registry: NuGet `catalogEntry.@id` (catalog0), npm Sigstore
+/// attestations. PyPI has none (every file URL is rewritten; `project_urls` are not
+/// registry URLs). Other upstream mentions (a readme) are not URLs NORA serves and
+/// the npm/NuGet rewriters leave them as text.
+pub(crate) const UPSTREAM_PASSTHROUGH: &[(&str, &[&str])] = &[
+    ("nuget", crate::registry::nuget::UPSTREAM_PASSTHROUGH_PATHS),
+    ("npm", crate::registry::npm::UPSTREAM_PASSTHROUGH_PATHS),
+];
+
 fn passthrough_paths(registry: &str) -> &'static [&'static str] {
-    match registry {
-        "nuget" => crate::registry::nuget::UPSTREAM_PASSTHROUGH_PATHS,
-        _ => &[],
-    }
+    UPSTREAM_PASSTHROUGH
+        .iter()
+        .find(|(r, _)| *r == registry)
+        .map_or(&[], |(_, paths)| *paths)
 }
 
 impl LeakFinders {
@@ -1144,6 +1151,55 @@ mod tests {
         // The exemption is NuGet's: another registry's finder on the same path flags it.
         let other = LeakFinders::new(vec![("npm".into(), "api.nuget.org".into())]);
         assert!(other.scan(index.as_bytes()).is_some());
+    }
+
+    /// Every pass-through entry is exempt for its own registry's upstream host, plain
+    /// and `\/`-escaped, while any other path on that host is still a leak.
+    #[test]
+    fn every_passthrough_entry_is_exempt_only_for_its_path() {
+        let host = |registry: &str| match registry {
+            "nuget" => "api.nuget.org",
+            "npm" => "registry.npmjs.org",
+            other => panic!("add a test host for {other}"),
+        };
+        for (registry, paths) in UPSTREAM_PASSTHROUGH {
+            let h = host(registry);
+            let finders = LeakFinders::new(vec![(registry.to_string(), h.to_string())]);
+            for p in *paths {
+                let plain = format!(r#"{{"u":"https://{h}{p}x"}}"#);
+                assert_eq!(finders.scan(plain.as_bytes()), None, "{registry} {p}");
+                let escaped = plain.replace('/', "\\/");
+                assert_eq!(
+                    finders.scan(escaped.as_bytes()),
+                    None,
+                    "{registry} {p} escaped"
+                );
+            }
+            let other = format!(r#"{{"u":"https://{h}/not-a-passthrough/x"}}"#);
+            assert_eq!(
+                finders.scan(other.as_bytes()),
+                Some((*registry, h)),
+                "{registry} other path"
+            );
+        }
+    }
+
+    /// npm packuments keep `dist.attestations.url` on registry.npmjs.org (Rootly
+    /// #0xaNNw, 555 WARNs on /npm/jsdom, /npm/vite-node): not a leak; a leftover
+    /// tarball URL still is.
+    #[test]
+    fn npm_attestations_url_is_not_a_leak() {
+        let finders = LeakFinders::new(vec![("npm".into(), "registry.npmjs.org".into())]);
+        let packument = r#"{"versions":{"1.0.0":{"dist":{"tarball":"https://nora/npm/vite-node/-/vite-node-1.0.0.tgz","attestations":{"url":"https://registry.npmjs.org/-/npm/v1/attestations/vite-node@1.0.0","provenance":{"predicateType":"https://slsa.dev/provenance/v1"}}}}}}"#;
+        assert_eq!(finders.scan(packument.as_bytes()), None);
+        let leftover = packument.replace(
+            "https://nora/npm/vite-node/-/vite-node-1.0.0.tgz",
+            "https://registry.npmjs.org/vite-node/-/vite-node-1.0.0.tgz",
+        );
+        assert_eq!(
+            finders.scan(leftover.as_bytes()),
+            Some(("npm", "registry.npmjs.org"))
+        );
     }
 
     /// Through the middleware: a leftover registration URL next to catalog0 @ids
