@@ -124,6 +124,40 @@ async fn nuget_internal_version_list_blocked() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
+/// R2-42: the `.nuspec` of an internal ID that is not hosted yet is blocked like its
+/// `.nupkg`: the request never reaches upstream (it would name the ID there and cache
+/// a public namesake's manifest). A local copy is still served.
+#[tokio::test]
+async fn nuget_internal_nuspec_blocked_not_proxied() {
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("<package/>"))
+        .mount(&upstream)
+        .await;
+    let uri = upstream.uri();
+    let ctx = create_test_context_with_config(move |c| {
+        c.nuget.enabled = true;
+        c.nuget.proxy = Some(uri);
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+    });
+    let path = "/nuget/v3/flatcontainer/internalpkg/1.0.0/internalpkg.nuspec";
+    let resp = send(&ctx.app, Method::GET, path, "").await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+
+    ctx.state
+        .storage
+        .put(
+            "nuget/flatcontainer/internalpkg/1.0.0/internalpkg.nuspec",
+            b"<package/>",
+        )
+        .await
+        .unwrap();
+    let resp = send(&ctx.app, Method::GET, path, "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn nuget_internal_search_not_forwarded() {
     let ctx = create_test_context_with_config(|c| {

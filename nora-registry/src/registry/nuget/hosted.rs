@@ -26,8 +26,9 @@
 //!
 //! Re-pushing an existing version with identical bytes answers 200 and writes nothing;
 //! different bytes answer 409. [`run_retention`] (periodic cleanup pass) expires PR
-//! pre-releases (`X.Y.Z-pr.*`, `[nuget] hosted_pr_*`) and sweeps blob dirs no document
-//! names; [`rebuild`] (`nora nuget rebuild <id>`) rewrites a document from the blobs.
+//! pre-releases (`X.Y.Z-pr.*`, `[nuget] hosted_pr_*`), writes back complete blob dirs no
+//! document names and sweeps incomplete ones; [`rebuild`] (`nora nuget rebuild <id>`)
+//! rewrites a document from the blobs.
 
 use super::{is_valid_package_id, with_json, with_json_gzip, SearchParams};
 use crate::activity_log::{ActionType, ActivityEntry};
@@ -209,6 +210,9 @@ pub(crate) struct HostedIndex {
     map: arc_swap::ArcSwapOption<IndexMap>,
     /// Serializes loads; holds the backoff after a failed one.
     loader: tokio::sync::Mutex<Backoff>,
+    /// Not hosted state: the proxied IDs' Q04 hidden-version memo, kept here as the
+    /// feed's one per-server in-memory structure.
+    pub(super) hidden: super::HiddenMemo,
 }
 
 #[derive(Default)]
@@ -632,6 +636,19 @@ async fn store(
         return Err(internal("nuspec"));
     }
 
+    // R2-35: re-read the document right before writing it. `nora import` and `nora nuget
+    // rebuild` write it from another process, which this process's lock does not
+    // exclude, and the upload above can take a while. The window left is this GET-PUT
+    // round trip; a version lost in it keeps its blobs, and the retention pass writes
+    // it back (R2-08).
+    pkg = match load(storage, &id_lower).await {
+        Ok(p) => p.unwrap_or_default(),
+        Err(_) => return Err(unavailable_err()),
+    };
+    // The other writer stored this very version meanwhile: the blobs are ours now (the
+    // last write), so is the entry.
+    pkg.versions
+        .retain(|v| !v.version.eq_ignore_ascii_case(&version));
     if pkg.id.is_empty() {
         pkg.id = spec.id.clone();
     }
@@ -893,8 +910,15 @@ async fn registration_leaf(
 
 /// `.nupkg` / `.nuspec` download. `path` is the flat-container path below the base
 /// (`{id}/{ver}/{file}`). Resolved through the state document: only an indexed version
-/// is served, so a blob left by a failed push is never handed out.
-pub(super) async fn download(state: &AppState, path: &str, id_lower: &str) -> Option<Response> {
+/// is served, so a blob left by a failed push is never handed out. Read like a cached
+/// proxied package (R2-09): streamed above `server.stream_threshold_mb`, verified
+/// against its pin, `.nupkg` Range requests answered from one ranged read.
+pub(super) async fn download(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+    id_lower: &str,
+) -> Option<Response> {
     let pkg = match lookup(state, id_lower).await {
         Lookup::NotHosted => return None,
         Lookup::Unavailable => return Some(unavailable()),
@@ -910,31 +934,24 @@ pub(super) async fn download(state: &AppState, path: &str, id_lower: &str) -> Op
         return Some(StatusCode::NOT_FOUND.into_response());
     }
     let key = format!("{BLOB_PREFIX}{path}");
-    match state.storage.get(&key).await {
-        Ok(data) => {
-            let content_type = if ends_with_ci(&path, ".nuspec") {
-                "application/xml"
-            } else {
-                "application/octet-stream"
-            };
-            state.metrics.record_download("nuget");
-            Some(
-                (
-                    StatusCode::OK,
-                    [
-                        (header::CONTENT_TYPE, content_type),
-                        (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
-                    ],
-                    data,
-                )
-                    .into_response(),
-            )
+    let nupkg = ends_with_ci(&path, ".nupkg");
+    if nupkg {
+        if let Some(resp) = super::ranged_large_nupkg(state, headers, &key, None).await {
+            return Some(resp);
         }
-        Err(e) => {
-            // Indexed but unreadable (or missing): never a silent 404.
-            tracing::error!(key = %key, error = %e, "nuget hosted: indexed blob unreadable");
+    }
+    // Ours, not a cache: a pin mismatch is a 500, never a delete.
+    match crate::registry::read_cached_artifact(state, "nuget", &key, true).await {
+        Ok(Some(cached)) => {
+            state.metrics.record_download("nuget");
+            Some(super::serve_artifact(state, headers, &key, cached, nupkg, true).await)
+        }
+        Ok(None) => {
+            // Indexed but missing: never a silent 404.
+            tracing::error!(key = %key, "nuget hosted: indexed blob missing");
             Some(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
+        Err(resp) => Some(resp),
     }
 }
 
@@ -1163,19 +1180,28 @@ async fn merged_search(
         // Fail the query rather than hide hosted IDs behind their public namesakes.
         Err(()) => return unavailable(),
     };
+    let hosted_ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+    // Only the requested page is rendered (R2-33): a short query matches every hosted ID.
+    let skip = p.skip.unwrap_or(0);
+    let take = p.take.unwrap_or(20);
+    let nuget = nuget_base(&state);
+    let page: Vec<Value> = hits
+        .iter()
+        .skip(skip)
+        .take(take)
+        .map(|(id_lower, pkg)| {
+            if names {
+                json!(pkg.id)
+            } else {
+                hit_json(pkg, id_lower, prerelease, semver2, &nuget)
+            }
+        })
+        .collect();
     // Without a proxy, or for an internal-namespace term, the upstream handler answers
     // from its local cache index, which lists hosted IDs too (UI) and would cost one
     // storage miss per matching hosted ID. Hosted IDs are answered here instead.
     if local_only(&state, q) && (!hits.is_empty() || hosted_name_matches(&state, q).await) {
-        let skip = p.skip.unwrap_or(0);
-        let take = p.take.unwrap_or(20);
-        let page = hits
-            .iter()
-            .skip(skip)
-            .take(take)
-            .map(|h| if names { h["id"].clone() } else { h.clone() })
-            .collect();
-        return with_json(merge_page(&hits, page, &Value::Null, 0));
+        return with_json(merge_page(&hosted_ids, page, &Value::Null, 0));
     }
     if hits.is_empty() {
         return upstream_search(state, headers, upstream_params(p.skip, p.take), raw, names).await;
@@ -1183,14 +1209,6 @@ async fn merged_search(
 
     // Paging over hosted ++ upstream: hosted rows fill the front, upstream gets the
     // remainder of the window, shifted by the hosted count.
-    let skip = p.skip.unwrap_or(0);
-    let take = p.take.unwrap_or(20);
-    let page: Vec<Value> = hits
-        .iter()
-        .skip(skip)
-        .take(take)
-        .map(|h| if names { h["id"].clone() } else { h.clone() })
-        .collect();
     let up_skip = skip.saturating_sub(hits.len());
     let up_take = take - page.len();
     // take=0 is not honoured by every upstream; ask for one row and drop it.
@@ -1215,7 +1233,7 @@ async fn merged_search(
         parts = Response::new(Body::empty()).into_parts().0;
         Value::Null
     };
-    let body = merge_page(&hits, page, &upstream, up_take);
+    let body = merge_page(&hosted_ids, page, &upstream, up_take);
     parts.headers.remove(header::CONTENT_LENGTH);
     parts.headers.insert(
         header::CONTENT_TYPE,
@@ -1258,13 +1276,10 @@ fn with_paging(raw: &str, skip: usize, take: usize) -> String {
 }
 
 /// One response page: `page` (hosted rows already sliced) then up to `up_take` upstream
-/// rows, minus upstream entries that are hosted IDs. `totalHits` = hosted + upstream
-/// total, less the namesakes seen on this page (the rest cannot be known per page).
-fn merge_page(hits: &[Value], page: Vec<Value>, upstream: &Value, up_take: usize) -> Vec<u8> {
-    let hosted_ids: Vec<String> = hits
-        .iter()
-        .filter_map(|h| h["id"].as_str().map(str::to_lowercase))
-        .collect();
+/// rows, minus upstream entries that are hosted IDs (`hosted_ids`: every hosted hit,
+/// lowercase). `totalHits` = hosted + upstream total, less the namesakes seen on this
+/// page (the rest cannot be known per page).
+fn merge_page(hosted_ids: &[&str], page: Vec<Value>, upstream: &Value, up_take: usize) -> Vec<u8> {
     let entry_id = |e: &Value| {
         e.as_str()
             .or_else(|| e["id"].as_str())
@@ -1274,14 +1289,14 @@ fn merge_page(hits: &[Value], page: Vec<Value>, upstream: &Value, up_take: usize
     let before = rows.len();
     let rows: Vec<Value> = rows
         .into_iter()
-        .filter(|e| !entry_id(e).is_some_and(|id| hosted_ids.contains(&id)))
+        .filter(|e| !entry_id(e).is_some_and(|id| hosted_ids.contains(&id.as_str())))
         .collect();
     let dropped = before - rows.len();
     let upstream_total = upstream["totalHits"].as_u64().unwrap_or(0) as usize;
     let mut data = page;
     data.extend(rows.into_iter().take(up_take));
     let doc = json!({
-        "totalHits": hits.len() + upstream_total.saturating_sub(dropped),
+        "totalHits": hosted_ids.len() + upstream_total.saturating_sub(dropped),
         "data": data,
     });
     doc.to_string().into_bytes()
@@ -1291,17 +1306,17 @@ fn visible(v: &HostedVersion, prerelease: bool, semver2: bool) -> bool {
     v.listed && (prerelease || !v.version.contains('-')) && (semver2 || !v.semver2)
 }
 
-/// Hosted search results from the in-memory index, sorted by ID. Each whitespace-
-/// separated term must be a substring of the ID; `packageid:`/`id:` terms must equal
-/// it (case-insensitive). Listed versions only; `packageType` matches the latest
-/// visible version's types.
+/// Hosted search hits from the in-memory index, `(lowercase ID, package)` sorted by
+/// ID; [`hit_json`] renders one. Each whitespace-separated term must be a substring of
+/// the ID; `packageid:`/`id:` terms must equal it (case-insensitive). An ID needs a
+/// visible (listed) version; `packageType` matches the latest visible version's types.
 async fn hosted_hits(
     state: &AppState,
     q: &str,
     prerelease: bool,
     semver2: bool,
     package_type: Option<&str>,
-) -> Result<Vec<Value>, ()> {
+) -> Result<Vec<(String, Arc<HostedPackage>)>, ()> {
     let mut exact: Vec<String> = Vec::new();
     let mut terms: Vec<String> = Vec::new();
     for t in q.split_whitespace().map(str::to_lowercase) {
@@ -1333,68 +1348,80 @@ async fn hosted_hits(
         };
         pkgs.push((id, pkg));
     }
-    pkgs.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let nuget = nuget_base(state);
-    let mut out = Vec::new();
-    for (id_lower, pkg) in pkgs {
-        let visible: Vec<&HostedVersion> = pkg
+    pkgs.retain(|(_, pkg)| {
+        let latest = pkg
             .versions
             .iter()
-            .filter(|v| visible(v, prerelease, semver2))
-            .collect();
-        let Some(latest) = visible.last() else {
-            continue;
-        };
-        if let Some(t) = package_type {
-            if !latest
-                .package_types()
-                .iter()
-                .any(|pt| pt.eq_ignore_ascii_case(t))
-            {
-                continue;
-            }
-        }
-        let versions: Vec<Value> = visible
-            .iter()
-            .map(|v| {
-                json!({
-                    "version": v.version,
-                    "downloads": 0,
-                    "@id": leaf_url(&nuget, &id_lower, &v.version.to_lowercase()),
-                })
+            .rev()
+            .find(|v| visible(v, prerelease, semver2));
+        latest.is_some_and(|latest| {
+            package_type.is_none_or(|t| {
+                latest
+                    .package_types()
+                    .iter()
+                    .any(|pt| pt.eq_ignore_ascii_case(t))
             })
-            .collect();
-        out.push(json!({
-            "@id": registration_url(&nuget, &id_lower),
-            "@type": "Package",
-            "registration": registration_url(&nuget, &id_lower),
-            "id": pkg.id,
-            "version": latest.version,
-            "description": latest.description,
-            "summary": latest.summary,
-            "title": latest.title,
-            "authors": [latest.authors],
-            "tags": latest.tags.split_whitespace().collect::<Vec<_>>(),
-            "projectUrl": latest.project_url,
-            "totalDownloads": 0,
-            "verified": false,
-            "packageTypes": latest
-                .package_types()
-                .iter()
-                .map(|t| json!({ "name": t }))
-                .collect::<Vec<_>>(),
-            "versions": versions,
-        }));
-    }
-    Ok(out)
+        })
+    });
+    pkgs.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(pkgs)
+}
+
+/// One search hit: the latest visible version's metadata and every visible version.
+/// Only called for an ID [`hosted_hits`] returned, which has a visible version.
+fn hit_json(
+    pkg: &HostedPackage,
+    id_lower: &str,
+    prerelease: bool,
+    semver2: bool,
+    nuget: &str,
+) -> Value {
+    let visible: Vec<&HostedVersion> = pkg
+        .versions
+        .iter()
+        .filter(|v| visible(v, prerelease, semver2))
+        .collect();
+    let Some(latest) = visible.last() else {
+        return Value::Null;
+    };
+    let versions: Vec<Value> = visible
+        .iter()
+        .map(|v| {
+            json!({
+                "version": v.version,
+                "downloads": 0,
+                "@id": leaf_url(nuget, id_lower, &v.version.to_lowercase()),
+            })
+        })
+        .collect();
+    json!({
+        "@id": registration_url(nuget, id_lower),
+        "@type": "Package",
+        "registration": registration_url(nuget, id_lower),
+        "id": pkg.id,
+        "version": latest.version,
+        "description": latest.description,
+        "summary": latest.summary,
+        "title": latest.title,
+        "authors": [latest.authors],
+        "tags": latest.tags.split_whitespace().collect::<Vec<_>>(),
+        "projectUrl": latest.project_url,
+        "totalDownloads": 0,
+        "verified": false,
+        "packageTypes": latest
+            .package_types()
+            .iter()
+            .map(|t| json!({ "name": t }))
+            .collect::<Vec<_>>(),
+        "versions": versions,
+    })
 }
 
 // ── Retention / orphan sweep (periodic cleanup pass) ───────────────────
 
-/// Blob dirs the state document does not name are deleted only once their newest file
-/// is older than this (a push that died before its save; pushes hold the ID's publish
-/// lock, so none is in flight while the sweep holds it).
+/// Blob dirs the state document does not name are looked at only once their newest
+/// file is older than this (a push in this process holds the ID's publish lock, so none
+/// is in flight while the sweep holds it; this covers another process's).
 const ORPHAN_MIN_AGE_SECS: u64 = 3600;
 
 /// `X.Y.Z-pr.<n>…`: the PR pre-release stream the retention pass expires.
@@ -1444,6 +1471,8 @@ pub(crate) struct RetentionSummary {
     pub ids: usize,
     pub expired: usize,
     pub orphans: usize,
+    /// Complete version dirs the document had lost, written back into it.
+    pub restored: usize,
     pub deleted_keys: usize,
     pub bytes_freed: u64,
     pub errors: usize,
@@ -1451,7 +1480,11 @@ pub(crate) struct RetentionSummary {
 
 /// Periodic hosted-feed pass: per ID, under its publish lock, re-read the state document
 /// into the index (picking up out-of-band writes), expire PR pre-releases per
-/// `[nuget] hosted_pr_*`, then delete their blobs and blob dirs no document names.
+/// `[nuget] hosted_pr_*`, then delete their blobs. A blob dir the document does not
+/// name (older than [`ORPHAN_MIN_AGE_SECS`]) is a version when it holds the package and
+/// a `.nuspec` matching its path: the document lost it (an update from another process,
+/// `nora import` or `nora nuget rebuild`, or a push whose document write failed) and
+/// it is written back (R2-08). Only an incomplete dir is an orphan and deleted.
 /// `dry_run` only logs. Order per version: document first, then blobs, so the feed
 /// never names a deleted blob.
 pub(crate) async fn run_retention(state: &AppState, dry_run: bool) -> RetentionSummary {
@@ -1473,7 +1506,7 @@ pub(crate) async fn run_retention(state: &AppState, dry_run: bool) -> RetentionS
         }
     };
     // id → version dir → (keys, newest mtime)
-    type Dirs = HashMap<String, (Vec<(String, u64)>, u64)>;
+    type Dirs = HashMap<String, (Vec<(String, crate::storage::FileMeta)>, u64)>;
     let mut by_id: HashMap<String, Dirs> = HashMap::new();
     for (key, meta) in blobs {
         let Some(rest) = key.strip_prefix(BLOB_PREFIX) else {
@@ -1489,7 +1522,7 @@ pub(crate) async fn run_retention(state: &AppState, dry_run: bool) -> RetentionS
             .entry(ver.to_string())
             .or_default();
         dir.1 = dir.1.max(meta.modified);
-        dir.0.push((key, meta.size));
+        dir.0.push((key, meta));
     }
     let mut ids: Vec<String> = meta_ids(metas).collect();
     ids.extend(map.read().keys().cloned());
@@ -1500,12 +1533,12 @@ pub(crate) async fn run_retention(state: &AppState, dry_run: bool) -> RetentionS
     let cfg = &state.config.nuget;
     let now = chrono::Utc::now();
     let now_secs = u64::try_from(now.timestamp()).unwrap_or(0);
-    let mut deleted_any = false;
+    let mut changed = false;
     for id in ids {
         let lock = state.publish_lock(&meta_key(&id));
         let _guard = lock.lock().await;
         let mut dirs = by_id.remove(&id).unwrap_or_default();
-        let pkg = match reload_locked(&state.storage, &map, &id).await {
+        let mut pkg = match reload_locked(&state.storage, &map, &id).await {
             Ok(Some(pkg)) => pkg,
             Ok(None) => {
                 if !dirs.is_empty() {
@@ -1520,28 +1553,79 @@ pub(crate) async fn run_retention(state: &AppState, dry_run: bool) -> RetentionS
             }
         };
         sum.ids += 1;
+        let named: Vec<String> = pkg
+            .versions
+            .iter()
+            .map(|v| v.version.to_lowercase())
+            .collect();
+        let mut unnamed: Vec<&String> = dirs
+            .iter()
+            .filter(|(ver, (_, newest))| {
+                !named.contains(ver) && now_secs.saturating_sub(*newest) > ORPHAN_MIN_AGE_SECS
+            })
+            .map(|(ver, _)| ver)
+            .collect();
+        unnamed.sort();
+        let mut orphans: Vec<String> = Vec::new();
+        let mut restored: Vec<HostedVersion> = Vec::new();
+        for ver in unnamed {
+            let nupkg_key = format!("{BLOB_PREFIX}{id}/{ver}/{id}.{ver}.nupkg");
+            let Some((_, nupkg)) = dirs[ver].0.iter().find(|(k, _)| *k == nupkg_key) else {
+                orphans.push(ver.clone());
+                continue;
+            };
+            match version_from_blobs(&state.storage, &id, ver, nupkg, false).await {
+                Ok((v, _)) => restored.push(v),
+                Err(BlobsError::Unusable(why)) => {
+                    tracing::info!(id = %id, version = %ver, why, "nuget hosted retention: incomplete blob dir");
+                    orphans.push(ver.clone());
+                }
+                Err(BlobsError::Storage(e)) => {
+                    tracing::warn!(id = %id, version = %ver, error = %e, "nuget hosted retention: blob dir unreadable, kept");
+                    sum.errors += 1;
+                }
+            }
+        }
+        sum.restored += restored.len();
+        if !restored.is_empty() {
+            let versions: Vec<&str> = restored.iter().map(|v| v.version.as_str()).collect();
+            if dry_run {
+                tracing::warn!(id = %id, ?versions, "nuget hosted retention (dry-run): would re-add versions the state document lost");
+            } else {
+                let mut fixed = (*pkg).clone();
+                fixed.versions.extend(restored.iter().cloned());
+                fixed
+                    .versions
+                    .sort_by(|a, b| compare_versions(&a.version, &b.version));
+                if save(&state.storage, Some(&map), &id, &fixed).await.is_err() {
+                    sum.errors += 1;
+                    continue; // nothing deleted on a document we could not write
+                }
+                tracing::warn!(id = %id, ?versions, "nuget hosted retention: re-added versions the state document lost");
+                for v in &restored {
+                    state.audit.log(AuditEntry::new(
+                        "retention-restore",
+                        "scheduler",
+                        &format!("{}@{}", pkg_id(&fixed, &id), v.version),
+                        "nuget",
+                        "unnamed-complete-blob-dir",
+                    ));
+                }
+                changed = true;
+                pkg = Arc::new(fixed);
+            }
+        }
         let expired = expired_pr_versions(
             &pkg.versions,
             now,
             cfg.hosted_pr_retention_days,
             cfg.hosted_pr_keep_last,
         );
-        let named: Vec<String> = pkg
-            .versions
-            .iter()
-            .map(|v| v.version.to_lowercase())
-            .collect();
         let mut doomed: Vec<(String, &'static str)> = expired
             .iter()
             .map(|v| (v.clone(), "pr-prerelease-expired"))
             .collect();
-        doomed.extend(
-            dirs.iter()
-                .filter(|(ver, (_, newest))| {
-                    !named.contains(ver) && now_secs.saturating_sub(*newest) > ORPHAN_MIN_AGE_SECS
-                })
-                .map(|(ver, _)| (ver.clone(), "orphan-blob-dir")),
-        );
+        doomed.extend(orphans.into_iter().map(|ver| (ver, "orphan-blob-dir")));
         sum.expired += expired.len();
         sum.orphans += doomed.len() - expired.len();
         if doomed.is_empty() {
@@ -1567,11 +1651,11 @@ pub(crate) async fn run_retention(state: &AppState, dry_run: bool) -> RetentionS
                 continue; // expired version whose blobs are already gone
             };
             let mut failed = false;
-            for (key, size) in keys {
+            for (key, meta) in keys {
                 match state.storage.delete(&key).await {
                     Ok(()) | Err(StorageError::NotFound) => {
                         sum.deleted_keys += 1;
-                        sum.bytes_freed += size;
+                        sum.bytes_freed += meta.size;
                     }
                     Err(e) => {
                         tracing::warn!(key = %key, error = %e, "nuget hosted retention: delete failed");
@@ -1580,7 +1664,7 @@ pub(crate) async fn run_retention(state: &AppState, dry_run: bool) -> RetentionS
                 }
             }
             sum.errors += usize::from(failed);
-            deleted_any = true;
+            changed = true;
             state.audit.log(AuditEntry::new(
                 "retention-delete",
                 "scheduler",
@@ -1590,7 +1674,7 @@ pub(crate) async fn run_retention(state: &AppState, dry_run: bool) -> RetentionS
             ));
         }
     }
-    if deleted_any {
+    if changed {
         state.repo_index.invalidate("nuget");
     }
     tracing::info!(
@@ -1598,6 +1682,7 @@ pub(crate) async fn run_retention(state: &AppState, dry_run: bool) -> RetentionS
         ids = sum.ids,
         expired = sum.expired,
         orphans = sum.orphans,
+        restored = sum.restored,
         deleted_keys = sum.deleted_keys,
         bytes_freed = sum.bytes_freed,
         errors = sum.errors,
@@ -1660,57 +1745,44 @@ pub(crate) async fn rebuild(
             tracing::warn!(dir = %ver_dir, "rebuild: no .nupkg, skipped");
             continue;
         };
-        let spec = match storage
-            .get(&format!("{prefix}{ver_dir}/{id_lower}.nuspec"))
-            .await
-        {
-            Ok(xml) => parse_nuspec(&String::from_utf8_lossy(&xml)),
-            Err(_) => match storage.get(&nupkg_key).await {
-                Ok(data) => parse_nupkg(std::io::Cursor::new(data)),
-                Err(e) => Err(e.to_string()),
-            },
-        };
-        let spec = match spec {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(dir = %ver_dir, error = %e, "rebuild: unreadable manifest, skipped");
-                continue;
-            }
-        };
-        let Some((version, semver2)) = normalize_version(&spec.version) else {
-            tracing::warn!(dir = %ver_dir, "rebuild: invalid version, skipped");
-            continue;
-        };
-        if spec.id.to_lowercase() != id_lower || version.to_lowercase() != ver_dir {
-            tracing::warn!(dir = %ver_dir, id = %spec.id, version = %version, "rebuild: manifest does not match its path, skipped");
-            continue;
-        }
+        let (mut v, spec_id) =
+            match version_from_blobs(storage, &id_lower, ver_dir, meta, true).await {
+                Ok(found) => found,
+                Err(e) => {
+                    tracing::warn!(dir = %ver_dir, error = %e, "rebuild: skipped");
+                    continue;
+                }
+            };
+        v.listed = listed.get(ver_dir).copied().unwrap_or(true);
         if pkg.id.is_empty() {
-            pkg.id = old_id.clone().unwrap_or_else(|| spec.id.clone());
+            pkg.id = old_id.clone().unwrap_or(spec_id);
         }
-        let published = chrono::DateTime::from_timestamp(meta.modified as i64, 0)
-            .unwrap_or_default()
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        pkg.versions.push(HostedVersion {
-            listed: listed.get(ver_dir).copied().unwrap_or(true),
-            version,
-            published,
-            semver2,
-            package_size: meta.size,
-            authors: spec.authors,
-            description: spec.description,
-            title: spec.title,
-            summary: spec.summary,
-            tags: spec.tags,
-            project_url: spec.project_url,
-            dependency_groups: spec.dependency_groups,
-            package_types: spec.package_types,
-        });
+        pkg.versions.push(v);
     }
     if pkg.versions.is_empty() {
         return Err(format!(
             "no readable package under {prefix}; nothing written"
         ));
+    }
+    if apply {
+        // R2-35: a push that landed after the listing above is in the current document
+        // but not in `pkg`: keep each such version whose blob is there now. A running
+        // server's lock does not reach this process, so the window left is this
+        // GET-PUT round trip; a version lost in it keeps its blobs, which the
+        // retention pass re-adds (R2-08).
+        if let Ok(Some(current)) = load(storage, &id_lower).await {
+            for v in current.versions {
+                let ver_lower = v.version.to_lowercase();
+                let known = pkg
+                    .versions
+                    .iter()
+                    .any(|p| p.version.to_lowercase() == ver_lower);
+                let nupkg_key = format!("{prefix}{ver_lower}/{id_lower}.{ver_lower}.nupkg");
+                if !known && storage.stat(&nupkg_key).await.is_some() {
+                    pkg.versions.push(v);
+                }
+            }
+        }
     }
     pkg.versions
         .sort_by(|a, b| compare_versions(&a.version, &b.version));
@@ -1726,6 +1798,83 @@ pub(crate) async fn rebuild(
         .into_iter()
         .map(|v| (v.version, v.listed))
         .collect())
+}
+
+/// Why a version blob dir yields no version: unusable for good, or not readable now.
+#[derive(Debug)]
+enum BlobsError {
+    Unusable(String),
+    Storage(StorageError),
+}
+
+impl std::fmt::Display for BlobsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlobsError::Unusable(why) => f.write_str(why),
+            BlobsError::Storage(e) => write!(f, "storage: {e}"),
+        }
+    }
+}
+
+/// The listed [`HostedVersion`] stored in blob dir `{id_lower}/{ver_dir}` and the ID as
+/// its manifest spells it: the stored `.nuspec`, else (with `read_nupkg`) the one in the
+/// package (a whole-object read). `nupkg` is the package blob's listing entry:
+/// `published` = its mtime. A manifest that does not parse or does not match the dir's
+/// ID and version is [`BlobsError::Unusable`].
+async fn version_from_blobs(
+    storage: &Storage,
+    id_lower: &str,
+    ver_dir: &str,
+    nupkg: &crate::storage::FileMeta,
+    read_nupkg: bool,
+) -> Result<(HostedVersion, String), BlobsError> {
+    let dir = format!("{BLOB_PREFIX}{id_lower}/{ver_dir}");
+    let spec = match storage.get(&format!("{dir}/{id_lower}.nuspec")).await {
+        Ok(xml) => parse_nuspec(&String::from_utf8_lossy(&xml)),
+        Err(StorageError::NotFound) if !read_nupkg => {
+            return Err(BlobsError::Unusable("no .nuspec".into()))
+        }
+        Err(e) if !read_nupkg => return Err(BlobsError::Storage(e)),
+        Err(_) => match storage
+            .get(&format!("{dir}/{id_lower}.{ver_dir}.nupkg"))
+            .await
+        {
+            Ok(data) => parse_nupkg(std::io::Cursor::new(data)),
+            Err(e) => return Err(BlobsError::Storage(e)),
+        },
+    };
+    let spec = spec.map_err(|e| BlobsError::Unusable(format!("unreadable manifest: {e}")))?;
+    let Some((version, semver2)) = normalize_version(&spec.version) else {
+        return Err(BlobsError::Unusable(format!(
+            "invalid version '{}'",
+            spec.version
+        )));
+    };
+    if spec.id.to_lowercase() != id_lower || version.to_lowercase() != ver_dir {
+        return Err(BlobsError::Unusable(format!(
+            "manifest {} {version} does not match its path",
+            spec.id
+        )));
+    }
+    let published = chrono::DateTime::from_timestamp(nupkg.modified as i64, 0)
+        .unwrap_or_default()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let v = HostedVersion {
+        listed: true,
+        version,
+        published,
+        semver2,
+        package_size: nupkg.size,
+        authors: spec.authors,
+        description: spec.description,
+        title: spec.title,
+        summary: spec.summary,
+        tags: spec.tags,
+        project_url: spec.project_url,
+        dependency_groups: spec.dependency_groups,
+        package_types: spec.package_types,
+    };
+    Ok((v, spec.id))
 }
 
 // ── Web UI detail ──────────────────────────────────────────────────────
@@ -2315,8 +2464,9 @@ mod tests {
         let hits = vec![json!({"id": "Maestra.A"}), json!({"id": "Maestra.B"})];
         let upstream =
             json!({"totalHits": 3, "data": [{"id": "maestra.a"}, {"id": "X"}, {"id": "Y"}]});
+        let hosted = ["maestra.a", "maestra.b"];
         let out: Value =
-            serde_json::from_slice(&merge_page(&hits, hits.clone(), &upstream, 2)).unwrap();
+            serde_json::from_slice(&merge_page(&hosted, hits.clone(), &upstream, 2)).unwrap();
         assert_eq!(out["totalHits"], 4);
         let ids: Vec<&str> = out["data"]
             .as_array()
@@ -2327,7 +2477,7 @@ mod tests {
         assert_eq!(ids, ["Maestra.A", "Maestra.B", "X", "Y"]);
         let names = json!({"totalHits": 1, "data": ["Z"]});
         let out: Value =
-            serde_json::from_slice(&merge_page(&hits, vec![json!("Maestra.A")], &names, 5))
+            serde_json::from_slice(&merge_page(&hosted, vec![json!("Maestra.A")], &names, 5))
                 .unwrap();
         assert_eq!(out["data"], json!(["Maestra.A", "Z"]));
     }
@@ -2398,12 +2548,16 @@ pub(crate) mod test_support {
     }
 
     pub fn nupkg(id: &str, version: &str, extra_metadata: &str) -> Vec<u8> {
+        nupkg_with_payload(id, version, extra_metadata, "x")
+    }
+
+    pub fn nupkg_with_payload(id: &str, version: &str, extra_metadata: &str, dll: &str) -> Vec<u8> {
         let nuspec = format!(
             r#"<?xml version="1.0"?><package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd"><metadata><id>{id}</id><version>{version}</version><authors>t</authors><description>d</description>{extra_metadata}</metadata></package>"#
         );
         zip(&[
             (&format!("{id}.nuspec"), &nuspec),
-            ("lib/net8.0/a.dll", "x"),
+            ("lib/net8.0/a.dll", dll),
         ])
     }
 
@@ -3328,6 +3482,309 @@ Jd74nq6dNCjpWG4drIsyhqX+
         // Idempotent: nothing left to do.
         let again = super::run_retention(&ctx.state, false).await;
         assert_eq!((again.expired, again.orphans), (0, 0));
+    }
+
+    /// R2-09: a hosted package above `stream_threshold_mb` is streamed from storage
+    /// like a cached proxied one, never read whole into memory, with its length; a
+    /// Range request is one ranged read. A small one is ranged from memory.
+    #[tokio::test]
+    async fn hosted_download_streams_large_packages_and_serves_ranges() {
+        let (storage, ops) = crate::test_helpers::op_counting_storage();
+        let ctx =
+            crate::test_helpers::create_test_context_with_storage_and_config(storage, |cfg| {
+                cfg.nuget.enabled = true;
+                cfg.nuget.proxy = None;
+                cfg.server.stream_threshold_mb = 1;
+            });
+        let mut x: u64 = 1;
+        let noise: Vec<u8> = (0..1536 * 1024)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (x >> 33) as u8
+            })
+            .collect();
+        let big = super::test_support::nupkg_with_payload(
+            "Maestra.Big",
+            "1.0.0",
+            "",
+            &hex::encode(noise),
+        );
+        assert!(big.len() > 1024 * 1024);
+        assert_eq!(push(&ctx.app, &big, &[]).await, StatusCode::CREATED);
+        let url = "/nuget/v3/flatcontainer/maestra.big/1.0.0/maestra.big.1.0.0.nupkg";
+
+        ops.reset();
+        let resp = send(&ctx.app, Method::GET, url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()["content-length"],
+            big.len().to_string().as_str()
+        );
+        assert_eq!(resp.headers()["accept-ranges"], "bytes");
+        assert_eq!(body_bytes(resp).await, big);
+        let full = ops.snapshot();
+        assert_eq!(full.get("get_reader"), Some(&1), "{full:?}");
+        assert_eq!(full.get("get"), None, "never a buffered read: {full:?}");
+
+        ops.reset();
+        let range = vec![("range", "bytes=10-19")];
+        let resp = send_with_headers(&ctx.app, Method::GET, url, range, "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_bytes(resp).await, big[10..20]);
+        let ranged = ops.snapshot();
+        assert_eq!(ranged.get("get_reader"), None, "{ranged:?}");
+        assert_eq!(ranged.get("get_range"), Some(&1), "{ranged:?}");
+
+        let small = nupkg("Maestra.Small", "1.0.0", "");
+        assert_eq!(push(&ctx.app, &small, &[]).await, StatusCode::CREATED);
+        let url = "/nuget/v3/flatcontainer/maestra.small/1.0.0/maestra.small.1.0.0.nupkg";
+        let range = vec![("range", "bytes=0-3")];
+        let resp = send_with_headers(&ctx.app, Method::GET, url, range, "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_bytes(resp).await, small[..4]);
+        let spec = "/nuget/v3/flatcontainer/maestra.small/1.0.0/maestra.small.nuspec";
+        let resp = send(&ctx.app, Method::GET, spec, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "application/xml");
+        assert!(resp.headers().get("accept-ranges").is_none());
+    }
+
+    /// R2-08: a blob dir the document does not name is a version when it is complete
+    /// (package + a nuspec matching its path): the document lost it (a write from
+    /// another process), so the pass writes it back instead of sweeping it. A package
+    /// without its nuspec, or with one for another version, is still an orphan.
+    #[tokio::test]
+    async fn retention_restores_complete_dirs_and_sweeps_incomplete_ones() {
+        let ctx = local_ctx();
+        for v in ["1.0.0", "2.0.0"] {
+            assert_eq!(
+                push(&ctx.app, &nupkg("Maestra.Lost", v, ""), &[]).await,
+                StatusCode::CREATED
+            );
+        }
+        let st = &ctx.state.storage;
+        let key = "nuget/hosted-meta/maestra.lost.json";
+        let mut doc: Value = serde_json::from_slice(&st.get(key).await.unwrap()).unwrap();
+        doc["versions"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|v| v["version"] != "2.0.0");
+        st.put(key, &serde_json::to_vec(&doc).unwrap())
+            .await
+            .unwrap();
+        super::refresh(&ctx.state).await;
+        let dir = "nuget/hosted/maestra.lost";
+        let lost = [
+            format!("{dir}/2.0.0/maestra.lost.2.0.0.nupkg"),
+            format!("{dir}/2.0.0/maestra.lost.nuspec"),
+        ];
+        let no_spec = format!("{dir}/3.0.0/maestra.lost.3.0.0.nupkg");
+        st.put(&no_spec, b"dead push").await.unwrap();
+        let spec_1 = st.get(&format!("{dir}/1.0.0/maestra.lost.nuspec")).await;
+        let wrong = [
+            format!("{dir}/4.0.0/maestra.lost.4.0.0.nupkg"),
+            format!("{dir}/4.0.0/maestra.lost.nuspec"),
+        ];
+        st.put(&wrong[0], b"pkg").await.unwrap();
+        st.put(&wrong[1], &spec_1.unwrap()).await.unwrap();
+        for k in lost.iter().chain(&wrong).chain([&no_spec]) {
+            set_mtime(&ctx, k, 2 * 3600);
+        }
+        let uri = "/nuget/v3/flatcontainer/maestra.lost/index.json";
+
+        let dry = super::run_retention(&ctx.state, true).await;
+        assert_eq!((dry.restored, dry.orphans, dry.deleted_keys), (1, 2, 0));
+        let (_, idx) = get_json(&ctx.app, uri).await;
+        assert_eq!(idx["versions"], serde_json::json!(["1.0.0"]));
+
+        let sum = super::run_retention(&ctx.state, false).await;
+        assert_eq!(
+            (sum.restored, sum.orphans, sum.errors, sum.deleted_keys),
+            (1, 2, 0, 3)
+        );
+        let (_, idx) = get_json(&ctx.app, uri).await;
+        assert_eq!(idx["versions"], serde_json::json!(["1.0.0", "2.0.0"]));
+        let pkg = "/nuget/v3/flatcontainer/maestra.lost/2.0.0/maestra.lost.2.0.0.nupkg";
+        assert_eq!(
+            send(&ctx.app, Method::GET, pkg, "").await.status(),
+            StatusCode::OK
+        );
+        for k in &lost {
+            assert!(st.get(k).await.is_ok(), "{k} kept");
+        }
+        for k in wrong.iter().chain([&no_spec]) {
+            assert!(st.get(k).await.is_err(), "{k} swept");
+        }
+        let again = super::run_retention(&ctx.state, false).await;
+        assert_eq!((again.restored, again.orphans), (0, 0));
+    }
+
+    /// In-memory storage that, on the first access to a key ending in `trigger`,
+    /// writes `writes` first: another process (`nora import`, `nora nuget rebuild`, a
+    /// second server) storing its document while this one is mid-write.
+    struct RacingBackend {
+        inner: crate::storage::ObjectStorage,
+        trigger: &'static str,
+        writes: parking_lot::Mutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    impl RacingBackend {
+        fn storage(trigger: &'static str, writes: Vec<(String, Vec<u8>)>) -> crate::Storage {
+            crate::Storage::from_backend(std::sync::Arc::new(Self {
+                inner: crate::storage::ObjectStorage::in_memory(),
+                trigger,
+                writes: parking_lot::Mutex::new(writes),
+            }))
+        }
+
+        async fn race(&self, key: &str) {
+            use crate::storage::StorageBackend;
+            if !key.ends_with(self.trigger) {
+                return;
+            }
+            let writes = std::mem::take(&mut *self.writes.lock());
+            for (k, body) in writes {
+                let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&body));
+                self.inner.put(&k, &body, &sha).await.unwrap();
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for RacingBackend {
+        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
+            self.inner.put(key, data, sha256).await
+        }
+        async fn get(
+            &self,
+            key: &str,
+        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+            self.race(key).await;
+            self.inner.get(key).await
+        }
+        async fn pin(&self, key: &str) -> Option<String> {
+            self.inner.pin(key).await
+        }
+        async fn delete(&self, key: &str) -> crate::storage::Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+        async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
+            self.inner.stat(key).await
+        }
+        async fn list_with_meta(
+            &self,
+            prefix: &str,
+        ) -> crate::storage::Result<Vec<(String, crate::storage::FileMeta)>> {
+            self.inner.list_with_meta(prefix).await
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+        async fn total_size(&self) -> u64 {
+            0
+        }
+        fn backend_name(&self) -> &'static str {
+            "racing"
+        }
+        async fn put_from_path(
+            &self,
+            key: &str,
+            src: &std::path::Path,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.race(key).await;
+            self.inner.put_from_path(key, src, sha256).await
+        }
+        async fn copy(
+            &self,
+            src: &str,
+            dst: &str,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.copy(src, dst, sha256).await
+        }
+        async fn get_reader(
+            &self,
+            key: &str,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(key).await
+        }
+    }
+
+    fn doc_with(id: &str, versions: &[&str]) -> Vec<u8> {
+        let versions: Vec<Value> = versions
+            .iter()
+            .map(|v| {
+                serde_json::json!({ "version": v, "listed": true,
+                    "published": "2026-01-01T00:00:00Z", "semver2": false })
+            })
+            .collect();
+        serde_json::to_vec(&serde_json::json!({ "id": id, "versions": versions })).unwrap()
+    }
+
+    /// R2-35: a document another process writes while a push uploads its package
+    /// (here: `nora import` storing 2.0.0) is re-read before the push saves, so the
+    /// push does not drop that version.
+    #[tokio::test]
+    async fn push_keeps_a_version_another_process_stored_meanwhile() {
+        let meta = "nuget/hosted-meta/maestra.race.json".to_string();
+        let st =
+            RacingBackend::storage(".nupkg", vec![(meta, doc_with("Maestra.Race", &["2.0.0"]))]);
+        let ctx = crate::test_helpers::create_test_context_with_storage_and_config(st, |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+        assert_eq!(
+            push(&ctx.app, &nupkg("Maestra.Race", "1.0.0", ""), &[]).await,
+            StatusCode::CREATED
+        );
+        let (_, idx) = get_json(&ctx.app, "/nuget/v3/flatcontainer/maestra.race/index.json").await;
+        assert_eq!(idx["versions"], serde_json::json!(["1.0.0", "2.0.0"]));
+    }
+
+    /// R2-35: `nora nuget rebuild --apply` keeps a version a running server pushed after
+    /// the rebuild listed the blobs (its package is there now), instead of writing a
+    /// document without it.
+    #[tokio::test]
+    async fn rebuild_keeps_a_version_pushed_while_it_ran() {
+        let dir = "nuget/hosted/maestra.rr";
+        let writes = vec![
+            (
+                format!("{dir}/2.0.0/maestra.rr.2.0.0.nupkg"),
+                b"pkg".to_vec(),
+            ),
+            (
+                "nuget/hosted-meta/maestra.rr.json".to_string(),
+                doc_with("Maestra.Rr", &["1.0.0", "2.0.0"]),
+            ),
+        ];
+        let st = RacingBackend::storage(".nuspec", writes);
+        let ctx = crate::test_helpers::create_test_context_with_storage_and_config(st, |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+        // The push itself reads no nuspec, so the race fires inside the rebuild.
+        assert_eq!(
+            push(&ctx.app, &nupkg("Maestra.Rr", "1.0.0", ""), &[]).await,
+            StatusCode::CREATED
+        );
+        let st = &ctx.state.storage;
+        let rebuilt = super::rebuild(st, "Maestra.Rr", true).await.unwrap();
+        let versions: Vec<&str> = rebuilt.iter().map(|(v, _)| v.as_str()).collect();
+        assert_eq!(versions, ["1.0.0", "2.0.0"]);
+        let doc: super::HostedPackage =
+            serde_json::from_slice(&st.get("nuget/hosted-meta/maestra.rr.json").await.unwrap())
+                .unwrap();
+        assert_eq!(doc.versions.len(), 2);
     }
 
     /// `nora nuget rebuild`: a corrupt document is rewritten from the stored nuspecs,
