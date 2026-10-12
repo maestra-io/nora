@@ -188,6 +188,9 @@ pub(crate) fn resolve_client_ip(
     headers: &HeaderMap,
     trusted_proxies: &crate::config::TrustedProxies,
 ) -> IpAddr {
+    // One key per client whether it arrived over IPv4 or as `::ffff:` on a
+    // dual-stack listener (or was written that way by a proxy).
+    let peer = crate::config::canonical_ip(peer);
     if !trusted_proxies.contains(peer) {
         if headers.contains_key("x-forwarded-for") {
             warn_untrusted_forwarded_once(peer);
@@ -201,7 +204,11 @@ pub(crate) fn resolve_client_ip(
     if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
         let mut client = None;
         for hop in xff.rsplit(',') {
-            let Ok(ip) = hop.trim().parse::<IpAddr>() else {
+            let Ok(ip) = hop
+                .trim()
+                .parse::<IpAddr>()
+                .map(crate::config::canonical_ip)
+            else {
                 break;
             };
             client = Some(ip);
@@ -217,7 +224,7 @@ pub(crate) fn resolve_client_ip(
     if let Some(xri) = headers.get("x-real-ip") {
         if let Ok(s) = xri.to_str() {
             if let Ok(ip) = s.trim().parse::<IpAddr>() {
-                return ip;
+                return crate::config::canonical_ip(ip);
             }
         }
     }
@@ -1092,6 +1099,57 @@ mod tests {
         let proxies = TrustedProxies::parse("192.168.1.1");
         assert!(proxies.contains("192.168.1.1".parse().unwrap()));
         assert!(!proxies.contains("192.168.1.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxies_match_ipv4_mapped_peers() {
+        // A `[::]` listener reports IPv4 peers as `::ffff:a.b.c.d`.
+        use crate::config::TrustedProxies;
+        let pods = TrustedProxies::parse("10.62.0.0/16");
+        assert!(pods.contains("::ffff:10.62.2.90".parse().unwrap()));
+        assert!(!pods.contains("::ffff:10.63.0.1".parse().unwrap()));
+        let loopback = TrustedProxies::parse("127.0.0.1");
+        assert!(loopback.contains("::ffff:127.0.0.1".parse().unwrap()));
+        // Real IPv6 peers still match IPv6 entries only.
+        let v6 = TrustedProxies::parse("fd00:62::/32");
+        assert!(v6.contains("fd00:62::5".parse().unwrap()));
+        assert!(!v6.contains("fd00:63::5".parse().unwrap()));
+        assert!(!pods.contains("fd00:62::5".parse().unwrap()));
+        // Mapped notation in the config means the IPv4 address / net.
+        let mapped_cfg = TrustedProxies::parse("::ffff:10.62.0.0/112,::ffff:127.0.0.1");
+        assert!(mapped_cfg.contains("10.62.9.9".parse().unwrap()));
+        assert!(mapped_cfg.contains("127.0.0.1".parse().unwrap()));
+        assert!(!mapped_cfg.contains("10.63.0.1".parse().unwrap()));
+        // A v6 CIDR wider than /96 keeps covering mapped peers (CodeRabbit #44).
+        let wide = TrustedProxies::parse("::ffff:0:0/95");
+        assert!(wide.contains("::ffff:10.62.2.90".parse().unwrap()));
+        let all_v6 = TrustedProxies::parse("::/0");
+        assert!(all_v6.contains("::ffff:10.62.2.90".parse().unwrap()));
+        assert!(!all_v6.contains("10.62.2.90".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_resolve_client_ip_canonicalises_mapped_addresses() {
+        use crate::config::TrustedProxies;
+        let trusted = TrustedProxies::parse("10.62.0.0/16");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        // traefik on cilium_host, seen as a mapped peer: XFF is honoured.
+        assert_eq!(
+            resolve_client_ip("::ffff:10.62.2.90".parse().unwrap(), &headers, &trusted),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+        // A mapped XFF hop keys the same as its plain IPv4 form.
+        headers.insert("x-forwarded-for", "::ffff:203.0.113.7".parse().unwrap());
+        assert_eq!(
+            resolve_client_ip("10.62.2.90".parse().unwrap(), &headers, &trusted),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+        // An untrusted mapped peer is keyed by its IPv4 form, one bucket per client.
+        assert_eq!(
+            resolve_client_ip("::ffff:198.51.100.1".parse().unwrap(), &headers, &trusted),
+            "198.51.100.1".parse::<IpAddr>().unwrap()
+        );
     }
 
     #[test]

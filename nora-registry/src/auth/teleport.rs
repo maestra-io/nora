@@ -653,5 +653,40 @@ AJvDZc4Bbdm5PNsOvQZYEIacnJLnu7vP0RqnkhSbTJ0lRhSmCMjFDCjQ
         let basic = format!("Basic {}", STANDARD.encode("admin:secret"));
         let resp = get(&ctx, "/raw/some/file", vec![("authorization", basic)]).await;
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // The same port-forward on a `[::]` listener arrives as ::ffff:127.0.0.1.
+        use tower::ServiceExt;
+        let mut req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"username":"admin","password":"secret"}"#))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            "::ffff:127.0.0.1".parse().unwrap(),
+            0,
+        )));
+        let resp = ctx.app.clone().oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.status().is_success(), "{}", resp.status());
+    }
+
+    #[tokio::test]
+    async fn jwt_from_a_mapped_trusted_peer_is_accepted() {
+        // Trusted proxy 127.0.0.1 seen through a dual-stack listener.
+        let (_s, ctx) = setup("127.0.0.1", |_| {}).await;
+        use tower::ServiceExt;
+        let (k, v) = jwt_header("alice", &["apps"]);
+        let mut req = axum::http::Request::builder()
+            .uri("/ui/")
+            .header(k, v)
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            "::ffff:127.0.0.1".parse().unwrap(),
+            0,
+        )));
+        let resp = ctx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
