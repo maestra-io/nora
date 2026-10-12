@@ -1,0 +1,162 @@
+{{- if .Values.backup.enabled }}
+{{- $st := .Values.config.storage }}
+{{- if ne $st.mode "s3" }}
+{{- fail "backup.enabled uploads to config.storage.bucket: it needs config.storage.mode=s3" }}
+{{- end }}
+{{- if not .Values.persistence.enabled }}
+{{- fail "backup.enabled backs up the data PVC: it needs persistence.enabled=true" }}
+{{- end }}
+{{- $credsDir := include "nora.storage.s3CredentialsDir" . }}
+{{- $tokens := .Values.config.auth.token_storage }}
+{{- $ledger := printf "%s/quarantine.jsonl" (trimSuffix "/" $st.path) }}
+{{- range (list $tokens $ledger) }}
+{{- if not (hasPrefix "/data/" .) }}
+{{- fail (printf "backup: %s is not on the /data volume" .) }}
+{{- end }}
+{{- end }}
+# A second pod on the RWO data volume: allowed on the same node, which the
+# podAffinity below (and a node-local PV's own node affinity) guarantees.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "nora.fullname" . }}-backup
+  labels:
+    {{- include "nora.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: {{ include "nora.name" . }}-backup
+            app.kubernetes.io/instance: {{ .Release.Name }}
+        spec:
+          restartPolicy: Never
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          serviceAccountName: {{ include "nora.serviceAccountName" . }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      {{- include "nora.selectorLabels" . | nindent 22 }}
+                  topologyKey: kubernetes.io/hostname
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          initContainers:
+            # Token records + ledger only: artifacts are already in the bucket.
+            - name: archive
+              image: {{ include "nora.image" . }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              {{- with .Values.backup.resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  cd /
+                  set --
+                  for p in {{ trimPrefix "/" $tokens | quote }} {{ trimPrefix "/" $ledger | quote }}; do
+                    if [ -e "$p" ]; then set -- "$@" "$p"; fi
+                  done
+                  if [ $# -eq 0 ]; then echo "no tokens or ledger yet, nothing to back up"; exit 0; fi
+                  tar -czf /work/nora-local.tar.gz "$@"
+                  ls -l /work/nora-local.tar.gz
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+                  readOnly: true
+                - name: work
+                  mountPath: /work
+          containers:
+            - name: upload
+              image: "{{ .Values.backup.image.repository }}:{{ .Values.backup.image.tag }}"
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              {{- with .Values.backup.resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              env:
+                - name: HOME
+                  value: /work
+                - name: AWS_DEFAULT_REGION
+                  value: {{ $st.s3_region | default "us-east-1" | quote }}
+                - name: AWS_REQUEST_CHECKSUM_CALCULATION
+                  value: when_required
+                - name: S3_URL
+                  value: {{ $st.s3_url | quote }}
+                - name: DEST
+                  value: {{ printf "s3://%s/%s" $st.bucket .Values.backup.prefix | quote }}
+                - name: KEEP
+                  value: {{ .Values.backup.keep | int | quote }}
+                {{- with $credsDir }}
+                - name: CREDS_DIR
+                  value: {{ . | quote }}
+                {{- end }}
+              {{- with .Values.existingSecret }}
+              envFrom:
+                - secretRef:
+                    name: {{ . }}
+              {{- end }}
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  if [ ! -f /work/nora-local.tar.gz ]; then exit 0; fi
+                  if [ -n "${CREDS_DIR:-}" ]; then
+                    AWS_ACCESS_KEY_ID=$(cat "$CREDS_DIR/access_key_id")
+                    AWS_SECRET_ACCESS_KEY=$(cat "$CREDS_DIR/secret_access_key")
+                    if [ -s "$CREDS_DIR/session_token" ]; then
+                      AWS_SESSION_TOKEN=$(cat "$CREDS_DIR/session_token"); export AWS_SESSION_TOKEN
+                    fi
+                  else
+                    AWS_ACCESS_KEY_ID=$NORA_STORAGE_S3_ACCESS_KEY
+                    AWS_SECRET_ACCESS_KEY=$NORA_STORAGE_S3_SECRET_KEY
+                  fi
+                  export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+                  s3() { aws --endpoint-url "$S3_URL" s3 "$@"; }
+                  s3 cp /work/nora-local.tar.gz "${DEST}$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+                  # Keys sort by timestamp: drop all but the newest $KEEP.
+                  s3 ls "$DEST" | while read -r _ _ _ key; do case $key in *.tar.gz) echo "$key" ;; esac; done |
+                    sort -r | tail -n +$((KEEP + 1)) | while read -r key; do s3 rm "${DEST}${key}"; done
+              volumeMounts:
+                - name: work
+                  mountPath: /work
+                {{- if $st.s3Credentials.existingSecret }}
+                - name: s3-credentials
+                  mountPath: {{ $st.s3Credentials.mountPath }}
+                  readOnly: true
+                {{- end }}
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: {{ include "nora.fullname" . }}-data
+                readOnly: true
+            - name: work
+              emptyDir: {}
+            {{- with $st.s3Credentials.existingSecret }}
+            - name: s3-credentials
+              secret:
+                secretName: {{ . }}
+                defaultMode: 0440
+            {{- end }}
+{{- end }}

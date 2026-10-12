@@ -70,8 +70,7 @@ data:
     {{- end }}
 
     [gc]
-    enabled = {{ .Values.config.gc.enabled }}
-    interval = {{ .Values.config.gc.interval }}
+    {{- include "nora.tomlScalars" .Values.config.gc | trim | nindent 4 }}
 
     [retention]
     enabled = {{ .Values.config.retention.enabled }}
@@ -107,6 +106,20 @@ data:
     {{- end }}
     {{- with $auth.admin_users }}
     admin_users = {{ toJson . }}
+    {{- end }}
+    {{- with $auth.read_only_users }}
+    read_only_users = {{ toJson . }}
+    {{- end }}
+    {{- with $auth.htpasswd_allowed_peers }}
+    htpasswd_allowed_peers = {{ ternary . (join "," .) (kindIs "string" .) | quote }}
+    {{- end }}
+    {{- with $auth.teleport }}
+
+    [auth.teleport]
+    {{- with .trusted_proxies }}
+    trusted_proxies = {{ ternary . (join "," .) (kindIs "string" .) | quote }}
+    {{- end }}
+    {{- include "nora.tomlScalars" (omit . "trusted_proxies") | trim | nindent 4 }}
     {{- end }}
     {{- if $auth.oidc.enabled }}
 
@@ -151,16 +164,18 @@ data:
     {{- end }}
 
     [audit]
-    mode = {{ .Values.config.audit.mode | quote }}
+    {{- include "nora.tomlScalars" .Values.config.audit | trim | nindent 4 }}
     {{- with .Values.config.circuit_breaker }}
 
     [circuit_breaker]
     {{- include "nora.tomlScalars" . | trim | nindent 4 }}
     {{- end }}
-    {{- with .Values.config.nuget }}
+    {{- range $section := list "nuget" "npm" "pypi" }}
+    {{- with get $.Values.config $section }}
 
-    [nuget]
+    [{{ $section }}]
     {{- include "nora.tomlScalars" . | trim | nindent 4 }}
+    {{- end }}
     {{- end }}
 
     [rate_limit]
@@ -176,7 +191,18 @@ data:
 
     {{- $blocklistPath := include "nora.curation.blocklistPath" . | trim }}
     {{- $allowlistPath := include "nora.curation.allowlistPath" . | trim }}
-    {{- if or (ne .Values.config.curation.mode "off") $blocklistPath $allowlistPath .Values.config.curation.min_release_age .Values.config.curation.require_integrity }}
+    {{- $cur := .Values.config.curation }}
+    {{- $curRegs := $cur.registries | default dict }}
+    {{- if $cur.min_release_age }}
+    {{- $quarantined := has ($cur.quarantine | default "off") (list "observe" "enforce") }}
+    {{- range $curRegs }}
+    {{- $quarantined = or $quarantined (has (.quarantine | default "off") (list "observe" "enforce")) }}
+    {{- end }}
+    {{- if not $quarantined }}
+    {{- fail "config.curation.min_release_age needs config.curation.quarantine (observe or enforce): nora refuses min_release_age on a proxy without a quarantine (config/mod.rs, #741)" }}
+    {{- end }}
+    {{- end }}
+    {{- if or (ne $cur.mode "off") $blocklistPath $allowlistPath $cur.min_release_age $cur.require_integrity $cur.internal_namespaces $cur.quarantine $curRegs }}
 
     [curation]
     mode = {{ .Values.config.curation.mode | quote }}
@@ -193,4 +219,24 @@ data:
     {{- if .Values.config.curation.min_release_age }}
     min_release_age = {{ .Values.config.curation.min_release_age | quote }}
     {{- end }}
+    {{- with $cur.quarantine }}
+    quarantine = {{ . | quote }}
+    {{- end }}
+    {{- with $cur.quarantine_ttl }}
+    quarantine_ttl = {{ . | quote }}
+    {{- end }}
+    {{- with $cur.internal_namespaces }}
+    internal_namespaces = {{ toJson . }}
+    {{- end }}
+    {{- range $name, $reg := $curRegs }}
+
+    [curation.{{ $name }}]
+    {{- include "nora.tomlScalars" $reg | trim | nindent 4 }}
+    {{- end }}
+    {{- end }}
+    {{- /* Verbatim, last: sections the chart does not render (a table header
+    the chart already emits would be a duplicate-table TOML error). */}}
+    {{- with .Values.config.extraToml }}
+    {{- "\n" }}
+    {{- . | trim | nindent 4 }}
     {{- end }}

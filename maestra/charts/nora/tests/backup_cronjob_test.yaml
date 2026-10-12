@@ -1,0 +1,114 @@
+# Maestra: scheduled backup of tokens + quarantine ledger (R2-57)
+suite: backup cronjob
+templates:
+  - templates/backup-cronjob.yaml
+set:
+  config.server.public_url: https://registry.example.com
+  config.storage.mode: s3
+  config.storage.s3_url: https://s3.example.com
+  config.storage.bucket: bkt
+  config.storage.s3_region: auto
+tests:
+  - it: renders nothing by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: refuses local storage
+    set:
+      backup.enabled: true
+      config.storage.mode: local
+    asserts:
+      - failedTemplate:
+          errorPattern: 'needs config.storage.mode=s3'
+
+  - it: refuses an ephemeral /data
+    set:
+      backup.enabled: true
+      persistence.enabled: false
+      persistence.allowEphemeral: true
+    asserts:
+      - failedTemplate:
+          errorPattern: 'needs persistence.enabled=true'
+
+  - it: refuses token storage off the volume
+    set:
+      backup.enabled: true
+      config.auth.token_storage: /var/tokens
+    asserts:
+      - failedTemplate:
+          errorPattern: '/var/tokens is not on the /data volume'
+
+  - it: archives tokens + ledger from the read-only PVC on nora's node and uploads with the creds files
+    set:
+      backup.enabled: true
+      backup.schedule: "0 2 * * *"
+      backup.keep: 7
+      config.storage.s3Credentials.existingSecret: r2-creds
+      config.storage.s3Credentials.mountPath: /r2-creds
+    asserts:
+      - isKind:
+          of: CronJob
+      - equal:
+          path: spec.schedule
+          value: "0 2 * * *"
+      - equal:
+          path: spec.concurrencyPolicy
+          value: Forbid
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.volumes[0].persistentVolumeClaim
+          value:
+            claimName: RELEASE-NAME-nora-data
+            readOnly: true
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution[0]
+          value:
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: nora
+                app.kubernetes.io/instance: RELEASE-NAME
+            topologyKey: kubernetes.io/hostname
+      - matchRegex:
+          path: spec.jobTemplate.spec.template.spec.initContainers[0].command[2]
+          pattern: 'for p in "data/tokens" "data/storage/quarantine\.jsonl"; do'
+      - contains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].env
+          content:
+            name: DEST
+            value: s3://bkt/.nora-backup/
+      - contains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].env
+          content:
+            name: KEEP
+            value: "7"
+      - contains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].env
+          content:
+            name: CREDS_DIR
+            value: /r2-creds
+      - contains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].volumeMounts
+          content:
+            name: s3-credentials
+            mountPath: /r2-creds
+            readOnly: true
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.volumes[2].secret.secretName
+          value: r2-creds
+
+  - it: falls back to the env keys of existingSecret
+    set:
+      backup.enabled: true
+      existingSecret: nora-s3
+    asserts:
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.containers[0].envFrom[0].secretRef.name
+          value: nora-s3
+      - notContains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].env
+          content:
+            name: CREDS_DIR
+            value: /etc/nora-s3
+      - matchRegex:
+          path: spec.jobTemplate.spec.template.spec.containers[0].command[2]
+          pattern: 'AWS_ACCESS_KEY_ID=\$NORA_STORAGE_S3_ACCESS_KEY'

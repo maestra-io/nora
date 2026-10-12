@@ -132,7 +132,7 @@ valid TOML for strings, numbers, booleans and string arrays).
 */}}
 {{- define "nora.tomlScalars" -}}
 {{- range $k, $v := . }}
-{{- if kindIs "map" $v }}
+{{- if or (kindIs "map" $v) (and (kindIs "slice" $v) $v (kindIs "map" (first $v))) }}
 {{- fail (printf "config key %q is a table; the chart renders scalar values here only" $k) }}
 {{- end }}
 {{ $k }} = {{ toJson $v }}

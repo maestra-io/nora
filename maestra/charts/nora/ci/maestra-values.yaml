@@ -1,9 +1,15 @@
-# Mirror of the packages.maestra.io HelmRelease (maestra-io/fluxcd
-# iota/us-iota-lw-kube-infra/nora/helm-release.yaml + config.toml, origin/main
-# 11.10.2026) expressed in this chart's values: everything the postRenderer
-# and the separate nora-config-maestra ConfigMap do today. Used by CI
-# (helm lint / template) and as the target values when the HelmRelease moves
-# to this chart.
+# Mirror of the packages.maestra.io deployment (maestra-io/fluxcd
+# iota/us-iota-lw-kube-infra/nora/: helm-release.yaml, config.toml,
+# network-policy.yaml, monitoring.yaml at origin/main 99005e86, 11.10.2026,
+# plus [auth] from the open fluxcd#22173, Teleport UI) expressed in this
+# chart's values: everything the postRenderer, the separate
+# nora-config-maestra ConfigMap and those manifests do today. Deliberate
+# additions over the live config: [gc] with a proxy-cache cap (C22), the
+# backup CronJob (C72), the deploy/prometheus-rules.yml alerts (C77). Used by
+# CI (helm lint / template, tests/maestra_values_test.yaml asserts the
+# rendered config.toml) and as the target values when the HelmRelease moves
+# to this chart; the switch then deletes config.toml, network-policy.yaml and
+# monitoring.yaml from fluxcd (same object names).
 replicaCount: 1
 
 deploymentAnnotations:
@@ -11,8 +17,8 @@ deploymentAnnotations:
 
 image:
   repository: 515260921971.dkr.ecr.us-west-2.amazonaws.com/nora
-  tag: 1.3.3-maestra.1
-  digest: sha256:4892881d9ad4eea92055dd2178d7ffd6447a1782124510b315ebceac3b75768f
+  tag: 1.3.3-maestra.2
+  digest: sha256:2389b07562d414b42ff4232322f97d8971c6176122593bfb8bc1d167d12c99c1
 
 imagePullSecrets:
   - name: image-pull
@@ -38,6 +44,8 @@ config:
   server:
     public_url: https://packages.maestra.io
     body_limit_mb: 256
+    # Cooldown age = the upstream publish date, not nora's cache mtime (C49).
+    trust_upstream_dates: true
 
   registries:
     enable: ["nuget", "npm", "pypi"]
@@ -52,11 +60,19 @@ config:
       existingSecret: nora-r2-creds   # VaultDynamicSecret, reloader-ignored
       mountPath: /r2-creds
 
-  # Live config.toml sets no [gc]: nora's default (off). Nothing docker-shaped
-  # to collect here.
+  # Live config.toml sets no [gc] (off); on here because the gc pass is what
+  # evicts the proxy cache (C22): without it nuget/flatcontainer, npm tarballs
+  # and PyPI files fetched from upstream grow in R2 forever. The cap, 100 GiB:
+  # several full dependency closures including ML wheel stacks (a CUDA torch
+  # set is ~5-6 GB per Python/platform), ~$1.5/month at R2's $0.015/GB-month,
+  # so it bounds growth from accumulating versions without cache churn.
+  # Eviction is oldest-cached first (mtime), hosted and internal_namespaces
+  # never. Preview before the first switch: `kubectl -n nora exec deploy/nora
+  # -- nora gc` (dry run).
   gc:
-    enabled: false
+    enabled: true
     interval: 86400
+    proxy_cache_max_bytes: 107374182400
 
   auth:
     enabled: true
@@ -65,12 +81,29 @@ config:
     htpasswd:
       existingSecret: nora-htpasswd
     # traefik-public is hostNetwork: node IPs and, over vxlan, cilium_host
-    # addresses in the pod pool.
+    # addresses in the pod pool (one per node, not pinned across node
+    # rebuilds), hence the whole pod CIDR. networkPolicy below admits only
+    # traefik (host/remote-node), vmagent and the Teleport agent, so no other
+    # pod can reach nora to spoof X-Forwarded-For.
     trusted_proxies:
       - 10.60.8.0/24
       - 10.62.0.0/16
     admin_users:
       - admin
+    # fluxcd#22173: passwords (htpasswd admin) only over
+    # `kubectl -n nora port-forward svc/nora 4000`.
+    htpasswd_allowed_peers: "127.0.0.1,::1"
+    # fluxcd#22173: web UI only through Teleport app `packages`.
+    teleport:
+      enabled: true
+      jwks_url: https://teleport.maestra.io/.well-known/jwks.json
+      issuer: teleport.maestra.io
+      # The app's internal URI (Teleport puts spec.uri in `aud`).
+      audience: http://nora-teleport.nora.svc.cluster.local:80
+      # teleport-maestra-agent pods (pod pool).
+      trusted_proxies: "10.62.0.0/16"
+      write_roles: ["apps"]
+      require_for_ui: true
     oidc:
       enabled: true
       leeway_secs: 60
@@ -116,3 +149,165 @@ config:
     upload_burst: 500
     general_rps: 100
     general_burst: 200
+
+  # Cooldown for public packages (issues-maestra#1442): audit until enforce;
+  # nora refuses min_release_age without a quarantine.
+  curation:
+    mode: audit
+    min_release_age: 7d
+    quarantine: observe
+    quarantine_ttl: 7d
+    internal_namespaces:
+      - "maestra.*"
+      - "@mindbox-cloud/*"
+      - mindbox-ml-commons
+      - python-mindbox-sdk
+      - python-mindbox-chat-ast
+      - mindbox-finance-mcp
+    registries:
+      nuget:
+        min_release_age: 3d
+        quarantine_ttl: 3d
+
+# fluxcd network-policy.yaml (+ the Teleport agent rule and `host` egress of
+# fluxcd#22173). Cilium: traefik-public is hostNetwork, reachable only as the
+# host / remote-node entities. Endpoint rules pinned to this cluster
+# (policy-default-local-cluster=false admits ClusterMesh peers otherwise).
+networkPolicy:
+  enabled: true
+  kind: CiliumNetworkPolicy
+  ingress:
+    - fromEntities:
+        - host
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "4000"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: teleport-maestra-agent
+            io.cilium.k8s.policy.cluster: us-iota-lw-kube-infra
+            app: teleport-maestra-agent
+      toPorts:
+        - ports:
+            - port: "4000"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: victoria-metrics
+            io.cilium.k8s.policy.cluster: us-iota-lw-kube-infra
+            app.kubernetes.io/name: vmagent
+      toPorts:
+        - ports:
+            - port: "4000"
+              protocol: TCP
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            io.cilium.k8s.policy.cluster: us-iota-lw-kube-infra
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+    # Upstream registries, R2, the OIDC/Teleport JWKS (teleport.maestra.io is
+    # the node public IPs; the pod's own node is `host` to Cilium).
+    - toEntities:
+        - world
+        - host
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+
+# fluxcd monitoring.yaml: picked up by vmks/vmalert (selectAllByDefault, rule
+# label mindbox/prometheus). The chart's rules are deploy/prometheus-rules.yml;
+# extraGroups are the fluxcd-only alerts. At the switch the HelmRelease needs
+# kustomize.toolkit.fluxcd.io/substitute: disabled, or Flux postBuild eats
+# `$value` / `$labels` in these values.
+metrics:
+  serviceMonitor:
+    enabled: true
+  prometheusRule:
+    enabled: true
+    labels:
+      mindbox/prometheus: kubernetes-system
+    additionalRuleLabels:
+      product: platform
+      feature: nora
+      service: nora
+    extraGroups:
+      - name: nora-maestra
+        rules:
+          # 429s counted by the metrics middleware, which wraps the rate limiters.
+          - alert: NoraRateLimiting
+            expr: sum by (namespace) (rate(nora_http_requests_total{namespace="nora",status="429"}[5m])) > 1
+            for: 15m
+            labels:
+              severity: warning
+              product: platform
+              feature: nora
+              component: api
+              service: nora
+            annotations:
+              summary: packages.maestra.io answers 429 at {{ $value | humanize }}/s
+              description: >-
+                nora's rate limiter is refusing requests. Check the audit/pod log of
+                nora/nora for the client IPs; one IP for everybody means
+                auth.trusted_proxies no longer matches the traefik source addresses.
+          # `jwks` = the GitHub signing keys could not be fetched or the kid is
+          # unknown: CI publishes and restores with OIDC fail until the cache refreshes.
+          - alert: NoraOidcJwksRejections
+            expr: sum by (namespace) (increase(nora_auth_oidc_rejected_total{namespace="nora",reason="jwks"}[10m])) > 5
+            for: 10m
+            labels:
+              severity: warning
+              product: platform
+              feature: nora
+              component: auth
+              service: nora
+            annotations:
+              summary: packages.maestra.io rejects GitHub Actions OIDC tokens on JWKS
+              description: >-
+                {{ $value | humanize }} OIDC rejections with reason=jwks in 10m. Check
+                egress to token.actions.githubusercontent.com from nora/nora and
+                the pod log for the failing kid.
+          - alert: NoraReadinessFlapping
+            expr: sum by (namespace, pod) (changes(kube_pod_status_ready{namespace="nora",condition="true"}[30m])) > 4
+            for: 0m
+            labels:
+              severity: warning
+              product: platform
+              feature: nora
+              component: api
+              service: nora
+            annotations:
+              summary: nora pod {{ $labels.pod }} flips Ready {{ $value }} times in 30m
+              description: >-
+                /ready follows R2 reachability from a periodic bucket LIST; flapping
+                means R2 errors or slow listings. Check nora_storage_operations_total
+                errors and the pod log.
+          - alert: NoraTokenVolumeFilling
+            expr: max by (namespace, persistentvolumeclaim) (kubelet_volume_stats_used_bytes{namespace="nora"} / kubelet_volume_stats_capacity_bytes{namespace="nora"}) > 0.8
+            for: 30m
+            labels:
+              severity: warning
+              product: platform
+              feature: nora
+              component: storage
+              service: nora
+            annotations:
+              summary: nora PVC {{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }} full
+              description: >-
+                The local volume holds API tokens and the quarantine ledger (audit
+                goes to stdout). A full volume fails token minting. Find what grew
+                under /data and raise persistence.size.
+
+# Tokens + quarantine ledger live only on the node-local PVC (C72): daily to
+# s3://nora-packages-iota/.nora-backup/, 14 kept. RPO 24 h.
+backup:
+  enabled: true

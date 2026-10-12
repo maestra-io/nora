@@ -168,6 +168,11 @@ config:
     #  - url: https://registry-1.docker.io
     #  - url: https://private.registry.io
     #    auth: "user:token"
+  # -- [gc], every key rendered as is: enabled, interval (s), dry_run,
+  # grace_secs (orphan age floor, nora default 604800), proxy_cache_max_bytes
+  # (cap on proxy-cached npm tarballs, PyPI files, NuGet .nupkg/.nuspec and
+  # rpm/deb; oldest evicted first by the gc pass; nora default 0 = no cap).
+  # Eviction runs only inside the gc pass, so a cap needs enabled: true.
   gc:
     enabled: true
     interval: 86400
@@ -194,6 +199,26 @@ config:
     trusted_proxies: []
     # -- htpasswd users allowed to mint admin-role API tokens (POST /api/tokens).
     admin_users: []
+    # -- Maestra fork: htpasswd users that authenticate as `read` (pull only,
+    # read tokens only).
+    read_only_users: []
+    # -- Maestra fork: TCP peers (list or comma-separated string) whose htpasswd
+    # password is checked; any other peer gets no bcrypt and 403 on
+    # /api/tokens*. Empty = every peer (nora default). E.g. "127.0.0.1,::1"
+    # for passwords only over `kubectl port-forward`.
+    htpasswd_allowed_peers: []
+    # -- Maestra fork: [auth.teleport], web UI identity from a Teleport app
+    # agent's JWT (MAESTRA.md). Rendered when set; trusted_proxies may be a
+    # list. Keys: enabled, jwks_url, issuer, audience, trusted_proxies,
+    # write_roles, require_for_ui, leeway_secs (60), jwks_cache_secs (300).
+    teleport: {}
+    #  enabled: true
+    #  jwks_url: https://teleport.example.com/.well-known/jwks.json
+    #  issuer: teleport.example.com
+    #  audience: http://nora-teleport.nora.svc.cluster.local:80
+    #  trusted_proxies: ["10.62.0.0/16"]
+    #  write_roles: ["apps"]
+    #  require_for_ui: true
     # -- Optional, rendered only when set (nora defaults in brackets):
     # docker_anon_pull (false), public_web_ui (false), public_metrics (true),
     # token_cache_ttl (300).
@@ -237,10 +262,11 @@ config:
       #      - pattern: "repo:myorg/*"
       #        role: read
 
-  # -- Audit log: file ({storage.path}/audit.jsonl, append-only, never
-  # rotated), stdout (JSONL to stderr, i.e. the pod log), both, off.
-  # stdout on Kubernetes: the cluster log pipeline keeps it and nothing grows
-  # on the volume. Env NORA_AUDIT_LOG overrides.
+  # -- Audit log: file ({storage.path}/audit.jsonl, rotated at max_size_mb,
+  # max_files kept; nora defaults 100 and 5), stdout (JSONL to stderr, i.e. the
+  # pod log), both, off. stdout on Kubernetes: the cluster log pipeline keeps it
+  # and nothing grows on the volume. Every key rendered as is. Env
+  # NORA_AUDIT_LOG / NORA_AUDIT_MAX_SIZE_MB / NORA_AUDIT_MAX_FILES override.
   audit:
     mode: stdout
 
@@ -265,6 +291,10 @@ config:
   nuget:
     proxy_timeout: 30
     metadata_proxy_timeout: 15
+  # -- [npm] / [pypi] scalar keys, rendered as is when set, e.g. metadata_ttl,
+  # proxy_timeout, proxy (tables such as pypi.proxies: extraToml or env).
+  # npm: {}
+  # pypi: {}
 
   # -- Rate limiting (token bucket). See https://getnora.dev/configuration/rate-limits/
   # Env overrides (NORA_RATE_LIMIT_*) still apply if set via extraEnv.
@@ -293,8 +323,23 @@ config:
     # -- Require integrity metadata (checksums) on allowlisted artifacts.
     require_integrity: false
     # -- Minimum release age before an artifact is allowed (e.g. "7d", "24h", "1w").
-    # Empty disables the release-age gate.
+    # Empty disables the release-age gate. Needs quarantine observe|enforce
+    # (here or in a registry below): nora refuses it otherwise, so does the chart.
     min_release_age: ""
+    # -- Digest quarantine: "" (nora default off), "observe", "enforce".
+    quarantine: ""
+    # -- How long a new digest is held, e.g. "7d".
+    quarantine_ttl: ""
+    # -- Name globs never proxied upstream and never cooled down, in every mode.
+    internal_namespaces: []
+    # -- Per-registry [curation.<registry>] tables: min_release_age, quarantine,
+    # quarantine_ttl, allow (Maestra fork: exact "name@version" exempt from
+    # min_release_age).
+    registries: {}
+    #  nuget:
+    #    min_release_age: 3d
+    #    quarantine_ttl: 3d
+    #    allow: ["Newtonsoft.Json@13.0.4"]
     # -- Blocklist JSON. Mount from an existing Secret or ConfigMap (same pattern
     # as config.auth.htpasswd). When existingSecret/existingConfigMap is set,
     # blocklist_path is auto-wired to <mountPath>/<key>, so the path is never
@@ -317,6 +362,10 @@ config:
       key: allowlist.json
       mountPath: /etc/nora-curation/allowlist
       path: ""
+
+  # -- TOML appended verbatim to config.toml, for sections the chart does not
+  # render (a section it renders cannot be extended here: duplicate table).
+  extraToml: ""
 
 # -- Name of an existing Secret whose keys become env vars (envFrom), e.g.
 # NORA_DOCKER_PROXIES, NORA_NPM_PROXY_AUTH, NORA_STORAGE_S3_ACCESS_KEY /
@@ -378,3 +427,66 @@ resources:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# -- Maestra: ingress/egress policy for the nora pods (its selector labels).
+# auth.trusted_proxies honours X-Forwarded-For from every peer in it; on a
+# cluster where that has to be the pod CIDR (hostNetwork ingress over a
+# tunnel), this policy is what keeps other pods from reaching nora and
+# spoofing it. kind NetworkPolicy (networking.k8s.io/v1) or
+# CiliumNetworkPolicy (cilium.io/v2, needed to admit a hostNetwork ingress via
+# the host/remote-node entities); ingress / egress are that kind's rules,
+# rendered verbatim. Empty egress = egress not restricted.
+networkPolicy:
+  enabled: false
+  kind: NetworkPolicy
+  ingress: []
+  egress: []
+
+# -- Maestra: Prometheus Operator objects (VictoriaMetrics operator converts
+# them too).
+metrics:
+  serviceMonitor:
+    enabled: false
+    labels: {}
+    interval: 30s
+    scrapeTimeout: 10s
+  # -- PrometheusRule with nora's alerts: files/prometheus-rules.yml, a copy of
+  # deploy/prometheus-rules.yml kept identical by CI (the helm chart job).
+  prometheusRule:
+    enabled: false
+    labels: {}
+    annotations: {}
+    # -- Added to every rule's labels (a rule's own label wins), e.g. routing.
+    additionalRuleLabels: {}
+    # -- More rule groups, verbatim (site-specific alerts).
+    extraGroups: []
+
+# -- Maestra: scheduled backup of the local state that is NOT in the bucket:
+# API token records (auth.token_storage) and the quarantine ledger
+# (storage.path/quarantine.jsonl). A CronJob tars them from the data PVC
+# (mounted read-only; RWO admits a second pod on the same node, and a required
+# podAffinity on the nora pod puts it there) and uploads the archive to
+# s3://<config.storage.bucket>/<prefix><timestamp>.tar.gz with the
+# config.storage endpoint and credentials, keeping the newest `keep`.
+# config.storage.mode s3 only. Restore: README "Backup and restore".
+backup:
+  enabled: false
+  schedule: "17 3 * * *"
+  # -- Object key prefix inside config.storage.bucket. nora never lists or
+  # serves it (no registry path starts with it).
+  prefix: ".nora-backup/"
+  # -- Archives kept (older ones deleted after each upload).
+  keep: 14
+  # -- Uploader image: anything with `aws` and /bin/sh; the tar runs in the
+  # nora image. 2.22.x: before aws-cli 2.23 made checksum trailers the
+  # default, which some S3-compatible stores reject (the script also sets
+  # AWS_REQUEST_CHECKSUM_CALCULATION=when_required).
+  image:
+    repository: public.ecr.aws/aws-cli/aws-cli
+    tag: "2.22.35"
+  resources:
+    requests:
+      cpu: 10m
+      memory: 128Mi
+    limits:
+      memory: 128Mi
