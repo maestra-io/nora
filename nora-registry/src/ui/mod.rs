@@ -266,13 +266,30 @@ async fn setup_page(
     State(state): State<AppState>,
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
+    user: Option<Extension<AuthenticatedUser>>,
+    role: Option<Extension<AuthenticatedRole>>,
 ) -> impl IntoResponse {
-    use crate::registry_type::RegistryType;
     let lang = extract_lang(
         &Query(query),
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
-    let base_url = resolve_base_url(&state);
+    let user = user.map(|Extension(u)| u.0);
+    let role = role.map(|Extension(r)| r.0);
+    Html(render_setup(&state, lang, user.as_deref(), role, None))
+}
+
+/// `/ui/setup` for this viewer. The "Generate token" form shows only to an
+/// authenticated identity on a deployment with a token store; `write` is offered
+/// only to a caller whose own role can write (the Tokens page's cap).
+fn render_setup(
+    state: &AppState,
+    lang: Lang,
+    user: Option<&str>,
+    role: Option<Role>,
+    token: Option<&str>,
+) -> String {
+    use crate::registry_type::RegistryType;
+    let base_url = resolve_base_url(state);
     let curation = state.curation();
     let engine = &curation.curation_engine;
     // Only enforce mode hides young versions; audit just logs.
@@ -295,13 +312,24 @@ async fn setup_page(
     } else {
         Vec::new()
     };
+    let mint = match (user, role, &state.tokens) {
+        (Some(user), Some(role), Some(_)) if user != "anonymous" => Some(setup::MintOptions {
+            can_write: role.can_write(),
+            description: format!("dev setup {user}"),
+            default_ttl_days: 90,
+            max_ttl_days: MAX_TOKEN_TTL_DAYS,
+        }),
+        _ => None,
+    };
     let info = setup::SetupInfo {
         base_url: &base_url,
         login_url: &state.config.server.ui_docs_login_url,
         cooldown,
         internal_namespaces: &state.config.curation.internal_namespaces,
+        mint,
+        token,
     };
-    Html(setup::render_setup_page(&info, lang, state.auth.is_some()))
+    setup::render_setup_page(&info, lang, state.auth.is_some())
 }
 
 // Docker pages
@@ -1012,6 +1040,9 @@ struct CreateTokenForm {
     description: String,
     role: String,
     ttl_days: Option<u64>,
+    /// Maestra: `setup` when posted from /ui/setup's "Generate token" form.
+    #[serde(default)]
+    ui: Option<String>,
 }
 
 async fn tokens_create(
@@ -1020,10 +1051,37 @@ async fn tokens_create(
     Extension(caller_role): Extension<AuthenticatedRole>,
     headers: axum::http::HeaderMap,
     Form(form): Form<CreateTokenForm>,
-) -> impl IntoResponse {
-    // CSRF check: require HX-Request header (HTMX sets this automatically)
-    if headers.get("hx-request").is_none() {
-        return (StatusCode::FORBIDDEN, Html("Forbidden".to_string()));
+) -> Response {
+    // Maestra: /ui/setup mints through this same endpoint. Its JS asks for JSON;
+    // without JS the form posts natively and gets the setup page back, filled.
+    let setup = form.ui.as_deref() == Some("setup");
+    let json = setup
+        && headers
+            .get(header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|a| a.contains("application/json"));
+    let error = |status: StatusCode, msg: &str| -> Response {
+        if json {
+            (status, axum::Json(serde_json::json!({ "error": msg }))).into_response()
+        } else {
+            (
+                status,
+                Html(format!(
+                    r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">{}</div>"##,
+                    components::html_escape(msg)
+                )),
+            )
+                .into_response()
+        }
+    };
+
+    // CSRF check: require HX-Request header (HTMX sets this automatically). The
+    // setup page's JS-free post cannot set a header; for it the browser's own
+    // Fetch Metadata must say same-origin (a cross-site form post never does).
+    let same_origin =
+        headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) == Some("same-origin");
+    if headers.get("hx-request").is_none() && !(setup && same_origin) {
+        return (StatusCode::FORBIDDEN, Html("Forbidden".to_string())).into_response();
     }
 
     let lang = extract_lang_from_headers(&headers);
@@ -1031,9 +1089,9 @@ async fn tokens_create(
     let store = match &state.tokens {
         Some(store) => store,
         None => {
-            return (
+            return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Html("Token store not configured".to_string()),
+                "Token store not configured",
             );
         }
     };
@@ -1052,23 +1110,16 @@ async fn tokens_create(
     // A token never outranks the credential that mints it (a read caller
     // cannot mint write).
     if role.can_write() && !caller_role.0.can_write() {
-        return (
-            StatusCode::FORBIDDEN,
-            Html(
-                r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Token role exceeds your own role</div>"##.to_string(),
-            ),
-        );
+        return error(StatusCode::FORBIDDEN, "Token role exceeds your own role");
     }
     // Admin mint needs both an admin-role credential and an auth.admin_users
     // entry, as on POST /api/tokens (GHSA-78cx-cfhm-rgmx).
     if role == Role::Admin
         && !(caller_role.0.can_admin() && state.config.auth.admin_users.contains(&user))
     {
-        return (
+        return error(
             StatusCode::FORBIDDEN,
-            Html(
-                r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Admin tokens require an admin credential and an auth.admin_users entry</div>"##.to_string(),
-            ),
+            "Admin tokens require an admin credential and an auth.admin_users entry",
         );
     }
 
@@ -1086,16 +1137,33 @@ async fn tokens_create(
             state
                 .audit
                 .log(AuditEntry::new("token_mint", &user, &user, "ui", &detail));
-            let html = render_token_created_fragment(&raw_token, lang);
-            (StatusCode::OK, Html(html))
+            let no_store = [(header::CACHE_CONTROL, "no-store")];
+            if json {
+                (
+                    no_store,
+                    axum::Json(serde_json::json!({ "token": raw_token })),
+                )
+                    .into_response()
+            } else if setup {
+                let page = render_setup(
+                    &state,
+                    lang,
+                    Some(&user),
+                    Some(caller_role.0),
+                    Some(&raw_token),
+                );
+                (no_store, Html(page)).into_response()
+            } else {
+                (
+                    no_store,
+                    Html(render_token_created_fragment(&raw_token, lang)),
+                )
+                    .into_response()
+            }
         }
         Err(e) => {
             tracing::error!(user = %user, error = %e, "UI token mint failed: cannot store the token record");
-            let html = format!(
-                r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Error: {}</div>"##,
-                components::html_escape(&e.to_string())
-            );
-            (StatusCode::INTERNAL_SERVER_ERROR, Html(html))
+            error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Error: {e}"))
         }
     }
 }

@@ -2972,6 +2972,27 @@ Jd74nq6dNCjpWG4drIsyhqX+
         for auth in [&bearer, &basic] {
             let resp = super::integration_tests::ui_create_token(&ctx, auth, "write").await;
             assert_eq!(resp.status(), StatusCode::FORBIDDEN, "mint via {auth:.6}");
+            // Nor through /ui/setup's "Generate token" (JS or JS-free post).
+            for extra in [("hx-request", "true"), ("sec-fetch-site", "same-origin")] {
+                let resp = send_with_headers(
+                    &ctx.app,
+                    Method::POST,
+                    "/api/ui/tokens/create",
+                    vec![
+                        ("authorization", auth),
+                        ("content-type", "application/x-www-form-urlencoded"),
+                        ("accept", "application/json"),
+                        extra,
+                    ],
+                    "description=x&role=read&ui=setup",
+                )
+                .await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::FORBIDDEN,
+                    "setup mint via {auth:.6}"
+                );
+            }
             let resp = send_with_headers(
                 &ctx.app,
                 Method::GET,

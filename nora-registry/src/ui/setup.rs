@@ -21,9 +21,27 @@ pub struct SetupInfo<'a> {
     pub cooldown: Vec<(&'static str, i64)>,
     /// `curation.internal_namespaces`: never delayed, never proxied.
     pub internal_namespaces: &'a [String],
+    /// The "Generate token" form; `None` when the viewer cannot mint here
+    /// (no token store, or no authenticated identity).
+    pub mint: Option<MintOptions>,
+    /// A token just minted by the JS-free form post: filled into every slot.
+    pub token: Option<&'a str>,
 }
 
-const TOKEN_MARK: &str = r#"<mark class="ds-tok">&lt;TOKEN&gt;</mark>"#;
+/// What the viewer may mint from the setup page (the Tokens page's rule).
+pub struct MintOptions {
+    /// The caller's own role can write (Teleport role `apps`), so `write` is offered.
+    pub can_write: bool,
+    pub description: String,
+    pub default_ttl_days: u64,
+    pub max_ttl_days: u64,
+}
+
+/// A command's token placeholder; `data-token-slot` is the hook the page's JS
+/// (and the JS-free post) fills with a freshly minted token.
+const TOKEN_MARK: &str = r#"<mark class="ds-tok" data-token-slot>&lt;TOKEN&gt;</mark>"#;
+/// The same look in prose, never filled.
+const TOKEN_LABEL: &str = r#"<mark class="ds-tok">&lt;TOKEN&gt;</mark>"#;
 
 /// A copyable code block; `<TOKEN>` is highlighted. `text` is plain text.
 fn code(text: &str) -> String {
@@ -43,8 +61,22 @@ fn per_os(mac: &str, win: &str) -> String {
 }
 
 fn section(id: &str, title: &str, body: &str) -> String {
+    section_with(id, "", title, body)
+}
+
+/// One tool tab's panel: shown alone once the tool switch is set.
+fn tool_section(id: &str, title: &str, body: &str) -> String {
+    section_with(
+        id,
+        &format!(r#" ds-tool" role="tabpanel" aria-labelledby="tab-{id}"#),
+        title,
+        body,
+    )
+}
+
+fn section_with(id: &str, extra: &str, title: &str, body: &str) -> String {
     format!(
-        r#"<section id="{id}" class="bg-[#1e293b] rounded-lg border border-slate-700 p-4 md:p-6 mb-6 ds-prose">
+        r#"<section id="{id}" class="bg-[#1e293b] rounded-lg border border-slate-700 p-4 md:p-6 mb-6 ds-prose{extra}">
     <h2 class="text-lg font-semibold text-slate-200 mb-2">{title}</h2>
     {body}
 </section>"#
@@ -100,9 +132,7 @@ const STYLE: &str = r#"<style>
 .ds-tab { padding: .45rem 1.1rem; border-radius: .45rem; font-size: .875rem; font-weight: 600; color: #94a3b8; transition: background .15s, color .15s; }
 .ds-tab:hover { color: #e2e8f0; }
 .ds-tab[aria-selected="true"] { background: #2563eb; color: #fff; }
-.ds-pills { display: flex; flex-wrap: wrap; gap: .5rem; }
-.ds-pills a { font-size: .8rem; padding: .3rem .7rem; border-radius: 9999px; border: 1px solid #334155; color: #cbd5e1; }
-.ds-pills a:hover { border-color: #60a5fa; color: #fff; }
+#ds-root [hidden] { display: none !important; }
 .ds-code { position: relative; margin: .5rem 0 1rem; }
 .ds-code pre { background: #0f172a; border: 1px solid #334155; border-radius: .5rem; padding: .75rem 4.75rem .75rem 1rem; font-size: .8125rem; line-height: 1.6; color: #e2e8f0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .ds-copy { position: absolute; top: .45rem; right: .45rem; padding: .2rem .6rem; font-size: .75rem; border-radius: .35rem; background: #334155; color: #cbd5e1; }
@@ -120,6 +150,23 @@ const STYLE: &str = r#"<style>
 .ds-note { border-left: 3px solid #2563eb; background: rgba(30, 58, 138, .25); padding: .6rem .9rem; border-radius: .35rem; margin: .75rem 0; }
 .ds-chip { display: inline-block; font-family: ui-monospace, monospace; font-size: .8rem; padding: .1rem .5rem; margin: .15rem .2rem .15rem 0; border-radius: .35rem; background: #0f172a; border: 1px solid #334155; color: #e2e8f0; }
 .ds-step { display: flex; gap: .75rem; align-items: flex-start; }
+#ds-root[data-tool="nuget"] .ds-tool:not(#nuget), #ds-root[data-tool="npm"] .ds-tool:not(#npm), #ds-root[data-tool="pypi"] .ds-tool:not(#pypi) { display: none; }
+#ds-root:not([data-tool]) .ds-tooltabs { display: none; }
+.ds-switches { display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; margin-bottom: 1.5rem; }
+.ds-tab:focus-visible, .ds-btn:focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; }
+.ds-mint { display: grid; grid-template-columns: 1fr; gap: .75rem; margin: .75rem 0; }
+@media (min-width: 768px) { .ds-mint { grid-template-columns: 2fr 1fr 1fr auto; align-items: end; } }
+.ds-mint label { display: flex; flex-direction: column; gap: .25rem; font-size: .8rem; color: #94a3b8; }
+.ds-mint input, .ds-mint select { background: #0f172a; border: 1px solid #475569; border-radius: .45rem; padding: .45rem .6rem; color: #e2e8f0; font-size: .875rem; width: 100%; }
+.ds-btn { background: #2563eb; color: #fff; font-weight: 600; border-radius: .45rem; padding: .5rem 1rem; font-size: .875rem; white-space: nowrap; }
+.ds-btn:hover { background: #1d4ed8; }
+.ds-btn:disabled { opacity: .6; }
+.ds-btn-ghost { background: #334155; color: #e2e8f0; }
+.ds-btn-ghost:hover { background: #475569; }
+.ds-warn { border-left: 3px solid #eab308; background: rgba(113, 63, 18, .3); padding: .6rem .9rem; border-radius: .35rem; margin: .75rem 0; }
+.ds-err { color: #f87171; }
+.ds-tok[data-filled] { outline-style: solid; }
+#ds-root.ds-masked .ds-tok[data-filled] { filter: blur(5px); }
 .ds-num { flex-shrink: 0; width: 1.6rem; height: 1.6rem; border-radius: 9999px; background: #1e3a8a; color: #bfdbfe; font-weight: 700; font-size: .8rem; display: flex; align-items: center; justify-content: center; }
 </style>"#;
 
@@ -134,24 +181,183 @@ function dsCopy(b) {
 }
 (function () {
     var root = document.getElementById('ds-root');
-    var tabs = document.querySelectorAll('[data-os-tab]');
-    function set(os) {
-        root.setAttribute('data-os', os);
-        tabs.forEach(function (t) { t.setAttribute('aria-selected', String(t.getAttribute('data-os-tab') === os)); });
-        try { localStorage.setItem('nora_setup_os', os); } catch (e) {}
+    function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+    function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+    // A tab switch: buttons [data-<attr>-tab] set #ds-root[data-<attr>]; arrow keys move.
+    function switcher(attr, key, values, initial) {
+        var tabs = Array.prototype.slice.call(root.querySelectorAll('[data-' + attr + '-tab]'));
+        function set(v, save) {
+            root.setAttribute('data-' + attr, v);
+            tabs.forEach(function (t) {
+                var on = t.getAttribute('data-' + attr + '-tab') === v;
+                t.setAttribute('aria-selected', String(on));
+                t.tabIndex = on ? 0 : -1;
+            });
+            if (save) store(key, v);
+        }
+        tabs.forEach(function (t, i) {
+            t.addEventListener('click', function () {
+                var v = t.getAttribute('data-' + attr + '-tab');
+                set(v, true);
+                if (attr === 'tool') history.replaceState(null, '', '#' + v);
+            });
+            t.addEventListener('keydown', function (e) {
+                var d = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+                if (!d) return;
+                e.preventDefault();
+                var n = tabs[(i + d + tabs.length) % tabs.length];
+                n.focus();
+                n.click();
+            });
+        });
+        set(values.indexOf(initial) >= 0 ? initial : values[0], false);
+        return set;
     }
-    var saved = null;
-    try { saved = localStorage.getItem('nora_setup_os'); } catch (e) {}
-    set(saved === 'mac' || saved === 'win' ? saved : (/Win/.test(navigator.platform) ? 'win' : 'mac'));
-    tabs.forEach(function (t) { t.addEventListener('click', function () { set(t.getAttribute('data-os-tab')); }); });
+    switcher('os', 'nora_setup_os', ['mac', 'win'], load('nora_setup_os') || (/Win/.test(navigator.platform) ? 'win' : 'mac'));
+    var tools = ['nuget', 'npm', 'pypi'];
+    function fromHash() { var h = location.hash.slice(1); return tools.indexOf(h) >= 0 ? h : null; }
+    var setTool = switcher('tool', 'nora_setup_tool', tools, fromHash() || load('nora_setup_tool'));
+    window.addEventListener('hashchange', function () { var h = fromHash(); if (h) setTool(h, true); });
+
+    // Generate token: the token lives only in this page's DOM (never in a URL or storage).
+    var form = document.getElementById('ds-mint');
+    var minted = document.getElementById('ds-minted');
+    var err = document.getElementById('ds-mint-err');
+    function fill(token) {
+        root.querySelectorAll('[data-token-slot]').forEach(function (el) {
+            el.textContent = token;
+            el.setAttribute('data-filled', '');
+        });
+        if (minted) minted.hidden = false;
+    }
+    if (form) form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        var btn = form.querySelector('button[type=submit]');
+        btn.disabled = true;
+        err.textContent = '';
+        fetch(form.action, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'HX-Request': 'true', 'Accept': 'application/json' },
+            body: new URLSearchParams(new FormData(form))
+        }).then(function (r) {
+            return r.json().catch(function () { return {}; }).then(function (j) {
+                if (!r.ok || !j.token) throw new Error(j.error || ('HTTP ' + r.status));
+                return j.token;
+            });
+        }).then(function (t) {
+            fill(t);
+            form.hidden = true;
+        }).catch(function (x) {
+            err.textContent = x.message;
+        }).then(function () { btn.disabled = false; });
+    });
+    root.querySelectorAll('[data-mask-toggle]').forEach(function (b) {
+        b.addEventListener('click', function () {
+            var masked = root.classList.toggle('ds-masked');
+            b.textContent = b.getAttribute(masked ? 'data-show' : 'data-hide');
+            b.setAttribute('aria-pressed', String(masked));
+        });
+    });
 })();
 </script>"#;
+
+/// The Claude Code shortcut: install the skillz `packages` plugin, then run its
+/// setup skill (steps as in the maestra-io/skillz README).
+fn claude_note(ru: bool) -> String {
+    let t = |en: &'static str, ru_text: &'static str| if ru { ru_text } else { en };
+    format!(
+        r#"<p>{intro}</p>
+<ol>
+<li>{s1}{c1}</li>
+<li>{s2}{c2}</li>
+<li>{s3}</li>
+<li>{s4}{c4}</li>
+</ol>
+<p>{upd}</p>
+{c5}
+<p>{dep}</p>"#,
+        intro = t(
+            "Using Claude Code? The <code>packages</code> plugin does every step below for you (token, NuGet, npm, pip, uv, Poetry) and verifies the result:",
+            "Работаете в Claude Code? Плагин <code>packages</code> сделает все шаги ниже сам (токен, NuGet, npm, pip, uv, Poetry) и проверит результат:",
+        ),
+        s1 = t(
+            "Add our marketplace, once per machine (needs GitHub SSH access to maestra-io):",
+            "Добавьте наш маркетплейс, один раз на машину (нужен SSH-доступ к GitHub maestra-io):",
+        ),
+        c1 = code("/plugin marketplace add git@github.com:maestra-io/skillz.git"),
+        s2 = t("Install the plugin:", "Установите плагин:"),
+        c2 = code("/plugin install packages@maestra-plugins"),
+        s3 = t("Restart Claude Code.", "Перезапустите Claude Code."),
+        s4 = t("Run the setup:", "Запустите настройку:"),
+        c4 = code("/packages:packages-dev-setup"),
+        upd = t("Update later with:", "Обновление:"),
+        c5 = code("/plugin marketplace update maestra-plugins\n/plugin update packages@maestra-plugins"),
+        dep = t(
+            "The <code>delivery</code> plugin depends on <code>packages</code>: installing <code>delivery@maestra-plugins</code> pulls it in.",
+            "Плагин <code>delivery</code> зависит от <code>packages</code>: установка <code>delivery@maestra-plugins</code> подтягивает его автоматически.",
+        ),
+    )
+}
+
+/// The "Generate token" form and the shown-once box it reveals. The form posts to
+/// the Tokens page's own endpoint (same auth, same role cap); JS fetches it as
+/// JSON and fills the page, without JS the response is this page, filled.
+fn mint_block(m: &MintOptions, minted: bool, ru: bool) -> String {
+    let t = |en: &'static str, ru_text: &'static str| if ru { ru_text } else { en };
+    let write = if m.can_write {
+        r#"<option value="write">write</option>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<h3>{heading}</h3>
+<p>{lead}</p>
+<form id="ds-mint" method="post" action="/api/ui/tokens/create" class="ds-mint"{form_hidden}>
+    <input type="hidden" name="ui" value="setup">
+    <label>{desc}<input type="text" name="description" value="{description}" maxlength="200" required></label>
+    <label>{role}<select name="role"><option value="read">read</option>{write}</select></label>
+    <label>{ttl}<input type="number" name="ttl_days" value="{ttl_default}" min="1" max="{ttl_max}"></label>
+    <button type="submit" class="ds-btn">{button}</button>
+</form>
+<p id="ds-mint-err" class="ds-err" role="alert"></p>
+<div id="ds-minted" class="ds-warn"{box_hidden}>
+    <p><b>{done}</b> {warn}</p>
+    {slot}
+    <button type="button" class="ds-btn ds-btn-ghost" data-mask-toggle data-hide="{hide}" data-show="{show}" aria-pressed="false">{hide}</button>
+</div>
+<h3>{manual}</h3>"#,
+        heading = t("Generate it here", "Выпустите его здесь"),
+        lead = t(
+            "One click mints a personal token and fills it into every command on this page.",
+            "Одна кнопка выпускает личный токен и подставляет его во все команды на этой странице.",
+        ),
+        form_hidden = if minted { " hidden" } else { "" },
+        desc = t("Description", "Описание"),
+        description = html_escape(&m.description),
+        role = t("Role", "Роль"),
+        ttl = t("Expiry (days)", "Срок жизни (дней)"),
+        ttl_default = m.default_ttl_days,
+        ttl_max = m.max_ttl_days,
+        button = t("Generate token", "Выпустить токен"),
+        box_hidden = if minted { "" } else { " hidden" },
+        done = t("Your token:", "Ваш токен:"),
+        warn = t(
+            "It is shown once and this page does not store it: a reload brings the placeholders back. It is already filled into the commands below.",
+            "Он показывается один раз, страница его не хранит: после перезагрузки вернутся плейсхолдеры. Он уже подставлен в команды ниже.",
+        ),
+        slot = code("<TOKEN>"),
+        hide = t("Hide token", "Скрыть токен"),
+        show = t("Show token", "Показать токен"),
+        manual = t("Or on the Tokens page", "Или на странице токенов"),
+    )
+}
 
 /// Renders `/ui/setup`.
 pub fn render_setup_page(info: &SetupInfo, lang: Lang, auth_enabled: bool) -> String {
     let ru = lang == Lang::Ru;
     let tr = |en: &'static str, ru_text: &'static str| if ru { ru_text } else { en };
-    let tok = TOKEN_MARK;
+    let tok = TOKEN_LABEL;
 
     // ── How it works ───────────────────────────────────────────────────
     let intro = format!(
@@ -205,6 +411,11 @@ pub fn render_setup_page(info: &SetupInfo, lang: Lang, auth_enabled: bool) -> St
 <div class="ds-mac">{kc}</div>
 <div class="ds-note">Passwords are not accepted from outside: package clients send only the token (any username, we use <code>token</code>). GitHub Actions need no token: workflows authenticate with GitHub OIDC, so never put a personal token into CI secrets.</div>"#
         )
+    };
+
+    let token_body = match &info.mint {
+        Some(m) => format!("{}{token_body}", mint_block(m, info.token.is_some(), ru)),
+        None => token_body,
     };
 
     // ── 2. NuGet ───────────────────────────────────────────────────────
@@ -413,18 +624,6 @@ pub fn render_setup_page(info: &SetupInfo, lang: Lang, auth_enabled: bool) -> St
         locals = code("dotnet nuget locals http-cache --clear"),
     );
 
-    let nav = [
-        ("token", tr("Token", "Токен")),
-        ("nuget", "NuGet"),
-        ("npm", "npm"),
-        ("pypi", "PyPI"),
-        ("cooldown", tr("Cooldown", "Карантин")),
-        ("troubleshooting", tr("Troubleshooting", "Если не работает")),
-    ]
-    .iter()
-    .map(|(id, label)| format!(r##"<a href="#{id}">{label}</a>"##))
-    .collect::<String>();
-
     let title = tr("Set up your machine", "Настройка машины");
     let content = format!(
         r#"{STYLE}
@@ -438,14 +637,18 @@ pub fn render_setup_page(info: &SetupInfo, lang: Lang, auth_enabled: bool) -> St
         {intro}
         <div class="ds-note">{claude}</div>
     </div>
-    <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-6">
+    {s_token}
+    <div class="ds-switches">
         <div class="ds-tabs" role="tablist" aria-label="OS">
             <button type="button" class="ds-tab" role="tab" data-os-tab="mac" aria-selected="true">macOS</button>
             <button type="button" class="ds-tab" role="tab" data-os-tab="win" aria-selected="false">Windows</button>
         </div>
-        <nav class="ds-pills">{nav}</nav>
+        <div class="ds-tabs ds-tooltabs" role="tablist" aria-label="{tools_label}">
+            <button type="button" class="ds-tab" role="tab" id="tab-nuget" aria-controls="nuget" data-tool-tab="nuget" aria-selected="true">NuGet</button>
+            <button type="button" class="ds-tab" role="tab" id="tab-npm" aria-controls="npm" data-tool-tab="npm" aria-selected="false">npm</button>
+            <button type="button" class="ds-tab" role="tab" id="tab-pypi" aria-controls="pypi" data-tool-tab="pypi" aria-selected="false">PyPI</button>
+        </div>
     </div>
-    {s_token}
     {s_nuget}
     {s_npm}
     {s_pypi}
@@ -457,14 +660,12 @@ pub fn render_setup_page(info: &SetupInfo, lang: Lang, auth_enabled: bool) -> St
             "Подключите dotnet, npm, pip, uv и Poetry к нашему реестру пакетов. По экрану на инструмент.",
         ),
         how = tr("How it works", "Как это устроено"),
-        claude = tr(
-            "Using Claude Code? Run <code>/packages:packages-dev-setup</code>: it does every step below for you (token, NuGet, npm, pip, uv, Poetry) and verifies the result.",
-            "Работаете в Claude Code? Запустите <code>/packages:packages-dev-setup</code>: он сделает все шаги ниже сам (токен, NuGet, npm, pip, uv, Poetry) и проверит результат.",
-        ),
-        s_token = section("token", tr("1. Get a token", "1. Получите токен"), &token_body),
-        s_nuget = section("nuget", "2. NuGet (dotnet)", &nuget_body),
-        s_npm = section("npm", "3. npm", &npm_body),
-        s_pypi = section("pypi", "4. PyPI (pip, uv, Poetry)", &pypi_body),
+        tools_label = tr("Package manager", "Менеджер пакетов"),
+        claude = claude_note(ru),
+        s_token = section("token", tr("Get a token", "Получите токен"), &token_body),
+        s_nuget = tool_section("nuget", "NuGet (dotnet)", &nuget_body),
+        s_npm = tool_section("npm", "npm", &npm_body),
+        s_pypi = tool_section("pypi", "PyPI (pip, uv, Poetry)", &pypi_body),
         s_cooldown = section("cooldown", tr("Cooldown for new public versions", "Карантин новых публичных версий"), &cooldown_body),
         s_trouble = section("troubleshooting", tr("Troubleshooting", "Если не работает"), &trouble_body),
     );
@@ -479,6 +680,17 @@ pub fn render_setup_page(info: &SetupInfo, lang: Lang, auth_enabled: bool) -> St
         .replace("{HOSTPATH}", &html_escape(hostpath))
         .replace("{LOGIN_HREF}", &html_escape(login_href))
         .replace("{LOGIN}", &html_escape(info.login_url));
+    // JS-free mint: the response page carries the token once, in every slot.
+    let content = match info.token {
+        Some(t) => content.replace(
+            TOKEN_MARK,
+            &format!(
+                r#"<mark class="ds-tok" data-token-slot data-filled>{}</mark>"#,
+                html_escape(t)
+            ),
+        ),
+        None => content,
+    };
 
     layout_dark(title, &content, Some("setup"), SCRIPT, lang, auth_enabled)
 }
@@ -494,7 +706,99 @@ mod tests {
             login_url: "https://login.example.test",
             cooldown,
             internal_namespaces: NS.get_or_init(|| vec!["@corp/*".into(), "corp.*".into()]),
+            mint: None,
+            token: None,
         }
+    }
+
+    fn mint(can_write: bool) -> Option<MintOptions> {
+        Some(MintOptions {
+            can_write,
+            description: "dev setup <alice>".into(),
+            default_ttl_days: 90,
+            max_ttl_days: 3650,
+        })
+    }
+
+    #[test]
+    fn tool_tabs_and_deep_link_ids() {
+        for (lang, label) in [
+            (Lang::En, "Package manager"),
+            (Lang::Ru, "Менеджер пакетов"),
+        ] {
+            let html = render(lang);
+            assert!(html.contains(label));
+            for tool in ["nuget", "npm", "pypi"] {
+                assert!(
+                    html.contains(&format!(r#"data-tool-tab="{tool}""#)),
+                    "{tool} tab"
+                );
+                assert!(html.contains(&format!(r#"aria-controls="{tool}""#)));
+                assert!(
+                    html.contains(&format!(r#"<section id="{tool}""#)),
+                    "#{tool} panel"
+                );
+                assert!(html.contains(&format!(r#"aria-labelledby="tab-{tool}""#)));
+            }
+            // Cooldown and Troubleshooting stay plain sections, always visible.
+            for id in ["cooldown", "troubleshooting", "token"] {
+                let at = html.find(&format!(r#"<section id="{id}""#)).expect(id);
+                let tag = &html[at..at + html[at..].find('>').unwrap()];
+                assert!(!tag.contains("ds-tool"), "{id} must not be a tab panel");
+            }
+            assert!(
+                html.contains("nora_setup_tool"),
+                "tool choice is remembered"
+            );
+            assert!(html.contains("location.hash"), "deep links select the tab");
+        }
+    }
+
+    #[test]
+    fn token_slots_carry_the_js_hook() {
+        let html = render(Lang::En);
+        assert!(html.matches("data-token-slot").count() > 10);
+        // The prose label ("replace every <TOKEN>") is never filled.
+        assert!(html.contains(TOKEN_LABEL));
+        assert!(html.contains("querySelectorAll('[data-token-slot]')"));
+    }
+
+    #[test]
+    fn mint_form_follows_the_callers_role() {
+        let mut i = info(vec![]);
+        assert!(!render_setup_page(&i, Lang::En, true).contains(r#"id="ds-mint""#));
+        i.mint = mint(false);
+        let html = render_setup_page(&i, Lang::En, true);
+        assert!(html.contains(r#"action="/api/ui/tokens/create""#));
+        assert!(html.contains(r#"name="ui" value="setup""#));
+        assert!(
+            html.contains("dev setup &lt;alice&gt;"),
+            "description escaped"
+        );
+        assert!(!html.contains(r#"<option value="write">"#));
+        assert!(html.contains(r#"id="ds-minted" class="ds-warn" hidden"#));
+        i.mint = mint(true);
+        let html = render_setup_page(&i, Lang::Ru, true);
+        assert!(html.contains(r#"<option value="write">"#));
+        assert!(html.contains("Выпустить токен"));
+        assert!(html.contains("Скрыть токен"));
+    }
+
+    #[test]
+    fn js_free_post_fills_every_slot_once() {
+        let mut i = info(vec![]);
+        i.mint = mint(true);
+        i.token = Some("nra_abc123");
+        let html = render_setup_page(&i, Lang::En, true);
+        assert!(!html.contains(TOKEN_MARK), "every slot filled");
+        assert!(html.contains(r#"data-token-slot data-filled>nra_abc123</mark>"#));
+        assert!(html.contains(r#"-p <mark class="ds-tok" data-token-slot data-filled>nra_abc123"#));
+        assert!(
+            html.contains(r#"id="ds-minted" class="ds-warn">"#),
+            "box shown"
+        );
+        assert!(html.contains(r#"class="ds-mint" hidden"#), "form hidden");
+        assert!(html.contains("shown once"));
     }
 
     fn render(lang: Lang) -> String {
@@ -585,6 +889,11 @@ mod tests {
         assert!(html.contains("NuGetPackageSourceCredentials_private"));
         assert!(html.contains("http-basic.maestra"));
         assert!(html.contains("/packages:packages-dev-setup"));
+        assert!(html.contains("/plugin marketplace add git@github.com:maestra-io/skillz.git"));
+        assert!(html.contains("/plugin install packages@maestra-plugins"));
+        assert!(html.contains("/plugin update packages@maestra-plugins"));
+        assert!(html.contains("delivery@maestra-plugins"));
+        assert!(render(Lang::Ru).contains("Перезапустите Claude Code."));
         assert!(html.contains(r#"href="/ui/tokens""#));
     }
 

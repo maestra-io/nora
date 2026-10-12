@@ -643,6 +643,85 @@ AJvDZc4Bbdm5PNsOvQZYEIacnJLnu7vP0RqnkhSbTJ0lRhSmCMjFDCjQ
         assert_eq!(mint("read").await, StatusCode::OK);
     }
 
+    /// Maestra /ui/setup "Generate token": write offered and minted only for a
+    /// Teleport identity whose role can write; JSON for the page's JS, the filled
+    /// page for a JS-free same-origin post, nothing for a cross-site post.
+    #[tokio::test]
+    async fn setup_page_mints_per_identity() {
+        let (_s, ctx) = setup("127.0.0.1", |_| {}).await;
+        let alice = jwt_header("alice", &["apps"]);
+        let bob = jwt_header("bob", &["apps-ai"]);
+        let page = |who: &(&'static str, String)| {
+            let h = vec![(who.0, who.1.clone())];
+            let ctx = &ctx;
+            async move { body_bytes(get(ctx, "/ui/setup", h).await).await }
+        };
+        let a = String::from_utf8(page(&alice).await.to_vec()).unwrap();
+        assert!(a.contains(r#"id="ds-mint""#) && a.contains(r#"<option value="write">"#));
+        assert!(a.contains("dev setup alice"));
+        let b = String::from_utf8(page(&bob).await.to_vec()).unwrap();
+        assert!(b.contains(r#"id="ds-mint""#) && !b.contains(r#"<option value="write">"#));
+
+        let mint =
+            |who: &(&'static str, String), role: &str, extra: Vec<(&'static str, &'static str)>| {
+                let mut h: Vec<(&str, String)> = vec![
+                    (who.0, who.1.clone()),
+                    ("content-type", "application/x-www-form-urlencoded".into()),
+                ];
+                h.extend(extra.into_iter().map(|(k, v)| (k, v.to_string())));
+                let body = format!("description=dev+setup&role={role}&ttl_days=7&ui=setup");
+                let app = ctx.app.clone();
+                async move {
+                    let hs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                    send_with_headers(
+                        &app,
+                        Method::POST,
+                        "/api/ui/tokens/create",
+                        hs,
+                        body.into_bytes(),
+                    )
+                    .await
+                }
+            };
+        let js = vec![("hx-request", "true"), ("accept", "application/json")];
+
+        // JS path: JSON, never cached, a write token owned by alice.
+        let resp = mint(&alice, "write", js.clone()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let token = v["token"].as_str().unwrap();
+        let (owner, role) = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .verify_token(token)
+            .unwrap();
+        assert_eq!((owner.as_str(), role), ("alice", Role::Write));
+
+        // A read identity: write refused (JSON error), read minted.
+        let resp = mint(&bob, "write", js.clone()).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("exceeds"));
+        assert_eq!(mint(&bob, "read", js).await.status(), StatusCode::OK);
+
+        // JS-free fallback: same-origin native post answers the filled page once.
+        let resp = mint(&alice, "read", vec![("sec-fetch-site", "same-origin")]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+        let html = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(html.contains("data-token-slot data-filled>nra_"));
+        // Cross-site or header-less native posts stay refused (CSRF).
+        for extra in [vec![("sec-fetch-site", "cross-site")], vec![]] {
+            assert_eq!(
+                mint(&alice, "read", extra).await.status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+
     #[tokio::test]
     async fn htpasswd_only_from_allowed_peers() {
         use base64::{engine::general_purpose::STANDARD, Engine};
