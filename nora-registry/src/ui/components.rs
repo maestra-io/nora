@@ -339,6 +339,15 @@ pub fn sidebar_dark_with_registries(
         })
         .collect();
 
+    // Maestra: developer setup guide, right above the registries.
+    let setup_html = render_nav_item(
+        "setup",
+        "/ui/setup",
+        t.nav_setup,
+        r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>"#,
+        true,
+    );
+
     let registries_html: String = nav_items
         .iter()
         .filter(|(id, _, _, _, _)| *id != "dashboard")
@@ -404,6 +413,7 @@ pub fn sidebar_dark_with_registries(
                 {}
                 {}
                 {}
+                {}
             </nav>
             <div class="px-4 py-4 border-t border-slate-700">
                 <div class="text-xs text-slate-400">
@@ -412,7 +422,7 @@ pub fn sidebar_dark_with_registries(
             </div>
         </div>
     "#,
-        dashboard_html, registries_section, admin_section, VERSION
+        dashboard_html, setup_html, registries_section, admin_section, VERSION
     )
 }
 

@@ -5,6 +5,7 @@ pub(crate) mod api;
 pub mod components;
 pub mod i18n;
 
+mod setup;
 mod static_assets;
 mod templates;
 
@@ -146,6 +147,8 @@ pub fn routes() -> Router<AppState> {
         .route("/ui/terraform/{name}", get(generic_registry_detail))
         // Token management UI (protected by auth middleware)
         .route("/ui/tokens", get(tokens_page))
+        // Maestra: developer setup guide
+        .route("/ui/setup", get(setup_page))
         // Token management API (HTMX endpoints)
         .route("/api/ui/tokens/create", post(tokens_create))
         .route("/api/ui/tokens/list", get(tokens_list))
@@ -254,6 +257,49 @@ async fn dashboard(
     let authenticated = user.map(|Extension(u)| u.0 != "anonymous").unwrap_or(false);
     let response = build_dashboard_response(&state, authenticated).await;
     Html(render_dashboard(&response, lang, auth_enabled))
+}
+
+// Maestra: developer setup guide
+async fn setup_page(
+    State(state): State<AppState>,
+    Query(query): Query<LangQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    use crate::registry_type::RegistryType;
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
+    let base_url = resolve_base_url(&state);
+    let curation = state.curation();
+    let engine = &curation.curation_engine;
+    // Only enforce mode hides young versions; audit just logs.
+    let cooldown = if *engine.mode() == crate::config::CurationMode::Enforce
+        && engine.metadata_filter_active()
+    {
+        [
+            ("NuGet", RegistryType::Nuget),
+            ("npm", RegistryType::Npm),
+            ("PyPI", RegistryType::PyPI),
+        ]
+        .into_iter()
+        .filter_map(|(label, reg)| {
+            engine
+                .min_release_age_secs(reg)
+                .filter(|s| *s > 0)
+                .map(|s| (label, s))
+        })
+        .collect()
+    } else {
+        Vec::new()
+    };
+    let info = setup::SetupInfo {
+        base_url: &base_url,
+        login_url: &state.config.server.ui_docs_login_url,
+        cooldown,
+        internal_namespaces: &state.config.curation.internal_namespaces,
+    };
+    Html(setup::render_setup_page(&info, lang, state.auth.is_some()))
 }
 
 // Docker pages
@@ -1201,5 +1247,55 @@ mod base_path_tests {
         // body text) is not a self-link and must not be rewritten.
         let html = r#"<p>the path /ui/docker is shown</p>"#;
         assert_eq!(apply_base_path(html, "/nora"), html);
+    }
+}
+
+#[cfg(test)]
+mod setup_route_tests {
+    use crate::test_helpers::*;
+    use axum::http::{Method, StatusCode};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    /// `/ui/setup` sits behind the same auth as the rest of the UI.
+    #[tokio::test]
+    async fn setup_page_requires_ui_auth() {
+        let ctx = create_test_context_with_auth_and_config(&[("admin", "secret")], |c| {
+            c.server.public_url = Some("https://registry.example.test".into());
+            c.curation.mode = crate::config::CurationMode::Enforce;
+            c.curation.min_release_age = Some("7d".into());
+            c.curation.internal_namespaces = vec!["@corp/*".into()];
+        });
+        let resp = send(&ctx.app, Method::GET, "/ui/setup", "").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let auth = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/ui/setup?lang=ru",
+            vec![("authorization", &auth)],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(html.contains("Настройка машины"));
+        assert!(html.contains("https://registry.example.test/nuget/v3/index.json"));
+        assert!(html.contains("https://login.example"));
+        assert!(html.contains("@corp/*"));
+        assert!(
+            html.contains("npm &middot; 7 дн."),
+            "cooldown from the engine"
+        );
+        assert!(html.contains(r#"href="/ui/setup""#), "sidebar entry");
+    }
+
+    #[tokio::test]
+    async fn dashboard_links_to_setup() {
+        let ctx = create_test_context();
+        let resp = send(&ctx.app, Method::GET, "/ui/", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(html.contains("Set up your machine"));
     }
 }

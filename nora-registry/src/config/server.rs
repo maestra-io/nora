@@ -95,6 +95,14 @@ pub struct ServerConfig {
     /// cap. Default 2048; 0 = no cap.
     #[serde(default = "default_proxy_max_artifact_mb")]
     pub proxy_max_artifact_mb: u64,
+    /// Maestra: where people open the web UI to sign in and mint a token, shown on
+    /// the `/ui/setup` page (the Teleport app; the UI is not on the public host).
+    #[serde(default = "default_ui_docs_login_url")]
+    pub ui_docs_login_url: String,
+}
+
+pub(super) fn default_ui_docs_login_url() -> String {
+    String::from("https://packages.teleport.maestra.io")
 }
 
 pub(super) fn default_server_host() -> String {
@@ -176,6 +184,7 @@ impl Default for ServerConfig {
             spool_dir: None,
             spool_max_mb: default_spool_max_mb(),
             proxy_max_artifact_mb: default_proxy_max_artifact_mb(),
+            ui_docs_login_url: default_ui_docs_login_url(),
         }
     }
 }
@@ -286,6 +295,11 @@ impl ServerConfig {
         }
         if let Ok(val) = env::var("NORA_PUBLIC_URL") {
             self.public_url = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_UI_DOCS_LOGIN_URL") {
+            if !val.is_empty() {
+                self.ui_docs_login_url = val;
+            }
         }
         if let Ok(val) = env::var("NORA_BODY_LIMIT_MB") {
             super::parse_env_warn("NORA_BODY_LIMIT_MB", &val, &mut self.body_limit_mb);
@@ -443,6 +457,7 @@ mod tests {
             spool_dir: None,
             spool_max_mb: 4096,
             proxy_max_artifact_mb: 2048,
+            ui_docs_login_url: default_ui_docs_login_url(),
         }
     }
 

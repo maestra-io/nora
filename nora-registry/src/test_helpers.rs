@@ -150,6 +150,7 @@ fn build_context_with(
             spool_dir: None,
             spool_max_mb: 4096,
             proxy_max_artifact_mb: 2048,
+            ui_docs_login_url: "https://login.example".into(),
         },
         storage: StorageConfig {
             mode: StorageMode::Local,
