@@ -49,12 +49,20 @@ groups:
           summary: "NORA cache hit rate below 50%"
 
       - alert: NoraUpstreamUrlLeak
-        expr: sum(rate(nora_response_upstream_url_leak_total[5m])) > 0
-        for: 1m
+        expr: sum by (registry) (rate(nora_response_upstream_url_leak_total[5m])) > 0
+        for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "Upstream URL leak detected in NORA responses"
+          summary: "Upstream URL leak detected in NORA {{ $labels.registry }} responses"
+          description: >-
+            A JSON response carried a configured upstream hostname: clients may
+            bypass NORA. Find the WARN log line "upstream URL leak detected in
+            response" (fields registry, upstream, path) and fetch that path: an
+            upstream URL a client follows (registration, flatcontainer, tarball,
+            file link) is a rewriter gap to fix. A URL kept on purpose (NuGet
+            /v3/catalog0/) belongs in that registry's pass-through list
+            (metrics::passthrough_paths), not in a silence.
 
       - alert: NoraCacheWriteErrors
         # Background cache writes (proxied artifacts, metadata) failing: requests
