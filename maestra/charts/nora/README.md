@@ -23,7 +23,7 @@ helm install nora ./helm-charts/charts/nora/
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `image.repository` | Container image | `ghcr.io/getnora-io/nora` |
+| `image.repository` | Container image | `515260921971.dkr.ecr.us-west-2.amazonaws.com/nora` |
 | `image.tag` | Image tag (defaults to `appVersion`) | `""` |
 | `image.digest` | Pin the image: renders `repository:tag@digest` | `""` |
 | `image.pullPolicy` | Pull policy | `IfNotPresent` |

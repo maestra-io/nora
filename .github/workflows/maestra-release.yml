@@ -3,7 +3,8 @@ name: Maestra release
 # Builds the upstream Dockerfile (default Alpine target) from a maestra tag and
 # pushes 515260921971.dkr.ecr.us-west-2.amazonaws.com/nora:<version>-maestra.N
 # (tag without the leading v) for packages.maestra.io on us-iota-lw-kube-infra
-# (maestra-io/issues-maestra#1442, W0a). Upstream's own Release workflow also
+# (maestra-io/issues-maestra#1442, W0a), then the vendored chart
+# maestra/charts/nora as oci://.../charts/nora, version and appVersion = that tag. Upstream's own Release workflow also
 # matches v* tags; it is disabled in this fork (see MAESTRA.md).
 
 concurrency: release-nora
@@ -30,7 +31,7 @@ jobs:
     env:
       GIT_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
-      - uses: runs-on/action@v2
+      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -59,7 +60,7 @@ jobs:
         run: docker build --pull --build-arg CARGO_FEATURES=--no-default-features -t "local/nora:${TAG}" .
 
       - name: Push to ECR us-west-2
-        uses: maestra-io/github-actions/push-to-aws-ecr-repository@main
+        uses: maestra-io/github-actions/push-to-aws-ecr-repository@8c2c0dd908663f5e9fc15844b050891610ee24c8 # v1.6.0
         with:
           awsRegion: us-west-2
           repositories: nora
@@ -73,3 +74,35 @@ jobs:
           digest=$(aws ecr describe-images --region us-west-2 --repository-name nora \
             --image-ids imageTag="${TAG}" --query 'imageDetails[0].imageDigest' --output text)
           echo "515260921971.dkr.ecr.us-west-2.amazonaws.com/nora:${TAG}@${digest}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The chart goes out only after the image it points at is in ECR. Version
+      # and appVersion = the image tag, so its default image (values.yaml
+      # image.repository + appVersion) is exactly the image pushed above.
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.22.0
+
+      # Reuses the AWS credentials the push action exported (image-push bot).
+      # charts/nora is created like the action creates image repositories
+      # (create-repository.sh: immutable tags, `latest` excluded) and gets the
+      # nora image repository's org-wide policy, so the same principals pull both.
+      - name: Push chart to ECR us-west-2
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+          REGISTRY: 515260921971.dkr.ecr.us-west-2.amazonaws.com
+        run: |
+          set -euo pipefail
+          helm package maestra/charts/nora --version "${TAG}" --app-version "${TAG}" --destination "${RUNNER_TEMP}"
+          aws ecr describe-repositories --region us-west-2 --repository-names charts/nora >/dev/null 2>&1 || {
+            policy=$(aws ecr get-repository-policy --region us-west-2 --repository-name nora --query policyText --output text)
+            aws ecr create-repository --region us-west-2 --repository-name charts/nora \
+              --image-tag-mutability IMMUTABLE_WITH_EXCLUSION \
+              --image-tag-mutability-exclusion-filters 'filterType=WILDCARD,filter=latest' >/dev/null
+            aws ecr set-repository-policy --region us-west-2 --repository-name charts/nora \
+              --policy-text "${policy}" >/dev/null
+          }
+          aws ecr get-login-password --region us-west-2 | helm registry login "${REGISTRY}" --username AWS --password-stdin
+          helm push "${RUNNER_TEMP}/nora-${TAG}.tgz" "oci://${REGISTRY}/charts"
+          digest=$(aws ecr describe-images --region us-west-2 --repository-name charts/nora \
+            --image-ids imageTag="${TAG}" --query 'imageDetails[0].imageDigest' --output text)
+          echo "oci://${REGISTRY}/charts/nora:${TAG}@${digest}" | tee -a "$GITHUB_STEP_SUMMARY"

@@ -96,7 +96,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: ghcr.io/getnora-io/nora:0.9.0
+          value: 515260921971.dkr.ecr.us-west-2.amazonaws.com/nora:0.9.0
 
   - it: uses chart appVersion when image tag is empty
     template: templates/deployment.yaml
@@ -105,7 +105,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: ghcr.io/getnora-io/nora:9.8.7
+          value: 515260921971.dkr.ecr.us-west-2.amazonaws.com/nora:9.8.7
 
   - it: sets replicaCount
     template: templates/deployment.yaml
@@ -439,7 +439,18 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: ghcr.io/getnora-io/nora:1.3.3-maestra.1@sha256:4892881d9ad4eea92055dd2178d7ffd6447a1782124510b315ebceac3b75768f
+          value: 515260921971.dkr.ecr.us-west-2.amazonaws.com/nora:1.3.3-maestra.1@sha256:4892881d9ad4eea92055dd2178d7ffd6447a1782124510b315ebceac3b75768f
+
+  # Maestra: what `helm template` of the published chart renders by default.
+  - it: defaults to the ECR image of the release the chart was published with
+    template: templates/deployment.yaml
+    chart:
+      version: 1.3.3-maestra.4
+      appVersion: 1.3.3-maestra.4
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: 515260921971.dkr.ecr.us-west-2.amazonaws.com/nora:1.3.3-maestra.4
 
   - it: defaults memory request to the limit and hardens the container
     template: templates/deployment.yaml
