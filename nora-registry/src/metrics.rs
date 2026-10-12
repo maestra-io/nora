@@ -552,6 +552,22 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     ([("content-type", "text/plain; charset=utf-8")], buffer)
 }
 
+/// The `method` label: the standard methods, anything else (any RFC 9110 token an
+/// unauthenticated client sends) as `OTHER`, so it cannot mint series at will.
+fn method_label(method: &axum::http::Method) -> &'static str {
+    use axum::http::Method;
+    match *method {
+        Method::GET => "GET",
+        Method::HEAD => "HEAD",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::PATCH => "PATCH",
+        Method::DELETE => "DELETE",
+        Method::OPTIONS => "OPTIONS",
+        _ => "OTHER",
+    }
+}
+
 /// Middleware to record request metrics
 pub async fn metrics_middleware(
     matched_path: Option<MatchedPath>,
@@ -559,7 +575,7 @@ pub async fn metrics_middleware(
     next: Next,
 ) -> Response {
     let start = Instant::now();
-    let method = request.method().to_string();
+    let method = method_label(request.method());
     let path = matched_path
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| request.uri().path().to_string());
@@ -575,11 +591,11 @@ pub async fn metrics_middleware(
 
     // Record metrics
     HTTP_REQUESTS_TOTAL
-        .with_label_values(&[&registry, &method, &status])
+        .with_label_values(&[&registry, method, &status])
         .inc();
 
     HTTP_REQUEST_DURATION
-        .with_label_values(&[&registry, &method])
+        .with_label_values(&[&registry, method])
         .observe(duration);
 
     response
@@ -811,6 +827,18 @@ fn detect_registry(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_method_label_is_bounded() {
+        use axum::http::Method;
+        assert_eq!(method_label(&Method::GET), "GET");
+        assert_eq!(method_label(&Method::DELETE), "DELETE");
+        assert_eq!(
+            method_label(&Method::from_bytes(b"FOO123").unwrap()),
+            "OTHER"
+        );
+        assert_eq!(method_label(&Method::CONNECT), "OTHER");
+    }
 
     #[test]
     fn test_detect_registry_docker() {
