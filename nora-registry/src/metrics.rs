@@ -494,6 +494,19 @@ struct LeakFinderEntry {
     registry: String,
     hostname: String,
     finder: memmem::Finder<'static>,
+    /// URL paths that may follow the hostname: the registry's intentional
+    /// pass-throughs, plain and `\/`-escaped.
+    passthrough: Vec<String>,
+}
+
+/// Upstream URL paths a registry's rewriter leaves in its responses on purpose.
+/// npm and PyPI have none: npm rewrites tarball links and leaves other mentions of
+/// the upstream (a readme) untouched as text, PyPI rewrites every file URL.
+fn passthrough_paths(registry: &str) -> &'static [&'static str] {
+    match registry {
+        "nuget" => crate::registry::nuget::UPSTREAM_PASSTHROUGH_PATHS,
+        _ => &[],
+    }
 }
 
 impl LeakFinders {
@@ -503,10 +516,15 @@ impl LeakFinders {
             .into_iter()
             .map(|(registry, hostname)| {
                 let finder = memmem::Finder::new(hostname.as_bytes()).into_owned();
+                let passthrough = passthrough_paths(&registry)
+                    .iter()
+                    .flat_map(|p| [p.to_string(), p.replace('/', "\\/")])
+                    .collect();
                 LeakFinderEntry {
                     registry,
                     hostname,
                     finder,
+                    passthrough,
                 }
             })
             .collect();
@@ -515,10 +533,18 @@ impl LeakFinders {
         }
     }
 
-    /// Scan bytes for any upstream hostname. Returns first match.
+    /// Scan bytes for any upstream hostname not followed by one of the registry's
+    /// intentional pass-through paths. Returns first match.
     fn scan(&self, haystack: &[u8]) -> Option<(&str, &str)> {
         for entry in self.entries.iter() {
-            if entry.finder.find(haystack).is_some() {
+            let leaked = entry.finder.find_iter(haystack).any(|at| {
+                let rest = &haystack[at + entry.hostname.len()..];
+                !entry
+                    .passthrough
+                    .iter()
+                    .any(|p| rest.starts_with(p.as_bytes()))
+            });
+            if leaked {
                 return Some((&entry.registry, &entry.hostname));
             }
         }
@@ -1094,6 +1120,56 @@ mod tests {
             ))
             .with_state(state.clone());
         (app, state)
+    }
+
+    /// NuGet registration indexes keep `catalogEntry.@id` on the upstream's catalog0
+    /// on purpose (no NORA handler, never fetched by restore): every proxied index
+    /// fired NoraUpstreamUrlLeak. Only a pass-through path is exempt: a leftover
+    /// registration URL on the same host is still a leak.
+    #[test]
+    fn nuget_catalog0_ids_are_not_a_leak() {
+        let finders = LeakFinders::new(vec![("nuget".into(), "api.nuget.org".into())]);
+        let index = r#"{"items":[{"items":[{"catalogEntry":{"@id":"https://api.nuget.org/v3/catalog0/data/2024.01.01/a.1.0.0.json","packageContent":"https://nora/nuget/v3/flatcontainer/a/1.0.0/a.1.0.0.nupkg"}}]}]}"#;
+        assert_eq!(finders.scan(index.as_bytes()), None);
+        let escaped = r#"{"@id":"https:\/\/api.nuget.org\/v3\/catalog0\/data\/a.json"}"#;
+        assert_eq!(finders.scan(escaped.as_bytes()), None);
+        let leftover = index.replace(
+            "https://nora/nuget/v3/flatcontainer/a/1.0.0/a.1.0.0.nupkg",
+            "https://api.nuget.org/v3/registration5-gz-semver2/a/index.json",
+        );
+        assert_eq!(
+            finders.scan(leftover.as_bytes()),
+            Some(("nuget", "api.nuget.org"))
+        );
+        // The exemption is NuGet's: another registry's finder on the same path flags it.
+        let other = LeakFinders::new(vec![("npm".into(), "api.nuget.org".into())]);
+        assert!(other.scan(index.as_bytes()).is_some());
+    }
+
+    /// Through the middleware: a leftover registration URL next to catalog0 @ids
+    /// still counts as a NuGet leak.
+    #[tokio::test]
+    async fn nuget_leftover_registration_url_counts_as_leak() {
+        use tower::ServiceExt;
+        let (app, _state) = leak_test_app(
+            "/nuget/v3/registration/a/index.json",
+            "nuget",
+            "api.nuget.org",
+            r#"{"items":[{"catalogEntry":{"@id":"https://api.nuget.org/v3/catalog0/data/a.json"},"registration":"https://api.nuget.org/v3/registration5-gz-semver2/a/index.json"}]}"#,
+        );
+        let before = UPSTREAM_URL_LEAK_TOTAL.with_label_values(&["nuget"]).get();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/nuget/v3/registration/a/index.json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let after = UPSTREAM_URL_LEAK_TOTAL.with_label_values(&["nuget"]).get();
+        assert!(after > before, "leak counter not incremented");
     }
 
     #[tokio::test]

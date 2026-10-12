@@ -63,6 +63,7 @@ pub fn layout_dark_filtered(
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Nora</title>
+    <link rel="icon" type="image/svg+xml" href="/ui/static/favicon.svg">
     <link rel="stylesheet" href="/ui/static/tailwind.css">
     <script src="/ui/static/htmx.min.js"></script>
     <style>
@@ -736,6 +737,11 @@ pub fn render_polling_script() -> String {
         setInterval(async () => {
             try {
                 const data = await fetch('/api/ui/dashboard').then(r => r.json());
+                // The startup index build finished: reload for the registry cards.
+                if (data.indexing.length === 0 && document.getElementById('indexing-banner')) {
+                    location.reload();
+                    return;
+                }
 
                 // Update global stats
                 document.getElementById('stat-downloads').textContent = data.global_stats.downloads;

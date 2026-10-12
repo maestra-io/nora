@@ -114,7 +114,7 @@ The dashboard includes a `registry` template variable to filter by specific prot
 | `NoraHighLatency` | p99 of `nora_http_request_duration_seconds` above 5s for 5m | warning |
 | `NoraCircuitBreakerOpen` | `nora_circuit_breaker_state == 1` for 1m | critical |
 | `NoraCacheLowHitRate` | hit share of `nora_cache_requests_total` below 50% for 15m | warning |
-| `NoraUpstreamUrlLeak` | any `nora_response_upstream_url_leak_total` increase | critical |
+| `NoraUpstreamUrlLeak` | any `nora_response_upstream_url_leak_total` increase for 5m (NuGet catalog0 `@id`s are not counted) | critical |
 | `NoraCacheWriteErrors` | any `nora_cache_write_errors_total` increase in 15m | warning |
 | `NoraSpoolFailures` | any `nora_spool_failures_total` increase in 15m | warning |
 | `NoraStorageWriteErrors` | `nora_storage_operations_total{operation=~"put\|copy",status="error"}` increasing for 5m | warning |

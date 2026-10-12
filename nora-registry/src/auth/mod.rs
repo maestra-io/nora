@@ -140,6 +140,19 @@ fn is_public_path(path: &str) -> bool {
     matches!(
         path,
         "/" | "/health" | "/ready" | "/api/tokens" | "/api/tokens/list" | "/api/tokens/revoke"
+    ) || is_static_asset(path)
+}
+
+/// The UI's embedded assets and the favicon: no data, served to any caller, also
+/// under `auth.teleport.require_for_ui` (a browser fetches `/favicon.ico` without
+/// the app session, so it logged a 401 per page load).
+fn is_static_asset(path: &str) -> bool {
+    matches!(
+        path,
+        "/favicon.ico"
+            | "/ui/static/favicon.svg"
+            | "/ui/static/tailwind.css"
+            | "/ui/static/htmx.min.js"
     )
 }
 
@@ -308,7 +321,8 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
     // Maestra: the web UI takes its identity from Teleport app access
     // (auth/teleport.rs); registry paths never look at the Teleport header.
     if let Some(teleport) = state.teleport.as_deref() {
-        if teleport::is_ui_path(request.uri().path()) {
+        let path = request.uri().path();
+        if teleport::is_ui_path(path) && !is_static_asset(path) {
             let jwt = teleport.trusted_header(&request);
             let id = match jwt {
                 Some(jwt) => teleport.identify(&jwt).await,
@@ -931,6 +945,17 @@ mod tests {
         }
         for p in ["/ui", "/ui/rpm", "/api/ui/stats", "/api-docs"] {
             assert!(is_web_surface(p), "{p}");
+        }
+        // The UI's embedded assets and the favicon carry no data: always public.
+        for p in [
+            "/favicon.ico",
+            "/ui/static/tailwind.css",
+            "/ui/static/htmx.min.js",
+        ] {
+            assert!(is_public_path(p), "{p}");
+        }
+        for p in ["/ui/static/", "/ui/static/../tokens", "/favicon.ico/x"] {
+            assert!(!is_public_path(p), "{p}");
         }
         // Token pages are part of the always-gated set, not the web surface.
         assert!(!is_web_surface("/ui/tokens"));

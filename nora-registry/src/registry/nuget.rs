@@ -61,6 +61,12 @@ struct SearchParams {
 /// Count .nupkg files (not index.json) so size reflects actual packages.
 pub const INDEX_PATTERN: (&str, &str) = ("nuget/flatcontainer/", ".nupkg");
 
+/// Upstream URL paths a rewritten NuGet response keeps on purpose: `catalogEntry.@id`
+/// (`/v3/catalog0/…`) has no NORA handler and restore never fetches it. One list for
+/// [`rewrite_registration_urls`], the leak detector (`metrics::LeakFinders`) and the
+/// air-gap invariant test.
+pub(crate) const UPSTREAM_PASSTHROUGH_PATHS: &[&str] = &["/v3/catalog0/"];
+
 /// Discover search and autocomplete endpoints from the upstream NuGet V3 service index.
 ///
 /// When the proxy URL differs from the default (api.nuget.org), the hardcoded
@@ -1899,7 +1905,7 @@ async fn local_search_results(
     prerelease: bool,
     sem_ver_level: Option<&str>,
 ) -> Vec<u8> {
-    let packages = state.repo_index.get("nuget", &state.storage).await;
+    let packages = state.repo_index.get("nuget", state).await;
     let base_url = nora_base_url(state);
 
     let query_lower = query.to_lowercase();
@@ -1957,7 +1963,7 @@ async fn local_autocomplete_results(
     prerelease: bool,
     sem_ver_level: Option<&str>,
 ) -> Vec<u8> {
-    let packages = state.repo_index.get("nuget", &state.storage).await;
+    let packages = state.repo_index.get("nuget", state).await;
 
     let query_lower = query.to_lowercase();
     let mut matched: Vec<&str> = Vec::new();
@@ -2058,9 +2064,9 @@ fn rewrite_registration_urls(json_text: &str, upstream_url: &str, base_url: &str
     let nora_reg = format!("{}/v3/registration/", nora_nuget);
 
     // Rewrite registration and flatcontainer URLs to point to Nora.
-    // catalog0 URLs (catalogEntry.@id) are intentionally left as-is: Nora has
-    // no catalog handler, and NuGet clients do not fetch these during restore.
-    // Rewriting them would produce Nora URLs that 404.
+    // UPSTREAM_PASSTHROUGH_PATHS (catalog0, catalogEntry.@id) are intentionally left
+    // as-is: Nora has no catalog handler, and NuGet clients do not fetch these during
+    // restore. Rewriting them would produce Nora URLs that 404.
     // Each mapping is escape-aware (plain + `\/`-escaped) so a slash-escaped upstream
     // registration/flatcontainer URL cannot survive and leak the host — sending the
     // client back to the origin, past Nora — after the client unescapes `\/` (#385).
@@ -4627,9 +4633,8 @@ mod spec_conformance_tests {
     ];
 
     /// Known URL patterns in NuGet responses that are NOT client-fetchable
-    /// and intentionally left unrewritten. catalog0 URLs appear in
-    /// catalogEntry.@id fields but NuGet clients never fetch them during restore.
-    const NUGET_EXCLUDED_PATTERNS: &[&str] = &["/v3/catalog0/"];
+    /// and intentionally left unrewritten (the leak detector skips them too).
+    const NUGET_EXCLUDED_PATTERNS: &[&str] = UPSTREAM_PASSTHROUGH_PATHS;
 
     /// Assert that no upstream URLs remain in a rewritten response body,
     /// excluding known non-client-fetchable URL patterns.

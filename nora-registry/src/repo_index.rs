@@ -1,25 +1,40 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
-//! In-memory repository index with lazy rebuild on invalidation.
+//! In-memory repository index, rebuilt in the background.
 //!
 //! Design:
-//! - Rebuild happens ONLY on write operations, not TTL
-//! - Double-checked locking prevents duplicate rebuilds
-//! - Arc<Vec> for zero-cost reads
+//! - Built at startup and every [`REFRESH_INTERVAL`] ([`RepoIndex::refresh`]), and
+//!   after every write that invalidates it
+//! - A request never runs a full rebuild: it starts one in the background and waits
+//!   at most [`REBUILD_WAIT`], then serves the stale index, or an empty one with
+//!   [`RepoIndex::is_ready`] false before the first build (R2 listings of a large
+//!   registry take minutes; a proxy in front of the UI gives up first)
 //! - Single rebuild at a time per registry (rebuild_lock)
+//! - Arc<Vec> for zero-cost reads
 
 use crate::registry_type::RegistryType;
 use crate::storage::{FileMeta, Storage};
 use crate::ui::components::format_timestamp;
 use crate::validation::ends_with_ci;
+use crate::AppState;
 use parking_lot::RwLock;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
+
+/// How long a read waits for the rebuilds it started before serving what is cached:
+/// a small registry still answers fresh right after a write, a large one never holds
+/// the request.
+const REBUILD_WAIT: Duration = Duration::from_millis(250);
+
+/// Full background rebuild cadence: picks up writes made outside this process
+/// (`nora import`, `nora nuget rebuild`, a restore).
+pub const REFRESH_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Repository info for UI display
 #[derive(Debug, Clone, Serialize, Default)]
@@ -37,6 +52,8 @@ pub struct RepoInfo {
 pub struct RegistryIndex {
     data: RwLock<Arc<Vec<RepoInfo>>>,
     dirty: AtomicBool,
+    /// A build has completed: before that, an empty `data` means "not indexed yet".
+    ready: AtomicBool,
     rebuild_lock: AsyncMutex<()>,
 }
 
@@ -45,6 +62,7 @@ impl RegistryIndex {
         Self {
             data: RwLock::new(Arc::new(Vec::new())),
             dirty: AtomicBool::new(true),
+            ready: AtomicBool::new(false),
             rebuild_lock: AsyncMutex::new(()),
         }
     }
@@ -62,9 +80,11 @@ impl RegistryIndex {
         Arc::clone(&self.data.read())
     }
 
+    /// Store a finished build. `dirty` is cleared when the build starts, so a write
+    /// that lands during the build leaves the index dirty for the next one.
     fn set(&self, data: Vec<RepoInfo>) {
         *self.data.write() = Arc::new(data);
-        self.dirty.store(false, Ordering::Release);
+        self.ready.store(true, Ordering::Release);
     }
 
     pub fn count(&self) -> usize {
@@ -145,88 +165,94 @@ impl RepoIndex {
         Ok(())
     }
 
-    /// Get index with double-checked locking (prevents race condition)
-    pub async fn get(&self, registry: &str, storage: &Storage) -> Arc<Vec<RepoInfo>> {
-        let reg_type = match RegistryType::from_str_opt(registry) {
-            Some(rt) => rt,
-            None => return Arc::new(Vec::new()),
-        };
-        let index = match self.indexes.get(&reg_type) {
-            Some(idx) => idx,
-            None => return Arc::new(Vec::new()),
-        };
+    fn index(&self, registry: &str) -> Option<(RegistryType, &RegistryIndex)> {
+        let rt = RegistryType::from_str_opt(registry)?;
+        Some((rt, self.indexes.get(&rt)?))
+    }
 
-        // Fast path: not dirty, return cached
-        if !index.is_dirty() {
-            return index.get_cached();
+    /// The cached index of `registry` (`state` is the AppState holding this index).
+    /// A dirty index is rebuilt in the background; see [`settle`](Self::settle).
+    pub async fn get(&self, registry: &str, state: &AppState) -> Arc<Vec<RepoInfo>> {
+        let Some((rt, index)) = self.index(registry) else {
+            return Arc::default();
+        };
+        self.settle([rt], state).await;
+        index.get_cached()
+    }
+
+    /// Start a background rebuild of every dirty index among `registries` and wait for
+    /// them, together, at most [`REBUILD_WAIT`]. Never waits on a whole rebuild.
+    pub async fn settle(
+        &self,
+        registries: impl IntoIterator<Item = RegistryType>,
+        state: &AppState,
+    ) {
+        let rebuilds: Vec<_> = registries
+            .into_iter()
+            .filter(|rt| self.indexes.get(rt).is_some_and(RegistryIndex::is_dirty))
+            .map(|rt| {
+                let state = state.clone();
+                tokio::spawn(async move { state.repo_index.rebuild(rt, &state).await })
+            })
+            .collect();
+        if !rebuilds.is_empty() {
+            // On timeout the tasks are detached, not cancelled: the rebuilds complete.
+            let _ = tokio::time::timeout(REBUILD_WAIT, futures::future::join_all(rebuilds)).await;
         }
+    }
 
-        // Slow path: acquire rebuild lock (only one thread rebuilds)
+    /// False until the first build of `registry` completes: its index is empty because
+    /// it is not built yet, not because the registry is.
+    pub fn is_ready(&self, registry: &str) -> bool {
+        self.index(registry)
+            .is_none_or(|(_, idx)| idx.ready.load(Ordering::Acquire))
+    }
+
+    /// Rebuild every enabled registry's index now (startup, then every
+    /// [`REFRESH_INTERVAL`]). Reads keep serving the previous index meanwhile.
+    pub async fn refresh(&self, state: &AppState) {
+        futures::future::join_all(state.enabled_registries.iter().map(|&rt| async move {
+            if let Some(idx) = self.indexes.get(&rt) {
+                idx.invalidate();
+            }
+            self.rebuild(rt, state).await;
+        }))
+        .await;
+    }
+
+    /// Rebuild one registry's index if it is dirty, one rebuild per registry at a time.
+    pub(crate) async fn rebuild(&self, reg_type: RegistryType, state: &AppState) {
+        let Some(index) = self.indexes.get(&reg_type) else {
+            return;
+        };
         let _guard = index.rebuild_lock.lock().await;
-
-        // Double-check under lock (another thread may have rebuilt)
-        if index.is_dirty() {
-            let data = match reg_type {
-                RegistryType::Docker => build_docker_index(storage).await,
-                RegistryType::Maven => build_maven_index(storage).await,
-                RegistryType::Npm => build_npm_index(storage).await,
-                RegistryType::Cargo => build_cargo_index(storage).await,
-                RegistryType::PyPI => build_pypi_index(storage).await,
-                RegistryType::Go => build_go_index(storage).await,
-                RegistryType::Raw => build_raw_index(storage).await,
-                RegistryType::Nuget => build_nuget_index(storage).await,
-                RegistryType::Gems => build_gems_index(storage).await,
-                RegistryType::Terraform => {
-                    let (p, s) = crate::registry::terraform::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-                RegistryType::Ansible => {
-                    let (p, s) = crate::registry::ansible::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-                RegistryType::PubDart => {
-                    let (p, s) = crate::registry::pub_dart::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-                RegistryType::Conan => build_conan_index(storage).await,
-                #[cfg(feature = "rpm")]
-                RegistryType::Rpm => {
-                    let (p, s) = crate::registry::rpm::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-                #[cfg(feature = "deb")]
-                RegistryType::Deb => {
-                    let (p, s) = crate::registry::deb::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-                // Compiled out: nothing of that format is served or indexed.
-                #[cfg(not(all(feature = "rpm", feature = "deb")))]
-                #[allow(unreachable_patterns)]
-                RegistryType::Rpm | RegistryType::Deb => Some(Vec::new()),
-                RegistryType::Cpan => {
-                    let (p, s) = crate::registry::cpan::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-            };
-            match data {
-                Some(data) => {
-                    info!(registry = registry, count = data.len(), "Index rebuilt");
-                    index.set(data);
-                }
-                None => {
-                    // Storage list failed mid-rebuild. Leave the index dirty so the
-                    // next read retries instead of caching an empty result as fresh:
-                    // otherwise a transient storage error during a restore/resync
-                    // would make the UI report zero artifacts on healthy data.
-                    tracing::warn!(
-                        registry = registry,
-                        "index rebuild skipped: storage list failed; serving stale index"
-                    );
-                }
+        // Cleared before the build, so a write during it marks the result stale again.
+        if !index.dirty.swap(false, Ordering::AcqRel) {
+            return; // another rebuild already covered every invalidation
+        }
+        let started = std::time::Instant::now();
+        match build(reg_type, state).await {
+            Some(data) => {
+                info!(
+                    registry = reg_type.as_str(),
+                    count = data.len(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "Index rebuilt"
+                );
+                index.set(data);
+            }
+            None => {
+                // Storage list failed mid-rebuild. Leave the index dirty so the next
+                // read retries instead of caching an empty result as fresh: otherwise
+                // a transient storage error during a restore/resync would make the UI
+                // report zero artifacts on healthy data.
+                index.invalidate();
+                tracing::warn!(
+                    registry = reg_type.as_str(),
+                    "index rebuild skipped: storage list failed; serving stale index"
+                );
             }
         }
-
-        index.get_cached()
     }
 
     /// Get counts for stats (no rebuild, just current state)
@@ -255,6 +281,52 @@ impl Default for RepoIndex {
 // ============================================================================
 // Index builders
 // ============================================================================
+
+async fn build(reg_type: RegistryType, state: &AppState) -> Option<Vec<RepoInfo>> {
+    let storage = &state.storage;
+    match reg_type {
+        RegistryType::Docker => build_docker_index(storage).await,
+        RegistryType::Maven => build_maven_index(storage).await,
+        RegistryType::Npm => build_npm_index(storage).await,
+        RegistryType::Cargo => build_cargo_index(storage).await,
+        RegistryType::PyPI => build_pypi_index(storage).await,
+        RegistryType::Go => build_go_index(storage).await,
+        RegistryType::Raw => build_raw_index(storage).await,
+        RegistryType::Nuget => build_nuget_index(state).await,
+        RegistryType::Gems => build_gems_index(storage).await,
+        RegistryType::Terraform => {
+            let (p, s) = crate::registry::terraform::INDEX_PATTERN;
+            build_generic_index(storage, p, s).await
+        }
+        RegistryType::Ansible => {
+            let (p, s) = crate::registry::ansible::INDEX_PATTERN;
+            build_generic_index(storage, p, s).await
+        }
+        RegistryType::PubDart => {
+            let (p, s) = crate::registry::pub_dart::INDEX_PATTERN;
+            build_generic_index(storage, p, s).await
+        }
+        RegistryType::Conan => build_conan_index(storage).await,
+        #[cfg(feature = "rpm")]
+        RegistryType::Rpm => {
+            let (p, s) = crate::registry::rpm::INDEX_PATTERN;
+            build_generic_index(storage, p, s).await
+        }
+        #[cfg(feature = "deb")]
+        RegistryType::Deb => {
+            let (p, s) = crate::registry::deb::INDEX_PATTERN;
+            build_generic_index(storage, p, s).await
+        }
+        // Compiled out: nothing of that format is served or indexed.
+        #[cfg(not(all(feature = "rpm", feature = "deb")))]
+        #[allow(unreachable_patterns)]
+        RegistryType::Rpm | RegistryType::Deb => Some(Vec::new()),
+        RegistryType::Cpan => {
+            let (p, s) = crate::registry::cpan::INDEX_PATTERN;
+            build_generic_index(storage, p, s).await
+        }
+    }
+}
 
 /// List storage keys under `prefix` for an index rebuild. Returns `None` (not an
 /// empty Vec) when the listing itself fails, so the caller can keep the existing
@@ -538,25 +610,30 @@ async fn build_generic_index(
 }
 
 /// NuGet: the proxy cache (`nuget/flatcontainer/{id}/{ver}/…`) plus the hosted feed
-/// (`nuget/hosted/{id}/{ver}/…`, maestra fork). Both key by lowercase ID.
-async fn build_nuget_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
-    let (proxy_prefix, suffix) = crate::registry::nuget::INDEX_PATTERN;
+/// (maestra fork), both keyed by lowercase ID. Hosted IDs come from the in-memory
+/// state documents, not a walk of `nuget/hosted/`: two blobs per version, ~115k keys
+/// (~100 s of sequential LIST pages on R2) for 57k versions.
+async fn build_nuget_index(state: &AppState) -> Option<Vec<RepoInfo>> {
+    let (prefix, suffix) = crate::registry::nuget::INDEX_PATTERN;
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
-    for prefix in [proxy_prefix, "nuget/hosted/"] {
-        for (key, meta) in &list_keys(storage, prefix).await? {
-            let Some(name) = key
-                .strip_prefix(prefix)
-                .filter(|_| key.ends_with(suffix))
-                .and_then(|rest| rest.split('/').next())
-                .filter(|n| !n.is_empty())
-            else {
-                continue;
-            };
-            let entry = packages.entry(name.to_string()).or_insert((0, 0, 0));
-            entry.0 += 1;
-            entry.1 += meta.size;
-            entry.2 = entry.2.max(meta.modified);
-        }
+    for (id, versions, size, modified) in
+        crate::registry::nuget::hosted::repo_summary(state).await?
+    {
+        packages.insert(id, (versions, size, modified));
+    }
+    for (key, meta) in &list_keys(&state.storage, prefix).await? {
+        let Some(name) = key
+            .strip_prefix(prefix)
+            .filter(|_| key.ends_with(suffix))
+            .and_then(|rest| rest.split('/').next())
+            .filter(|n| !n.is_empty())
+        else {
+            continue;
+        };
+        let entry = packages.entry(name.to_string()).or_insert((0, 0, 0));
+        entry.0 += 1;
+        entry.1 += meta.size;
+        entry.2 = entry.2.max(meta.modified);
     }
     Some(to_sorted_vec(packages))
 }
@@ -688,9 +765,9 @@ mod tests {
     #[test]
     fn invalidate_all_marks_every_index_dirty() {
         let idx = RepoIndex::new();
-        // Clear dirty on every index (they start dirty).
+        // Clear dirty on every index (they start dirty), as a rebuild does.
         for ri in idx.indexes.values() {
-            ri.set(Vec::new());
+            ri.dirty.store(false, Ordering::Release);
             assert!(!ri.is_dirty());
         }
         idx.invalidate_all();
@@ -768,7 +845,9 @@ mod tests {
         // Initially dirty
         assert!(idx.is_dirty());
 
-        // Set data clears dirty
+        // A rebuild clears dirty when it starts; storing its result marks it ready.
+        idx.dirty.store(false, Ordering::Release);
+        assert!(!idx.ready.load(Ordering::Acquire));
         idx.set(vec![RepoInfo {
             name: "test".to_string(),
             versions: 1,
@@ -777,6 +856,7 @@ mod tests {
             ..Default::default()
         }]);
         assert!(!idx.is_dirty());
+        assert!(idx.ready.load(Ordering::Acquire));
         assert_eq!(idx.count(), 1);
 
         // Invalidate makes it dirty again
@@ -936,7 +1016,8 @@ mod tests {
         // The metadata-only dir is not a repository. `/api/ui/stats` and
         // `nora_artifacts_total` (both read RegistryIndex::count via counts())
         // must report maven:1 for the single pushed jar, NOT 2.
-        let (_d, s) = temp_storage();
+        let ctx = crate::test_helpers::create_test_context();
+        let s = &ctx.state.storage;
         s.put("maven/com/example/a/1.0/a-1.0.jar", &[0u8; 200])
             .await
             .unwrap();
@@ -946,8 +1027,8 @@ mod tests {
 
         // Exercise the exact prod path /api/ui/stats walks: RepoIndex::get(...)
         // builds + caches the index, then counts() reads it.
-        let idx = RepoIndex::new();
-        let repos = idx.get("maven", &s).await;
+        let idx = &ctx.state.repo_index;
+        let repos = idx.get("maven", &ctx.state).await;
         // Two on-disk dir buckets, but only one carries an artifact.
         assert_eq!(repos.len(), 2, "both dirs are indexed buckets");
         assert_eq!(
@@ -1133,5 +1214,95 @@ mod tests {
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].versions, 1);
         assert_eq!(repos[0].size, 440);
+    }
+
+    /// GET `uri`, failing the test if it takes a second: what the UI must answer in
+    /// while a rebuild is stuck on a slow storage listing.
+    async fn get_within_1s(app: &axum::Router, uri: &str) -> (axum::http::StatusCode, String) {
+        let resp = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::test_helpers::send(app, axum::http::Method::GET, uri, ""),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{uri} waited on the index rebuild"));
+        let status = resp.status();
+        let body = crate::test_helpers::body_bytes(resp).await;
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// The first `/ui/` after a start ran every registry's full rebuild inside the
+    /// request (97 s for NuGet on R2, past the proxy's 36 s). Now the startup build
+    /// runs in the background and every reader answers at once: "indexing" before the
+    /// first build, the data after it.
+    #[tokio::test]
+    async fn requests_never_wait_on_a_stalled_index_build() {
+        use crate::test_helpers::{create_test_context_with_storage, op_counting_storage};
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage(storage);
+        ctx.state
+            .storage
+            .put("npm/left-pad/tarballs/left-pad-1.0.0.tgz", b"tgz")
+            .await
+            .unwrap();
+        ops.stall_lists(Some("npm/"));
+        let state = ctx.state.clone();
+        let startup = tokio::spawn(async move { state.repo_index.refresh(&state).await });
+
+        let (status, html) = get_within_1s(&ctx.app, "/ui/").await;
+        assert_eq!(status, 200);
+        assert!(html.contains("indexing-banner"), "{html}");
+        let (_, html) = get_within_1s(&ctx.app, "/ui/npm").await;
+        assert!(html.contains("Indexing storage"), "{html}");
+        assert!(!html.contains("left-pad"), "{html}");
+        let (status, json) = get_within_1s(&ctx.app, "/api/ui/dashboard").await;
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(json["indexing"], serde_json::json!(["npm"]));
+        for uri in [
+            "/api/ui/stats",
+            "/api/ui/npm/list",
+            "/api/ui/npm/search?q=left",
+        ] {
+            assert_eq!(get_within_1s(&ctx.app, uri).await.0, 200, "{uri}");
+        }
+        assert!(!startup.is_finished(), "the build is still stalled");
+
+        // The build completes in the background and the UI serves its result.
+        ops.stall_lists(None);
+        startup.await.unwrap();
+        assert!(ctx.state.repo_index.is_ready("npm"));
+        let (_, html) = get_within_1s(&ctx.app, "/ui/npm").await;
+        assert!(html.contains("left-pad"), "{html}");
+        let (_, json) = get_within_1s(&ctx.app, "/api/ui/dashboard").await;
+        assert!(json.contains(r#""indexing":[]"#), "{json}");
+    }
+
+    /// A write that lands while a rebuild lists storage must not be lost: the rebuild
+    /// clears `dirty` when it starts, so the invalidation survives it.
+    #[tokio::test]
+    async fn write_during_rebuild_marks_the_index_stale_again() {
+        use crate::test_helpers::{create_test_context_with_storage, op_counting_storage};
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage(storage);
+        let idx = &ctx.state.repo_index;
+        ops.stall_lists(Some("npm/"));
+        let state = ctx.state.clone();
+        let rebuild =
+            tokio::spawn(async move { state.repo_index.rebuild(RegistryType::Npm, &state).await });
+        while ops.calls("list_with_meta", "npm/") == 0 {
+            tokio::task::yield_now().await;
+        }
+        ctx.state
+            .storage
+            .put("npm/late/tarballs/late-1.0.0.tgz", b"tgz")
+            .await
+            .unwrap();
+        idx.invalidate("npm");
+        ops.stall_lists(None);
+        rebuild.await.unwrap();
+        assert!(idx.indexes[&RegistryType::Npm].is_dirty());
+        let repos = idx.get("npm", &ctx.state).await;
+        assert_eq!(repos.len(), 1, "the next read rebuilds and sees the write");
+        assert_eq!(repos[0].name, "late");
     }
 }

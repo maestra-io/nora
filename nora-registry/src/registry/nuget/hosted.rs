@@ -198,7 +198,8 @@ fn unavailable_err() -> (StatusCode, String) {
 
 /// In-memory view of `nuget/hosted-meta/`, keyed by lowercase ID.
 ///
-/// Loaded from storage on first use (one LIST, parallel GETs) and updated after every
+/// Loaded from storage by the startup repo index build or on first use, whichever comes
+/// first (one LIST, parallel GETs), and updated after every
 /// successful write. A failed load leaves no index at all (never an empty or partial
 /// one that would let public namesakes through): every hosted hook answers 503 and the
 /// load is retried on a later request, with backoff. nora runs a single writer replica,
@@ -367,6 +368,37 @@ pub(crate) async fn refresh(state: &AppState) {
         })
         .await;
     tracing::info!(ids = map.read().len(), "nuget hosted: index refreshed");
+}
+
+/// Per hosted ID: (lowercase ID, versions, package bytes, newest publish as epoch
+/// seconds), from the in-memory index (loaded first if needed) for the UI repo index.
+/// `None` while the index cannot load. An unparsable document is left out.
+pub(crate) async fn repo_summary(state: &AppState) -> Option<Vec<(String, usize, u64, u64)>> {
+    let map = index(state).await.ok()?;
+    let map = map.read();
+    Some(
+        map.iter()
+            .filter_map(|(id, doc)| match doc {
+                Doc::Ready(pkg) => Some((id, pkg)),
+                Doc::Corrupt(_) => None,
+            })
+            .map(|(id, pkg)| {
+                let published = pkg
+                    .versions
+                    .iter()
+                    .filter_map(|v| chrono::DateTime::parse_from_rfc3339(&v.published).ok());
+                (
+                    id.clone(),
+                    pkg.versions.len(),
+                    pkg.versions.iter().map(|v| v.package_size).sum(),
+                    published
+                        .map(|t| t.timestamp().max(0) as u64)
+                        .max()
+                        .unwrap_or(0),
+                )
+            })
+            .collect(),
+    )
 }
 
 enum Lookup {
@@ -1882,13 +1914,16 @@ async fn version_from_blobs(
 /// Detail page rows for a hosted ID (newest first, unlisted left out), or `None` when the
 /// ID has no readable state document. Read from storage: the UI has no `AppState` here.
 pub(crate) async fn ui_detail(
-    storage: &Storage,
+    state: &AppState,
     id_lower: &str,
 ) -> Option<(
     Vec<crate::ui::api::VersionInfo>,
     crate::ui::api::PackageMetadata,
 )> {
-    let pkg = load(storage, id_lower).await.ok()??;
+    // The in-memory index: no storage read, for hosted and proxied IDs alike.
+    let Lookup::Hosted(pkg) = lookup(state, id_lower).await else {
+        return None;
+    };
     let versions = pkg
         .versions
         .iter()
@@ -3901,6 +3936,68 @@ Jd74nq6dNCjpWG4drIsyhqX+
         assert_eq!(idx["versions"], serde_json::json!(["1.0.0"]));
     }
 
+    /// The UI repo index took hosted IDs from a walk of `nuget/hosted/` (two blobs per
+    /// version: 57k versions on packages.maestra.io, 97 s of R2 LIST pages inside the
+    /// first `/ui/`). It now reads the in-memory state documents: the only listing left
+    /// is the proxy cache's.
+    #[tokio::test]
+    async fn repo_index_reads_hosted_state_not_blobs() {
+        let (storage, ops) = crate::test_helpers::op_counting_storage();
+        let ctx =
+            crate::test_helpers::create_test_context_with_storage_and_config(storage, |cfg| {
+                cfg.nuget.enabled = true;
+                cfg.nuget.proxy = None;
+            });
+        let mut bytes = 0;
+        for (id, v) in [
+            ("Maestra.A", "1.0.0"),
+            ("Maestra.A", "1.1.0"),
+            ("Maestra.B", "2.0.0"),
+        ] {
+            let pkg = nupkg(id, v, "");
+            bytes += if id == "Maestra.A" {
+                pkg.len() as u64
+            } else {
+                0
+            };
+            assert_eq!(push(&ctx.app, &pkg, &[]).await, StatusCode::CREATED);
+        }
+        ctx.state
+            .storage
+            .put(
+                "nuget/flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg",
+                b"pk",
+            )
+            .await
+            .unwrap();
+
+        ops.reset();
+        ctx.state
+            .repo_index
+            .rebuild(crate::RegistryType::Nuget, &ctx.state)
+            .await;
+        assert_eq!(
+            ops.snapshot(),
+            [("list_with_meta", 1)].into_iter().collect(),
+            "one listing (the proxy cache), no hosted blob walk"
+        );
+        assert_eq!(ops.calls("list_with_meta", "nuget/flatcontainer/"), 1);
+
+        let repos = ctx.state.repo_index.get("nuget", &ctx.state).await;
+        let row = |name: &str| repos.iter().find(|r| r.name == name).unwrap();
+        assert_eq!(repos.len(), 3);
+        assert_eq!(
+            (row("maestra.a").versions, row("maestra.a").size),
+            (2, bytes)
+        );
+        assert_ne!(row("maestra.a").updated, "N/A");
+        assert_eq!(row("maestra.b").versions, 1);
+        assert_eq!(
+            (row("newtonsoft.json").versions, row("newtonsoft.json").size),
+            (1, 2)
+        );
+    }
+
     /// Hosted packages show up in the web UI list (repo index invalidated on push) and
     /// the detail page reads the state document.
     #[tokio::test]
@@ -3922,14 +4019,8 @@ Jd74nq6dNCjpWG4drIsyhqX+
         let (_, list) = get_json(&ctx.app, "/api/ui/nuget/list").await;
         assert_eq!(list[0]["name"], "maestra.ui");
         assert_eq!(list[0]["versions"], 2);
-        let detail = crate::ui::api::get_generic_detail(
-            &ctx.state.storage,
-            "nuget",
-            "Maestra.Ui",
-            true,
-            true,
-        )
-        .await;
+        let detail =
+            crate::ui::api::get_generic_detail(&ctx.state, "nuget", "Maestra.Ui", true, true).await;
         let versions: Vec<&str> = detail.versions.iter().map(|v| v.version.as_str()).collect();
         assert_eq!(versions, ["1.1.0-pr.1", "1.0.0"]);
         assert!(detail.versions[0].size > 0);

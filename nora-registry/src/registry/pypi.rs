@@ -70,7 +70,17 @@ pub fn routes() -> Router<AppState> {
 /// write), not a listing of the whole `pypi/` prefix per request. Only projects holding
 /// at least one distribution file are listed.
 async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let index = state.repo_index.get("pypi", &state.storage).await;
+    let index = state.repo_index.get("pypi", &state).await;
+    if !state.repo_index.is_ready("pypi") {
+        // First build still running after a start: a 503 is retried, an empty
+        // (cacheable) project list would read as "nothing here".
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "5")],
+            "package index is being built, retry shortly",
+        )
+            .into_response();
+    }
     let pkg_list: Vec<&str> = index
         .iter()
         .filter(|repo| repo.versions > 0)
@@ -4779,6 +4789,38 @@ mod integration_tests {
             StatusCode::BAD_GATEWAY,
             "no good copy: not a partial local index"
         );
+    }
+
+    /// `/simple/` never runs the index build itself: before the startup build finishes
+    /// it answers 503 + Retry-After at once (not an empty, cacheable project list).
+    #[tokio::test]
+    async fn root_index_answers_503_while_the_first_build_runs() {
+        use crate::test_helpers::{create_test_context_with_storage, op_counting_storage};
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage(storage);
+        ctx.state
+            .storage
+            .put("pypi/real/real-1.0.tar.gz", b"x")
+            .await
+            .unwrap();
+        ops.stall_lists(Some("pypi/"));
+        let state = ctx.state.clone();
+        let startup = tokio::spawn(async move { state.repo_index.refresh(&state).await });
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            send(&ctx.app, Method::GET, "/simple/", ""),
+        )
+        .await
+        .expect("/simple/ waited on the index build");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()[header::RETRY_AFTER], "5");
+
+        ops.stall_lists(None);
+        startup.await.unwrap();
+        let resp = send(&ctx.app, Method::GET, "/simple/", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(text(resp).await.contains("/simple/real/"));
     }
 
     /// C45: `/simple/` lists only projects holding a distribution file, with absolute
