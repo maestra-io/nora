@@ -249,6 +249,8 @@ pub struct AuthConfig {
 
 /// Maestra fork: identity from the `Teleport-Jwt-Assertion` header that a
 /// Teleport application agent adds to every request it proxies.
+/// ENV: `NORA_AUTH_TELEPORT_<KEY>` per key (e.g. NORA_AUTH_TELEPORT_ENABLED,
+/// NORA_AUTH_TELEPORT_WRITE_ROLES=apps,admins).
 ///
 /// ```toml
 /// [auth.teleport]
@@ -302,6 +304,52 @@ impl Default for TeleportConfig {
             require_for_ui: false,
             leeway_secs: default_oidc_leeway(),
             jwks_cache_secs: default_teleport_jwks_cache_secs(),
+        }
+    }
+}
+
+impl TeleportConfig {
+    /// `NORA_AUTH_TELEPORT_<KEY>` for every `[auth.teleport]` key;
+    /// `WRITE_ROLES` and `TRUSTED_PROXIES` are comma-separated.
+    fn apply_env_overrides(&mut self) {
+        if let Ok(val) = env::var("NORA_AUTH_TELEPORT_ENABLED") {
+            self.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_AUTH_TELEPORT_JWKS_URL") {
+            self.jwks_url = val;
+        }
+        if let Ok(val) = env::var("NORA_AUTH_TELEPORT_ISSUER") {
+            self.issuer = val;
+        }
+        if let Ok(val) = env::var("NORA_AUTH_TELEPORT_AUDIENCE") {
+            self.audience = val;
+        }
+        if let Ok(val) = env::var("NORA_AUTH_TELEPORT_TRUSTED_PROXIES") {
+            self.trusted_proxies = TrustedProxies::parse(&val);
+        }
+        if let Ok(val) = env::var("NORA_AUTH_TELEPORT_WRITE_ROLES") {
+            self.write_roles = val
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Ok(val) = env::var("NORA_AUTH_TELEPORT_REQUIRE_FOR_UI") {
+            self.require_for_ui = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_AUTH_TELEPORT_LEEWAY_SECS") {
+            super::parse_env_warn(
+                "NORA_AUTH_TELEPORT_LEEWAY_SECS",
+                &val,
+                &mut self.leeway_secs,
+            );
+        }
+        if let Ok(val) = env::var("NORA_AUTH_TELEPORT_JWKS_CACHE_SECS") {
+            super::parse_env_warn(
+                "NORA_AUTH_TELEPORT_JWKS_CACHE_SECS",
+                &val,
+                &mut self.jwks_cache_secs,
+            );
         }
     }
 }
@@ -603,6 +651,7 @@ impl AuthConfig {
         if let Ok(val) = env::var("NORA_AUTH_HTPASSWD_ALLOWED_PEERS") {
             self.htpasswd_allowed_peers = Some(TrustedProxies::parse(&val));
         }
+        self.teleport.apply_env_overrides();
         if let Ok(val) = env::var("NORA_AUTH_OIDC_ENABLED") {
             self.oidc.enabled = val.to_lowercase() == "true" || val == "1";
         }
@@ -626,6 +675,47 @@ mod tests {
         assert_eq!(cfg.read_only_users, ["viewer", "auditor"]);
         assert_eq!(cfg.htpasswd_role("viewer"), crate::tokens::Role::Read);
         assert_eq!(cfg.htpasswd_role("admin"), crate::tokens::Role::Write);
+    }
+
+    #[test]
+    fn teleport_config_from_env() {
+        let _lock = crate::test_env::env_lock();
+        let vars = [
+            ("NORA_AUTH_TELEPORT_ENABLED", "true"),
+            (
+                "NORA_AUTH_TELEPORT_JWKS_URL",
+                "https://tp.example/.well-known/jwks.json",
+            ),
+            ("NORA_AUTH_TELEPORT_ISSUER", "tp.example"),
+            (
+                "NORA_AUTH_TELEPORT_AUDIENCE",
+                "http://nora-teleport.nora.svc:80",
+            ),
+            ("NORA_AUTH_TELEPORT_TRUSTED_PROXIES", "10.62.0.0/16"),
+            ("NORA_AUTH_TELEPORT_WRITE_ROLES", " apps, admins ,"),
+            ("NORA_AUTH_TELEPORT_REQUIRE_FOR_UI", "1"),
+            ("NORA_AUTH_TELEPORT_LEEWAY_SECS", "30"),
+            ("NORA_AUTH_TELEPORT_JWKS_CACHE_SECS", "120"),
+        ];
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+        let mut cfg = AuthConfig::default();
+        cfg.apply_env_overrides();
+        for (k, _) in vars {
+            std::env::remove_var(k);
+        }
+        let t = &cfg.teleport;
+        assert!(t.enabled);
+        assert_eq!(t.jwks_url, "https://tp.example/.well-known/jwks.json");
+        assert_eq!(t.issuer, "tp.example");
+        assert_eq!(t.audience, "http://nora-teleport.nora.svc:80");
+        assert!(t.trusted_proxies.contains("10.62.3.4".parse().unwrap()));
+        assert!(!t.trusted_proxies.contains("10.63.0.1".parse().unwrap()));
+        assert_eq!(t.write_roles, ["apps", "admins"]);
+        assert!(t.require_for_ui);
+        assert_eq!(t.leeway_secs, 30);
+        assert_eq!(t.jwks_cache_secs, 120);
     }
 
     #[test]
