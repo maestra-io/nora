@@ -42,12 +42,18 @@ pub struct ServerConfig {
     /// (up to 10 s) it fits Kubernetes' default 30 s grace period.
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout: u64,
-    /// Seconds a client gets to send a request's headers, on a new connection and
-    /// between keep-alive requests; a client that is slower is disconnected
-    /// (slowloris). Default 30 (hyper's own default, which `axum::serve` never armed).
-    /// 0 disables the timeout.
+    /// Seconds a client gets to send a request's headers, from the connection's
+    /// start or from the first byte of a later request on it; a client that is
+    /// slower is disconnected (slowloris). Default 30 (hyper's own default, which
+    /// `axum::serve` never armed). 0 disables the timeout.
     #[serde(default = "default_header_read_timeout")]
     pub header_read_timeout: u64,
+    /// Seconds an idle keep-alive connection waits for its next request before it
+    /// is closed. Keep it above the reverse proxy's idle timeout (traefik: 90 s), so
+    /// the proxy closes an idle connection first and never sends a request on one
+    /// NORA is closing (a 502 for a non-replayable publish). Default 120; 0 = no limit.
+    #[serde(default = "default_keep_alive_timeout")]
+    pub keep_alive_timeout: u64,
     /// Open client connections served at once. Past it NORA stops accepting until
     /// one closes; new clients wait in the listen backlog. Default 4096; 0 = no limit.
     #[serde(default = "default_max_connections")]
@@ -111,6 +117,10 @@ pub(super) fn default_header_read_timeout() -> u64 {
     30
 }
 
+pub(super) fn default_keep_alive_timeout() -> u64 {
+    120
+}
+
 pub(super) fn default_max_connections() -> usize {
     4096
 }
@@ -150,6 +160,7 @@ impl Default for ServerConfig {
             shutdown_timeout: default_shutdown_timeout(),
             trust_upstream_dates: default_trust_upstream_dates(),
             header_read_timeout: default_header_read_timeout(),
+            keep_alive_timeout: default_keep_alive_timeout(),
             max_connections: default_max_connections(),
             publish_body_limit_mb: default_publish_body_limit_mb(),
             stream_threshold_mb: default_stream_threshold_mb(),
@@ -280,6 +291,13 @@ impl ServerConfig {
                 &mut self.header_read_timeout,
             );
         }
+        if let Ok(val) = env::var("NORA_KEEP_ALIVE_TIMEOUT") {
+            super::parse_env_warn(
+                "NORA_KEEP_ALIVE_TIMEOUT",
+                &val,
+                &mut self.keep_alive_timeout,
+            );
+        }
         if let Ok(val) = env::var("NORA_MAX_CONNECTIONS") {
             super::parse_env_warn("NORA_MAX_CONNECTIONS", &val, &mut self.max_connections);
         }
@@ -343,16 +361,29 @@ mod tests {
     fn connection_limits_default_and_env_override() {
         let _lock = crate::test_env::env_lock();
         let d = ServerConfig::default();
-        assert_eq!((d.header_read_timeout, d.max_connections), (30, 4096));
+        assert_eq!(
+            (
+                d.header_read_timeout,
+                d.keep_alive_timeout,
+                d.max_connections
+            ),
+            (30, 120, 4096)
+        );
         let mut config = ServerConfig::default();
         std::env::set_var("NORA_HEADER_READ_TIMEOUT", "5");
+        std::env::set_var("NORA_KEEP_ALIVE_TIMEOUT", "100");
         std::env::set_var("NORA_MAX_CONNECTIONS", "10");
         config.apply_env_overrides();
         std::env::remove_var("NORA_HEADER_READ_TIMEOUT");
+        std::env::remove_var("NORA_KEEP_ALIVE_TIMEOUT");
         std::env::remove_var("NORA_MAX_CONNECTIONS");
         assert_eq!(
-            (config.header_read_timeout, config.max_connections),
-            (5, 10)
+            (
+                config.header_read_timeout,
+                config.keep_alive_timeout,
+                config.max_connections
+            ),
+            (5, 100, 10)
         );
     }
 
@@ -384,6 +415,7 @@ mod tests {
             trust_upstream_dates: false,
             shutdown_timeout: 15,
             header_read_timeout: 30,
+            keep_alive_timeout: 120,
             max_connections: 4096,
             publish_body_limit_mb: 512,
             stream_threshold_mb: 16,
