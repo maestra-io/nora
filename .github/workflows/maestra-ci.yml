@@ -45,7 +45,9 @@ jobs:
             echo "rust=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          other=$(git diff --name-only "${BASE}" HEAD | grep -vE '\.md$' || true)
+          # A failed diff fails the step; only grep's "no match" is a Markdown-only PR.
+          changed=$(git diff --name-only "${BASE}" HEAD)
+          other=$(printf '%s\n' "${changed}" | grep -vE '^$|\.md$' || true)
           printf 'non-Markdown changes:\n%s\n' "${other:-(none)}"
           echo "rust=$([ -n "${other}" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
