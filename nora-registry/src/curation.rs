@@ -224,6 +224,21 @@ impl CurationEngine {
         true
     }
 
+    /// `registry`'s min-release-age in seconds, `None` when none is configured.
+    pub fn min_release_age_secs(&self, registry: RegistryType) -> Option<i64> {
+        self.min_age.as_ref().map(|f| f.threshold(registry).0)
+    }
+
+    /// The date min-release-age judges a proxied version by when its trusted upstream
+    /// release date stayed unknown after every source was tried (NuGet: registration,
+    /// then catalog leaf): `on_failure = "closed"` holds it as released now (blocked on
+    /// download, hidden from metadata), `"open"` leaves it undated (min-release-age
+    /// defers to the quarantine).
+    pub fn unknown_release_date(&self) -> Option<i64> {
+        (self.config.on_failure == crate::config::CurationOnFailure::Closed)
+            .then(|| crate::cache_ttl::now_unix() as i64)
+    }
+
     /// Whether `name@version` has not logged its audit hiding line within
     /// [`AUDIT_HIDDEN_LOG_SECS`]; records it as logged now if so.
     fn first_audit_hidden_log(&self, registry: RegistryType, name: &str, version: &str) -> bool {
