@@ -20,7 +20,17 @@ data:
     {{- else }}
     {{- fail "config.server.public_url is required when ingress and httpRoute are both disabled. Set config.server.public_url in your values (e.g. https://registry.example.com)." }}
     {{- end }}
-    {{- with include "nora.tomlScalars" (omit .Values.config.server "host" "port" "public_url") | trim }}
+    {{- $server := omit .Values.config.server "host" "port" "public_url" }}
+    {{- if .Values.spool.enabled }}
+    {{- $_ := set $server "spool_dir" .Values.spool.mountPath }}
+    {{- if not (hasKey $server "spool_max_mb") }}
+    {{- $_ := set $server "spool_max_mb" (div (mul (int .Values.spool.sizeLimitMb) 7) 8) }}
+    {{- end }}
+    {{- if or (lt (int $server.spool_max_mb) 1) (ge (int $server.spool_max_mb) (int .Values.spool.sizeLimitMb)) }}
+    {{- fail (printf "config.server.spool_max_mb (%d) must be between 1 and spool.sizeLimitMb (%d): a spool that reaches the emptyDir sizeLimit gets the pod evicted" (int $server.spool_max_mb) (int .Values.spool.sizeLimitMb)) }}
+    {{- end }}
+    {{- end }}
+    {{- with include "nora.tomlScalars" $server | trim }}
     {{- . | nindent 4 }}
     {{- end }}
 

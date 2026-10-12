@@ -542,3 +542,38 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: 'config key "overrides" is a table'
+
+  # R2-05: the spool emptyDir is nora's spool_dir, with a budget below sizeLimit.
+  - it: renders no spool keys by default
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'spool_'
+
+  - it: renders spool_dir and a budget of 7/8 of the spool sizeLimit
+    set:
+      spool.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\nspool_dir = "/spool"\n'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\nspool_max_mb = 3584\n'
+
+  - it: keeps an explicit spool_max_mb below the sizeLimit
+    set:
+      spool.enabled: true
+      config.server.spool_max_mb: 1000
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\nspool_max_mb = 1000\n'
+
+  - it: refuses a spool budget that reaches the sizeLimit
+    set:
+      spool.enabled: true
+      config.server.spool_max_mb: 4096
+    asserts:
+      - failedTemplate:
+          errorPattern: "spool_max_mb \\(4096\\) must be between 1 and spool.sizeLimitMb \\(4096\\)"
