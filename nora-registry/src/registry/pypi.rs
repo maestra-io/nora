@@ -17,7 +17,7 @@ use crate::config::UpstreamAuth;
 use crate::registry::{
     cache_read, circuit_open_response, method_not_allowed, nora_base_url, proxy_error_response,
     proxy_fetch_artifact, proxy_fetch_bytes, proxy_fetch_text, read_cached_artifact, ProxyBody,
-    TempFileGuard,
+    SpoolError, TempFileGuard,
 };
 use crate::registry_type::RegistryType;
 use crate::ui::components::html_escape;
@@ -842,6 +842,8 @@ async fn download_file(
                 continue;
             }
             Err(crate::registry::ProxyError::NotFound) => continue,
+            // nora's own disk: another upstream would not help.
+            Err(crate::registry::ProxyError::Spool(e)) => return e.response("pypi"),
             Err(e) => {
                 tracing::debug!(error = ?e, package = %normalized, filename = %filename, upstream = %up.url(), "PyPI file proxy fetch failed, trying next upstream");
                 upstream_err = Some((file_url, e));
@@ -998,6 +1000,8 @@ async fn upload(
     let mut requires_python = String::new();
     // (temp file, its guard, size, sha256) of the `content` field.
     let mut content: Option<(std::path::PathBuf, TempFileGuard, u64, String)> = None;
+    // Spool budget held by `content` until it is stored (R2-05).
+    let mut reservation = None;
     let budget = (state.config.server.body_limit_mb as u64).saturating_mul(1024 * 1024);
 
     // Parse multipart fields
@@ -1022,20 +1026,20 @@ async fn upload(
             }
             "content" if content.is_none() => {
                 filename = field.file_name().unwrap_or("unknown").to_string();
-                let dir =
-                    std::path::PathBuf::from(&state.config.storage.path).join("tmp/pypi-uploads");
-                if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-                    tracing::error!(path = %dir.display(), error = %e, "pypi: cannot create upload temp dir");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
+                let dir = state.spool.dir(crate::registry::PYPI_UPLOAD_SUBDIR);
                 let path = dir.join(uuid::Uuid::new_v4().to_string());
+                let local = |e| SpoolError::io(&path)(e).response("pypi");
+                let spool = reservation.insert(match state.spool.reserve(0) {
+                    Ok(r) => r,
+                    Err(e) => return e.response("pypi"),
+                });
+                if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+                    return local(e);
+                }
                 let guard = TempFileGuard::new(path.clone());
                 let mut file = match tokio::fs::File::create(&path).await {
                     Ok(f) => f,
-                    Err(e) => {
-                        tracing::error!(error = %e, "pypi: cannot create upload temp file");
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
+                    Err(e) => return local(e),
                 };
                 let mut hasher = sha2::Sha256::new();
                 let mut size = 0u64;
@@ -1050,10 +1054,12 @@ async fn upload(
                                 )
                                     .into_response();
                             }
+                            if let Err(e) = spool.grow(size) {
+                                return e.response("pypi");
+                            }
                             hasher.update(&chunk);
                             if let Err(e) = file.write_all(&chunk).await {
-                                tracing::error!(error = %e, "pypi: upload temp write failed");
-                                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                                return local(e);
                             }
                         }
                         Ok(None) => break,
@@ -1068,8 +1074,7 @@ async fn upload(
                 }
                 // Durable before put_from_path's rename publishes it.
                 if let Err(e) = file.sync_all().await {
-                    tracing::error!(error = %e, "pypi: upload temp fsync failed");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    return local(e);
                 }
                 content = Some((path, guard, size, hex::encode(hasher.finalize())));
             }
@@ -3895,6 +3900,36 @@ mod integration_tests {
             body,
         )
         .await
+    }
+
+    /// R2-05: an upload spools under `server.spool_max_mb`: while other spools hold
+    /// the budget it is a 503 + Retry-After, a file bigger than the whole budget a
+    /// 507, and neither leaves a file behind.
+    #[tokio::test]
+    async fn upload_over_the_spool_budget_is_refused_and_leaves_no_spool() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.server.spool_max_mb = 4;
+        });
+        let upload = |mib: usize| {
+            let app = ctx.app.clone();
+            async move {
+                twine_upload(
+                    &app,
+                    &[("name", "big"), ("version", "1.0")],
+                    "big-1.0.tar.gz",
+                    &vec![0u8; mib * 1024 * 1024],
+                )
+                .await
+            }
+        };
+        let held = ctx.state.spool.reserve(3 * 1024 * 1024).unwrap();
+        let resp = upload(2).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
+        drop(held);
+        assert_eq!(upload(5).await.status(), StatusCode::INSUFFICIENT_STORAGE);
+        let dir = ctx.state.spool.dir(crate::registry::PYPI_UPLOAD_SUBDIR);
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
     }
 
     /// A wheel holding `{dist_info}/METADATA` and one module.

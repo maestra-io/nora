@@ -67,6 +67,17 @@ groups:
         annotations:
           summary: "NORA cache writes failing for {{ $labels.registry }} ({{ $labels.operation }})"
 
+      - alert: NoraSpoolFailures
+        # A proxied download, NuGet push or PyPI upload could not be spooled:
+        # budget busy (503), body too large / volume full (507) or a local disk
+        # error (500). Size server.spool_max_mb and the spool volume.
+        expr: sum by (registry, reason) (increase(nora_spool_failures_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NORA spool refusing transfers for {{ $labels.registry }} ({{ $labels.reason }})"
+
       - alert: NoraStorageWriteErrors
         expr: sum(increase(nora_storage_operations_total{operation=~"put|copy",status="error"}[5m])) > 0
         for: 5m

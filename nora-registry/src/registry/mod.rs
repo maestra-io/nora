@@ -241,6 +241,8 @@ pub(crate) enum ProxyError {
     RateLimited(Option<String>),
     /// Upstream answered 401/403: a credential or policy refusal, not a missing artifact.
     Denied(u16),
+    /// The body could not be spooled locally: nora's own disk or budget, not upstream.
+    Spool(SpoolError),
 }
 
 /// Classify a transport-level reqwest failure.
@@ -274,6 +276,7 @@ pub(crate) fn proxy_error_response(registry: &str, url: &str, err: &ProxyError) 
     let status = match err {
         ProxyError::NotFound => return StatusCode::NOT_FOUND.into_response(),
         ProxyError::CircuitOpen(reg) => return circuit_open_response(reg),
+        ProxyError::Spool(e) => return e.response(registry),
         ProxyError::RateLimited(retry_after) => {
             tracing::warn!(
                 registry,
@@ -376,11 +379,17 @@ fn policy_block_reason(headers: &reqwest::header::HeaderMap) -> Option<&'static 
 }
 
 /// Core fetch logic with retry. Callers provide a response extractor.
+///
+/// `timeout` bounds each attempt from connect to the end of the body, or, with
+/// `headers_only`, to the response headers: the extractor then reads the body
+/// under its own idle timeout, so a large artifact is bounded by progress, not by
+/// `timeout` x bandwidth (R2-39).
 #[allow(clippy::too_many_arguments)]
 async fn proxy_fetch_core<T, F, Fut>(
     client: &reqwest::Client,
     url: &str,
     timeout: Duration,
+    headers_only: bool,
     auth: Option<UpstreamAuth<'_>>,
     extra_headers: Option<(&str, &str)>,
     extract: F,
@@ -389,7 +398,7 @@ async fn proxy_fetch_core<T, F, Fut>(
 ) -> Result<T, ProxyError>
 where
     F: Fn(reqwest::Response) -> Fut + Copy,
-    Fut: std::future::Future<Output = Result<T, reqwest::Error>>,
+    Fut: std::future::Future<Output = Result<T, ProxyError>>,
 {
     let auth_header = upstream_auth_header(auth)?;
     let scope = scope.into();
@@ -398,7 +407,10 @@ where
     let probe = cb.check(&cb_key)?;
 
     for attempt in 0..2 {
-        let mut request = client.get(url).timeout(timeout);
+        let mut request = client.get(url);
+        if !headers_only {
+            request = request.timeout(timeout);
+        }
         if let Some(value) = &auth_header {
             request = request.header(header::AUTHORIZATION, value.clone());
         }
@@ -407,20 +419,30 @@ where
         }
 
         let upstream_start = Instant::now();
-        match request.send().await {
+        let sent = if headers_only {
+            match tokio::time::timeout(timeout, request.send()).await {
+                Ok(sent) => sent.map_err(transport_error),
+                Err(_) => Err(ProxyError::Timeout(format!(
+                    "no response headers within {timeout:?}"
+                ))),
+            }
+        } else {
+            request.send().await.map_err(transport_error)
+        };
+        match sent {
             Ok(response) => {
                 let elapsed = upstream_start.elapsed().as_secs_f64();
                 if response.status().is_success() {
                     UPSTREAM_REQUEST_DURATION
                         .with_label_values(&[registry_str, "2xx"])
                         .observe(elapsed);
-                    let result = extract(response).await.map_err(transport_error);
-                    if result.is_ok() {
-                        cb.record_success(&cb_key, probe);
-                    } else {
+                    let result = extract(response).await;
+                    match &result {
+                        // A local spool refusal or failure is nora's, not upstream's.
+                        Ok(_) | Err(ProxyError::Spool(_)) => cb.record_success(&cb_key, probe),
                         // 2xx but the body could not be read (e.g. a mid-stream
                         // drop) — treat as a fetch failure for the breaker.
-                        cb.record_failure(&cb_key, probe);
+                        Err(_) => cb.record_failure(&cb_key, probe),
                     }
                     return result;
                 }
@@ -476,17 +498,21 @@ where
             }
             Err(e) => {
                 let elapsed = upstream_start.elapsed().as_secs_f64();
-                let status_label = if e.is_timeout() { "timeout" } else { "error" };
+                let status_label = if matches!(e, ProxyError::Timeout(_)) {
+                    "timeout"
+                } else {
+                    "error"
+                };
                 UPSTREAM_REQUEST_DURATION
                     .with_label_values(&[registry_str, status_label])
                     .observe(elapsed);
                 if attempt == 0 {
-                    tracing::debug!(url, error = %e, "upstream error, retrying in 1s");
+                    tracing::debug!(url, error = ?e, "upstream error, retrying in 1s");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
                 cb.record_failure(&cb_key, probe);
-                return Err(transport_error(e));
+                return Err(e);
             }
         }
     }
@@ -507,9 +533,10 @@ pub(crate) async fn proxy_fetch(
         client,
         url,
         timeout,
+        false,
         auth,
         None,
-        |r| async { r.bytes().await.map(|b| b.to_vec()) },
+        |r| async { r.bytes().await.map(|b| b.to_vec()).map_err(transport_error) },
         cb,
         scope,
     )
@@ -530,9 +557,10 @@ pub(crate) async fn proxy_fetch_bytes(
         client,
         url,
         timeout,
+        false,
         auth,
         None,
-        reqwest::Response::bytes,
+        |r| async { r.bytes().await.map_err(transport_error) },
         cb,
         scope,
     )
@@ -582,29 +610,228 @@ pub(crate) async fn proxy_fetch_shared(
 // Bounded-memory proxied artifacts (C17/C74)
 // ============================================================================
 
-/// Temp directory of spooled proxy downloads, under `{storage.path}`.
-const PROXY_SPOOL_SUBDIR: &str = "tmp/proxy-spool";
+/// Subdirectories of `server.spool_dir`: proxied downloads, NuGet pushes, PyPI uploads.
+pub(crate) const PROXY_SPOOL_SUBDIR: &str = "proxy-spool";
+pub(crate) const NUGET_UPLOAD_SUBDIR: &str = "nuget-uploads";
+pub(crate) const PYPI_UPLOAD_SUBDIR: &str = "pypi-uploads";
 
-/// Spool files older than this are orphans (crash, OOM) and reaped: a download in
-/// progress keeps writing, and a served one is unlinked when its last reader ends.
-const PROXY_SPOOL_MAX_AGE: Duration = Duration::from_secs(4 * 60 * 60);
+/// Spool files older than this are orphans (crash, OOM) and reaped: a transfer in
+/// progress keeps writing, and a served download is unlinked when its last reader ends.
+const SPOOL_MAX_AGE: Duration = Duration::from_secs(4 * 60 * 60);
 
-/// Remove orphaned proxy spool files (startup and the periodic maintenance tick).
-pub(crate) fn cleanup_proxy_spool_dir(data_dir: &str) {
-    let dir = std::path::Path::new(data_dir).join(PROXY_SPOOL_SUBDIR);
-    let removed = remove_stale_temp_files(&dir, PROXY_SPOOL_MAX_AGE);
-    if removed > 0 {
-        tracing::info!(removed, dir = %dir.display(), "Cleaned up stale proxy spool files");
+/// Remove orphaned spool files from every spool directory (startup and the
+/// periodic maintenance tick).
+pub(crate) fn cleanup_spool_dirs(spool_dir: &std::path::Path) {
+    for sub in [PROXY_SPOOL_SUBDIR, NUGET_UPLOAD_SUBDIR, PYPI_UPLOAD_SUBDIR] {
+        let dir = spool_dir.join(sub);
+        let removed = remove_stale_temp_files(&dir, SPOOL_MAX_AGE);
+        if removed > 0 {
+            tracing::info!(removed, dir = %dir.display(), "Cleaned up stale spool files");
+        }
+    }
+}
+
+const MIB: u64 = 1024 * 1024;
+/// A spool of unknown length reserves budget in steps of this many MiB.
+const SPOOL_STEP_MIB: u64 = 8;
+/// Free space a spool always leaves on its filesystem, so that with `spool_dir` on
+/// the data volume the tokens and the quarantine ledger can still be written.
+const SPOOL_FREE_FLOOR: u64 = 64 * MIB;
+
+/// Why a body could not be spooled. Never an upstream failure.
+#[derive(Debug)]
+pub(crate) enum SpoolError {
+    /// `server.spool_max_mb` is in use by other transfers: retry shortly.
+    Busy,
+    /// Larger than the cap (bytes) or than the whole budget: no retry can fit it.
+    TooLarge(u64),
+    /// Local disk failure (path in the message).
+    Io(std::io::Error),
+}
+
+impl SpoolError {
+    /// A local I/O error on `path`, the path kept in its message for the log.
+    pub(crate) fn io(path: &std::path::Path) -> impl FnOnce(std::io::Error) -> Self + '_ {
+        move |e| {
+            SpoolError::Io(std::io::Error::new(
+                e.kind(),
+                format!("{}: {e}", path.display()),
+            ))
+        }
+    }
+
+    /// The client response, logged and counted in `nora_spool_failures_total`:
+    /// 503 + `Retry-After` while the budget is busy (NuGet, npm and pip retry it),
+    /// 507 when the body cannot fit or the volume is full, 500 for another local
+    /// failure. Never 502: nothing here is upstream's fault.
+    pub(crate) fn response(&self, registry: &str) -> Response {
+        let (reason, response) = match self {
+            SpoolError::Busy => (
+                "busy",
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::RETRY_AFTER, HeaderValue::from_static("10"))],
+                    "spool budget in use, retry shortly",
+                )
+                    .into_response(),
+            ),
+            SpoolError::TooLarge(cap) => (
+                "too_large",
+                (
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    format!("body exceeds the {} MiB spool cap", cap / MIB),
+                )
+                    .into_response(),
+            ),
+            SpoolError::Io(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+                ) =>
+            {
+                ("no_space", StatusCode::INSUFFICIENT_STORAGE.into_response())
+            }
+            SpoolError::Io(_) => ("io", StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        };
+        if let SpoolError::Io(e) = self {
+            tracing::error!(registry, reason, error = %e, "local spool failure (not upstream)");
+        } else {
+            tracing::warn!(registry, reason, error = ?self, "spool refused the body");
+        }
+        crate::metrics::SPOOL_FAILURES
+            .with_label_values(&[registry, reason])
+            .inc();
+        response
+    }
+}
+
+/// The disk spool directory and its byte budget (`server.spool_dir`,
+/// `server.spool_max_mb`), shared by proxied downloads, NuGet pushes and PyPI uploads.
+#[derive(Debug)]
+pub(crate) struct SpoolBudget {
+    dir: std::path::PathBuf,
+    /// One permit per MiB; `None` = no budget.
+    permits: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    total_mib: u64,
+}
+
+impl SpoolBudget {
+    pub(crate) fn new(config: &crate::config::Config) -> Self {
+        let total_mib = config
+            .server
+            .spool_max_mb
+            .min(tokio::sync::Semaphore::MAX_PERMITS as u64);
+        Self {
+            dir: config.server.spool_dir(&config.storage.path),
+            permits: (total_mib > 0)
+                .then(|| std::sync::Arc::new(tokio::sync::Semaphore::new(total_mib as usize))),
+            total_mib,
+        }
+    }
+
+    /// `{spool_dir}/{sub}`.
+    pub(crate) fn dir(&self, sub: &str) -> std::path::PathBuf {
+        self.dir.join(sub)
+    }
+
+    /// Reserve room for a spool of `len` bytes; [`SpoolReservation::grow`] adds more.
+    /// Never waits: a busy budget is an immediate [`SpoolError::Busy`].
+    pub(crate) fn reserve(&self, len: u64) -> Result<SpoolReservation, SpoolError> {
+        let mut reservation = SpoolReservation {
+            permits: self.permits.clone(),
+            held: None,
+            mib: 0,
+            total_mib: self.total_mib,
+            dir: self.dir.clone(),
+        };
+        reservation.grow(len)?;
+        Ok(reservation)
+    }
+}
+
+/// Budget held by one spool file; released when dropped.
+#[derive(Debug)]
+pub(crate) struct SpoolReservation {
+    permits: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    held: Option<tokio::sync::OwnedSemaphorePermit>,
+    mib: u64,
+    total_mib: u64,
+    dir: std::path::PathBuf,
+}
+
+impl SpoolReservation {
+    /// Make room for `len` bytes in all, if the budget and the filesystem's free
+    /// space (above [`SPOOL_FREE_FLOOR`]) have it.
+    pub(crate) fn grow(&mut self, len: u64) -> Result<(), SpoolError> {
+        let need = len.div_ceil(MIB);
+        if need <= self.mib {
+            return Ok(());
+        }
+        if self.total_mib > 0 && need > self.total_mib {
+            return Err(SpoolError::TooLarge(self.total_mib * MIB));
+        }
+        // ponytail: concurrent spools check the free space independently; the
+        // budget, sized below the spool volume, is the hard bound.
+        if free_space(&self.dir)
+            .is_some_and(|free| free < (need - self.mib) * MIB + SPOOL_FREE_FLOOR)
+        {
+            return Err(SpoolError::Io(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!("{}: below the spool free-space floor", self.dir.display()),
+            )));
+        }
+        // A step ahead when the budget has it, else exactly what is needed.
+        let step = need.next_multiple_of(SPOOL_STEP_MIB);
+        let step = if self.total_mib > 0 {
+            step.min(self.total_mib)
+        } else {
+            step
+        };
+        if let Some(permits) = &self.permits {
+            let acquire = |mib: u64| {
+                std::sync::Arc::clone(permits).try_acquire_many_owned((mib - self.mib) as u32)
+            };
+            let (permit, got) = match acquire(step) {
+                Ok(p) => (p, step),
+                Err(_) => (acquire(need).map_err(|_| SpoolError::Busy)?, need),
+            };
+            match &mut self.held {
+                Some(held) => held.merge(permit),
+                None => self.held = Some(permit),
+            }
+            self.mib = got;
+        } else {
+            self.mib = step;
+        }
+        Ok(())
+    }
+}
+
+/// Bytes available to an unprivileged writer on the filesystem of `dir` (or of its
+/// nearest existing ancestor); `None` where that cannot be told.
+fn free_space(dir: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        dir.ancestors()
+            .find_map(|p| rustix::fs::statvfs(p).ok())
+            .map(|s| s.f_bavail.saturating_mul(s.f_frsize))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
     }
 }
 
 /// An upstream body spooled to a temp file with its SHA-256 computed on the way in.
-/// The file is removed when the last holder (response, follower, cache write) drops.
+/// The file is removed, and its budget released, when the last holder (response,
+/// follower, cache write) drops.
 #[derive(Debug)]
 pub(crate) struct SpoolFile {
     path: std::path::PathBuf,
     sha256: String,
     len: u64,
+    _reservation: SpoolReservation,
 }
 
 impl Drop for SpoolFile {
@@ -621,74 +848,108 @@ pub(crate) enum ProxyBody {
     File(std::sync::Arc<SpoolFile>),
 }
 
-/// Read an upstream response body: whole into memory up to `threshold` bytes, else
-/// to a spool file in `dir` with a running SHA-256, never holding more than one
-/// chunk of it. A transport error is the outer `Err` (an upstream failure for the
-/// breaker); a local disk error the inner one.
+/// The next body chunk, failing as a timeout when upstream sends nothing for `idle`.
+async fn next_chunk(
+    response: &mut reqwest::Response,
+    idle: Duration,
+) -> Result<Option<Bytes>, ProxyError> {
+    match tokio::time::timeout(idle, response.chunk()).await {
+        Ok(chunk) => chunk.map_err(transport_error),
+        Err(_) => Err(ProxyError::Timeout(format!(
+            "upstream body stalled for {idle:?}"
+        ))),
+    }
+}
+
+/// Read an upstream response body, each chunk under the `idle` timeout: whole into
+/// memory up to `threshold` bytes (0 = always), else to a spool file under `spool`'s
+/// budget with a running SHA-256, never holding more than one chunk of it. A body
+/// above `cap` is refused on its `Content-Length` before any of it is read, or as
+/// soon as the running count crosses the cap.
 async fn read_or_spool(
     mut response: reqwest::Response,
-    dir: &std::path::Path,
+    spool: &SpoolBudget,
     threshold: u64,
-) -> Result<std::io::Result<ProxyBody>, reqwest::Error> {
+    cap: Option<u64>,
+    idle: Duration,
+) -> Result<ProxyBody, ProxyError> {
     use sha2::Digest;
     use tokio::io::AsyncWriteExt;
-    if threshold == 0 || response.content_length().is_some_and(|n| n <= threshold) {
-        return response.bytes().await.map(|b| Ok(ProxyBody::Mem(b)));
+    let over_cap = |len: u64| cap.is_some_and(|cap| len > cap);
+    let too_large = || ProxyError::Spool(SpoolError::TooLarge(cap.unwrap_or_default()));
+    let in_memory = |len: u64| threshold == 0 || len <= threshold;
+    let declared = response.content_length();
+    if declared.is_some_and(over_cap) {
+        return Err(too_large());
     }
-    // Unknown or too big a length: buffer until the threshold, then spill.
-    let mut head = Vec::new();
+    // A body known to spill reserves its whole length before any of it is read.
+    let mut reservation = match declared.filter(|&n| !in_memory(n)) {
+        Some(n) => Some(spool.reserve(n).map_err(ProxyError::Spool)?),
+        None => None,
+    };
+    // Buffer until the threshold, then spill.
+    let mut head = Vec::with_capacity(declared.unwrap_or(0).min(threshold) as usize);
     loop {
-        let Some(chunk) = response.chunk().await? else {
-            return Ok(Ok(ProxyBody::Mem(Bytes::from(head))));
+        let Some(chunk) = next_chunk(&mut response, idle).await? else {
+            return Ok(ProxyBody::Mem(Bytes::from(head)));
         };
-        if (head.len() + chunk.len()) as u64 > threshold {
-            head.extend_from_slice(&chunk);
+        head.extend_from_slice(&chunk);
+        if over_cap(head.len() as u64) {
+            return Err(too_large());
+        }
+        if !in_memory(head.len() as u64) {
             break;
         }
-        head.extend_from_slice(&chunk);
     }
-    let path = dir.join(uuid::Uuid::new_v4().to_string());
-    let mut guard = TempFileGuard::new(path.clone());
-    let mut file = match tokio::fs::create_dir_all(dir).await {
-        Ok(()) => match tokio::fs::File::create(&path).await {
-            Ok(f) => f,
-            Err(e) => return Ok(Err(e)),
-        },
-        Err(e) => return Ok(Err(e)),
-    };
-    let mut hasher = sha2::Sha256::new();
     let mut len = head.len() as u64;
+    let mut reservation = match reservation.take() {
+        Some(r) => r,
+        None => spool.reserve(len).map_err(ProxyError::Spool)?,
+    };
+    let dir = spool.dir(PROXY_SPOOL_SUBDIR);
+    let path = dir.join(uuid::Uuid::new_v4().to_string());
+    let local = |e| ProxyError::Spool(SpoolError::io(&path)(e));
+    let mut guard = TempFileGuard::new(path.clone());
+    tokio::fs::create_dir_all(&dir).await.map_err(local)?;
+    let mut file = tokio::fs::File::create(&path).await.map_err(local)?;
+    let mut hasher = sha2::Sha256::new();
     hasher.update(&head);
-    if let Err(e) = file.write_all(&head).await {
-        return Ok(Err(e));
-    }
+    file.write_all(&head).await.map_err(local)?;
     drop(head);
-    while let Some(chunk) = response.chunk().await? {
-        hasher.update(&chunk);
+    while let Some(chunk) = next_chunk(&mut response, idle).await? {
         len += chunk.len() as u64;
-        if let Err(e) = file.write_all(&chunk).await {
-            return Ok(Err(e));
+        if over_cap(len) {
+            return Err(too_large());
         }
+        reservation.grow(len).map_err(ProxyError::Spool)?;
+        hasher.update(&chunk);
+        file.write_all(&chunk).await.map_err(local)?;
     }
     // Durable before the cache write renames a link to it into place (local backend).
-    if let Err(e) = file.sync_all().await {
-        return Ok(Err(e));
-    }
+    file.sync_all().await.map_err(local)?;
     guard.disarm();
-    Ok(Ok(ProxyBody::File(std::sync::Arc::new(SpoolFile {
+    Ok(ProxyBody::File(std::sync::Arc::new(SpoolFile {
         path,
         sha256: hex::encode(hasher.finalize()),
         len,
-    }))))
+        _reservation: reservation,
+    })))
 }
+
+/// How long a coalesced follower waits for the leader's artifact download. The
+/// leader is bounded by progress (idle timeout) rather than total time, and a
+/// follower that gave up would download and spool the same body again.
+const ARTIFACT_FOLLOWER_BUDGET: Duration = Duration::from_secs(30 * 60);
 
 /// Cold-miss fetch of a proxied artifact (NuGet `.nupkg`, npm tarball, PyPI file)
 /// for storage `key`, with bounded memory and under single-flight (#595).
 ///
 /// A body above `server.stream_threshold_mb` is spooled to disk instead of
-/// buffered; concurrent misses on one key share one upstream fetch and one body
-/// (the same spool file). The flag is true for the caller whose own fetch ran —
-/// the only one that should cache it.
+/// buffered, within the spool budget; concurrent misses on one key share one
+/// upstream fetch and one body (the same spool file). `timeout_secs` bounds the
+/// response headers of each attempt and every stall of the body, not the whole
+/// download. The flag is true for the caller whose own fetch ran — the only one
+/// that should cache it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn proxy_fetch_artifact(
     state: &AppState,
@@ -699,23 +960,21 @@ pub(crate) async fn proxy_fetch_artifact(
     auth: Option<UpstreamAuth<'_>>,
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<(ProxyBody, bool), ProxyError> {
-    let dir = std::path::Path::new(&state.config.storage.path).join(PROXY_SPOOL_SUBDIR);
+    let spool = state.spool.as_ref();
     let threshold = state.config.server.stream_threshold();
-    let dir = dir.as_path();
-    let fetch = async {
-        proxy_fetch_core(
-            &state.http_client,
-            url,
-            Duration::from_secs(timeout_secs),
-            auth,
-            None,
-            |r| read_or_spool(r, dir, threshold),
-            &state.circuit_breaker,
-            scope,
-        )
-        .await?
-        .map_err(|e| ProxyError::Network(format!("proxy spool: {e}")))
-    };
+    let cap = state.config.server.proxy_max_artifact();
+    let timeout = Duration::from_secs(timeout_secs);
+    let fetch = proxy_fetch_core(
+        &state.http_client,
+        url,
+        timeout,
+        true,
+        auth,
+        None,
+        |r| read_or_spool(r, spool, threshold, cap, timeout),
+        &state.circuit_breaker,
+        scope,
+    );
     if !state.config.server.proxy_coalesce {
         return fetch.await.map(|b| (b, true));
     }
@@ -727,7 +986,7 @@ pub(crate) async fn proxy_fetch_artifact(
         .coalesced(
             &format!("fetch:{key}"),
             registry,
-            crate::proxy_coalesce::follower_budget(timeout_secs),
+            crate::proxy_coalesce::follower_budget(timeout_secs).max(ARTIFACT_FOLLOWER_BUDGET),
             move || async move {
                 let result = fetch.await;
                 let value = result.as_ref().ok().cloned();
@@ -946,9 +1205,10 @@ pub(crate) async fn proxy_fetch_text(
         client,
         url,
         timeout,
+        false,
         auth,
         extra_headers,
-        |r| r.text(),
+        |r| async { r.text().await.map_err(transport_error) },
         cb,
         scope,
     )
@@ -1742,6 +2002,287 @@ mod tests {
             fetchers += usize::from(fetched);
         }
         assert_eq!(fetchers, 1, "only the leader owns the cache write");
+    }
+
+    /// An upstream on a raw socket that answers 200 with a chunked body: `chunks`
+    /// chunks of `chunk_len` bytes, `gap` apart. No `Content-Length`, so the reader
+    /// learns the size only by counting.
+    async fn chunked_upstream(chunks: usize, chunk_len: usize, gap: Duration) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+                    if sock.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    for _ in 0..chunks {
+                        tokio::time::sleep(gap).await;
+                        let mut chunk = format!("{chunk_len:x}\r\n").into_bytes();
+                        chunk.extend(std::iter::repeat_n(b'x', chunk_len));
+                        chunk.extend_from_slice(b"\r\n");
+                        if sock.write_all(&chunk).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = sock.write_all(b"0\r\n\r\n").await;
+                });
+            }
+        });
+        format!("http://{addr}/a")
+    }
+
+    async fn fetch_artifact(
+        state: &AppState,
+        key: &str,
+        url: &str,
+        timeout_secs: u64,
+    ) -> Result<(ProxyBody, bool), ProxyError> {
+        proxy_fetch_artifact(
+            state,
+            key,
+            "npm",
+            url,
+            timeout_secs,
+            None,
+            RegistryType::Npm,
+        )
+        .await
+    }
+
+    fn spool_files(state: &AppState) -> usize {
+        std::fs::read_dir(state.spool.dir(PROXY_SPOOL_SUBDIR))
+            .map(|d| d.count())
+            .unwrap_or(0)
+    }
+
+    /// R2-05: the spool budget is shared, never waited on, and released with the
+    /// spool: a second reservation over it is `Busy`, one bigger than all of it is
+    /// `TooLarge`, and dropping the first frees the room.
+    #[test]
+    fn spool_budget_refuses_busy_and_oversized_and_releases_on_drop() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.server.spool_max_mb = 20;
+        });
+        let budget = &ctx.state.spool;
+        let mut first = budget.reserve(MIB).unwrap();
+        first.grow(12 * MIB).unwrap();
+        assert!(matches!(budget.reserve(9 * MIB), Err(SpoolError::Busy)));
+        assert!(matches!(budget.reserve(21 * MIB), Err(SpoolError::TooLarge(n)) if n == 20 * MIB));
+        // A step past the remaining room falls back to exactly what is needed.
+        let second = budget.reserve(3 * MIB).unwrap();
+        drop(second);
+        drop(first);
+        budget.reserve(20 * MIB).unwrap();
+
+        let unlimited = crate::test_helpers::create_test_context_with_config(|c| {
+            c.server.spool_max_mb = 0;
+        });
+        // No budget, but the free-space floor still holds.
+        let err = unlimited.state.spool.reserve(1 << 50).unwrap_err();
+        assert!(
+            matches!(err, SpoolError::Io(ref e) if e.kind() == std::io::ErrorKind::StorageFull)
+        );
+        unlimited.state.spool.reserve(64 * MIB).unwrap();
+    }
+
+    /// R2-05/R2-60: spool refusals and local failures answer for nora's disk, never
+    /// a 502 "upstream" error, and count in `nora_spool_failures_total`.
+    #[test]
+    fn spool_error_responses_are_local_statuses_with_a_metric() {
+        let count = |reason: &str| {
+            crate::metrics::SPOOL_FAILURES
+                .with_label_values(&["spooltest", reason])
+                .get()
+        };
+        let enospc = || std::io::Error::new(std::io::ErrorKind::StorageFull, "full");
+        let cases = [
+            (SpoolError::Busy, StatusCode::SERVICE_UNAVAILABLE, "busy"),
+            (
+                SpoolError::TooLarge(MIB),
+                StatusCode::INSUFFICIENT_STORAGE,
+                "too_large",
+            ),
+            (
+                SpoolError::Io(enospc()),
+                StatusCode::INSUFFICIENT_STORAGE,
+                "no_space",
+            ),
+            (
+                SpoolError::Io(std::io::Error::other("eio")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "io",
+            ),
+        ];
+        for (err, status, reason) in cases {
+            let before = count(reason);
+            let resp = proxy_error_response("spooltest", "u", &ProxyError::Spool(err));
+            assert_eq!(resp.status(), status, "{reason}");
+            assert_eq!(count(reason), before + 1, "{reason}");
+            if reason == "busy" {
+                assert_eq!(resp.headers()[header::RETRY_AFTER], "10");
+            }
+        }
+    }
+
+    /// R2-05: a spooled artifact holds its share of `spool_max_mb` until its last
+    /// holder drops; meanwhile another big miss is a 503 + Retry-After, not a fill
+    /// of the volume, and the breaker does not count it against upstream.
+    #[tokio::test]
+    async fn proxy_fetch_artifact_holds_the_spool_budget_until_the_body_drops() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7u8; 2 * MIB as usize]))
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.server.stream_threshold_mb = 1;
+            c.server.spool_max_mb = 3;
+        });
+        let state = &ctx.state;
+        let a = format!("{}/a", upstream.uri());
+        let b = format!("{}/b", upstream.uri());
+        let (held, _) = fetch_artifact(state, "npm/a", &a, 5).await.unwrap();
+        assert!(matches!(held, ProxyBody::File(_)));
+        let err = fetch_artifact(state, "npm/b", &b, 5).await.unwrap_err();
+        assert!(
+            matches!(err, ProxyError::Spool(SpoolError::Busy)),
+            "{err:?}"
+        );
+        assert_eq!(
+            proxy_error_response("npm", &b, &err).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            spool_files(state),
+            1,
+            "the refused body never touched the disk"
+        );
+        drop(held);
+        let (body, _) = fetch_artifact(state, "npm/b", &b, 5).await.unwrap();
+        assert_eq!(body.len(), 2 * MIB);
+    }
+
+    /// R2-05: `proxy_max_artifact_mb` refuses a body on its Content-Length before
+    /// reading it, and a chunked one as soon as the running count crosses the cap;
+    /// both are a 507 and leave no spool file.
+    #[tokio::test]
+    async fn proxy_fetch_artifact_refuses_a_body_over_the_cap() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1u8; 3 * MIB as usize]))
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.server.stream_threshold_mb = 1;
+            c.server.proxy_max_artifact_mb = 2;
+        });
+        let state = &ctx.state;
+        let declared = format!("{}/big", upstream.uri());
+        let chunked = chunked_upstream(48, 64 * 1024, Duration::ZERO).await;
+        for url in [declared, chunked] {
+            let err = fetch_artifact(state, "npm/big", &url, 5).await.unwrap_err();
+            assert!(
+                matches!(err, ProxyError::Spool(SpoolError::TooLarge(n)) if n == 2 * MIB),
+                "{url}: {err:?}"
+            );
+            assert_eq!(
+                proxy_error_response("npm", &url, &err).status(),
+                StatusCode::INSUFFICIENT_STORAGE
+            );
+            assert_eq!(spool_files(state), 0, "{url}");
+        }
+    }
+
+    /// R2-60: a spool directory nora cannot write is its own failure (500 with a
+    /// distinct log and metric), not a 502 blamed on upstream.
+    #[tokio::test]
+    async fn proxy_fetch_artifact_local_spool_failure_is_not_an_upstream_error() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1u8; 2 * MIB as usize]))
+            .mount(&upstream)
+            .await;
+        let blocker = tempfile::NamedTempFile::new().unwrap();
+        let spool_dir = blocker.path().to_str().unwrap().to_string();
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.server.stream_threshold_mb = 1;
+            c.server.spool_dir = Some(spool_dir); // a file: no directory can be made under it
+        });
+        let url = format!("{}/a", upstream.uri());
+        let err = fetch_artifact(&ctx.state, "npm/a", &url, 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProxyError::Spool(SpoolError::Io(_))),
+            "{err:?}"
+        );
+        assert_eq!(
+            proxy_error_response("npm", &url, &err).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// R2-39: the per-attempt timeout bounds the response headers and each stall of
+    /// the body, not the whole download: a body trickling in over twice the timeout
+    /// is proxied, a body that stops for longer than the timeout is not.
+    #[tokio::test]
+    async fn proxy_fetch_artifact_times_out_on_stalls_not_on_total_time() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.server.stream_threshold_mb = 1;
+        });
+        let slow = chunked_upstream(6, 512 * 1024, Duration::from_millis(400)).await;
+        let (body, _) = fetch_artifact(&ctx.state, "npm/slow", &slow, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.len(),
+            3 * MIB,
+            "2.4 s of steady progress under a 1 s timeout"
+        );
+
+        let stalled = chunked_upstream(2, 1024, Duration::from_millis(1500)).await;
+        let err = fetch_artifact(&ctx.state, "npm/stall", &stalled, 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProxyError::Timeout(_)), "{err:?}");
+    }
+
+    /// R2-10/R2-34/R2-58: the maintenance sweep reaps orphans in every spool
+    /// directory, NuGet push and PyPI upload included, and leaves fresh files.
+    #[test]
+    fn cleanup_spool_dirs_reaps_orphans_in_every_spool_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let old = std::time::SystemTime::now() - SPOOL_MAX_AGE - Duration::from_secs(60);
+        for sub in [PROXY_SPOOL_SUBDIR, NUGET_UPLOAD_SUBDIR, PYPI_UPLOAD_SUBDIR] {
+            let dir = root.path().join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("fresh"), b"x").unwrap();
+            let orphan = dir.join("orphan");
+            std::fs::write(&orphan, b"x").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&orphan)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        cleanup_spool_dirs(root.path());
+        for sub in [PROXY_SPOOL_SUBDIR, NUGET_UPLOAD_SUBDIR, PYPI_UPLOAD_SUBDIR] {
+            let dir = root.path().join(sub);
+            assert!(!dir.join("orphan").exists(), "{sub}");
+            assert!(dir.join("fresh").exists(), "{sub}");
+        }
     }
 
     /// C17: the artifact fetch keeps a body up to `server.stream_threshold_mb` in

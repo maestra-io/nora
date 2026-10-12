@@ -293,6 +293,8 @@ pub struct AppState {
     pub(crate) proxy_coalesce: proxy_coalesce::InflightMap<Bytes>,
     /// Single-flight of proxied artifact cold misses, whose body may be spooled to disk.
     pub(crate) artifact_flights: proxy_coalesce::InflightMap<registry::ProxyBody>,
+    /// Disk spool directory and byte budget (proxied artifacts, NuGet pushes, PyPI uploads).
+    pub(crate) spool: Arc<registry::SpoolBudget>,
     /// Docker blob fills in flight, shared by every request for the blob (#1003).
     pub(crate) blob_flights: proxy_coalesce::InflightMap<registry::docker::SpoolShare>,
     pub digest_store: Arc<digest_quarantine::DigestStore>,
@@ -2084,6 +2086,7 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     let state = AppState {
         storage,
+        spool: Arc::new(registry::SpoolBudget::new(&config)),
         config: Arc::new(config),
         enabled_registries,
         start_time,
@@ -2321,8 +2324,9 @@ async fn run_server(mut config: Config, storage: Storage) {
         registry::docker::cleanup_upload_temp_dir(&state.config.storage.path);
         registry::docker::cleanup_proxy_temp_dir(&state.config.storage.path);
     }
-    // Proxied artifacts spooled to disk by an instance that died mid-download.
-    registry::cleanup_proxy_spool_dir(&state.config.storage.path);
+    // Spool files (proxied downloads, NuGet pushes, PyPI uploads) of an instance
+    // that died mid-transfer.
+    registry::cleanup_spool_dirs(&state.config.server.spool_dir(&state.config.storage.path));
     // ...and streamed raw uploads a crash cut off mid-request.
     if state.config.raw.enabled {
         registry::raw::cleanup_upload_temp_dir(&state.config.storage.path);
@@ -2429,6 +2433,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                 let mut locks = metrics_state.publish_locks.lock();
                 locks.retain(|_, arc| Arc::strong_count(arc) > 1);
                 let storage_path = metrics_state.config.storage.path.clone();
+                let spool_dir = metrics_state.config.server.spool_dir(&storage_path);
                 tokio::task::spawn_blocking(move || {
                     registry::docker::cleanup_proxy_temp_dir(&storage_path);
                     // Reclaim upload temp files orphaned by a storage-write failure
@@ -2439,7 +2444,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                     // so in-progress uploads are never reaped.
                     registry::docker::cleanup_upload_temp_dir(&storage_path);
                     registry::raw::cleanup_upload_temp_dir(&storage_path);
-                    registry::cleanup_proxy_spool_dir(&storage_path);
+                    registry::cleanup_spool_dirs(&spool_dir);
                 });
             }
         }

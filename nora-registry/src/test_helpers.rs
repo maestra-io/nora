@@ -145,6 +145,9 @@ fn build_context_with(
             max_connections: 4096,
             publish_body_limit_mb: 512,
             stream_threshold_mb: 16,
+            spool_dir: None,
+            spool_max_mb: 4096,
+            proxy_max_artifact_mb: 2048,
         },
         storage: StorageConfig {
             mode: StorageMode::Local,
@@ -368,6 +371,7 @@ fn build_context_with(
     });
     let state = AppState {
         storage,
+        spool: Arc::new(crate::registry::SpoolBudget::new(&config)),
         config: Arc::new(config),
         enabled_registries: enabled_registries.clone(),
         start_time: Instant::now(),

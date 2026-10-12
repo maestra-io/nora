@@ -33,7 +33,7 @@ use super::{is_valid_package_id, with_json, with_json_gzip, SearchParams};
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, AuthenticatedUser, NamespaceAuthority};
-use crate::registry::nora_base_url;
+use crate::registry::{nora_base_url, SpoolError};
 use crate::registry_type::RegistryType;
 use crate::storage::{Storage, StorageError};
 use crate::validation::ends_with_ci;
@@ -424,19 +424,21 @@ async fn push(
         _ => return bad_request("expected multipart/form-data with the .nupkg as the first part"),
     };
 
-    // Spool to disk with a running hash: memory stays flat however large the package.
-    let dir = std::path::PathBuf::from(&state.config.storage.path).join("tmp/nuget-uploads");
-    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-        tracing::error!(path = %dir.display(), error = %e, "nuget hosted: cannot create spool dir");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    // Spool to disk with a running hash: memory stays flat however large the package,
+    // and the spool budget bounds the disk (R2-05).
+    let dir = state.spool.dir(crate::registry::NUGET_UPLOAD_SUBDIR);
     let spool = Spool(dir.join(uuid::Uuid::new_v4().to_string()));
+    let local = |e| SpoolError::io(&spool.0)(e).response("nuget");
+    let mut reservation = match state.spool.reserve(0) {
+        Ok(r) => r,
+        Err(e) => return e.response("nuget"),
+    };
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        return local(e);
+    }
     let mut file = match tokio::fs::File::create(&spool.0).await {
         Ok(f) => f,
-        Err(e) => {
-            tracing::error!(error = %e, "nuget hosted: cannot create spool file");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+        Err(e) => return local(e),
     };
     let mut hasher = sha2::Sha256::new();
     let mut size = 0u64;
@@ -451,10 +453,12 @@ async fn push(
                     )
                         .into_response();
                 }
+                if let Err(e) = reservation.grow(size) {
+                    return e.response("nuget");
+                }
                 hasher.update(&chunk);
                 if let Err(e) = file.write_all(&chunk).await {
-                    tracing::error!(error = %e, "nuget hosted: spool write failed");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    return local(e);
                 }
             }
             Ok(None) => break,
@@ -463,8 +467,7 @@ async fn push(
     }
     // Durable before the rename into storage publishes it.
     if let Err(e) = file.sync_all().await {
-        tracing::error!(error = %e, "nuget hosted: spool fsync failed");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return local(e);
     }
     drop(file);
     let sha256 = hex::encode(hasher.finalize());
@@ -2460,6 +2463,41 @@ mod integration_tests {
             cfg.nuget.proxy_timeout = 1;
             cfg.nuget.metadata_proxy_timeout = 1;
         })
+    }
+
+    /// R2-05: a push spools under `server.spool_max_mb`: while other spools hold
+    /// the budget it is a 503 + Retry-After, a package bigger than the whole budget
+    /// a 507, neither leaves a file behind, and the budget is back for the next push.
+    #[tokio::test]
+    async fn push_over_the_spool_budget_is_refused_and_leaves_no_spool() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.server.spool_max_mb = 4;
+        });
+        let push_junk = |mib: usize| {
+            let app = ctx.app.clone();
+            async move {
+                let (ct, body) = multipart(&vec![0u8; mib * 1024 * 1024]);
+                let headers = vec![("content-type", ct.as_str())];
+                send_with_headers(&app, Method::PUT, "/nuget/v3/package/", headers, body).await
+            }
+        };
+        let held = ctx.state.spool.reserve(3 * 1024 * 1024).unwrap();
+        let resp = push_junk(2).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().contains_key("retry-after"));
+        drop(held);
+        assert_eq!(
+            push_junk(5).await.status(),
+            StatusCode::INSUFFICIENT_STORAGE
+        );
+        let dir = ctx.state.spool.dir(crate::registry::NUGET_UPLOAD_SUBDIR);
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        assert_eq!(
+            push(&ctx.app, &nupkg("Maestra.Small", "1.0.0", ""), &[]).await,
+            StatusCode::CREATED
+        );
     }
 
     #[tokio::test]

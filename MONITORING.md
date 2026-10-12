@@ -30,6 +30,7 @@ Import `dist/grafana-dashboard.json` into Grafana (Dashboards > Import > Upload 
 |--------|------|--------|-------------|
 | `nora_cache_requests_total` | counter | registry, result | Cache lookups (`result`: hit / miss) |
 | `nora_cache_write_errors_total` | counter | registry, operation | Background cache writes that failed: the response was served, nothing was cached |
+| `nora_spool_failures_total` | counter | registry, reason | Transfers the disk spool refused or lost (`reason`: `busy` 503, `too_large` 507, `no_space` 507, `io` 500); never upstream's fault |
 
 ### Upstream Proxy
 
@@ -115,6 +116,7 @@ The dashboard includes a `registry` template variable to filter by specific prot
 | `NoraCacheLowHitRate` | hit share of `nora_cache_requests_total` below 50% for 15m | warning |
 | `NoraUpstreamUrlLeak` | any `nora_response_upstream_url_leak_total` increase | critical |
 | `NoraCacheWriteErrors` | any `nora_cache_write_errors_total` increase in 15m | warning |
+| `NoraSpoolFailures` | any `nora_spool_failures_total` increase in 15m | warning |
 | `NoraStorageWriteErrors` | `nora_storage_operations_total{operation=~"put\|copy",status="error"}` increasing for 5m | warning |
 | `NoraStorageUnreachable` | `nora_storage_reachable == 0` for 2m (readiness failing) | critical |
 | `NoraIntegrityFailure` | any `get` with `status=~"integrity_fail\|verify_error"` | critical |
