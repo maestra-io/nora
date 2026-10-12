@@ -26,8 +26,8 @@ pub use self::signing_cfg::SigningConfig;
 // Re-exports maintain API surface: `crate::config::OidcRoleRule` etc. used by test code in auth/, circuit_breaker/
 #[allow(unused_imports)]
 pub use self::auth::{
-    AuthConfig, OidcConfig, OidcProvider, OidcRoleRule, ScopeEnforcement, TeleportConfig,
-    TrustedProxies,
+    canonical_ip, AuthConfig, OidcConfig, OidcProvider, OidcRoleRule, ScopeEnforcement,
+    TeleportConfig, TrustedProxies,
 };
 #[allow(unused_imports)]
 pub use self::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerOverride};

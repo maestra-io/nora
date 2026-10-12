@@ -6,6 +6,17 @@
 use serde::{Deserialize, Serialize};
 use std::env;
 
+/// The IPv4 address behind an IPv4-mapped IPv6 one (`::ffff:a.b.c.d`), else `ip`.
+///
+/// A dual-stack listener (`[::]:port`) reports IPv4 peers in mapped form; every
+/// peer comparison and every lockout/rate-limit key goes through this first.
+pub fn canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
+        v4 => v4,
+    }
+}
+
 /// CIDR-aware trusted proxy list for X-Forwarded-For validation.
 ///
 /// Only connections from trusted proxies have their XFF/X-Real-IP headers
@@ -29,6 +40,13 @@ impl TrustedProxies {
                     addr_str.parse::<std::net::IpAddr>(),
                     prefix_str.parse::<u8>(),
                 ) {
+                    // `::ffff:a.b.c.d/96+` is the IPv4 net `a.b.c.d/(prefix-96)`.
+                    let (addr, prefix) = match (canonical_ip(addr), addr) {
+                        (std::net::IpAddr::V4(v4), std::net::IpAddr::V6(_)) if prefix >= 96 => {
+                            (std::net::IpAddr::V4(v4), prefix - 96)
+                        }
+                        _ => (addr, prefix),
+                    };
                     let max_prefix = if addr.is_ipv4() { 32 } else { 128 };
                     if prefix <= max_prefix {
                         if prefix == 0 {
@@ -46,6 +64,7 @@ impl TrustedProxies {
                     tracing::warn!(value = %item, "Cannot parse CIDR, skipping");
                 }
             } else if let Ok(addr) = item.parse::<std::net::IpAddr>() {
+                let addr = canonical_ip(addr);
                 let prefix = if addr.is_ipv4() { 32 } else { 128 };
                 entries.push((addr, prefix));
             } else {
@@ -67,6 +86,7 @@ impl TrustedProxies {
 
     /// Check if an IP address is within the trusted proxy list.
     pub fn contains(&self, ip: std::net::IpAddr) -> bool {
+        let ip = canonical_ip(ip);
         self.entries.iter().any(|(network, prefix)| {
             match (network, ip) {
                 (std::net::IpAddr::V4(net), std::net::IpAddr::V4(addr)) => {
