@@ -1,0 +1,44 @@
+# Maestra: ci/maestra-values.yaml must keep rendering everything the live
+# packages.maestra.io config.toml (fluxcd iota/us-iota-lw-kube-infra/nora)
+# sets; a key dropped from the values or the template fails here (R2-36/R2-44).
+suite: maestra values
+templates:
+  - templates/configmap.yaml
+values:
+  - ../ci/maestra-values.yaml
+tests:
+  - it: renders every live config.toml key
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[server\]\nhost = "0\.0\.0\.0"\nport = 4000\npublic_url = "https://packages\.maestra\.io"\nbody_limit_mb = 256\nspool_dir = "/spool"\nspool_max_mb = 3584\ntrust_upstream_dates = true\n'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[registries\]\nenable = \["nuget", "npm", "pypi"\]\n'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[storage\]\nmode = "s3"\npath = "/data/storage"\ns3_url = "https://7409859d029eee9a1aa7b88360259e00\.r2\.cloudflarestorage\.com"\nbucket = "nora-packages-iota"\ns3_region = "auto"\ns3_credentials_dir = "/r2-creds"\n'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[gc\]\nenabled = true\ninterval = 86400\nproxy_cache_max_bytes = 107374182400\n'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[auth\]\nenabled = true\nhtpasswd_file = "/etc/nora/users\.htpasswd"\ntoken_storage = "/data/tokens"\nanonymous_read = false\ntrusted_proxies = "10\.60\.8\.0/24,10\.62\.0\.0/16"\nadmin_users = \["admin"\]\nhtpasswd_allowed_peers = "127\.0\.0\.1,::1"\n'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[auth\.teleport\]\ntrusted_proxies = "10\.62\.0\.0/16"\naudience = "http://nora-teleport\.nora\.svc\.cluster\.local:80"\nenabled = true\nissuer = "teleport\.maestra\.io"\njwks_url = "https://teleport\.maestra\.io/\.well-known/jwks\.json"\nrequire_for_ui = true\nwrite_roles = \["apps"\]\n'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[auth\.oidc\]\nenabled = true\nleeway_secs = 60\njwks_cache_secs = 300\n\n\[\[auth\.oidc\.providers\]\]\nname = "github-actions"\nissuer = "https://token\.actions\.githubusercontent\.com"\naudience = "packages\.maestra\.io"\nalgorithms = \["RS256"\]\nmax_token_lifetime_secs = 900\nenabled = true\nnamespace_scope = \["mindbox\.\*","maestra\.\*","@mindbox-cloud/\*","mindbox-ml-commons","python-mindbox-sdk","python-mindbox-chat-ast","mindbox-finance-mcp"\]\nnamespace_scope_enforcement = "enforce"\n'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'pattern = "repo:maestra-io/\*:ref:refs/heads/main"\nrole = "write"\n\n\[\[auth\.oidc\.providers\.role_rules\]\]\npattern = "repo:maestra-io/\*:ref:refs/heads/master"\nrole = "write"\n\n\[\[auth\.oidc\.providers\.role_rules\]\]\npattern = "repo:maestra-io@180315372/\*:ref:refs/heads/main"\nrole = "write"\n\n\[\[auth\.oidc\.providers\.role_rules\]\]\npattern = "repo:maestra-io@180315372/\*:ref:refs/heads/master"\nrole = "write"\n\n\[\[auth\.oidc\.providers\.role_rules\]\]\npattern = "repo:maestra-io/\*"\nrole = "read"\n\n\[\[auth\.oidc\.providers\.role_rules\]\]\npattern = "repo:maestra-io@180315372/\*"\nrole = "read"\n'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[audit\]\nmode = "stdout"\n'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[rate_limit\]\nenabled = true\nauth_rps = 1\nauth_burst = 5\nupload_rps = 200\nupload_burst = 500\ngeneral_rps = 100\ngeneral_burst = 200\n'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[curation\]\nmode = "audit"\non_failure = "closed"\nmin_release_age = "7d"\nquarantine = "observe"\nquarantine_ttl = "7d"\ninternal_namespaces = \["maestra\.\*","@mindbox-cloud/\*","mindbox-ml-commons","python-mindbox-sdk","python-mindbox-chat-ast","mindbox-finance-mcp"\]\n\n\[curation\.nuget\]\nmin_release_age = "3d"\nquarantine_ttl = "3d"\n'

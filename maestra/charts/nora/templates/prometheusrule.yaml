@@ -1,0 +1,29 @@
+{{- with .Values.metrics.prometheusRule }}
+{{- if .enabled }}
+{{- $extra := .additionalRuleLabels | default dict }}
+{{- $groups := list }}
+{{- range (($.Files.Get "files/prometheus-rules.yml" | fromYaml).groups) }}
+{{- $rules := list }}
+{{- range .rules }}
+{{- $rules = append $rules (set (deepCopy .) "labels" (merge (deepCopy (.labels | default dict)) $extra)) }}
+{{- end }}
+{{- $groups = append $groups (set (deepCopy .) "rules" $rules) }}
+{{- end }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "nora.fullname" $ }}
+  labels:
+    {{- include "nora.labels" $ | nindent 4 }}
+    {{- with .labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  groups:
+    {{- toYaml (concat $groups (.extraGroups | default list)) | nindent 4 }}
+{{- end }}
+{{- end }}

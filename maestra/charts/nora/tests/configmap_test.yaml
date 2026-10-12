@@ -344,9 +344,11 @@ tests:
           path: data["config.toml"]
           pattern: 'allowlist_path = "/opt/al/allow\.json"'
 
+  # Maestra: + quarantine, without one nora refuses min_release_age (#741)
   - it: renders curation section for min_release_age even when mode is off
     set:
       config.curation.min_release_age: 7d
+      config.curation.quarantine: observe
     asserts:
       - matchRegex:
           path: data["config.toml"]
@@ -577,3 +579,142 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "spool_max_mb \\(4096\\) must be between 1 and spool.sizeLimitMb \\(4096\\)"
+
+  - it: refuses an array of tables where the chart renders scalars
+    set:
+      config.pypi.proxies:
+        - url: https://pypi.example.com/simple/
+    asserts:
+      - failedTemplate:
+          errorPattern: 'config key "proxies" is a table'
+
+  # Maestra: fork [auth] keys (R2-02/R2-50/R2-55)
+  - it: renders read_only_users, htpasswd_allowed_peers and [auth.teleport]
+    set:
+      config.auth.enabled: true
+      config.auth.read_only_users: [viewer, auditor]
+      config.auth.htpasswd_allowed_peers: ["127.0.0.1", "::1"]
+      config.auth.teleport:
+        enabled: true
+        jwks_url: https://tp.example/.well-known/jwks.json
+        issuer: tp.example
+        audience: http://nora-teleport.nora.svc.cluster.local:80
+        trusted_proxies: ["10.62.0.0/16", "10.60.8.0/24"]
+        write_roles: [apps]
+        require_for_ui: true
+        leeway_secs: 30
+        jwks_cache_secs: 120
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'read_only_users = \["viewer","auditor"\]\nhtpasswd_allowed_peers = "127\.0\.0\.1,::1"\n\n\[auth\.teleport\]\ntrusted_proxies = "10\.62\.0\.0/16,10\.60\.8\.0/24"\naudience = "http://nora-teleport\.nora\.svc\.cluster\.local:80"\nenabled = true\nissuer = "tp\.example"\njwks_cache_secs = 120\njwks_url = "https://tp\.example/\.well-known/jwks\.json"\nleeway_secs = 30\nrequire_for_ui = true\nwrite_roles = \["apps"\]\n'
+
+  - it: takes htpasswd_allowed_peers and teleport trusted_proxies as strings
+    set:
+      config.auth.enabled: true
+      config.auth.htpasswd_allowed_peers: "127.0.0.1"
+      config.auth.teleport:
+        enabled: true
+        trusted_proxies: "10.62.0.0/16"
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'htpasswd_allowed_peers = "127\.0\.0\.1"\n\n\[auth\.teleport\]\ntrusted_proxies = "10\.62\.0\.0/16"\nenabled = true\n'
+
+  - it: renders no fork auth keys by default
+    set:
+      config.auth.enabled: true
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'read_only_users|htpasswd_allowed_peers|auth\.teleport'
+
+  # Maestra: every [gc] / [audit] key (R2-15/R2-56: proxy_cache_max_bytes)
+  - it: renders every gc and audit key
+    set:
+      config.gc.proxy_cache_max_bytes: 107374182400
+      config.gc.dry_run: true
+      config.gc.grace_secs: 3600
+      config.audit.mode: file
+      config.audit.max_size_mb: 50
+      config.audit.max_files: 3
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[gc\]\ndry_run = true\nenabled = true\ngrace_secs = 3600\ninterval = 86400\nproxy_cache_max_bytes = 107374182400\n'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[audit\]\nmax_files = 3\nmax_size_mb = 50\nmode = "file"\n'
+
+  - it: renders [npm] and [pypi] only when set
+    set:
+      config.pypi.metadata_ttl: 600
+      config.npm.proxy_timeout: 45
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[npm\]\nproxy_timeout = 45\n\n\[pypi\]\nmetadata_ttl = 600\n'
+
+  - it: renders no [npm] or [pypi] by default
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: '\[(npm|pypi)\]'
+
+  # Maestra: [curation] quarantine, internal namespaces, per-registry tables
+  # incl. allow (R2-36/R2-44/R2-55)
+  - it: renders the full curation block with per-registry tables
+    set:
+      config.curation.mode: audit
+      config.curation.min_release_age: 7d
+      config.curation.quarantine: observe
+      config.curation.quarantine_ttl: 7d
+      config.curation.internal_namespaces: ["maestra.*", "@mindbox-cloud/*"]
+      config.curation.registries:
+        nuget:
+          min_release_age: 3d
+          quarantine_ttl: 3d
+          allow: ["Newtonsoft.Json@13.0.4"]
+        npm:
+          allow: ["left-pad@1.3.0"]
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[curation\]\nmode = "audit"\non_failure = "closed"\nmin_release_age = "7d"\nquarantine = "observe"\nquarantine_ttl = "7d"\ninternal_namespaces = \["maestra\.\*","@mindbox-cloud/\*"\]\n\n\[curation\.npm\]\nallow = \["left-pad@1\.3\.0"\]\n\n\[curation\.nuget\]\nallow = \["Newtonsoft\.Json@13\.0\.4"\]\nmin_release_age = "3d"\nquarantine_ttl = "3d"\n'
+
+  - it: renders [curation] for internal namespaces alone
+    set:
+      config.curation.internal_namespaces: ["maestra.*"]
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[curation\]\nmode = "off"\non_failure = "closed"\ninternal_namespaces = \["maestra\.\*"\]'
+
+  - it: refuses min_release_age without a quarantine
+    set:
+      config.curation.mode: audit
+      config.curation.min_release_age: 7d
+    asserts:
+      - failedTemplate:
+          errorPattern: 'min_release_age needs config.curation.quarantine'
+
+  - it: accepts min_release_age with a per-registry quarantine
+    set:
+      config.curation.min_release_age: 7d
+      config.curation.registries:
+        npm:
+          quarantine: enforce
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[curation\.npm\]\nquarantine = "enforce"\n'
+
+  - it: appends extraToml verbatim at the end
+    set:
+      config.extraToml: |
+        [pypi]
+        metadata_ttl = 600
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'general_burst = 200\n\n\[pypi\]\nmetadata_ttl = 600\n$'

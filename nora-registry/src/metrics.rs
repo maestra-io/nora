@@ -1213,34 +1213,41 @@ mod tests {
             .collect()
     }
 
-    /// The shipped alert rules only use metrics nora registers, with the right
+    /// The shipped alert rules, and our own in the chart's
+    /// ci/maestra-values.yaml, only use metrics nora registers, with the right
     /// type: `rate`/`increase` over counters (or histogram series), `_bucket`
     /// only on histograms. The alerts match the table in MONITORING.md.
     #[test]
     fn prometheus_rules_use_registered_metrics() {
         let registered = registered_metrics();
         assert!(registered.len() > 20, "source scan found {registered:?}");
-        let rules = repo_file("deploy/prometheus-rules.yml");
-        let tokens = metric_tokens(&rules);
-        assert!(!tokens.is_empty());
-        for (at, name) in tokens {
-            let series = ["_bucket", "_sum", "_count"]
-                .iter()
-                .find_map(|sfx| name.strip_suffix(sfx))
-                .filter(|base| registered.get(*base) == Some(&"histogram"));
-            let kind = match (registered.get(name), series) {
-                (Some(kind), _) => *kind,
-                (None, Some(_)) => "counter", // histogram series are counters
-                (None, None) => panic!("{name} is not a registered metric"),
-            };
-            let before = rules[..at].trim_end();
-            if before.ends_with("rate(") || before.ends_with("increase(") {
-                assert_eq!(kind, "counter", "{name} is a {kind}, not a counter");
-            }
-            if name.ends_with("_bucket") {
-                assert!(series.is_some(), "{name} is not a histogram series");
+        for file in [
+            "deploy/prometheus-rules.yml",
+            "maestra/charts/nora/ci/maestra-values.yaml",
+        ] {
+            let rules = repo_file(file);
+            let tokens = metric_tokens(&rules);
+            assert!(!tokens.is_empty(), "{file}");
+            for (at, name) in tokens {
+                let series = ["_bucket", "_sum", "_count"]
+                    .iter()
+                    .find_map(|sfx| name.strip_suffix(sfx))
+                    .filter(|base| registered.get(*base) == Some(&"histogram"));
+                let kind = match (registered.get(name), series) {
+                    (Some(kind), _) => *kind,
+                    (None, Some(_)) => "counter", // histogram series are counters
+                    (None, None) => panic!("{name} is not a registered metric"),
+                };
+                let before = rules[..at].trim_end();
+                if before.ends_with("rate(") || before.ends_with("increase(") {
+                    assert_eq!(kind, "counter", "{name} is a {kind}, not a counter");
+                }
+                if name.ends_with("_bucket") {
+                    assert!(series.is_some(), "{name} is not a histogram series");
+                }
             }
         }
+        let rules = repo_file("deploy/prometheus-rules.yml");
 
         let alerts = |text: &str, marker: &str| -> Vec<String> {
             let mut v: Vec<String> = text

@@ -7,13 +7,16 @@ The first commit on this path is the verbatim copy; every later commit is ours. 
 
 - `strategy: Recreate`, `preStopSleepSeconds` (5), `terminationGracePeriodSeconds` (40, render fails if it cannot cover preStop + `shutdown_timeout` + 10 s), `deploymentAnnotations`, no PDB (README "Rollout").
 - `image.repository` defaults to our ECR `nora`; `image.digest` → `repository:tag@digest`; memory request == limit; hardened securityContext.
-- The whole `[auth]` section: `trusted_proxies`, `admin_users`, `docker_anon_pull`, `public_web_ui`, `public_metrics`, `token_cache_ttl`, provider `namespace_scope` / `namespace_scope_enforcement`, rule `namespace_scope`; explicit provider `enabled: false` kept.
+- The whole `[auth]` section: `trusted_proxies`, `admin_users`, `docker_anon_pull`, `public_web_ui`, `public_metrics`, `token_cache_ttl`, provider `namespace_scope` / `namespace_scope_enforcement`, rule `namespace_scope`; explicit provider `enabled: false` kept. Fork keys `read_only_users`, `htpasswd_allowed_peers`, `[auth.teleport]`.
+- `[curation]` `quarantine`, `quarantine_ttl`, `internal_namespaces`, per-registry `[curation.<registry>]` (`registries:`, incl. `allow`); `min_release_age` without a quarantine fails the render. Every `[gc]` / `[audit]` key, `[npm]` / `[pypi]` scalars, `extraToml`.
+- `networkPolicy` (NetworkPolicy or CiliumNetworkPolicy), `metrics.serviceMonitor`, `metrics.prometheusRule` (`files/prometheus-rules.yml` = `deploy/prometheus-rules.yml`, CI `cmp`), `backup` CronJob (tokens + ledger to the bucket).
 - `storage.mode: s3` refuses `persistence.enabled: false` (tokens, quarantine ledger, audit live on `/data`) unless `persistence.allowEphemeral`; `token_storage: /data/tokens`.
 - `config.storage.s3Credentials.existingSecret` → directory mount + `s3_credentials_dir` (fork-only key, see `MAESTRA.md`).
 - `existingSecret` is an `envFrom` secretRef (nora never read the mounted `secrets.toml`); `extraVolumes` / `extraVolumeMounts`.
 - `[audit] mode` (default `stdout`), `[circuit_breaker]` (on), `[nuget]` (`metadata_proxy_timeout` 15 s), extra `[server]` keys.
 - `spool` (off by default, on in `ci/maestra-values.yaml`): size-limited emptyDir for the disk spools, rendered as `server.spool_dir` with `spool_max_mb` below the size limit and a matching `ephemeral-storage` request/limit.
 - `ci/maestra-values.yaml`: our HelmRelease (fluxcd `iota/us-iota-lw-kube-infra/nora`) as values for this chart.
+- `ci/maestra-values.yaml`: our deployment (fluxcd `iota/us-iota-lw-kube-infra/nora`: HelmRelease, `config.toml`, `network-policy.yaml`, `monitoring.yaml`) as values for this chart; `tests/maestra_values_test.yaml` asserts every live `config.toml` key renders. Re-check against fluxcd whenever either side changes.
 
 ## Re-sync from upstream
 
@@ -35,4 +38,4 @@ helm lint --strict maestra/charts/nora -f maestra/charts/nora/ci/maestra-values.
 
 `.github/workflows/maestra-release.yml`, on tag `v<version>-maestra.<n>`, after the image push: `oci://515260921971.dkr.ecr.us-west-2.amazonaws.com/charts/nora:<version>-maestra.<n>`, version and appVersion = the image tag, so the default image is the image of that release. The job summary prints chart and image digests.
 
-Not done yet: pointing the HelmRelease at it, which drops its postRenderer patches and the separate config ConfigMap.
+Not done yet: pointing the HelmRelease at it, which drops its postRenderer patches and the separate config ConfigMap. The same fluxcd change deletes `config.toml`, `network-policy.yaml` and `monitoring.yaml` (the chart renders them, same object names), annotates the HelmRelease `kustomize.toolkit.fluxcd.io/substitute: disabled` (the alert values carry `$value` / `$labels`), and checks the backup uploader image is pullable there.

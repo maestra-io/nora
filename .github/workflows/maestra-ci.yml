@@ -67,6 +67,11 @@ jobs:
         with:
           version: v3.22.0
 
+      # templates/prometheusrule.yaml renders the chart's copy; deploy/ is the
+      # source the metrics test checks against the code.
+      - name: chart rules match deploy/prometheus-rules.yml
+        run: cmp deploy/prometheus-rules.yml maestra/charts/nora/files/prometheus-rules.yml
+
       # Release tarball pinned by sha256 and unpacked as the plugin: `helm plugin
       # install` would fetch a git tag and run its hook, which downloads the
       # binary and its checksum from the same mutable release.

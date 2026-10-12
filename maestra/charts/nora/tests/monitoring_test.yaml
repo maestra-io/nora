@@ -1,0 +1,99 @@
+# Maestra: ServiceMonitor + PrometheusRule from files/prometheus-rules.yml (R2-61)
+suite: monitoring
+templates:
+  - templates/servicemonitor.yaml
+  - templates/prometheusrule.yaml
+set:
+  config.server.public_url: https://registry.example.com
+tests:
+  - it: renders nothing by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders a ServiceMonitor on the http port
+    set:
+      metrics.serviceMonitor.enabled: true
+      metrics.serviceMonitor.labels:
+        team: platform
+    template: templates/servicemonitor.yaml
+    release:
+      namespace: nora
+    asserts:
+      - isKind:
+          of: ServiceMonitor
+      - equal:
+          path: metadata.labels.team
+          value: platform
+      - equal:
+          path: spec.namespaceSelector.matchNames
+          value: [nora]
+      - equal:
+          path: spec.selector.matchLabels
+          value:
+            app.kubernetes.io/name: nora
+            app.kubernetes.io/instance: RELEASE-NAME
+      - equal:
+          path: spec.endpoints[0]
+          value:
+            port: http
+            path: /metrics
+            interval: 30s
+            scrapeTimeout: 10s
+
+  - it: renders every alert of the rules file with the extra labels
+    set:
+      metrics.prometheusRule.enabled: true
+      metrics.prometheusRule.labels:
+        mindbox/prometheus: kubernetes-system
+      metrics.prometheusRule.additionalRuleLabels:
+        product: platform
+        severity: page
+    template: templates/prometheusrule.yaml
+    asserts:
+      - isKind:
+          of: PrometheusRule
+      - equal:
+          path: metadata.labels["mindbox/prometheus"]
+          value: kubernetes-system
+      - equal:
+          path: spec.groups[0].name
+          value: nora
+      - lengthEqual:
+          path: spec.groups[0].rules
+          count: 9
+      - equal:
+          path: spec.groups[1].rules[0].alert
+          value: NoraIntegrityFailure
+      # the rule's own label wins over additionalRuleLabels
+      - equal:
+          path: spec.groups[0].rules[0].labels
+          value:
+            product: platform
+            severity: warning
+      - equal:
+          path: spec.groups[1].rules[0].labels
+          value:
+            product: platform
+            severity: critical
+      # vmalert templating survives untouched
+      - equal:
+          path: spec.groups[0].rules[2].annotations.summary
+          value: "NORA circuit breaker OPEN for {{ $labels.registry }}"
+
+  - it: appends extraGroups
+    set:
+      metrics.prometheusRule.enabled: true
+      metrics.prometheusRule.extraGroups:
+        - name: site
+          rules:
+            - alert: Site
+              expr: vector(1)
+    template: templates/prometheusrule.yaml
+    asserts:
+      - lengthEqual:
+          path: spec.groups
+          count: 3
+      - equal:
+          path: spec.groups[2].rules[0].alert
+          value: Site

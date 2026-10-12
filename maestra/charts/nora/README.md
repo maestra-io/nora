@@ -90,6 +90,7 @@ config:
   gc:
     enabled: true
     interval: 86400
+    # proxy_cache_max_bytes: 107374182400   # cap on proxy-cached artifacts, see below
   retention:
     enabled: false
     interval: 86400
@@ -104,16 +105,21 @@ config:
     general_burst: 200
 ```
 
-### Audit, circuit breaker, NuGet, extra server keys
+### GC, audit, circuit breaker, NuGet / npm / PyPI, extra server keys
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `config.audit.mode` | `file` (`{storage.path}/audit.jsonl`, never rotated), `stdout` (pod log), `both`, `off` | `stdout` |
+| `config.gc.*` | Every `[gc]` key: `enabled`, `interval`, `dry_run`, `grace_secs`, `proxy_cache_max_bytes` | `true`, `86400`, unset |
+| `config.audit.*` | `mode`: `file` (`{storage.path}/audit.jsonl`, rotated at `max_size_mb`, `max_files` kept), `stdout` (pod log), `both`, `off` | `stdout` |
 | `config.circuit_breaker.*` | `enabled`, `failure_threshold`, `reset_timeout`: fail fast (503) on an upstream that keeps failing | `true`, `5`, `30` |
 | `config.nuget.*` | Any `[nuget]` key, e.g. `proxy_timeout`, `metadata_proxy_timeout` | `30`, `15` |
-| `config.server.*` | Keys besides host/port/public_url are rendered as is, e.g. `body_limit_mb`, `shutdown_timeout` | unset |
+| `config.npm.*`, `config.pypi.*` | Any scalar `[npm]` / `[pypi]` key (e.g. `metadata_ttl`); rendered only when set | unset |
+| `config.server.*` | Keys besides host/port/public_url are rendered as is, e.g. `body_limit_mb`, `shutdown_timeout`, `trust_upstream_dates` | unset |
+| `config.extraToml` | TOML appended verbatim, for sections the chart does not render | `""` |
 
-nora's own defaults differ: audit `file`, circuit breaker off, NuGet metadata timeout 2 s (too short for a large registration index on a cold cache).
+The proxy cache (npm tarballs, PyPI files, NuGet `.nupkg`/`.nuspec` fetched from upstream, rpm/deb) is bounded only by `gc.proxy_cache_max_bytes`, and eviction runs inside the gc pass: with `gc.enabled: false` or a cap of 0 it grows without bound. Hosted packages and `curation.internal_namespaces` are never evicted. `kubectl exec deploy/nora -- nora gc` previews a pass (dry run).
+
+nora's own defaults differ: gc off, audit `file`, circuit breaker off, NuGet metadata timeout 10 s per attempt.
 
 ### Authentication
 
@@ -152,6 +158,9 @@ The chart mounts the Secret at `/etc/nora/users.htpasswd` and sets `htpasswd_fil
 | `config.auth.htpasswd.mountPath` | Mount directory | `/etc/nora` |
 | `config.auth.trusted_proxies` | IPs/CIDRs whose `X-Forwarded-For` is honoured (list or comma-separated string) | `[]` (nora: loopback) |
 | `config.auth.admin_users` | htpasswd users allowed to mint admin tokens | `[]` |
+| `config.auth.read_only_users` | htpasswd users that authenticate as `read` (Maestra fork) | `[]` |
+| `config.auth.htpasswd_allowed_peers` | TCP peers whose htpasswd password is checked, list or string (Maestra fork) | `[]` (every peer) |
+| `config.auth.teleport.*` | `[auth.teleport]`: web UI identity from a Teleport app agent's JWT (Maestra fork, see `MAESTRA.md`); `trusted_proxies` may be a list | unset |
 | `config.auth.docker_anon_pull`, `public_web_ui`, `public_metrics`, `token_cache_ttl` | Rendered only when set | nora defaults |
 
 **Behind an ingress set `trusted_proxies`** to the ingress pods'/nodes' addresses. nora keys the brute-force lockout and every rate limiter on the client IP it resolves; with the default (loopback only) every request resolves to the ingress IP, so five bad logins from any client lock out everyone. nora reads `X-Forwarded-For` right to left, so the ingress must not pass client-supplied entries through unchecked.
@@ -267,7 +276,11 @@ Example `blocklist.json`:
 | `config.curation.mode` | `off`, `audit`, or `enforce` | `off` |
 | `config.curation.on_failure` | Filter-error behavior: `closed` or `open` | `closed` |
 | `config.curation.require_integrity` | Require integrity metadata on allowlisted artifacts | `false` |
-| `config.curation.min_release_age` | Minimum release age gate (e.g. `7d`, `24h`) | `""` |
+| `config.curation.min_release_age` | Minimum release age gate (e.g. `7d`, `24h`); needs a quarantine, the chart refuses it otherwise (as nora does) | `""` |
+| `config.curation.quarantine` | Digest quarantine: `observe` or `enforce` | `""` (off) |
+| `config.curation.quarantine_ttl` | Quarantine hold (e.g. `7d`) | `""` |
+| `config.curation.internal_namespaces` | Name globs never proxied upstream, enforced in every mode | `[]` |
+| `config.curation.registries.<registry>` | `[curation.<registry>]`: `min_release_age`, `quarantine`, `quarantine_ttl`, `allow` (`name@version` exempt from the age gate, Maestra fork) | `{}` |
 | `config.curation.blocklist.existingSecret` | Secret holding the blocklist JSON | `""` |
 | `config.curation.blocklist.existingConfigMap` | ConfigMap holding the blocklist JSON | `""` |
 | `config.curation.blocklist.key` | Key in the Secret/ConfigMap | `blocklist.json` |
@@ -338,6 +351,52 @@ resources:
   limits:
     memory: 512Mi
 ```
+
+### Network policy (Maestra)
+
+`networkPolicy.enabled` renders a policy on the nora pods with `ingress` / `egress` rules taken verbatim. `kind: NetworkPolicy` (default) or `CiliumNetworkPolicy`; the latter is the one that can admit a hostNetwork ingress controller (Cilium entities `host` / `remote-node`). Use it whenever `auth.trusted_proxies` has to be wider than the ingress itself (a pod CIDR): every peer in it may set `X-Forwarded-For`, i.e. pick its own lockout and rate-limit key, so only the ingress (and agents you trust) should reach the pod. The chart's `helm test` pod is not admitted.
+
+### Monitoring (Maestra)
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `metrics.serviceMonitor.enabled` | ServiceMonitor on the `http` port, `/metrics` | `false` |
+| `metrics.serviceMonitor.labels`, `interval`, `scrapeTimeout` | | `{}`, `30s`, `10s` |
+| `metrics.prometheusRule.enabled` | PrometheusRule with nora's alerts (`files/prometheus-rules.yml`) | `false` |
+| `metrics.prometheusRule.labels`, `annotations` | On the object (e.g. the label your rule selector wants) | `{}` |
+| `metrics.prometheusRule.additionalRuleLabels` | Added to every rule's labels; a rule's own label wins | `{}` |
+| `metrics.prometheusRule.extraGroups` | More rule groups, verbatim | `[]` |
+
+`files/prometheus-rules.yml` is a copy of the repository's `deploy/prometheus-rules.yml` (helm cannot read outside the chart); CI fails when they differ, and the metrics test checks every metric in both against the code. `/metrics` needs `auth.public_metrics` (default true) or scrape credentials.
+
+### Backup and restore (Maestra)
+
+With `storage.mode: s3` the artifacts are in the bucket, but the API token records (`auth.token_storage`) and the digest-quarantine ledger (`<storage.path>/quarantine.jsonl`) live only on the `/data` volume. Losing it (node loss with a node-local volume, recreating the PVC to resize it) voids every `nra_` token. `backup.enabled` adds a CronJob that archives both and uploads `<prefix><UTC timestamp>.tar.gz` to `config.storage.bucket` with the same endpoint and credentials (the `s3Credentials` files or the `NORA_STORAGE_S3_*` keys of `existingSecret`), then keeps the newest `backup.keep`. RPO = the schedule interval.
+
+The job mounts the ReadWriteOnce data PVC read-only next to the running pod: RWO limits a volume to one node, not one pod, and a required podAffinity on the nora pod schedules the job onto that node (a node-local PV pins it there anyway). It needs nora running (Recreate rollouts make it wait); `startingDeadlineSeconds` is an hour.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `backup.enabled` | Add the CronJob (`storage.mode: s3`, persistence on) | `false` |
+| `backup.schedule` | Cron schedule | `17 3 * * *` |
+| `backup.prefix` | Key prefix in the bucket (`.nora-` keys are hidden from nora's own listings) | `.nora-backup/` |
+| `backup.keep` | Archives kept | `14` |
+| `backup.image` | Uploader image with `aws` and `/bin/sh` (the tar runs in the nora image) | `public.ecr.aws/aws-cli/aws-cli:2.22.35` |
+| `backup.resources` | Both containers | `128Mi` |
+
+Restore (new PVC, or after a node loss):
+
+```bash
+kubectl scale deploy/nora --replicas=0
+# a shell pod with the data PVC at /data and the bucket credentials, then:
+aws --endpoint-url "$S3_URL" s3 ls "s3://$BUCKET/.nora-backup/"            # newest last
+aws --endpoint-url "$S3_URL" s3 cp "s3://$BUCKET/.nora-backup/<ts>.tar.gz" /tmp/b.tar.gz
+tar -xzf /tmp/b.tar.gz -C /          # writes /data/tokens/*.json and /data/storage/quarantine.jsonl
+chown -R 1000:1000 /data/tokens /data/storage/quarantine.jsonl
+kubectl scale deploy/nora --replicas=1
+```
+
+Tokens minted after the archive are lost (re-mint them); revocations after it come back (revoke again).
 
 ## S3 Storage
 
@@ -444,6 +503,8 @@ Tests live in `charts/nora/tests/`:
 | `pvc_test.yaml` | persistence on/off, storage class |
 | `serviceaccount_test.yaml` | create/skip, annotations |
 | `test_connection_test.yaml` | `helm test` hook pod |
+| `maestra_values_test.yaml` | `ci/maestra-values.yaml` renders every key of the live packages.maestra.io `config.toml` |
+| `networkpolicy_test.yaml`, `monitoring_test.yaml`, `backup_cronjob_test.yaml` | Maestra templates |
 
 ### Post-install hook
 
