@@ -39,7 +39,7 @@ tests:
       - failedTemplate:
           errorPattern: '/var/tokens is not on the /data volume'
 
-  - it: archives tokens + ledger from the read-only PVC on nora's node and uploads with the creds files
+  - it: archives tokens + ledger through a read-only bind of the PVC on nora's node and uploads with the creds files
     set:
       backup.enabled: true
       backup.schedule: "0 2 * * *"
@@ -55,11 +55,23 @@ tests:
       - equal:
           path: spec.concurrencyPolicy
           value: Forbid
+      # The PVC volume itself must not be readOnly (a CSI ro device mount
+      # turns nora's own /data read-only); the archive mount is a ro bind.
       - equal:
           path: spec.jobTemplate.spec.template.spec.volumes[0].persistentVolumeClaim
           value:
             claimName: RELEASE-NAME-nora-data
+      - notExists:
+          path: spec.jobTemplate.spec.template.spec.volumes[0].persistentVolumeClaim.readOnly
+      - contains:
+          path: spec.jobTemplate.spec.template.spec.initContainers[0].volumeMounts
+          content:
+            name: data
+            mountPath: /data
             readOnly: true
+      - equal:
+          path: spec.jobTemplate.spec.activeDeadlineSeconds
+          value: 900
       - equal:
           path: spec.jobTemplate.spec.template.spec.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution[0]
           value:

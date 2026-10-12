@@ -31,6 +31,9 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 2
+      # A pod stuck in ContainerCreating (volume not mountable) gives up instead
+      # of holding the data volume until nora's next restart.
+      activeDeadlineSeconds: {{ .Values.backup.activeDeadlineSeconds | int }}
       template:
         metadata:
           labels:
@@ -147,10 +150,13 @@ spec:
                   readOnly: true
                 {{- end }}
           volumes:
+            # No volume-level readOnly: on a node-local CSI PV (openebs LVM) it
+            # mounts the device itself ro; that waits until nora's rw mount is
+            # gone and then nora's next pod inherits the ro mount. The archive
+            # container's volumeMount is a read-only bind instead.
             - name: data
               persistentVolumeClaim:
                 claimName: {{ include "nora.fullname" . }}-data
-                readOnly: true
             - name: work
               emptyDir: {}
             {{- with $st.s3Credentials.existingSecret }}
