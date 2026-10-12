@@ -74,31 +74,31 @@ fn date_of(time: Option<&Map<String, Value>>, key: &str) -> Option<i64> {
     time?.get(key)?.as_str().and_then(parse_iso8601_to_unix)
 }
 
-/// npm packument, full or abbreviated (`install-v1`). `stored_time` is the `time`
-/// map of the cached full packument, for the abbreviated form that carries none.
-/// Hidden versions leave `versions` and `time`; `latest` moves to the newest allowed
-/// release (a pre-release only when no release is left); any other tag on a hidden
-/// version is dropped.
-pub fn npm_packument(
-    engine: &CurationEngine,
-    name: &str,
-    body: &[u8],
-    stored_time: Option<&Map<String, Value>>,
-) -> Option<Vec<u8>> {
+/// The FULL npm packument, parsed once by the caller, which abbreviates it to
+/// `install-v1` afterwards (the abbreviated form carries no `time`). Hidden versions
+/// leave `versions` and `time`; `latest` moves to the newest allowed release (a
+/// pre-release only when no release is left); any other tag on a hidden version is
+/// dropped. Whether anything was hidden.
+pub fn npm_packument(engine: &CurationEngine, name: &str, doc: &mut Value) -> bool {
     use crate::registry::npm::semver_key as version_key;
-    let mut doc: Value = serde_json::from_slice(body).ok()?;
-    let obj = doc.as_object_mut()?;
+    let Some(obj) = doc.as_object_mut() else {
+        return false;
+    };
     let hidden: HashSet<String> = {
-        let time = obj.get("time").and_then(Value::as_object).or(stored_time);
-        obj.get("versions")?
-            .as_object()?
-            .keys()
-            .filter(|v| engine.hides_from_metadata(RegistryType::Npm, name, v, date_of(time, v)))
-            .cloned()
-            .collect()
+        let time = obj.get("time").and_then(Value::as_object);
+        match obj.get("versions").and_then(Value::as_object) {
+            Some(versions) => versions
+                .keys()
+                .filter(|v| {
+                    engine.hides_from_metadata(RegistryType::Npm, name, v, date_of(time, v))
+                })
+                .cloned()
+                .collect(),
+            None => return false,
+        }
     };
     if hidden.is_empty() {
-        return None;
+        return false;
     }
     if let Some(versions) = obj.get_mut("versions").and_then(Value::as_object_mut) {
         versions.retain(|v, _| !hidden.contains(v));
@@ -137,7 +137,7 @@ pub fn npm_packument(
             }
         }
     }
-    serde_json::to_vec(&doc).ok()
+    true
 }
 
 /// The PyPI files to hide: young by their `dates.json` upload-time (filename → ISO).
@@ -331,6 +331,45 @@ mod tests {
         let short = json_of(resp).await;
         assert_eq!(version_keys(&short), ["0.9.0", "1.0.0"]);
         assert_eq!(short["dist-tags"]["latest"], "1.0.0");
+    }
+
+    /// R2-16: the abbreviated packument served by the TTL refetch that brings a
+    /// young version is filtered on that fresh document, not on the cached `time`
+    /// that predates the version.
+    #[tokio::test]
+    async fn npm_abbreviated_ttl_refetch_is_filtered() {
+        let upstream = npm_upstream().await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 0;
+            cooldown(cfg, CurationMode::Enforce);
+        });
+        let v = |n: &str| json!({ "name": "pkg", "version": n, "dist": {} });
+        let cached = json!({
+            "name": "pkg", "dist-tags": { "latest": "1.0.0" },
+            "versions": { "0.9.0": v("0.9.0"), "1.0.0": v("1.0.0") },
+            "time": { "0.9.0": iso_ago(OLD + 10), "1.0.0": iso_ago(OLD) }
+        });
+        ctx.state
+            .storage
+            .put("npm/pkg/metadata.json", cached.to_string().as_bytes())
+            .await
+            .unwrap();
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/npm/pkg",
+            vec![("accept", "application/vnd.npm.install-v1+json")],
+            "",
+        )
+        .await;
+        let short = json_of(resp).await;
+        assert_eq!(version_keys(&short), ["0.9.0", "1.0.0"]);
+        assert_eq!(short["dist-tags"]["latest"], "1.0.0");
+        // The fresh document is cached before the response.
+        let stored = ctx.state.storage.get("npm/pkg/metadata.json").await;
+        let stored: Value = serde_json::from_slice(&stored.unwrap()).unwrap();
+        assert!(stored["versions"].get("1.1.0").is_some());
     }
 
     #[tokio::test]
