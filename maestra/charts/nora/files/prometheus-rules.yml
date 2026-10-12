@@ -49,7 +49,9 @@ groups:
           summary: "NORA cache hit rate below 50%"
 
       - alert: NoraUpstreamUrlLeak
-        expr: sum by (registry) (rate(nora_response_upstream_url_leak_total[5m])) > 0
+        # 15m window, 5m for: a single leak keeps the increase positive long
+        # enough to fire; a burst cleared by a fix resolves within 15m.
+        expr: sum by (registry) (increase(nora_response_upstream_url_leak_total[15m])) > 0
         for: 5m
         labels:
           severity: critical
