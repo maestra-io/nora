@@ -24,7 +24,7 @@ jobs:
     name: cargo test
     runs-on: runs-on=${{ github.run_id }}/pool=build
     steps:
-      - uses: runs-on/action@v2
+      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -59,7 +59,7 @@ jobs:
     name: helm chart
     runs-on: runs-on=${{ github.run_id }}/pool=build
     steps:
-      - uses: runs-on/action@v2
+      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -67,9 +67,19 @@ jobs:
         with:
           version: v3.22.0
 
+      # Release tarball pinned by sha256 and unpacked as the plugin: `helm plugin
+      # install` would fetch a git tag and run its hook, which downloads the
+      # binary and its checksum from the same mutable release.
       - name: helm unittest
+        env:
+          UNITTEST_URL: https://github.com/helm-unittest/helm-unittest/releases/download/v1.1.0/helm-unittest-linux-amd64-1.1.0.tgz
+          UNITTEST_SHA256: 3a8adc16a6d56cb2176b3668b4c4a3ec55130a8a8a52ae78804fd9b12ddf3418
         run: |
-          helm plugin install https://github.com/helm-unittest/helm-unittest --version v1.1.0
+          curl -sfL --proto '=https' -o "${RUNNER_TEMP}/untt.tgz" "${UNITTEST_URL}"
+          echo "${UNITTEST_SHA256}  ${RUNNER_TEMP}/untt.tgz" | sha256sum -c -
+          dir="$(helm env HELM_PLUGINS)/helm-unittest"
+          mkdir -p "${dir}"
+          tar -xzf "${RUNNER_TEMP}/untt.tgz" -C "${dir}"
           helm unittest maestra/charts/nora
 
       - name: helm lint + template
@@ -83,7 +93,7 @@ jobs:
     name: cargo deny advisories
     runs-on: runs-on=${{ github.run_id }}/pool=build
     steps:
-      - uses: runs-on/action@v2
+      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 

@@ -27,7 +27,9 @@ preStopSleepSeconds: 5
 deploymentAnnotations: {}
 
 image:
-  repository: ghcr.io/getnora-io/nora
+  # Maestra: our ECR build (maestra-release.yml); the published chart's
+  # appVersion is that image's tag.
+  repository: 515260921971.dkr.ecr.us-west-2.amazonaws.com/nora
   # -- Image tag. Leave empty to use Chart.appVersion (recommended).
   tag: ""
   # -- Image digest (`sha256:...`). When set the image is `repository:tag@digest`,
