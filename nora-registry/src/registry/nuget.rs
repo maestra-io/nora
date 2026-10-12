@@ -1899,7 +1899,7 @@ async fn local_search_results(
     prerelease: bool,
     sem_ver_level: Option<&str>,
 ) -> Vec<u8> {
-    let packages = state.repo_index.get("nuget", &state.storage).await;
+    let packages = state.repo_index.get("nuget", state).await;
     let base_url = nora_base_url(state);
 
     let query_lower = query.to_lowercase();
@@ -1957,7 +1957,7 @@ async fn local_autocomplete_results(
     prerelease: bool,
     sem_ver_level: Option<&str>,
 ) -> Vec<u8> {
-    let packages = state.repo_index.get("nuget", &state.storage).await;
+    let packages = state.repo_index.get("nuget", state).await;
 
     let query_lower = query.to_lowercase();
     let mut matched: Vec<&str> = Vec::new();

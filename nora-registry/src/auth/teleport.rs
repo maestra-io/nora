@@ -483,6 +483,38 @@ AJvDZc4Bbdm5PNsOvQZYEIacnJLnu7vP0RqnkhSbTJ0lRhSmCMjFDCjQ
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// The browser fetches `/favicon.ico` (and may fetch static assets) without the
+    /// app session: they answer 200 to anyone, the data pages stay Teleport-only.
+    #[tokio::test]
+    async fn favicon_and_static_assets_need_no_identity() {
+        let (_s, ctx) = setup("127.0.0.1", |_| {}).await;
+        for (uri, content_type) in [
+            ("/favicon.ico", "image/svg+xml"),
+            ("/ui/static/favicon.svg", "image/svg+xml"),
+            ("/ui/static/tailwind.css", "text/css; charset=utf-8"),
+            (
+                "/ui/static/htmx.min.js",
+                "application/javascript; charset=utf-8",
+            ),
+        ] {
+            let resp = get(&ctx, uri, vec![("accept", "text/html".into())]).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            assert_eq!(resp.headers()[header::CONTENT_TYPE], content_type, "{uri}");
+        }
+        for uri in ["/ui/", "/ui/static/", "/ui/static/../tokens"] {
+            let resp = get(&ctx, uri, vec![]).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+        let html = String::from_utf8(
+            body_bytes(get(&ctx, "/ui/", vec![jwt_header("alice", &["apps"])]).await)
+                .await
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html
+            .contains(r#"<link rel="icon" type="image/svg+xml" href="/ui/static/favicon.svg">"#));
+    }
+
     #[tokio::test]
     async fn jwt_from_an_untrusted_peer_is_ignored() {
         let (_s, ctx) = setup("10.0.0.0/8", |_| {}).await;

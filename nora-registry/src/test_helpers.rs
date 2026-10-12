@@ -585,6 +585,8 @@ pub struct OpCounts {
     failing_puts: std::sync::Mutex<Option<String>>,
     /// Every counted call as (method, key or prefix), for [`calls`](Self::calls).
     log: std::sync::Mutex<Vec<(&'static str, String)>>,
+    /// Listings under this prefix park (see [`stall_lists`](Self::stall_lists)).
+    stalled_lists: tokio::sync::watch::Sender<Option<String>>,
 }
 
 impl OpCounts {
@@ -602,6 +604,19 @@ impl OpCounts {
     /// handler's storage-failure branch.
     pub fn fail_puts_ending(&self, suffix: Option<&str>) {
         *self.failing_puts.lock().unwrap() = suffix.map(str::to_string);
+    }
+
+    /// Make every `list_with_meta` under `prefix` park before returning until called
+    /// again with `None`: a listing that takes minutes, as a large registry's does on R2.
+    pub fn stall_lists(&self, prefix: Option<&str>) {
+        self.stalled_lists.send_replace(prefix.map(str::to_string));
+    }
+
+    async fn wait_unstalled(&self, prefix: &str) {
+        let mut rx = self.stalled_lists.subscribe();
+        let _ = rx
+            .wait_for(|p| p.as_deref().is_none_or(|p| !prefix.starts_with(p)))
+            .await;
     }
 
     fn put_refused(&self, key: &str) -> crate::storage::Result<()> {
@@ -725,7 +740,10 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         prefix: &str,
     ) -> crate::storage::Result<Vec<(String, crate::storage::FileMeta)>> {
         self.counts.hit("list_with_meta", prefix);
-        self.inner.list_with_meta(prefix).await
+        // The listing is taken first: a write made while it is stalled is not in it.
+        let listing = self.inner.list_with_meta(prefix).await;
+        self.counts.wait_unstalled(prefix).await;
+        listing
     }
 
     async fn health_check(&self) -> bool {

@@ -156,6 +156,8 @@ pub fn routes() -> Router<AppState> {
             get(static_assets::serve_tailwind_css),
         )
         .route("/ui/static/htmx.min.js", get(static_assets::serve_htmx_js))
+        .route("/ui/static/favicon.svg", get(static_assets::serve_favicon))
+        .route("/favicon.ico", get(static_assets::serve_favicon))
         // API endpoints for HTMX
         .route("/api/ui/stats", get(api_stats))
         .route("/api/ui/dashboard", get(api_dashboard))
@@ -267,7 +269,7 @@ async fn docker_list(
     let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
     let auth_enabled = state.auth.is_some();
 
-    let all_repos = state.repo_index.get("docker", &state.storage).await;
+    let all_repos = state.repo_index.get("docker", &state).await;
     let (repos, total) = paginate(&all_repos, page, limit);
 
     Html(render_registry_list_paginated(
@@ -279,6 +281,7 @@ async fn docker_list(
         total,
         lang,
         auth_enabled,
+        !state.repo_index.is_ready("docker"),
     ))
 }
 
@@ -369,7 +372,7 @@ async fn npm_list(
     let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
     let auth_enabled = state.auth.is_some();
 
-    let all_packages = state.repo_index.get("npm", &state.storage).await;
+    let all_packages = state.repo_index.get("npm", &state).await;
     let (packages, total) = paginate(&all_packages, page, limit);
 
     Html(render_registry_list_paginated(
@@ -381,6 +384,7 @@ async fn npm_list(
         total,
         lang,
         auth_enabled,
+        !state.repo_index.is_ready("npm"),
     ))
 }
 
@@ -425,7 +429,7 @@ async fn cargo_list(
     let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
     let auth_enabled = state.auth.is_some();
 
-    let all_crates = state.repo_index.get("cargo", &state.storage).await;
+    let all_crates = state.repo_index.get("cargo", &state).await;
     let (crates, total) = paginate(&all_crates, page, limit);
 
     Html(render_registry_list_paginated(
@@ -437,6 +441,7 @@ async fn cargo_list(
         total,
         lang,
         auth_enabled,
+        !state.repo_index.is_ready("cargo"),
     ))
 }
 
@@ -484,7 +489,7 @@ async fn pypi_list(
     // A project with only bookkeeping (cached upstream index, dates) holds no release.
     let all_packages: Vec<_> = state
         .repo_index
-        .get("pypi", &state.storage)
+        .get("pypi", &state)
         .await
         .iter()
         .filter(|p| p.versions > 0)
@@ -501,6 +506,7 @@ async fn pypi_list(
         total,
         lang,
         auth_enabled,
+        !state.repo_index.is_ready("pypi"),
     ))
 }
 
@@ -614,7 +620,7 @@ async fn raw_list(
     let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
     let auth_enabled = state.auth.is_some();
 
-    let all_files = state.repo_index.get("raw", &state.storage).await;
+    let all_files = state.repo_index.get("raw", &state).await;
     let (files, total) = paginate(&all_files, page, limit);
 
     Html(render_registry_list_paginated(
@@ -626,6 +632,7 @@ async fn raw_list(
         total,
         lang,
         auth_enabled,
+        !state.repo_index.is_ready("raw"),
     ))
 }
 
@@ -696,7 +703,7 @@ async fn generic_registry_list(
         _ => registry_key,
     };
 
-    let all_items = state.repo_index.get(registry_key, &state.storage).await;
+    let all_items = state.repo_index.get(registry_key, &state).await;
     let (items, total) = paginate(&all_items, page, limit);
 
     Html(render_registry_list_paginated(
@@ -708,6 +715,7 @@ async fn generic_registry_list(
         total,
         lang,
         auth_enabled,
+        !state.repo_index.is_ready(registry_key),
     ))
 }
 
@@ -739,14 +747,7 @@ async fn generic_registry_detail(
         .and_then(|s| s.split('/').next())
         .unwrap_or("raw");
 
-    let detail = get_generic_detail(
-        &state.storage,
-        registry_key,
-        &name,
-        show_prerelease,
-        show_all,
-    )
-    .await;
+    let detail = get_generic_detail(&state, registry_key, &name, show_prerelease, show_all).await;
     Html(render_package_detail(
         registry_key,
         &name,
@@ -915,14 +916,8 @@ async fn ansible_browse(
             let show_prerelease = query.prerelease.unwrap_or(false);
             let show_all = query.all.unwrap_or(false);
             let full_name = format!("{}.{}", segments[0], segments[1]);
-            let detail = get_generic_detail(
-                &state.storage,
-                "ansible",
-                &full_name,
-                show_prerelease,
-                show_all,
-            )
-            .await;
+            let detail =
+                get_generic_detail(&state, "ansible", &full_name, show_prerelease, show_all).await;
             Html(render_package_detail(
                 "ansible",
                 &full_name,

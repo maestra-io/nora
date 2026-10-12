@@ -2451,6 +2451,19 @@ async fn run_server(mut config: Config, storage: Storage) {
         }
     });
 
+    // Background task: build the repo index (and with it the hosted NuGet index) at
+    // startup, then refresh it on a slow cadence. Requests never build it: on R2 a full
+    // rebuild of a large registry takes minutes (97 s for NuGet on packages.maestra.io, past the 36 s Teleport proxy timeout).
+    let index_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(repo_index::REFRESH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            index_state.repo_index.refresh(&index_state).await;
+        }
+    });
+
     // Background task: flush token last_used + periodic maintenance every 30 seconds
     let metrics_state = state.clone();
     tokio::spawn(async move {

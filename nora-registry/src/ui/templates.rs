@@ -133,8 +133,21 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
     #[cfg(not(feature = "demo"))]
     let bragging_footer = String::new();
 
+    // Startup index build still running: say so instead of showing zero counts. The
+    // polling script reloads the page once `/api/ui/dashboard` reports it finished.
+    let indexing_banner = if data.indexing.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r##"<div id="indexing-banner" class="mb-6 px-4 py-3 rounded-lg bg-slate-800 border border-slate-700 text-slate-300 text-sm">{} {}</div>"##,
+            t.indexing_in_progress,
+            html_escape(&data.indexing.join(", "))
+        )
+    };
+
     let content = format!(
         r##"
+        {}
         <div class="mb-6">
             <div class="flex items-center justify-between">
                 <div>
@@ -161,6 +174,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
 
         {}
     "##,
+        indexing_banner,
         t.dashboard_title,
         t.dashboard_subtitle,
         t.uptime,
@@ -213,11 +227,20 @@ pub fn render_registry_list_paginated(
     total: usize,
     lang: Lang,
     auth_enabled: bool,
+    indexing: bool,
 ) -> String {
     let t = get_translations(lang);
     let icon = get_registry_icon(registry_type);
 
-    let table_rows = if repos.is_empty() && page == 1 {
+    let table_rows = if repos.is_empty() && page == 1 && indexing {
+        format!(
+            r##"<tr><td colspan="4" class="px-6 py-12 text-center text-slate-500">
+            <div>{} {}</div>
+        </td></tr>"##,
+            t.indexing_in_progress,
+            html_escape(registry_type)
+        )
+    } else if repos.is_empty() && page == 1 {
         format!(
             r##"<tr><td colspan="4" class="px-6 py-12 text-center text-slate-500">
             <div class="text-4xl mb-2">📭</div>
