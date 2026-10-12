@@ -5,7 +5,8 @@ name: Maestra release
 # (tag without the leading v) for packages.maestra.io on us-iota-lw-kube-infra
 # (maestra-io/issues-maestra#1442, W0a), then the vendored chart
 # maestra/charts/nora as oci://.../charts/nora, version and appVersion = that tag. Upstream's own Release workflow also
-# matches v* tags; it is disabled in this fork (see MAESTRA.md).
+# matches v* tags; it is disabled in this fork (see MAESTRA.md). Last, the
+# release job creates or updates the GitHub Release for the tag.
 
 concurrency: release-nora
 
@@ -30,6 +31,9 @@ jobs:
     runs-on: runs-on=${{ github.run_id }}/pool=build
     env:
       GIT_TAG: ${{ inputs.tag || github.ref_name }}
+    outputs:
+      image: ${{ steps.image.outputs.ref }}
+      chart: ${{ steps.chart.outputs.ref }}
     steps:
       - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 
@@ -68,12 +72,15 @@ jobs:
           targetTag: ${{ steps.tag.outputs.value }}
 
       - name: Report digest
+        id: image
         env:
           TAG: ${{ steps.tag.outputs.value }}
         run: |
           digest=$(aws ecr describe-images --region us-west-2 --repository-name nora \
             --image-ids imageTag="${TAG}" --query 'imageDetails[0].imageDigest' --output text)
-          echo "515260921971.dkr.ecr.us-west-2.amazonaws.com/nora:${TAG}@${digest}" | tee -a "$GITHUB_STEP_SUMMARY"
+          ref="515260921971.dkr.ecr.us-west-2.amazonaws.com/nora:${TAG}@${digest}"
+          echo "${ref}" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
 
       # The chart goes out only after the image it points at is in ECR. Version
       # and appVersion = the image tag, so its default image (values.yaml
@@ -87,6 +94,7 @@ jobs:
       # (create-repository.sh: immutable tags, `latest` excluded) and gets the
       # nora image repository's org-wide policy, so the same principals pull both.
       - name: Push chart to ECR us-west-2
+        id: chart
         env:
           TAG: ${{ steps.tag.outputs.value }}
           REGISTRY: 515260921971.dkr.ecr.us-west-2.amazonaws.com
@@ -105,4 +113,42 @@ jobs:
           helm push "${RUNNER_TEMP}/nora-${TAG}.tgz" "oci://${REGISTRY}/charts"
           digest=$(aws ecr describe-images --region us-west-2 --repository-name charts/nora \
             --image-ids imageTag="${TAG}" --query 'imageDetails[0].imageDigest' --output text)
-          echo "oci://${REGISTRY}/charts/nora:${TAG}@${digest}" | tee -a "$GITHUB_STEP_SUMMARY"
+          ref="oci://${REGISTRY}/charts/nora:${TAG}@${digest}"
+          echo "${ref}" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+  # Runs only after image and chart are in ECR. Notes = PRs since the previous
+  # v*-maestra.* tag (version order) plus the pushed artifacts; a re-run edits
+  # the existing release. "Latest" only when the tag is the highest maestra tag.
+  release:
+    name: GitHub Release
+    needs: image
+    runs-on: runs-on=${{ github.run_id }}/pool=small
+    permissions:
+      contents: write
+    env:
+      GIT_TAG: ${{ inputs.tag || github.ref_name }}
+      IMAGE: ${{ needs.image.outputs.image }}
+      CHART: ${{ needs.image.outputs.chart }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - name: Create or update release
+        run: |
+          set -euo pipefail
+          tags=$(gh api --paginate "repos/${GH_REPO}/git/matching-refs/tags/v" --jq '.[].ref | ltrimstr("refs/tags/")' \
+            | grep -E '^v[0-9.]+-maestra\.[0-9]+$' | sort -V)
+          prev=$(printf '%s\n' "${tags}" | grep -B1 -xF "${GIT_TAG}" | grep -vxF "${GIT_TAG}" || true)
+          latest=$([ "$(printf '%s\n' "${tags}" | tail -n1)" = "${GIT_TAG}" ] && echo true || echo false)
+          notes="${RUNNER_TEMP}/notes.md"
+          gh api "repos/${GH_REPO}/releases/generate-notes" -f tag_name="${GIT_TAG}" \
+            ${prev:+-f previous_tag_name="${prev}"} --jq .body > "${notes}"
+          # shellcheck disable=SC2016  # backticks are Markdown, not expansion
+          printf '\n## Artifacts\n\n- Image: `%s`\n- Chart: `%s`\n' "${IMAGE}" "${CHART}" >> "${notes}"
+          if gh release view "${GIT_TAG}" >/dev/null 2>&1; then
+            gh release edit "${GIT_TAG}" --title "${GIT_TAG}" --notes-file "${notes}" --latest="${latest}"
+          else
+            gh release create "${GIT_TAG}" --verify-tag --title "${GIT_TAG}" --notes-file "${notes}" --latest="${latest}"
+          fi
