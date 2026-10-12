@@ -485,7 +485,9 @@ impl Storage {
     /// bigger pinned object comes back as an open reader instead, never in memory
     /// (C17), for the caller to stream through an EOF digest check against `pin`
     /// (raw's `verify_while_streaming`). One backend round-trip either way.
-    /// `max_buffered == 0` is exactly `get_verified`.
+    /// `max_buffered == 0` is exactly `get_verified`. A body read whole is bounded at
+    /// the buffered `get`'s body bound (C15): the reader's client timeout is sized for
+    /// streaming to a download client, not for a read that holds the request.
     // ponytail: a big UNPINNED object is still buffered — with no recorded digest
     // there is nothing to gate it on before the first byte goes out; stream-hash it
     // in a first pass if such objects ever matter.
@@ -504,7 +506,12 @@ impl Storage {
         }
         use tokio::io::AsyncReadExt;
         let mut buf = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
-        reader.read_to_end(&mut buf).await?;
+        let limit = object::BODY_OP_TIMEOUT;
+        tokio::time::timeout(limit, reader.read_to_end(&mut buf))
+            .await
+            .map_err(|_| {
+                StorageError::Network(format!("body read exceeded {} s", limit.as_secs()))
+            })??;
         let (data, pin) = Self::verify_pinned(key, Bytes::from(buf), pin).await?;
         Self::witness(data, pin).map(BoundedRead::Buffered)
     }
@@ -846,6 +853,74 @@ mod tests {
             storage.get_verified_bounded("raw/small.bin", 1024).await,
             Err(StorageError::IntegrityViolation)
         ));
+    }
+
+    /// C15: a cached object read whole is bounded like the buffered `get` body: a
+    /// store that stops sending mid-body fails the read at the body bound instead of
+    /// holding the request for the streaming client's hour.
+    #[tokio::test(start_paused = true)]
+    async fn get_verified_bounded_cuts_off_a_stalled_body() {
+        /// Sends three bytes of a ten-byte object, then nothing.
+        struct Stalls;
+
+        #[async_trait]
+        impl StorageBackend for Stalls {
+            async fn get_reader(
+                &self,
+                _k: &str,
+            ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+                use futures::StreamExt;
+                let body =
+                    futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))])
+                        .chain(futures::stream::pending());
+                let reader = tokio_util::io::StreamReader::new(body);
+                Ok((10, Some(sha256_hex(b"abcdefghij")), Box::pin(reader)))
+            }
+            async fn put(&self, _k: &str, _d: &[u8], _sha256: &str) -> Result<()> {
+                Err(StorageError::NotFound)
+            }
+            async fn get(&self, _k: &str) -> Result<(Bytes, Option<String>)> {
+                Err(StorageError::NotFound)
+            }
+            async fn pin(&self, _k: &str) -> Option<String> {
+                None
+            }
+            async fn delete(&self, _k: &str) -> Result<()> {
+                Err(StorageError::NotFound)
+            }
+            async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+                Ok(Vec::new())
+            }
+            async fn stat(&self, _k: &str) -> Option<FileMeta> {
+                None
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+            async fn total_size(&self) -> u64 {
+                0
+            }
+            fn backend_name(&self) -> &'static str {
+                "stalls-test"
+            }
+            async fn put_from_path(
+                &self,
+                _k: &str,
+                _src: &Path,
+                _sha256: Option<&str>,
+            ) -> Result<()> {
+                Err(StorageError::NotFound)
+            }
+            async fn copy(&self, _src: &str, _dst: &str, _sha256: Option<&str>) -> Result<()> {
+                Err(StorageError::NotFound)
+            }
+        }
+
+        let storage = Storage::from_backend(Arc::new(Stalls));
+        let start = tokio::time::Instant::now();
+        let read = storage.get_verified_bounded("raw/stall.bin", 1024).await;
+        assert!(matches!(read, Err(StorageError::Network(_))));
+        assert_eq!(start.elapsed(), object::BODY_OP_TIMEOUT);
     }
 
     /// The GCS wrapper constructs without credentials or network.
