@@ -15,6 +15,14 @@ with origin `nuget.org` and fetched from nuget.org itself: once the ID is hosted
 stops proxying it upstream, so they must be imported too to stay resolvable.
 npm: every `@mindbox-cloud/*` package in `npm-local` (packument from the local repo).
 PyPI: the four internal names from the `pypi` virtual repo's simple index.
+
+nuget.org only (no ART_TOKEN): the public `Mindbox.*` IDs listed in a file, every version from the
+nuget.org registration with its catalog `packageHash` (sha512), origin `nuget.org`. With
+--missing-only (NORA_TOKEN, read is enough) only versions nora does not host yet: the daily sync
+(.github/workflows/maestra-sync-public-ids.yml), since nora never proxies an ID it hosts.
+
+    uv run maestra/scripts/import/enumerate.py --nuget-org-ids maestra/scripts/import/public-ids.txt \
+        [--missing-only] --out manifest.json
 """
 import argparse
 import html.parser
@@ -26,7 +34,7 @@ from datetime import datetime, timezone
 
 import requests
 
-from common import ART, NPM_SCOPE, NUGET_ID, PYPI_NAMES, Limiter, art_session, is_pr_prerelease, split_nupkg, version_key
+from common import ART, NORA, NPM_SCOPE, NUGET_ID, PYPI_NAMES, Limiter, art_session, env, is_pr_prerelease, split_nupkg, version_key
 
 lim = Limiter(8)
 art = art_session()
@@ -68,7 +76,8 @@ def registration(base, idl):
             items = p.json()["items"]
         for it in items:
             ce = it["catalogEntry"]
-            out.append({"version": ce["version"], "listed": ce.get("listed", True), "url": it["packageContent"]})
+            out.append({"version": ce["version"], "listed": ce.get("listed", True), "url": it["packageContent"],
+                        "leaf": ce.get("@id")})
     return out
 
 
@@ -103,6 +112,38 @@ def nuget(files):
     # by_file now holds files no registration entry claimed (odd file names): import them as-is.
     stray = [{"file": k, "size": f["size"], "sha256": f["sha2"]} for k, f in by_file.items()]
     return pkgs, stray
+
+
+NUGET_ORG_REG = "https://api.nuget.org/v3/registration5-gz-semver2"
+
+
+def nuget_org(ids, missing_only):
+    """Versions of public IDs from nuget.org, verified later against the catalog leaf's packageHash."""
+    auth = {"Authorization": "Bearer " + env("NORA_TOKEN")} if missing_only else {}
+
+    def one(pkg_id):
+        idl, have = pkg_id.lower(), set()
+        if missing_only:
+            r = pub.get(f"{NORA}/nuget/v3/flatcontainer/{idl}/index.json", headers=auth, timeout=120)
+            if r.status_code != 404:
+                r.raise_for_status()
+                have = {v.lower() for v in r.json()["versions"]}
+        versions = []
+        for e in registration(NUGET_ORG_REG, idl):
+            if e["version"].split("+", 1)[0].lower() in have:
+                continue
+            leaf = get(pub, e["leaf"])
+            leaf.raise_for_status()
+            leaf = leaf.json()
+            if leaf.get("packageHashAlgorithm", "").upper() != "SHA512":
+                sys.exit(f"{pkg_id} {e['version']}: unexpected packageHashAlgorithm {leaf.get('packageHashAlgorithm')}")
+            versions.append({**e, "size": leaf["packageSize"], "sha256": None, "sha512": leaf["packageHash"],
+                             "origin": "nuget.org"})
+        versions.sort(key=lambda v: version_key(v["version"]))
+        return {"id": pkg_id, "on_nuget_org": True, "versions": versions}
+
+    with ThreadPoolExecutor(8) as ex:
+        return list(ex.map(one, ids))
 
 
 def npm(files):
@@ -179,8 +220,23 @@ def totals(items, key):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
+    ap.add_argument("--nuget-org-ids", help="file of public NuGet IDs (one per line, # comments): nuget.org only")
+    ap.add_argument("--missing-only", action="store_true", help="with --nuget-org-ids: skip versions nora hosts")
     args = ap.parse_args()
     started = datetime.now(timezone.utc)
+    if args.nuget_org_ids:
+        with open(args.nuget_org_ids) as f:
+            ids = [ln.split("#", 1)[0].strip() for ln in f]
+        pkgs = nuget_org([i for i in ids if i], args.missing_only)
+        t = {"nuget": totals(pkgs, "versions")}
+        manifest = {"generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "started_at": started.strftime("%Y-%m-%dT%H:%M:%SZ"), "source": "https://api.nuget.org",
+                    "totals": t, "nuget": pkgs, "npm": [], "pypi": []}
+        with open(args.out, "w") as f:
+            json.dump(manifest, f, indent=1)
+        print(json.dumps({"generated_at": manifest["generated_at"], "totals": t,
+                          "missing": {p["id"]: len(p["versions"]) for p in pkgs if p["versions"]}}, indent=1))
+        return
     nuget_pkgs, nuget_stray = nuget(storage_list("nuget-local"))
     npm_pkgs = npm(storage_list("npm-local"))
     pypi_pkgs = pypi()

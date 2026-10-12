@@ -13,7 +13,7 @@ ART_TOKEN: Artifactory read token (GET/HEAD only). NORA_TOKEN: a nora `write` to
 Idempotent and resumable: every finished artifact is appended to --state (JSON lines) and skipped
 on the next run; nora's own 409 on an existing version counts as done (= `--skip-duplicate`).
 Each artifact is verified against the source digest before it is pushed (NuGet: Artifactory
-sha256; npm: dist.integrity sha512, else shasum; PyPI: the index sha256). Packages run in
+sha256, nuget.org catalog packageHash sha512 for an `enumerate.py --nuget-org-ids` manifest; npm: dist.integrity sha512, else shasum; PyPI: the index sha256). Packages run in
 parallel (--workers), the versions of one package run in version order.
 
 Not preserved, because nora's APIs take no such input: NuGet `published` and the npm `time`
@@ -130,10 +130,12 @@ def nuget_pkg(p, st, a):
         t0 = time.monotonic()
         try:
             if not st.has(key, a.dry_run):
-                path, size, _, sha256, _ = download(v["url"], a.workdir)
+                path, size, _, sha256, sha512 = download(v["url"], a.workdir)
                 try:
                     if v["sha256"] and sha256 != v["sha256"]:
                         raise Failed(f"sha256 mismatch {sha256} != {v['sha256']}")
+                    if v.get("sha512") and base64.b64encode(sha512).decode() != v["sha512"]:
+                        raise Failed("sha512 mismatch against the nuget.org catalog packageHash")
                     if not zipfile.is_zipfile(path):
                         raise Failed("not a zip")
                     if a.dry_run:

@@ -1,0 +1,50 @@
+name: Maestra sync public NuGet IDs
+
+# Imports the nuget.org versions packages.maestra.io does not host yet for the
+# public Mindbox.* IDs in maestra/scripts/import/public-ids.txt. nora never
+# proxies an ID it hosts and treats mindbox.* as internal, so this is how their
+# new releases arrive (issues-maestra#1442). Credential: this run's GitHub OIDC
+# token (fluxcd nora role rule for maestra/main: write, scoped to mindbox.*).
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: maestra-sync-public-ids
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: sync
+    runs-on: runs-on=${{ github.run_id }}/pool=small
+    timeout-minutes: 30
+    steps:
+      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install requests
+        run: python3 -m venv "$RUNNER_TEMP/venv" && "$RUNNER_TEMP/venv/bin/pip" install --quiet requests==2.32.5
+
+      # ponytail: one OIDC token for the whole run; a backlog that outlives its
+      # lifetime fails with 401 and the next run resumes (only missing versions).
+      - name: Import missing versions
+        working-directory: maestra/scripts/import
+        run: |
+          NORA_TOKEN=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=packages.maestra.io" | jq -r .value)
+          echo "::add-mask::$NORA_TOKEN"
+          export NORA_TOKEN
+          py="$RUNNER_TEMP/venv/bin/python"
+          "$py" enumerate.py --nuget-org-ids public-ids.txt --missing-only --out "$RUNNER_TEMP/manifest.json"
+          "$py" import.py --manifest "$RUNNER_TEMP/manifest.json" --state "$RUNNER_TEMP/state.jsonl" --formats nuget --workers 8
+          if grep -q '"status": "failed"' "$RUNNER_TEMP/state.jsonl"; then
+            echo "::error::some versions failed to import, see the log above"
+            exit 1
+          fi

@@ -1,0 +1,56 @@
+# Public Mindbox.* NuGet IDs (nuget.org owner mindbox) synced into packages.maestra.io daily by
+# .github/workflows/maestra-sync-public-ids.yml: nora never proxies an ID it hosts, and
+# curation.internal_namespaces holds mindbox.*, so a new nuget.org version arrives only this way.
+# Adding an ID here imports all its nuget.org versions on the next run (issues-maestra#1442).
+Mindbox.Analyzers.ConsoleApplication
+Mindbox.Analyzers.V3
+Mindbox.Data.Linq
+Mindbox.DateTimeProvider
+Mindbox.DateTimeProvider.Abstractions
+Mindbox.DateTimeProviderForTests
+Mindbox.DiagnosticContext.AspNetCore
+Mindbox.DiagnosticContext.Core
+Mindbox.DiagnosticContext.EntityFramework
+Mindbox.DiagnosticContext.Prometheus
+Mindbox.DiagnosticContext.Tracing
+Mindbox.EasyCaching.Abstractions
+Mindbox.EasyCaching.Advanced
+Mindbox.EasyCaching.Advanced.Template
+Mindbox.EasyCaching.Bus.CSRedis
+Mindbox.EasyCaching.Bus.RabbitMQ
+Mindbox.EasyCaching.Bus.Redis
+Mindbox.EasyCaching.Core
+Mindbox.EasyCaching.CSRedis
+Mindbox.EasyCaching.Decoration.Polly
+Mindbox.EasyCaching.Disk
+Mindbox.EasyCaching.HybridCache
+Mindbox.EasyCaching.InMemory
+Mindbox.EasyCaching.Interceptor.AspectCore
+Mindbox.EasyCaching.Interceptor.Castle
+Mindbox.EasyCaching.LiteDB
+Mindbox.EasyCaching.Memcached
+Mindbox.EasyCaching.Redis
+Mindbox.EasyCaching.ResponseCaching
+Mindbox.EasyCaching.Serialization.Json
+Mindbox.EasyCaching.Serialization.MessagePack
+Mindbox.EasyCaching.Serialization.Protobuf
+Mindbox.EasyCaching.Serialization.SystemTextJson
+Mindbox.EasyCaching.SQLite
+Mindbox.EasyCaching.TestHelpers
+Mindbox.ExceptionsHandling
+Mindbox.ExceptionsHandling.Abstractions
+Mindbox.ExceptionsHandling.GraphQL
+Mindbox.ExceptionsHandling.Template
+Mindbox.Expressions
+Mindbox.I18n
+Mindbox.I18n.Abstractions
+Mindbox.I18n.Analyzers
+Mindbox.I18n.AspNetCore
+Mindbox.I18n.Template
+Mindbox.Quokka
+Mindbox.Quokka.Abstractions
+Mindbox.ServicesIntegration
+Mindbox.WorkingCalendar
+Mindbox.YandexTracker
+Mindbox.YandexTracker.Abstractions
+Mindbox.YandexTracker.Template
