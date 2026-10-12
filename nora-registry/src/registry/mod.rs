@@ -1048,19 +1048,29 @@ impl ProxyBody {
     /// yet. A spool file goes in through `put_from_path`, pinned to its digest, from a
     /// hard link (or a copy) of the spool, because the backend consumes its source
     /// while followers may still be reading the spool. Returns whether it wrote.
+    ///
+    /// An immutable write runs under the key's publish lock, as an upload of the same
+    /// file does (PyPI `store_file`): whichever comes first wins and the other leaves
+    /// it as is, also for a spool file, whose multipart put cannot be conditional (C53).
+    // ponytail: process-local lock, enough for one replica; a second replica would need
+    // a conditional multipart complete.
     pub(crate) async fn cache(
         &self,
-        storage: &crate::Storage,
+        state: &AppState,
         key: &str,
         immutable: bool,
     ) -> crate::storage::Result<bool> {
+        let storage = &state.storage;
+        let lock = immutable.then(|| state.publish_lock(key));
+        let _guard = match &lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let spool = match self {
             ProxyBody::Mem(b) if immutable => return storage.put_if_absent(key, b.clone()).await,
             ProxyBody::Mem(b) => return storage.put_bytes(key, b.clone()).await.map(|()| true),
             ProxyBody::File(spool) => spool,
         };
-        // ponytail: stat-then-put, not create-only like put_if_absent; two fills of
-        // one key both write the same verified bytes.
         if immutable && storage.stat(key).await.is_some() {
             return Ok(false);
         }
@@ -1085,11 +1095,10 @@ pub(crate) fn spawn_cache_body(
     key: String,
     body: ProxyBody,
 ) {
-    let storage = state.storage.clone();
-    let repo_index = std::sync::Arc::clone(&state.repo_index);
+    let state = state.clone();
     tokio::spawn(async move {
-        match body.cache(&storage, &key, true).await {
-            Ok(true) => repo_index.invalidate(registry),
+        match body.cache(&state, &key, true).await {
+            Ok(true) => state.repo_index.invalidate(registry),
             Ok(false) => {}
             Err(e) => crate::record_cache_write_error(registry, &key, &e),
         }
@@ -1127,36 +1136,91 @@ impl CachedArtifact {
     }
 
     /// Response body. A streamed one is checked against its pin as it goes: a
-    /// mismatch aborts the body one frame short and, for a proxied key, deletes the
-    /// bad copy so the next request refetches it (C54).
-    pub(crate) fn into_body(self, state: &AppState, key: &str, internal: bool) -> Body {
+    /// mismatch aborts the body one frame short, counts as an integrity failure and,
+    /// for a provable proxy copy of a non-internal name, deletes the bad copy so the
+    /// next request refetches it (C54, [`drop_proxied_copy`]).
+    pub(crate) fn into_body(
+        self,
+        state: &AppState,
+        registry: &'static str,
+        key: &str,
+        internal: bool,
+    ) -> Body {
         match self {
             CachedArtifact::Buffered(b) => Body::from(b),
             CachedArtifact::Streamed { sha256, reader, .. } => {
-                let heal: Option<Box<dyn FnOnce() + Send + Sync>> = (!internal).then(|| {
-                    let storage = state.storage.clone();
-                    let key = key.to_string();
-                    Box::new(move || {
+                let state = state.clone();
+                let heal_key = key.to_string();
+                let heal: Box<dyn FnOnce() + Send + Sync> = Box::new(move || {
+                    crate::metrics::STORAGE_OPERATIONS
+                        .with_label_values(&["get", "integrity_fail"])
+                        .inc();
+                    if !internal {
                         tokio::spawn(async move {
-                            let _ = storage.delete(&key).await;
+                            drop_proxied_copy(&state, registry, &heal_key).await;
                         });
-                    }) as Box<dyn FnOnce() + Send + Sync>
+                    }
                 });
                 nora_registry::verified::stream_body(raw::verify_while_streaming(
                     reader,
                     Some(sha256),
                     key.to_string(),
-                    heal,
+                    Some(heal),
                 ))
             }
         }
     }
 }
 
+/// Whether the cached copy at `key` provably came from an upstream. NuGet's flat
+/// container holds only proxy fills (hosted packages live under `nuget/hosted/`).
+/// npm tarballs and PyPI files share their key space with publishes, uploads and
+/// imports: only the provenance record a proxy fill writes (`.nora-origins/<key>`,
+/// whose last line is the digest it cached, as GC's eviction reads it) proves one,
+/// and only while that digest is still the object's pin.
+pub(crate) async fn is_proxied_copy(storage: &crate::Storage, key: &str) -> bool {
+    if key.starts_with("nuget/flatcontainer/") {
+        return true;
+    }
+    let Ok(record) = storage.get(&npm::origin_key(key)).await else {
+        return false;
+    };
+    let cached = std::str::from_utf8(&record)
+        .ok()
+        .and_then(|r| r.lines().last());
+    cached.is_some() && storage.pin(key).await.as_deref() == cached
+}
+
+/// Delete a cached copy at `key` that failed its pin, so the refetch that follows
+/// can cache the upstream bytes again — the immutable write never overwrites a key
+/// (C54). Only a provable proxy copy ([`is_proxied_copy`]): anything else may be the
+/// only copy of a published or uploaded artifact, so it is kept (and answered with a
+/// 500) for an operator to restore. Check and delete run under the key's publish
+/// lock, which every writer that can replace the object (npm publish, PyPI upload,
+/// an immutable cache fill) holds, so a replacement landing in between is never the
+/// one deleted. Returns whether it was dropped.
+async fn drop_proxied_copy(state: &AppState, registry: &str, key: &str) -> bool {
+    let storage = &state.storage;
+    let lock = state.publish_lock(key);
+    let _guard = lock.lock().await;
+    if !is_proxied_copy(storage, key).await {
+        tracing::error!(
+            registry,
+            key,
+            "hosted artifact failed integrity verification: kept, not refetched; restore it from a backup"
+        );
+        return false;
+    }
+    if let Err(e) = storage.delete(key).await {
+        tracing::warn!(registry, key, error = %e, "could not drop a cached copy failing integrity");
+    }
+    true
+}
+
 /// Cache read of a proxied artifact with bounded memory: [`cache_read`] over
-/// `Storage::get_verified_bounded`. A copy failing its integrity pin is deleted
-/// when it is a proxied (non-internal) one, so the refetch that follows can cache
-/// the upstream bytes again — the immutable write never overwrites a key (C54).
+/// `Storage::get_verified_bounded`. A copy failing its integrity pin is dropped
+/// and refetched only when it is a provable proxy copy of a non-internal name
+/// ([`drop_proxied_copy`]); otherwise the read fails closed with a 500.
 pub(crate) async fn read_cached_artifact(
     state: &AppState,
     registry: &str,
@@ -1168,13 +1232,11 @@ pub(crate) async fn read_cached_artifact(
         .storage
         .get_verified_bounded(key, state.config.server.stream_threshold())
         .await;
-    if matches!(read, Err(StorageError::IntegrityViolation)) && !internal {
-        if let Err(e) = state.storage.delete(key).await {
-            tracing::warn!(registry, key, error = %e, "could not drop a cached copy failing integrity");
-        }
-    }
+    let fail_closed = internal
+        || (matches!(read, Err(StorageError::IntegrityViolation))
+            && !drop_proxied_copy(state, registry, key).await);
     Ok(
-        cache_read(read, registry, key, internal)?.map(|read| match read {
+        cache_read(read, registry, key, fail_closed)?.map(|read| match read {
             BoundedRead::Buffered(outcome) => {
                 use nora_registry::verified::{verified_body, GateOutcome};
                 CachedArtifact::Buffered(match outcome {
@@ -1852,6 +1914,78 @@ mod tests {
         // Under the cap the body reaches the handler (here: invalid JSON).
         let resp = send(&ctx.app, Method::PUT, "/npm/pkg", vec![b'x'; 1024]).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// C54: only NuGet's flat container, or a provenance record whose digest is still
+    /// the object's pin, proves a cached copy came from an upstream.
+    #[tokio::test]
+    async fn only_a_recorded_proxy_fill_is_a_proxied_copy() {
+        use sha2::Digest;
+        let ctx = crate::test_helpers::create_test_context();
+        let storage = &ctx.state.storage;
+        let digest = |b: &[u8]| hex::encode(sha2::Sha256::digest(b));
+        assert!(is_proxied_copy(storage, "nuget/flatcontainer/a/1.0.0/a.1.0.0.nupkg").await);
+
+        let tgz = "npm/a/tarballs/a-1.0.0.tgz";
+        storage.put(tgz, b"published").await.unwrap();
+        assert!(!is_proxied_copy(storage, tgz).await, "no provenance");
+        let record = format!("npm:https://r.example\n{}", digest(b"upstream"));
+        storage
+            .put(&npm::origin_key(tgz), record.as_bytes())
+            .await
+            .unwrap();
+        assert!(
+            !is_proxied_copy(storage, tgz).await,
+            "provenance of other bytes"
+        );
+        storage.put(tgz, b"upstream").await.unwrap();
+        assert!(is_proxied_copy(storage, tgz).await);
+
+        let whl = "pypi/a/a-1.0-py3-none-any.whl";
+        storage.put(whl, b"wheel").await.unwrap();
+        assert!(
+            !is_proxied_copy(storage, whl).await,
+            "an upload has no marker"
+        );
+        storage
+            .put(&pypi::proxied_marker_key(whl), digest(b"wheel").as_bytes())
+            .await
+            .unwrap();
+        assert!(is_proxied_copy(storage, whl).await);
+    }
+
+    /// C53: an immutable cache write of a spooled body serialises with an upload of the
+    /// same file on its publish lock, so an upload that got there first wins: the fill
+    /// neither overwrites it nor reports a write (after which provenance would follow).
+    #[tokio::test]
+    async fn spooled_immutable_cache_write_never_overwrites_an_upload() {
+        use sha2::Digest;
+        let ctx = crate::test_helpers::create_test_context();
+        let state = ctx.state.clone();
+        let key = "pypi/race/race-1.0.tar.gz";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool");
+        std::fs::write(&path, b"upstream").unwrap();
+        let body = ProxyBody::File(std::sync::Arc::new(SpoolFile {
+            path,
+            sha256: hex::encode(sha2::Sha256::digest(b"upstream")),
+            len: 8,
+            _reservation: state.spool.reserve(8).unwrap(),
+        }));
+
+        // An upload holds the lock from its existence check through its write.
+        let lock = state.publish_lock(key);
+        let upload = lock.lock().await;
+        let fill = tokio::spawn({
+            let state = state.clone();
+            async move { body.cache(&state, key, true).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!fill.is_finished(), "the fill waits for the upload");
+        state.storage.put(key, b"uploaded").await.unwrap();
+        drop(upload);
+        assert!(!fill.await.unwrap().unwrap(), "the fill does not write");
+        assert_eq!(&state.storage.get(key).await.unwrap()[..], b"uploaded");
     }
 
     #[tokio::test]

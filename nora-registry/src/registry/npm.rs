@@ -1319,7 +1319,7 @@ async fn serve_streamed_tarball(
         .audit
         .log(AuditEntry::new("cache_hit", "proxy", "", "npm", ""));
     let len = cached.len();
-    tarball_stream_response(cached.into_body(state, key, internal), len)
+    tarball_stream_response(cached.into_body(state, "npm", key, internal), len)
 }
 
 /// Cold miss on a tarball spooled to disk (C17). `origin` is set for the caller
@@ -1346,11 +1346,11 @@ async fn serve_spooled_tarball(
         }
     }
     if let Some(origin) = origin {
-        let storage = state.storage.clone();
-        let repo_index = Arc::clone(&state.repo_index);
+        let state = state.clone();
         let (key, body, sha) = (key.to_string(), body.clone(), body.sha256());
         tokio::spawn(async move {
-            if let Err(e) = body.cache(&storage, &key, false).await {
+            let (storage, repo_index) = (&state.storage, &state.repo_index);
+            if let Err(e) = body.cache(&state, &key, false).await {
                 tracing::warn!(key = %key, error = ?e, "npm proxy: failed to cache artifact");
                 return;
             }
@@ -1751,7 +1751,15 @@ async fn handle_publish(
     // Lock per package to serialize the packument regeneration within one process.
     let lock = state.publish_lock(&format!("npm/{}/metadata.json", package_name));
     let _guard = lock.lock().await;
-    if let Err(e) = publish_versions(&state.storage, &package_name, &payload, tarballs).await {
+    if let Err(e) = publish_versions(
+        &state.storage,
+        &state.publish_locks,
+        &package_name,
+        &payload,
+        tarballs,
+    )
+    .await
+    {
         return e.into_response();
     }
 
@@ -1781,6 +1789,7 @@ async fn handle_publish(
 /// the new versions. The caller holds the package's publish lock.
 pub(crate) async fn publish_versions(
     storage: &crate::storage::Storage,
+    locks: &crate::PublishLocks,
     package_name: &str,
     payload: &serde_json::Value,
     tarballs: Vec<(String, Bytes)>,
@@ -1866,10 +1875,25 @@ pub(crate) async fn publish_versions(
     for (name, tarball_bytes) in tarballs {
         let tarball_key = format!("npm/{}/tarballs/{}", package_name, name);
         let hash = hex::encode(sha2::Sha256::digest(&tarball_bytes));
+        // A publish is never a proxy cache: drop the provenance of a proxied copy it
+        // replaces, or GC and the integrity heal would treat it as one (C54). Under the
+        // tarball's publish lock, so the heal of a failing proxied copy and a cache fill
+        // of the same key serialise with the replacement; a provenance that cannot be
+        // removed aborts the publish (same bytes would keep it valid for the new pin).
+        let lock = crate::acquire_publish_lock(locks, &tarball_key);
+        let guard = lock.lock().await;
+        match storage.delete(&origin_key(&tarball_key)).await {
+            Ok(()) | Err(crate::storage::StorageError::NotFound) => {}
+            Err(e) => {
+                tracing::error!(key = %tarball_key, error = ?e, "npm publish: failed to remove stale provenance");
+                return Err(internal_error());
+            }
+        }
         if let Err(e) = storage.put_bytes(&tarball_key, tarball_bytes).await {
             tracing::error!(key = %tarball_key, error = ?e, "npm publish: failed to store tarball");
             return Err(internal_error());
         }
+        drop(guard);
 
         // Store sha256
         let hash_key = format!("{}.sha256", tarball_key);
@@ -5026,6 +5050,115 @@ mod integration_tests {
             .stat("npm/pinned/tarballs/pinned-1.0.0.tgz")
             .await
             .is_none());
+    }
+
+    /// C54: a tarball published here that fails its pin may be the only copy: it is
+    /// kept, answered 500 when read whole and cut off when streamed, and its name never
+    /// goes upstream.
+    #[tokio::test]
+    async fn tampered_hosted_tarball_is_kept_not_refetched() {
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"upstream".to_vec()))
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.server.stream_threshold_mb = 1;
+        });
+        let root = std::path::Path::new(&ctx.state.config.storage.path).to_path_buf();
+        assert_eq!(
+            publish(&ctx.app, "corp", "1.0.0").await,
+            StatusCode::CREATED
+        );
+        let small = "npm/corp/tarballs/corp-1.0.0.tgz";
+        std::fs::write(root.join(small), b"rot").unwrap();
+        let resp = send(&ctx.app, Method::GET, "/npm/corp/-/corp-1.0.0.tgz", "").await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let big = "npm/corpbig/tarballs/corpbig-1.0.0.tgz";
+        let mut bytes = vec![7u8; 2 * 1024 * 1024];
+        ctx.state.storage.put(big, &bytes).await.unwrap();
+        bytes[1_500_000] ^= 0xff;
+        std::fs::write(root.join(big), &bytes).unwrap();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/corpbig/-/corpbig-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "headers go out before EOF");
+        assert!(axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .is_err());
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        for key in [small, big] {
+            assert!(ctx.state.storage.stat(key).await.is_some(), "{key} kept");
+        }
+        // Metadata lookups (publish dates) aside, no tarball is fetched.
+        let requests = upstream.received_requests().await.unwrap();
+        assert!(!requests.iter().any(|r| r.url.path().ends_with(".tgz")));
+    }
+
+    /// C54: a proxied tarball (provenance recorded for the bytes it holds) that fails
+    /// its pin is dropped and refetched. A publish over a proxied copy drops that
+    /// provenance, so the published tarball is never taken for one.
+    #[tokio::test]
+    async fn tampered_proxied_tarball_is_refetched() {
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"upstream".to_vec()))
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+        });
+        let key = "npm/prox/tarballs/prox-1.0.0.tgz";
+        let uri = "/npm/prox/-/prox-1.0.0.tgz";
+        let origin = super::origin_key(key);
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(&body_bytes(resp).await[..], b"upstream");
+        for _ in 0..100 {
+            if ctx.state.storage.get(&origin).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        std::fs::write(
+            std::path::Path::new(&ctx.state.config.storage.path).join(key),
+            b"rotten!!",
+        )
+        .unwrap();
+
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"upstream");
+        let requests = upstream.received_requests().await.unwrap();
+        let fetches = requests
+            .iter()
+            .filter(|r| r.url.path() == "/prox/-/prox-1.0.0.tgz");
+        assert_eq!(fetches.count(), 2, "fetched, then refetched");
+        // Let the background re-cache (tarball, then its provenance) land.
+        let mut recached = false;
+        for _ in 0..100 {
+            if ctx.state.storage.get(key).await.is_ok() {
+                recached = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(recached, "the refetched tarball is cached again");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(
+            publish(&ctx.app, "prox", "1.0.0").await,
+            StatusCode::CREATED
+        );
+        assert!(ctx.state.storage.get(&origin).await.is_err());
     }
 
     /// `npm ping`, `npm search` and `npm login` are registry endpoints, not packuments:

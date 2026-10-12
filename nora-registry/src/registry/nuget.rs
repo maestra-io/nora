@@ -1001,7 +1001,7 @@ async fn flatcontainer_download(
                 (header::CONTENT_TYPE, content_type),
                 (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
             ],
-            cached.into_body(&state, &storage_key, internal),
+            cached.into_body(&state, "nuget", &storage_key, internal),
         )
             .into_response();
         response

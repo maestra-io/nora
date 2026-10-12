@@ -36,10 +36,10 @@ fn streaming_client_options() -> object_store::ClientOptions {
 /// Bounds for calls that do not stream a body to a client. The client timeout above
 /// is sized for streamed downloads; without these a silently dropped connection holds
 /// a HEAD or a small GET for STREAM_ATTEMPT_TIMEOUT. Request-to-headers / small ops /
-/// each next page of a LIST (see [`idle_bounded`]):
+/// each next page of a LIST or chunk of a read body (see [`idle_bounded`]):
 const METADATA_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-/// Whole in-memory body transfers (`put`, the body of `get`).
-const BODY_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// Whole in-memory body transfers (`put`, the body of `get`, a reader read whole).
+pub(super) const BODY_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 async fn bounded<T>(
     limit: std::time::Duration,
@@ -56,7 +56,9 @@ async fn bounded<T>(
 /// A LIST walk has no fixed size (its cost grows with the prefix), so it gets no total
 /// bound. Each next entry must arrive within `idle` instead: entries come a page at a
 /// time, so this bounds every page request, and a connection that goes silent mid-walk
-/// fails the walk instead of holding it for STREAM_ATTEMPT_TIMEOUT.
+/// fails the walk instead of holding it for STREAM_ATTEMPT_TIMEOUT. A read body is
+/// bounded the same way: the clock runs only while the consumer waits for the next
+/// chunk, so a slow download client (backpressure) never trips it, a stalled store does.
 fn idle_bounded<T: Send + 'static>(
     stream: futures::stream::BoxStream<'static, object_store::Result<T>>,
     idle: std::time::Duration,
@@ -70,7 +72,7 @@ fn idle_bounded<T: Send + 'static>(
             Err(_) => Some((
                 Err(object_store::Error::Generic {
                     store: "object_store",
-                    source: format!("listing made no progress for {} s", idle.as_secs()).into(),
+                    source: format!("no progress for {} s", idle.as_secs()).into(),
                 }),
                 None,
             )),
@@ -784,7 +786,8 @@ impl StorageBackend for ObjectStorage {
         };
         let size = result.meta.size;
         let pin = read_pin(&result.attributes);
-        let stream = result.into_stream().map_err(std::io::Error::other);
+        let stream =
+            idle_bounded(result.into_stream(), METADATA_OP_TIMEOUT).map_err(std::io::Error::other);
         let reader = tokio_util::io::StreamReader::new(stream);
         Ok((size as u64, pin, Box::pin(reader)))
     }
@@ -815,7 +818,8 @@ impl StorageBackend for ObjectStorage {
                 Err(e) => return Err(map_err(e)),
             };
         let size = result.meta.size;
-        let stream = result.into_stream().map_err(std::io::Error::other);
+        let stream =
+            idle_bounded(result.into_stream(), METADATA_OP_TIMEOUT).map_err(std::io::Error::other);
         let reader = tokio_util::io::StreamReader::new(stream);
         Ok((size as u64, Box::pin(reader)))
     }
@@ -1407,6 +1411,34 @@ mod tests {
         let err = bounded(limit, hung).await.unwrap_err();
         assert!(matches!(map_err(err), StorageError::Network(_)));
         assert!(bounded(METADATA_OP_TIMEOUT, async { Ok(1) }).await.is_ok());
+    }
+
+    /// C15: a read body that stops arriving fails after `idle`, but a consumer that
+    /// takes longer than `idle` between chunks (a slow download client) does not.
+    #[tokio::test(start_paused = true)]
+    async fn idle_bounded_body_cuts_off_a_stall_not_a_slow_consumer() {
+        use futures::StreamExt;
+        let idle = std::time::Duration::from_secs(30);
+        let chunks =
+            || futures::stream::iter([Ok(Bytes::from_static(b"a")), Ok(Bytes::from_static(b"b"))]);
+
+        let mut slow = idle_bounded(chunks().boxed(), idle);
+        assert!(slow.next().await.unwrap().is_ok());
+        tokio::time::sleep(idle * 3).await;
+        assert!(
+            slow.next().await.unwrap().is_ok(),
+            "a slow consumer is not a stall"
+        );
+        assert!(slow.next().await.is_none());
+
+        let mut stalled = idle_bounded(chunks().chain(futures::stream::pending()).boxed(), idle);
+        stalled.next().await;
+        stalled.next().await;
+        let start = tokio::time::Instant::now();
+        let err = stalled.next().await.unwrap().unwrap_err();
+        assert_eq!(start.elapsed(), idle);
+        assert!(matches!(map_err(err), StorageError::Network(_)));
+        assert!(stalled.next().await.is_none(), "a cut-off body ends");
     }
 }
 

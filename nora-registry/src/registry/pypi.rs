@@ -656,7 +656,7 @@ async fn download_file(
                 (header::ACCEPT_RANGES, "bytes"),
                 (header::CONTENT_LENGTH, &len),
             ],
-            cached.into_body(&state, &key, internal),
+            cached.into_body(&state, "pypi", &key, internal),
         )
             .into_response();
     }
@@ -759,6 +759,7 @@ async fn download_file(
                 // Cache in background + compute hash, invalidate AFTER write.
                 // Only the caller that fetched caches; coalesced followers share its body.
                 if fetched {
+                    let cache_state = state.clone();
                     let storage = state.storage.clone();
                     let key_clone = key.clone();
                     let data_clone = data.clone();
@@ -787,8 +788,9 @@ async fn download_file(
                         } else {
                             None
                         };
-                        // Create-only: a concurrent upload of the same filename wins.
-                        if let Ok(true) = data_clone.cache(&storage, &key_clone, true).await {
+                        // Create-only under the file's publish lock: an upload that
+                        // got there first wins (C53).
+                        if let Ok(true) = data_clone.cache(&cache_state, &key_clone, true).await {
                             let _ = storage
                                 .put(&format!("{}.sha256", key_clone), hash.as_bytes())
                                 .await;
@@ -5085,6 +5087,54 @@ mod hash_marker_tests {
             "stale digest not served: {body}"
         );
         wait_for_markers(&ctx, "dup", &[hash_marker_key("dup", filename, &current)]).await;
+    }
+
+    /// C54: an uploaded file that fails its pin is the only copy: it is kept and
+    /// answered 500, and the file is never fetched from the upstream.
+    #[tokio::test]
+    async fn tampered_uploaded_file_is_kept_not_refetched() {
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"upstream".to_vec()))
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.pypi.proxy = Some(upstream.uri());
+        });
+        let filename = "ours-1.0-py3-none-any.whl";
+        let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/simple/",
+            vec![("content-type", content_type.as_str())],
+            upload_body("ours", "1.0", filename, b"our wheel"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let key = format!("pypi/ours/{filename}");
+        std::fs::write(
+            std::path::Path::new(&ctx.state.config.storage.path).join(&key),
+            b"rotten",
+        )
+        .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/simple/ours/{filename}"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            ctx.state.storage.stat(&key).await.is_some(),
+            "the only copy is kept"
+        );
+        // The index may be read for release dates; the file is never fetched.
+        let requests = upstream.received_requests().await.unwrap();
+        assert!(!requests.iter().any(|r| r.url.path().ends_with(".whl")));
     }
 
     /// Uploading a filename that was deleted and is stored again with other bytes replaces
