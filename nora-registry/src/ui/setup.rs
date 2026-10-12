@@ -182,13 +182,16 @@ pub fn render_setup_page(info: &SetupInfo, lang: Lang, auth_enabled: bool) -> St
     );
 
     // ── 1. Token ───────────────────────────────────────────────────────
+    let kc = code("security add-generic-password -U -s {HOSTPATH} -a nora -w <TOKEN>");
     let token_body = if ru {
         format!(
             r#"<ol>
 <li>Откройте UI через Teleport: <a href="{{LOGIN_HREF}}" target="_blank" rel="noopener">{{LOGIN}}</a>, вход через GitHub SSO.</li>
 <li>Страница <a href="/ui/tokens">Токены</a> &rarr; «Создать токен»: описание (например, имя ноутбука), роль <b>read</b> для установки пакетов, <b>write</b> только если вы публикуете пакеты (доступна с ролью Teleport <code>apps</code>), срок жизни в днях.</li>
 <li>Скопируйте токен сразу: он показывается один раз. Токены выглядят как <code>nra_…</code>; ниже везде вместо {tok} подставьте его.</li>
+<li class="ds-mac">Сохраните его в связке ключей (login keychain): строки профиля для uv и NuGet ниже читают токен оттуда, и секрет не лежит в профиле шелла:</li>
 </ol>
+<div class="ds-mac">{kc}</div>
 <div class="ds-note">Пароли снаружи не принимаются: клиенты пакетов отправляют только токен (имя пользователя любое, мы пишем <code>token</code>). В GitHub Actions токен не нужен: workflow авторизуются через GitHub OIDC, личный токен в секреты CI не кладите.</div>"#
         )
     } else {
@@ -197,7 +200,9 @@ pub fn render_setup_page(info: &SetupInfo, lang: Lang, auth_enabled: bool) -> St
 <li>Open the UI through Teleport: <a href="{{LOGIN_HREF}}" target="_blank" rel="noopener">{{LOGIN}}</a>, sign in with GitHub SSO.</li>
 <li><a href="/ui/tokens">Tokens</a> page &rarr; Create token: a description (e.g. your laptop's name), role <b>read</b> to install packages, <b>write</b> only if you publish (available with the Teleport role <code>apps</code>), expiry in days.</li>
 <li>Copy the token right away, it is shown once. Tokens look like <code>nra_…</code>; replace every {tok} below with it.</li>
+<li class="ds-mac">Keep it in the login keychain; the uv and NuGet profile lines below read it from there, so no shell profile holds the secret:</li>
 </ol>
+<div class="ds-mac">{kc}</div>
 <div class="ds-note">Passwords are not accepted from outside: package clients send only the token (any username, we use <code>token</code>). GitHub Actions need no token: workflows authenticate with GitHub OIDC, so never put a personal token into CI secrets.</div>"#
         )
     };
@@ -207,7 +212,9 @@ pub fn render_setup_page(info: &SetupInfo, lang: Lang, auth_enabled: bool) -> St
         r#"<p>{p1}</p>
 {add}
 <p>{p2}</p>
+<p>{p_org}</p>
 <div class="ds-note">{p3}</div>
+{cred}
 <h3>{publish}</h3>
 {push}"#,
         p1 = tr(
@@ -215,17 +222,25 @@ pub fn render_setup_page(info: &SetupInfo, lang: Lang, auth_enabled: bool) -> St
             "Один раз добавьте фид в пользовательский конфиг NuGet:",
         ),
         add = per_os(
-            r#"dotnet nuget add source "{BASE}/nuget/v3/index.json" --name private --username token --password <TOKEN> --store-password-in-clear-text"#,
-            r#"dotnet nuget add source "{BASE}/nuget/v3/index.json" --name private --username token --password <TOKEN>"#,
+            "dotnet nuget add source \"{BASE}/nuget/v3/index.json\" -n maestra -u token -p <TOKEN> --store-password-in-clear-text\ndotnet nuget disable source nuget.org",
+            "dotnet nuget add source \"{BASE}/nuget/v3/index.json\" -n maestra -u token -p <TOKEN>\ndotnet nuget disable source nuget.org",
         ),
         p2 = if ru {
             r#"<span class="ds-mac">Пишется в <code>~/.nuget/NuGet/NuGet.Config</code>. На macOS NuGet не умеет шифровать пароли, поэтому флаг <code>--store-password-in-clear-text</code> обязателен, а токен лежит в файле открытым текстом.</span><span class="ds-win">Пишется в <code>%APPDATA%\NuGet\NuGet.Config</code>. На Windows NuGet шифрует пароль (только для вас и этой машины), поэтому флаг <code>--store-password-in-clear-text</code> не нужен.</span>"#
         } else {
             r#"<span class="ds-mac">This writes <code>~/.nuget/NuGet/NuGet.Config</code>. NuGet can encrypt passwords only on Windows, so on macOS <code>--store-password-in-clear-text</code> is required and the token sits in the file as plain text.</span><span class="ds-win">This writes <code>%APPDATA%\NuGet\NuGet.Config</code>. On Windows NuGet encrypts the password (for you on this machine only), so <code>--store-password-in-clear-text</code> is not needed.</span>"#
         },
+        p_org = tr(
+            "<code>nuget.org</code> is disabled on purpose: the registry proxies it, and a direct source would bypass the cooldown and the dependency-confusion guard. To turn it back on: <code>dotnet nuget enable source nuget.org</code>.",
+            "<code>nuget.org</code> отключён намеренно: реестр его проксирует, а прямой источник обходил бы карантин и защиту от dependency confusion. Включить обратно: <code>dotnet nuget enable source nuget.org</code>.",
+        ),
         p3 = tr(
-            "Our repositories pin the feed in their own <code>nuget.config</code> with <code>&lt;clear/&gt;</code> under the key <code>private</code>. <code>&lt;clear/&gt;</code> drops your user-level sources, but credentials are matched by source name, so keep the name <code>private</code> exactly.",
-            "Наши репозитории фиксируют фид в своём <code>nuget.config</code> с <code>&lt;clear/&gt;</code> под ключом <code>private</code>. <code>&lt;clear/&gt;</code> отбрасывает ваши пользовательские источники, но учётные данные сопоставляются по имени источника, поэтому имя должно быть ровно <code>private</code>.",
+            "A repository whose own <code>nuget.config</code> pins the feed with <code>&lt;clear/&gt;</code> under another key (ours use <code>private</code>) gets no credentials from the <code>maestra</code> source: NuGet matches credentials by key. Give that key the token through the environment (new terminals):",
+            "Репозиторий, чей <code>nuget.config</code> фиксирует фид с <code>&lt;clear/&gt;</code> под другим ключом (у нас <code>private</code>), не получает учётные данные источника <code>maestra</code>: NuGet сопоставляет их по ключу. Передайте токен этому ключу через окружение (в новых терминалах):",
+        ),
+        cred = per_os(
+            r#"echo 'export NuGetPackageSourceCredentials_private="Username=token;Password=$(security find-generic-password -s {HOSTPATH} -a nora -w 2>/dev/null)"' >> ~/.zshrc"#,
+            "[Environment]::SetEnvironmentVariable('NuGetPackageSourceCredentials_private', 'Username=token;Password=<TOKEN>', 'User')",
         ),
         publish = tr("Publish (write token)", "Публикация (токен write)"),
         push = per_os(
@@ -240,6 +255,7 @@ pub fn render_setup_page(info: &SetupInfo, lang: Lang, auth_enabled: bool) -> St
 {set}
 <p>{p2}</p>
 {file}
+<p>{p_scope}</p>
 <h3>Yarn &amp; pnpm</h3>
 <p>{p3}</p>
 {yarn}
@@ -256,6 +272,10 @@ pub fn render_setup_page(info: &SetupInfo, lang: Lang, auth_enabled: bool) -> St
             r#"These are two lines in <span class="ds-mac"><code>~/.npmrc</code></span><span class="ds-win"><code>%USERPROFILE%\.npmrc</code></span>; you can also write them by hand:"#
         },
         file = code("registry={BASE}/npm/\n//{HOSTPATH}/npm/:_authToken=<TOKEN>"),
+        p_scope = tr(
+            "Delete any <code>@mindbox-cloud:registry=</code> line from that file: a scope pinned elsewhere bypasses the registry.",
+            "Удалите из этого файла строку <code>@mindbox-cloud:registry=</code>, если она есть: scope, направленный в другое место, обходит реестр.",
+        ),
         p3 = tr(
             "pnpm and Yarn 1 read the same <code>.npmrc</code>, nothing else to do. Yarn 2+ (Berry) keeps its own config:",
             "pnpm и Yarn 1 читают тот же <code>.npmrc</code>, больше ничего не нужно. У Yarn 2+ (Berry) свой конфиг:",
@@ -290,8 +310,8 @@ pub fn render_setup_page(info: &SetupInfo, lang: Lang, auth_enabled: bool) -> St
             "uv не читает <code>pip.conf</code>; задайте индекс по умолчанию через окружение (<code>UV_INDEX_URL</code> — старое, устаревшее имя той же настройки):",
         ),
         uv = per_os(
-            r#"echo 'export UV_DEFAULT_INDEX="{SCHEME}://token:<TOKEN>@{HOSTPATH}/simple/"' >> ~/.zshrc"#,
-            r#"setx UV_DEFAULT_INDEX "{SCHEME}://token:<TOKEN>@{HOSTPATH}/simple/""#,
+            r#"echo 'export UV_DEFAULT_INDEX="{SCHEME}://token:$(security find-generic-password -s {HOSTPATH} -a nora -w 2>/dev/null)@{HOSTPATH}/simple/"' >> ~/.zshrc"#,
+            "[Environment]::SetEnvironmentVariable('UV_DEFAULT_INDEX', '{SCHEME}://token:<TOKEN>@{HOSTPATH}/simple/', 'User')",
         ),
         p3 = tr(
             "Per project: add the source, then store the credentials once per machine:",
@@ -383,8 +403,8 @@ pub fn render_setup_page(info: &SetupInfo, lang: Lang, auth_enabled: bool) -> St
             "После выпуска нового токена повторите команды выше; для NuGet обновите существующий источник:",
         ),
         update = per_os(
-            "dotnet nuget update source private --username token --password <TOKEN> --store-password-in-clear-text",
-            "dotnet nuget update source private --username token --password <TOKEN>",
+            "dotnet nuget update source maestra -s \"{BASE}/nuget/v3/index.json\" -u token -p <TOKEN> --store-password-in-clear-text",
+            "dotnet nuget update source maestra -s \"{BASE}/nuget/v3/index.json\" -u token -p <TOKEN>",
         ),
         p5 = tr(
             "NuGet caches feed responses for 30 minutes; if a version that just left the cooldown is still not found:",
@@ -416,6 +436,7 @@ pub fn render_setup_page(info: &SetupInfo, lang: Lang, auth_enabled: bool) -> St
     <div class="bg-[#1e293b] rounded-lg border border-slate-700 p-4 md:p-6 mb-6">
         <h2 class="text-lg font-semibold text-slate-200">{how}</h2>
         {intro}
+        <div class="ds-note">{claude}</div>
     </div>
     <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-6">
         <div class="ds-tabs" role="tablist" aria-label="OS">
@@ -436,6 +457,10 @@ pub fn render_setup_page(info: &SetupInfo, lang: Lang, auth_enabled: bool) -> St
             "Подключите dotnet, npm, pip, uv и Poetry к нашему реестру пакетов. По экрану на инструмент.",
         ),
         how = tr("How it works", "Как это устроено"),
+        claude = tr(
+            "Using Claude Code? Run <code>/packages:packages-dev-setup</code>: it does every step below for you (token, NuGet, npm, pip, uv, Poetry) and verifies the result.",
+            "Работаете в Claude Code? Запустите <code>/packages:packages-dev-setup</code>: он сделает все шаги ниже сам (токен, NuGet, npm, pip, uv, Poetry) и проверит результат.",
+        ),
         s_token = section("token", tr("1. Get a token", "1. Получите токен"), &token_body),
         s_nuget = section("nuget", "2. NuGet (dotnet)", &nuget_body),
         s_npm = section("npm", "3. npm", &npm_body),
@@ -545,6 +570,22 @@ mod tests {
             let html = render(lang);
             assert!(!html.contains("maestra.io"), "hardcoded host in {lang:?}");
         }
+    }
+
+    /// Same commands as the skillz `packages` plugin's dev-setup.sh / dev-setup.ps1.
+    #[test]
+    fn matches_dev_setup_scripts() {
+        let html = render(Lang::En);
+        assert!(html.contains("-n maestra -u token -p"));
+        assert!(html.contains("dotnet nuget disable source nuget.org"));
+        assert!(html.contains("dotnet nuget enable source nuget.org"));
+        assert!(html.contains("export UV_DEFAULT_INDEX="));
+        assert!(html.contains("SetEnvironmentVariable(&#39;UV_DEFAULT_INDEX&#39;"));
+        assert!(html.contains("security add-generic-password -U -s registry.example.test -a nora"));
+        assert!(html.contains("NuGetPackageSourceCredentials_private"));
+        assert!(html.contains("http-basic.maestra"));
+        assert!(html.contains("/packages:packages-dev-setup"));
+        assert!(html.contains(r#"href="/ui/tokens""#));
     }
 
     #[test]
