@@ -851,7 +851,7 @@ async fn flatcontainer_download(
             crate::curation::RegistryType::Nuget,
             &id_lower,
             crate::curation::RequestVersion::Known(ver.to_string()),
-            publish_date,
+            judged_date(&state, publish_date),
         ) {
             return response;
         }
@@ -1228,23 +1228,21 @@ fn serve_stale_or_error(
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-/// Where a registration index puts a version: the `published` date of its inlined
-/// leaf, or the bounds of the non-inlined page covering it (nuget.org inlines no
-/// pages for an ID with more than 128 versions, e.g. AWSSDK.Core).
+/// Where a registration index puts a version: its inlined leaf, or the bounds of the
+/// non-inlined page covering it (nuget.org inlines no pages for an ID with more than
+/// 128 versions, e.g. AWSSDK.Core).
 enum RegistrationHit {
-    Published(Option<i64>),
+    Leaf(serde_json::Value),
     Page(String, String),
 }
 
-/// The publish date of `version` among registration leaves, `None` when absent.
-/// NuGet dates an unlisted version `1900-01-01`: that is no release date, so it
-/// reads as unknown (`Some(None)`), never as a decades-old release.
-fn leaf_published(leaves: &[serde_json::Value], version: &str) -> Option<Option<i64>> {
-    let entry = leaves
+/// The registration leaf of `version` among `leaves`.
+fn find_leaf(leaves: &[serde_json::Value], version: &str) -> Option<serde_json::Value> {
+    leaves
         .iter()
-        .filter_map(|l| l.get("catalogEntry"))
-        .find(|e| {
-            e.get("version")
+        .find(|l| {
+            l.get("catalogEntry")
+                .and_then(|e| e.get("version"))
                 .and_then(|v| v.as_str())
                 // A leaf may carry SemVer 2 build metadata the flat-container path drops.
                 .is_some_and(|v| {
@@ -1253,14 +1251,68 @@ fn leaf_published(leaves: &[serde_json::Value], version: &str) -> Option<Option<
                         .unwrap_or(v)
                         .eq_ignore_ascii_case(version)
                 })
-        })?;
-    Some(
-        entry
-            .get("published")
-            .and_then(|d| d.as_str())
-            .and_then(crate::curation::parse_iso8601_to_unix)
-            .filter(|&ts| ts > 0),
-    )
+        })
+        .cloned()
+}
+
+/// A NuGet date field as a Unix timestamp. nuget.org dates an unlisted version
+/// `1900-01-01`: any year before 1950 is no release date and reads as unknown, never
+/// as a decades-old release.
+fn nuget_date(field: Option<&serde_json::Value>) -> Option<i64> {
+    const Y1950: i64 = -631_152_000;
+    crate::curation::parse_iso8601_to_unix(field?.as_str()?).filter(|&ts| ts >= Y1950)
+}
+
+/// Release date of a registration leaf: `catalogEntry.published`. An undated one (an
+/// unlisted version) is dated from its catalog leaf ([`catalog_created`]), unless the
+/// registration leaf's own `commitTimeStamp` (never before the release) is already past
+/// the NuGet `min_release_age`: then by that, with no fetch.
+async fn leaf_date(state: &AppState, id: &str, leaf: &serde_json::Value) -> Option<i64> {
+    let entry = leaf.get("catalogEntry")?;
+    if let Some(date) = nuget_date(entry.get("published")) {
+        return Some(date);
+    }
+    let committed = nuget_date(leaf.get("commitTimeStamp"));
+    let min_age = state
+        .curation()
+        .curation_engine
+        .min_release_age_secs(RegistryType::Nuget);
+    if let (Some(at), Some(min_age)) = (committed, min_age) {
+        if crate::cache_ttl::now_unix() as i64 - at >= min_age {
+            return Some(at);
+        }
+    }
+    let version = entry_version(entry).filter(|v| is_valid_version(v))?;
+    catalog_created(state, id, &version, entry.get("@id")?.as_str()?).await
+}
+
+/// `created` (else `catalog:commitTimeStamp`) of the catalog leaf at `url`
+/// (`catalogEntry.@id`). Fetched through [`refresh_metadata`] (one flight per version)
+/// and kept for good under `nuget/catalog/{id}/{version}.json`: a creation date never
+/// changes. Only from the configured upstream's origin: the request carries `proxy_auth`.
+async fn catalog_created(state: &AppState, id: &str, version: &str, url: &str) -> Option<i64> {
+    let key = format!("nuget/catalog/{id}/{version}.json");
+    let leaf = match read_json(&state.storage, &key).await {
+        Some(leaf) => leaf,
+        None => {
+            let origin = format!("{}/", upstream_url(state).trim_end_matches('/'));
+            if !url.starts_with(&origin) {
+                return None;
+            }
+            serde_json::from_slice(&refresh_metadata(state, &key, url, None).await.ok()?).ok()?
+        }
+    };
+    nuget_date(leaf.get("created")).or_else(|| nuget_date(leaf.get("catalog:commitTimeStamp")))
+}
+
+/// The date curation judges a proxied version by: its release date, or for one still
+/// unknown with `trust_upstream_dates` (every date source tried), what
+/// `curation.on_failure` makes of it ([`crate::curation::CurationEngine::unknown_release_date`]).
+fn judged_date(state: &AppState, date: Option<i64>) -> Option<i64> {
+    if date.is_some() || !state.config.server.trust_upstream_dates {
+        return date;
+    }
+    state.curation().curation_engine.unknown_release_date()
 }
 
 /// Find `version` in a registration index: an inlined leaf, or the page that covers it.
@@ -1268,8 +1320,8 @@ fn registration_hit(index: &serde_json::Value, version: &str) -> Option<Registra
     for page in index.get("items")?.as_array()? {
         // Pages may be non-inline (no items array) per NuGet V3 spec (#535).
         if let Some(leaves) = page.get("items").and_then(|i| i.as_array()) {
-            if let Some(date) = leaf_published(leaves, version) {
-                return Some(RegistrationHit::Published(date));
+            if let Some(leaf) = find_leaf(leaves, version) {
+                return Some(RegistrationHit::Leaf(leaf));
             }
             continue;
         }
@@ -1333,6 +1385,7 @@ async fn fetch_registration_doc(
 /// ```json
 /// { "items": [{ "items": [{ "catalogEntry": { "version": "1.0.0", "published": "2024-01-15T10:30:00Z" } }] }] }
 /// ```
+/// An unlisted version is dated from its catalog leaf ([`leaf_date`]).
 /// `None` when upstream dates are untrusted (#513): the upstream date is spoofable,
 /// and nora's cache mtime is no publish date either (C49: every metadata refresh
 /// re-dated every version to now, and an old index matured a new version in the
@@ -1352,16 +1405,19 @@ async fn nuget_publish_date(state: &AppState, id: &str, version: &str) -> Option
         }
     };
     let (lower, upper) = match hit {
-        RegistrationHit::Published(date) => return date,
+        RegistrationHit::Leaf(leaf) => return leaf_date(state, id, &leaf).await,
         RegistrationHit::Page(lower, upper) => (lower, upper),
     };
     let page_key = registration_page_key(id, &lower, &upper);
-    let date = |page: serde_json::Value| leaf_published(page.get("items")?.as_array()?, version);
-    if let Some(date) = read_json(&state.storage, &page_key).await.and_then(date) {
-        return date;
-    }
-    let upstream_path = format!("{id}/page/{lower}/{upper}.json");
-    date(fetch_registration_doc(state, &page_key, &upstream_path).await?)?
+    let leaf = |page: serde_json::Value| find_leaf(page.get("items")?.as_array()?, version);
+    let leaf = match read_json(&state.storage, &page_key).await.and_then(leaf) {
+        Some(leaf) => leaf,
+        None => {
+            let upstream_path = format!("{id}/page/{lower}/{upper}.json");
+            leaf(fetch_registration_doc(state, &page_key, &upstream_path).await?)?
+        }
+    };
+    leaf_date(state, id, &leaf).await
 }
 
 // ── Q04: hide young versions from proxied metadata ─────────────────────
@@ -1373,39 +1429,30 @@ fn entry_version(entry: &serde_json::Value) -> Option<String> {
     Some(v.split('+').next().unwrap_or(v).to_lowercase())
 }
 
-/// Whether `leaf` (a registration leaf) is a version metadata must hide.
-fn leaf_hidden(
-    engine: &crate::curation::CurationEngine,
-    id: &str,
-    leaf: &serde_json::Value,
-) -> bool {
-    let Some(entry) = leaf.get("catalogEntry") else {
-        return false;
-    };
-    let Some(version) = entry_version(entry) else {
-        return false;
-    };
-    let published = leaf_published(std::slice::from_ref(leaf), &version).flatten();
-    engine.hides_from_metadata(RegistryType::Nuget, id, &version, published)
+/// The version of `leaf` (a registration leaf) if metadata must hide it.
+async fn leaf_hidden(state: &AppState, id: &str, leaf: &serde_json::Value) -> Option<String> {
+    let version = entry_version(leaf.get("catalogEntry")?)?;
+    let date = judged_date(state, leaf_date(state, id, leaf).await);
+    let curation = state.curation();
+    let engine = &curation.curation_engine;
+    engine
+        .hides_from_metadata(RegistryType::Nuget, id, &version, date)
+        .then_some(version)
 }
 
-/// Drop hidden leaves from a registration index (its inlined pages) or page, fixing
+/// Drop `hidden` leaves from a registration index (its inlined pages) or page, fixing
 /// each `count`. `None` when nothing is hidden.
-fn filter_registration(
-    engine: &crate::curation::CurationEngine,
-    id: &str,
-    body: &[u8],
-) -> Option<Vec<u8>> {
-    fn retain(
-        engine: &crate::curation::CurationEngine,
-        id: &str,
-        holder: &mut serde_json::Value,
-    ) -> bool {
+fn filter_registration(hidden: &HashSet<String>, body: &[u8]) -> Option<Vec<u8>> {
+    fn retain(hidden: &HashSet<String>, holder: &mut serde_json::Value) -> bool {
         let Some(leaves) = holder.get_mut("items").and_then(|i| i.as_array_mut()) else {
             return false;
         };
         let before = leaves.len();
-        leaves.retain(|leaf| !leaf_hidden(engine, id, leaf));
+        leaves.retain(|leaf| {
+            leaf.get("catalogEntry")
+                .and_then(entry_version)
+                .is_none_or(|v| !hidden.contains(&v))
+        });
         let after = leaves.len();
         if after != before {
             holder["count"] = serde_json::json!(after);
@@ -1419,11 +1466,11 @@ fn filter_registration(
         .iter()
         .any(|i| i.get("catalogEntry").is_some());
     let changed = if is_page {
-        retain(engine, id, &mut doc)
+        retain(hidden, &mut doc)
     } else {
         let mut changed = false;
         for page in doc.get_mut("items")?.as_array_mut()? {
-            changed |= retain(engine, id, page);
+            changed |= retain(hidden, page);
         }
         changed
     };
@@ -1490,8 +1537,6 @@ async fn compute_hidden_versions(
     id: &str,
     last_page_only: bool,
 ) -> HashSet<String> {
-    let curation = state.curation();
-    let engine = &curation.curation_engine;
     let index_key = registration_key(id);
     let ttl = state.config.nuget.metadata_ttl;
     let fresh = match state.storage.stat(&index_key).await {
@@ -1541,12 +1586,17 @@ async fn compute_hidden_versions(
         }
     }))
     .await;
-    docs.iter()
+    let leaves = docs
+        .iter()
         .flatten()
         .filter_map(|d| d.get("items")?.as_array())
+        .flatten();
+    // ponytail: unbounded join; only undated leaves committed within min_release_age
+    // fetch (once each), a semaphore if an upstream without commitTimeStamp shows up.
+    futures::future::join_all(leaves.map(|leaf| leaf_hidden(state, id, leaf)))
+        .await
+        .into_iter()
         .flatten()
-        .filter(|leaf| leaf_hidden(engine, id, leaf))
-        .filter_map(|leaf| entry_version(leaf.get("catalogEntry")?))
         .collect()
 }
 
@@ -1584,12 +1634,11 @@ async fn registration_index_filtered(
 ) -> Response {
     let id_lower = id.to_lowercase();
     let resp = registration_index(State(state.clone()), headers, Path(id)).await;
-    if !filters_metadata(&state, &id_lower).await {
+    if resp.status() != StatusCode::OK || !filters_metadata(&state, &id_lower).await {
         return resp;
     }
-    let curation = state.curation();
-    let engine = &curation.curation_engine;
-    crate::metadata_filter::rewrite_body(resp, |b| filter_registration(engine, &id_lower, b)).await
+    let hidden = hidden_versions(&state, &id_lower, false).await;
+    crate::metadata_filter::rewrite_body(resp, |b| filter_registration(&hidden, b)).await
 }
 
 async fn registration_page_filtered(
@@ -1598,12 +1647,11 @@ async fn registration_page_filtered(
 ) -> Response {
     let id_lower = id.to_lowercase();
     let resp = registration_page(State(state.clone()), Path((id, lower, upper))).await;
-    if !filters_metadata(&state, &id_lower).await {
+    if resp.status() != StatusCode::OK || !filters_metadata(&state, &id_lower).await {
         return resp;
     }
-    let curation = state.curation();
-    let engine = &curation.curation_engine;
-    crate::metadata_filter::rewrite_body(resp, |b| filter_registration(engine, &id_lower, b)).await
+    let hidden = hidden_versions(&state, &id_lower, false).await;
+    crate::metadata_filter::rewrite_body(resp, |b| filter_registration(&hidden, b)).await
 }
 
 /// Flat-container `index.json` — what `dotnet restore` resolves ranges against.
@@ -3160,9 +3208,183 @@ mod integration_tests {
     /// An unlisted version is dated 1900-01-01 by NuGet: unknown, not ancient.
     #[test]
     fn test_unlisted_sentinel_date_is_unknown() {
+        let date = |s: &str| super::nuget_date(Some(&serde_json::json!(s)));
+        assert_eq!(date("1900-01-01T00:00:00+00:00"), None);
+        assert_eq!(date("1949-12-31T23:59:59Z"), None);
+        assert_eq!(date("not a date"), None);
+        assert_eq!(super::nuget_date(None), None);
+        assert_eq!(date("2026-10-12T03:21:10.437Z"), Some(1_791_775_270));
         let leaves = [leaf("1.0.0", "1900-01-01T00:00:00+00:00")];
-        assert_eq!(super::leaf_published(&leaves, "1.0.0"), Some(None));
-        assert_eq!(super::leaf_published(&leaves, "2.0.0"), None);
+        assert!(super::find_leaf(&leaves, "1.0.0").is_some());
+        assert!(super::find_leaf(&leaves, "2.0.0").is_none());
+    }
+
+    /// A registration leaf of an unlisted version as nuget.org serves it
+    /// (squil.sqlserver 1.0.0-beta.206, 12.10.2026): `published` 1900-01-01, the real
+    /// date only in the catalog leaf at `catalogEntry.@id`.
+    fn unlisted_leaf(base: &str, id: &str, version: &str, committed: &str) -> serde_json::Value {
+        serde_json::json!({
+            "@id": format!("{base}/v3/registration5-gz-semver2/{id}/{version}.json"),
+            "@type": "Package",
+            "commitId": "891f12ff-077f-4182-8232-37dfde0f100c",
+            "commitTimeStamp": committed,
+            "catalogEntry": {
+                "@id": format!("{base}/v3/catalog0/data/2026.10.12.03.30.25/{id}.{version}.json"),
+                "@type": "PackageDetails",
+                "id": id,
+                "listed": false,
+                "published": "1900-01-01T00:00:00+00:00",
+                "version": version
+            },
+            "packageContent": format!("{base}/v3-flatcontainer/{id}/{version}/{id}.{version}.nupkg")
+        })
+    }
+
+    /// The catalog leaf of an unlisted version (the real document's date fields).
+    fn catalog_leaf(id: &str, version: &str, created: &str) -> serde_json::Value {
+        serde_json::json!({
+            "@type": ["PackageDetails", "catalog:Permalink"],
+            "catalog:commitId": "06705cfd-dce0-4e52-8dd0-0daf0abbc88b",
+            "catalog:commitTimeStamp": iso_ago(3000),
+            "created": created,
+            "id": id,
+            "lastEdited": iso_ago(3000),
+            "listed": false,
+            "published": "1900-01-01T00:00:00Z",
+            "version": version
+        })
+    }
+
+    /// `unl.pkg` on `upstream`, every version unlisted: 0.9.0 committed 30 days ago,
+    /// 1.0.0 created 30 days ago and 2.0.0 an hour ago, both re-committed an hour ago.
+    /// The catalog leaves are mounted when `leaves`.
+    async fn mount_unlisted(upstream: &wiremock::MockServer, leaves: bool) {
+        let base = upstream.uri();
+        let reg = |v: &str, c: &str| unlisted_leaf(&base, "unl.pkg", v, c);
+        mount_json(
+            upstream,
+            "/v3/registration5-gz-semver2/unl.pkg/index.json",
+            serde_json::json!({ "items": [{ "items": [
+                reg("0.9.0", &iso_ago(30 * 86400)),
+                reg("1.0.0", &iso_ago(3600)),
+                reg("2.0.0", &iso_ago(3600)),
+            ] }] }),
+        )
+        .await;
+        mount_json(
+            upstream,
+            "/v3-flatcontainer/unl.pkg/index.json",
+            serde_json::json!({ "versions": ["0.9.0", "1.0.0", "2.0.0"] }),
+        )
+        .await;
+        if leaves {
+            for (v, created) in [("1.0.0", 30 * 86400), ("2.0.0", 3600)] {
+                let path = format!("/v3/catalog0/data/2026.10.12.03.30.25/unl.pkg.{v}.json");
+                mount_json(
+                    upstream,
+                    &path,
+                    catalog_leaf("unl.pkg", v, &iso_ago(created)),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Upstream requests for `unl.pkg`'s catalog leaves, by version.
+    async fn catalog_fetches(upstream: &wiremock::MockServer) -> super::HashMap<String, usize> {
+        let mut by_version = super::HashMap::new();
+        for r in upstream.received_requests().await.unwrap() {
+            if let Some(leaf) = r.url.path().strip_prefix("/v3/catalog0/") {
+                let v = leaf.trim_end_matches(".json").rsplit("unl.pkg.").next();
+                *by_version.entry(v.unwrap().to_string()).or_default() += 1;
+            }
+        }
+        by_version
+    }
+
+    /// Live on iota 12.10.2026: an unlisted version (dated 1900-01-01) passed the
+    /// cooldown on both paths. It is dated from its catalog leaf: a young one is hidden
+    /// and refused, an old one served; each leaf is fetched once, and none for a
+    /// version whose registration commit is already past the cooldown.
+    #[tokio::test]
+    async fn test_unlisted_version_dated_from_catalog_leaf() {
+        let (upstream, ctx) = cooldown_upstream(true, &[], false).await;
+        mount_unlisted(&upstream, true).await;
+        assert_eq!(
+            flat_versions(&ctx, "unl.pkg").await,
+            serde_json::json!(["0.9.0", "1.0.0"])
+        );
+        let doc = json_body(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/nuget/v3/registration/unl.pkg/index.json",
+                "",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(leaf_versions(&doc["items"][0]["items"]), ["0.9.0", "1.0.0"]);
+        for _ in 0..2 {
+            for (v, status) in [
+                ("0.9.0", StatusCode::OK),
+                ("1.0.0", StatusCode::OK),
+                ("2.0.0", StatusCode::FORBIDDEN),
+            ] {
+                let resp = send(&ctx.app, Method::GET, &nupkg_uri("unl.pkg", v), "").await;
+                assert_eq!(resp.status(), status, "{v}");
+            }
+        }
+        let fetches = catalog_fetches(&upstream).await;
+        assert_eq!(fetches.get("1.0.0"), Some(&1), "{fetches:?}");
+        assert_eq!(fetches.get("2.0.0"), Some(&1), "{fetches:?}");
+        assert_eq!(fetches.get("0.9.0"), None, "{fetches:?}");
+    }
+
+    /// An unlisted version whose catalog leaf cannot be read: `curation.on_failure`
+    /// decides, `closed` hides and refuses it, `open` serves it. The one dated by its
+    /// old registration commit is served either way.
+    #[tokio::test]
+    async fn test_unlisted_version_without_catalog_leaf_follows_on_failure() {
+        use crate::config::CurationOnFailure;
+        for on_failure in [CurationOnFailure::Closed, CurationOnFailure::Open] {
+            let (upstream, _) = cooldown_upstream(true, &[], false).await;
+            mount_unlisted(&upstream, false).await;
+            let (uri, mode) = (upstream.uri(), on_failure.clone());
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.nuget.enabled = true;
+                cfg.nuget.proxy = Some(uri);
+                cfg.server.trust_upstream_dates = true;
+                cfg.curation.mode = crate::config::CurationMode::Enforce;
+                cfg.curation.min_release_age = Some("7d".to_string());
+                cfg.curation.on_failure = mode;
+            });
+            let closed = on_failure == CurationOnFailure::Closed;
+            let listed = if closed {
+                serde_json::json!(["0.9.0"])
+            } else {
+                serde_json::json!(["0.9.0", "1.0.0", "2.0.0"])
+            };
+            assert_eq!(
+                flat_versions(&ctx, "unl.pkg").await,
+                listed,
+                "{on_failure:?}"
+            );
+            for (v, status) in [
+                ("0.9.0", StatusCode::OK),
+                (
+                    "1.0.0",
+                    if closed {
+                        StatusCode::FORBIDDEN
+                    } else {
+                        StatusCode::OK
+                    },
+                ),
+            ] {
+                let resp = send(&ctx.app, Method::GET, &nupkg_uri("unl.pkg", v), "").await;
+                assert_eq!(resp.status(), status, "{on_failure:?} {v}");
+            }
+        }
     }
 
     /// C49: with `trust_upstream_dates = false` the cache mtime is no publish date:
@@ -3692,6 +3914,8 @@ mod integration_tests {
             cfg.curation.mode = crate::config::CurationMode::Enforce;
             cfg.curation.min_release_age = Some("7d".to_string());
             cfg.curation.internal_namespaces = vec!["corp.*".to_string()];
+            // No upstream date can be read: a proxied version would be held (on_failure).
+            cfg.server.trust_upstream_dates = true;
         });
         let (ct, body) = multipart(&nupkg("Own.Lib", "1.0.0", ""));
         let resp = crate::test_helpers::send_with_headers(
@@ -3707,6 +3931,8 @@ mod integration_tests {
             flat_versions(&ctx, "own.lib").await,
             serde_json::json!(["1.0.0"])
         );
+        let resp = send(&ctx.app, Method::GET, &nupkg_uri("own.lib", "1.0.0"), "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
         let doc = json_body(
             send(
                 &ctx.app,
