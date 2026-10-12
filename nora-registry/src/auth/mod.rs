@@ -2165,6 +2165,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             )),
             proxy_coalesce: crate::proxy_coalesce::InflightMap::new(),
             artifact_flights: crate::proxy_coalesce::InflightMap::new(),
+            spool: ctx.state.spool.clone(),
             blob_flights: crate::proxy_coalesce::InflightMap::new(),
             digest_store: ctx.state.digest_store.clone(),
             signer: ctx.state.signer.clone(),

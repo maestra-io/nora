@@ -686,9 +686,16 @@ async fn fetch_pub_api(
         &state.http_client,
         url,
         Duration::from_secs(state.config.pub_dart.proxy_timeout),
+        false,
         expose_opt(&state.config.pub_dart.proxy_auth).map(UpstreamAuth::Basic),
         Some(("Accept", PUB_CONTENT_TYPE)),
-        |response| async { response.bytes().await.map(|b| b.to_vec()) },
+        |response| async {
+            response
+                .bytes()
+                .await
+                .map(|b| b.to_vec())
+                .map_err(super::transport_error)
+        },
         cb,
         RegistryType::PubDart,
     )

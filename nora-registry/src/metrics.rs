@@ -384,6 +384,18 @@ pub static CACHE_WRITE_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create CACHE_WRITE_ERRORS metric at startup")
 });
 
+/// Disk spool refusals and failures by registry and reason: `busy` (the
+/// `server.spool_max_mb` budget is in use, 503), `too_large` (507 / 413),
+/// `no_space` (the spool volume is full, 507) and `io` (any other local failure, 500).
+pub static SPOOL_FAILURES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_spool_failures_total",
+        "Disk spool refusals and local failures (proxied artifacts, NuGet pushes, PyPI uploads)",
+        &["registry", "reason"]
+    )
+    .expect("failed to create SPOOL_FAILURES metric at startup")
+});
+
 /// Corrupt metadata detected during publish (#533)
 pub static METADATA_CORRUPT_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(

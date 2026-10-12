@@ -59,12 +59,28 @@ pub struct ServerConfig {
     #[serde(default = "default_publish_body_limit_mb")]
     pub publish_body_limit_mb: usize,
     /// Proxied NuGet/npm/PyPI artifacts larger than this many MB are never held in
-    /// memory whole: a cold miss is spooled to a temp file under `{storage.path}/tmp/`
+    /// memory whole: a cold miss is spooled to a temp file under `spool_dir`
     /// and served from it, a cache hit is streamed from storage with its digest
     /// checked as it streams. Smaller ones are buffered as before. Default 16;
     /// 0 buffers everything.
     #[serde(default = "default_stream_threshold_mb")]
     pub stream_threshold_mb: u64,
+    /// Directory of the disk spools: proxied artifacts above `stream_threshold_mb`
+    /// (`proxy-spool/`), NuGet pushes (`nuget-uploads/`) and PyPI uploads
+    /// (`pypi-uploads/`). Default `{storage.path}/tmp`. Point it at a volume of its
+    /// own so a full spool cannot starve the tokens and the quarantine ledger.
+    #[serde(default)]
+    pub spool_dir: Option<String>,
+    /// MB all spools may hold at once. A transfer that would exceed it is refused
+    /// with 503 + `Retry-After` (counted in `nora_spool_failures_total`); keep it
+    /// below the spool volume's size. Default 4096; 0 = no budget.
+    #[serde(default = "default_spool_max_mb")]
+    pub spool_max_mb: u64,
+    /// Largest upstream artifact body in MB nora proxies: a bigger one is refused
+    /// with 507 on its `Content-Length`, or as soon as the running count crosses the
+    /// cap. Default 2048; 0 = no cap.
+    #[serde(default = "default_proxy_max_artifact_mb")]
+    pub proxy_max_artifact_mb: u64,
 }
 
 pub(super) fn default_server_host() -> String {
@@ -107,6 +123,14 @@ pub(super) fn default_stream_threshold_mb() -> u64 {
     16
 }
 
+pub(super) fn default_spool_max_mb() -> u64 {
+    4096
+}
+
+pub(super) fn default_proxy_max_artifact_mb() -> u64 {
+    2048
+}
+
 /// TLS configuration for outbound connections to upstream registries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsConfig {
@@ -129,6 +153,9 @@ impl Default for ServerConfig {
             max_connections: default_max_connections(),
             publish_body_limit_mb: default_publish_body_limit_mb(),
             stream_threshold_mb: default_stream_threshold_mb(),
+            spool_dir: None,
+            spool_max_mb: default_spool_max_mb(),
+            proxy_max_artifact_mb: default_proxy_max_artifact_mb(),
         }
     }
 }
@@ -145,6 +172,20 @@ impl ServerConfig {
     /// `stream_threshold_mb` in bytes; 0 = never stream.
     pub fn stream_threshold(&self) -> u64 {
         self.stream_threshold_mb.saturating_mul(1024 * 1024)
+    }
+
+    /// `proxy_max_artifact_mb` in bytes; `None` = no cap.
+    pub fn proxy_max_artifact(&self) -> Option<u64> {
+        (self.proxy_max_artifact_mb > 0)
+            .then(|| self.proxy_max_artifact_mb.saturating_mul(1024 * 1024))
+    }
+
+    /// The spool directory: `spool_dir`, else `{storage_path}/tmp`.
+    pub fn spool_dir(&self, storage_path: &str) -> std::path::PathBuf {
+        match &self.spool_dir {
+            Some(dir) => dir.into(),
+            None => std::path::Path::new(storage_path).join("tmp"),
+        }
     }
 
     /// Format bind address for `TcpListener::bind`.
@@ -249,6 +290,19 @@ impl ServerConfig {
                 &mut self.stream_threshold_mb,
             );
         }
+        if let Ok(val) = env::var("NORA_SPOOL_DIR") {
+            self.spool_dir = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_SPOOL_MAX_MB") {
+            super::parse_env_warn("NORA_SPOOL_MAX_MB", &val, &mut self.spool_max_mb);
+        }
+        if let Ok(val) = env::var("NORA_PROXY_MAX_ARTIFACT_MB") {
+            super::parse_env_warn(
+                "NORA_PROXY_MAX_ARTIFACT_MB",
+                &val,
+                &mut self.proxy_max_artifact_mb,
+            );
+        }
         if let Ok(val) = env::var("NORA_PUBLISH_BODY_LIMIT_MB") {
             super::parse_env_warn(
                 "NORA_PUBLISH_BODY_LIMIT_MB",
@@ -333,7 +387,42 @@ mod tests {
             max_connections: 4096,
             publish_body_limit_mb: 512,
             stream_threshold_mb: 16,
+            spool_dir: None,
+            spool_max_mb: 4096,
+            proxy_max_artifact_mb: 2048,
         }
+    }
+
+    /// The spool lives under `{storage.path}/tmp` unless moved, with a 4 GB budget
+    /// and a 2 GB artifact cap by default; all three follow the env (R2-05).
+    #[test]
+    fn spool_knobs_default_and_env_override() {
+        let _lock = crate::test_env::env_lock();
+        let d = ServerConfig::default();
+        assert_eq!(
+            d.spool_dir("/data/storage"),
+            std::path::Path::new("/data/storage/tmp")
+        );
+        assert_eq!(
+            (d.spool_max_mb, d.proxy_max_artifact()),
+            (4096, Some(2048 << 20))
+        );
+        let mut config = ServerConfig::default();
+        std::env::set_var("NORA_SPOOL_DIR", "/spool");
+        std::env::set_var("NORA_SPOOL_MAX_MB", "100");
+        std::env::set_var("NORA_PROXY_MAX_ARTIFACT_MB", "0");
+        config.apply_env_overrides();
+        std::env::remove_var("NORA_SPOOL_DIR");
+        std::env::remove_var("NORA_SPOOL_MAX_MB");
+        std::env::remove_var("NORA_PROXY_MAX_ARTIFACT_MB");
+        assert_eq!(
+            config.spool_dir("/data/storage"),
+            std::path::Path::new("/spool")
+        );
+        assert_eq!(
+            (config.spool_max_mb, config.proxy_max_artifact()),
+            (100, None)
+        );
     }
 
     #[test]

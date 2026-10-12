@@ -82,7 +82,13 @@ spec:
               port: http
             periodSeconds: 15
             timeoutSeconds: 3
-          {{- with .Values.resources }}
+          {{- $resources := deepCopy (.Values.resources | default dict) }}
+          {{- if .Values.spool.enabled }}
+          {{- $mb := int .Values.spool.sizeLimitMb }}
+          {{- $_ := set $resources "requests" (merge ($resources.requests | default dict) (dict "ephemeral-storage" (printf "%dMi" $mb))) }}
+          {{- $_ := set $resources "limits" (merge ($resources.limits | default dict) (dict "ephemeral-storage" (printf "%dMi" (add $mb 1024)))) }}
+          {{- end }}
+          {{- with $resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
@@ -132,6 +138,10 @@ spec:
               mountPath: /data
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.spool.enabled }}
+            - name: spool
+              mountPath: {{ .Values.spool.mountPath }}
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -194,6 +204,11 @@ spec:
           {{- end }}
         - name: tmp
           emptyDir: {}
+        {{- if .Values.spool.enabled }}
+        - name: spool
+          emptyDir:
+            sizeLimit: {{ printf "%dMi" (int .Values.spool.sizeLimitMb) }}
+        {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

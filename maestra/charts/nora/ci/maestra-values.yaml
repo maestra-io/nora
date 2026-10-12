@@ -22,6 +22,11 @@ persistence:
   size: 1Gi
   storageClass: local-data
 
+# Spools off the 1Gi PVC: a torch-class wheel or a NuGet push can no longer fill
+# the volume that holds tokens and the quarantine ledger (R2-05).
+spool:
+  enabled: true
+
 resources:
   requests:
     cpu: 500m

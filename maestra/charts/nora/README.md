@@ -69,7 +69,7 @@ No PodDisruptionBudget: with one replica, `minAvailable: 1` / `maxUnavailable: 0
 | `persistence.accessModes` | Access modes | `[ReadWriteOnce]` |
 | `persistence.allowEphemeral` | Allow `storage.mode: s3` without a PVC | `false` |
 
-Keep persistence on in every storage mode. `/data` holds nora's local state even with S3: API tokens (`auth.token_storage`), the digest-quarantine ledger and the audit file (under `storage.path`) and upload spools. Only artifacts go to the bucket. With `persistence.enabled: false` `/data` is an emptyDir and every pod restart deletes all API tokens, so the chart refuses `storage.mode: s3` without persistence unless `persistence.allowEphemeral: true`.
+Keep persistence on in every storage mode. `/data` holds nora's local state even with S3: API tokens (`auth.token_storage`), the digest-quarantine ledger and the audit file (under `storage.path`) and, unless `spool.enabled`, the disk spools. Only artifacts go to the bucket. With `persistence.enabled: false` `/data` is an emptyDir and every pod restart deletes all API tokens, so the chart refuses `storage.mode: s3` without persistence unless `persistence.allowEphemeral: true`.
 
 ### NORA Configuration
 
@@ -326,7 +326,9 @@ Older chart versions mounted `existingSecret` as `/config/secrets/secrets.toml`,
 
 ### Resources
 
-Memory request equals the limit. nora holds a proxied artifact or a publish body in RAM (up to ~3x the body), so size memory for the largest package and cap `config.server.body_limit_mb` accordingly.
+Memory request equals the limit. nora holds a buffered publish body (npm, Maven, Cargo) and proxied artifacts up to `config.server.stream_threshold_mb` in RAM, so size memory for the largest such package and cap `config.server.publish_body_limit_mb` accordingly.
+
+Bigger proxied artifacts, NuGet pushes and PyPI uploads go to the disk spool. `spool.enabled: true` puts it on an emptyDir of `spool.sizeLimitMb` (4096) at `spool.mountPath`, sets `server.spool_dir` and a budget `server.spool_max_mb` of 7/8 of the size (a transfer over it is a 503 + `Retry-After`; the render fails on a budget that reaches the size), and adds an `ephemeral-storage` request of the size and limit of the size + 1Gi. Size it for the largest artifact times expected concurrency; `config.server.proxy_max_artifact_mb` (2048) caps one proxied artifact (507 above it).
 
 ```yaml
 resources:

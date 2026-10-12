@@ -101,10 +101,10 @@ httpRoute:
 
 # -- /data holds nora's local state in EVERY storage mode: API tokens
 # (auth.token_storage), the digest-quarantine ledger and audit.jsonl (under
-# storage.path) and upload spools. With storage.mode=s3 only artifacts go to
-# the bucket, so keep the volume: an emptyDir loses every API token on each
-# restart. The chart refuses s3 mode without persistence unless
-# allowEphemeral is set.
+# storage.path) and, unless spool.enabled, the disk spools. With
+# storage.mode=s3 only artifacts go to the bucket, so keep the volume: an
+# emptyDir loses every API token on each restart. The chart refuses s3 mode
+# without persistence unless allowEphemeral is set.
 persistence:
   enabled: true
   allowEphemeral: false
@@ -129,7 +129,8 @@ config:
     public_url: ""
     # -- Any other [server] key is rendered as is, e.g. body_limit_mb (2048),
     # shutdown_timeout (15, see terminationGracePeriodSeconds), proxy_coalesce,
-    # trust_upstream_dates.
+    # trust_upstream_dates, stream_threshold_mb (16), spool_max_mb (4096, see
+    # spool), proxy_max_artifact_mb (2048).
     # body_limit_mb: 256
     # shutdown_timeout: 15
   registries:
@@ -252,7 +253,8 @@ config:
     reset_timeout: 30
 
   # -- [nuget] keys, rendered as is: proxy_timeout (artifact download, 30 s
-  # per attempt), metadata_proxy_timeout (registration index / version list,
+  # to the response headers per attempt and per body stall, not for the whole
+  # download), metadata_proxy_timeout (registration index / version list,
   # per attempt, one retry; nora default 10 s), metadata_ttl, serve_stale,
   # revalidate, proxy, search_service, autocomplete. Enable NuGet itself via
   # registries.enable.
@@ -344,9 +346,24 @@ extraEnvFrom: []
 extraVolumes: []
 extraVolumeMounts: []
 
+# -- Dedicated volume for nora's disk spools: proxied artifacts above
+# config.server.stream_threshold_mb (16), NuGet pushes and PyPI uploads. An
+# emptyDir with sizeLimit at mountPath, rendered as server.spool_dir, so a
+# spool never fills /data (tokens, quarantine ledger). server.spool_max_mb
+# defaults to 7/8 of sizeLimitMb (past sizeLimit the kubelet evicts the pod);
+# a transfer over it is a 503 + Retry-After. The container gets an
+# ephemeral-storage request of sizeLimitMb and a limit of sizeLimitMb + 1Gi
+# unless resources sets them. Size it for the largest artifacts times their
+# concurrency (config.server.proxy_max_artifact_mb caps one, default 2048).
+spool:
+  enabled: false
+  mountPath: /spool
+  sizeLimitMb: 4096
+
 # -- Memory request == limit (Guaranteed memory, no overcommit OOM kills).
-# nora buffers a proxied artifact and a publish body in RAM (up to ~3x the
-# body), so size memory for the largest package; lower body_limit_mb to match.
+# nora buffers a publish body (npm, Maven, Cargo) and proxied artifacts up to
+# config.server.stream_threshold_mb in RAM; bigger artifacts and NuGet/PyPI
+# uploads go to the disk spool (see spool).
 resources:
   requests:
     cpu: 100m

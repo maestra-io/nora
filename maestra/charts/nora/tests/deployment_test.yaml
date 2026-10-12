@@ -524,3 +524,62 @@ tests:
             secret:
               secretName: nora-r2-creds
               defaultMode: 288
+
+  # R2-05: spools on their own size-limited emptyDir, never on the /data PVC.
+  - it: mounts no spool volume by default
+    template: templates/deployment.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: spool
+          any: true
+      - notExists:
+          path: spec.template.spec.containers[0].resources.requests.ephemeral-storage
+
+  - it: mounts the spool emptyDir with sizeLimit and matching ephemeral-storage
+    template: templates/deployment.yaml
+    set:
+      spool.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: spool
+            emptyDir:
+              sizeLimit: 4096Mi
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: spool
+            mountPath: /spool
+      - equal:
+          path: spec.template.spec.containers[0].resources
+          value:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+              ephemeral-storage: 4096Mi
+            limits:
+              memory: 512Mi
+              ephemeral-storage: 5120Mi
+
+  - it: keeps an explicit ephemeral-storage resource over the spool default
+    template: templates/deployment.yaml
+    set:
+      spool.enabled: true
+      spool.sizeLimitMb: 2048
+      resources.limits.ephemeral-storage: 8Gi
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.ephemeral-storage
+          value: 8Gi
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.ephemeral-storage
+          value: 2048Mi
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: spool
+            emptyDir:
+              sizeLimit: 2048Mi
