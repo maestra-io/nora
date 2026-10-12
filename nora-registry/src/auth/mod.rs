@@ -66,8 +66,10 @@ pub fn audit_actor(user: &Option<axum::Extension<AuthenticatedUser>>) -> &str {
 /// credentials (htpasswd passwords) are tracked: an `nra_` token or a JWT cannot be
 /// brute-forced, so a Bearer credential is never refused by the lockout.
 pub struct AuthFailureTracker {
-    /// (IP, username) -> (consecutive failures, last failure time)
-    entries: parking_lot::Mutex<HashMap<(IpAddr, String), (u32, Instant)>>,
+    /// (IP, username hash) -> (consecutive failures, last failure time). The hash
+    /// keeps an entry fixed-size whatever username a client sends.
+    entries: parking_lot::Mutex<HashMap<(IpAddr, u64), (u32, Instant)>>,
+    user_hasher: std::collections::hash_map::RandomState,
     /// Number of failures before lockout kicks in (default: 5)
     max_failures: u32,
     /// Maximum lockout duration in seconds (default: 900 = 15 minutes)
@@ -78,16 +80,22 @@ impl AuthFailureTracker {
     pub fn new(max_failures: u32, max_lockout_secs: u64) -> Self {
         Self {
             entries: parking_lot::Mutex::new(HashMap::new()),
+            user_hasher: Default::default(),
             max_failures,
             max_lockout_secs,
         }
+    }
+
+    fn key(&self, ip: IpAddr, user: &str) -> (IpAddr, u64) {
+        use std::hash::BuildHasher;
+        (ip, self.user_hasher.hash_one(user))
     }
 
     /// Check if `user` from `ip` is currently locked out. Returns remaining lockout
     /// seconds if blocked.
     pub fn check_blocked(&self, ip: &IpAddr, user: &str) -> Option<u64> {
         let entries = self.entries.lock();
-        let (failures, last_failure) = entries.get(&(*ip, user.to_string()))?;
+        let (failures, last_failure) = entries.get(&self.key(*ip, user))?;
         if *failures < self.max_failures {
             return None;
         }
@@ -105,7 +113,7 @@ impl AuthFailureTracker {
     pub fn record_failure(&self, ip: IpAddr, user: &str) {
         let mut entries = self.entries.lock();
         let entry = entries
-            .entry((ip, user.to_string()))
+            .entry(self.key(ip, user))
             .or_insert_with(|| (0, Instant::now()));
         entry.0 += 1;
         entry.1 = Instant::now();
@@ -114,7 +122,7 @@ impl AuthFailureTracker {
     /// Clear the failure count of `user` from `ip` on successful auth.
     pub fn record_success(&self, ip: &IpAddr, user: &str) {
         let mut entries = self.entries.lock();
-        entries.remove(&(*ip, user.to_string()));
+        entries.remove(&self.key(*ip, user));
     }
 
     /// Remove entries older than max_lockout_secs (call periodically).
