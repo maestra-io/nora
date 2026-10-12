@@ -1970,6 +1970,7 @@ mod tests {
             path,
             sha256: hex::encode(sha2::Sha256::digest(b"upstream")),
             len: 8,
+            _reservation: state.spool.reserve(8).unwrap(),
         }));
 
         // An upload holds the lock from its existence check through its write.
