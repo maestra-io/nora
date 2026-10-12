@@ -64,6 +64,11 @@ spec:
             - name: http
               containerPort: {{ .Values.config.server.port | default 4000 }}
               protocol: TCP
+            {{- with .Values.config.server.internal_port }}
+            - name: internal
+              containerPort: {{ . }}
+              protocol: TCP
+            {{- end }}
           startupProbe:
             httpGet:
               path: /health

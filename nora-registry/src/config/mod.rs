@@ -841,6 +841,11 @@ impl Config {
         if self.server.port == 0 {
             errors.push("server.port must not be 0".to_string());
         }
+        if let Some(internal) = self.server.internal_port {
+            if internal == 0 || internal == self.server.port {
+                errors.push("server.internal_port must not be 0 nor equal server.port".to_string());
+            }
+        }
 
         // 1b. Wildcard host requires public_url (non-routable address → broken client URLs)
         {
@@ -2861,6 +2866,18 @@ proxies = [
         let (_, errors) = config.validate();
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("port"));
+    }
+
+    #[test]
+    fn test_validate_internal_port_equal_to_port() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.server.internal_port = Some(config.server.port);
+        let (_, errors) = config.validate();
+        assert!(
+            errors.iter().any(|e| e.contains("internal_port")),
+            "{errors:?}"
+        );
     }
 
     #[test]

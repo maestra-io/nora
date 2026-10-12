@@ -13,6 +13,7 @@ The first commit on this path is the verbatim copy; every later commit is ours. 
 - `existingSecret` is an `envFrom` secretRef (nora never read the mounted `secrets.toml`); `extraVolumes` / `extraVolumeMounts`.
 - `[audit] mode` (default `stdout`), `[circuit_breaker]` (on), `[nuget]` (`metadata_proxy_timeout` 15 s), extra `[server]` keys.
 - `spool` (off by default, on in `ci/maestra-values.yaml`): size-limited emptyDir for the disk spools, rendered as `server.spool_dir` with `spool_max_mb` below the size limit and a matching `ephemeral-storage` request/limit.
+- `config.server.internal_port` (fork-only key, see `MAESTRA.md`) → containerPort and Service port `internal`; probes stay on `http`.
 - `ci/maestra-values.yaml`: our HelmRelease (fluxcd `iota/us-iota-lw-kube-infra/nora`) as values for this chart.
 
 ## Re-sync from upstream

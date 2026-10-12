@@ -2058,8 +2058,7 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     // Routes WITHOUT rate limiting (health, metrics, UI)
     let public_routes = Router::new()
-        .merge(health::routes())
-        .merge(metrics::routes())
+        .merge(health::public_routes(config.server.internal_port))
         .merge(ui::routes())
         .merge(openapi::routes());
 
@@ -2536,9 +2535,25 @@ async fn run_server(mut config: Config, storage: Storage) {
         });
     }
 
+    let limits = ConnLimits::from_config(&state.config.server);
+    // Maestra: detailed /health and /metrics on an internal port, off the public hostname.
+    if let Some(port) = state.config.server.internal_port {
+        let internal_listener = bind_listener(&state.config.server.host, port)
+            .await
+            .expect("Failed to bind server.internal_port");
+        info!(port, "Internal listener: /health, /ready, /metrics");
+        let internal = health::internal_routes().with_state(state.clone());
+        tokio::spawn(serve_with_drain(
+            internal_listener,
+            internal,
+            cancel_token.clone().cancelled_owned(),
+            std::time::Duration::from_secs(1),
+            limits,
+        ));
+    }
+
     // Graceful shutdown on SIGTERM/SIGINT, draining for at most `shutdown_timeout` (#1016)
     let drain = std::time::Duration::from_secs(state.config.server.shutdown_timeout);
-    let limits = ConnLimits::from_config(&state.config.server);
     match serve_with_drain(listener, app, shutdown_signal(), drain, limits).await {
         ServeEnd::Drained => {}
         ServeEnd::DeadlinePassed => warn!(

@@ -54,6 +54,14 @@ pub struct ServerConfig {
     /// NORA is closing (a 502 for a non-replayable publish). Default 120; 0 = no limit.
     #[serde(default = "default_keep_alive_timeout")]
     pub keep_alive_timeout: u64,
+    /// Port of an internal listener (same `host`) serving the detailed `/health`,
+    /// `/ready` and `/metrics`, for the kubelet and the Prometheus scrape. When set,
+    /// the main port no longer serves `/metrics`, and its `/health` reports the status
+    /// only (no version, storage backend, registries, upstream breaker state). Keep
+    /// the internal port off the public ingress. Default unset (all on `port`);
+    /// `NORA_INTERNAL_PORT=0` unsets it.
+    #[serde(default)]
+    pub internal_port: Option<u16>,
     /// Open client connections served at once. Past it NORA stops accepting until
     /// one closes; new clients wait in the listen backlog. Default 4096; 0 = no limit.
     #[serde(default = "default_max_connections")]
@@ -161,6 +169,7 @@ impl Default for ServerConfig {
             trust_upstream_dates: default_trust_upstream_dates(),
             header_read_timeout: default_header_read_timeout(),
             keep_alive_timeout: default_keep_alive_timeout(),
+            internal_port: None,
             max_connections: default_max_connections(),
             publish_body_limit_mb: default_publish_body_limit_mb(),
             stream_threshold_mb: default_stream_threshold_mb(),
@@ -291,6 +300,12 @@ impl ServerConfig {
                 &mut self.header_read_timeout,
             );
         }
+        if let Ok(val) = env::var("NORA_INTERNAL_PORT") {
+            // 0 = off.
+            let mut port = self.internal_port.unwrap_or(0);
+            super::parse_env_warn("NORA_INTERNAL_PORT", &val, &mut port);
+            self.internal_port = (port > 0).then_some(port);
+        }
         if let Ok(val) = env::var("NORA_KEEP_ALIVE_TIMEOUT") {
             super::parse_env_warn(
                 "NORA_KEEP_ALIVE_TIMEOUT",
@@ -385,6 +400,11 @@ mod tests {
             ),
             (5, 100, 10)
         );
+        assert_eq!(d.internal_port, None);
+        std::env::set_var("NORA_INTERNAL_PORT", "9100");
+        config.apply_env_overrides();
+        std::env::remove_var("NORA_INTERNAL_PORT");
+        assert_eq!(config.internal_port, Some(9100));
     }
 
     /// The publish cap defaults to 512 MB, follows the env and never exceeds the
@@ -416,6 +436,7 @@ mod tests {
             shutdown_timeout: 15,
             header_read_timeout: 30,
             keep_alive_timeout: 120,
+            internal_port: None,
             max_connections: 4096,
             publish_body_limit_mb: 512,
             stream_threshold_mb: 16,

@@ -11,5 +11,11 @@ spec:
       targetPort: http
       protocol: TCP
       name: http
+    {{- with .Values.config.server.internal_port }}
+    - port: {{ . }}
+      targetPort: internal
+      protocol: TCP
+      name: internal
+    {{- end }}
   selector:
     {{- include "nora.selectorLabels" . | nindent 4 }}

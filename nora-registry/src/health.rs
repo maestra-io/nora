@@ -63,6 +63,28 @@ pub fn routes() -> Router<AppState> {
         .route("/ready", get(readiness_check))
 }
 
+/// Probe and metrics routes of the main listener. With `server.internal_port` set
+/// the detailed `/health` and `/metrics` live on the internal listener only, and the
+/// public hostname gets the verdicts alone: status and code, nothing to fingerprint.
+pub fn public_routes(internal_port: Option<u16>) -> Router<AppState> {
+    match internal_port {
+        None => routes().merge(crate::metrics::routes()),
+        Some(_) => Router::new()
+            .route("/health", get(health_status_only))
+            .route("/ready", get(readiness_check)),
+    }
+}
+
+/// The internal listener's routes (`server.internal_port`).
+pub fn internal_routes() -> Router<AppState> {
+    routes().merge(crate::metrics::routes())
+}
+
+async fn health_status_only(state: State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let (code, Json(health)) = health_check(state).await;
+    (code, Json(serde_json::json!({ "status": health.status })))
+}
+
 async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<HealthStatus>) {
     let storage_reachable = check_storage_reachable(&state).await;
     let total_size = state.storage.total_size().await;
@@ -275,6 +297,34 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(json["status"], "stalled");
+    }
+
+    /// With an internal port the public listener's /health carries the status only
+    /// and /metrics is not served there; the internal routes keep both (R2-53).
+    #[tokio::test]
+    async fn test_internal_port_moves_details_off_the_public_routes() {
+        let ctx = create_test_context();
+        let public = super::public_routes(Some(9100)).with_state(ctx.state.clone());
+        let resp = send(&public, Method::GET, "/health", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json, serde_json::json!({ "status": "healthy" }));
+        let ready = send(&public, Method::GET, "/ready", "").await;
+        assert_eq!(ready.status(), StatusCode::OK);
+        let metrics = send(&public, Method::GET, "/metrics", "").await;
+        assert_eq!(metrics.status(), StatusCode::NOT_FOUND);
+
+        let internal = super::internal_routes().with_state(ctx.state.clone());
+        let resp = send(&internal, Method::GET, "/health", "").await;
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert!(json.get("version").is_some() && json.get("upstreams").is_some());
+        let metrics = send(&internal, Method::GET, "/metrics", "").await;
+        assert_eq!(metrics.status(), StatusCode::OK);
+
+        // Unset: everything on the main listener, as upstream.
+        let all = super::public_routes(None).with_state(ctx.state.clone());
+        let metrics = send(&all, Method::GET, "/metrics", "").await;
+        assert_eq!(metrics.status(), StatusCode::OK);
     }
 
     #[tokio::test]
