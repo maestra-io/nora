@@ -284,7 +284,10 @@ mod tests {
             j.record(&format!("k{i}"), "sha").await.unwrap();
         }
         assert_eq!(j.snapshot().len(), 70);
-        // Rebuilt from disk confirms the periodic fsync persisted them.
+        // The periodic sync made the first SYNC_EVERY durable; the tail is only
+        // guaranteed after an explicit sync (tokio's File may still be writing it).
+        assert!(store.open_journal("r").await.unwrap().snapshot().len() >= SYNC_EVERY);
+        j.sync().await.unwrap();
         assert_eq!(store.open_journal("r").await.unwrap().snapshot().len(), 70);
     }
 }
