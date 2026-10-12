@@ -62,4 +62,4 @@ Changes meant for upstream: branch from `main`, cherry-pick, open the PR against
 
 ## Runbooks
 
-`maestra/runbooks/<Alertname>.md`: agent-executable runbooks for packages.maestra.io, linked from the alert's `runbook_url` in `deploy/prometheus-rules.yml` (and its chart copy). The cluster's PrometheusRule picks up a new `runbook_url` only with the next chart release and fluxcd version bump.
+`maestra/runbooks/<Alertname>.md`: agent-executable runbooks for packages.maestra.io, linked from the alert's `runbook_url` in `deploy/prometheus-rules.yml` (and its chart copy). The cluster's PrometheusRule picks up a new `runbook_url` only with the next chart release and fluxcd version bump. Exception: alerts in the fluxcd HelmRelease `metrics.prometheusRule.extraGroups` (group `nora-maestra`, e.g. `NoraOidcJwksRejections`) carry their `runbook_url` there and change with a fluxcd PR alone.
