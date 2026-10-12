@@ -160,16 +160,6 @@ async fn package_versions(
     let prefix = format!("pypi/{}/", normalized);
     let base_url = nora_base_url(&state);
 
-    // #896: for JSON (Renovate) clients, ensure upstream PEP 700 upload-times are cached
-    // so the index can surface them. No-op if already cached / internal / no upstream.
-    // The map is read ONCE here and threaded through to [`pep700_meta`] — re-reading
-    // `dates.json` per response was a second round-trip on the hot path (#969).
-    let dates = if wants_json(&headers) {
-        ensure_pypi_dates_cached(&state, &normalized, None).await
-    } else {
-        serde_json::Map::new()
-    };
-
     // Collect local files with their hashes and sizes. `list_with_meta` carries the
     // size from the listing itself; a per-key `stat()` is a HEAD per file on S3 and
     // must never appear on this path (#738, regressed on the JSON index by #969).
@@ -306,7 +296,8 @@ async fn package_versions(
             .iter()
             .find(|(key, _)| *key == cache_key)
             .map(|(_, meta)| meta.modified);
-        let upstream = match upstream_index(&state, &normalized, &cache_key, cached_at).await {
+        let ttl = state.config.pypi.metadata_ttl;
+        let upstream = match upstream_index(&state, &normalized, cached_at, ttl).await {
             UpstreamIndex::Files(upstream) => upstream,
             UpstreamIndex::Stale(upstream) => {
                 stale = true;
@@ -319,6 +310,11 @@ async fn package_versions(
 
     if !files.is_empty() {
         let mut response = if wants_json(&headers) {
+            // #896: for JSON (Renovate) clients, ensure upstream PEP 700 upload-times are
+            // cached so the index can surface them. No-op if already cached / internal /
+            // no upstream. Read after the index refresh, which refreshes them too (R2-24),
+            // and ONCE: re-reading `dates.json` per file was a round-trip each (#969).
+            let dates = ensure_pypi_dates_cached(&state, &normalized, None).await;
             let pep700 = pep700_meta(&files, &local_sizes, &dates);
             versions_json_response(&normalized, &files, &base_url, &pep700)
         } else {
@@ -389,7 +385,11 @@ async fn fetch_upstream_index(state: &AppState, normalized: &str) -> UpstreamFet
         {
             Ok(html) => {
                 out.answered = true;
-                out.files.extend(parse_upstream_files(&html));
+                out.files
+                    .extend(parse_upstream_files(&html, &url).into_iter().map(|mut f| {
+                        f.upstream = Some(up.url().to_string());
+                        f
+                    }));
             }
             Err(crate::registry::ProxyError::NotFound) => out.answered = true,
             Err(crate::registry::ProxyError::CircuitOpen(_)) => out.circuit_open = true,
@@ -402,28 +402,37 @@ async fn fetch_upstream_index(state: &AppState, normalized: &str) -> UpstreamFet
     out
 }
 
-/// The upstream file list of `normalized`, cached in `cache_key` (`cached_at` is its
-/// mtime from the project listing, `None` when absent).
+/// The upstream file list of `normalized`, cached in `pypi/<project>/upstream-index.json`
+/// (`cached_at` is its mtime, `None` when absent) and served while within `ttl`
+/// (`pypi.metadata_ttl`, or the miss TTL of a lookup the copy cannot answer).
 ///
-/// Within `pypi.metadata_ttl` the stored copy is served without asking the upstreams,
+/// Within the TTL the stored copy is served without asking the upstreams,
 /// so a project every upstream 404s (a private one outside
 /// `curation.internal_namespaces`) is not looked up on every request, and a CI fan-out
 /// costs one upstream fetch per project per TTL. A refetch runs single-flight per
 /// project and is stored only when every upstream answered. When it fails, the last
 /// good copy is served stale; with no copy, the merge of the upstreams that did answer
 /// (one dead mirror must not sink the others, #663), or the upstream error when none did.
+///
+/// With `server.trust_upstream_dates` the refetch also refreshes `dates.json`, after the
+/// file list (a file published in between is dated, never listed undated) and stored
+/// before it: the index and its dates are one snapshot (R2-24).
 async fn upstream_index(
     state: &AppState,
     normalized: &str,
-    cache_key: &str,
     cached_at: Option<u64>,
+    ttl: i64,
 ) -> UpstreamIndex {
+    let cache_key = format!("pypi/{normalized}/{UPSTREAM_INDEX_FILE}");
+    let cache_key = cache_key.as_str();
+    // A copy written before entries carried their URL cannot resolve a download.
     let read_cached = || async {
         let data = state.storage.get(cache_key).await.ok()?;
-        serde_json::from_slice::<Vec<FileEntry>>(&data).ok()
+        serde_json::from_slice::<Vec<FileEntry>>(&data)
+            .ok()
+            .filter(|files| files.iter().all(|f| f.url.is_some()))
     };
-    if cached_at.is_some_and(|m| crate::cache_ttl::is_within_ttl(m, state.config.pypi.metadata_ttl))
-    {
+    if cached_at.is_some_and(|m| crate::cache_ttl::is_within_ttl(m, ttl)) {
         if let Some(files) = read_cached().await {
             return UpstreamIndex::Files(files);
         }
@@ -437,6 +446,23 @@ async fn upstream_index(
         *fetch_slot = fetch_upstream_index(state, normalized).await;
         if fetch_slot.circuit_open || fetch_slot.error.is_some() {
             return None;
+        }
+        if state.config.server.trust_upstream_dates {
+            // A project no upstream lists has nothing to date: no second lookup.
+            let dates = if fetch_slot.files.is_empty() {
+                serde_json::Map::new()
+            } else {
+                fetch_upstream_dates(state, normalized).await?
+            };
+            let key = format!("pypi/{normalized}/dates.json");
+            if let Err(e) = state
+                .storage
+                .put(&key, &serde_json::to_vec(&dates).ok()?)
+                .await
+            {
+                tracing::warn!(key = %key, error = %e, "pypi: failed to cache dates");
+                return None;
+            }
         }
         let bytes = serde_json::to_vec(&fetch_slot.files).ok()?;
         if let Err(e) = state.storage.put(cache_key, &bytes).await {
@@ -479,6 +505,51 @@ async fn upstream_index(
     }
 }
 
+/// The upstream index entries of `filename` with the configured upstream of each, in
+/// precedence order, resolved from the cached index (R2-27): a download or `.metadata`
+/// request costs no project page fetch while the index is within `pypi.metadata_ttl`.
+/// A copy that does not list the file is refetched once it is older than the miss TTL
+/// (a release published since); an upstream outage with no copy is its 5xx.
+async fn upstream_entries(
+    state: &AppState,
+    normalized: &str,
+    filename: &str,
+) -> Result<Vec<(crate::config::PypiProxyEntry, FileEntry)>, Response> {
+    let cache_key = format!("pypi/{normalized}/{UPSTREAM_INDEX_FILE}");
+    let upstreams = state.config.pypi.upstreams();
+    let listing = |files: Vec<FileEntry>| -> Vec<_> {
+        files
+            .into_iter()
+            .filter(|f| f.filename == filename)
+            .filter_map(|f| {
+                let up = upstreams
+                    .iter()
+                    .find(|up| f.upstream.as_deref() == Some(up.url()))?;
+                Some((up.clone(), f))
+            })
+            .collect()
+    };
+    let ttl = state.config.pypi.metadata_ttl;
+    let cached_at = state.storage.stat(&cache_key).await.map(|m| m.modified);
+    let (found, stale) = match upstream_index(state, normalized, cached_at, ttl).await {
+        UpstreamIndex::Files(files) => (listing(files), false),
+        UpstreamIndex::Stale(files) => (listing(files), true),
+        UpstreamIndex::Failed(response) => return Err(response),
+    };
+    // Not listed by a copy served from cache past the miss TTL: refetch it once.
+    let refetch = cached_at.is_some_and(|m| {
+        crate::cache_ttl::is_within_ttl(m, ttl)
+            && !crate::cache_ttl::is_within_ttl(m, miss_ttl(state))
+    });
+    if !found.is_empty() || stale || !refetch {
+        return Ok(found);
+    }
+    match upstream_index(state, normalized, cached_at, miss_ttl(state)).await {
+        UpstreamIndex::Files(files) | UpstreamIndex::Stale(files) => Ok(listing(files)),
+        UpstreamIndex::Failed(response) => Err(response),
+    }
+}
+
 // ============================================================================
 // Download
 // ============================================================================
@@ -508,22 +579,7 @@ async fn download_file(
 
     // Curation check — before storage access
     let version = crate::curation::parse_pypi_version(&normalized, &filename);
-
-    // Extract the upstream release date for this file (PEP 700 `upload-time` from
-    // the PEP 691 simple JSON, cached as dates.json). Seeds the digest-quarantine
-    // first-seen clock so a provably-old release is not held as "new to this
-    // mirror" (#748/#750). Only consulted when upstream dates are trusted. A file the
-    // cached map does not date (published after it was fetched) refreshes it, so a new
-    // release is never dated by an older snapshot.
-    let publish_date = if state.config.server.trust_upstream_dates {
-        ensure_pypi_dates_cached(&state, &normalized, Some(&filename))
-            .await
-            .get(&filename)
-            .and_then(|v| v.as_str())
-            .and_then(crate::curation::parse_iso8601_to_unix)
-    } else {
-        extract_pypi_publish_date(&state.storage, &normalized, &filename).await
-    };
+    let key = format!("pypi/{}/{}", normalized, filename);
 
     // #733 serve-local: an internal-namespace package is operator-owned — skip curation
     // and serve any local copy below; the upstream branch is blocked separately (never proxy).
@@ -532,25 +588,10 @@ async fn download_file(
         crate::curation::RegistryType::PyPI,
         &normalized,
     );
-    if !internal {
-        if let Some(response) = crate::curation::check_download(
-            &state.curation().curation_engine,
-            state.bypass_token().as_deref(),
-            &headers,
-            crate::curation::RegistryType::PyPI,
-            &normalized,
-            crate::curation::RequestVersion::of_artifact(version.as_deref()),
-            publish_date,
-        ) {
-            return response;
-        }
-    }
-
-    let key = format!("pypi/{}/{}", normalized, filename);
 
     // Digest-quarantine: first-seen hold for proxy artifacts (generalizes the
     // Docker-only wiring). Resolved once; applied at each serve point below.
-    let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+    let (mut q_mode, q_secs) = crate::digest_quarantine::resolve_global(
         state.config.curation.pypi.quarantine.as_ref().or(state
             .config
             .curation
@@ -564,6 +605,55 @@ async fn download_file(
             .as_deref()
             .or(state.config.curation.quarantine_ttl.as_deref()),
     );
+    let quarantine_on = !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off);
+
+    // A hosted file (internal namespace, or uploaded / imported here: stored without the
+    // proxy's provenance marker) is our own publish, not an upstream artifact: never held
+    // by the quarantine (R2-23, as npm's C30), never dated upstream (R2-45).
+    let hosted = internal
+        || ((quarantine_on || state.config.server.trust_upstream_dates)
+            && state.storage.stat(&key).await.is_some()
+            && state
+                .storage
+                .stat(&proxied_marker_key(&key))
+                .await
+                .is_none());
+    if hosted {
+        q_mode = crate::digest_quarantine::QuarantineMode::Off;
+    }
+    let quarantine_on = !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off);
+
+    // Extract the upstream release date for this file (PEP 700 `upload-time` from
+    // the PEP 691 simple JSON, cached as dates.json). Seeds the digest-quarantine
+    // first-seen clock so a provably-old release is not held as "new to this
+    // mirror" (#748/#750). Only consulted when upstream dates are trusted. A file the
+    // cached map does not date (published after it was fetched) refreshes the index and
+    // the map together, so a new release is never dated by an older snapshot (R2-24).
+    let publish_date = if hosted {
+        None
+    } else if state.config.server.trust_upstream_dates {
+        ensure_pypi_dates_cached(&state, &normalized, Some(&filename))
+            .await
+            .get(&filename)
+            .and_then(|v| v.as_str())
+            .and_then(crate::curation::parse_iso8601_to_unix)
+    } else {
+        extract_pypi_publish_date(&state.storage, &normalized, &filename).await
+    };
+
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::PyPI,
+            &normalized,
+            crate::curation::RequestVersion::of_artifact(version.as_deref()),
+            publish_date,
+        ) {
+            return response;
+        }
+    }
 
     // Resumable download (#657): serve the requested bytes from the backend and skip
     // the full read below. Package files only — the simple index is generated, never
@@ -598,7 +688,6 @@ async fn download_file(
     }
 
     let engine = &state.curation().curation_engine;
-    let quarantine_on = !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off);
 
     // Try local storage first, integrity-gated: read whole and verified, or above
     // `server.stream_threshold_mb` streamed with its pin checked as it streams.
@@ -671,42 +760,20 @@ async fn download_file(
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
-    // Try each configured upstream in order; the first whose index lists the file
-    // serves it, fetched from that same upstream with that upstream's auth. One
-    // upstream's failure or open breaker skips to the next rather than failing (#663).
+    // The upstreams whose index lists the file, in precedence order, from the cached
+    // index (R2-27); each is fetched with that upstream's auth. One upstream's failure
+    // or open breaker skips to the next rather than failing (#663).
+    let entries = match upstream_entries(&state, &normalized, &filename).await {
+        Ok(entries) => entries,
+        Err(response) => return response,
+    };
     let mut circuit_open = false;
     let mut upstream_err: Option<(String, crate::registry::ProxyError)> = None;
-    for up in &state.config.pypi.upstreams() {
-        let page_url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
-
-        let html = match proxy_fetch_text(
-            &state.http_client,
-            &page_url,
-            Duration::from_secs(state.config.pypi.proxy_timeout),
-            up.auth().map(UpstreamAuth::Basic),
-            Some(("Accept", "text/html")),
-            &state.circuit_breaker,
-            BreakerScope::upstream(RegistryType::PyPI, up.url()),
-        )
-        .await
-        {
-            Ok(html) => html,
-            Err(crate::registry::ProxyError::CircuitOpen(_)) => {
-                circuit_open = true;
-                continue;
-            }
-            Err(crate::registry::ProxyError::NotFound) => continue,
-            Err(e) => {
-                tracing::debug!(error = ?e, package = %normalized, upstream = %up.url(), "PyPI page proxy fetch failed, trying next upstream");
-                upstream_err = Some((page_url, e));
-                continue;
-            }
-        };
-
-        // The file may live on a later upstream — keep walking the list.
-        let Some((file_url, expected_sha256)) = find_file_url(&html, &filename, &page_url) else {
+    for (up, entry) in &entries {
+        let Some(file_url) = entry.url.clone() else {
             continue;
         };
+        let expected_sha256 = entry.sha256.as_deref();
 
         // A file above `server.stream_threshold_mb` is spooled to disk (C17).
         match proxy_fetch_artifact(
@@ -725,9 +792,9 @@ async fn download_file(
                 let sha256 = data.sha256();
                 // The index published this file's digest: a body that does not match
                 // (truncated, corrupted, tampered) is neither served nor cached.
-                if let Some(expected) = &expected_sha256 {
+                if let Some(expected) = expected_sha256 {
                     let actual = &sha256;
-                    if actual != expected {
+                    if !actual.eq_ignore_ascii_case(expected) {
                         tracing::warn!(package = %normalized, filename = %filename, upstream = %up.url(), %expected, %actual, "PyPI upstream file does not match the index sha256, refusing it");
                         return StatusCode::BAD_GATEWAY.into_response();
                     }
@@ -896,42 +963,16 @@ async fn core_metadata(state: &AppState, normalized: &str, wheel: &str) -> Respo
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    let entries = match upstream_entries(state, normalized, wheel).await {
+        Ok(entries) => entries,
+        Err(response) => return response,
+    };
     let mut circuit_open = false;
     let mut upstream_err: Option<(String, crate::registry::ProxyError)> = None;
-    for up in &state.config.pypi.upstreams() {
+    for (up, entry) in &entries {
         let timeout = Duration::from_secs(state.config.pypi.proxy_timeout);
-        let page_url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
-        let html = match proxy_fetch_text(
-            &state.http_client,
-            &page_url,
-            timeout,
-            up.auth().map(UpstreamAuth::Basic),
-            Some(("Accept", "text/html")),
-            &state.circuit_breaker,
-            BreakerScope::upstream(RegistryType::PyPI, up.url()),
-        )
-        .await
-        {
-            Ok(html) => html,
-            Err(crate::registry::ProxyError::CircuitOpen(_)) => {
-                circuit_open = true;
-                continue;
-            }
-            Err(crate::registry::ProxyError::NotFound) => continue,
-            Err(e) => {
-                upstream_err = Some((page_url, e));
-                continue;
-            }
-        };
-        let Some((file_url, _)) = find_file_url(&html, wheel, &page_url) else {
-            continue;
-        };
         // Only where this upstream's index advertises it, as PEP 658 requires.
-        let Some(advertised) = parse_upstream_files(&html)
-            .into_iter()
-            .find(|f| f.filename == wheel)
-            .and_then(|f| f.core_metadata)
-        else {
+        let (Some(file_url), Some(advertised)) = (&entry.url, &entry.core_metadata) else {
             continue;
         };
         let url = format!("{file_url}.metadata");
@@ -1004,27 +1045,40 @@ async fn upload(
     let mut content: Option<(std::path::PathBuf, TempFileGuard, u64, String)> = None;
     // Spool budget held by `content` until it is stored (R2-05).
     let mut reservation = None;
-    let budget = (state.config.server.body_limit_mb as u64).saturating_mul(1024 * 1024);
+    // The body is capped by `server.body_limit_mb` (DefaultBodyLimit, which the multipart
+    // stream enforces): crossing it is a 413, any other malformed body a 400 (R2-25).
+    let limit_mb = state.config.server.body_limit_mb;
+    let reject = |e: axum::extract::multipart::MultipartError| {
+        let status = e.status();
+        if status == StatusCode::PAYLOAD_TOO_LARGE {
+            (status, format!("upload exceeds {limit_mb} MiB")).into_response()
+        } else {
+            (status, format!("Failed to read upload: {}", e.body_text())).into_response()
+        }
+    };
 
     // Parse multipart fields
-    while let Ok(Some(mut field)) = multipart.next_field().await {
+    loop {
+        let mut field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) => return reject(e),
+        };
         let field_name = field.name().unwrap_or("").to_string();
 
         match field_name.as_str() {
-            ":action" => {
-                action = field.text().await.ok().unwrap_or_default();
-            }
-            "name" => {
-                name = field.text().await.ok().unwrap_or_default();
-            }
-            "version" => {
-                version = field.text().await.ok().unwrap_or_default();
-            }
-            "sha256_digest" => {
-                sha256_digest = field.text().await.ok().unwrap_or_default();
-            }
-            "requires_python" => {
-                requires_python = field.text().await.ok().unwrap_or_default();
+            ":action" | "name" | "version" | "sha256_digest" | "requires_python" => {
+                let value = match field.text().await {
+                    Ok(value) => value,
+                    Err(e) => return reject(e),
+                };
+                match field_name.as_str() {
+                    ":action" => action = value,
+                    "name" => name = value,
+                    "version" => version = value,
+                    "sha256_digest" => sha256_digest = value,
+                    _ => requires_python = value,
+                }
             }
             "content" if content.is_none() => {
                 filename = field.file_name().unwrap_or("unknown").to_string();
@@ -1049,13 +1103,6 @@ async fn upload(
                     match field.chunk().await {
                         Ok(Some(chunk)) => {
                             size += chunk.len() as u64;
-                            if size > budget {
-                                return (
-                                    StatusCode::PAYLOAD_TOO_LARGE,
-                                    format!("file exceeds {} MiB", budget >> 20),
-                                )
-                                    .into_response();
-                            }
                             if let Err(e) = spool.grow(size) {
                                 return e.response("pypi");
                             }
@@ -1065,13 +1112,7 @@ async fn upload(
                             }
                         }
                         Ok(None) => break,
-                        Err(e) => {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                format!("Failed to read file: {}", e),
-                            )
-                                .into_response()
-                        }
+                        Err(e) => return reject(e),
                     }
                 }
                 // Durable before put_from_path's rename publishes it.
@@ -1082,7 +1123,13 @@ async fn upload(
             }
             _ => {
                 // Skip other metadata fields (summary, author, etc.) without buffering.
-                while let Ok(Some(_)) = field.chunk().await {}
+                loop {
+                    match field.chunk().await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(e) => return reject(e),
+                    }
+                }
             }
         }
     }
@@ -1307,6 +1354,13 @@ struct FileEntry {
     /// nora can serve `<file>.metadata`: a stored copy, or the upstream's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     core_metadata: Option<String>,
+    /// Upstream entries only: the file's absolute URL (no fragment) and the configured
+    /// upstream that lists it, so a download or `.metadata` request is resolved from the
+    /// cached index instead of refetching the project page (R2-27).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upstream: Option<String>,
 }
 
 /// PEP 691 top-level response — typed to prevent field-name drift.
@@ -1331,8 +1385,8 @@ struct Pep691Meta {
 struct Pep691File {
     filename: String,
     url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hashes: Option<Pep691Hashes>,
+    /// Always present, `{}` when no digest is known: PEP 691 says it MUST be (R2-29).
+    hashes: Pep691Hashes,
     /// PEP 700 upload-time (RFC3339), when known (from the cached dates.json).
     #[serde(rename = "upload-time", skip_serializing_if = "Option::is_none")]
     upload_time: Option<String>,
@@ -1354,7 +1408,8 @@ struct Pep691File {
 
 #[derive(serde::Serialize)]
 struct Pep691Hashes {
-    sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
 }
 
 /// Render the PEP 691 + PEP 700 simple JSON. `pep700` maps filename → (size,
@@ -1384,10 +1439,9 @@ fn versions_json_response(
             Pep691File {
                 filename: f.filename.clone(),
                 url: format!("{}/simple/{}/{}", base, normalized, f.filename),
-                hashes: f
-                    .sha256
-                    .as_ref()
-                    .map(|h| Pep691Hashes { sha256: h.clone() }),
+                hashes: Pep691Hashes {
+                    sha256: f.sha256.clone(),
+                },
                 upload_time,
                 size,
                 requires_python: f.requires_python.clone(),
@@ -1648,9 +1702,17 @@ fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str)
 // Helpers
 // ============================================================================
 
-/// Seconds a cached `dates.json` that lacks a requested file is kept before that
-/// miss refetches it (bounds the upstream lookups for files no upstream dates).
-const DATES_MISS_REFETCH_SECS: i64 = 60;
+/// Seconds a cached upstream index (and with trusted dates its `dates.json`) that
+/// lacks a requested file is kept before that miss refetches it (bounds the upstream
+/// lookups for a file no upstream lists or dates). Never above `pypi.metadata_ttl`.
+const MISS_REFETCH_SECS: i64 = 60;
+
+fn miss_ttl(state: &AppState) -> i64 {
+    match state.config.pypi.metadata_ttl {
+        ttl if ttl < 0 => MISS_REFETCH_SECS,
+        ttl => ttl.min(MISS_REFETCH_SECS),
+    }
+}
 
 /// Untrusted upstream dates (#513): NORA's own first-seen clock, the mtime of the
 /// `dates.json` that listed the file (never rewritten in this mode). A file it does not
@@ -1676,12 +1738,12 @@ async fn extract_pypi_publish_date(
 /// to NORA's own time. The PEP 503 HTML index NORA fetches for the file *listing*
 /// carries no dates, hence this JSON fetch.
 ///
-/// With trusted upstream dates a cached map is refreshed (single-flight per project)
-/// when it is older than `pypi.metadata_ttl` (`want` = `None`, the index), or when it
-/// does not list `want` and is older than [`DATES_MISS_REFETCH_SECS`]: a release
-/// published after the map was fetched would otherwise carry no date and pass the
-/// `min_release_age` cooldown. With untrusted dates a cached map is never rewritten,
-/// its mtime is the first-seen clock ([`extract_pypi_publish_date`]).
+/// With trusted upstream dates the map is written with the upstream index, as one
+/// snapshot ([`upstream_index`], R2-24): a cached map is returned as is for the index
+/// (`want` = `None`); one that does not list `want`, or no map at all, refreshes the
+/// index (and with it the map) unless it is younger than the miss TTL, so a release
+/// published after the snapshot is never dated by it. With untrusted dates a cached map
+/// is never rewritten, its mtime is the first-seen clock ([`extract_pypi_publish_date`]).
 ///
 /// #969: an upstream that answers but emits no `upload-time` (any pre-PEP-700 index —
 /// devpi, Artifactory, an older NORA) used to leave nothing cached, so every single
@@ -1696,37 +1758,45 @@ async fn ensure_pypi_dates_cached(
     want: Option<&str>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let key = format!("pypi/{}/dates.json", normalized);
-    let cached: Option<serde_json::Map<String, serde_json::Value>> = state
-        .storage
-        .get(&key)
-        .await
-        .ok()
-        .map(|data| serde_json::from_slice(&data).unwrap_or_default());
-    if let Some(map) = &cached {
-        if !state.config.server.trust_upstream_dates {
-            return cached.unwrap_or_default();
-        }
-        let ttl = match want {
-            Some(file) if map.contains_key(file) => return cached.unwrap_or_default(),
-            Some(_) => DATES_MISS_REFETCH_SECS,
-            None => state.config.pypi.metadata_ttl,
-        };
-        let fresh = state
+    let read = || async {
+        state
             .storage
-            .stat(&key)
+            .get(&key)
             .await
-            .is_some_and(|meta| crate::cache_ttl::is_within_ttl(meta.modified, ttl));
-        if fresh {
-            return cached.unwrap_or_default();
+            .ok()
+            .map(|data| serde_json::from_slice(&data).unwrap_or_default())
+    };
+    let trusted = state.config.server.trust_upstream_dates;
+    let cached: Option<serde_json::Map<String, serde_json::Value>> = read().await;
+    if let Some(map) = &cached {
+        match want {
+            _ if !trusted => return cached.unwrap_or_default(),
+            Some(file) if map.contains_key(file) => return cached.unwrap_or_default(),
+            None => return cached.unwrap_or_default(),
+            Some(_) => {
+                let fresh = state.storage.stat(&key).await.is_some_and(|meta| {
+                    crate::cache_ttl::is_within_ttl(meta.modified, miss_ttl(state))
+                });
+                if fresh {
+                    return cached.unwrap_or_default();
+                }
+            }
         }
     }
     // #68: never fetch an internal-namespace package's metadata upstream.
-    if crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::PyPI,
-        normalized,
-    ) {
+    if state.config.pypi.upstreams().is_empty()
+        || crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::PyPI,
+            normalized,
+        )
+    {
         return cached.unwrap_or_default();
+    }
+    if trusted {
+        // R2-24: refetch the index, which refreshes the dates with it.
+        let _ = upstream_index(state, normalized, None, 0).await;
+        return read().await.or(cached).unwrap_or_default();
     }
     let refresh = || async {
         let map = fetch_upstream_dates(state, normalized).await?;
@@ -1968,8 +2038,11 @@ fn extract_filename(url: &str) -> Option<&str> {
 ///
 /// Extracts filenames, optional `#sha256=` fragments and the PEP 503/592
 /// `data-requires-python` / `data-yanked` attributes from `<a href="...">` links.
-/// Filenames are percent-decoded (`%2B` -> `+`), the form the download route sees.
-fn parse_upstream_files(html: &str) -> Vec<FileEntry> {
+/// Filenames are percent-decoded (`%2B` -> `+`), the form the download route sees; each
+/// `url` is the href without its fragment, still encoded, resolved against `page_url`
+/// (relative hrefs of some mirrors: Tsinghua, USTC, Aliyun, #877).
+fn parse_upstream_files(html: &str, page_url: &str) -> Vec<FileEntry> {
+    let base = reqwest::Url::parse(page_url).ok();
     let mut files = Vec::new();
     let mut offset = 0;
 
@@ -1993,6 +2066,14 @@ fn parse_upstream_files(html: &str) -> Vec<FileEntry> {
                 })
                 .map_or(html.len(), |(e, _)| offset + 1 + e);
             let tag = &html[tag_start..tag_end];
+            let raw = url.split('#').next().unwrap_or(url);
+            let resolved = if raw.starts_with("http://") || raw.starts_with("https://") {
+                raw.to_string()
+            } else {
+                base.as_ref()
+                    .and_then(|base| base.join(raw).ok())
+                    .map_or_else(|| raw.to_string(), |u| u.to_string())
+            };
             files.push(FileEntry {
                 filename: percent_encoding::percent_decode_str(filename)
                     .decode_utf8_lossy()
@@ -2003,6 +2084,8 @@ fn parse_upstream_files(html: &str) -> Vec<FileEntry> {
                 core_metadata: html_attr(tag, "data-core-metadata")
                     .or_else(|| html_attr(tag, "data-dist-info-metadata"))
                     .map(html_unescape),
+                url: Some(resolved),
+                upstream: None,
             });
         }
     }
@@ -2072,55 +2155,6 @@ fn merge_file_lists(upstream: Vec<FileEntry>, local: &[FileEntry]) -> Vec<FileEn
     result
 }
 
-/// Find the download URL for a specific file in the HTML, with the `#sha256=`
-/// digest the index publishes for it, if any.
-///
-/// `page_url` is the simple-index page URL used to resolve relative hrefs
-/// returned by some mirrors (Tsinghua, USTC, Aliyun) (#877).
-fn find_file_url(
-    html: &str,
-    target_filename: &str,
-    page_url: &str,
-) -> Option<(String, Option<String>)> {
-    let mut remaining = html;
-
-    while let Some(href_start) = remaining.find("href=\"") {
-        remaining = &remaining[href_start + 6..];
-
-        if let Some(href_end) = remaining.find('"') {
-            let url = &remaining[..href_end];
-
-            if let Some(filename) = extract_filename(url) {
-                // Index hrefs percent-encode characters such as '+' (PyTorch's
-                // "+cu124" -> "%2Bcu124"); the requested filename arrives already
-                // decoded, so compare decoded forms. The URL itself is returned
-                // unchanged — it must stay encoded to fetch from the upstream (#664).
-                let decoded = percent_encoding::percent_decode_str(filename).decode_utf8_lossy();
-                if decoded.as_ref() == target_filename {
-                    let raw = url.split('#').next().unwrap_or(url).to_string();
-                    let sha256 = url
-                        .find("#sha256=")
-                        .map(|pos| url[pos + 8..].to_ascii_lowercase());
-                    // Resolve relative URLs against the page URL (#877).
-                    if raw.starts_with("http://") || raw.starts_with("https://") {
-                        return Some((raw, sha256));
-                    }
-                    let resolved = reqwest::Url::parse(page_url)
-                        .ok()
-                        .and_then(|base| base.join(&raw).ok())
-                        .map(|u| u.to_string())
-                        .unwrap_or(raw);
-                    return Some((resolved, sha256));
-                }
-            }
-
-            remaining = &remaining[href_end..];
-        }
-    }
-
-    None
-}
-
 // ============================================================================
 // Unit Tests
 // ============================================================================
@@ -2130,6 +2164,14 @@ fn find_file_url(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// The resolved URL and lower-cased `#sha256=` of `target` in an upstream index page.
+    fn find_file_url(html: &str, target: &str, page_url: &str) -> Option<(String, Option<String>)> {
+        parse_upstream_files(html, page_url)
+            .into_iter()
+            .find(|f| f.filename == target)
+            .map(|f| (f.url.unwrap(), f.sha256.map(|h| h.to_ascii_lowercase())))
+    }
 
     fn find_url(html: &str, target: &str, page_url: &str) -> Option<String> {
         find_file_url(html, target, page_url).map(|(url, _)| url)
@@ -2417,7 +2459,7 @@ mod tests {
     fn test_parse_upstream_files_basic() {
         let html = r#"<a href="https://files.example.com/pkg-1.0-cp310-cp310-linux_x86_64.whl#sha256=aaa">pkg</a>
 <a href="https://files.example.com/pkg-1.0-cp314-cp314-linux_x86_64.whl#sha256=bbb">pkg</a>"#;
-        let files = parse_upstream_files(html);
+        let files = parse_upstream_files(html, "https://pypi.org/simple/x/");
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].filename, "pkg-1.0-cp310-cp310-linux_x86_64.whl");
         assert_eq!(files[0].sha256.as_deref(), Some("aaa"));
@@ -2428,7 +2470,7 @@ mod tests {
     #[test]
     fn test_parse_upstream_files_no_hash() {
         let html = r#"<a href="https://example.com/pkg-1.0.tar.gz">pkg</a>"#;
-        let files = parse_upstream_files(html);
+        let files = parse_upstream_files(html, "https://pypi.org/simple/x/");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].filename, "pkg-1.0.tar.gz");
         assert!(files[0].sha256.is_none());
@@ -2436,15 +2478,18 @@ mod tests {
 
     #[test]
     fn test_parse_upstream_files_empty() {
-        assert!(parse_upstream_files("").is_empty());
-        assert!(parse_upstream_files("<html><body></body></html>").is_empty());
+        assert!(parse_upstream_files("", "https://pypi.org/simple/x/").is_empty());
+        assert!(
+            parse_upstream_files("<html><body></body></html>", "https://pypi.org/simple/x/")
+                .is_empty()
+        );
     }
 
     #[test]
     fn test_parse_upstream_files_skips_non_package_links() {
         let html = r#"<a href="https://example.com/readme.txt">readme</a>
 <a href="https://example.com/pkg-1.0.whl#sha256=abc">pkg</a>"#;
-        let files = parse_upstream_files(html);
+        let files = parse_upstream_files(html, "https://pypi.org/simple/x/");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].filename, "pkg-1.0.whl");
     }
@@ -2607,7 +2652,7 @@ mod tests {
             "\n",
             r#"<a data-requires-python="<4" href="https://f/pkg-2.0.tar.gz" data-yanked=">old">x</a>"#,
         );
-        let files = parse_upstream_files(html);
+        let files = parse_upstream_files(html, "https://pypi.org/simple/x/");
         assert_eq!(files.len(), 5);
         // Unescaped `<` / `>` inside attribute values (lenient mirrors).
         assert_eq!(files[4].requires_python.as_deref(), Some("<4"));
@@ -2632,6 +2677,7 @@ mod tests {
                 requires_python: Some(">=3.8".into()),
                 yanked: None,
                 core_metadata: Some("sha256=cc".into()),
+                ..Default::default()
             },
             FileEntry {
                 filename: "pkg-1.1.tar.gz".into(),
@@ -2655,7 +2701,7 @@ mod tests {
             html.contains(r#"data-requires-python="&gt;=3.8""#),
             "{html}"
         );
-        let parsed = parse_upstream_files(html);
+        let parsed = parse_upstream_files(html, "https://pypi.org/simple/x/");
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[0].requires_python.as_deref(), Some(">=3.8"));
         assert_eq!(parsed[0].sha256.as_deref(), Some("aa"));
@@ -2671,6 +2717,7 @@ mod tests {
         assert_eq!(parsed[2].core_metadata, None);
         let legacy = parse_upstream_files(
             r#"<a href="https://up/pkg-1.0-py3-none-any.whl" data-dist-info-metadata="sha256=dd">x</a>"#,
+            "https://pypi.org/simple/pkg/",
         );
         assert_eq!(legacy[0].core_metadata.as_deref(), Some("sha256=dd"));
 
@@ -2752,6 +2799,7 @@ mod tests {
             requires_python: Some(">=3.9".into()),
             yanked: Some("cve".into()),
             core_metadata: Some("sha256=up".into()),
+            ..Default::default()
         }];
         let local = vec![FileEntry {
             filename: "pkg-1.0.whl".into(),
@@ -4371,6 +4419,225 @@ mod integration_tests {
         );
     }
 
+    /// R2-23, R2-45: a file uploaded here (internal namespace or not) is never held by
+    /// the digest quarantine and never dated upstream: its downloads cost no upstream
+    /// request, even with a dead upstream. A proxied copy (provenance marker) still is held.
+    #[tokio::test]
+    async fn uploaded_files_are_neither_quarantined_nor_dated_upstream() {
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxy = Some(uri);
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("1h".to_string());
+            cfg.curation.internal_namespaces = vec!["intpkg".to_string()];
+        });
+        for project in ["intpkg", "ownpkg"] {
+            let file = format!("{project}-1.0.tar.gz");
+            let resp = twine_upload(
+                &ctx.app,
+                &[("name", project), ("version", "1.0")],
+                &file,
+                b"sdist",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            for _ in 0..2 {
+                let uri = format!("/simple/{project}/{file}");
+                let resp = send(&ctx.app, Method::GET, &uri, "").await;
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+                assert_eq!(text(resp).await, "sdist");
+            }
+        }
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "an uploaded file is never looked up upstream"
+        );
+
+        let key = "pypi/cached/cached-1.0.tar.gz";
+        ctx.state.storage.put(key, b"proxied").await.unwrap();
+        ctx.state
+            .storage
+            .put(&super::proxied_marker_key(key), b"")
+            .await
+            .unwrap();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/cached/cached-1.0.tar.gz",
+            "",
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a proxied copy is held"
+        );
+    }
+
+    /// R2-24: the index and its dates are one snapshot. A dates map cached before a
+    /// release (fresh by its own clock) no longer lets an index refresh list the release
+    /// undated, nor its download through the `min_release_age` cooldown.
+    #[tokio::test]
+    async fn index_refresh_dates_the_files_it_lists() {
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let u = upstream.uri();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        Mock::given(method("GET"))
+            .and(path("/fresh/"))
+            .and(header("accept", super::PEP691_JSON))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"files":[
+                {{"filename":"fresh-1.0.tar.gz","upload-time":"2020-01-01T00:00:00Z"}},
+                {{"filename":"fresh-2.0.tar.gz","upload-time":"{now}"}}]}}"#
+            )))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/fresh/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<a href="{u}/f/fresh-1.0.tar.gz">a</a><a href="{u}/f/fresh-2.0.tar.gz">b</a>"#
+            )))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/f/fresh-2.0.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"sdist".to_vec()))
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxy = Some(u);
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+        });
+        // Just cached (by a download miss of another file), before 2.0 was published.
+        ctx.state
+            .storage
+            .put(
+                "pypi/fresh/dates.json",
+                br#"{"fresh-1.0.tar.gz":"2020-01-01T00:00:00Z"}"#,
+            )
+            .await
+            .unwrap();
+
+        let html = text(send(&ctx.app, Method::GET, "/simple/fresh/", "").await).await;
+        assert!(html.contains("fresh-1.0.tar.gz"), "{html}");
+        assert!(!html.contains("fresh-2.0.tar.gz"), "listed undated: {html}");
+        let resp = send(&ctx.app, Method::GET, "/simple/fresh/fresh-2.0.tar.gz", "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "the cooldown holds it"
+        );
+    }
+
+    /// R2-27: a cold-miss download and a PEP 658 `.metadata` request are resolved from
+    /// the cached upstream index: after the index request, no project page is fetched
+    /// again.
+    #[tokio::test]
+    async fn downloads_resolve_from_the_cached_upstream_index() {
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let meta = "Metadata-Version: 2.1\nName: cold\nVersion: 1.0\n";
+        let whl = wheel("cold-1.0.dist-info", meta);
+        let index = format!(
+            r#"<a href="{u}/f/cold-1.0-py3-none-any.whl#sha256={w}" data-core-metadata="sha256={m}">a</a>
+<a href="{u}/f/cold-1.0.tar.gz">b</a>"#,
+            u = upstream.uri(),
+            w = sha256_hex(&whl),
+            m = sha256_hex(meta.as_bytes()),
+        );
+        Mock::given(method("GET"))
+            .and(path("/cold/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(index))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/f/cold-1.0-py3-none-any.whl.metadata"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(meta))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/f/cold-1.0-py3-none-any.whl"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(whl.clone()))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/f/cold-1.0.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"sdist".to_vec()))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| cfg.pypi.proxy = Some(uri));
+        let page_fetches = || async {
+            upstream
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path() == "/cold/")
+                .count()
+        };
+
+        assert_eq!(
+            send(&ctx.app, Method::GET, "/simple/cold/", "")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let after_index = page_fetches().await;
+        for file in [
+            "cold-1.0-py3-none-any.whl.metadata",
+            "cold-1.0-py3-none-any.whl.metadata",
+            "cold-1.0-py3-none-any.whl",
+            "cold-1.0.tar.gz",
+        ] {
+            let uri = format!("/simple/cold/{file}");
+            assert_eq!(
+                send(&ctx.app, Method::GET, &uri, "").await.status(),
+                StatusCode::OK,
+                "{uri}"
+            );
+        }
+        assert_eq!(page_fetches().await, after_index, "no project page refetch");
+    }
+
+    /// R2-25: an upload over `server.body_limit_mb` is a 413, not a 400.
+    #[tokio::test]
+    async fn oversize_upload_is_413() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.server.body_limit_mb = 1;
+        });
+        let resp = twine_upload(
+            &ctx.app,
+            &[("name", "big"), ("version", "1.0")],
+            "big-1.0.tar.gz",
+            &vec![0u8; 2 * 1024 * 1024],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let dir = ctx.state.spool.dir(crate::registry::PYPI_UPLOAD_SUBDIR);
+        let left = std::fs::read_dir(dir).map_or(0, |d| d.count());
+        assert_eq!(left, 0, "no spool left");
+    }
+
     /// C40: a project only nora has (every upstream answers 404) is looked up upstream
     /// once per `metadata_ttl`, not on every index request, for HTML and JSON clients.
     #[tokio::test]
@@ -4411,8 +4678,9 @@ mod integration_tests {
         }
         let hits = upstream.received_requests().await.unwrap().len();
         assert_eq!(
-            hits, 2,
-            "one index and one dates lookup in total, not one per request"
+            hits, 1,
+            "one index lookup in total, not one per request; no upstream lists it, so \
+             there is nothing to date"
         );
     }
 
@@ -4444,7 +4712,15 @@ mod integration_tests {
         }
         let resp = send(&ctx.app, Method::GET, "/simple/hot/", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+        // One fetch of the index and one of its dates (trusted upstream dates, R2-24).
+        let accepts: Vec<String> = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.headers["accept"].to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(accepts, ["text/html", super::PEP691_JSON]);
     }
 
     /// C41: when the refetch fails, the last good merged index is served (with a
@@ -4617,10 +4893,10 @@ mod spec_conformance_tests {
         );
     }
 
-    /// PEP 691: `hashes` field must be omitted when no hash is available,
-    /// not set to null or empty object.
+    /// PEP 691: the `hashes` dictionary MUST be present even when no hash is available
+    /// (uv rejects the whole project page without it), as `{}`, not null.
     #[test]
-    fn test_pep691_hashes_omitted_when_none() {
+    fn test_pep691_hashes_empty_when_none() {
         let files = vec![FileEntry {
             filename: "pkg-1.0.tar.gz".into(),
             sha256: None,
@@ -4633,9 +4909,10 @@ mod spec_conformance_tests {
                 .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
-        assert!(
-            json["files"][0].get("hashes").is_none(),
-            "hashes must be omitted (not null) when no hash available"
+        assert_eq!(
+            json["files"][0]["hashes"],
+            serde_json::json!({}),
+            "R2-29: PEP 691 hashes MUST be present, empty when no hash is known"
         );
     }
 
@@ -4771,7 +5048,7 @@ mod spec_conformance_tests {
             <a href="https://example.com/page">Not a package</a>
             <a href="/about">About</a>
         </body></html>"#;
-        let files = parse_upstream_files(html);
+        let files = parse_upstream_files(html, "https://pypi.org/simple/x/");
         assert!(
             files.is_empty(),
             "HTML without package links should yield empty list"

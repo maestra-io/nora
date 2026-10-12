@@ -390,6 +390,21 @@ mod tests {
             <a href=\"/f/pkg-1.0-py3-none-any.whl#sha256=bb\">pkg-1.0-py3-none-any.whl</a><br>\
             <a href=\"/f/pkg-1.1.tar.gz#sha256=cc\">pkg-1.1.tar.gz</a><br>\
             </body></html>";
+        // The dates come with the index, from the upstream's PEP 691 JSON (R2-24).
+        let dated = |f: &str, ago: i64| json!({ "filename": f, "upload-time": iso_ago(ago) });
+        let pep691 = json!({ "files": [
+            dated("pkg-1.0.tar.gz", OLD), dated("pkg-1.0-py3-none-any.whl", OLD),
+            dated("pkg-1.1.tar.gz", YOUNG)
+        ]});
+        Mock::given(method("GET"))
+            .and(path("/pkg/"))
+            .and(wiremock::matchers::header(
+                "accept",
+                "application/vnd.pypi.simple.v1+json",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pep691))
+            .mount(&upstream)
+            .await;
         Mock::given(method("GET"))
             .and(path("/pkg/"))
             .respond_with(ResponseTemplate::new(200).set_body_string(html))
@@ -402,15 +417,6 @@ mod tests {
             cooldown(cfg, mode);
             cfg.curation.pypi.allow = allow;
         });
-        let dates = json!({
-            "pkg-1.0.tar.gz": iso_ago(OLD), "pkg-1.0-py3-none-any.whl": iso_ago(OLD),
-            "pkg-1.1.tar.gz": iso_ago(YOUNG)
-        });
-        ctx.state
-            .storage
-            .put("pypi/pkg/dates.json", dates.to_string().as_bytes())
-            .await
-            .unwrap();
         (upstream, ctx)
     }
 

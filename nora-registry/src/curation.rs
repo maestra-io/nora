@@ -13,7 +13,6 @@
 //! - [`CurationMetrics`] for raw counters
 
 use crate::config::{CurationConfig, CurationMode};
-use crate::validation::ends_with_ci;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -145,7 +144,14 @@ pub struct CurationEngine {
     /// Namespace isolation filter — always active, even in Off mode.
     namespace_filter: Option<Box<dyn ProxyFilter>>,
     metrics: CurationMetrics,
+    /// When each (registry, name, version) last logged its audit "would be hidden"
+    /// line, so a metadata request per CI job does not repeat it (R2-28).
+    audit_hidden_logged:
+        parking_lot::Mutex<std::collections::HashMap<(RegistryType, String, String), u64>>,
 }
+
+/// One audit "would be hidden from metadata" line per version per this many seconds.
+const AUDIT_HIDDEN_LOG_SECS: u64 = 3600;
 
 impl CurationEngine {
     /// Create a new engine with no filters.
@@ -156,6 +162,7 @@ impl CurationEngine {
             min_age: None,
             namespace_filter: None,
             metrics: CurationMetrics::new(),
+            audit_hidden_logged: Default::default(),
         }
     }
 
@@ -204,14 +211,34 @@ impl CurationEngine {
             return false;
         }
         if self.config.mode == CurationMode::Audit {
-            tracing::info!(
-                registry = %registry,
-                package = %name,
-                version = %version,
-                "[AUDIT] Version would be hidden from metadata (min-release-age)"
-            );
+            if self.first_audit_hidden_log(registry, name, version) {
+                tracing::info!(
+                    registry = %registry,
+                    package = %name,
+                    version = %version,
+                    "[AUDIT] Version would be hidden from metadata (min-release-age)"
+                );
+            }
             return false;
         }
+        true
+    }
+
+    /// Whether `name@version` has not logged its audit hiding line within
+    /// [`AUDIT_HIDDEN_LOG_SECS`]; records it as logged now if so.
+    fn first_audit_hidden_log(&self, registry: RegistryType, name: &str, version: &str) -> bool {
+        let now = crate::cache_ttl::now_unix();
+        let fresh = |at: u64| now.saturating_sub(at) < AUDIT_HIDDEN_LOG_SECS;
+        let mut logged = self.audit_hidden_logged.lock();
+        // Bounded: expired entries are swept once the map grows large.
+        if logged.len() >= 10_000 {
+            logged.retain(|_, at| fresh(*at));
+        }
+        let key = (registry, name.to_string(), version.to_string());
+        if logged.get(&key).is_some_and(|at| fresh(*at)) {
+            return false;
+        }
+        logged.insert(key, now);
         true
     }
 
@@ -722,38 +749,16 @@ fn parse_npm_tarball_file(package_name: &str, filename: &str) -> Option<String> 
     Some(version.to_string())
 }
 
-/// Parse version from a PyPI download filename.
+/// Parse version from a PyPI download filename of project `normalized_name`.
 ///
-/// Handles: `.tar.gz`, `.zip`, `.whl`, `.egg`, `.tgz`
-/// For wheels, version is between the first and second `-`.
+/// Handles: `.tar.gz`, `.zip`, `.whl`, `.egg`, `.tgz`. The distribution part is
+/// compared PEP 503-normalized, so a pre-PEP 625 sdist that keeps the project's
+/// hyphens (`python-dateutil-2.8.2.tar.gz`) parses like its wheel (R2-26). Same split
+/// as the upload validation ([`crate::registry::pypi::split_dist_filename`]).
 pub fn parse_pypi_version(normalized_name: &str, filename: &str) -> Option<String> {
-    // Strip known extensions
-    let base = filename
-        .strip_suffix(".tar.gz")
-        .or_else(|| filename.strip_suffix(".tgz"))
-        .or_else(|| filename.strip_suffix(".zip"))
-        .or_else(|| filename.strip_suffix(".whl"))
-        .or_else(|| filename.strip_suffix(".egg"))?;
-
-    // Normalize: PyPI filenames use underscores, normalized names use hyphens
-    let name_underscore = normalized_name.replace('-', "_");
-    let base_lower = base.to_lowercase();
-    let prefix = format!("{}-", name_underscore.to_lowercase());
-
-    let rest = base_lower.strip_prefix(&prefix)?;
-    // For wheels: rest is "VERSION-py3-none-any" — take until next '-' that starts a tag
-    // For sdist: rest is just "VERSION"
-    // Heuristic: version chars are digits, dots, letters (rc, alpha, beta, post, dev)
-    // Split at first '-' followed by non-digit (wheel tags like py3, cp39)
-    let version = if ends_with_ci(filename, ".whl") {
-        rest.split('-').next()?
-    } else {
-        rest
-    };
-    if version.is_empty() {
-        return None;
-    }
-    Some(version.to_string())
+    use crate::registry::pypi::{normalize_name, split_dist_filename};
+    let (dist, version) = split_dist_filename(filename)?;
+    (normalize_name(dist) == normalize_name(normalized_name)).then(|| version.to_lowercase())
 }
 
 // ============================================================================
@@ -1521,6 +1526,50 @@ mod tests {
             mode: CurationMode::Enforce,
             ..CurationConfig::default()
         }
+    }
+
+    /// R2-28: audit mode logs a young version's "would be hidden" line once per window,
+    /// not once per metadata request, per registry, name and version.
+    #[test]
+    fn audit_hidden_from_metadata_logs_once_per_version() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .finish();
+
+        let mut engine = CurationEngine::new(audit_config());
+        engine.set_min_release_age(MinReleaseAgeFilter::new(7 * 86400, "7d"));
+        let young = Some(crate::cache_ttl::now_unix() as i64);
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..5 {
+                for (registry, name, version) in [
+                    (RegistryType::PyPI, "boto3", "1.0"),
+                    (RegistryType::PyPI, "boto3", "1.1"),
+                    (RegistryType::Npm, "boto3", "1.0"),
+                ] {
+                    assert!(!engine.hides_from_metadata(registry, name, version, young));
+                }
+            }
+        });
+        let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            out.matches("would be hidden from metadata").count(),
+            3,
+            "{out}"
+        );
     }
 
     // ---- Mode=Off tests ----
@@ -3411,6 +3460,44 @@ mod tests {
             super::parse_pypi_version("my-package", "my_package-1.2.3.tar.gz"),
             Some("1.2.3".to_string())
         );
+    }
+
+    /// R2-26: a pre-PEP 625 sdist keeps the project's hyphens; its wheel escapes them.
+    #[test]
+    fn test_parse_pypi_version_hyphenated_sdist_and_wheel() {
+        for file in [
+            "python-dateutil-2.8.2.tar.gz",
+            "python_dateutil-2.8.2.tar.gz",
+            "python_dateutil-2.8.2-py2.py3-none-any.whl",
+            "Python.Dateutil-2.8.2.zip",
+        ] {
+            assert_eq!(
+                super::parse_pypi_version("python-dateutil", file).as_deref(),
+                Some("2.8.2"),
+                "{file}"
+            );
+        }
+        // Another project's file is not a version of this one.
+        assert_eq!(
+            super::parse_pypi_version("python", "python-dateutil-2.8.2.tar.gz"),
+            None
+        );
+        // The allow list exempts the hyphenated sdist (it reads its version).
+        let mut filter = MinReleaseAgeFilter::new(7 * 86400, "7d");
+        filter
+            .add_allow(RegistryType::PyPI, "python-dateutil@2.8.2")
+            .unwrap();
+        let version = super::parse_pypi_version("python-dateutil", "python-dateutil-2.8.2.tar.gz");
+        let request = FilterRequest {
+            registry: RegistryType::PyPI,
+            upstream: None,
+            name: "python-dateutil".to_string(),
+            version: RequestVersion::of_artifact(version.as_deref()),
+            integrity: None,
+            bypass: false,
+            publish_date: Some(crate::cache_ttl::now_unix() as i64),
+        };
+        assert_eq!(filter.evaluate(&request), Decision::Skip);
     }
 
     #[test]

@@ -169,7 +169,7 @@ pub use self::maven::{MavenConfig, MavenProxy, MavenProxyEntry};
 pub use self::npm::{npm_scope_of, NpmConfig, NpmProxyEntry};
 pub use self::nuget::NugetConfig;
 pub use self::pub_dart::PubDartConfig;
-pub use self::pypi::PypiConfig;
+pub use self::pypi::{PypiConfig, PypiProxyEntry};
 pub use self::raw::RawConfig;
 pub use self::rpm::RpmConfig;
 pub use self::terraform::TerraformConfig;
