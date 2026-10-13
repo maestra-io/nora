@@ -149,7 +149,7 @@ fn pypi_hidden(
 ) -> HashSet<String> {
     filenames
         .filter(|f| {
-            let version = crate::curation::parse_pypi_version(name, f);
+            let version = crate::pypi_files::parse_pypi_version(name, f);
             let version = version.as_deref().unwrap_or(f);
             engine.hides_from_metadata(RegistryType::PyPI, name, version, date_of(Some(dates), f))
         })
@@ -182,15 +182,16 @@ pub fn pypi_index(
         let kept: HashSet<String> = files
             .iter()
             .filter_map(filename)
-            .filter_map(|f| crate::curation::parse_pypi_version(name, &f))
+            .filter_map(|f| crate::pypi_files::parse_pypi_version(name, &f))
             .collect();
         let gone: HashSet<String> = hidden
             .iter()
-            .filter_map(|f| crate::curation::parse_pypi_version(name, f))
+            .filter_map(|f| crate::pypi_files::parse_pypi_version(name, f))
             .filter(|v| !kept.contains(v))
             .collect();
+        // parse_pypi_version lowercases the file name; `versions` carries them as published.
         if let Some(versions) = doc.get_mut("versions").and_then(Value::as_array_mut) {
-            versions.retain(|v| v.as_str().is_none_or(|v| !gone.contains(v)));
+            versions.retain(|v| v.as_str().is_none_or(|v| !gone.contains(&v.to_lowercase())));
         }
         return serde_json::to_vec(&doc).ok();
     }
