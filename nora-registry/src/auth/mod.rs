@@ -99,8 +99,7 @@ impl AuthFailureTracker {
         if *failures < self.max_failures {
             return None;
         }
-        let exponent = (*failures - self.max_failures).min(20);
-        let lockout_secs = (1u64 << exponent).min(self.max_lockout_secs);
+        let lockout_secs = self.lockout_secs(*failures);
         let elapsed = last_failure.elapsed().as_secs();
         if elapsed < lockout_secs {
             Some(lockout_secs - elapsed)
@@ -109,14 +108,40 @@ impl AuthFailureTracker {
         }
     }
 
-    /// Record a failed auth attempt of `user` from `ip`.
-    pub fn record_failure(&self, ip: IpAddr, user: &str) {
-        let mut entries = self.entries.lock();
-        let entry = entries
-            .entry(self.key(ip, user))
-            .or_insert_with(|| (0, Instant::now()));
-        entry.0 += 1;
-        entry.1 = Instant::now();
+    /// Lockout length after `failures` consecutive failures (`failures >= max_failures`).
+    fn lockout_secs(&self, failures: u32) -> u64 {
+        let exponent = (failures - self.max_failures).min(20);
+        (1u64 << exponent).min(self.max_lockout_secs)
+    }
+
+    /// Record a failed auth attempt of `user` from `ip`. Returns the lockout length
+    /// when this failure starts a lockout. A locked-out pair is refused before its
+    /// credentials are checked, so every failure at or past the threshold starts a
+    /// new (longer) lockout: one WARN per lockout, never one per 429.
+    pub fn record_failure(&self, ip: IpAddr, user: &str) -> Option<u64> {
+        let failures = {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .entry(self.key(ip, user))
+                .or_insert_with(|| (0, Instant::now()));
+            entry.0 += 1;
+            entry.1 = Instant::now();
+            entry.0
+        };
+        if failures < self.max_failures {
+            return None;
+        }
+        let lockout_secs = self.lockout_secs(failures);
+        crate::metrics::AUTH_LOCKOUTS_TOTAL.inc();
+        let username: String = user.chars().take(64).collect();
+        tracing::warn!(
+            client_ip = %ip,
+            username = %username,
+            failures,
+            lockout_secs,
+            "auth lockout: too many failed Basic logins, answering 429"
+        );
+        Some(lockout_secs)
     }
 
     /// Clear the failure count of `user` from `ip` on successful auth.
@@ -1204,6 +1229,16 @@ mod tests {
             tracker.record_failure(ip, "u");
         }
         assert!(tracker.check_blocked(&ip, "u").is_some());
+    }
+
+    #[test]
+    fn test_auth_failure_tracker_reports_lockout_once_per_lockout() {
+        let tracker = AuthFailureTracker::new(5, 900);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let started: Vec<_> = (0..5).map(|_| tracker.record_failure(ip, "u")).collect();
+        assert_eq!(started, [None, None, None, None, Some(1)]);
+        // Next failure (after the lockout ran out) starts the next, longer lockout.
+        assert_eq!(tracker.record_failure(ip, "u"), Some(2));
     }
 
     #[test]

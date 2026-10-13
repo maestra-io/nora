@@ -98,6 +98,16 @@ pub fn record_oidc_rejection(reason: &'static str) {
     AUTH_OIDC_REJECTED_TOTAL.with_label_values(&[reason]).inc();
 }
 
+/// Brute-force lockouts started (a client IP + Basic username reached the failure
+/// threshold). The WARN "auth lockout: …" carries the IP and username; no labels here.
+pub static AUTH_LOCKOUTS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "nora_auth_lockouts_total",
+        "Brute-force auth lockouts started (client IP + Basic username)"
+    )
+    .expect("failed to create AUTH_LOCKOUTS_TOTAL metric at startup")
+});
+
 /// Proxy artifacts held by the digest quarantine, by registry and outcome
 /// (`blocked` = enforce returned 403; `observed` = observe served but recorded).
 /// Gives the operator an alertable/graphable signal — the quarantine was

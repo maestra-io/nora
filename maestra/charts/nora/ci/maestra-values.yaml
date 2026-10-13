@@ -259,8 +259,10 @@ metrics:
             annotations:
               summary: packages.maestra.io answers 429 at {{ $value | humanize }}/s
               description: >-
-                nora's rate limiter is refusing requests. Check the audit/pod log of
-                nora/nora for the client IPs; one IP for everybody means
+                nora answers 429: mostly the brute-force lockout of a Basic username
+                from one client IP (nora_auth_lockouts_total). The nora/nora pod log
+                has one WARN "auth lockout: too many failed Basic logins" per lockout
+                with client_ip and username; one client_ip for everybody means
                 auth.trusted_proxies no longer matches the traefik source addresses.
           # `jwks` = the GitHub signing keys could not be fetched or the kid is
           # unknown: CI publishes and restores with OIDC fail until the cache refreshes.
