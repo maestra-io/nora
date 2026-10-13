@@ -65,6 +65,10 @@ Output shape: `<time> {"<registry>":<N>}` per window; `<pod> start=<time> restar
   almost every metadata response of that registry.
 - The counter resets on restart: compare windows from step 1, never the raw total across a restart.
 - Repeated firing after a merged fix: check the running image first (step 2) before suspecting a new gap.
+- Firing on a few npm packages after a rewriter fix is running: their packument was cached by the older rewriter and
+  revalidates with a 304. Since 1.3.5-maestra.4 a 304 rewrites and stores the cached body, so such a hit stops after the
+  first request; on an older image it repeats until upstream changes the document. Check the cached copy in R2
+  (`npm/<name>/metadata.json`) for the WARN path before calling it a new gap.
 - No WARN line = no path: a document fetched for step 3 is an example, say so; the code and the prefix count
   carry the conclusion.
 

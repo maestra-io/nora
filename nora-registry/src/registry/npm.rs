@@ -1578,6 +1578,11 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Byt
         Ok(Revalidation::NotModified) => {
             match state.storage.get(key).await {
                 Ok(cached) => {
+                    // Cached by an older rewriter (before #65: an http tarball, another
+                    // package's tarball as a dependency): a 304 would serve its upstream
+                    // links forever. Rewrite them now and keep the healed body.
+                    let cached =
+                        heal_cached_tarball_links(&state.storage, path, cached, proxy_url).await;
                     crate::metrics::PROXY_UPSTREAM_304_TOTAL
                         .with_label_values(&["npm"])
                         .inc();
@@ -1663,6 +1668,28 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Byt
             None
         }
     }
+}
+
+/// Rewrite the upstream tarball links a cached packument still carries and store the
+/// result, so a body cached by an older rewriter stops leaking upstream URLs. Returns
+/// `cached` unchanged when there is nothing to rewrite.
+async fn heal_cached_tarball_links(
+    storage: &crate::Storage,
+    name: &str,
+    cached: Bytes,
+    proxy_url: &str,
+) -> Bytes {
+    let nora_npm_base = format!("{}/npm", PUBLIC_BASE);
+    let healed =
+        rewrite_upstream_tarball_links(&cached, proxy_url.trim_end_matches('/'), &nora_npm_base);
+    if healed[..] == cached[..] {
+        return cached;
+    }
+    let healed = Bytes::from(healed);
+    if let Err(e) = cache_packument(storage, name, healed.clone(), &origin_of(proxy_url)).await {
+        tracing::warn!(name = %name, error = ?e, "npm proxy: failed to store healed metadata");
+    }
+    healed
 }
 
 // ============================================================================
@@ -6008,6 +6035,75 @@ mod spec_conformance_tests {
             .with_label_values(&["npm"])
             .get();
         assert!(after > before, "a 304 revalidation must be recorded");
+    }
+
+    /// A packument cached before #65 still carries upstream tarball links (an http
+    /// tarball, another package's tarball as a dependency). An upstream 304 must not
+    /// serve them as is: the links are rewritten and the healed body is stored.
+    #[tokio::test]
+    async fn test_npm_revalidation_304_heals_upstream_tarball_links() {
+        use crate::registry::{write_validators, Validators};
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+        let up = upstream.uri();
+        let host = up.split_once("://").unwrap().1.to_string();
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 0;
+            cfg.npm.revalidate = true;
+            cfg.npm.serve_stale = false;
+        });
+
+        let key = "npm/testpkg/metadata.json";
+        let cached = serde_json::json!({
+            "name": "testpkg",
+            "versions": {
+                "1.0.0": {
+                    "dist": {"tarball": format!("{PUBLIC_BASE}/npm/testpkg/-/testpkg-1.0.0.tgz")}
+                },
+                "0.0.1": {
+                    "dist": {"tarball": format!("http://{host}/testpkg/-/testpkg-0.0.1.tgz")},
+                    "dependencies": {"dep": format!("{up}/dep/-/dep-2.0.0.tgz")}
+                }
+            }
+        });
+        ctx.state
+            .storage
+            .put(key, &serde_json::to_vec(&cached).unwrap())
+            .await
+            .unwrap();
+        write_validators(
+            &ctx.state.storage,
+            key,
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+
+        let resp = send(&ctx.app, Method::GET, "/npm/testpkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(!body.contains(&host), "upstream link served: {body}");
+        assert!(body.contains("/npm/testpkg/-/testpkg-0.0.1.tgz"), "{body}");
+        assert!(body.contains("/npm/dep/-/dep-2.0.0.tgz"), "{body}");
+
+        let stored = ctx.state.storage.get(key).await.unwrap();
+        assert!(
+            memchr::memmem::find(&stored, host.as_bytes()).is_none(),
+            "the healed body must be stored"
+        );
     }
 
     /// #595: a thundering herd of concurrent requests for the same expired
