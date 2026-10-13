@@ -65,6 +65,10 @@ pub static RETENTION_LAST_RUN: LazyLock<IntGauge> = LazyLock::new(|| {
 pub struct VersionEntry {
     /// Human-readable version/tag name (e.g., "1.0.0", "latest", "lodash-4.17.21.tgz")
     pub name: String,
+    /// The version `name` denotes when `name` is a file name (npm: "4.17.21"
+    /// for "lodash-4.17.21.tgz"). `include_tags`/`exclude_tags` match it as
+    /// well as `name`; None when `name` is the version itself.
+    pub version: Option<String>,
     /// Storage keys belonging to this version (primary + checksums + metadata)
     pub keys: Vec<String>,
     /// Last modified timestamp (unix seconds) — max of all keys
@@ -115,11 +119,11 @@ pub fn plan_deletions(
     for version in &versions {
         // An explicit scope protects unknown names, including future releases.
         // Nonmatching names do not consume the eligible keep_last budget.
-        if !rule.include_tags.is_empty() && !is_excluded(&version.name, &rule.include_tags) {
+        if !rule.include_tags.is_empty() && !matches_tags(version, &rule.include_tags) {
             continue;
         }
         // Check exclusion patterns — excluded versions are invisible to keep_last (#926)
-        if is_excluded(&version.name, &rule.exclude_tags) {
+        if matches_tags(version, &rule.exclude_tags) {
             continue;
         }
 
@@ -218,6 +222,17 @@ fn cmp_version_names(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
+/// Whether an `include_tags`/`exclude_tags` pattern matches the version: its
+/// parsed version where the collector only had a file name, or the name
+/// itself (a pattern written against the file name keeps matching).
+fn matches_tags(entry: &VersionEntry, patterns: &[String]) -> bool {
+    is_excluded(&entry.name, patterns)
+        || entry
+            .version
+            .as_deref()
+            .is_some_and(|version| is_excluded(version, patterns))
+}
+
 /// Check if a version name matches any exclusion glob pattern.
 fn is_excluded(name: &str, patterns: &[String]) -> bool {
     for pattern in patterns {
@@ -296,6 +311,7 @@ async fn collect_maven_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
             let (modified, size) = aggregate_meta(storage, keys).await;
             entries.push(VersionEntry {
                 name: version.clone(),
+                version: None,
                 keys: keys.clone(),
                 modified,
                 size,
@@ -430,6 +446,7 @@ async fn collect_sidecar_versions(
         };
         groups.entry(group).or_default().push(VersionEntry {
             name: sv.version,
+            version: None,
             keys: vec![package_key, key.clone()],
             modified,
             size: sv.size,
@@ -484,6 +501,7 @@ async fn collect_raw_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
                     .into_iter()
                     .map(|(name, (keys, modified, size))| VersionEntry {
                         name,
+                        version: None,
                         keys,
                         modified,
                         size,
@@ -537,6 +555,7 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
             // shared across tags. GC handles orphan blobs separately.
             entries.push(VersionEntry {
                 name: tag.clone(),
+                version: None,
                 keys: vec![manifest_key.clone()],
                 modified,
                 size,
@@ -596,7 +615,8 @@ async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
             if storage.stat(&origin_key).await.is_some() {
                 keys.push(origin_key);
             }
-            if let Some(version) = crate::curation::parse_npm_tarball_version(pkg, filename) {
+            let version = crate::curation::parse_npm_tarball_version(pkg, filename);
+            if let Some(version) = &version {
                 let version_key = format!("npm/{}/versions/{}.json", pkg, version);
                 if storage.stat(&version_key).await.is_some() {
                     keys.push(version_key);
@@ -604,6 +624,7 @@ async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
             }
             entries.push(VersionEntry {
                 name: filename.to_string(),
+                version,
                 keys,
                 modified,
                 size,
@@ -689,6 +710,7 @@ async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEnt
             let (modified, size) = aggregate_meta(storage, &file_keys).await;
             entries.push(VersionEntry {
                 name: release.clone(),
+                version: None,
                 keys,
                 modified,
                 size,
@@ -740,6 +762,7 @@ async fn collect_cargo_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
             let (modified, size) = aggregate_meta(storage, keys).await;
             entries.push(VersionEntry {
                 name: version.clone(),
+                version: None,
                 keys: keys.clone(),
                 modified,
                 size,
@@ -788,6 +811,7 @@ async fn collect_go_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry
             let (modified, size) = aggregate_meta(storage, keys).await;
             entries.push(VersionEntry {
                 name: version.clone(),
+                version: None,
                 keys: keys.clone(),
                 modified,
                 size,
@@ -1089,6 +1113,7 @@ mod tests {
     fn make_version(name: &str, modified: u64, size: u64) -> VersionEntry {
         VersionEntry {
             name: name.to_string(),
+            version: None,
             keys: vec![format!("test/{}", name)],
             modified,
             size,
@@ -1171,6 +1196,71 @@ mod tests {
         assert!(plan
             .iter()
             .all(|entry| matches!(entry.version_name.as_str(), "preview-old" | "test-old")));
+    }
+
+    fn make_file_version(package: &str, version: &str, modified: u64) -> VersionEntry {
+        let name = format!("{package}-{version}.tgz");
+        VersionEntry {
+            keys: vec![format!("npm/{package}/tarballs/{name}")],
+            name,
+            version: Some(version.to_string()),
+            modified,
+            size: 100,
+        }
+    }
+
+    /// A collector that only has a file name (npm tarballs) still exposes the
+    /// version to `include_tags`: the pattern is written against the version.
+    #[test]
+    fn test_include_tags_match_version_behind_file_name() {
+        let rule: RetentionRule = serde_json::from_value(serde_json::json!({
+            "registry": "npm",
+            "include_tags": ["1.*"],
+            "keep_last": 0
+        }))
+        .unwrap();
+        let versions = vec![
+            make_file_version("pkg", "2.0.0", NOW - DAY),
+            make_file_version("pkg", "1.2.0", NOW - 2 * DAY),
+        ];
+        let plan = plan_deletions(versions, &rule, NOW);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].version_name, "pkg-1.2.0.tgz");
+    }
+
+    #[test]
+    fn test_exclude_tags_match_version_behind_file_name() {
+        let rule: RetentionRule = serde_json::from_value(serde_json::json!({
+            "registry": "npm",
+            "exclude_tags": ["1.*"],
+            "keep_last": 0
+        }))
+        .unwrap();
+        let versions = vec![
+            make_file_version("pkg", "2.0.0", NOW - DAY),
+            make_file_version("pkg", "1.2.0", NOW - 2 * DAY),
+        ];
+        let plan = plan_deletions(versions, &rule, NOW);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].version_name, "pkg-2.0.0.tgz");
+    }
+
+    /// A pattern written against the file name keeps matching.
+    #[test]
+    fn test_exclude_tags_still_match_file_name() {
+        let rule: RetentionRule = serde_json::from_value(serde_json::json!({
+            "registry": "npm",
+            "exclude_tags": ["pkg-1.*.tgz"],
+            "keep_last": 0
+        }))
+        .unwrap();
+        let versions = vec![
+            make_file_version("pkg", "2.0.0", NOW - DAY),
+            make_file_version("pkg", "1.2.0", NOW - 2 * DAY),
+        ];
+        let plan = plan_deletions(versions, &rule, NOW);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].version_name, "pkg-2.0.0.tgz");
     }
 
     #[test]
@@ -2632,6 +2722,35 @@ mod format_retention_tests {
             .unwrap();
         assert_eq!(before, after, "an untouched package must not be rewritten");
         assert_eq!(packument_versions(&ctx, "quiet").await, vec!["2.0.0"]);
+    }
+
+    /// The npm collector names a version by its tarball file, but the rule's
+    /// patterns are written against the version: `1.*` retires 1.2.0, not 2.0.0.
+    #[tokio::test]
+    async fn test_npm_include_tags_match_version() {
+        let ctx = create_test_context();
+        for version in ["1.2.0", "2.0.0"] {
+            publish_npm(&ctx, "scoped", version).await;
+        }
+        let mut rules = vec![rule("npm", None, Some(0), None)];
+        rules[0].include_tags = vec!["1.*".to_string()];
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            false,
+        )
+        .await;
+        assert_eq!(
+            result.planned, 1,
+            "include_tags selects the 1.x version only"
+        );
+        assert_eq!(
+            stored_versions(&ctx.state.storage, "scoped").await,
+            vec!["2.0.0"]
+        );
+        assert_eq!(packument_versions(&ctx, "scoped").await, vec!["2.0.0"]);
     }
 
     #[cfg(feature = "deb")]

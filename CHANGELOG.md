@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 
+### Fixed
+- **npm retention `include_tags`/`exclude_tags` match the version** — the npm collector names a version by its tarball file (`pkg-1.2.0.tgz`), so a pattern written against the version (`1.*`) selected or protected nothing. The patterns now match the version parsed from the file name as well as the file name itself.
+
 ## [1.3.5] - 2026-10-13
 
 ### Added
