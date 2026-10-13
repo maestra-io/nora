@@ -1087,6 +1087,13 @@ fn gem_platform_to_s((cpu, os, version): &GemPlatformParts, rubygems4: bool) -> 
 /// CPU-less `darwin19` as `darwin-19`), so the platforms tried are the suffix itself and the
 /// suffix with one `-` taken out or made `_` (`mswin32_60`).
 fn rubygems_writes_platform(suffix: &str) -> bool {
+    // `to_s` joins at most a CPU, an OS and a version, none of which holds a `-` (the CPU is the
+    // field before the first `-`, the OS a pattern's literal or one field, the version digits,
+    // dots and word characters): a suffix with more than two `-` is never written, and the
+    // candidates below would cost two parses per `-`.
+    if suffix.matches('-').count() > 2 {
+        return false;
+    }
     let mut candidates = vec![suffix.to_string()];
     for (at, _) in suffix.match_indices('-') {
         candidates.push(format!("{}{}", &suffix[..at], &suffix[at + 1..]));
@@ -1181,19 +1188,30 @@ fn is_gem_platform(suffix: &str) -> bool {
 ///   "ffi-1.15.5-universal-darwin-19" → ffi 1.15.5 for universal-darwin-19, and
 ///                                      ffi-1.15.5-universal-darwin 19
 pub fn gem_file_readings(stem: &str) -> Vec<GemFile> {
+    // The stem comes from a request path. Every split below joins the fields on both sides and
+    // weighs the suffix as a platform, so the work grows with the length and the number of fields;
+    // a reading served has a name and a platform of at most `GEM_NAME_MAX_LEN` bytes each and a
+    // version of at most `GEM_VERSION_MAX_LEN` (`is_valid_gem_file`), so a longer stem has no
+    // reading worth finding and is refused before it is split.
+    if stem.len() > GEM_NAME_MAX_LEN + 1 + GEM_VERSION_MAX_LEN + 1 + GEM_NAME_MAX_LEN {
+        return Vec::new();
+    }
     let fields: Vec<&str> = stem.split('-').collect();
     (1..fields.len())
         .filter_map(|at| {
             let name = fields[..at].join("-");
+            if !(is_gem_name(&name) && is_gem_version_field(fields[at])) {
+                return None;
+            }
             let platform = (at + 1 < fields.len()).then(|| fields[at + 1..].join("-"));
-            let suffix_ok = platform
+            platform
                 .as_deref()
-                .is_none_or(|p| is_gem_platform(p) || is_gem_content_address(p));
-            (is_gem_name(&name) && is_gem_version_field(fields[at]) && suffix_ok).then(|| GemFile {
-                name,
-                version: fields[at].to_string(),
-                platform,
-            })
+                .is_none_or(|p| is_gem_platform(p) || is_gem_content_address(p))
+                .then(|| GemFile {
+                    name,
+                    version: fields[at].to_string(),
+                    platform,
+                })
         })
         .collect()
 }
@@ -1371,11 +1389,15 @@ async fn upstream_gem_release_dates(
     dated
 }
 
+/// The longest name (or platform) and version of a reading NORA serves under.
+const GEM_NAME_MAX_LEN: usize = 256;
+const GEM_VERSION_MAX_LEN: usize = 128;
+
 /// Validate gem name: alphanumeric, hyphens, underscores, dots.
 /// No path traversal, no slashes, no null bytes.
 fn is_valid_gem_name(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 256
+        && name.len() <= GEM_NAME_MAX_LEN
         && !name.contains('/')
         && !name.contains('\0')
         && !name.contains("..")
@@ -1387,7 +1409,7 @@ fn is_valid_gem_name(name: &str) -> bool {
 /// Validate version string: digits, dots, hyphens, alphanumeric, ".pre", ".beta", etc.
 fn is_valid_version(version: &str) -> bool {
     !version.is_empty()
-        && version.len() <= 128
+        && version.len() <= GEM_VERSION_MAX_LEN
         && !version.contains('/')
         && !version.contains('\0')
         && !version.contains("..")
@@ -2187,6 +2209,44 @@ mod gem_file_names_per_rubygems {
         assert_eq!(
             gem_file_readings("nokogiri-1.19.0-1a2b3c4d"),
             vec![file("nokogiri", "1.19.0", Some("1a2b3c4d"))]
+        );
+    }
+
+    // A stem no gem file name can be — longer than a name, a version and a platform allow, or
+    // with more fields than they carry — is refused before any split is weighed: the work a
+    // request's path segment buys stays bounded. The documented readings are unchanged.
+    #[test]
+    fn an_oversized_stem_is_refused_before_it_is_split() {
+        let hyphens = format!("1{}", "-1".repeat(2000));
+        let long = "a".repeat(4000);
+        let started = std::time::Instant::now();
+        assert_eq!(gem_file_readings(&hyphens), vec![]);
+        assert_eq!(gem_file_readings(&long), vec![]);
+        assert_eq!(gem_file_readings(&format!("{long}-1.0")), vec![]);
+        let elapsed = started.elapsed();
+        eprintln!("oversized stems read in {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "{elapsed:?}"
+        );
+        assert_eq!(
+            gem_file_readings("rails-7.0.0"),
+            vec![file("rails", "7.0.0", None)]
+        );
+        assert_eq!(
+            gem_file_readings("nokogiri-1.13.0-x86_64-linux"),
+            vec![file("nokogiri", "1.13.0", Some("x86_64-linux"))]
+        );
+        assert_eq!(
+            gem_file_readings("foo-2-bar-1.0.0"),
+            vec![file("foo-2-bar", "1.0.0", None)]
+        );
+        assert_eq!(
+            gem_file_readings("ffi-1.15.5-universal-darwin-19"),
+            vec![
+                file("ffi", "1.15.5", Some("universal-darwin-19")),
+                file("ffi-1.15.5-universal-darwin", "19", None)
+            ]
         );
     }
 
