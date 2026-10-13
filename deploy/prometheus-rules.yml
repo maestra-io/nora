@@ -58,6 +58,7 @@ groups:
           severity: critical
         annotations:
           summary: "Upstream URL leak detected in NORA {{ $labels.registry }} responses"
+          runbook_url: "https://github.com/maestra-io/nora/blob/maestra/main/maestra/runbooks/NoraUpstreamUrlLeak.md"
           description: >-
             A JSON response carried a configured upstream hostname: clients may
             bypass NORA. Find the WARN log line "upstream URL leak detected in
