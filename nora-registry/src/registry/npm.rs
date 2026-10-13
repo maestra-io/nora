@@ -419,6 +419,26 @@ fn rewrite_tarball_urls(data: &[u8], nora_base: &str, upstream_url: &str) -> Res
     ))
 }
 
+/// Re-run the tarball-link safety net on a revalidated cached packument and store the
+/// result when it changed, so a 304 never serves upstream links an older rewriter left.
+async fn upgrade_cached_packument(
+    state: &AppState,
+    key: &str,
+    cached: Bytes,
+    proxy_url: &str,
+) -> Bytes {
+    let nora_npm_base = format!("{}/npm", PUBLIC_BASE.trim_end_matches('/'));
+    let current =
+        rewrite_upstream_tarball_links(&cached, proxy_url.trim_end_matches('/'), &nora_npm_base);
+    if current[..] == cached[..] {
+        return cached;
+    }
+    if let Err(e) = state.storage.put(key, &current).await {
+        tracing::warn!(key = %key, error = %e, "npm: could not store the upgraded cached packument");
+    }
+    Bytes::from(current)
+}
+
 /// Rewrite every `http(s)://<upstream host+path>/<pkg>/-/<file>` link in `data` to
 /// `<nora_npm_base>/<pkg>/-/<file>`, whatever the package: a dependency spec can be
 /// another package's upstream tarball URL, and npm fetches it as is.
@@ -1584,6 +1604,9 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Byt
                     crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
                         .with_label_values(&["npm"])
                         .inc_by(cached.len() as u64);
+                    // A body cached by an older rewriter keeps its upstream tarball
+                    // links through every 304: bring it to the current form once.
+                    let cached = upgrade_cached_packument(state, key, cached, proxy_url).await;
                     // Cached before PUBLIC_BASE: its tarball URLs carry the public_url
                     // of that day, and a 304 would keep them forever. Without
                     // validators the next revalidation refetches it in the current form.
@@ -6008,6 +6031,61 @@ mod spec_conformance_tests {
             .with_label_values(&["npm"])
             .get();
         assert!(after > before, "a 304 revalidation must be recorded");
+    }
+
+    /// A packument cached by an older rewriter keeps a foreign upstream tarball link;
+    /// a 304 must not serve it as is, and the cache is upgraded in place (13.10:
+    /// /npm/mixin-deep kept NoraUpstreamUrlLeak firing after the rewriter fix).
+    #[tokio::test]
+    async fn npm_revalidation_304_upgrades_an_old_cached_rewrite() {
+        use crate::registry::{write_validators, Validators};
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+        let up = upstream.uri();
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(up.clone());
+            cfg.npm.metadata_ttl = 0;
+            cfg.npm.revalidate = true;
+            cfg.npm.serve_stale = false;
+        });
+
+        let key = "npm/mixin-deep/metadata.json";
+        let old = format!(
+            r#"{{"name":"mixin-deep","versions":{{"1.1.0":{{"dependencies":{{"is-plain-object":"{up}/is-plain-object/-/is-plain-object-2.0.0.tgz"}},"dist":{{"tarball":"{PUBLIC_BASE}/npm/mixin-deep/-/mixin-deep-1.1.0.tgz"}}}}}}}}"#
+        );
+        ctx.state.storage.put(key, old.as_bytes()).await.unwrap();
+        write_validators(
+            &ctx.state.storage,
+            key,
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+
+        let resp = send(&ctx.app, Method::GET, "/npm/mixin-deep", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(!body.contains(&up), "served: {body}");
+        assert!(
+            body.contains("/npm/is-plain-object/-/is-plain-object-2.0.0.tgz"),
+            "{body}"
+        );
+        let stored = ctx.state.storage.get(key).await.unwrap();
+        assert!(
+            memchr::memmem::find(&stored, up.as_bytes()).is_none(),
+            "cache not upgraded"
+        );
     }
 
     /// #595: a thundering herd of concurrent requests for the same expired
