@@ -1202,6 +1202,30 @@ mod tests {
         );
     }
 
+    /// `publishConfig.registry` / `@scope:registry` name the bare registry root (13.10:
+    /// @rolldown/*, @napi-rs/*, @shopify/*): not a leak; a package URL still is.
+    #[test]
+    fn npm_publish_config_registry_root_is_not_a_leak() {
+        let finders = LeakFinders::new(vec![("npm".into(), "registry.npmjs.org".into())]);
+        for body in [
+            r#"{"publishConfig":{"access":"public","registry":"https://registry.npmjs.org/"}}"#,
+            r#"{"publishConfig":{"@shopify:registry":"https://registry.npmjs.org"}}"#,
+            r#"{"publishConfig":{"registry":"https:\/\/registry.npmjs.org\/"}}"#,
+        ] {
+            assert_eq!(finders.scan(body.as_bytes()), None, "{body}");
+        }
+        for body in [
+            r#"{"u":"https://registry.npmjs.org/uuid"}"#,
+            r#"{"u":"https://registry.npmjs.org/ "}"#,
+        ] {
+            assert_eq!(
+                finders.scan(body.as_bytes()),
+                Some(("npm", "registry.npmjs.org")),
+                "{body}"
+            );
+        }
+    }
+
     /// Through the middleware: a leftover registration URL next to catalog0 @ids
     /// still counts as a NuGet leak.
     #[tokio::test]
