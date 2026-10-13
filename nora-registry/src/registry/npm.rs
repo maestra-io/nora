@@ -421,22 +421,26 @@ fn rewrite_tarball_urls(data: &[u8], nora_base: &str, upstream_url: &str) -> Res
 
 /// Re-run the tarball-link safety net on a revalidated cached packument and store the
 /// result when it changed, so a 304 never serves upstream links an older rewriter left.
+/// Stored like a fresh upstream body (provenance included), never over a packument
+/// this registry owns.
 async fn upgrade_cached_packument(
     state: &AppState,
-    key: &str,
+    path: &str,
     cached: Bytes,
     proxy_url: &str,
 ) -> Bytes {
     let nora_npm_base = format!("{}/npm", PUBLIC_BASE.trim_end_matches('/'));
     let current =
         rewrite_upstream_tarball_links(&cached, proxy_url.trim_end_matches('/'), &nora_npm_base);
-    if current[..] == cached[..] {
+    if current[..] == cached[..] || has_local_versions(&state.storage, path).await {
         return cached;
     }
-    if let Err(e) = state.storage.put(key, &current).await {
-        tracing::warn!(key = %key, error = %e, "npm: could not store the upgraded cached packument");
+    let current = Bytes::from(current);
+    let origin = origin_of(proxy_url);
+    if let Err(e) = cache_packument(&state.storage, path, current.clone(), &origin).await {
+        tracing::warn!(path = %path, error = ?e, "npm: could not store the upgraded cached packument");
     }
-    Bytes::from(current)
+    current
 }
 
 /// Rewrite every `http(s)://<upstream host+path>/<pkg>/-/<file>` link in `data` to
@@ -1606,7 +1610,7 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Byt
                         .inc_by(cached.len() as u64);
                     // A body cached by an older rewriter keeps its upstream tarball
                     // links through every 304: bring it to the current form once.
-                    let cached = upgrade_cached_packument(state, key, cached, proxy_url).await;
+                    let cached = upgrade_cached_packument(state, path, cached, proxy_url).await;
                     // Cached before PUBLIC_BASE: its tarball URLs carry the public_url
                     // of that day, and a 304 would keep them forever. Without
                     // validators the next revalidation refetches it in the current form.
@@ -6085,6 +6089,12 @@ mod spec_conformance_tests {
         assert!(
             memchr::memmem::find(&stored, up.as_bytes()).is_none(),
             "cache not upgraded"
+        );
+        // The provenance record vouches for the upgraded bytes, not the old ones.
+        let record = ctx.state.storage.get(&origin_key(key)).await.unwrap();
+        assert_eq!(
+            &record[..],
+            provenance_record(&origin_of(&up), &stored).as_bytes()
         );
     }
 
