@@ -119,7 +119,7 @@ tsh ssh --login=teleport-production "$NODE" 'pid=$(pgrep -xo cilium-agent);
 | Signature | Meaning | Go to |
 |---|---|---|
 | `eno5` rx ≈ 800 Mbit/s flat (quota engaged), rps in the hundreds, p99 up only for NuGet | the quota is doing its job: clients queue behind 800 Mbit/s; the node's neighbours are protected | Step 4d |
-| `eno5` rx > 900 Mbit/s with the quota configured | the quota is not applied: `bpf bandwidth list` has no entry for the nora endpoint (pod created before the annotation / bandwidth manager off: `BandwidthManager: Disabled`) | Step 4d |
+| `bpf bandwidth list` has no 800M entries for the nora endpoint (or `BandwidthManager: Disabled`), whatever `eno5` shows | the quota is not applied: pod created before the annotation, or the bandwidth manager is off. `eno5` rx alone cannot tell: it is the whole node, another tenant can fill it while nora stays capped | Step 4d |
 | `eno5` rx well below 800 and p99 still high | not the link | Step 3 |
 
 ## Step 3 — Other causes (check each; the alert does not say which)
@@ -172,7 +172,7 @@ Baselines: storage `get` errors are never zero (12.10 12:00 UTC: 2880 `get` + 15
 - **4d. Link saturated / quota engaged** (Step 2b). Expected during a CI burst: the
   latency is the price of the 800 Mbit/s cap and ends with the burst (12.10: resolved
   16:10 UTC on its own). Nothing to roll back. A missing throttle entry → recreate the pod
-  (`kubectl -n nora rollout restart deploy/nora`, Recreate strategy, ~20s outage) after
+  (`kubectl --context "$CTX" -n nora rollout restart deploy/nora`, Recreate strategy, ~20s outage) after
   confirming the bandwidth manager is on. Raising the cap costs the node's other tenants
   (traefik, backups) their headroom; the real fix for repeated bursts is a local hot cache
   in nora so repeated restores stop reading R2 (open, not built).
