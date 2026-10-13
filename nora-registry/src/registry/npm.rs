@@ -363,9 +363,12 @@ fn with_public_base(data: Bytes, nora_base: &str) -> Bytes {
 /// Upstream URL paths a proxied packument keeps on purpose: Sigstore provenance
 /// (`versions.*.dist.attestations.url`, `/-/npm/v1/attestations/<pkg>@<ver>`) has no
 /// NORA handler, so `npm audit signatures` fetches it from the upstream directly.
+/// The bare registry root right before a closing quote (`publishConfig.registry`,
+/// `@scope:registry`) is read only by `npm publish` in the author's own tree, never
+/// by a client installing the package.
 /// One list for the leak detector (`metrics::UPSTREAM_PASSTHROUGH`) and the air-gap
 /// invariant test.
-pub(crate) const UPSTREAM_PASSTHROUGH_PATHS: &[&str] = &["/-/npm/v1/attestations/"];
+pub(crate) const UPSTREAM_PASSTHROUGH_PATHS: &[&str] = &["/-/npm/v1/attestations/", "/\"", "\""];
 
 /// Rewrite tarball URLs in npm metadata to point to NORA.
 ///
@@ -374,9 +377,11 @@ pub(crate) const UPSTREAM_PASSTHROUGH_PATHS: &[&str] = &["/-/npm/v1/attestations
 ///
 /// Two-layer approach (#439):
 /// 1. Targeted: parse JSON, rewrite `versions.*.dist.tarball`
-/// 2. Safety net: byte-level replace of this package's upstream tarball links
-///    (`<upstream>/<name>/-/`) in the serialized output, e.g. `_resolved`. Other
-///    fields that merely mention the upstream (a readme) are left alone.
+/// 2. Safety net: byte-level rewrite of every upstream tarball link
+///    (`<upstream>/<pkg>/-/<file>`, any package, http or https) in the serialized
+///    output: `_resolved`, an http `dist.bin` tarball, a dependency given as another
+///    package's tarball URL. Other mentions of the upstream (a readme, the
+///    `publishConfig` registry) are left alone.
 fn rewrite_tarball_urls(data: &[u8], nora_base: &str, upstream_url: &str) -> Result<Vec<u8>, ()> {
     let mut json: serde_json::Value = serde_json::from_slice(data).map_err(|e| {
         tracing::warn!(error = %e, "npm: JSON parse failed in rewrite_tarball_urls");
@@ -405,17 +410,69 @@ fn rewrite_tarball_urls(data: &[u8], nora_base: &str, upstream_url: &str) -> Res
         tracing::warn!(error = %e, "npm: JSON serialize failed in rewrite_tarball_urls");
     })?;
 
-    // Safety net: byte-level replace of any remaining upstream tarball link (#439).
+    // Safety net: byte-level rewrite of any remaining upstream tarball link (#439).
     // Catches edge cases where targeted rewrite missed (e.g. new npm metadata fields).
-    let name = json.get("name").and_then(|n| n.as_str());
-    let Some(name) = name.filter(|_| !upstream_trimmed.is_empty()) else {
-        return Ok(output);
-    };
-    Ok(replace_upstream_bytes(
+    Ok(rewrite_upstream_tarball_links(
         &output,
-        &format!("{upstream_trimmed}/{name}/-/"),
-        &format!("{nora_npm_base}/{name}/-/"),
+        upstream_trimmed,
+        &nora_npm_base,
     ))
+}
+
+/// Rewrite every `http(s)://<upstream host+path>/<pkg>/-/<file>` link in `data` to
+/// `<nora_npm_base>/<pkg>/-/<file>`, whatever the package: a dependency spec can be
+/// another package's upstream tarball URL, and npm fetches it as is.
+fn rewrite_upstream_tarball_links(data: &[u8], upstream: &str, nora_npm_base: &str) -> Vec<u8> {
+    let Some((_, host)) = upstream.split_once("://").filter(|(_, h)| !h.is_empty()) else {
+        return data.to_vec();
+    };
+    let mut out = Vec::with_capacity(data.len());
+    let mut copied = 0;
+    for at in memchr::memmem::find_iter(data, host.as_bytes()) {
+        let start = match &data[..at] {
+            d if d.ends_with(b"https://") => at - 8,
+            d if d.ends_with(b"http://") => at - 7,
+            _ => continue,
+        };
+        let path_start = at + host.len();
+        let path_end = data[path_start..]
+            .iter()
+            .position(|b| {
+                matches!(b, b'"' | b'\\' | b'\'' | b'<' | b'>' | b')') || b.is_ascii_whitespace()
+            })
+            .map_or(data.len(), |n| path_start + n);
+        if start < copied || !is_tarball_path(&data[path_start..path_end]) {
+            continue;
+        }
+        out.extend_from_slice(&data[copied..start]);
+        out.extend_from_slice(nora_npm_base.as_bytes());
+        copied = path_start;
+    }
+    out.extend_from_slice(&data[copied..]);
+    out
+}
+
+/// `/<pkg>/-/<file>` with `<pkg>` = `name`, `@scope/name` or `@scope%2fname`.
+fn is_tarball_path(path: &[u8]) -> bool {
+    let Some((pkg, file)) = std::str::from_utf8(path)
+        .ok()
+        .and_then(|p| p.strip_prefix('/'))
+        .and_then(|p| p.split_once("/-/"))
+    else {
+        return false;
+    };
+    let name = match pkg.strip_prefix('@') {
+        Some(scoped) => scoped
+            .split_once('/')
+            .or_else(|| scoped.split_once("%2f"))
+            .or_else(|| scoped.split_once("%2F"))
+            .filter(|(scope, _)| !scope.is_empty())
+            .map(|(_, name)| name),
+        None => Some(pkg),
+    };
+    name.is_some_and(|n| !n.is_empty() && !n.contains('/'))
+        && !file.is_empty()
+        && !file.contains('/')
 }
 
 /// Byte-level replace of upstream URL prefix in response body (#439).
@@ -3243,6 +3300,82 @@ mod tests {
             json["versions"]["1.0.0"]["_resolved"],
             "http://nora:5000/npm/test/-/test-1.0.0.tgz"
         );
+    }
+
+    /// mixin-deep 1.1.0 depends on another package by its upstream tarball URL: npm
+    /// would fetch it straight from registry.npmjs.org (NoraUpstreamUrlLeak, 13.10).
+    #[test]
+    fn rewrite_safety_net_rewrites_foreign_package_tarball_links() {
+        let packument = br#"{"name":"mixin-deep","versions":{"1.1.0":{"dependencies":{"is-plain-object":"https://registry.npmjs.org/is-plain-object/-/is-plain-object-2.0.0.tgz","@shopify/generate-docs":"https://registry.npmjs.org/@shopify/generate-docs/-/generate-docs-0.11.1.tgz"},"dist":{"tarball":"https://registry.npmjs.org/mixin-deep/-/mixin-deep-1.1.0.tgz"}}}}"#;
+        let out = rewrite_tarball_urls(packument, "http://nora:5000", "https://registry.npmjs.org")
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let deps = &json["versions"]["1.1.0"]["dependencies"];
+        assert_eq!(
+            deps["is-plain-object"],
+            "http://nora:5000/npm/is-plain-object/-/is-plain-object-2.0.0.tgz"
+        );
+        assert_eq!(
+            deps["@shopify/generate-docs"],
+            "http://nora:5000/npm/@shopify/generate-docs/-/generate-docs-0.11.1.tgz"
+        );
+    }
+
+    /// uuid 0.0.2 keeps an http `dist.bin` tarball on the upstream (13.10 leak).
+    #[test]
+    fn rewrite_safety_net_rewrites_http_tarball_links() {
+        let packument = br#"{"name":"uuid","versions":{"0.0.2":{"dist":{"bin":{"0.4-sunos-5.11":{"shasum":"2ff8d977261ddadfd1446cee661ab87863659e45","tarball":"http://registry.npmjs.org/uuid/-/uuid-0.0.2-0.4-sunos-5.11.tgz"}},"tarball":"https://registry.npmjs.org/uuid/-/uuid-0.0.2.tgz"}}}}"#;
+        let out = rewrite_tarball_urls(packument, "http://nora:5000", "https://registry.npmjs.org")
+            .unwrap();
+        let body = String::from_utf8(out).unwrap();
+        assert!(!body.contains("registry.npmjs.org"), "{body}");
+        assert!(body.contains("http://nora:5000/npm/uuid/-/uuid-0.0.2-0.4-sunos-5.11.tgz"));
+    }
+
+    /// Mentions of the upstream that are not tarball links stay as they are.
+    #[test]
+    fn rewrite_safety_net_leaves_non_tarball_mentions() {
+        let metadata = serde_json::json!({
+            "name": "test",
+            "readme": "see https://registry.npmjs.org/test and https://registry.npmjs.org/-/v1/search",
+            "versions": { "1.0.0": {
+                "publishConfig": { "registry": "https://registry.npmjs.org/" },
+                "dist": { "tarball": "https://registry.npmjs.org/test/-/test-1.0.0.tgz" }
+            } }
+        });
+        let data = serde_json::to_vec(&metadata).unwrap();
+        let out =
+            rewrite_tarball_urls(&data, "http://nora:5000", "https://registry.npmjs.org").unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(json["readme"], metadata["readme"]);
+        assert_eq!(
+            json["versions"]["1.0.0"]["publishConfig"],
+            metadata["versions"]["1.0.0"]["publishConfig"]
+        );
+    }
+
+    #[test]
+    fn tarball_path_shapes() {
+        for ok in [
+            "/a/-/a-1.tgz",
+            "/@s/a/-/a-1.tgz",
+            "/@s%2fa/-/a-1.tgz",
+            "/@s%2Fa/-/a-1.tgz",
+        ] {
+            assert!(is_tarball_path(ok.as_bytes()), "{ok}");
+        }
+        for bad in [
+            "",
+            "/",
+            "/a",
+            "/a/-/",
+            "/-/npm/v1/attestations/a@1",
+            "/a/b/-/a.tgz",
+            "/@/a/-/a.tgz",
+            "/a/-/x/y.tgz",
+        ] {
+            assert!(!is_tarball_path(bad.as_bytes()), "{bad}");
+        }
     }
 
     #[test]
