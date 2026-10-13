@@ -81,8 +81,8 @@ burst can sit on the previous container only.
 ```bash
 # current container; add --previous for the one that died (OOM restart)
 kubectl --context "$CTX" -n nora logs deploy/nora --since=1h \
-  | grep -E 'JWKS fetch failed|OIDC authentication rejected' \
-  | jq -r '.fields.message + " | " + (.fields.reason // .fields.error)' \
+  | grep -E 'JWKS fetch failed|auth rejected: credential refused' \
+  | jq -r '.fields.message + " | " + (.fields.detail // .fields.reason // .fields.error) + " | " + (.fields.client_ip // "-")' \
   | sort | uniq -c | sort -rn | head
 # first/last timestamp of the burst: same grep, then  jq -r .timestamp | sed -n '1p;$p'
 ```

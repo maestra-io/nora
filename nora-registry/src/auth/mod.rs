@@ -66,9 +66,10 @@ pub fn audit_actor(user: &Option<axum::Extension<AuthenticatedUser>>) -> &str {
 /// credentials (htpasswd passwords) are tracked: an `nra_` token or a JWT cannot be
 /// brute-forced, so a Bearer credential is never refused by the lockout.
 pub struct AuthFailureTracker {
-    /// (IP, username hash) -> (consecutive failures, last failure time). The hash
-    /// keeps an entry fixed-size whatever username a client sends.
-    entries: parking_lot::Mutex<HashMap<(IpAddr, u64), (u32, Instant)>>,
+    /// (IP, username hash) -> (consecutive failures, last failure time, a 429 of
+    /// the current lockout already logged). The hash keeps an entry fixed-size
+    /// whatever username a client sends.
+    entries: parking_lot::Mutex<HashMap<(IpAddr, u64), (u32, Instant, bool)>>,
     user_hasher: std::collections::hash_map::RandomState,
     /// Number of failures before lockout kicks in (default: 5)
     max_failures: u32,
@@ -95,12 +96,11 @@ impl AuthFailureTracker {
     /// seconds if blocked.
     pub fn check_blocked(&self, ip: &IpAddr, user: &str) -> Option<u64> {
         let entries = self.entries.lock();
-        let (failures, last_failure) = entries.get(&self.key(*ip, user))?;
+        let (failures, last_failure, _) = entries.get(&self.key(*ip, user))?;
         if *failures < self.max_failures {
             return None;
         }
-        let exponent = (*failures - self.max_failures).min(20);
-        let lockout_secs = (1u64 << exponent).min(self.max_lockout_secs);
+        let lockout_secs = self.lockout_secs(*failures);
         let elapsed = last_failure.elapsed().as_secs();
         if elapsed < lockout_secs {
             Some(lockout_secs - elapsed)
@@ -109,14 +109,50 @@ impl AuthFailureTracker {
         }
     }
 
-    /// Record a failed auth attempt of `user` from `ip`.
-    pub fn record_failure(&self, ip: IpAddr, user: &str) {
+    /// Lockout length after `failures` consecutive failures (`failures >= max_failures`).
+    fn lockout_secs(&self, failures: u32) -> u64 {
+        let exponent = (failures - self.max_failures).min(20);
+        (1u64 << exponent).min(self.max_lockout_secs)
+    }
+
+    /// Record a failed auth attempt of `user` from `ip`. Returns the lockout length
+    /// when this failure starts a lockout. A locked-out pair is refused before its
+    /// credentials are checked, so every failure at or past the threshold starts a
+    /// new (longer) lockout: one WARN per lockout, never one per 429.
+    pub fn record_failure(&self, ip: IpAddr, user: &str) -> Option<u64> {
+        let failures = {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .entry(self.key(ip, user))
+                .or_insert_with(|| (0, Instant::now(), false));
+            entry.0 += 1;
+            entry.1 = Instant::now();
+            entry.2 = false;
+            entry.0
+        };
+        if failures < self.max_failures {
+            return None;
+        }
+        let lockout_secs = self.lockout_secs(failures);
+        crate::metrics::AUTH_LOCKOUTS_TOTAL.inc();
+        let username: String = user.chars().take(64).collect();
+        tracing::warn!(
+            client_ip = %ip,
+            username = %username,
+            failures,
+            lockout_secs,
+            "auth lockout: too many failed Basic logins, answering 429"
+        );
+        Some(lockout_secs)
+    }
+
+    /// True for the first 429 of the current lockout of `user` from `ip`: the
+    /// refusals of one lockout are logged once, not once per request.
+    pub fn first_refusal(&self, ip: &IpAddr, user: &str) -> bool {
         let mut entries = self.entries.lock();
-        let entry = entries
-            .entry(self.key(ip, user))
-            .or_insert_with(|| (0, Instant::now()));
-        entry.0 += 1;
-        entry.1 = Instant::now();
+        entries
+            .get_mut(&self.key(*ip, user))
+            .is_some_and(|e| !std::mem::replace(&mut e.2, true))
     }
 
     /// Clear the failure count of `user` from `ip` on successful auth.
@@ -128,7 +164,7 @@ impl AuthFailureTracker {
     /// Remove entries older than max_lockout_secs (call periodically).
     pub fn cleanup(&self) {
         let mut entries = self.entries.lock();
-        entries.retain(|_, (_, last)| last.elapsed().as_secs() < self.max_lockout_secs * 2);
+        entries.retain(|_, (_, last, _)| last.elapsed().as_secs() < self.max_lockout_secs * 2);
     }
 }
 
@@ -288,6 +324,102 @@ async fn anonymous_read_passthrough(mut request: Request<Body>, next: Next) -> R
     next.run(request).await
 }
 
+/// Why `authenticate` refused a presented credential. Put on the response at the
+/// refusal; `auth_middleware` logs it with the request context. Never a secret.
+#[derive(Clone)]
+struct AuthRejection {
+    /// Bounded: wrong_password, token_invalid, malformed, basic_not_configured,
+    /// no_oidc, locked_out, or an OIDC class from `oidc::classify_rejection`.
+    reason: &'static str,
+    /// Counted in `nora_auth_oidc_rejected_total` already.
+    oidc: bool,
+    /// Off for the repeated 429s of one lockout (counted, not logged).
+    log: bool,
+    retry_after: Option<u64>,
+    /// The OIDC validator's error text (no token material).
+    detail: Option<String>,
+    /// `sub` and `repository` of a well-formed JWT refused for expiry or audience,
+    /// read WITHOUT signature verification: names the CI job, proves nothing.
+    unverified_claims: Option<(String, String)>,
+}
+
+impl AuthRejection {
+    fn new(reason: &'static str) -> Self {
+        Self {
+            reason,
+            oidc: false,
+            log: true,
+            retry_after: None,
+            detail: None,
+            unverified_claims: None,
+        }
+    }
+
+    fn on(self, mut response: Response) -> Response {
+        response.extensions_mut().insert(self);
+        response
+    }
+}
+
+/// The credential a request presented, read before `authenticate` rewrites
+/// headers. `None` = no credential (the anonymous NuGet/Docker challenge round:
+/// never logged). `kind` is bounded; `username` is the Basic user, truncated.
+fn presented_credential(request: &Request<Body>) -> Option<(&'static str, Option<String>)> {
+    let headers = request.headers();
+    let Some(auth) = headers.get(header::AUTHORIZATION) else {
+        let nuget_key =
+            request.uri().path().starts_with("/nuget/") && headers.contains_key("x-nuget-apikey");
+        return nuget_key.then_some(("x_nuget_apikey", None));
+    };
+    let auth = auth.to_str().unwrap_or("");
+    if let Some(token) = auth.strip_prefix("Bearer ") {
+        let kind = if token.trim().starts_with("nra_") {
+            "bearer_nra"
+        } else {
+            "bearer_jwt"
+        };
+        return Some((kind, None));
+    }
+    let Some((user, password)) = auth
+        .strip_prefix("Basic ")
+        .and_then(|e| STANDARD.decode(e.trim()).ok())
+        .and_then(|d| String::from_utf8(d).ok())
+        .and_then(|c| {
+            c.split_once(':')
+                .map(|(u, p)| (u.to_string(), p.to_string()))
+        })
+    else {
+        return Some(("malformed", None));
+    };
+    let kind = if password.starts_with("nra_") {
+        "basic_nra"
+    } else if password.starts_with("eyJ") && password.split('.').count() == 3 {
+        "basic_jwt"
+    } else {
+        "basic_htpasswd"
+    };
+    Some((kind, Some(user.chars().take(64).collect())))
+}
+
+/// `sub` and `repository` of a JWT, decoded WITHOUT verifying the signature.
+/// Only for logging a token already refused for expiry or audience.
+fn unverified_ci_claims(token: &str) -> Option<(String, String)> {
+    #[derive(serde::Deserialize)]
+    struct Ci {
+        sub: Option<String>,
+        repository: Option<String>,
+    }
+    // Same order of size as the largest real CI token (GitHub ~1.5 KB).
+    if token.len() > 16 * 1024 {
+        return None;
+    }
+    let ci = jsonwebtoken::dangerous::insecure_decode::<Ci>(token)
+        .ok()?
+        .claims;
+    let cut = |v: Option<String>| v.unwrap_or_default().chars().take(128).collect();
+    Some((cut(ci.sub), cut(ci.repository)))
+}
+
 /// Auth middleware - supports Basic auth, Bearer tokens, OIDC JWT and (Maestra
 /// fork) Teleport app-access JWT on the web UI.
 pub async fn auth_middleware(
@@ -299,11 +431,52 @@ pub async fn auth_middleware(
     // challenge, so no password dialog on the public hostname.
     let drop_challenge = state.teleport.as_ref().is_some_and(|t| t.require_for_ui())
         && teleport::is_browser(request.headers());
+    let presented = presented_credential(&request);
+    let client_ip = extract_client_ip(&request, &state.config.auth.trusted_proxies);
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
     let mut response = authenticate(state, request, next).await;
+    if let Some(rej) = response.extensions_mut().remove::<AuthRejection>() {
+        if let Some((kind, username)) = presented {
+            log_rejection(&rej, kind, username.as_deref(), client_ip, &method, &path);
+        }
+    }
     if drop_challenge && response.status() == StatusCode::UNAUTHORIZED {
         response.headers_mut().remove(header::WWW_AUTHENTICATE);
     }
     response
+}
+
+fn log_rejection(
+    rej: &AuthRejection,
+    kind: &'static str,
+    username: Option<&str>,
+    client_ip: Option<IpAddr>,
+    method: &axum::http::Method,
+    path: &str,
+) {
+    if !rej.oidc {
+        crate::metrics::AUTH_REJECTED_TOTAL
+            .with_label_values(&[kind, rej.reason])
+            .inc();
+    }
+    if !rej.log {
+        return;
+    }
+    let (sub, repository) = rej.unverified_claims.clone().unwrap_or_default();
+    tracing::warn!(
+        client_ip = %client_ip.map_or_else(|| "-".to_string(), |ip| ip.to_string()),
+        kind,
+        reason = rej.reason,
+        username = username.unwrap_or("-"),
+        method = %method,
+        path,
+        retry_after = rej.retry_after.unwrap_or(0),
+        detail = rej.detail.as_deref().unwrap_or("-"),
+        unverified_sub = sub.as_str(),
+        unverified_repository = repository.as_str(),
+        "auth rejected: credential refused"
+    );
 }
 
 async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -> Response {
@@ -413,6 +586,7 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
             // (e.g. to gate proxy_upstreams disclosure). If validation fails
             // we fall through to anonymous — the path is open regardless.
             let client_ip = extract_client_ip(&request, &state.config.auth.trusted_proxies);
+            let mut open_rejection = None;
             if let Some(auth_val) = request
                 .headers()
                 .get(axum::http::header::AUTHORIZATION)
@@ -422,9 +596,10 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
                 if let Some(encoded) = auth_val.strip_prefix("Basic ") {
                     // A locked-out username is not validated (no bcrypt) on the open path.
                     let lockout_key = client_ip.zip(basic_username(encoded));
-                    let blocked = lockout_key.as_ref().is_some_and(|(ip, user)| {
-                        state.auth_failures.check_blocked(ip, user).is_some()
-                    });
+                    let retry_after = lockout_key
+                        .as_ref()
+                        .and_then(|(ip, user)| state.auth_failures.check_blocked(ip, user));
+                    let blocked = retry_after.is_some();
                     let identity = match blocked {
                         true => None,
                         false => try_basic_auth(encoded, &state, htpasswd).await,
@@ -439,6 +614,14 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
                     }
                     // A wrong Basic credential counts toward lockout here too,
                     // or the open path is an unthrottled password oracle.
+                    open_rejection = Some(match (&lockout_key, retry_after) {
+                        (Some((ip, user)), Some(secs)) => AuthRejection {
+                            log: state.auth_failures.first_refusal(ip, user),
+                            retry_after: Some(secs),
+                            ..AuthRejection::new("locked_out")
+                        },
+                        _ => AuthRejection::new("wrong_password"),
+                    });
                     if let Some((ip, user)) = lockout_key.filter(|_| !blocked) {
                         state.auth_failures.record_failure(ip, &user);
                     }
@@ -463,7 +646,11 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
             request
                 .extensions_mut()
                 .insert(AuthenticatedUser("anonymous".to_string()));
-            return next.run(request).await;
+            let response = next.run(request).await;
+            return match open_rejection {
+                Some(rejection) => rejection.on(response),
+                None => response,
+            };
         }
         // A gated web-surface request without credentials gets a Basic
         // challenge so browsers prompt instead of rendering a bare 401.
@@ -616,7 +803,14 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
             }
         }
 
+        // An nra_ token that failed above can never be a JWT: no OIDC attempt.
+        if token.starts_with("nra_") {
+            return AuthRejection::new("token_invalid")
+                .on(unauthorized_response("Invalid or expired token", realm));
+        }
+
         // 2. Try OIDC JWT validation
+        let mut rejection = AuthRejection::new("no_oidc");
         if let Some(ref oidc_validator) = state.oidc {
             if oidc_validator.is_active() {
                 match oidc_validator.validate_token(token).await {
@@ -675,10 +869,17 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
                         // metric bucket for alerting plus the full reason in a warn
                         // log (never the token). Without this a lifetime ceiling, a
                         // wrong audience and a missing role rule are indistinguishable.
-                        crate::metrics::record_oidc_rejection(
-                            crate::auth::oidc::classify_rejection(&reason),
-                        );
-                        tracing::warn!(reason = %reason, "OIDC authentication rejected");
+                        let class = crate::auth::oidc::classify_rejection(&reason);
+                        crate::metrics::record_oidc_rejection(class);
+                        // Logged with the client by auth_middleware (log_rejection).
+                        let named = reason.contains("ExpiredSignature")
+                            || reason.contains("InvalidAudience");
+                        rejection = AuthRejection {
+                            oidc: true,
+                            unverified_claims: named.then(|| unverified_ci_claims(token)).flatten(),
+                            detail: Some(reason),
+                            ..AuthRejection::new(class)
+                        };
                     }
                 }
             }
@@ -687,41 +888,59 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
         // Both token and OIDC failed. Not counted toward the lockout: an nra_ token
         // or a signed JWT cannot be guessed, and counting a stale token or an expired
         // JWT would only lock out the valid credentials sharing its egress IP.
-        return unauthorized_response("Invalid or expired token", realm);
+        return rejection.on(unauthorized_response("Invalid or expired token", realm));
     }
 
     // Parse Basic auth
     if !auth_header.starts_with("Basic ") {
-        return unauthorized_response("Basic or Bearer authentication required", realm);
+        return AuthRejection::new("malformed").on(unauthorized_response(
+            "Basic or Bearer authentication required",
+            realm,
+        ));
     }
 
     // Basic carries either an htpasswd password or an API token (#736): it is
     // unusable only when neither store is configured.
     if htpasswd.is_none() && state.tokens.is_none() {
-        return unauthorized_response("Basic auth not configured", realm);
+        return AuthRejection::new("basic_not_configured")
+            .on(unauthorized_response("Basic auth not configured", realm));
     }
 
     let encoded = &auth_header[6..];
     let decoded = match STANDARD.decode(encoded) {
         Ok(d) => d,
-        Err(_) => return unauthorized_response("Invalid credentials encoding", realm),
+        Err(_) => {
+            return AuthRejection::new("malformed")
+                .on(unauthorized_response("Invalid credentials encoding", realm))
+        }
     };
 
     let credentials = match String::from_utf8(decoded) {
         Ok(c) => c,
-        Err(_) => return unauthorized_response("Invalid credentials encoding", realm),
+        Err(_) => {
+            return AuthRejection::new("malformed")
+                .on(unauthorized_response("Invalid credentials encoding", realm))
+        }
     };
 
     let (username, password) = match credentials.split_once(':') {
         Some((u, p)) => (u, p),
-        None => return unauthorized_response("Invalid credentials format", realm),
+        None => {
+            return AuthRejection::new("malformed")
+                .on(unauthorized_response("Invalid credentials format", realm))
+        }
     };
 
     // Brute-force lockout of this username from this client IP.
-    if let Some(retry_after) =
-        client_ip.and_then(|ip| state.auth_failures.check_blocked(&ip, username))
+    if let Some((ip, retry_after)) =
+        client_ip.and_then(|ip| Some((ip, state.auth_failures.check_blocked(&ip, username)?)))
     {
-        return (
+        return AuthRejection {
+            log: state.auth_failures.first_refusal(&ip, username),
+            retry_after: Some(retry_after),
+            ..AuthRejection::new("locked_out")
+        }
+        .on((
             StatusCode::TOO_MANY_REQUESTS,
             [
                 (header::RETRY_AFTER, retry_after.to_string()),
@@ -732,7 +951,7 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
                 retry_after
             ),
         )
-            .into_response();
+            .into_response());
     }
 
     // Verify credentials. htpasswd first; if that fails, the password may be an API
@@ -789,7 +1008,8 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
             if let Some(ip) = client_ip {
                 state.auth_failures.record_failure(ip, username);
             }
-            return unauthorized_response("Invalid username or password", realm);
+            return AuthRejection::new("wrong_password")
+                .on(unauthorized_response("Invalid username or password", realm));
         }
     }
 
@@ -1204,6 +1424,16 @@ mod tests {
             tracker.record_failure(ip, "u");
         }
         assert!(tracker.check_blocked(&ip, "u").is_some());
+    }
+
+    #[test]
+    fn test_auth_failure_tracker_reports_lockout_once_per_lockout() {
+        let tracker = AuthFailureTracker::new(5, 900);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let started: Vec<_> = (0..5).map(|_| tracker.record_failure(ip, "u")).collect();
+        assert_eq!(started, [None, None, None, None, Some(1)]);
+        // Next failure (after the lockout ran out) starts the next, longer lockout.
+        assert_eq!(tracker.record_failure(ip, "u"), Some(2));
     }
 
     #[test]
@@ -3409,6 +3639,132 @@ mod web_surface_gating_tests {
         assert!(
             !npm["proxy_upstreams"].as_array().unwrap().is_empty(),
             "bearer-authenticated must see populated proxy_upstreams"
+        );
+    }
+
+    /// Captures the formatted log of the current thread (tokio::test is single-threaded).
+    #[derive(Clone, Default)]
+    struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+        type Writer = LogSink;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogSink {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_writer(self.clone())
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    async fn get_with_auth(ctx: &crate::test_helpers::TestContext, auth: &str) -> StatusCode {
+        send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/test.txt",
+            vec![("authorization", auth)],
+            "",
+        )
+        .await
+        .status()
+    }
+
+    /// A refused credential is logged with its client, kind and reason, and the
+    /// secret itself (password, nra_ token, JWT) never reaches the log.
+    #[tokio::test]
+    async fn rejected_credentials_are_logged_without_the_secret() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let sink = LogSink::default();
+        let _guard = sink.install();
+        let jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJjYW5hcnktc3ViIn0.c2lnbmF0dXJlLWNhbmFyeQ";
+        let basic = |p: &str| format!("Basic {}", STANDARD.encode(format!("admin:{p}")));
+        let tried = [
+            (basic("canary-pass-1"), "basic_htpasswd", "wrong_password"),
+            (
+                basic("nra_canarytoken0000000000000000"),
+                "basic_nra",
+                "token_invalid",
+            ),
+            (
+                "Bearer nra_canarytoken1111111111111111".to_string(),
+                "bearer_nra",
+                "token_invalid",
+            ),
+            (format!("Bearer {jwt}"), "bearer_jwt", "no_oidc"),
+            ("Digest canary-digest".to_string(), "malformed", "malformed"),
+        ];
+        for (auth, kind, reason) in &tried {
+            assert_eq!(get_with_auth(&ctx, auth).await, StatusCode::UNAUTHORIZED);
+            let out = sink.text();
+            let line = out
+                .lines()
+                .rfind(|l| l.contains("auth rejected: credential refused"))
+                .unwrap_or_else(|| panic!("{kind}: no rejection logged in {out}"));
+            assert!(line.contains(&format!(r#""kind":"{kind}""#)), "{line}");
+            assert!(line.contains(&format!(r#""reason":"{reason}""#)), "{line}");
+            assert!(line.contains(r#""client_ip":"127.0.0.1""#), "{line}");
+        }
+        let out = sink.text();
+        for secret in ["canary", "nra_", "eyJ", "c2lnbmF0dXJl", "Basic ", "Bearer "] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+    }
+
+    /// The anonymous round of the NuGet/Docker challenge (no Authorization) is half
+    /// of all traffic: answered 401, never logged.
+    #[tokio::test]
+    async fn anonymous_challenge_is_not_logged() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let sink = LogSink::default();
+        let _guard = sink.install();
+        let response = send(&ctx.app, Method::GET, "/raw/test.txt", "").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(sink.text(), "");
+    }
+
+    /// One lockout: one WARN at its start, one for its refusals, however many 429s.
+    #[tokio::test]
+    async fn lockout_refusals_are_logged_once() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let sink = LogSink::default();
+        let _guard = sink.install();
+        let wrong = format!("Basic {}", STANDARD.encode("admin:wrong"));
+        for _ in 0..5 {
+            assert_eq!(get_with_auth(&ctx, &wrong).await, StatusCode::UNAUTHORIZED);
+        }
+        for _ in 0..3 {
+            assert_eq!(
+                get_with_auth(&ctx, &wrong).await,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+        }
+        let out = sink.text();
+        assert_eq!(out.matches("auth lockout:").count(), 1, "{out}");
+        assert_eq!(out.matches(r#""reason":"locked_out""#).count(), 1, "{out}");
+        assert_eq!(
+            out.matches(r#""reason":"wrong_password""#).count(),
+            5,
+            "{out}"
         );
     }
 }

@@ -259,9 +259,15 @@ metrics:
             annotations:
               summary: packages.maestra.io answers 429 at {{ $value | humanize }}/s
               description: >-
-                nora's rate limiter is refusing requests. Check the audit/pod log of
-                nora/nora for the client IPs; one IP for everybody means
-                auth.trusted_proxies no longer matches the traefik source addresses.
+                nora answers 429: mostly the brute-force lockout of a Basic username
+                from one client IP. Causes: sum by (kind, reason)
+                (increase(nora_auth_rejected_total[15m])). Clients: VictoriaLogs
+                pod-logs, kubernetes.pod_namespace:nora
+                fields.message:"auth rejected: credential refused" | stats by
+                (fields.client_ip, fields.kind, fields.reason, fields.username)
+                count(); lockout starts: fields.message:"auth lockout: too many
+                failed Basic logins, answering 429". One client_ip for everybody
+                means auth.trusted_proxies no longer matches the traefik addresses.
           # `jwks` = the GitHub signing keys could not be fetched or the kid is
           # unknown: CI publishes and restores with OIDC fail until the cache refreshes.
           - alert: NoraOidcJwksRejections
