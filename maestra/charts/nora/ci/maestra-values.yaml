@@ -260,10 +260,14 @@ metrics:
               summary: packages.maestra.io answers 429 at {{ $value | humanize }}/s
               description: >-
                 nora answers 429: mostly the brute-force lockout of a Basic username
-                from one client IP (nora_auth_lockouts_total). The nora/nora pod log
-                has one WARN "auth lockout: too many failed Basic logins" per lockout
-                with client_ip and username; one client_ip for everybody means
-                auth.trusted_proxies no longer matches the traefik source addresses.
+                from one client IP. Causes: sum by (kind, reason)
+                (increase(nora_auth_rejected_total[15m])). Clients: VictoriaLogs
+                pod-logs, kubernetes.pod_namespace:nora
+                fields.message:"auth rejected: credential refused" | stats by
+                (fields.client_ip, fields.kind, fields.reason, fields.username)
+                count(); lockout starts: fields.message:"auth lockout: too many
+                failed Basic logins, answering 429". One client_ip for everybody
+                means auth.trusted_proxies no longer matches the traefik addresses.
           # `jwks` = the GitHub signing keys could not be fetched or the kid is
           # unknown: CI publishes and restores with OIDC fail until the cache refreshes.
           - alert: NoraOidcJwksRejections
