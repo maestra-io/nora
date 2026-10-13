@@ -807,3 +807,130 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         self.inner.get_range(key, start, end).await
     }
 }
+
+// ── Per-registry artifact counts, each read from its real source ────────────
+
+/// The three per-registry artifact counts an operator can read for one store.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ArtifactCounts {
+    /// Dashboard card: `/api/ui/dashboard` → `registry_stats[].artifact_count`
+    /// (the HTML dashboard renders the same `build_dashboard_response`).
+    pub dashboard: usize,
+    /// `/api/ui/stats` → the registry's field.
+    pub stats: usize,
+    /// `nora_artifacts_total{registry}`: the 60 s tick in `main.rs` sets the gauge
+    /// verbatim from `repo_index.counts()`, read here after the two endpoints above
+    /// rebuilt the index. Read directly rather than through the process-global
+    /// gauge, which parallel tests would race on.
+    pub metric: usize,
+}
+
+/// Read [`ArtifactCounts`] for `registry` through the router and the shared index.
+pub async fn artifact_counts(ctx: &TestContext, registry: &str) -> ArtifactCounts {
+    use axum::http::{Method, StatusCode};
+
+    let resp = send(&ctx.app, Method::GET, "/api/ui/dashboard", "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let dashboard: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let card = dashboard["registry_stats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|card| card["name"] == registry)
+        .unwrap_or_else(|| panic!("no dashboard card for {registry}: {dashboard}"));
+    let dashboard = card["artifact_count"].as_u64().unwrap() as usize;
+
+    let resp = send(&ctx.app, Method::GET, "/api/ui/stats", "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stats: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let stats = stats[registry].as_u64().unwrap() as usize;
+
+    let rt = crate::registry_type::RegistryType::from_str_opt(registry).unwrap();
+    let metric = ctx.state.repo_index.counts().get(&rt).copied().unwrap_or(0);
+
+    ArtifactCounts {
+        dashboard,
+        stats,
+        metric,
+    }
+}
+
+/// The path of every request an upstream mock has received, in order.
+pub async fn upstream_paths(upstream: &wiremock::MockServer) -> Vec<String> {
+    upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect()
+}
+
+/// A curation blocklist file refusing every version of `name` in `registry`. Keep the
+/// directory alive while a context uses the path.
+pub fn blocklist_file(registry: &str, name: &str) -> (TempDir, String) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("blocklist.json");
+    std::fs::write(
+        &path,
+        format!(r#"{{"version": 1, "rules": [{{"registry": "{registry}", "name": "{name}", "version": "*", "reason": "malware"}}]}}"#),
+    )
+    .unwrap();
+    (dir, path.to_string_lossy().into_owned())
+}
+
+/// Readers of a source file for white-list teeth: which functions hold a call, and the body of a
+/// function. They read production code only — everything before the first test module.
+pub mod source_reader {
+    /// Production code: everything before the first `#[cfg(test)]` at the start of a line.
+    pub fn production(source: &str) -> &str {
+        &source[..source.find("\n#[cfg(test)]").unwrap_or(source.len())]
+    }
+
+    /// The name a top-level function's signature line declares (`fn`, `async fn`, `pub fn`,
+    /// `pub(crate) async fn`, …), if the line is one.
+    fn declares(line: &str) -> Option<&str> {
+        let mut rest = line;
+        for prefix in ["pub(crate) ", "pub "] {
+            rest = rest.strip_prefix(prefix).unwrap_or(rest);
+        }
+        rest = rest.strip_prefix("async ").unwrap_or(rest);
+        let rest = rest.strip_prefix("fn ")?;
+        Some(&rest[..rest.find(['(', '<']).unwrap_or(rest.len())])
+    }
+
+    /// The body of the top-level function `name`, from its signature to its closing brace.
+    pub fn body<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+        let mut offset = 0;
+        for line in source.split_inclusive('\n') {
+            if declares(line) == Some(name) {
+                let end = source[offset..].find("\n}\n").map(|end| offset + end)?;
+                return Some(&source[offset..end]);
+            }
+            offset += line.len();
+        }
+        None
+    }
+
+    /// The top-level functions whose bodies contain `needle`, a call on the signature's own line
+    /// included; `fn needle(` itself is no call.
+    pub fn holders(source: &str, needle: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut current = String::new();
+        for line in source.lines() {
+            if let Some(name) = declares(line) {
+                current = name.to_string();
+            }
+            // An occurrence that names the function being declared (`fn needle(`) is not a call.
+            if line
+                .match_indices(needle)
+                .any(|(at, _)| !line[..at].ends_with("fn "))
+            {
+                found.push(current.clone());
+            }
+        }
+        found.sort();
+        found.dedup();
+        found
+    }
+}

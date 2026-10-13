@@ -905,7 +905,7 @@ async fn cpan_browse(
                 let location = format!(
                     "/ui/cpan/{}/{}",
                     encoded_author_path,
-                    templates::encode_uri_component(distribution)
+                    templates::encode_uri_component(&distribution)
                 );
                 return Redirect::permanent(&location).into_response();
             }
