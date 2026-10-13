@@ -65,8 +65,9 @@ and retry with credentials, so about half the NuGet requests are 401 handshakes.
 are cheap and normal; do not chase them.
 
 **Branch:** CPU per request ≥ ~0.05 or pod CPU in whole cores while rps is in the
-hundreds → Step 2 (CPU contention). CPU per request flat and p99 high only for one
-registry → Step 3.
+hundreds → Step 2 (CPU contention). CPU per request flat (12.10 16:00: 0.006 at 413 rps,
+1.5–1.8 cores) and p99 high → Step 2b (network link) before Step 3. p99 high only for
+one registry → Step 3.
 
 ## Step 2 — CPU contention: profile the process on the node
 
@@ -88,6 +89,38 @@ twice and diff. The node has 32 cores.
 |---|---|---|
 | `native_queued_spin_lock_slowpath` on top (12.10: 85% of nora CPU), under `futex_wait`/`futex_wake`; `stime` ≥ `utime`; node load ≈ core count (12.10: 26, node at 90% CPU) | allocator lock contention: every tokio worker (32) spins on one malloc lock | Step 4a |
 | userspace frames on top (`[.] 0x…`: the binary is stripped, so they show as addresses), `stime` ≪ `utime`, no spinlock in the top 15 (12.10 after the fix: top entry `__handle_mm_fault` 8.8%) | real work: load beyond one replica | Step 4b |
+
+## Step 2b — Network link: the node's 1 Gbit NIC and the pod quota
+
+nora serves every artifact from R2 (no local blob cache), so each download is read from
+R2 over the node's public NIC `eno5` (1 Gbit on every iota node) and written back out
+towards traefik (`eno6` to the other nodes, `eno5` for the local one). A NuGet burst fills
+the link before CPU matters: on 12.10 16:00–16:05 UTC 413 rps pushed `eno5` rx to
+982 Mbit/s (98%) and 3.6–7 rps of NuGet requests took > 10s, no 5xx.
+
+```bash
+NODE=$(pod_of | awk '{print $2}')
+q "rate(node_network_receive_bytes_total{instance=\"$NODE\",device=\"eno5\"}[1m]) * 8 / 1e6"    # Mbit/s, R2 → nora
+q "rate(node_network_transmit_bytes_total{instance=\"$NODE\",device=~\"eno5|eno6\"}[1m]) * 8 / 1e6"
+q 'sum(rate(container_network_receive_bytes_total{namespace="nora",pod=~"nora-.*"}[1m])) * 8 / 1e6'
+```
+
+Since 13.10.2026 the pod carries a Cilium bandwidth quota (`podAnnotations`
+`kubernetes.io/ingress-bandwidth: 800M`, `egress-bandwidth: 800M` in the fluxcd
+HelmRelease; Cilium bandwidth manager enabled by kubernetes-clusters#165). Confirm it is
+in force on the node (`kube-system` exec is RBAC-denied; `nsenter` into the agent):
+
+```bash
+tsh ssh --login=teleport-production "$NODE" 'pid=$(pgrep -xo cilium-agent);
+  sudo nsenter -t "$pid" -m -p -- cilium-dbg status | grep BandwidthManager;
+  sudo nsenter -t "$pid" -m -p -- cilium-dbg bpf bandwidth list'     # nora endpoint: Egress 800M + Ingress 800M
+```
+
+| Signature | Meaning | Go to |
+|---|---|---|
+| `eno5` rx ≈ 800 Mbit/s flat (quota engaged), rps in the hundreds, p99 up only for NuGet | the quota is doing its job: clients queue behind 800 Mbit/s; the node's neighbours are protected | Step 4d |
+| `eno5` rx > 900 Mbit/s with the quota configured | the quota is not applied: `bpf bandwidth list` has no entry for the nora endpoint (pod created before the annotation / bandwidth manager off: `BandwidthManager: Disabled`) | Step 4d |
+| `eno5` rx well below 800 and p99 still high | not the link | Step 3 |
 
 ## Step 3 — Other causes (check each; the alert does not say which)
 
@@ -136,6 +169,13 @@ Baselines: storage `get` errors are never zero (12.10 12:00 UTC: 2880 `get` + 15
   `requests` in the HelmRelease or finding the client generating the burst (12.10: the
   GitHub runner migration raised traffic to ~200 rps).
 - **4c. A Step 3 branch.** Act per its table row.
+- **4d. Link saturated / quota engaged** (Step 2b). Expected during a CI burst: the
+  latency is the price of the 800 Mbit/s cap and ends with the burst (12.10: resolved
+  16:10 UTC on its own). Nothing to roll back. A missing throttle entry → recreate the pod
+  (`kubectl -n nora rollout restart deploy/nora`, Recreate strategy, ~20s outage) after
+  confirming the bandwidth manager is on. Raising the cap costs the node's other tenants
+  (traefik, backups) their headroom; the real fix for repeated bursts is a local hot cache
+  in nora so repeated restores stop reading R2 (open, not built).
 
 ## Act
 
@@ -147,6 +187,9 @@ All changes go through PRs, never by hand:
 - Version, resources, config: `maestra-io/fluxcd`
   `iota/us-iota-lw-kube-infra/nora/helm-release.yaml` (chart `version:` and image
   `tag:` together). Example: fluxcd#22246 rolled `1.3.3-maestra.10` at 15:08 UTC.
+- Bandwidth quota: `podAnnotations` in the same HelmRelease (fluxcd#22471 set
+  800M/800M); the bandwidth manager itself lives in `maestra-io/kubernetes-clusters`
+  `k0s/us-iota-lw-kube-infra/cilium-values.yaml` + its k0sctl.yaml mirror.
 
 ## Verify
 
@@ -173,6 +216,7 @@ After the pod is Ready (`pod_of`), at least 10 minutes of traffic:
 
 | Date (UTC) | Object | Cause | Category | What helped | Thread |
 |---|---|---|---|---|---|
+| 12.10.2026 16:05–16:10 | nora `1.3.3-maestra.10`, iota node 02 | NuGet CI burst up to 413 rps; every artifact read from R2 filled the node's 1 Gbit `eno5` (982 Mbit/s rx, 98%), responses 637 Mbit/s on `eno6`; CPU 1.5–1.8 cores, 0.006 core-s/request; 3.6–7 rps of NuGet > 10s, no 5xx | network link saturated | ended with the burst. Follow-up 13.10: Cilium bandwidth manager on iota (kubernetes-clusters#165) + 800M/800M pod quota (fluxcd#22471); verified with 2×16 parallel downloads from nodes 01/03: `eno5` rx ~805 Mbit/s, 256/256 OK | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1791821141024479> |
 | 12.10.2026 14:15–15:07, 4 firings | nora `1.3.3-maestra.9`, iota | musl static-pie build (Alpine builder) using musl's malloc with one global lock; at ~200 rps all 32 tokio workers spun on it: `perf` 85% `native_queued_spin_lock_slowpath`, 10–26 cores, node load 26, p99 ≥ 10s, p90 3.9s, p50 60ms, no 5xx. OOMKilled at 2Gi in parallel, with a JWKS rejection burst after each restart | allocator contention + OOM | mimalloc global allocator (maestra-io/nora#53, release `v1.3.3-maestra.10`, fluxcd#22246, rolled 15:08); memory 2Gi→4Gi (fluxcd#22241). After: 0.2–0.5 cores at 75–112 rps, p99 2.1s, node load 3 | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1791814920896829> |
 
 ## Reply format for the alert thread
