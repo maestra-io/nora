@@ -904,15 +904,22 @@ async fn an_internal_name_never_reaches_a_recording_upstream_dates_included() {
     for path in INTERNAL_PATHS {
         let before = upstream_paths(&upstream).await.len();
         let twin = public_twin(path);
-        let _ = send(&ctx.app, Method::GET, &twin, "").await;
-        let after = upstream_paths(&upstream).await;
-        // A PyPI file resolves from the project's cached index (one upstream fetch per
-        // project per TTL): the index already asked for proves the path live.
-        let via_index = twin
+        // A PyPI file resolves from the project's cached upstream index (one fetch per
+        // project per TTL): drop the copy the index twin cached, so this request has to
+        // ask the upstream itself.
+        if let Some(project) = twin
             .strip_prefix("/simple/")
+            .filter(|rest| rest.trim_end_matches('/').contains('/'))
             .and_then(|rest| rest.split('/').next())
-            .is_some_and(|project| after.iter().any(|p| p == &format!("/{project}/")));
-        if after.len() == before && !via_index {
+        {
+            let _ = ctx
+                .state
+                .storage
+                .delete(&format!("pypi/{project}/upstream-index.json"))
+                .await;
+        }
+        let _ = send(&ctx.app, Method::GET, &twin, "").await;
+        if upstream_paths(&upstream).await.len() == before {
             dead.push(twin);
         }
     }

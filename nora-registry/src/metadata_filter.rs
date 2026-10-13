@@ -189,8 +189,9 @@ pub fn pypi_index(
             .filter_map(|f| crate::pypi_files::parse_pypi_version(name, f))
             .filter(|v| !kept.contains(v))
             .collect();
+        // parse_pypi_version lowercases the file name; `versions` carries them as published.
         if let Some(versions) = doc.get_mut("versions").and_then(Value::as_array_mut) {
-            versions.retain(|v| v.as_str().is_none_or(|v| !gone.contains(v)));
+            versions.retain(|v| v.as_str().is_none_or(|v| !gone.contains(&v.to_lowercase())));
         }
         return serde_json::to_vec(&doc).ok();
     }
