@@ -1842,31 +1842,138 @@ pub fn parse_duration(s: &str) -> Result<i64, String> {
 /// the digest quarantine (see `evaluate`). Supports per-registry overrides: if a
 /// registry has its own threshold, it takes precedence over the global
 /// `min_age_secs`. Versions on the per-registry `allow` list
-/// (`[curation.<registry>] allow = ["name@version"]`) are exempt from the age check
-/// only; the digest quarantine still applies to them.
+/// (`[curation.<registry>] allow = ["name@version", "name", "prefix*"]`, see
+/// [`AllowEntry`]) are exempt from the age check only; the digest quarantine, the
+/// blocklist and internal namespaces still apply to them.
 #[derive(Clone)]
 pub struct MinReleaseAgeFilter {
     min_age_secs: i64,
     label: String,
     /// Per-registry override thresholds (seconds).
     overrides: std::collections::HashMap<RegistryType, (i64, String)>,
-    /// Exact versions exempt from the age check: (registry, name, version), normalized.
-    allow: std::collections::HashSet<(RegistryType, String, String)>,
+    /// Exact versions exempt from the age check: (registry, name, version), normalized,
+    /// to the entry as configured.
+    allow: std::collections::HashMap<(RegistryType, String, String), String>,
+    /// Entries naming any version or a name prefix, checked one by one.
+    allow_patterns: Vec<(RegistryType, AllowEntry)>,
 }
 
 /// The form a name and version are compared in on the `allow` list: NuGet IDs and
 /// versions are case-insensitive, PyPI names compare PEP 503-normalized; every other
 /// format compares as written (npm names are case-sensitive, `@scope/name` included).
 fn allow_key(registry: RegistryType, name: &str, version: &str) -> (RegistryType, String, String) {
-    let (name, version) = match registry {
-        RegistryType::Nuget => (name.to_lowercase(), version.to_lowercase()),
-        RegistryType::PyPI => (
-            crate::registry::pypi::normalize_name(name),
-            version.to_string(),
-        ),
-        _ => (name.to_string(), version.to_string()),
-    };
-    (registry, name, version)
+    (
+        registry,
+        allow_name(registry, name),
+        allow_version(registry, version),
+    )
+}
+
+/// A name (or a name prefix) in [`allow_key`]'s form.
+fn allow_name(registry: RegistryType, name: &str) -> String {
+    match registry {
+        RegistryType::Nuget => name.to_lowercase(),
+        RegistryType::PyPI => crate::registry::pypi::normalize_name(name),
+        _ => name.to_string(),
+    }
+}
+
+/// A version in [`allow_key`]'s form.
+fn allow_version(registry: RegistryType, version: &str) -> String {
+    match registry {
+        RegistryType::Nuget => version.to_lowercase(),
+        _ => version.to_string(),
+    }
+}
+
+/// Which names an `allow` entry covers, in [`allow_name`]'s form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AllowName {
+    /// One package.
+    Exact(String),
+    /// Every package whose name starts with this (`Microsoft.NETCore.*`).
+    Prefix(String),
+}
+
+/// One parsed `[curation.<registry>] allow` entry:
+///
+/// - `name@version`: that exact version (the last `@` after the first character
+///   splits, so an npm `@scope/name@1.0.0` works);
+/// - `name` or `name@*`: every version of that package;
+/// - `prefix*` or `prefix*@*`: every version of every package whose name starts with
+///   `prefix` (`prefix*@1.0.0`: that version of each). The `*` is a plain prefix
+///   match, so `Microsoft.NETCore.*` covers `Microsoft.NETCore.App.Ref` but not
+///   `Microsoft.NETCoreApp`; `Microsoft.NETCore*` covers both.
+///
+/// Only one `*`, as the last character of the name, and a version of `*` or an exact
+/// one: `*` alone, an empty prefix, a `*` elsewhere in the name and version globs
+/// (`1.*`) are refused. Names and versions take the registry's form ([`allow_key`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllowEntry {
+    /// The entry as configured, for logs and `nora curation explain`.
+    pub entry: String,
+    pub name: AllowName,
+    /// The exact version, `None` for any version.
+    pub version: Option<String>,
+}
+
+impl AllowEntry {
+    /// Parse one `allow` entry of `registry` (see [`AllowEntry`]).
+    pub fn parse(registry: RegistryType, entry: &str) -> Result<Self, String> {
+        let fail = |why: &str| {
+            Err(format!(
+                "invalid curation.{registry}.allow entry {entry:?}: {why}; expected \
+                 \"name@version\", \"name\" (any version) or \"prefix*\" (any version of \
+                 every name starting with prefix)"
+            ))
+        };
+        let raw = entry.trim();
+        // The version separator is the last `@` past the first character: an npm
+        // scope's leading `@` is part of the name.
+        let (name, version) = match raw.rfind('@').filter(|&at| at > 0) {
+            Some(at) => (&raw[..at], Some(&raw[at + 1..])),
+            None => (raw, None),
+        };
+        if name.is_empty() {
+            return fail("the name is empty");
+        }
+        if name.starts_with('@') && !name.contains('/') {
+            return fail("a name starting with @ must be an npm @scope/name");
+        }
+        let version = match version {
+            None | Some("*") => None,
+            Some("") => return fail("the version after @ is empty"),
+            Some(v) if v.contains('*') => return fail("a version is exact or *, never a glob"),
+            Some(v) => Some(allow_version(registry, v)),
+        };
+        let name = match name.find('*') {
+            None => AllowName::Exact(allow_name(registry, name)),
+            Some(star) if star + 1 != name.len() => {
+                return fail("* is allowed only once, at the end of the name")
+            }
+            Some(_) => {
+                let prefix = allow_name(registry, &name[..name.len() - 1]);
+                if prefix.is_empty() {
+                    return fail("a * needs a non-empty prefix before it");
+                }
+                AllowName::Prefix(prefix)
+            }
+        };
+        Ok(Self {
+            entry: raw.to_string(),
+            name,
+            version,
+        })
+    }
+
+    /// Whether this entry covers `name@version`, both already in [`allow_key`]'s form.
+    fn covers(&self, name: &str, version: &str) -> bool {
+        let name_holds = match &self.name {
+            AllowName::Exact(exact) => exact == name,
+            AllowName::Prefix(prefix) => name.starts_with(prefix.as_str()),
+        };
+        name_holds && self.version.as_deref().is_none_or(|v| v == version)
+    }
 }
 
 impl MinReleaseAgeFilter {
@@ -1875,22 +1982,25 @@ impl MinReleaseAgeFilter {
             min_age_secs,
             label: label.to_string(),
             overrides: std::collections::HashMap::new(),
-            allow: std::collections::HashSet::new(),
+            allow: std::collections::HashMap::new(),
+            allow_patterns: Vec::new(),
         }
     }
 
-    /// Exempt one exact version (`name@version`; the last `@` splits, so an npm
-    /// `@scope/name@1.0.0` works) of `registry` from the age check.
+    /// Exempt the versions one `allow` entry names (see [`AllowEntry`]) of `registry`
+    /// from the age check.
     pub fn add_allow(&mut self, registry: RegistryType, entry: &str) -> Result<(), String> {
-        match entry.trim().rsplit_once('@') {
-            Some((name, version)) if !name.is_empty() && !version.is_empty() => {
-                self.allow.insert(allow_key(registry, name, version));
-                Ok(())
+        let parsed = AllowEntry::parse(registry, entry)?;
+        match (&parsed.name, &parsed.version) {
+            (AllowName::Exact(name), Some(version)) => {
+                self.allow.insert(
+                    (registry, name.clone(), version.clone()),
+                    parsed.entry.clone(),
+                );
             }
-            _ => Err(format!(
-                "invalid curation.{registry}.allow entry {entry:?}: expected \"name@version\""
-            )),
+            _ => self.allow_patterns.push((registry, parsed)),
         }
+        Ok(())
     }
 
     /// Add a per-registry override. If `registry` has its own min_release_age,
@@ -1910,7 +2020,25 @@ impl MinReleaseAgeFilter {
 
     /// Whether `name@version` is on `registry`'s allow list.
     fn allowed(&self, registry: RegistryType, name: &str, version: &str) -> bool {
-        !self.allow.is_empty() && self.allow.contains(&allow_key(registry, name, version))
+        self.allow_rule(registry, name, version).is_some()
+    }
+
+    /// The `allow` entry (as configured) that exempts `name@version` of `registry`
+    /// from the age check, if any: an exact `name@version` entry first, then the
+    /// any-version and prefix entries in configuration order.
+    pub fn allow_rule(&self, registry: RegistryType, name: &str, version: &str) -> Option<&str> {
+        if self.allow.is_empty() && self.allow_patterns.is_empty() {
+            return None;
+        }
+        let key = allow_key(registry, name, version);
+        if let Some(entry) = self.allow.get(&key) {
+            return Some(entry);
+        }
+        let (_, name, version) = key;
+        self.allow_patterns
+            .iter()
+            .find(|(r, rule)| *r == registry && rule.covers(&name, &version))
+            .map(|(_, rule)| rule.entry.as_str())
     }
 
     fn format_duration(secs: i64) -> String {
@@ -1960,7 +2088,7 @@ impl ProxyFilter for MinReleaseAgeFilter {
         let age = now - publish_ts;
         if age < threshold {
             if let Some(version) = request.version.known() {
-                if self.allowed(request.registry, &request.name, version) {
+                if let Some(rule) = self.allow_rule(request.registry, &request.name, version) {
                     crate::metrics::CURATION_MIN_AGE_ALLOWED_TOTAL
                         .with_label_values(&[request.registry.as_str()])
                         .inc();
@@ -1969,6 +2097,7 @@ impl ProxyFilter for MinReleaseAgeFilter {
                         package = %request.name,
                         version = %version,
                         age = %Self::format_duration(age.max(0)),
+                        rule = %rule,
                         "[SECURITY] min-release-age exempted by curation allow list"
                     );
                     return Decision::Skip;
@@ -4529,9 +4658,338 @@ mod min_release_age_tests {
     #[test]
     fn test_min_release_age_allow_rejects_malformed_entries() {
         let mut filter = MinReleaseAgeFilter::new(604800, "7d");
-        for bad in ["left-pad", "@scope/pkg", "left-pad@", "@1.0.0", ""] {
+        for bad in [
+            "left-pad@",
+            "@1.0.0",
+            "",
+            "  ",
+            "@",
+            // Patterns: `*` alone, an empty prefix, `*` inside or twice, version globs.
+            "*",
+            "*@*",
+            "*@1.0.0",
+            "@*",
+            "*left-pad",
+            "left*pad",
+            "left**",
+            "left*@1.*",
+            "left-pad@1.*",
+            "left-pad@*1",
+            "left-pad@**",
+            "@scope/*@",
+        ] {
             assert!(filter.add_allow(RegistryType::Npm, bad).is_err(), "{bad:?}");
         }
+        for bad in ["Microsoft.*.App", "*.Runtime", "Microsoft.NETCore.*@10.*"] {
+            assert!(
+                filter.add_allow(RegistryType::Nuget, bad).is_err(),
+                "{bad:?}"
+            );
+        }
+        let empty = || (filter.allow.is_empty(), filter.allow_patterns.is_empty());
+        assert_eq!(empty(), (true, true), "a refused entry exempts nothing");
+    }
+
+    #[test]
+    fn test_allow_entry_parses_every_form() {
+        use AllowName::{Exact, Prefix};
+        let parse = |r, e| AllowEntry::parse(r, e).map(|a| (a.name, a.version));
+        let exact = |n: &str| Exact(n.to_string());
+        let prefix = |n: &str| Prefix(n.to_string());
+        let v = |v: &str| Some(v.to_string());
+        assert_eq!(
+            parse(RegistryType::Npm, "left-pad@1.3.0"),
+            Ok((exact("left-pad"), v("1.3.0")))
+        );
+        assert_eq!(
+            parse(RegistryType::Npm, "left-pad"),
+            Ok((exact("left-pad"), None))
+        );
+        assert_eq!(
+            parse(RegistryType::Npm, "left-pad@*"),
+            Ok((exact("left-pad"), None))
+        );
+        assert_eq!(
+            parse(RegistryType::Npm, "@scope/pkg"),
+            Ok((exact("@scope/pkg"), None))
+        );
+        assert_eq!(
+            parse(RegistryType::Npm, "@scope/pkg@2.0.0"),
+            Ok((exact("@scope/pkg"), v("2.0.0")))
+        );
+        assert_eq!(
+            parse(RegistryType::Npm, "@scope/*"),
+            Ok((prefix("@scope/"), None))
+        );
+        assert_eq!(
+            parse(RegistryType::Nuget, " Microsoft.NETCore.* "),
+            Ok((prefix("microsoft.netcore."), None))
+        );
+        assert_eq!(
+            parse(RegistryType::Nuget, "Microsoft.AspNetCore.*@*"),
+            Ok((prefix("microsoft.aspnetcore."), None))
+        );
+        assert_eq!(
+            parse(RegistryType::Nuget, "Microsoft.NETCore.*@10.0.13-RC.1"),
+            Ok((prefix("microsoft.netcore."), v("10.0.13-rc.1")))
+        );
+        assert_eq!(
+            parse(RegistryType::Nuget, "Microsoft.NETCore*"),
+            Ok((prefix("microsoft.netcore"), None))
+        );
+        assert_eq!(
+            parse(RegistryType::PyPI, "Zope.*"),
+            Ok((prefix("zope-"), None))
+        );
+        // The entry is kept as written (trimmed) for logs and `curation explain`.
+        let entry = AllowEntry::parse(RegistryType::Nuget, " Microsoft.NETCore.* ").unwrap();
+        assert_eq!(entry.entry, "Microsoft.NETCore.*");
+        // The error names the registry, the entry and the accepted forms.
+        let err = AllowEntry::parse(RegistryType::Nuget, "*").unwrap_err();
+        assert!(
+            err.contains("curation.nuget.allow") && err.contains("\"*\""),
+            "{err}"
+        );
+        assert!(err.contains("prefix*"), "{err}");
+    }
+
+    #[test]
+    fn test_min_release_age_allow_any_version_of_one_package() {
+        let mut filter = MinReleaseAgeFilter::new(604800, "7d");
+        filter.add_allow(RegistryType::Npm, "left-pad").unwrap();
+        filter.add_allow(RegistryType::Npm, "@scope/pkg@*").unwrap();
+        filter
+            .add_allow(RegistryType::Nuget, "Newtonsoft.Json")
+            .unwrap();
+        let ok = |r: &FilterRequest| matches!(filter.evaluate(r), Decision::Skip);
+        assert!(ok(&young_request(RegistryType::Npm, "left-pad", "1.3.0")));
+        assert!(ok(&young_request(
+            RegistryType::Npm,
+            "left-pad",
+            "2.0.0-beta.1"
+        )));
+        assert!(ok(&young_request(RegistryType::Npm, "@scope/pkg", "9.9.9")));
+        assert!(ok(&young_request(
+            RegistryType::Nuget,
+            "newtonsoft.json",
+            "13.0.5"
+        )));
+        // Not a prefix: another package, or the same name under another registry.
+        assert!(!ok(&young_request(
+            RegistryType::Npm,
+            "left-pad-extra",
+            "1.0.0"
+        )));
+        assert!(!ok(&young_request(
+            RegistryType::Npm,
+            "@scope/pkg2",
+            "1.0.0"
+        )));
+        assert!(!ok(&young_request(RegistryType::PyPI, "left-pad", "1.3.0")));
+        assert!(!ok(&young_request(
+            RegistryType::Nuget,
+            "newtonsoft.json.bson",
+            "1.0.0"
+        )));
+    }
+
+    /// The .NET servicing case (2026-10-13): every runtime / targeting / apphost /
+    /// crossgen2 pack of a fresh patch passes, whatever its version, and nothing
+    /// outside the two namespaces does.
+    #[test]
+    fn test_min_release_age_allow_prefix_nuget() {
+        let mut filter = MinReleaseAgeFilter::new(3 * 86400, "3d");
+        filter
+            .add_allow(RegistryType::Nuget, "Microsoft.NETCore.*")
+            .unwrap();
+        filter
+            .add_allow(RegistryType::Nuget, "Microsoft.AspNetCore.*@*")
+            .unwrap();
+        let rule = |n: &str, v: &str| filter.allow_rule(RegistryType::Nuget, n, v);
+        for (id, version, by) in [
+            (
+                "Microsoft.NETCore.App.Runtime.linux-x64",
+                "10.0.13",
+                "Microsoft.NETCore.*",
+            ),
+            (
+                "microsoft.netcore.app.runtime.linux-x64",
+                "10.0.13",
+                "Microsoft.NETCore.*",
+            ),
+            ("MICROSOFT.NETCORE.APP.REF", "9.0.21", "Microsoft.NETCore.*"),
+            (
+                "Microsoft.NETCore.App.Crossgen2.linux-x64",
+                "8.0.32",
+                "Microsoft.NETCore.*",
+            ),
+            (
+                "Microsoft.NETCore.App.Host.linux-x64",
+                "11.0.0-preview.1.26",
+                "Microsoft.NETCore.*",
+            ),
+            (
+                "microsoft.aspnetcore.app.runtime.linux-x64",
+                "10.0.13",
+                "Microsoft.AspNetCore.*@*",
+            ),
+            (
+                "Microsoft.AspNetCore.App.Ref",
+                "8.0.32",
+                "Microsoft.AspNetCore.*@*",
+            ),
+        ] {
+            assert_eq!(rule(id, version), Some(by), "{id}@{version}");
+            let req = young_request(RegistryType::Nuget, id, version);
+            assert!(matches!(filter.evaluate(&req), Decision::Skip), "{id}");
+        }
+        // The prefix holds at the start only, and the `.` is part of it.
+        for id in [
+            "Microsoft.NETCoreApp",
+            "Microsoft.NETCore",
+            "Microsoft.NETCoreX.Runtime",
+            "Microsoft.AspNetCore",
+            "Microsoft.AspNetCoreX",
+            "My.Microsoft.NETCore.App.Ref",
+            "Microsoft.NET.ILLink.Tasks",
+            "Microsoft.Extensions.Logging",
+            "Newtonsoft.Json",
+        ] {
+            assert_eq!(rule(id, "10.0.13"), None, "{id}");
+            let req = young_request(RegistryType::Nuget, id, "10.0.13");
+            assert!(
+                matches!(filter.evaluate(&req), Decision::Block { .. }),
+                "{id}"
+            );
+        }
+        // Another registry is untouched.
+        assert_eq!(
+            filter.allow_rule(RegistryType::Npm, "Microsoft.NETCore.App.Ref", "1.0.0"),
+            None
+        );
+        // Without the dot the prefix covers the neighbours too.
+        let mut loose = MinReleaseAgeFilter::new(3 * 86400, "3d");
+        loose
+            .add_allow(RegistryType::Nuget, "Microsoft.NETCore*")
+            .unwrap();
+        for id in [
+            "Microsoft.NETCoreApp",
+            "Microsoft.NETCore",
+            "Microsoft.NETCore.App.Ref",
+        ] {
+            assert!(loose.allowed(RegistryType::Nuget, id, "1.0.0"), "{id}");
+        }
+    }
+
+    #[test]
+    fn test_min_release_age_allow_prefix_with_exact_version_and_other_formats() {
+        let mut filter = MinReleaseAgeFilter::new(604800, "7d");
+        filter
+            .add_allow(RegistryType::Nuget, "Microsoft.NETCore.*@10.0.13")
+            .unwrap();
+        filter.add_allow(RegistryType::Npm, "@types/*").unwrap();
+        filter.add_allow(RegistryType::PyPI, "Zope.*").unwrap();
+        let allowed = |r, n, v| filter.allowed(r, n, v);
+        assert!(allowed(
+            RegistryType::Nuget,
+            "Microsoft.NETCore.App.Ref",
+            "10.0.13"
+        ));
+        assert!(!allowed(
+            RegistryType::Nuget,
+            "Microsoft.NETCore.App.Ref",
+            "10.0.14"
+        ));
+        assert!(allowed(RegistryType::Npm, "@types/node", "24.0.0"));
+        assert!(
+            !allowed(RegistryType::Npm, "@Types/node", "24.0.0"),
+            "npm is case-sensitive"
+        );
+        assert!(!allowed(RegistryType::Npm, "@typesx/node", "24.0.0"));
+        // PyPI compares PEP 503 names: `Zope.*` is `zope-…`, however it is spelled.
+        assert!(allowed(RegistryType::PyPI, "zope.interface", "6.0"));
+        assert!(allowed(RegistryType::PyPI, "Zope_Interface", "6.0"));
+        assert!(!allowed(RegistryType::PyPI, "zopeinterface", "6.0"));
+    }
+
+    /// An exact entry is reported before a pattern covering the same version.
+    #[test]
+    fn test_min_release_age_allow_rule_prefers_the_exact_entry() {
+        let mut filter = MinReleaseAgeFilter::new(604800, "7d");
+        filter
+            .add_allow(RegistryType::Nuget, "Microsoft.NETCore.*")
+            .unwrap();
+        filter
+            .add_allow(RegistryType::Nuget, "Microsoft.NETCore.App.Ref@10.0.13")
+            .unwrap();
+        assert_eq!(
+            filter.allow_rule(RegistryType::Nuget, "microsoft.netcore.app.ref", "10.0.13"),
+            Some("Microsoft.NETCore.App.Ref@10.0.13")
+        );
+        assert_eq!(
+            filter.allow_rule(RegistryType::Nuget, "microsoft.netcore.app.ref", "10.0.14"),
+            Some("Microsoft.NETCore.*")
+        );
+    }
+
+    /// A pattern exempts the age check only: the namespace filter runs before the
+    /// chain and still refuses an internal name the pattern covers, and a blocklist
+    /// rule ahead of min-release-age still blocks.
+    #[test]
+    fn test_min_release_age_allow_pattern_never_lifts_namespace_or_blocklist() {
+        let config = CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        };
+        let mut engine = CurationEngine::new(config);
+        engine.set_namespace_filter(Box::new(NamespaceFilter::new(vec![
+            "Microsoft.NETCore.Internal.*".to_string(),
+        ])));
+        let blocklist = BlocklistFilter::new(vec![BlocklistRule {
+            registry: "nuget".to_string(),
+            name: "Microsoft.NETCore.Evil".to_string(),
+            version: "*".to_string(),
+            reason: "known bad".to_string(),
+        }]);
+        engine.add_filter(Box::new(blocklist));
+        let mut filter = MinReleaseAgeFilter::new(3 * 86400, "3d");
+        filter
+            .add_allow(RegistryType::Nuget, "Microsoft.NETCore.*")
+            .unwrap();
+        engine.set_min_release_age(filter);
+        let decided_by = |id: &str| {
+            let result = engine.evaluate(&young_request(RegistryType::Nuget, id, "10.0.13"));
+            let blocked = matches!(result.decision, Decision::Block { .. });
+            (blocked, result.decided_by)
+        };
+        assert_eq!(
+            decided_by("Microsoft.NETCore.Internal.Secrets"),
+            (true, Some("namespace".to_string()))
+        );
+        assert_eq!(
+            decided_by("Microsoft.NETCore.Evil"),
+            (true, Some("blocklist".to_string()))
+        );
+        assert_eq!(decided_by("Microsoft.NETCore.App.Ref"), (false, None));
+        assert!(is_internal_namespace(
+            &engine,
+            RegistryType::Nuget,
+            "microsoft.netcore.internal.secrets"
+        ));
+        // Metadata: a pattern keeps a young version visible, never an unlisted one.
+        let young = Some(crate::cache_ttl::now_unix() as i64 - 3600);
+        assert!(!engine.hides_from_metadata(
+            RegistryType::Nuget,
+            "microsoft.netcore.app.ref",
+            "10.0.13",
+            young
+        ));
+        assert!(engine.hides_from_metadata(
+            RegistryType::Nuget,
+            "microsoft.extensions.logging",
+            "10.0.13",
+            young
+        ));
     }
 
     #[test]

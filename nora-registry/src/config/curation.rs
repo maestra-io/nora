@@ -4,6 +4,7 @@
 //! Curation layer configuration.
 
 use crate::digest_quarantine::QuarantineMode;
+use crate::registry_type::RegistryType;
 use crate::secrets::ProtectedString;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -75,8 +76,8 @@ pub enum CurationOnFailure {
 /// - `NORA_CURATION_QUARANTINE_TTL` — quarantine hold duration (e.g., "14d", "24h")
 /// - `NORA_CURATION_<REGISTRY>_MIN_RELEASE_AGE` / `_QUARANTINE` / `_QUARANTINE_TTL` —
 ///   per-registry overrides
-/// - `NORA_CURATION_<REGISTRY>_ALLOW` — comma-separated `name@version` list exempt
-///   from `min_release_age` (e.g., `NORA_CURATION_NUGET_ALLOW=Newtonsoft.Json@13.0.4`)
+/// - `NORA_CURATION_<REGISTRY>_ALLOW` — comma-separated `allow` entries exempt from
+///   `min_release_age` (e.g., `NORA_CURATION_NUGET_ALLOW=Newtonsoft.Json@13.0.4,Microsoft.NETCore.*`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurationConfig {
     #[serde(default)]
@@ -153,10 +154,14 @@ pub struct RegistryCurationOverride {
     /// Override quarantine TTL for this specific registry.
     #[serde(default)]
     pub quarantine_ttl: Option<String>,
-    /// Exact versions exempt from `min_release_age`, as `"name@version"` (npm
-    /// `"@scope/name@1.0.0"`; NuGet compares case-insensitively, PyPI by PEP 503 name).
-    /// Exempts the age check only: the digest quarantine still holds a new digest.
-    /// Reloaded on SIGHUP with the rest of the curation policy.
+    /// Versions exempt from `min_release_age`: `"name@version"` (that version; npm
+    /// `"@scope/name@1.0.0"`), `"name"` or `"name@*"` (every version of that package),
+    /// `"prefix*"` or `"prefix*@*"` (every version of every package whose name starts
+    /// with `prefix`: `"Microsoft.NETCore.*"`). Names and versions compare in the
+    /// registry's form (NuGet case-insensitively, PyPI by PEP 503 name); see
+    /// `curation::AllowEntry`. Exempts the age check only: the digest quarantine, the
+    /// blocklist and internal namespaces still apply. Reloaded on SIGHUP with the rest
+    /// of the curation policy.
     #[serde(default)]
     pub allow: Vec<String>,
 }
@@ -194,6 +199,28 @@ impl Default for CurationConfig {
 }
 
 impl CurationConfig {
+    /// `registry`'s `[curation.<registry>]` table; `None` for raw, which has none.
+    pub fn registry_override(&self, registry: RegistryType) -> Option<&RegistryCurationOverride> {
+        Some(match registry {
+            RegistryType::Npm => &self.npm,
+            RegistryType::PyPI => &self.pypi,
+            RegistryType::Cargo => &self.cargo,
+            RegistryType::Go => &self.go,
+            RegistryType::Docker => &self.docker,
+            RegistryType::Maven => &self.maven,
+            RegistryType::Gems => &self.gems,
+            RegistryType::Terraform => &self.terraform,
+            RegistryType::Ansible => &self.ansible,
+            RegistryType::Nuget => &self.nuget,
+            RegistryType::PubDart => &self.pub_dart,
+            RegistryType::Conan => &self.conan,
+            RegistryType::Rpm => &self.rpm,
+            RegistryType::Deb => &self.deb,
+            RegistryType::Cpan => &self.cpan,
+            RegistryType::Raw => return None,
+        })
+    }
+
     /// Apply environment variable overrides for curation config.
     pub(super) fn apply_env_overrides(&mut self) -> Result<(), String> {
         if let Ok(val) = env::var("NORA_CURATION_MODE") {

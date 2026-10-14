@@ -1129,6 +1129,26 @@ impl Config {
             }
         }
 
+        // 8b. Per-registry `allow` entries (Maestra fork): an entry nora cannot read
+        // exempts nothing (the versions it meant stay held), so it is a warning and
+        // is refused under NORA_CONFIG_STRICT. `*` alone, an empty prefix, a `*`
+        // inside a name and version globs are such entries: a pattern exempts every
+        // version of the names it covers, so its syntax is kept narrow.
+        for &rt in RegistryType::all() {
+            let Some(registry) = self.curation.registry_override(rt) else {
+                continue;
+            };
+            for entry in &registry.allow {
+                if let Err(e) = crate::curation::AllowEntry::parse(rt, entry) {
+                    if config_strict_from_env() {
+                        errors.push(format!("{e} (NORA_CONFIG_STRICT is on)"));
+                    } else {
+                        warnings.push(format!("{e} (the entry is ignored)"));
+                    }
+                }
+            }
+        }
+
         // 9. Docker upstream prefix validation
         {
             const RESERVED_PREFIXES: &[&str] =
@@ -3363,6 +3383,71 @@ proxies = [
             ["requests@2.32.3", "numpy@2.1.0"]
         );
         assert_eq!(config.curation.nuget.allow, ["Newtonsoft.Json@13.0.4"]);
+    }
+
+    /// Pattern `allow` entries parse from TOML and env; an entry nora cannot read is a
+    /// warning naming it, an error under NORA_CONFIG_STRICT.
+    #[test]
+    fn test_curation_allow_patterns_validated() {
+        let _lock = env_lock();
+        std::env::remove_var("NORA_CONFIG_STRICT");
+        let toml = r#"
+            [curation.nuget]
+            allow = ["Microsoft.NETCore.*", "Microsoft.AspNetCore.*@*", "Newtonsoft.Json"]
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let (warnings, errors) = config.validate_with_config_path(None);
+        let about_allow = |list: &[String]| {
+            list.iter()
+                .filter(|m| m.contains(".allow entry"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert!(about_allow(&warnings).is_empty(), "{warnings:?}");
+        assert!(about_allow(&errors).is_empty(), "{errors:?}");
+
+        let mut config = Config::default();
+        config.curation.nuget.allow = vec![
+            "Microsoft.NETCore.*".to_string(),
+            "*".to_string(),
+            "Microsoft.*.App".to_string(),
+            "Microsoft.NETCore.App.Ref@10.*".to_string(),
+        ];
+        config.curation.npm.allow = vec!["@*".to_string()];
+        let (warnings, errors) = config.validate_with_config_path(None);
+        let warned = about_allow(&warnings);
+        assert_eq!(warned.len(), 4, "{warned:?}");
+        assert!(
+            warned[0].contains("curation.npm.allow entry \"@*\""),
+            "{warned:?}"
+        );
+        assert!(warned
+            .iter()
+            .any(|m| m.contains("curation.nuget.allow entry \"*\"")));
+        assert!(about_allow(&errors).is_empty(), "{errors:?}");
+
+        std::env::set_var("NORA_CONFIG_STRICT", "true");
+        let (warnings, errors) = config.validate_with_config_path(None);
+        std::env::remove_var("NORA_CONFIG_STRICT");
+        assert!(about_allow(&warnings).is_empty(), "{warnings:?}");
+        let refused = about_allow(&errors);
+        assert_eq!(refused.len(), 4, "{refused:?}");
+        assert!(refused
+            .iter()
+            .all(|m| m.contains("NORA_CONFIG_STRICT is on")));
+
+        std::env::set_var(
+            "NORA_CURATION_NUGET_ALLOW",
+            "Microsoft.NETCore.*,Microsoft.AspNetCore.*",
+        );
+        let mut config = Config::default();
+        let applied = config.apply_env_overrides();
+        std::env::remove_var("NORA_CURATION_NUGET_ALLOW");
+        applied.unwrap();
+        assert_eq!(
+            config.curation.nuget.allow,
+            ["Microsoft.NETCore.*", "Microsoft.AspNetCore.*"]
+        );
     }
 
     #[test]

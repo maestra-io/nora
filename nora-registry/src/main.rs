@@ -1774,13 +1774,15 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
         println!("Namespaces: not configured");
     }
 
+    let mut min_age = None;
     if let Some(ref age_str) = config.curation.min_release_age {
         match curation::parse_duration(age_str) {
             Ok(secs) => {
                 let mut filter = curation::MinReleaseAgeFilter::new(secs, age_str);
                 load_registry_overrides(&mut filter, &config.curation);
                 println!("Min-release-age: {} ({}s)", age_str, secs);
-                engine.add_filter(Box::new(filter));
+                engine.add_filter(Box::new(filter.clone()));
+                min_age = Some(filter);
             }
             Err(e) => println!("Min-release-age: {} (ERROR: {})", age_str, e),
         }
@@ -1815,6 +1817,17 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
     );
     if result.audited {
         println!("Mode: AUDIT (would block but logs only)");
+    }
+    // The decision above has no publish date, so the age check never runs here:
+    // say whether a young release of this version would be exempt from it.
+    if let (Some(filter), Some(version)) = (&min_age, version.as_deref()) {
+        match filter.allow_rule(registry, &name, version) {
+            Some(rule) => println!(
+                "Min-release-age allow: {rule:?} exempts this version from the age check \
+                 (quarantine, blocklist and internal namespaces still apply)"
+            ),
+            None => println!("Min-release-age allow: no entry matches"),
+        }
     }
 }
 

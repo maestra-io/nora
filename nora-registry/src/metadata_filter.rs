@@ -387,6 +387,28 @@ mod tests {
         assert!(doc["dist-tags"].get("next").is_none());
     }
 
+    /// A prefix or any-version `allow` entry keeps every young version visible; an
+    /// entry that does not cover the package hides them as before.
+    #[tokio::test]
+    async fn npm_allow_pattern_keeps_young_versions_visible() {
+        for (allow, visible) in [
+            ("pk*", vec!["0.9.0", "1.0.0", "1.1.0", "2.0.0-beta.1"]),
+            ("pkg", vec!["0.9.0", "1.0.0", "1.1.0", "2.0.0-beta.1"]),
+            ("pkg@*", vec!["0.9.0", "1.0.0", "1.1.0", "2.0.0-beta.1"]),
+            ("pkg-*", vec!["0.9.0", "1.0.0"]),
+            ("other", vec!["0.9.0", "1.0.0"]),
+        ] {
+            let upstream = npm_upstream().await;
+            let ctx = create_test_context_with_config(|cfg| {
+                cfg.npm.proxy = Some(upstream.uri());
+                cooldown(cfg, CurationMode::Enforce);
+                cfg.curation.npm.allow = vec![allow.to_string()];
+            });
+            let doc = json_of(send(&ctx.app, Method::GET, "/npm/pkg", "").await).await;
+            assert_eq!(version_keys(&doc), visible, "allow = [{allow:?}]");
+        }
+    }
+
     #[tokio::test]
     async fn npm_audit_mode_and_internal_packages_are_not_filtered() {
         let upstream = npm_upstream().await;

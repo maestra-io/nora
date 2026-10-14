@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 
+### Added
+- **`[curation.<registry>] allow` takes any-version and prefix entries (Maestra fork)** — besides an exact `name@version`, an entry can be `name` / `name@*` (every version of that package) or `prefix*` / `prefix*@*` (every version of every package whose name starts with `prefix`, e.g. `Microsoft.NETCore.*`, compared in the registry's form: NuGet case-insensitively). Before, every exemption had to name an exact version, so a .NET patch day (2026-10-13: 10.0.13, 9.0.21, 8.0.32) held the runtime, apphost, crossgen2 and targeting packs for the whole NuGet `min_release_age` and broke every RID-specific restore until each version was listed by hand. Like an exact entry, a pattern lifts only the age check, in downloads and in metadata: the digest quarantine, the blocklist and `internal_namespaces` still apply. `*` alone, an empty prefix, a `*` inside a name and version globs are refused (a config warning, an error under `NORA_CONFIG_STRICT`); a pattern trusts a whole namespace on that upstream, so keep it to first-party prefixes. The `[SECURITY]` exemption log names the matching entry and `nora curation explain` prints it.
+
 ### Fixed
 - **npm retention `include_tags`/`exclude_tags` match the version** — the npm collector names a version by its tarball file (`pkg-1.2.0.tgz`), so a pattern written against the version (`1.*`) selected or protected nothing. The patterns now match the version parsed from the file name as well as the file name itself.
 
