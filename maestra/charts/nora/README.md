@@ -280,7 +280,7 @@ Example `blocklist.json`:
 | `config.curation.quarantine` | Digest quarantine: `observe` or `enforce` | `""` (off) |
 | `config.curation.quarantine_ttl` | Quarantine hold (e.g. `7d`) | `""` |
 | `config.curation.internal_namespaces` | Name globs never proxied upstream, enforced in every mode | `[]` |
-| `config.curation.registries.<registry>` | `[curation.<registry>]`: `min_release_age`, `quarantine`, `quarantine_ttl`, `allow` (`name@version` exempt from the age gate, Maestra fork) | `{}` |
+| `config.curation.registries.<registry>` | `[curation.<registry>]`: `min_release_age`, `quarantine`, `quarantine_ttl`, `allow` (entries exempt from the age gate only: `name@version`, `name` or `name@*` for every version, `prefix*` for every version of every name starting with `prefix`; Maestra fork, see MAESTRA.md) | `{}` |
 | `config.curation.blocklist.existingSecret` | Secret holding the blocklist JSON | `""` |
 | `config.curation.blocklist.existingConfigMap` | ConfigMap holding the blocklist JSON | `""` |
 | `config.curation.blocklist.key` | Key in the Secret/ConfigMap | `blocklist.json` |

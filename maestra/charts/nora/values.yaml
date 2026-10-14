@@ -333,13 +333,14 @@ config:
     # -- Name globs never proxied upstream and never cooled down, in every mode.
     internal_namespaces: []
     # -- Per-registry [curation.<registry>] tables: min_release_age, quarantine,
-    # quarantine_ttl, allow (Maestra fork: exact "name@version" exempt from
-    # min_release_age).
+    # quarantine_ttl, allow (Maestra fork: entries exempt from min_release_age only:
+    # "name@version", "name" / "name@*" for every version, "prefix*" for every
+    # version of every name starting with prefix; see MAESTRA.md).
     registries: {}
     #  nuget:
     #    min_release_age: 3d
     #    quarantine_ttl: 3d
-    #    allow: ["Newtonsoft.Json@13.0.4"]
+    #    allow: ["Newtonsoft.Json@13.0.4", "Microsoft.NETCore.*"]
     # -- Blocklist JSON. Mount from an existing Secret or ConfigMap (same pattern
     # as config.auth.htpasswd). When existingSecret/existingConfigMap is set,
     # blocklist_path is auto-wired to <mountPath>/<key>, so the path is never

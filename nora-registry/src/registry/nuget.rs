@@ -3243,6 +3243,108 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
+    /// A prefix `allow` entry (`Microsoft.NETCore.*`, the .NET servicing case): every
+    /// young version of every ID under it is listed in the flat `index.json` and
+    /// served; a young version of an ID outside it stays hidden and held.
+    #[tokio::test]
+    async fn test_flatcontainer_allow_prefix_lists_and_serves_young_versions() {
+        let (upstream, ctx) = cooldown_upstream(
+            true,
+            &["Microsoft.NETCore.*", "Microsoft.AspNetCore.*@*"],
+            false,
+        )
+        .await;
+        let ids = [
+            "microsoft.netcore.app.runtime.linux-x64",
+            "microsoft.aspnetcore.app.runtime.linux-x64",
+            "microsoft.netcoreapp.other",
+            "microsoft.extensions.logging",
+        ];
+        for id in ids {
+            mount_json(
+                &upstream,
+                &format!("/v3-flatcontainer/{id}/index.json"),
+                serde_json::json!({ "versions": ["10.0.12", "10.0.13"] }),
+            )
+            .await;
+            mount_json(
+                &upstream,
+                &format!("/v3/registration5-gz-semver2/{id}/index.json"),
+                serde_json::json!({ "items": [{ "lower": "10.0.12", "upper": "10.0.13", "items": [
+                    leaf("10.0.12", &iso_ago(30 * 86400)), leaf("10.0.13", &iso_ago(19 * 3600))
+                ] }] }),
+            )
+            .await;
+        }
+        let [netcore, aspnetcore, lookalike, other] = ids;
+        for id in [netcore, aspnetcore] {
+            assert_eq!(
+                flat_versions(&ctx, id).await,
+                serde_json::json!(["10.0.12", "10.0.13"]),
+                "{id}: the young version stays listed"
+            );
+            let resp = send(&ctx.app, Method::GET, &nupkg_uri(id, "10.0.13"), "").await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{id}: the young version is served"
+            );
+        }
+        for id in [lookalike, other] {
+            assert_eq!(
+                flat_versions(&ctx, id).await,
+                serde_json::json!(["10.0.12"]),
+                "{id}: the young version stays hidden"
+            );
+            let resp = send(&ctx.app, Method::GET, &nupkg_uri(id, "10.0.13"), "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{id}: held");
+            let resp = send(&ctx.app, Method::GET, &nupkg_uri(id, "10.0.12"), "").await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{id}: the old version is served"
+            );
+        }
+    }
+
+    /// A prefix `allow` entry never reaches an internal-namespace ID: it is not
+    /// proxied at all, whatever its age.
+    #[tokio::test]
+    async fn test_allow_prefix_does_not_proxy_an_internal_namespace() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"nupkg".to_vec()))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+            cfg.curation.internal_namespaces = vec!["corp.*".to_string()];
+            cfg.curation.nuget.allow = vec!["Corp.*".to_string(), "corp.lib".to_string()];
+        });
+        let resp = send(&ctx.app, Method::GET, &nupkg_uri("corp.lib", "1.0.0"), "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/flatcontainer/corp.lib/index.json",
+            "",
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::OK);
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "an internal ID is never asked upstream"
+        );
+    }
+
     /// An unlisted version is dated 1900-01-01 by NuGet: unknown, not ancient.
     #[test]
     fn test_unlisted_sentinel_date_is_unknown() {
