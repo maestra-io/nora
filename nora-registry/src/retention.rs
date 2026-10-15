@@ -527,7 +527,10 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
             if let Some(idx) = rest.find("/manifests/") {
                 let repo = &rest[..idx];
                 let tag_file = &rest[idx + "/manifests/".len()..];
-                if ends_with_ci(tag_file, ".json") && !ends_with_ci(tag_file, ".meta.json") {
+                if ends_with_ci(tag_file, ".json")
+                    && !ends_with_ci(tag_file, ".meta.json")
+                    && !ends_with_ci(tag_file, ".stats.json")
+                {
                     let tag = tag_file.strip_suffix(".json").unwrap_or(tag_file);
                     // Skip digest references (sha256:…, sha512:…) — they are
                     // stored alongside the tag file by put_manifest and must not
@@ -544,6 +547,7 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
         }
     }
 
+    let key_set: std::collections::HashSet<&String> = all_keys.iter().collect();
     let mut result = Vec::new();
     for (repo, tags) in &repos {
         let mut entries = Vec::new();
@@ -551,12 +555,20 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
             let meta = storage.stat(manifest_key).await;
             let modified = meta.as_ref().map(|m| m.modified).unwrap_or(0);
             let size = meta.as_ref().map(|m| m.size).unwrap_or(0);
-            // Note: we don't include blob keys here because blobs may be
-            // shared across tags. GC handles orphan blobs separately.
+            // The tag's sidecars go with it: .meta.json and the .stats.json pull
+            // stats (#1114), which nothing else would ever reap. Blob keys are not
+            // included because blobs may be shared across tags; GC handles orphans.
+            let stem = manifest_key.strip_suffix(".json").unwrap_or(manifest_key);
+            let mut keys = vec![manifest_key.clone()];
+            for sidecar in [format!("{stem}.meta.json"), format!("{stem}.stats.json")] {
+                if key_set.contains(&sidecar) {
+                    keys.push(sidecar);
+                }
+            }
             entries.push(VersionEntry {
                 name: tag.clone(),
                 version: None,
-                keys: vec![manifest_key.clone()],
+                keys,
                 modified,
                 size,
             });
@@ -1917,6 +1929,65 @@ mod tests {
         assert_eq!(
             result.planned, 1,
             "exactly 1 tag should be planned for deletion"
+        );
+    }
+
+    /// #1114: a `.stats.json` pull-stats sidecar is not a tag — retention must
+    /// not count it toward keep_last. With 4 tags and keep_last=3 exactly one tag
+    /// is planned; if the sidecar were mistaken for a fifth tag, two would be.
+    #[tokio::test]
+    async fn retention_does_not_treat_the_stats_sidecar_as_a_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        for (i, tag) in ["v1", "v2", "v3", "v4"].iter().enumerate() {
+            let body = serde_json::to_vec(&serde_json::json!({"tag": tag, "i": i})).unwrap();
+            storage
+                .put(&format!("docker/img/manifests/{}.json", tag), &body)
+                .await
+                .unwrap();
+        }
+        // A pull-stats sidecar beside one tag — NOT a fifth tag.
+        storage
+            .put(
+                "docker/img/manifests/v1.stats.json",
+                b"{\"downloads\":3,\"last_pulled\":1}",
+            )
+            .await
+            .unwrap();
+
+        let rules = vec![RetentionRule {
+            registry: "docker".to_string(),
+            name_glob: None,
+            keep_last: Some(3),
+            older_than_days: None,
+            include_tags: Vec::new(),
+            exclude_tags: vec![],
+        }];
+        let result =
+            super::run_retention(&storage, &test_publish_locks(), None, &rules, true).await;
+        assert_eq!(
+            result.planned, 1,
+            "one real tag planned; the .stats.json sidecar is not a tag"
+        );
+
+        // Applied: the tag's sidecar leaves with its manifest, never on its own.
+        let result =
+            super::run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
+        let left = storage.list("docker/img/manifests/").await.unwrap();
+        assert_eq!(
+            left.iter().filter(|k| !k.ends_with(".stats.json")).count(),
+            3,
+            "{left:?}"
+        );
+        let v1_gone = !left.iter().any(|k| k == "docker/img/manifests/v1.json");
+        assert_eq!(result.deleted_keys, if v1_gone { 2 } else { 1 }, "{left:?}");
+        assert_eq!(
+            !left
+                .iter()
+                .any(|k| k == "docker/img/manifests/v1.stats.json"),
+            v1_gone,
+            "the sidecar is deleted exactly when its tag is: {left:?}"
         );
     }
 

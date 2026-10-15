@@ -20,7 +20,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditEntry;
-use crate::auth::AuthenticatedUser;
+use crate::auth::{AuthenticatedUser, NamespaceAuthority};
 use crate::registry_type::RegistryType;
 use crate::tokens::{Role, MAX_TOKEN_TTL_DAYS};
 use crate::AppState;
@@ -188,18 +188,36 @@ struct AdminCreateTokenResponse {
 /// Mint an API token of any role — including `admin` — WITHOUT the
 /// `auth.admin_users` self-service check.
 ///
-/// Safe because this route lives under `/api/v1/admin/` and is therefore only
-/// reachable by a caller already holding an `Admin`-role token (enforced in the
-/// auth middleware, `auth::is_admin_path`): anonymous and Basic-auth are denied
-/// fail-closed, and a Read/Write token gets 403 before reaching this handler. So
-/// the admin privilege is proven by the gate, not re-derived from an allowlist —
-/// `auth.admin_users` becomes a bootstrap-only fallback on the public
-/// `POST /api/tokens` route (#746, follow-up to GHSA-78cx-cfhm-rgmx).
+/// The admin gate (`auth::is_admin_path`) proves the caller holds the `Admin`
+/// ROLE — anonymous and Basic-auth are denied fail-closed, and a Read/Write
+/// token gets 403 before reaching this handler — so `auth.admin_users` is only a
+/// bootstrap fallback on the public `POST /api/tokens` route (#746, follow-up to
+/// GHSA-78cx-cfhm-rgmx).
+///
+/// But admin ROLE is not admin AUTHORITY: an OIDC identity can be assigned
+/// `admin` with a restricted `namespace_scope`. The opaque token minted here is
+/// always namespace-unrestricted, so a namespace-scoped caller must be refused
+/// (below) — otherwise a `ci-transport/**` admin could mint a token that writes
+/// to `prod/`, escalating past its own scope.
 async fn admin_create_token(
     State(state): State<AppState>,
     Extension(caller): Extension<AuthenticatedUser>,
+    Extension(caller_authority): Extension<NamespaceAuthority>,
+    caller_mint_ceiling: Option<Extension<crate::auth::MintLifetimeCeiling>>,
     Json(req): Json<AdminCreateTokenRequest>,
 ) -> Response {
+    // Role is proven by the gate, but role is not authority: a minted opaque
+    // token is always namespace-unrestricted, so a scoped identity must not mint
+    // one. Refuse fail-closed, before parsing role/ttl — a scoped admin cannot
+    // mint ANY token here (same decision as the UI mint, `decide_ui_token_mint`).
+    if caller_authority.is_scoped() {
+        return (
+            StatusCode::FORBIDDEN,
+            "A namespace-scoped identity cannot mint an unrestricted token",
+        )
+            .into_response();
+    }
+
     let role = match req.role.as_str() {
         "read" => Role::Read,
         "write" => Role::Write,
@@ -217,7 +235,12 @@ async fn admin_create_token(
         return (StatusCode::BAD_REQUEST, "ttl_days must be > 0").into_response();
     }
     // The store clamps too; clamp here so the response and audit report the real TTL.
-    let ttl_days = req.ttl_days.min(MAX_TOKEN_TTL_DAYS);
+    // An OIDC caller's provider ceiling (#1094) applies here as on the UI mint:
+    // a 15-minute credential must not mint a token that lasts years.
+    let ttl_days = crate::ui::cap_ttl_days(
+        req.ttl_days.min(MAX_TOKEN_TTL_DAYS),
+        caller_mint_ceiling.map(|Extension(c)| c.0),
+    );
 
     let Some(token_store) = &state.tokens else {
         return (
