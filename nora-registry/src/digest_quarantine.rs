@@ -491,7 +491,12 @@ fn append_jsonl(path: &Path, entry: &DigestEntry) {
     tokio::task::spawn_blocking(move || {
         match OpenOptions::new().create(true).append(true).open(&path) {
             Ok(mut file) => {
-                let _ = writeln!(file, "{}", json);
+                // One write for the whole line: `writeln!` on an unbuffered File
+                // is two syscalls (the JSON, then the newline), and a SIGKILL
+                // between them (a Recreate rollout) left a line without its
+                // newline, so the next append glued onto it and `load` dropped
+                // both entries ("trailing characters", 2 per restart on iota).
+                let _ = file.write_all(format!("{json}\n").as_bytes());
                 let _ = file.flush();
             }
             Err(e) => {

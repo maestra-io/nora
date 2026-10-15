@@ -123,7 +123,9 @@ impl FileSink {
         {
             self.rotate();
         }
-        if let Err(e) = writeln!(self.file, "{}", json) {
+        // One write per line (see digest_quarantine::append_jsonl): a kill
+        // between the JSON and the newline would glue the next entry onto it.
+        if let Err(e) = self.file.write_all(format!("{json}\n").as_bytes()) {
             tracing::error!(error = %e, "Audit log write failed");
         }
         if let Err(e) = self.file.flush() {
