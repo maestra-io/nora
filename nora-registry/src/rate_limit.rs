@@ -242,6 +242,86 @@ mod tests {
         .0;
     }
 
+    /// A POST routed through `layer`, from `peer`, carrying `xff` as X-Forwarded-For
+    /// (POST: the upload limiter gates write methods only).
+    async fn status_through(
+        layer: &Limiter<TrustedProxyKeyExtractor>,
+        peer: [u8; 4],
+        xff: &str,
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route("/", axum::routing::post(|| async { "ok" }))
+            .layer(layer.clone());
+        let mut req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/")
+            .header("x-forwarded-for", xff)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from((peer, 10000))));
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    // The upload and general limiters must bucket an untrusted peer by its TCP address, not by a
+    // header it controls: a burst of one is spent by the first request, and a second request from
+    // the same peer with a different X-Forwarded-For is limited (429), not given a fresh bucket.
+    #[tokio::test]
+    async fn edge_limiters_ignore_xff_from_an_untrusted_peer() {
+        let quota = Quota {
+            interval: Duration::from_secs(3600),
+            burst: 1,
+        };
+        // The peer (2.2.2.2) is not in the trusted set, so its XFF must not be honored.
+        let trusted = TrustedProxies::default_loopback();
+        type Make = fn(
+            Quota,
+            TrustedProxies,
+        ) -> (Limiter<TrustedProxyKeyExtractor>, Quota, RateLimiterState);
+        for make in [upload_rate_limiter as Make, general_rate_limiter as Make] {
+            let (layer, _, _) = make(quota, trusted.clone());
+            let peer = [2, 2, 2, 2];
+            assert_eq!(
+                status_through(&layer, peer, "1.1.1.1").await,
+                axum::http::StatusCode::OK,
+                "first request spends the single token"
+            );
+            assert_eq!(
+                status_through(&layer, peer, "9.9.9.9").await,
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                "a different XFF from the same peer must not mint a fresh bucket"
+            );
+        }
+    }
+
+    // A trusted proxy's XFF is still honored: two different clients behind it keep their own
+    // buckets, so the fix does not collapse everyone behind a reverse proxy into one limit.
+    #[tokio::test]
+    async fn edge_limiters_honor_xff_from_a_trusted_proxy() {
+        let quota = Quota {
+            interval: Duration::from_secs(3600),
+            burst: 1,
+        };
+        let trusted = TrustedProxies::default_loopback(); // 127.0.0.1 is trusted
+        let (layer, _, _) = upload_rate_limiter(quota, trusted);
+        let proxy = [127, 0, 0, 1];
+        assert_eq!(
+            status_through(&layer, proxy, "1.1.1.1").await,
+            axum::http::StatusCode::OK
+        );
+        assert_eq!(
+            status_through(&layer, proxy, "2.2.2.2").await,
+            axum::http::StatusCode::OK,
+            "a second client behind the trusted proxy keeps its own bucket"
+        );
+        assert_eq!(
+            status_through(&layer, proxy, "1.1.1.1").await,
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "the first client's bucket is spent"
+        );
+    }
+
     #[test]
     fn test_custom_config() {
         let config = RateLimitConfig {

@@ -199,26 +199,31 @@ impl Default for CurationConfig {
 }
 
 impl CurationConfig {
-    /// `registry`'s `[curation.<registry>]` table; `None` for raw, which has none.
-    pub fn registry_override(&self, registry: RegistryType) -> Option<&RegistryCurationOverride> {
-        Some(match registry {
-            RegistryType::Npm => &self.npm,
-            RegistryType::PyPI => &self.pypi,
-            RegistryType::Cargo => &self.cargo,
-            RegistryType::Go => &self.go,
-            RegistryType::Docker => &self.docker,
-            RegistryType::Maven => &self.maven,
-            RegistryType::Gems => &self.gems,
-            RegistryType::Terraform => &self.terraform,
-            RegistryType::Ansible => &self.ansible,
-            RegistryType::Nuget => &self.nuget,
-            RegistryType::PubDart => &self.pub_dart,
-            RegistryType::Conan => &self.conan,
-            RegistryType::Rpm => &self.rpm,
-            RegistryType::Deb => &self.deb,
-            RegistryType::Cpan => &self.cpan,
-            RegistryType::Raw => return None,
-        })
+    /// The `[curation.<registry>]` section of `rt`; `None` for Raw, which has none.
+    ///
+    /// The `match` is exhaustive over [`RegistryType`], so a new registry is a
+    /// compile error here until its section is declared — a hand-written list of
+    /// sections once left out rpm, deb and cpan, and their `min_release_age` was
+    /// read by nothing (#1098).
+    pub fn registry_override(&self, rt: RegistryType) -> Option<&RegistryCurationOverride> {
+        match rt {
+            RegistryType::Docker => Some(&self.docker),
+            RegistryType::Maven => Some(&self.maven),
+            RegistryType::Npm => Some(&self.npm),
+            RegistryType::Cargo => Some(&self.cargo),
+            RegistryType::PyPI => Some(&self.pypi),
+            RegistryType::Go => Some(&self.go),
+            RegistryType::Raw => None,
+            RegistryType::Gems => Some(&self.gems),
+            RegistryType::Terraform => Some(&self.terraform),
+            RegistryType::Ansible => Some(&self.ansible),
+            RegistryType::Nuget => Some(&self.nuget),
+            RegistryType::PubDart => Some(&self.pub_dart),
+            RegistryType::Conan => Some(&self.conan),
+            RegistryType::Rpm => Some(&self.rpm),
+            RegistryType::Deb => Some(&self.deb),
+            RegistryType::Cpan => Some(&self.cpan),
+        }
     }
 
     /// Apply environment variable overrides for curation config.
@@ -318,5 +323,42 @@ impl CurationConfig {
         }
 
         Ok(())
+    }
+
+    /// Every `min_release_age` and `quarantine_ttl`, global and per registry, that
+    /// does not parse as a duration, named by key and value. A configuration error
+    /// in every mode (#1099): the quarantine fell back to 14 days on one without a
+    /// word, and outside enforce mode an unparsable minimum age was only logged.
+    pub fn duration_errors(&self) -> Vec<String> {
+        let mut durations = vec![
+            (
+                "curation.min_release_age".to_string(),
+                self.min_release_age.as_deref(),
+            ),
+            (
+                "curation.quarantine_ttl".to_string(),
+                self.quarantine_ttl.as_deref(),
+            ),
+        ];
+        for &rt in RegistryType::all() {
+            if let Some(section) = self.registry_override(rt) {
+                durations.push((
+                    format!("curation.{rt}.min_release_age"),
+                    section.min_release_age.as_deref(),
+                ));
+                durations.push((
+                    format!("curation.{rt}.quarantine_ttl"),
+                    section.quarantine_ttl.as_deref(),
+                ));
+            }
+        }
+        durations
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let value = value?;
+                let error = crate::curation::parse_duration(value).err()?;
+                Some(format!("{key}=\"{value}\" is not a duration: {error}"))
+            })
+            .collect()
     }
 }
