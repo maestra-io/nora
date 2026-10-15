@@ -1105,7 +1105,7 @@ fn decide_ui_token_mint(
 /// matching the store's whole-day TTL: a sub-day ceiling floors to 1 day (the
 /// store's minimum), still far below the 3650-day clamp. `None` (Basic/opaque
 /// callers, which carry no ceiling) leaves the lifetime unchanged.
-fn cap_ttl_days(requested_days: u64, ceiling_secs: Option<u64>) -> u64 {
+pub(crate) fn cap_ttl_days(requested_days: u64, ceiling_secs: Option<u64>) -> u64 {
     match ceiling_secs {
         Some(secs) => requested_days.min((secs / 86_400).max(1)),
         None => requested_days,

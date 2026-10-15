@@ -547,6 +547,7 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
         }
     }
 
+    let key_set: std::collections::HashSet<&String> = all_keys.iter().collect();
     let mut result = Vec::new();
     for (repo, tags) in &repos {
         let mut entries = Vec::new();
@@ -554,12 +555,20 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
             let meta = storage.stat(manifest_key).await;
             let modified = meta.as_ref().map(|m| m.modified).unwrap_or(0);
             let size = meta.as_ref().map(|m| m.size).unwrap_or(0);
-            // Note: we don't include blob keys here because blobs may be
-            // shared across tags. GC handles orphan blobs separately.
+            // The tag's sidecars go with it: .meta.json and the .stats.json pull
+            // stats (#1114), which nothing else would ever reap. Blob keys are not
+            // included because blobs may be shared across tags; GC handles orphans.
+            let stem = manifest_key.strip_suffix(".json").unwrap_or(manifest_key);
+            let mut keys = vec![manifest_key.clone()];
+            for sidecar in [format!("{stem}.meta.json"), format!("{stem}.stats.json")] {
+                if key_set.contains(&sidecar) {
+                    keys.push(sidecar);
+                }
+            }
             entries.push(VersionEntry {
                 name: tag.clone(),
                 version: None,
-                keys: vec![manifest_key.clone()],
+                keys,
                 modified,
                 size,
             });
@@ -1960,6 +1969,25 @@ mod tests {
         assert_eq!(
             result.planned, 1,
             "one real tag planned; the .stats.json sidecar is not a tag"
+        );
+
+        // Applied: the tag's sidecar leaves with its manifest, never on its own.
+        let result =
+            super::run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
+        let left = storage.list("docker/img/manifests/").await.unwrap();
+        assert_eq!(
+            left.iter().filter(|k| !k.ends_with(".stats.json")).count(),
+            3,
+            "{left:?}"
+        );
+        let v1_gone = !left.iter().any(|k| k == "docker/img/manifests/v1.json");
+        assert_eq!(result.deleted_keys, if v1_gone { 2 } else { 1 }, "{left:?}");
+        assert_eq!(
+            !left
+                .iter()
+                .any(|k| k == "docker/img/manifests/v1.stats.json"),
+            v1_gone,
+            "the sidecar is deleted exactly when its tag is: {left:?}"
         );
     }
 

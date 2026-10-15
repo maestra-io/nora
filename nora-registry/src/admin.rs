@@ -203,6 +203,7 @@ async fn admin_create_token(
     State(state): State<AppState>,
     Extension(caller): Extension<AuthenticatedUser>,
     Extension(caller_authority): Extension<NamespaceAuthority>,
+    caller_mint_ceiling: Option<Extension<crate::auth::MintLifetimeCeiling>>,
     Json(req): Json<AdminCreateTokenRequest>,
 ) -> Response {
     // Role is proven by the gate, but role is not authority: a minted opaque
@@ -234,7 +235,12 @@ async fn admin_create_token(
         return (StatusCode::BAD_REQUEST, "ttl_days must be > 0").into_response();
     }
     // The store clamps too; clamp here so the response and audit report the real TTL.
-    let ttl_days = req.ttl_days.min(MAX_TOKEN_TTL_DAYS);
+    // An OIDC caller's provider ceiling (#1094) applies here as on the UI mint:
+    // a 15-minute credential must not mint a token that lasts years.
+    let ttl_days = crate::ui::cap_ttl_days(
+        req.ttl_days.min(MAX_TOKEN_TTL_DAYS),
+        caller_mint_ceiling.map(|Extension(c)| c.0),
+    );
 
     let Some(token_store) = &state.tokens else {
         return (

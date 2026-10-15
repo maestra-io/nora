@@ -343,7 +343,9 @@ async fn build_docker_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     let mut repos: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for (key, meta) in &keys {
-        if ends_with_ci(key, ".meta.json") || ends_with_ci(key, ".stats.json") {
+        // The .stats.json pull-stats sidecar (#1114) is bytes on disk, not a tag:
+        // its size counts below, the tag count skips it.
+        if ends_with_ci(key, ".meta.json") {
             continue;
         }
 
@@ -378,7 +380,10 @@ async fn build_docker_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
             // tag manifest (`manifests/<tag>.json`) and a content-addressed
             // `manifests/sha256:<digest>.json`; counting both double-counted
             // every image (#588). Count only the tag form.
-            if parts[boundary] == "manifests" && ends_with_ci(key, ".json") {
+            if parts[boundary] == "manifests"
+                && ends_with_ci(key, ".json")
+                && !ends_with_ci(key, ".stats.json")
+            {
                 if let Some(reference) = parts.get(boundary + 1) {
                     let reference = reference.trim_end_matches(".json");
                     if !reference.starts_with("sha256:") {
@@ -1384,5 +1389,6 @@ mod tests {
             .unwrap();
         let repos = build_docker_index(&s).await.expect("index built");
         assert_eq!(repos[0].versions, 1);
+        assert_eq!(repos[0].size, 4, "the sidecar's bytes are stored bytes");
     }
 }
