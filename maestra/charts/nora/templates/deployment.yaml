@@ -38,6 +38,10 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      # No service-link env: the Service named `nora` would inject NORA_PORT
+      # (tcp://<ip>:4000), which collides with nora's own NORA_PORT config
+      # variable and logs "env override ignored" on every start.
+      enableServiceLinks: false
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
