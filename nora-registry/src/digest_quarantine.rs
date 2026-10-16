@@ -489,25 +489,51 @@ fn append_jsonl(path: &Path, entry: &DigestEntry) {
     }
 
     tokio::task::spawn_blocking(move || {
-        match OpenOptions::new().create(true).append(true).open(&path) {
-            Ok(mut file) => {
-                // One write for the whole line: `writeln!` on an unbuffered File
-                // is two syscalls (the JSON, then the newline), and a SIGKILL
-                // between them (a Recreate rollout) left a line without its
-                // newline, so the next append glued onto it and `load` dropped
-                // both entries ("trailing characters", 2 per restart on iota).
-                let _ = file.write_all(format!("{json}\n").as_bytes());
-                let _ = file.flush();
-            }
-            Err(e) => {
-                error!(
-                    path = %path.display(),
-                    error = %e,
-                    "Failed to append quarantine entry (fail-open)"
-                );
-            }
+        if let Err(e) = append_jsonl_line(&path, &json) {
+            error!(
+                path = %path.display(),
+                error = %e,
+                "Failed to append quarantine entry (fail-open)"
+            );
         }
     });
+}
+
+/// Append `json` as one line, in one write, after a newline-terminated tail.
+///
+/// `writeln!` on an unbuffered File was two syscalls (the JSON, then the
+/// newline); a SIGKILL between them (a Recreate rollout) left a line without
+/// its newline, the next append glued onto it and `load` dropped both entries
+/// ("trailing characters", 1-3 per restart on iota). A single write of the
+/// whole line cannot be split by a kill, and an unterminated tail left by an
+/// earlier torn write gets its newline first, so at most that fragment is
+/// lost, never the records after it.
+fn append_jsonl_line(path: &Path, json: &str) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let line = if tail_is_terminated(path)? {
+        format!("{json}\n")
+    } else {
+        format!("\n{json}\n")
+    };
+    file.write_all(line.as_bytes())?;
+    file.flush()
+}
+
+/// True when `path` is missing, empty, or ends with a newline.
+pub(crate) fn tail_is_terminated(path: &Path) -> std::io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(e),
+    };
+    if file.metadata()?.len() == 0 {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] == b'\n')
 }
 
 /// Rewrite JSONL atomically: write temp file → fsync → rename.
@@ -552,6 +578,31 @@ fn atomic_rewrite(path: &Path, entries: &HashMap<String, DigestEntry>) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A torn append (the JSON written, the kill before its newline) must not
+    /// swallow the next record: the append terminates the tail first, so only
+    /// the fragment is unparsable and the new entry loads.
+    #[test]
+    fn append_after_a_torn_tail_keeps_the_new_entry_parsable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("quarantine.jsonl");
+        std::fs::write(&path, b"{\"registry\":\"npm\",\"digest\":\"sha256:torn").unwrap();
+        assert!(!tail_is_terminated(&path).unwrap());
+        let entry = DigestEntry {
+            registry: "nuget".to_string(),
+            digest: "sha256:aa".to_string(),
+            first_seen: 1,
+            upstream: "cache".to_string(),
+        };
+        append_jsonl_line(&path, &serde_json::to_string(&entry).unwrap()).unwrap();
+        assert!(tail_is_terminated(&path).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text:?}");
+        assert!(serde_json::from_str::<DigestEntry>(lines[0]).is_err());
+        let loaded: DigestEntry = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(loaded.digest, "sha256:aa");
+    }
 
     #[test]
     fn test_quarantine_mode_from_str() {

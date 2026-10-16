@@ -201,9 +201,16 @@ impl AuditLog {
                 let _ = fs::create_dir_all(parent);
             }
             match open_append(&path) {
-                Ok(file) => {
+                Ok(mut file) => {
                     info!(path = %path.display(), mode = ?mode, "Audit log initialized");
-                    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+                    let mut size = file.metadata().map(|m| m.len()).unwrap_or(0);
+                    // A tail torn by a kill (see digest_quarantine::append_jsonl_line)
+                    // gets its newline once here, so the next entry starts a line.
+                    if !crate::digest_quarantine::tail_is_terminated(&path).unwrap_or(true)
+                        && file.write_all(b"\n").is_ok()
+                    {
+                        size += 1;
+                    }
                     Some(FileSink {
                         file,
                         path: path.clone(),
