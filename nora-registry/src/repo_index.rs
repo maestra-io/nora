@@ -322,6 +322,7 @@ async fn build(reg_type: RegistryType, state: &AppState) -> Option<Vec<RepoInfo>
         #[allow(unreachable_patterns)]
         RegistryType::Rpm | RegistryType::Deb => Some(Vec::new()),
         RegistryType::Cpan => build_cpan_index(storage).await,
+        RegistryType::HuggingFace => build_hf_index(storage).await,
     }
 }
 
@@ -381,15 +382,10 @@ async fn build_docker_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
             // `manifests/sha256:<digest>.json`; counting both double-counted
             // every image (#588). Count only the tag form.
             if parts[boundary] == "manifests"
-                && ends_with_ci(key, ".json")
-                && !ends_with_ci(key, ".stats.json")
+                && parts.len() == boundary + 2
+                && crate::registry::docker::tag_from_manifest_file(parts[boundary + 1]).is_some()
             {
-                if let Some(reference) = parts.get(boundary + 1) {
-                    let reference = reference.trim_end_matches(".json");
-                    if !reference.starts_with("sha256:") {
-                        entry.0 += 1;
-                    }
-                }
+                entry.0 += 1;
             }
         }
     }
@@ -512,6 +508,8 @@ async fn build_pypi_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
         }
     }
 
+    // A package NORA holds only the release dates of has no artifact to list.
+    packages.retain(|_, entry| entry.0 > 0);
     Some(to_sorted_vec(packages))
 }
 
@@ -704,6 +702,32 @@ fn cpan_package_of(rel: &str) -> Option<String> {
     let (author_path, file) = rel.rsplit_once('/')?;
     let (distribution, _) = crate::registry::cpan::parse_dist_archive_filename(file)?;
     Some(format!("{author_path}/{distribution}"))
+}
+
+/// Hugging Face index: cached files under `hf/models/{repo}/blobs/{digest}`, one entry per
+/// repository id (one or two segments), counting its cached files.
+async fn build_hf_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let keys = list_keys(storage, "hf/models/").await?;
+    let mut repos: HashMap<String, (usize, u64, u64)> = HashMap::new();
+    for (key, meta) in &keys {
+        let Some(repo) = key.strip_prefix("hf/models/").and_then(hf_repo_of) else {
+            continue;
+        };
+        let entry = repos.entry(repo.to_string()).or_insert((0, 0, 0));
+        entry.0 += 1;
+        entry.1 += meta.size;
+        if meta.modified > entry.2 {
+            entry.2 = meta.modified;
+        }
+    }
+    Some(to_sorted_vec(repos))
+}
+
+/// The repository id of a key under `hf/models/`: `{repo}/blobs/{digest}`, a digest with no
+/// `/`, or none for anything else under the prefix.
+fn hf_repo_of(rel: &str) -> Option<&str> {
+    let (repo, digest) = rel.rsplit_once("/blobs/")?;
+    (!repo.is_empty() && !digest.is_empty() && !digest.contains('/')).then_some(repo)
 }
 
 /// Conan index: keys like conan/{name}/{ver}/{user}/{chan}/revisions/{rev}/files/{file}
@@ -981,6 +1005,37 @@ mod tests {
         }
     }
 
+    /// The Hugging Face index counts the files cached per repository id, one or two segments,
+    /// and nothing else under `hf/` or outside it; an empty cache builds empty.
+    #[tokio::test]
+    async fn hf_index_counts_cached_files_per_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        assert!(build_hf_index(&storage).await.unwrap().is_empty());
+        for (key, body) in [
+            ("hf/models/org/model/blobs/aaaa", &b"12345"[..]),
+            ("hf/models/org/model/blobs/bbbb", b"123"),
+            ("hf/models/gpt2/blobs/cccc", b"1"),
+            ("hf/models/org/model/other", b"x"),
+            ("hf/models/org/model/blobs/dd/ee", b"x"),
+            ("cpan/authors/id/F/FO/FOO/Foo-Bar-1.0.tar.gz", b"tgz"),
+            ("raw/some/file.bin", b"raw"),
+        ] {
+            storage.put(key, body).await.unwrap();
+        }
+        let mut got: Vec<(String, usize, u64)> = build_hf_index(&storage)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.name.clone(), r.versions, r.size))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("gpt2".to_string(), 1, 1), ("org/model".to_string(), 2, 8)]
+        );
+    }
+
     #[test]
     fn test_repo_index_invalidate() {
         let idx = RepoIndex::new();
@@ -1049,6 +1104,29 @@ mod tests {
         assert_eq!(repos[0].versions, 1, "checksum sidecar must not be counted");
         // ...but its bytes still count toward size, so size == on-disk du.
         assert_eq!(repos[0].size, 100 + 8);
+    }
+
+    #[tokio::test]
+    async fn pypi_index_counts_no_release_dates_record() {
+        let (_d, s) = temp_storage();
+        s.put("pypi/six/six-1.16.0-py3-none-any.whl", &[0u8; 100])
+            .await
+            .unwrap();
+        s.put("pypi/six/dates.json", br#"{"a":null}"#)
+            .await
+            .unwrap();
+        // A package NORA holds only the release dates of (a refused download).
+        s.put("pypi/other/dates.json", b"{}").await.unwrap();
+        // Only a distribution file is an artifact: a file named like the record but
+        // deeper is not one either.
+        s.put("pypi/deep/sub/dates.json", &[0u8; 5]).await.unwrap();
+
+        let repos = build_pypi_index(&s).await.expect("index built");
+        let names: Vec<&str> = repos.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["six"], "{names:?}");
+        let six = repos.iter().find(|r| r.name == "six").unwrap();
+        assert_eq!(six.versions, 1, "dates.json is not an artifact");
+        assert_eq!(six.size, 100 + 10, "its bytes still count toward size");
     }
 
     #[tokio::test]
@@ -1390,5 +1468,19 @@ mod tests {
         let repos = build_docker_index(&s).await.expect("index built");
         assert_eq!(repos[0].versions, 1);
         assert_eq!(repos[0].size, 4, "the sidecar's bytes are stored bytes");
+    }
+
+    /// only tags count as versions: a sha512 digest copy of a manifest is not one.
+    #[tokio::test]
+    async fn docker_index_counts_only_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::new_local(dir.path().to_str().unwrap());
+        s.put("docker/img/manifests/v1.json", b"{}").await.unwrap();
+        let digest = format!("sha512:{}", "a".repeat(128));
+        s.put(&format!("docker/img/manifests/{digest}.json"), b"{}")
+            .await
+            .unwrap();
+        let repos = build_docker_index(&s).await.expect("index built");
+        assert_eq!(repos[0].versions, 1);
     }
 }

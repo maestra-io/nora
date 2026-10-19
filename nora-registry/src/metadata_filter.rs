@@ -307,7 +307,7 @@ mod tests {
         let cached = ctx
             .state
             .storage
-            .get("npm/pkg/metadata.json")
+            .get("npm/pkg/upstream/packument.json")
             .await
             .unwrap();
         let cached: Value = serde_json::from_slice(&cached).unwrap();
@@ -353,7 +353,10 @@ mod tests {
         });
         ctx.state
             .storage
-            .put("npm/pkg/metadata.json", cached.to_string().as_bytes())
+            .put(
+                "npm/pkg/upstream/packument.json",
+                cached.to_string().as_bytes(),
+            )
             .await
             .unwrap();
         let resp = send_with_headers(
@@ -368,7 +371,11 @@ mod tests {
         assert_eq!(version_keys(&short), ["0.9.0", "1.0.0"]);
         assert_eq!(short["dist-tags"]["latest"], "1.0.0");
         // The fresh document is cached before the response.
-        let stored = ctx.state.storage.get("npm/pkg/metadata.json").await;
+        let stored = ctx
+            .state
+            .storage
+            .get("npm/pkg/upstream/packument.json")
+            .await;
         let stored: Value = serde_json::from_slice(&stored.unwrap()).unwrap();
         assert!(stored["versions"].get("1.1.0").is_some());
     }

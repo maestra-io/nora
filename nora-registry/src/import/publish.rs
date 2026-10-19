@@ -223,7 +223,16 @@ async fn commit_npm(
         payload["dist-tags"] = serde_json::json!({ "latest": version });
     }
     payload["versions"] = serde_json::json!({ version: doc });
-    npm::publish_versions(storage, locks, package, &payload, vec![(file, tarball)]).await
+    // An unknown-origin packument at the key is never imported from here: the operator decides.
+    npm::publish_versions(
+        storage,
+        locks,
+        package,
+        &payload,
+        vec![(file, tarball)],
+        false,
+    )
+    .await
 }
 
 /// PyPI: project and version come from the filename (as an upload checks them
