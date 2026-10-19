@@ -54,8 +54,9 @@ Output shape: `<time> {"<registry>":<N>}` per window; `<pod> start=<time> restar
    - npm: count the host inside and outside the README text, for EVERY path of step 3 (`%2F` stays encoded):
      `curl -s --compressed https://registry.npmjs.org/<pkg> > /tmp/p.json; grep -o 'registry\.npmjs\.org' /tmp/p.json | wc -l; jq -c 'del(.readme, .versions[]?.readme) | walk(if type=="object" then del(.tarball, .attestations) else . end)' /tmp/p.json | grep -o 'registry\.npmjs\.org' | wc -l`
      second number 0 = every hit is README prose (cache-key examples, `fetch('https://registry.npmjs.org/…')` in code
-     samples): **false positive of the detector**. The fix is a detector that skips `readme` fields; matching only after
-     `://` or a pass-through entry does not cover READMEs that carry full URLs, so check all paths before proposing it.
+     samples): **false positive of the detector**. Since `1.3.6-maestra.4` (#78) the detector drops `readme` fields
+     before scanning, so a README-only hit on that or a newer `image` tag (step 2) is a detector bug, not a known false
+     positive; matching only after `://` does not cover READMEs that carry full URLs.
 4. Step 5 lists a fix merged before the alert; compare its release with the running `image` tag (step 2): merged but not
    running = wait for the release, the alert repeats until then.
 
