@@ -786,6 +786,21 @@ pub async fn leak_detection_middleware(
         &body_bytes[..]
     };
 
+    // npm READMEs are prose: `fetch('https://registry.npmjs.org/…')` samples and cache keys
+    // (make-fetch-happen, cacache) name the upstream, but no client follows them. Not JSON →
+    // scan the raw bytes (over-report, never miss).
+    let stripped: Vec<u8>;
+    let haystack = match (detect_registry(&path) == "npm")
+        .then(|| strip_npm_readmes(haystack))
+        .flatten()
+    {
+        Some(b) => {
+            stripped = b;
+            &stripped[..]
+        }
+        None => haystack,
+    };
+
     if let Some((registry, hostname)) = state.leak_finders.scan(haystack) {
         UPSTREAM_URL_LEAK_TOTAL.with_label_values(&[registry]).inc();
         tracing::warn!(
@@ -799,6 +814,20 @@ pub async fn leak_detection_middleware(
 
     // Return original (possibly gzip-compressed) body unchanged
     Response::from_parts(parts, Body::from(body_bytes))
+}
+
+/// The packument re-serialized without top-level `readme` and `versions.*.readme`;
+/// None if it is not a JSON object.
+fn strip_npm_readmes(body: &[u8]) -> Option<Vec<u8>> {
+    let mut doc: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = doc.as_object_mut()?;
+    obj.remove("readme");
+    if let Some(versions) = obj.get_mut("versions").and_then(|v| v.as_object_mut()) {
+        for v in versions.values_mut().filter_map(|v| v.as_object_mut()) {
+            v.remove("readme");
+        }
+    }
+    serde_json::to_vec(&doc).ok()
 }
 
 /// Decompress gzip bytes; returns None on failure or if decompressed size exceeds limit.
@@ -1349,6 +1378,33 @@ mod tests {
             leak_before + 1,
             "a registry proxy response leaking an upstream URL must be flagged"
         );
+    }
+
+    /// Leak-counter delta for one GET of `/npm/x` returning `body`.
+    async fn npm_leak_delta(label: &'static str, body: &'static str) -> u64 {
+        use tower::ServiceExt;
+        let (app, _state) = leak_test_app("/npm/x", label, "registry.npmjs.org", body);
+        let before = UPSTREAM_URL_LEAK_TOTAL.with_label_values(&[label]).get();
+        let req = axum::http::Request::builder().uri("/npm/x");
+        let resp = app
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        UPSTREAM_URL_LEAK_TOTAL.with_label_values(&[label]).get() - before
+    }
+
+    /// README prose naming the upstream (cacache, make-fetch-happen, @npmcli/agent paged
+    /// NoraUpstreamUrlLeak 16x, 12-16.10) is not a leak; a tarball outside it still is,
+    /// and a body that is not JSON is scanned raw.
+    #[tokio::test]
+    async fn npm_readme_upstream_urls_are_not_a_leak() {
+        let readme = r#"{"name":"x","readme":"key 'registry.npmjs.org|cacache@1.0.0'; fetch('https://registry.npmjs.org/make-fetch-happen')","versions":{"1.0.0":{"readme":"https://registry.npmjs.org/x/-/x-1.0.0.tgz","dist":{"tarball":"https://packages.maestra.io/npm/x/-/x-1.0.0.tgz"}}}}"#;
+        assert_eq!(npm_leak_delta("canary-readme-a", readme).await, 0);
+        let tarball = r#"{"name":"x","readme":"key 'registry.npmjs.org|cacache@1.0.0'","versions":{"1.0.0":{"readme":"fetch('https://registry.npmjs.org/x')","dist":{"tarball":"https://registry.npmjs.org/x/-/x-1.0.0.tgz"}}}}"#;
+        assert_eq!(npm_leak_delta("canary-readme-b", tarball).await, 1);
+        let broken = r#"{"name":"x","readme":"fetch('https://registry.npmjs.org/x')","versions":"#;
+        assert_eq!(npm_leak_delta("canary-readme-c", broken).await, 1);
     }
 
     /// Metric name -> "counter" | "gauge" | "histogram", read off every
