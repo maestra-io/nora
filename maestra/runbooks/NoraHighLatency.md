@@ -7,8 +7,9 @@
 For an automation agent; every step is read-only except **Act**.
 Provenance: this alert had no runbook; everything below comes from the first incident
 (12.10.2026, Slack <https://maestraio.slack.com/archives/C0BN1L82W8M/p1791814920896829>)
-and probes re-run while writing. Branches other than "allocator contention" are
-config-derived checks, not incident history: frequencies unknown.
+and probes re-run while writing; the allocator (4a) and link (4d) branches have since
+recurred (case history). Step 3 branches are config-derived checks, not incident
+history: frequencies unknown.
 
 ## What the alert means
 
@@ -163,7 +164,15 @@ Baselines: storage `get` errors are never zero (12.10 12:00 UTC: 2880 `get` + 15
   `kubectl --context "$CTX" -n nora get deploy nora -o jsonpath='{.spec.template.spec.containers[0].image}'`.
   If it is older, or the allocator was removed, the fix is the release, not more CPU or
   replicas: more cores only add spinners on the same lock and burn the node (12.10:
-  26 cores).
+  26 cores). The image tag is not proof: since nora#23 `mimalloc` is a cargo feature
+  inside `default`, and the release builds `--no-default-features`, so a release that
+  forgets `--features mimalloc` ships musl's malloc under a newer tag (16–19.10.2026:
+  `1.3.6-maestra.1/.2`). Check the binary itself:
+  `docker pull <ECR>/nora:<tag> && docker create … && docker cp <id>:/usr/local/bin/nora - | grep -a -c mimalloc`
+  (5 hits with the allocator, 0 without; since nora#76 the Dockerfile fails the build
+  at 0). A cheaper tell without the image: `stime` ≫ `utime` in `/proc/<pid>/stat`
+  (19.10 before the fix: 3.1M vs 0.68M ticks; after, over a 10 s sample: +7 vs +34)
+  and CPU per request ≥ 0.03 core-s at only 15–25 rps.
 - **4b. Real load.** CPU per request flat near the after-fix value while rps grows:
   capacity. nora runs a single replica (local token volume), so options are CPU
   `requests` in the HelmRelease or finding the client generating the burst (12.10: the
@@ -216,6 +225,7 @@ After the pod is Ready (`pod_of`), at least 10 minutes of traffic:
 
 | Date (UTC) | Object | Cause | Category | What helped | Thread |
 |---|---|---|---|---|---|
+| 16–19.10.2026, 10 firings (16.10 ×1, 17.10 ×4, 18.10 ×3, 19.10 ×1) | nora `1.3.6-maestra.1/.2`, iota | the 1.3.6 release was built `--no-default-features` after nora#23 moved `mimalloc` into `default`: the image lost the allocator and the 12.10 musl malloc lock came back. CPU per request 0.004 → 0.03–0.07 core-s, `stime/utime` 4.6 on node 02, p99 ≥ 9s on NuGet bursts of only 15–25 rps while traffic itself had dropped 6–12× (170 → 12–28 GB/day) after the CI cache-mount sweep | allocator regression | nora#76: release and CI gates build `--no-default-features --features mimalloc`, Dockerfile refuses a binary without mimalloc; `1.3.6-maestra.3` (fluxcd#23672). Traffic side, same week: NuGet cache mount in ~180 repo Dockerfiles + test-job cache (github-actions #146/#147/#149/#151/#153): warm image legs 300 → 0.2 MB, test jobs 210 → 0 MB | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1792399381398669> |
 | 12.10.2026 16:05–16:10 | nora `1.3.3-maestra.10`, iota node 02 | NuGet CI burst up to 413 rps; every artifact read from R2 filled the node's 1 Gbit `eno5` (982 Mbit/s rx, 98%), responses 637 Mbit/s on `eno6`; CPU 1.5–1.8 cores, 0.006 core-s/request; 3.6–7 rps of NuGet > 10s, no 5xx | network link saturated | ended with the burst. Follow-up 13.10: Cilium bandwidth manager on iota (kubernetes-clusters#165) + 800M/800M pod quota (fluxcd#22471); verified with 2×16 parallel downloads from nodes 01/03: `eno5` rx ~805 Mbit/s, 256/256 OK | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1791821141024479> |
 | 12.10.2026 14:15–15:07, 4 firings | nora `1.3.3-maestra.9`, iota | musl static-pie build (Alpine builder) using musl's malloc with one global lock; at ~200 rps all 32 tokio workers spun on it: `perf` 85% `native_queued_spin_lock_slowpath`, 10–26 cores, node load 26, p99 ≥ 10s, p90 3.9s, p50 60ms, no 5xx. OOMKilled at 2Gi in parallel, with a JWKS rejection burst after each restart | allocator contention + OOM | mimalloc global allocator (maestra-io/nora#53, release `v1.3.3-maestra.10`, fluxcd#22246, rolled 15:08); memory 2Gi→4Gi (fluxcd#22241). After: 0.2–0.5 cores at 75–112 rps, p99 2.1s, node load 3 | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1791814920896829> |
 
