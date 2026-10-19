@@ -52,11 +52,14 @@ Output shape: `<time> {"<registry>":<N>}` per window; `<pod> start=<time> restar
    - a prefix clients never follow (NuGet `/v3/catalog0/`, npm attestations) → **false positive**: the fix is the
      registry's `UPSTREAM_PASSTHROUGH_PATHS` (step 4), not a silence.
    - npm: count the host inside and outside the README text, for EVERY path of step 3 (`%2F` stays encoded):
-     `curl -s --compressed https://registry.npmjs.org/<pkg> > /tmp/p.json; grep -o 'registry\.npmjs\.org' /tmp/p.json | wc -l; jq -c 'del(.readme, .versions[]?.readme) | walk(if type=="object" then del(.tarball, .attestations) else . end)' /tmp/p.json | grep -o 'registry\.npmjs\.org' | wc -l`
-     second number 0 = every hit is README prose (cache-key examples, `fetch('https://registry.npmjs.org/…')` in code
-     samples): **false positive of the detector**. Since `1.3.6-maestra.4` (#78) the detector drops `readme` fields
-     before scanning, so a README-only hit on that or a newer `image` tag (step 2) is a detector bug, not a known false
-     positive; matching only after `://` does not cover READMEs that carry full URLs.
+     `curl -s --compressed https://registry.npmjs.org/<pkg> > /tmp/p.json; for f in '.' 'del(.readme, .versions[]?.readme)' 'del(.readme, .versions[]?.readme) | walk(if type=="object" then del(.tarball, .attestations) else . end)'; do jq -c "$f" /tmp/p.json | grep -o 'registry\.npmjs\.org' | wc -l; done`
+     Three numbers: all hits, hits outside README, hits outside README/tarball/attestations. First minus second = README
+     prose (cache-key examples, `fetch('https://registry.npmjs.org/…')` in code samples): since `1.3.6-maestra.4` (#78)
+     the detector drops `readme` fields before scanning, so on that or a newer `image` tag (step 2) README hits cannot
+     fire it; if nothing else explains the firing it is a detector bug. Second minus third = `dist.tarball` / attestation
+     links nora rewrites or passes through: confirm in nora's OWN response (step 3) that none is left, else **rewriter
+     gap**. Third > 0 = the host sits in another field: `jq` for it, that is the rewriter gap or the new pass-through
+     entry. Matching only after `://` does not cover READMEs with full URLs, so it was never the fix.
 4. Step 5 lists a fix merged before the alert; compare its release with the running `image` tag (step 2): merged but not
    running = wait for the release, the alert repeats until then.
 
