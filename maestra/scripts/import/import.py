@@ -214,8 +214,13 @@ def npm_pkg(p, st, a):
     imported = {v["version"] for v in p["versions"] if st.done.get(f"npm:{name}@{v['version']}") in ("pushed", "exists")}
     # Never move a nora dist-tag back: nora may already carry a newer version (a GitHub
     # release, or an earlier sync) than the source's tag points at.
+    # A failed tag step is recorded as `failed` (the sync workflows go red on it).
     r = call(nora, nora_lim, "GET", f"{NORA}/npm/{q}", headers={"Authorization": f"Bearer {a.token}"})
-    current = r.json().get("dist-tags", {}) if r.status_code == 200 else {}
+    if r.status_code != 200:
+        st.put(f"npm-tags:{name}", "failed", reason=f"nora packument HTTP {r.status_code}")
+        log("npm", name, "-", "tag-failed", detail=f"nora packument HTTP {r.status_code}, dist-tags left as they are")
+        return
+    current = r.json().get("dist-tags", {})
     for tag, ver in doc.get("dist-tags", {}).items():
         if ver not in imported:
             log("npm", name, ver, "tag-skipped", detail=f"dist-tag {tag}: version not imported")
@@ -225,7 +230,10 @@ def npm_pkg(p, st, a):
             continue
         r = call(nora, nora_lim, "PUT", f"{NORA}/npm/-/package/{q}/dist-tags/{urllib.parse.quote(tag)}",
                  json=ver, headers={"Authorization": f"Bearer {a.token}"})
-        log("npm", name, ver, "tagged" if r.status_code in (200, 201, 204) else "tag-failed", detail=f"{tag} HTTP {r.status_code}")
+        ok = r.status_code in (200, 201, 204)
+        if not ok:
+            st.put(f"npm-tag:{name}:{tag}", "failed", reason=f"HTTP {r.status_code}", version=ver)
+        log("npm", name, ver, "tagged" if ok else "tag-failed", detail=f"{tag} HTTP {r.status_code}")
 
 
 def pypi_pkg(p, st, a):

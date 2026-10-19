@@ -154,7 +154,7 @@ def nuget_org(ids, missing_only):
         return list(ex.map(one, ids))
 
 
-def npm(files):
+def npm(files, npmjs=True):
     sizes, names = {}, set()
     for f in files:
         p = f["uri"].lstrip("/")
@@ -174,9 +174,12 @@ def npm(files):
             versions.append({"version": ver, "url": url, "size": size,
                              "integrity": vd["dist"].get("integrity"), "shasum": vd["dist"].get("shasum")})
         versions.sort(key=lambda v: version_key(v["version"]))
-        pubr = pub.get(f"https://registry.npmjs.org/{urllib.parse.quote(name, safe='@')}", timeout=60)
+        npmjs_versions = 0
+        if npmjs:
+            pubr = pub.get(f"https://registry.npmjs.org/{urllib.parse.quote(name, safe='@')}", timeout=60)
+            npmjs_versions = len(pubr.json().get("versions", {})) if pubr.ok else 0
         return {"name": name, "dist_tags": doc.get("dist-tags", {}), "time": doc.get("time", {}),
-                "npmjs_versions": len(pubr.json().get("versions", {})) if pubr.ok else 0, "versions": versions}
+                "npmjs_versions": npmjs_versions, "versions": versions}
 
     with ThreadPoolExecutor(8) as ex:
         return list(ex.map(one, sorted(names)))
@@ -239,7 +242,14 @@ def npm_missing(pkgs):
         return {**p, "versions": [v for v in p["versions"] if v["version"] not in have]}
 
     with ThreadPoolExecutor(8) as ex:
-        return [p for p in ex.map(one, pkgs) if p["versions"]]
+        out = [p for p in ex.map(one, pkgs) if p["versions"]]
+    # The import is byte-exact only against a sha512 digest (what lockfiles pin): refuse the
+    # run rather than import a version import.py could check only by sha1 or not at all.
+    weak = [f"{p['name']}@{v['version']}" for p in out for v in p["versions"]
+            if not (v.get("integrity") or "").startswith("sha512-")]
+    if weak:
+        sys.exit(f"no sha512 dist.integrity on Artifactory for: {', '.join(weak)}")
+    return out
 
 
 def main():
@@ -252,7 +262,7 @@ def main():
     args = ap.parse_args()
     started = datetime.now(timezone.utc)
     if args.npm_missing_only:
-        pkgs = npm_missing(npm(storage_list("npm-local")))
+        pkgs = npm_missing(npm(storage_list("npm-local"), npmjs=False))
         t = {"npm": totals(pkgs, "versions")}
         manifest = {"generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "started_at": started.strftime("%Y-%m-%dT%H:%M:%SZ"), "source": ART,

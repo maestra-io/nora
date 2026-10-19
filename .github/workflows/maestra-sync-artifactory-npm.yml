@@ -7,8 +7,9 @@ name: Maestra sync Artifactory npm
 # nora; a consumer whose lockfile picked one up then fails `npm ci` with
 # 403 blocked_by_policy (@mindbox-cloud/* is an internal namespace, never proxied).
 # The import is byte-exact: each tarball is checked against the source's
-# dist.integrity (sha512) before the push, so lockfile integrity stays valid.
-# A nora dist-tag is never moved back. issues-maestra#1567.
+# dist.integrity (sha512; a version without one fails the run) before the push,
+# so lockfile integrity stays valid. A nora dist-tag is never moved back; a failed
+# tag update fails the run. issues-maestra#1567.
 #
 # Credentials: the Artifactory read token from the central Vault (jwt-github role
 # nora-artifactory-sync-github-ci, maestra/main only; fluxcd
@@ -38,6 +39,8 @@ jobs:
       - uses: runs-on/action@v2.5.0
 
       - uses: actions/checkout@v6.1.0
+        with:
+          persist-credentials: false
 
       - uses: hashicorp/vault-action@v4.0.0
         with:
