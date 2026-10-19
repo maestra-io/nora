@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 
 import requests
 
-from common import ART, NORA, Limiter, art_session, env
+from common import ART, NORA, Limiter, art_session, env, version_key
 
 art = art_session()
 pub = requests.Session()
@@ -212,9 +212,16 @@ def npm_pkg(p, st, a):
     if a.dry_run:
         return
     imported = {v["version"] for v in p["versions"] if st.done.get(f"npm:{name}@{v['version']}") in ("pushed", "exists")}
+    # Never move a nora dist-tag back: nora may already carry a newer version (a GitHub
+    # release, or an earlier sync) than the source's tag points at.
+    r = call(nora, nora_lim, "GET", f"{NORA}/npm/{q}", headers={"Authorization": f"Bearer {a.token}"})
+    current = r.json().get("dist-tags", {}) if r.status_code == 200 else {}
     for tag, ver in doc.get("dist-tags", {}).items():
         if ver not in imported:
             log("npm", name, ver, "tag-skipped", detail=f"dist-tag {tag}: version not imported")
+            continue
+        if tag in current and version_key(current[tag]) >= version_key(ver):
+            log("npm", name, ver, "tag-skipped", detail=f"dist-tag {tag}: nora has {current[tag]}")
             continue
         r = call(nora, nora_lim, "PUT", f"{NORA}/npm/-/package/{q}/dist-tags/{urllib.parse.quote(tag)}",
                  json=ver, headers={"Authorization": f"Bearer {a.token}"})

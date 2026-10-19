@@ -23,6 +23,14 @@ nuget.org registration with its catalog `packageHash` (sha512), origin `nuget.or
 
     uv run maestra/scripts/import/enumerate.py --nuget-org-ids maestra/scripts/import/public-ids.txt \
         [--missing-only] --out manifest.json
+
+npm only, missing only (ART_TOKEN + NORA_TOKEN, read is enough on nora): the `@mindbox-cloud/*`
+versions in Artifactory `npm-local` that nora does not host yet. GitLab pipelines still publish
+there (the RU contour) and their tags reach GitHub with the GitLab syncs, so semantic-release on
+GitHub never publishes those versions to nora: the daily sync
+(.github/workflows/maestra-sync-artifactory-npm.yml) imports them byte-exact.
+
+    ART_TOKEN=... NORA_TOKEN=... uv run maestra/scripts/import/enumerate.py --npm-missing-only --out manifest.json
 """
 import argparse
 import html.parser
@@ -217,13 +225,43 @@ def totals(items, key):
             "pr_dev_bytes": sum(v["size"] for v in pr)}
 
 
+def npm_missing(pkgs):
+    """Drop the versions nora already hosts; a package nora does not know (404) keeps them all."""
+    auth = {"Authorization": "Bearer " + env("NORA_TOKEN")}
+
+    def one(p):
+        r = pub.get(f"{NORA}/npm/{urllib.parse.quote(p['name'], safe='@')}", headers=auth, timeout=120)
+        if r.status_code == 404:
+            have = set()
+        else:
+            r.raise_for_status()
+            have = set(r.json().get("versions", {}))
+        return {**p, "versions": [v for v in p["versions"] if v["version"] not in have]}
+
+    with ThreadPoolExecutor(8) as ex:
+        return [p for p in ex.map(one, pkgs) if p["versions"]]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--nuget-org-ids", help="file of public NuGet IDs (one per line, # comments): nuget.org only")
     ap.add_argument("--missing-only", action="store_true", help="with --nuget-org-ids: skip versions nora hosts")
+    ap.add_argument("--npm-missing-only", action="store_true",
+                    help="Artifactory npm-local only: the @mindbox-cloud/* versions nora does not host yet")
     args = ap.parse_args()
     started = datetime.now(timezone.utc)
+    if args.npm_missing_only:
+        pkgs = npm_missing(npm(storage_list("npm-local")))
+        t = {"npm": totals(pkgs, "versions")}
+        manifest = {"generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "started_at": started.strftime("%Y-%m-%dT%H:%M:%SZ"), "source": ART,
+                    "totals": t, "nuget": [], "npm": pkgs, "pypi": []}
+        with open(args.out, "w") as f:
+            json.dump(manifest, f, indent=1)
+        print(json.dumps({"generated_at": manifest["generated_at"], "totals": t,
+                          "missing": {p["name"]: [v["version"] for v in p["versions"]] for p in pkgs}}, indent=1))
+        return
     if args.nuget_org_ids:
         with open(args.nuget_org_ids) as f:
             ids = [ln.split("#", 1)[0].strip() for ln in f]
