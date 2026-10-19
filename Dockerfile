@@ -28,15 +28,19 @@ COPY nora-registry/ nora-registry/
 # the workspace intact so --locked holds; `-p nora-registry` never builds them.
 COPY fuzz/ fuzz/
 
-# CARGO_FEATURES: extra cargo args, e.g. "--no-default-features" drops the rpm
-# and deb registries (and their rpgp signer).
+# CARGO_FEATURES: extra cargo args, e.g. "--no-default-features --features mimalloc"
+# drops the rpm and deb registries (and their rpgp signer) but keeps the allocator.
+# A production binary must carry mimalloc: the static musl build otherwise serialises
+# every allocation on one lock (perf: native_queued_spin_lock_slowpath, 12.10 and
+# 16-19.10.2026). The grep below fails the build when the feature got dropped.
 ARG CARGO_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
     cargo build --release --locked -p nora-registry $CARGO_FEATURES && \
     cp target/release/nora /nora && \
-    strip /nora
+    strip /nora && \
+    (grep -a -q mimalloc /nora || { echo 'nora built without mimalloc (add --features mimalloc)' >&2; exit 1; })
 
 # ── Binary export (for CI release artifacts) ───────────────────────────────
 FROM scratch AS binary
@@ -67,7 +71,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release --locked --target aarch64-unknown-linux-musl -p nora-registry $CARGO_FEATURES && \
     cp target/aarch64-unknown-linux-musl/release/nora /nora && \
-    aarch64-linux-musl-strip /nora
+    aarch64-linux-musl-strip /nora && \
+    (grep -a -q mimalloc /nora || { echo 'nora built without mimalloc (add --features mimalloc)' >&2; exit 1; })
 
 FROM scratch AS binary-arm64
 COPY --from=cross-arm64 /nora /nora
