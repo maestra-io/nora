@@ -512,6 +512,45 @@ async fn collect_raw_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
         .collect()
 }
 
+/// Collect Hugging Face cached files (#579): one group per repository (`hf:{repo}`), one
+/// version per file the Hub named by its digest (`hf/models/{repo}/blobs/{digest}`), dated
+/// by when it was cached. The format is pull-through only, so every file is a copy the next
+/// download fetches again: `older_than_days` bounds how long one is kept, `keep_last` how
+/// many files of a repository are.
+async fn collect_hf_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
+    let keys = match storage.list_with_meta("hf/models/").await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!("Failed to list hf/models/ keys: {}", e);
+            return Vec::new();
+        }
+    };
+    let mut groups: std::collections::HashMap<String, Vec<VersionEntry>> =
+        std::collections::HashMap::new();
+    for (key, meta) in &keys {
+        let Some((repo, digest)) = key
+            .strip_prefix("hf/models/")
+            .and_then(|rest| rest.rsplit_once("/blobs/"))
+        else {
+            continue;
+        };
+        if repo.is_empty() || digest.is_empty() || digest.contains('/') {
+            continue;
+        }
+        groups
+            .entry(format!("hf:{repo}"))
+            .or_default()
+            .push(VersionEntry {
+                name: digest.to_string(),
+                version: None,
+                keys: vec![key.clone()],
+                modified: meta.modified,
+                size: meta.size,
+            });
+    }
+    groups.into_iter().collect()
+}
+
 /// Collect Docker tags for each repository.
 async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
     let all_keys = storage.list("docker/").await.unwrap_or_else(|e| {
@@ -527,17 +566,9 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
             if let Some(idx) = rest.find("/manifests/") {
                 let repo = &rest[..idx];
                 let tag_file = &rest[idx + "/manifests/".len()..];
-                if ends_with_ci(tag_file, ".json")
-                    && !ends_with_ci(tag_file, ".meta.json")
-                    && !ends_with_ci(tag_file, ".stats.json")
-                {
-                    let tag = tag_file.strip_suffix(".json").unwrap_or(tag_file);
-                    // Skip digest references (sha256:…, sha512:…) — they are
-                    // stored alongside the tag file by put_manifest and must not
-                    // consume keep_last budget (#932).
-                    if tag.starts_with("sha256:") || tag.starts_with("sha512:") {
-                        continue;
-                    }
+                // Digest copies (sha256:…), stored beside the tag by put_manifest, must not
+                // consume keep_last budget (#932); sidecars are not tags either.
+                if let Some(tag) = crate::registry::docker::tag_from_manifest_file(tag_file) {
                     repos
                         .entry(repo.to_string())
                         .or_default()
@@ -745,17 +776,12 @@ async fn collect_cargo_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
     > = std::collections::HashMap::new();
 
     for key in &all_keys {
-        // cargo/{crate}/{version}/{crate}-{version}.crate
-        // Also: cargo/{crate}/metadata.json, cargo/index/...
+        // A version is exactly cargo/{crate}/{version}/{crate}-{version}.crate. Every other cargo
+        // key — the sparse index, its per-version entries and the records beside it, metadata.json —
+        // is not a version of a crate, whatever its path looks like.
         if let Some(rest) = key.strip_prefix("cargo/") {
-            if rest.starts_with("index/") {
-                continue; // Skip sparse index
-            }
-            let parts: Vec<&str> = rest.split('/').collect();
-            if parts.len() >= 3 {
-                let crate_name = parts[0];
-                let version = parts[1];
-                if crate_name != "index" && version != "metadata.json" {
+            if let [crate_name, version, file] = rest.split('/').collect::<Vec<_>>()[..] {
+                if file == format!("{crate_name}-{version}.crate") {
                     crates
                         .entry(crate_name.to_string())
                         .or_default()
@@ -893,6 +919,7 @@ pub async fn run_retention(
     #[cfg(feature = "deb")]
     all_groups.extend(collect_deb_versions(storage).await);
     all_groups.extend(collect_raw_versions(storage).await);
+    all_groups.extend(collect_hf_versions(storage).await);
 
     let mut all_plans: Vec<(String, Vec<DeletionPlan>)> = Vec::new();
     let mut total_planned = 0usize;
@@ -900,7 +927,9 @@ pub async fn run_retention(
     let mut total_bytes = 0u64;
     // rpm/deb repos whose packages were deleted — their indexes must be
     // rebuilt (and re-signed) afterwards or they keep advertising ghosts.
-    let mut npm_regen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // npm packages retention touched, with the versions it removed from each.
+    let mut npm_regen: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
     let mut regen: std::collections::BTreeSet<(&'static str, String)> =
         std::collections::BTreeSet::new();
 
@@ -921,7 +950,12 @@ pub async fn run_retention(
 
         if !dry_run {
             if let Some(package) = group_name.strip_prefix("npm:") {
-                npm_regen.insert(package.to_string());
+                npm_regen
+                    .entry(package.to_string())
+                    .or_default()
+                    .extend(plans.iter().filter_map(|plan| {
+                        crate::curation::parse_npm_tarball_version(package, &plan.version_name)
+                    }));
             }
             if let Some(repo) = group_name
                 .strip_prefix("rpm:")
@@ -972,18 +1006,20 @@ pub async fn run_retention(
         all_plans.push((group_name, plans));
     }
 
-    // Regenerate the packument of every npm package retention touched, for the
+    // Reconcile the packument of every npm package retention touched, for the
     // same reason the rpm/deb rebuild below exists: the index is derived, and
     // leaving it describing deleted artifacts makes the registry promise
-    // versions it can no longer serve (#961). A dangling dist-tag pointer is
-    // dropped first, so the regenerated `latest` is derived from what survives
-    // rather than pointing at a retired version.
+    // versions it can no longer serve (#961). A published package is regenerated
+    // from `versions/`; a dangling dist-tag pointer is dropped first, so the
+    // regenerated `latest` is derived from what survives rather than pointing at
+    // a retired version. A proxied package has no `versions/` keys: the retired
+    // versions are removed from its cached upstream packument instead.
     //
     // Fail-open per package: a failed regeneration logs and the next publish or
     // read heals it (a read rebuilds a *missing* packument, #956); the
     // deletions themselves are already durable.
-    for package in &npm_regen {
-        let lock_key = format!("npm/{package}/metadata.json");
+    for (package, retired) in &npm_regen {
+        let lock_key = crate::registry::npm::package_lock_key(package);
         let lock = crate::acquire_publish_lock(publish_locks, &lock_key);
         let _guard = lock.lock().await;
 
@@ -1003,12 +1039,14 @@ pub async fn run_retention(
             }
         }
 
-        match crate::registry::npm::regenerate_packument(storage, package).await {
+        match crate::registry::npm::reconcile_packument_after_retention(storage, package, retired)
+            .await
+        {
             Ok(()) => {
-                info!(registry = "npm", package = %package, "retention: packument regenerated")
+                info!(registry = "npm", package = %package, "retention: packument reconciled")
             }
-            Err(()) => tracing::error!(registry = "npm", package = %package,
-                "retention: packument regeneration failed — the next publish or read heals it"),
+            Err(e) => tracing::error!(registry = "npm", package = %package, error = %e,
+                "retention: packument reconciliation failed — the next publish or read heals it"),
         }
     }
 
@@ -1087,9 +1125,16 @@ fn find_matching_rule<'a>(
         .map(|(_, n)| n)
         .unwrap_or(group_name);
     rules.iter().find(|r| {
-        (r.registry == registry || r.registry == "*")
+        (r.registry == registry || (r.registry == "*" && wildcard_covers(registry)))
             && r.name_glob.as_deref().is_none_or(|g| glob_match(g, name))
     })
+}
+
+/// A `*` rule covers the registries `all` enables. An opt-in format (Hugging Face) is pruned
+/// only by a rule that names it, so a wildcard written before the format existed does not
+/// start deleting its cache on upgrade — `keep_last` counts files there, not versions.
+fn wildcard_covers(registry: &str) -> bool {
+    crate::registry_type::RegistryType::from_str_opt(registry).is_none_or(|rt| rt.in_all())
 }
 
 // ============================================================================
@@ -2074,6 +2119,57 @@ mod tests {
             .is_ok());
     }
 
+    /// The cargo keys that are not crate files — per-version index entries, the sparse index and
+    /// the records beside it — are not versions of a crate: no rule prunes them.
+    #[tokio::test]
+    async fn cargo_index_keys_are_not_crate_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let service = [
+            "cargo/index-entries/se/rd/serde/1.0.0.json",
+            "cargo/index-entries/to/ki/tokio/1.0.0.json",
+            "cargo/index-entries/3/a/abc/0.1.0.json",
+            "cargo/index/se/rd/serde",
+            "cargo/index/to/ki/tokio",
+            "cargo/index-assembled/se/rd/serde",
+            "cargo/index-assembled/to/ki/tokio",
+            // One- and two-letter names: three segments, the shape of a crate file. Two of each
+            // prefix, so a rule that took them for versions would prune one.
+            "cargo/index/1/a",
+            "cargo/index/2/ab",
+            "cargo/index-assembled/1/a",
+            "cargo/index-assembled/2/ab",
+            "cargo/index-upstream/1/a",
+            "cargo/index-upstream/2/ab",
+            "cargo/index-entries/1/a/0.1.0.json",
+        ];
+        for key in service {
+            storage.put(key, b"x").await.unwrap();
+        }
+        for key in [
+            "cargo/serde/1.0.0/serde-1.0.0.crate",
+            "cargo/tokio/1.0.0/tokio-1.0.0.crate",
+            "cargo/abc/0.1.0/abc-0.1.0.crate",
+            "cargo/a/0.1.0/a-0.1.0.crate",
+            "cargo/ab/0.1.0/ab-0.1.0.crate",
+        ] {
+            storage.put(key, b"crate").await.unwrap();
+        }
+        let rules = vec![RetentionRule {
+            registry: "cargo".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            include_tags: Vec::new(),
+            exclude_tags: vec![],
+        }];
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
+        for key in service {
+            assert!(storage.get(key).await.is_ok(), "{key} pruned");
+        }
+        assert_eq!(result.planned, 0, "one version per crate: nothing to prune");
+    }
+
     #[tokio::test]
     async fn test_retention_dry_run_preserves() {
         let dir = tempfile::tempdir().unwrap();
@@ -2824,6 +2920,401 @@ mod format_retention_tests {
         assert_eq!(packument_versions(&ctx, "scoped").await, vec!["2.0.0"]);
     }
 
+    /// The per-version document of a cached upstream packument, as the proxy
+    /// stores it (tarball URL already rewritten to this registry).
+    fn upstream_version_doc(package: &str, version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": package,
+            "version": version,
+            "dist": {
+                "tarball": format!("http://localhost:4000/npm/{package}/-/{package}-{version}.tgz"),
+                "shasum": format!("sha1-of-{version}"),
+                "integrity": format!("sha512-of-{version}"),
+            }
+        })
+    }
+
+    /// A proxied package as the cache leaves it: the upstream packument at
+    /// `upstream/packument.json` (no `versions/` keys), and the tarballs a client happened to
+    /// fetch, each with its hash sidecar and an explicit modification time in the
+    /// past (`days_ago`), so `keep_last` ordering does not depend on the clock.
+    async fn seed_proxied_npm(
+        ctx: &crate::test_helpers::TestContext,
+        package: &str,
+        advertised: &[&str],
+        dist_tags: serde_json::Value,
+        cached: &[(&str, u64)],
+    ) {
+        use sha2::Digest as _;
+        let versions: serde_json::Map<String, serde_json::Value> = advertised
+            .iter()
+            .map(|v| (v.to_string(), upstream_version_doc(package, v)))
+            .collect();
+        let packument = serde_json::json!({
+            "name": package,
+            "dist-tags": dist_tags,
+            "versions": versions,
+            "time": advertised.iter().map(|v| (v.to_string(), serde_json::json!("2020-01-01T00:00:00.000Z"))).collect::<serde_json::Map<_, _>>(),
+        });
+        let storage = &ctx.state.storage;
+        storage
+            .put(
+                &format!("npm/{package}/upstream/packument.json"),
+                &serde_json::to_vec(&packument).unwrap(),
+            )
+            .await
+            .unwrap();
+        let root = std::path::Path::new(&ctx.state.config.storage.path);
+        for (version, days_ago) in cached {
+            let key = format!("npm/{package}/tarballs/{package}-{version}.tgz");
+            let body = format!("tarball {version}");
+            storage.put(&key, body.as_bytes()).await.unwrap();
+            let sha = hex::encode(sha2::Sha256::digest(body.as_bytes()));
+            storage
+                .put(&format!("{key}.sha256"), sha.as_bytes())
+                .await
+                .unwrap();
+            let when = SystemTime::now() - std::time::Duration::from_secs(days_ago * 86_400);
+            std::fs::File::options()
+                .write(true)
+                .open(root.join(&key))
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        }
+    }
+
+    fn cached_packument_json(body: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(body).unwrap()
+    }
+
+    /// A proxied package keeps the versions retention left on disk in its
+    /// packument, with their upstream documents unchanged. Regenerating it from
+    /// `versions/` — where only published versions live — emptied it, and with
+    /// the upstream unreachable `npm install` of the surviving version failed
+    /// with ENOVERSIONS.
+    /// A packument an older release cached at `metadata.json` is never written by retention:
+    /// a rollback reads it as it was. Only 1.4.0's own cache is pruned.
+    #[tokio::test]
+    async fn test_npm_retention_leaves_an_older_releases_cache_alone() {
+        let ctx = create_test_context();
+        seed_proxied_npm(
+            &ctx,
+            "oldcache",
+            &["6.0.0", "7.0.0"],
+            serde_json::json!({ "latest": "7.0.0" }),
+            &[("6.0.0", 20), ("7.0.0", 10)],
+        )
+        .await;
+        let storage = &ctx.state.storage;
+        let cached = storage
+            .get("npm/oldcache/upstream/packument.json")
+            .await
+            .unwrap();
+        storage
+            .put("npm/oldcache/metadata.json", &cached)
+            .await
+            .unwrap();
+        storage
+            .delete("npm/oldcache/upstream/packument.json")
+            .await
+            .unwrap();
+
+        let rules = vec![rule("npm", None, Some(1), None)];
+        let result = run_retention(
+            storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 1);
+        assert_eq!(
+            storage.get("npm/oldcache/metadata.json").await.unwrap(),
+            cached
+        );
+        assert!(storage
+            .get("npm/oldcache/upstream/packument.json")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_npm_retention_keeps_surviving_proxied_versions_in_packument() {
+        let ctx = create_test_context();
+        // 5.0.0 is advertised upstream but was never fetched through the proxy.
+        seed_proxied_npm(
+            &ctx,
+            "isnum",
+            &["5.0.0", "6.0.0", "7.0.0"],
+            serde_json::json!({ "latest": "7.0.0", "legacy": "6.0.0" }),
+            &[("6.0.0", 20), ("7.0.0", 10)],
+        )
+        .await;
+
+        let rules = vec![rule("npm", None, Some(1), None)];
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 1, "keep_last=1 of two cached tarballs");
+        assert_eq!(
+            stored_versions(&ctx.state.storage, "isnum").await,
+            vec!["7.0.0"]
+        );
+
+        let response = send(&ctx.app, Method::GET, "/npm/isnum", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = cached_packument_json(&body_bytes(response).await);
+        assert_eq!(
+            json["versions"]["7.0.0"],
+            upstream_version_doc("isnum", "7.0.0"),
+            "the surviving version keeps its upstream document (dist, shasum, integrity): {json}"
+        );
+        assert!(
+            json["versions"].get("6.0.0").is_none(),
+            "the retired version is no longer advertised: {json}"
+        );
+        // Absence of a cached tarball is how a proxy cache normally looks; only
+        // what retention removed leaves the packument (gc-respects-proxy-metadata).
+        assert_eq!(
+            json["versions"]["5.0.0"],
+            upstream_version_doc("isnum", "5.0.0"),
+            "a version retention did not remove stays as upstream advertised it: {json}"
+        );
+        assert_eq!(json["dist-tags"]["latest"], "7.0.0");
+        assert!(
+            json["dist-tags"].get("legacy").is_none(),
+            "a dist-tag must not point at a removed version: {json}"
+        );
+    }
+
+    /// `latest` pointing at a version retention removed is re-pointed at the
+    /// highest version still advertised, as the registry does when a version is
+    /// unpublished; it never names a version the packument no longer has.
+    #[tokio::test]
+    async fn test_npm_retention_repoints_latest_of_proxied_package() {
+        let ctx = create_test_context();
+        seed_proxied_npm(
+            &ctx,
+            "repoint",
+            &["1.0.0", "1.1.0", "2.0.0"],
+            serde_json::json!({ "latest": "1.1.0" }),
+            &[("1.1.0", 30), ("2.0.0", 5)],
+        )
+        .await;
+
+        let rules = vec![rule("npm", None, Some(1), None)];
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 1);
+
+        let response = send(&ctx.app, Method::GET, "/npm/repoint", "").await;
+        let json = cached_packument_json(&body_bytes(response).await);
+        let mut advertised: Vec<&String> = json["versions"].as_object().unwrap().keys().collect();
+        advertised.sort();
+        assert_eq!(advertised, ["1.0.0", "2.0.0"], "{json}");
+        assert_eq!(json["dist-tags"]["latest"], "2.0.0", "{json}");
+    }
+
+    /// Retention rewrites the cached document, so the upstream validators stored
+    /// for the old one must go: a conditional request answered 304 would
+    /// otherwise re-serve the pruned copy as the fresh upstream packument.
+    #[tokio::test]
+    async fn test_npm_retention_clears_validators_of_pruned_packument() {
+        let ctx = create_test_context();
+        seed_proxied_npm(
+            &ctx,
+            "etagged",
+            &["1.0.0", "2.0.0"],
+            serde_json::json!({ "latest": "2.0.0" }),
+            &[("1.0.0", 30), ("2.0.0", 5)],
+        )
+        .await;
+        let storage = &ctx.state.storage;
+        let meta_key = "npm/etagged/upstream/packument.json";
+        crate::registry::write_validators(
+            storage,
+            meta_key,
+            &crate::registry::Validators {
+                etag: Some("\"upstream-etag\"".into()),
+                last_modified: None,
+            },
+        )
+        .await;
+        assert!(crate::registry::read_validators(storage, meta_key)
+            .await
+            .is_some());
+
+        let rules = vec![rule("npm", None, Some(1), None)];
+        run_retention(storage, &ctx.state.publish_locks, None, &rules, false).await;
+
+        assert!(
+            crate::registry::read_validators(storage, meta_key)
+                .await
+                .is_none(),
+            "validators of the replaced document must be cleared"
+        );
+    }
+
+    /// In a scope owned by a private upstream, a cached packument is served only
+    /// while its provenance record matches its bytes. Retention's rewrite carries
+    /// the owner's record over to the new bytes; a record that did not match the
+    /// old bytes is not upgraded into one that matches.
+    #[tokio::test]
+    async fn test_npm_retention_carries_provenance_of_pruned_packument() {
+        use sha2::Digest as _;
+        let ctx = create_test_context();
+        let storage = &ctx.state.storage;
+        for (package, vouches) in [("trusted", true), ("foreign", false)] {
+            seed_proxied_npm(
+                &ctx,
+                package,
+                &["1.0.0", "2.0.0"],
+                serde_json::json!({ "latest": "2.0.0" }),
+                &[("1.0.0", 30), ("2.0.0", 5)],
+            )
+            .await;
+            let key = format!("npm/{package}/upstream/packument.json");
+            let old = storage.get(&key).await.unwrap();
+            let digest = if vouches {
+                hex::encode(sha2::Sha256::digest(&old))
+            } else {
+                "0".repeat(64)
+            };
+            storage
+                .put(
+                    &crate::registry::npm::origin_key(&key),
+                    format!("npm:https://owner.example\n{digest}").as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let rules = vec![rule("npm", None, Some(1), None)];
+        run_retention(storage, &ctx.state.publish_locks, None, &rules, false).await;
+
+        for (package, vouches) in [("trusted", true), ("foreign", false)] {
+            let key = format!("npm/{package}/upstream/packument.json");
+            let new = storage.get(&key).await.unwrap();
+            assert!(
+                cached_packument_json(&new)["versions"]
+                    .get("1.0.0")
+                    .is_none(),
+                "{package}: pruned"
+            );
+            let record = storage
+                .get(&crate::registry::npm::origin_key(&key))
+                .await
+                .unwrap();
+            let record = String::from_utf8(record.to_vec()).unwrap();
+            let (origin, digest) = record.split_once('\n').unwrap();
+            assert_eq!(origin, "npm:https://owner.example", "{package}");
+            assert_eq!(
+                digest == hex::encode(sha2::Sha256::digest(&new)),
+                vouches,
+                "{package}: the record vouches for the new bytes only if it vouched for the old ones"
+            );
+        }
+    }
+
+    /// A retired version whose tarball is on disk again by the time the packument
+    /// is reconciled — a client fetched it through the proxy in between — stays
+    /// advertised: the packument never loses a version storage can serve.
+    #[tokio::test]
+    async fn test_npm_reconcile_keeps_retired_version_cached_again() {
+        let ctx = create_test_context();
+        seed_proxied_npm(
+            &ctx,
+            "refetched",
+            &["1.0.0", "2.0.0", "3.0.0"],
+            serde_json::json!({ "latest": "3.0.0" }),
+            &[("1.0.0", 30), ("3.0.0", 5)],
+        )
+        .await;
+        let retired: std::collections::BTreeSet<String> =
+            ["1.0.0", "2.0.0"].iter().map(|v| v.to_string()).collect();
+        crate::registry::npm::reconcile_packument_after_retention(
+            &ctx.state.storage,
+            "refetched",
+            &retired,
+        )
+        .await
+        .unwrap();
+
+        let json = cached_packument_json(
+            &ctx.state
+                .storage
+                .get("npm/refetched/upstream/packument.json")
+                .await
+                .unwrap(),
+        );
+        let mut advertised: Vec<&String> = json["versions"].as_object().unwrap().keys().collect();
+        advertised.sort();
+        assert_eq!(advertised, ["1.0.0", "3.0.0"], "{json}");
+    }
+
+    /// A package with published versions owns its packument (#975): it is
+    /// assembled from `versions/`, and a tarball cached from the upstream for the
+    /// same name counts toward `keep_last` but never enters it. Retention keeps
+    /// that rule — it regenerates from `versions/`, whatever the cached document
+    /// says.
+    #[tokio::test]
+    async fn test_npm_retention_mixed_package_follows_published_versions() {
+        let ctx = create_test_context();
+        let storage = &ctx.state.storage;
+        for version in ["1.0.1", "1.0.2"] {
+            publish_npm(&ctx, "mixed", version).await;
+        }
+        // A tarball of an upstream version cached through the proxy, oldest of all.
+        let proxied = "npm/mixed/tarballs/mixed-0.9.0.tgz";
+        storage.put(proxied, b"upstream tarball").await.unwrap();
+        let root = std::path::Path::new(&ctx.state.config.storage.path);
+        for (key, days_ago) in [
+            (proxied.to_string(), 30u64),
+            ("npm/mixed/tarballs/mixed-1.0.1.tgz".to_string(), 20),
+            ("npm/mixed/tarballs/mixed-1.0.2.tgz".to_string(), 10),
+        ] {
+            std::fs::File::options()
+                .write(true)
+                .open(root.join(&key))
+                .unwrap()
+                .set_modified(SystemTime::now() - std::time::Duration::from_secs(days_ago * 86_400))
+                .unwrap();
+        }
+        // The assembled document also names the upstream version, as a stale or
+        // foreign copy would; regeneration from `versions/` must not keep it.
+        let mut doc = cached_packument_json(&storage.get("npm/mixed/metadata.json").await.unwrap());
+        doc["versions"]["0.8.0"] = upstream_version_doc("mixed", "0.8.0");
+        storage
+            .put(
+                "npm/mixed/metadata.json",
+                &serde_json::to_vec(&doc).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let rules = vec![rule("npm", None, Some(1), None)];
+        let result = run_retention(storage, &ctx.state.publish_locks, None, &rules, false).await;
+        assert_eq!(
+            result.planned, 2,
+            "the cached upstream tarball counts toward keep_last"
+        );
+        assert_eq!(stored_versions(storage, "mixed").await, vec!["1.0.2"]);
+        assert_eq!(packument_versions(&ctx, "mixed").await, vec!["1.0.2"]);
+    }
+
     #[cfg(feature = "deb")]
     /// an independent APT index, so two architectures of the same
     /// package/version/distribution must not share one `keep_last` budget —
@@ -2975,6 +3466,99 @@ mod format_retention_tests {
         )
         .unwrap();
         assert!(focal.contains("Version: 2.0\n"), "{focal}");
+    }
+
+    /// Hugging Face: one group per repository, one version per cached file; only a rule
+    /// that names hf applies.
+    #[tokio::test]
+    async fn test_hf_files_grouped_per_repository_and_pruned_by_name() {
+        let ctx = create_test_context();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86400);
+        for (key, aged) in [
+            (
+                "hf/models/org/model/blobs/1111111111111111111111111111111111111111",
+                true,
+            ),
+            (
+                "hf/models/org/model/blobs/2222222222222222222222222222222222222222",
+                false,
+            ),
+            (
+                "hf/models/gpt2/blobs/3333333333333333333333333333333333333333",
+                true,
+            ),
+            (
+                "hf/models/org/blobs/blobs/4444444444444444444444444444444444444444",
+                true,
+            ),
+        ] {
+            ctx.state.storage.put(key, b"data").await.unwrap();
+            if aged {
+                std::fs::File::options()
+                    .write(true)
+                    .open(std::path::Path::new(&ctx.state.config.storage.path).join(key))
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+        }
+        let mut groups = collect_hf_versions(&ctx.state.storage).await;
+        groups.sort_by(|a, b| a.0.cmp(&b.0));
+        let names: Vec<(&str, usize)> = groups.iter().map(|(g, v)| (g.as_str(), v.len())).collect();
+        assert_eq!(
+            names,
+            vec![("hf:gpt2", 1), ("hf:org/blobs", 1), ("hf:org/model", 2)]
+        );
+
+        // A wildcard rule written for the other formats leaves the opt-in cache alone.
+        let wildcard = vec![rule("*", None, Some(1), Some(1))];
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            None,
+            &wildcard,
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 0);
+        assert_eq!(ctx.state.storage.list("hf/").await.unwrap().len(), 4);
+
+        // A rule that names hf prunes what is older than its age, in the repositories it names.
+        let rules = vec![rule("hf", Some("org/*"), None, Some(1))];
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            None,
+            &rules,
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 2);
+        let mut left = ctx.state.storage.list("hf/").await.unwrap();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "hf/models/gpt2/blobs/3333333333333333333333333333333333333333".to_string(),
+                "hf/models/org/model/blobs/2222222222222222222222222222222222222222".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wildcard_rule_covers_what_all_enables() {
+        let rules = vec![rule("*", None, Some(1), None)];
+        for registry in [
+            "docker", "npm", "maven", "pypi", "cargo", "go", "rpm", "deb", "raw",
+        ] {
+            assert!(
+                find_matching_rule(&rules, registry, &format!("{registry}:x")).is_some(),
+                "{registry}"
+            );
+        }
+        assert!(find_matching_rule(&rules, "hf", "hf:org/model").is_none());
+        let named = vec![rule("hf", None, Some(1), None)];
+        assert!(find_matching_rule(&named, "hf", "hf:org/model").is_some());
     }
 
     /// Raw: a depth-2 prefix is the version unit — the whole CALVER-style

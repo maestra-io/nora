@@ -730,8 +730,13 @@ pub fn render_activity_log(rows: &str, t: &Translations) -> String {
     )
 }
 
-/// Render the polling script for auto-refresh
-pub fn render_polling_script() -> String {
+/// Render the polling script for auto-refresh.
+///
+/// The live uptime recomputed here every 5s must agree with [`format_uptime`],
+/// so the day/hour/minute units are the same localized strings from `t` and the
+/// arithmetic (the 86400/3600/60 split and the `days > 0` conditional) is kept in
+/// lockstep with it.
+pub fn render_polling_script(t: &Translations) -> String {
     r##"
     <script>
         setInterval(async () => {
@@ -758,20 +763,26 @@ pub fn render_polling_script() -> String {
                 else sizeStr = bytes + ' B';
                 document.getElementById('stat-storage').textContent = sizeStr;
 
-                // Update uptime
+                // Update uptime (days/hours/minutes; the day part appears only when
+                // there is one, matching the server-rendered value)
                 const uptime = document.getElementById('uptime');
                 if (uptime) {
                     const secs = data.uptime_seconds;
-                    const hours = Math.floor(secs / 3600);
+                    const days = Math.floor(secs / 86400);
+                    const hours = Math.floor((secs % 86400) / 3600);
                     const mins = Math.floor((secs % 3600) / 60);
-                    uptime.textContent = hours + 'h ' + mins + 'm';
+                    uptime.textContent =
+                        (days > 0 ? days + '__UPTIME_D__ ' : '') + hours + '__UPTIME_H__ ' + mins + '__UPTIME_M__';
                 }
             } catch (e) {
                 console.error('Dashboard poll failed:', e);
             }
         }, 5000);
     </script>
-    "##.to_string()
+    "##
+    .replace("__UPTIME_D__", t.uptime_days)
+    .replace("__UPTIME_H__", t.uptime_hours)
+    .replace("__UPTIME_M__", t.uptime_mins)
 }
 
 /// SVG icon definitions for registries (exported for use in templates)
@@ -792,6 +803,8 @@ pub mod icons {
     pub const PYPI: &str = r#"<path fill="currentColor" d="M14.25.18l.9.2.73.26.59.3.45.32.34.34.25.34.16.33.1.3.04.26.02.2-.01.13V8.5l-.05.63-.13.55-.21.46-.26.38-.3.31-.33.25-.35.19-.35.14-.33.1-.3.07-.26.04-.21.02H8.83l-.69.05-.59.14-.5.22-.41.27-.33.32-.27.35-.2.36-.15.37-.1.35-.07.32-.04.27-.02.21v3.06H3.23l-.21-.03-.28-.07-.32-.12-.35-.18-.36-.26-.36-.36-.35-.46-.32-.59-.28-.73-.21-.88-.14-1.05L0 11.97l.06-1.22.16-1.04.24-.87.32-.71.36-.57.4-.44.42-.33.42-.24.4-.16.36-.1.32-.05.24-.01h.16l.06.01h8.16v-.83H6.24l-.01-2.75-.02-.37.05-.34.11-.31.17-.28.25-.26.31-.23.38-.2.44-.18.51-.15.58-.12.64-.1.71-.06.77-.04.84-.02 1.27.05 1.07.13zm-6.3 1.98l-.23.33-.08.41.08.41.23.34.33.22.41.09.41-.09.33-.22.23-.34.08-.41-.08-.41-.23-.33-.33-.22-.41-.09-.41.09-.33.22zM21.1 6.11l.28.06.32.12.35.18.36.27.36.35.35.47.32.59.28.73.21.88.14 1.04.05 1.23-.06 1.23-.16 1.04-.24.86-.32.71-.36.57-.4.45-.42.33-.42.24-.4.16-.36.09-.32.05-.24.02-.16-.01h-8.22v.82h5.84l.01 2.76.02.36-.05.34-.11.31-.17.29-.25.25-.31.24-.38.2-.44.17-.51.15-.58.13-.64.09-.71.07-.77.04-.84.01-1.27-.04-1.07-.14-.9-.2-.73-.25-.59-.3-.45-.33-.34-.34-.25-.34-.16-.33-.1-.3-.04-.25-.02-.2.01-.13v-5.34l.05-.64.13-.54.21-.46.26-.38.3-.32.33-.24.35-.2.35-.14.33-.1.3-.06.26-.04.21-.02.13-.01h5.84l.69-.05.59-.14.5-.21.41-.28.33-.32.27-.35.2-.36.15-.36.1-.35.07-.32.04-.28.02-.21V6.07h2.09l.14.01.21.03zm-6.47 14.25l-.23.33-.08.41.08.41.23.33.33.23.41.08.41-.08.33-.23.23-.33.08-.41-.08-.41-.23-.33-.33-.23-.41-.08-.41.08-.33.23z"/>"#;
     pub const RPM: &str = r#"<path fill="currentColor" d="M16.009 13.386c1.577 0 3.86-.326 3.86-2.202a1.765 1.765 0 0 0-.04-.431l-.94-4.08c-.216-.898-.406-1.305-1.982-2.093-1.223-.625-3.888-1.658-4.676-1.658-.733 0-.947.946-1.822.946-.842 0-1.467-.706-2.255-.706-.757 0-1.25.515-1.63 1.576 0 0-1.06 2.99-1.197 3.424a.81.81 0 0 0-.028.245c0 1.162 4.577 4.974 10.71 4.974m4.101-1.435c.218 1.032.218 1.14.218 1.277 0 1.765-1.984 2.745-4.593 2.745-5.895.004-11.06-3.451-11.06-5.734a2.326 2.326 0 0 1 .19-.925C2.746 9.415 0 9.794 0 12.217c0 3.969 9.405 8.861 16.851 8.861 5.71 0 7.149-2.582 7.149-4.62 0-1.605-1.387-3.425-3.887-4.512"/>"#;
     pub const CPAN: &str = r#"<path fill="currentColor" fill-rule="evenodd" d="M12.72 1.68h-.48l-.48.24L.96 15.84v.72l1.2 1.2 1.68.48.24 1.44.72.96 13.44.24 1.2-.96-.72-1.44v-.24l.96-.48.72.48.72-.24 1.2-.48.72-.72v-.72L14.64 6.24l.72-1.92-.24-.48-.48.24-3.36 6.24-.24.24-.24-.24.48-1.68 2.64-4.56v-.96l-.72-.48-4.56 6.48-4.8 5.04-1.92 1.68 6.72-7.44 4.32-6.24zM18.24 16.8H6.48l-.96.24-.96.72h-.24l7.2-6.72 1.2-1.44z"/>"#;
+    /// A plain isometric cube: a neutral mark for model repositories, not a brand logo.
+    pub const HF: &str = r#"<path fill="currentColor" d="M12 2 3 7v10l9 5 9-5V7zm0 2.3L18.7 8 12 11.7 5.3 8zM5 9.7l6 3.3v6.7l-6-3.3zm8 10V13l6-3.3v6.7z"/>"#;
 }
 
 /// Format file size in human-readable format
@@ -981,6 +994,29 @@ pub fn render_bragging_footer(lang: Lang, stats: &BraggingStats) -> String {
         deps_label = t.deps_label,
         tagline = t.tagline,
     )
+}
+
+/// Format an uptime in seconds as `Xd Xh Ym`, with the day/hour/minute units
+/// taken from `t` so they localize with the rest of the dashboard.
+///
+/// The day component is shown only when there is one, so a registry that has been
+/// up for a week reads `7d 3h 12m` instead of `171h 12m`, while a freshly
+/// started one reads `0h 12m` (the hours place is always present).
+///
+/// The polling script in `render_polling_script` mirrors this formatting; keep the
+/// two in step so the server-rendered value and the live one do not disagree.
+pub fn format_uptime(secs: u64, t: &Translations) -> String {
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    if days > 0 {
+        format!(
+            "{days}{} {hours}{} {mins}{}",
+            t.uptime_days, t.uptime_hours, t.uptime_mins
+        )
+    } else {
+        format!("{hours}{} {mins}{}", t.uptime_hours, t.uptime_mins)
+    }
 }
 
 /// Format Unix timestamp as relative time
@@ -1242,6 +1278,60 @@ mod tests {
         assert_eq!(sanitize_href("ftp://example.com"), None);
         assert_eq!(sanitize_href("ssh://git@github.com"), None);
         assert_eq!(sanitize_href("git://github.com/repo"), None);
+    }
+
+    #[test]
+    fn format_uptime_renders_days_hours_minutes() {
+        let t = get_translations(Lang::En);
+        let cases: [(u64, &str); 6] = [
+            (0, "0h 0m"),        // nothing on the clock yet
+            (60, "0h 1m"),       // the minute rolls, hours stay 0
+            (3660, "1h 1m"),     // an hour and a minute
+            (90060, "1d 1h 1m"), // all three places non-zero: 1 day + 1 hour + 1 minute
+            (86399, "23h 59m"),  // one second short of a day: no day part yet
+            (86400, "1d 0h 0m"), // exactly one day: day part appears, hours/mins zero
+        ];
+        for (secs, expected) in cases {
+            assert_eq!(format_uptime(secs, t), expected, "uptime_seconds={secs}");
+        }
+    }
+
+    #[test]
+    fn format_uptime_localizes_units() {
+        // Units come from the active locale, not hardcoded English.
+        assert_eq!(format_uptime(90060, get_translations(Lang::Ru)), "1д 1ч 1м");
+        assert_eq!(
+            format_uptime(90060, get_translations(Lang::Zh)),
+            "1天 1小时 1分"
+        );
+    }
+
+    #[test]
+    fn polling_script_uptime_mirrors_format_uptime() {
+        // The live-refresh script recomputes uptime in JS every 5s; if it drifts
+        // from `format_uptime` the dashboard flips between two values. Pin the
+        // arithmetic split and the day conditional, and that the units are the
+        // same localized strings (here Russian) rather than hardcoded English.
+        let script = render_polling_script(get_translations(Lang::Ru));
+        assert!(script.contains("secs / 86400"), "day divisor drifted");
+        assert!(
+            script.contains("(secs % 86400) / 3600"),
+            "hour split drifted"
+        );
+        assert!(
+            script.contains("(secs % 3600) / 60"),
+            "minute split drifted"
+        );
+        assert!(script.contains("days > 0 ?"), "day conditional drifted");
+        assert!(
+            script.contains("days + 'д ' : '') + hours + 'ч ' + mins + 'м'"),
+            "polling units not localized in lockstep with format_uptime"
+        );
+        // No leftover hardcoded English unit in the localized render.
+        assert!(
+            !script.contains("+ 'h '"),
+            "English hour unit leaked into localized script"
+        );
     }
 
     proptest! {

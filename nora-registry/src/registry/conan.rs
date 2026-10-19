@@ -47,8 +47,6 @@ use axum::{
 use std::collections::HashMap;
 use std::time::Duration;
 
-const UPSTREAM_DEFAULT: &str = "https://center2.conan.io";
-
 pub fn routes() -> Router<AppState> {
     Router::new()
         // Ping — must come before the wildcard.
@@ -135,7 +133,10 @@ async fn search(
         return with_json(br#"{"results":[]}"#.to_vec());
     }
 
-    let proxy_url = upstream_url(&state);
+    // No upstream when the operator switched it off: nothing beyond what is stored is searched.
+    let Some(proxy_url) = upstream_url(&state) else {
+        return with_json(br#"{"results":[]}"#.to_vec());
+    };
     // Percent-encode query for upstream
     let encoded_query: String = query
         .bytes()
@@ -240,7 +241,8 @@ async fn recipe_latest(
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
-    let proxy_url = upstream_url(&state);
+    // The fetch helpers answer from storage alone when the upstream is switched off.
+    let proxy_url = upstream_url(&state).unwrap_or_default();
     let url = format!(
         "{}/v2/conans/{}/latest",
         proxy_url.trim_end_matches('/'),
@@ -298,7 +300,8 @@ async fn recipe_revisions(
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
-    let proxy_url = upstream_url(&state);
+    // The fetch helpers answer from storage alone when the upstream is switched off.
+    let proxy_url = upstream_url(&state).unwrap_or_default();
     let url = format!(
         "{}/v2/conans/{}/revisions",
         proxy_url.trim_end_matches('/'),
@@ -343,7 +346,8 @@ async fn recipe_file_list(
         return response;
     }
 
-    let proxy_url = upstream_url(&state);
+    // The fetch helpers answer from storage alone when the upstream is switched off.
+    let proxy_url = upstream_url(&state).unwrap_or_default();
     let url = format!(
         "{}/v2/conans/{}/revisions/{}/files",
         proxy_url.trim_end_matches('/'),
@@ -497,7 +501,10 @@ async fn recipe_file_download(
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
-    let proxy_url = upstream_url(&state);
+    // Fetch from upstream — none when the operator switched it off.
+    let Some(proxy_url) = upstream_url(&state) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let url = format!(
         "{}/v2/conans/{}/revisions/{}/files/{}",
         proxy_url.trim_end_matches('/'),
@@ -517,6 +524,17 @@ async fn recipe_file_download(
     .await
     {
         Ok(bytes) => {
+            // The allowlist's pinned integrity holds on the first download too, before anything is cached:
+            // the cache-hit branch checks the same rule.
+            if let Some(response) = crate::curation::verify_integrity(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::Conan,
+                &name,
+                Some(&ver),
+                &bytes,
+            ) {
+                return response;
+            }
             state.metrics.record_download("conan");
             state.metrics.record_cache_miss("conan");
             state.activity.push(ActivityEntry::new(
@@ -631,7 +649,8 @@ async fn package_latest(
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
-    let proxy_url = upstream_url(&state);
+    // The fetch helpers answer from storage alone when the upstream is switched off.
+    let proxy_url = upstream_url(&state).unwrap_or_default();
     let url = format!(
         "{}/v2/conans/{}/revisions/{}/packages/{}/latest",
         proxy_url.trim_end_matches('/'),
@@ -707,7 +726,8 @@ async fn package_revisions(
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
-    let proxy_url = upstream_url(&state);
+    // The fetch helpers answer from storage alone when the upstream is switched off.
+    let proxy_url = upstream_url(&state).unwrap_or_default();
     let url = format!(
         "{}/v2/conans/{}/revisions/{}/packages/{}/revisions",
         proxy_url.trim_end_matches('/'),
@@ -767,7 +787,8 @@ async fn package_file_list(
         return response;
     }
 
-    let proxy_url = upstream_url(&state);
+    // The fetch helpers answer from storage alone when the upstream is switched off.
+    let proxy_url = upstream_url(&state).unwrap_or_default();
     let url = format!(
         "{}/v2/conans/{}/revisions/{}/packages/{}/revisions/{}/files",
         proxy_url.trim_end_matches('/'),
@@ -930,7 +951,10 @@ async fn package_file_download(
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
-    let proxy_url = upstream_url(&state);
+    // Fetch from upstream — none when the operator switched it off.
+    let Some(proxy_url) = upstream_url(&state) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let url = format!(
         "{}/v2/conans/{}/revisions/{}/packages/{}/revisions/{}/files/{}",
         proxy_url.trim_end_matches('/'),
@@ -952,6 +976,17 @@ async fn package_file_download(
     .await
     {
         Ok(bytes) => {
+            // The allowlist's pinned integrity holds on the first download too, before anything is cached:
+            // the cache-hit branch checks the same rule.
+            if let Some(response) = crate::curation::verify_integrity(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::Conan,
+                &name,
+                Some(&ver),
+                &bytes,
+            ) {
+                return response;
+            }
             state.metrics.record_download("conan");
             state.metrics.record_cache_miss("conan");
             state.activity.push(ActivityEntry::new(
@@ -1012,6 +1047,13 @@ async fn fetch_and_cache_json(
     artifact: &str,
     cached: Option<Bytes>,
 ) -> Response {
+    // No upstream when the operator switched it off: what is stored is all there is.
+    if upstream_url(state).is_none() {
+        return match cached {
+            Some(data) => with_json(data.to_vec()),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
     // Revalidate stale metadata with a conditional request when enabled and fall
     // back to a full fetch otherwise. Empty validators ⇒ no conditional headers ⇒
     // always a 200, which is also how the first fetch captures validators.
@@ -1139,6 +1181,10 @@ async fn fetch_and_cache_immutable_json(
     storage_key: &str,
     artifact: &str,
 ) -> Response {
+    // No upstream when the operator switched it off.
+    if upstream_url(state).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     match proxy_fetch_text(
         &state.http_client,
         url,
@@ -1207,13 +1253,10 @@ async fn extract_conan_publish_date(
     crate::curation::parse_iso8601_to_unix(date_str)
 }
 
-fn upstream_url(state: &AppState) -> String {
-    state
-        .config
-        .conan
-        .proxy
-        .clone()
-        .unwrap_or_else(|| UPSTREAM_DEFAULT.to_string())
+/// The configured upstream, or None when the operator switched it off with an empty
+/// NORA_CONAN_PROXY: then nothing is asked of any upstream.
+fn upstream_url(state: &AppState) -> Option<String> {
+    crate::config::configured_upstream(&state.config.conan.proxy).map(str::to_string)
 }
 
 fn with_json(data: Vec<u8>) -> Response {

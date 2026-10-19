@@ -256,27 +256,8 @@ pub(crate) fn resolve_client_ip(
         return peer;
     }
 
-    // X-Forwarded-For: walk from the right past our own proxies. Entries left of the
-    // first untrusted hop are client-supplied whenever a proxy appends rather than
-    // overwrites, so the leftmost entry must not pick the lockout/rate-limit key.
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        let mut client = None;
-        for hop in xff.rsplit(',') {
-            let Ok(ip) = hop
-                .trim()
-                .parse::<IpAddr>()
-                .map(crate::config::canonical_ip)
-            else {
-                break;
-            };
-            client = Some(ip);
-            if !trusted_proxies.contains(ip) {
-                break;
-            }
-        }
-        if let Some(ip) = client {
-            return ip;
-        }
+    if let Some(ip) = forwarded_for_client(headers, trusted_proxies) {
+        return ip;
     }
     // Try X-Real-IP
     if let Some(xri) = headers.get("x-real-ip") {
@@ -304,6 +285,37 @@ fn warn_untrusted_forwarded_once(peer: IpAddr) {
              NORA_AUTH_TRUSTED_PROXIES, or every client shares one lockout/rate-limit bucket"
         );
     });
+}
+
+/// The client X-Forwarded-For names, read from the right. Each proxy appends the address it
+/// received the request from, so the left part of the header is whatever the client sent: the
+/// client is the rightmost address that is not a trusted proxy, or the leftmost when every
+/// address is one. An entry that is not an address ends the walk at the hop that wrote it. Every
+/// header line counts, in order; `None` when no entry is readable.
+fn forwarded_for_client(
+    headers: &HeaderMap,
+    trusted_proxies: &crate::config::TrustedProxies,
+) -> Option<IpAddr> {
+    let entries: Vec<&[u8]> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .flat_map(|line| line.as_bytes().split(|b| *b == b','))
+        .collect();
+    let mut nearest = None;
+    for entry in entries.into_iter().rev() {
+        let Some(ip) = std::str::from_utf8(entry)
+            .ok()
+            .and_then(|s| s.trim().parse::<IpAddr>().ok())
+            .map(crate::config::canonical_ip)
+        else {
+            break;
+        };
+        if !trusted_proxies.contains(ip) {
+            return Some(ip);
+        }
+        nearest = Some(ip);
+    }
+    nearest
 }
 
 fn extract_client_ip(
@@ -1403,6 +1415,53 @@ mod tests {
         )));
         let ip = extract_client_ip(&request, &proxies);
         assert_eq!(ip, Some("1.2.3.4".parse().unwrap()));
+    }
+
+    /// A reverse proxy appends the address it received the request from to whatever
+    /// X-Forwarded-For the client sent, so the left part of the header is the client's to choose.
+    /// The client is the rightmost address that is not a trusted proxy.
+    #[test]
+    fn a_client_behind_a_trusted_proxy_cannot_choose_its_address() {
+        use crate::config::TrustedProxies;
+        let loopback = TrustedProxies::default_loopback();
+        let hops = TrustedProxies::parse("127.0.0.1,10.0.0.0/8");
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        let resolve = |lines: &[&str], real_ip: Option<&str>, trusted: &TrustedProxies| {
+            let mut headers = HeaderMap::new();
+            for line in lines {
+                headers.append("x-forwarded-for", line.parse().unwrap());
+            }
+            if let Some(ip) = real_ip {
+                headers.insert("x-real-ip", ip.parse().unwrap());
+            }
+            resolve_client_ip(peer, &headers, trusted).to_string()
+        };
+        let cases: [(&[&str], Option<&str>, &TrustedProxies, &str); 9] = [
+            // nginx `$proxy_add_x_forwarded_for`: the client's header, then the real address
+            (&["6.6.6.6, 203.0.113.9"], None, &loopback, "203.0.113.9"),
+            (&["6.6.6.6,203.0.113.9"], None, &loopback, "203.0.113.9"),
+            // a proxy that adds its own header line after the client's
+            (&["6.6.6.6", "203.0.113.9"], None, &loopback, "203.0.113.9"),
+            // a chain of trusted hops is walked past
+            (
+                &["6.6.6.6, 198.51.100.7, 10.0.0.5"],
+                None,
+                &hops,
+                "198.51.100.7",
+            ),
+            // every address a trusted proxy: the leftmost
+            (&["10.0.0.7, 10.0.0.5"], None, &hops, "10.0.0.7"),
+            // a proxy that replaces the header: its one address
+            (&["203.0.113.9"], None, &loopback, "203.0.113.9"),
+            // an entry that is not an address ends the walk at the hop that wrote it
+            (&["6.6.6.6, unknown, 10.0.0.5"], None, &hops, "10.0.0.5"),
+            // nothing readable in X-Forwarded-For: X-Real-IP, as before
+            (&["unknown"], Some("203.0.113.9"), &loopback, "203.0.113.9"),
+            (&[], None, &loopback, "127.0.0.1"),
+        ];
+        for (lines, real_ip, trusted, want) in cases {
+            assert_eq!(resolve(lines, real_ip, trusted), want, "{lines:?}");
+        }
     }
 
     #[test]
@@ -3571,6 +3630,8 @@ Jd74nq6dNCjpWG4drIsyhqX+
             docker_auth: Arc::new(crate::registry::DockerAuth::new(reqwest::Client::new(), 5)),
             repo_index: Arc::new(crate::repo_index::RepoIndex::new()),
             http_client: reqwest::Client::new(),
+            http_client_no_redirect: reqwest::Client::new(),
+            hf_canonical_ids: Arc::default(),
             upload_sessions: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             publish_locks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             reloadable: Arc::new(arc_swap::ArcSwap::from_pointee(crate::ReloadableConfig {

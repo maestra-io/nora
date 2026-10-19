@@ -138,6 +138,17 @@ fn open_staging(_root: &Path) -> std::io::Result<Staging> {
     ))
 }
 
+/// The directory a listing names must be readable: a listing that silently skipped it would
+/// answer "nothing here" for files that are there (a published npm package would read as
+/// unpublished). A directory deeper down that cannot be read is still skipped, as before.
+fn readable_listing_root(root: &Path) -> std::result::Result<(), StorageError> {
+    match std::fs::read_dir(root) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StorageError::Io(e)),
+    }
+}
+
 /// Remove the staging directories of dead instances: those whose lock can be taken,
 /// those without a lock file, and `.new-*` ones abandoned half-created. A directory
 /// whose lock is held belongs to a live instance and is left alone, and so is any
@@ -711,6 +722,10 @@ impl StorageBackend for LocalStorage {
 
     async fn delete(&self, key: &str) -> Result<()> {
         let path = self.key_to_path(key);
+        // Body and pin leave as one critical section, as they arrive (#1041, see commit_lock):
+        // a write of this key between the two steps would lose the pin it just recorded.
+        let lock = self.commit_lock(key);
+        let _commit = lock.lock().await;
 
         if let Err(e) = fs::remove_file(&path).await {
             // A directory is not an object; unlink(2) refuses it with EISDIR on Linux and
@@ -749,14 +764,17 @@ impl StorageBackend for LocalStorage {
         // Use blocking task for filesystem traversal
         tokio::task::spawn_blocking(move || {
             let mut results = Vec::new();
-            if let Some(root) = list_root(&base, &prefix).filter(|r| r.exists()) {
+            // A missing root lists nothing; one a parent denies access to is an error
+            // (`exists()` reads both as absent).
+            if let Some(root) = list_root(&base, &prefix) {
+                readable_listing_root(&root)?;
                 Self::list_files_sync(&root, &base, &prefix, &mut results);
             }
             results.sort();
-            results
+            Ok(results)
         })
         .await
-        .map_err(|e| StorageError::Io(std::io::Error::other(format!("list task panicked: {e}"))))
+        .map_err(|e| StorageError::Io(std::io::Error::other(format!("list task panicked: {e}"))))?
     }
 
     async fn list_with_meta(&self, prefix: &str) -> Result<Vec<(String, FileMeta)>> {
@@ -765,14 +783,17 @@ impl StorageBackend for LocalStorage {
 
         tokio::task::spawn_blocking(move || {
             let mut results = Vec::new();
-            if let Some(root) = list_root(&base, &prefix).filter(|r| r.exists()) {
+            // A missing root lists nothing; one a parent denies access to is an error
+            // (`exists()` reads both as absent).
+            if let Some(root) = list_root(&base, &prefix) {
+                readable_listing_root(&root)?;
                 Self::list_files_with_meta_sync(&root, &base, &prefix, &mut results);
             }
             results.sort_by(|a, b| a.0.cmp(&b.0));
-            results
+            Ok(results)
         })
         .await
-        .map_err(|e| StorageError::Io(std::io::Error::other(format!("list task panicked: {e}"))))
+        .map_err(|e| StorageError::Io(std::io::Error::other(format!("list task panicked: {e}"))))?
     }
 
     async fn stat(&self, key: &str) -> Option<FileMeta> {
@@ -938,7 +959,29 @@ impl StorageBackend for LocalStorage {
             other => other,
         };
         match linked {
-            Ok(()) => sync_parent_dir(&dst_path).await?,
+            Ok(()) => {
+                // A hard link shares the source inode and thus its mtime; a freshly
+                // published object must look fresh so GC's grace window covers an
+                // in-flight mount whose referencing manifest lands next (the
+                // byte-copy fallback below gets a current mtime from the new file,
+                // and S3 copy stamps a current LastModified). Sharing the inode means
+                // this also refreshes the source's mtime, which can only defer the
+                // source's own grace-based collection (fail-safe), never delete early.
+                // Best-effort: a failed stamp only leaves the old mtime — never fail
+                // the mount for it.
+                let touch = dst_path.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    std::fs::File::open(&touch)
+                        .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+                })
+                .await
+                .map_err(std::io::Error::other)
+                .and_then(|inner| inner)
+                {
+                    tracing::warn!(dst = %dst, error = %e, "copy: could not refresh mtime of linked object");
+                }
+                sync_parent_dir(&dst_path).await?;
+            }
             Err(e) if is_missing(&e) => return Err(StorageError::NotFound),
             // Cross-device, or a filesystem without links — copy the bytes.
             Err(_) => {
@@ -1273,6 +1316,83 @@ mod tests {
     /// was found: one key out of 4039 during `nora migrate`). The guarantee is
     /// structural (the per-key commit lock in the backend); this hammers the pair and
     /// checks after every round that the recorded pin describes the stored body.
+    /// A delete removes the body and then its pin. A write of the same key that lands between the
+    /// two would lose the pin it just recorded: the stored copy is then unpinned, so a reader that
+    /// needs a pin fetches it again, and a reader that does not serves it unchecked. The delete
+    /// therefore holds the key's commit lock across both steps, as a write does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delete_holds_the_commit_lock_across_body_and_pin() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(LocalStorage::new(dir.path().to_str().unwrap()));
+        let key = "hf/models/org/model/blobs/aaaa";
+        put(&storage, key, b"first").await.unwrap();
+
+        let lock = storage.commit_lock(key);
+        let held = lock.lock().await;
+        let deleting = tokio::spawn({
+            let storage = Arc::clone(&storage);
+            async move { storage.delete(key).await }
+        });
+        // CANCEL-SAFETY: the timeout only stops waiting for the spawned delete; the task itself
+        // keeps running and is awaited below.
+        let early = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            while storage.stat(key).await.is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            early.is_err(),
+            "the delete removed the body while a write held the key"
+        );
+        drop(held);
+        deleting.await.unwrap().unwrap();
+        assert!(storage.stat(key).await.is_none());
+        assert_eq!(storage.pins.get(key), None, "the pin outlived its body");
+
+        // A write after the delete keeps its pin.
+        put(&storage, key, b"second").await.unwrap();
+        assert_eq!(
+            storage.pins.get(key).as_deref(),
+            Some(hex::encode(Sha256::digest(b"second")).as_str())
+        );
+    }
+
+    /// A listing whose own directory cannot be read is an error, not "nothing here"; a directory
+    /// deeper down that cannot be read is still skipped. (Root reads anything: then it is moot.)
+    #[tokio::test]
+    async fn an_unreadable_listing_directory_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        put(&storage, "npm/pkg/versions/1.0.0.json", b"{}")
+            .await
+            .unwrap();
+        put(&storage, "npm/pkg/tarballs/pkg-1.0.0.tgz", b"tgz")
+            .await
+            .unwrap();
+        let versions = dir.path().join("npm/pkg/versions");
+        std::fs::set_permissions(&versions, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&versions).is_err();
+        let own = storage.list("npm/pkg/versions/").await;
+        let meta = storage.list_with_meta("npm/pkg/versions/").await;
+        let wider = storage.list("npm/pkg/").await;
+        std::fs::set_permissions(&versions, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if unreadable {
+            assert!(own.is_err(), "{own:?}");
+            assert!(meta.is_err());
+            assert_eq!(
+                wider.unwrap(),
+                vec!["npm/pkg/tarballs/pkg-1.0.0.tgz".to_string()]
+            );
+        }
+        assert!(storage
+            .list("npm/absent/versions/")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_writers_never_split_body_from_pin() {
         let dir = TempDir::new().unwrap();

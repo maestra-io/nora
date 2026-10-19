@@ -245,7 +245,7 @@ async fn search_query(
     let sem_ver_level = params.sem_ver_level;
 
     // No upstream proxy configured → local search directly
-    if state.config.nuget.proxy.is_none() {
+    if upstream_url(&state).is_none() {
         let data = local_search_results(
             &state,
             &query,
@@ -294,7 +294,7 @@ async fn search_query(
     {
         Ok(text) => {
             let base_url = nora_base_url(&state);
-            let upstream = upstream_url(&state);
+            let upstream = rewrite_host(&state);
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss("nuget");
@@ -340,7 +340,7 @@ async fn autocomplete_query(
     let sem_ver_level = params.sem_ver_level;
 
     // No upstream proxy configured → local autocomplete from cache
-    if state.config.nuget.proxy.is_none() {
+    if upstream_url(&state).is_none() {
         let data = local_autocomplete_results(
             &state,
             &query,
@@ -387,7 +387,7 @@ async fn autocomplete_query(
     {
         Ok(text) => {
             let base_url = nora_base_url(&state);
-            let upstream = upstream_url(&state);
+            let upstream = rewrite_host(&state);
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss("nuget");
@@ -462,7 +462,7 @@ async fn registration_index(
     let storage_key = format!("nuget/registration/{}/index.json", id_lower);
 
     let base_url = nora_base_url(&state);
-    let upstream = upstream_url(&state);
+    let upstream = rewrite_host(&state);
 
     // Read cache eagerly so stale data is available on upstream failure.
     let cached_data = state.storage.get(&storage_key).await.ok();
@@ -498,6 +498,16 @@ async fn registration_index(
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
+    // No upstream when the operator switched it off: what is stored is all there is.
+    if upstream_url(&state).is_none() {
+        return match cached_data {
+            Some(data) => {
+                let text = String::from_utf8_lossy(&data);
+                with_json_gzip(rewrite_registration_urls(&text, &upstream, &base_url).into_bytes())
+            }
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
     let url = format!(
         "{}/v3/registration5-gz-semver2/{}/index.json",
         upstream.trim_end_matches('/'),
@@ -541,7 +551,7 @@ async fn registration_page(
     }
 
     let base_url = nora_base_url(&state);
-    let upstream = upstream_url(&state);
+    let upstream = rewrite_host(&state);
     let storage_key = format!(
         "nuget/registration/{}/page/{}/{}.json",
         id_lower, lower, upper
@@ -587,6 +597,16 @@ async fn registration_page(
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
+    // No upstream when the operator switched it off: what is stored is all there is.
+    if upstream_url(&state).is_none() {
+        return match cached_data {
+            Some(data) => {
+                let text = String::from_utf8_lossy(&data);
+                with_json_gzip(rewrite_registration_urls(&text, &upstream, &base_url).into_bytes())
+            }
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
     let url = format!(
         "{}/v3/registration5-gz-semver2/{}/page/{}/{}.json",
         upstream.trim_end_matches('/'),
@@ -680,7 +700,13 @@ async fn version_list(state: AppState, id: &str) -> Response {
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
-    let proxy_url = upstream_url(&state);
+    // No upstream when the operator switched it off: what is stored is all there is.
+    let Some(proxy_url) = upstream_url(&state) else {
+        return match cached_data {
+            Some(data) => with_json(data.to_vec()),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    };
     let url = format!(
         "{}/v3-flatcontainer/{}/index.json",
         proxy_url.trim_end_matches('/'),
@@ -951,8 +977,10 @@ async fn flatcontainer_download(
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
-    // Fetch from upstream
-    let proxy_url = upstream_url(&state);
+    // Fetch from upstream — none when the operator switched it off.
+    let Some(proxy_url) = upstream_url(&state) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let url = format!(
         "{}/v3-flatcontainer/{}/{}/{}",
         proxy_url.trim_end_matches('/'),
@@ -973,6 +1001,19 @@ async fn flatcontainer_download(
     .await
     {
         Ok((body, fetched)) => {
+            // The allowlist's pinned integrity holds on the first download too, before anything is cached:
+            // the cache-hit branch checks the same rule.
+            if nupkg {
+                if let Some(response) = crate::curation::verify_integrity_by_hash(
+                    &state.curation().curation_engine,
+                    crate::curation::RegistryType::Nuget,
+                    &id_lower,
+                    Some(ver),
+                    &body.digest(),
+                ) {
+                    return response;
+                }
+            }
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
@@ -1301,7 +1342,8 @@ async fn catalog_created(state: &AppState, id: &str, version: &str, url: &str) -
     let leaf = match read_json(&state.storage, &key).await {
         Some(leaf) => leaf,
         None => {
-            let origin = format!("{}/", upstream_url(state).trim_end_matches('/'));
+            // No upstream configured: no leaf is fetched.
+            let origin = format!("{}/", upstream_url(state)?.trim_end_matches('/'));
             if !url.starts_with(&origin) {
                 return None;
             }
@@ -1372,7 +1414,7 @@ async fn fetch_registration_doc(
 ) -> Option<serde_json::Value> {
     let url = format!(
         "{}/v3/registration5-gz-semver2/{upstream_path}",
-        upstream_url(state).trim_end_matches('/')
+        upstream_url(state)?.trim_end_matches('/')
     );
     let raw = refresh_metadata(state, key, &url, None).await.ok()?;
     serde_json::from_slice(&raw).ok()
@@ -1745,14 +1787,16 @@ async fn filter_search_results(state: &AppState, body: String) -> Vec<u8> {
     serde_json::to_vec(&doc).unwrap_or_else(|_| body.into_bytes())
 }
 
-fn upstream_url(state: &AppState) -> String {
-    let raw = state
-        .config
-        .nuget
-        .proxy
-        .clone()
-        .unwrap_or_else(|| UPSTREAM_DEFAULT.to_string());
-    strip_url_path(&raw)
+/// The configured upstream (`scheme://authority`), or None when the operator switched it off with
+/// an empty NORA_NUGET_PROXY: then nothing is asked of any upstream.
+fn upstream_url(state: &AppState) -> Option<String> {
+    crate::config::configured_upstream(&state.config.nuget.proxy).map(strip_url_path)
+}
+
+/// The host stored registration bodies are rewritten from: the configured upstream, else the
+/// default one a cached body may still name.
+fn rewrite_host(state: &AppState) -> String {
+    upstream_url(state).unwrap_or_else(|| UPSTREAM_DEFAULT.to_string())
 }
 
 /// Keep only `scheme://authority` from a URL, stripping path/query/fragment.

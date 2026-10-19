@@ -81,15 +81,18 @@ pub async fn create_backup(
         .list("")
         .await
         .map_err(|e| format!("storage list failed: {}", e))?;
-    // npm cache provenance (#1055) sits under an internal prefix that list() hides.
-    // Without it a restored owned scope is not trusted: refetched from its owner, and
-    // served by no one while that owner is down.
-    keys.extend(
-        storage
-            .list_internal(crate::registry::npm::ORIGINS_PREFIX)
-            .await
-            .map_err(|e| format!("storage list failed: {}", e))?,
-    );
+    // npm cache provenance (#1055) and first-seen times sit under internal prefixes that
+    // list() hides. Without them a restored owned scope is not trusted — refetched from
+    // its owner, and served by no one while that owner is down — and every npm release
+    // age starts over.
+    for prefix in crate::registry::npm::INTERNAL_PREFIXES {
+        keys.extend(
+            storage
+                .list_internal(prefix)
+                .await
+                .map_err(|e| format!("storage list failed: {}", e))?,
+        );
+    }
     // With local storage the ledger sits at the storage root; it is archived once,
     // as local state below.
     keys.retain(|k| k != LEDGER_FILE);
@@ -621,6 +624,34 @@ mod tests {
         );
         assert_eq!(restored.pin(key).await, storage.pin(key).await);
         assert!(restored.pin(key).await.is_some());
+    }
+
+    /// npm first-seen times are hidden from list() too, and survive a backup.
+    #[tokio::test]
+    async fn test_backup_restore_carries_npm_first_seen() {
+        use crate::registry::npm::first_seen_key;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let key = "npm/a/metadata.json";
+        storage.put(key, b"{}").await.unwrap();
+        storage
+            .put(&first_seen_key(key), br#"{"1.0.0":1700000000}"#)
+            .await
+            .unwrap();
+
+        let backup_file = dir.path().join("backup.tar.gz");
+        create_backup(&storage, &backup_file, &local(dir.path()))
+            .await
+            .unwrap();
+        let restored = Storage::new_local(dir.path().join("restored").to_str().unwrap());
+        restore_backup(&restored, &backup_file, &local(dir.path()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            &restored.get(&first_seen_key(key)).await.unwrap()[..],
+            br#"{"1.0.0":1700000000}"#
+        );
     }
 
     #[tokio::test]

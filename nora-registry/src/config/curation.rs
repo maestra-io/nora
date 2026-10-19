@@ -82,6 +82,10 @@ pub enum CurationOnFailure {
 pub struct CurationConfig {
     #[serde(default)]
     pub mode: CurationMode,
+    /// Whether `mode` was written down (the config file or `NORA_CURATION_MODE`), rather than
+    /// left at its default. An open proxy is the operator's decision only when it is (#1135).
+    #[serde(skip)]
+    pub mode_explicit: bool,
     #[serde(default)]
     pub on_failure: CurationOnFailure,
     #[serde(default)]
@@ -170,6 +174,7 @@ impl Default for CurationConfig {
     fn default() -> Self {
         Self {
             mode: CurationMode::Off,
+            mode_explicit: false,
             on_failure: CurationOnFailure::Closed,
             allowlist_path: None,
             blocklist_path: None,
@@ -199,7 +204,8 @@ impl Default for CurationConfig {
 }
 
 impl CurationConfig {
-    /// The `[curation.<registry>]` section of `rt`; `None` for Raw, which has none.
+    /// The `[curation.<registry>]` section of `rt`; `None` for Raw and Hugging Face,
+    /// which have none.
     ///
     /// The `match` is exhaustive over [`RegistryType`], so a new registry is a
     /// compile error here until its section is declared — a hand-written list of
@@ -223,6 +229,7 @@ impl CurationConfig {
             RegistryType::Rpm => Some(&self.rpm),
             RegistryType::Deb => Some(&self.deb),
             RegistryType::Cpan => Some(&self.cpan),
+            RegistryType::HuggingFace => None,
         }
     }
 
@@ -232,6 +239,7 @@ impl CurationConfig {
             self.mode = val
                 .parse::<CurationMode>()
                 .map_err(|e| format!("NORA_CURATION_MODE={:?}: {}", val, e))?;
+            self.mode_explicit = true;
         }
         if let Ok(val) = env::var("NORA_CURATION_ON_FAILURE") {
             self.on_failure = match val.to_lowercase().as_str() {

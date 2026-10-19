@@ -92,6 +92,14 @@ pub static GC_STAT_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("gc_stat_failures metric")
 });
 
+pub static GC_DOCKER_MARK_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "nora_gc_docker_mark_failures_total",
+        "Docker GC sweeps skipped because manifest reachability could not be established"
+    )
+    .expect("gc_docker_mark_failures metric")
+});
+
 // ============================================================================
 // GC Result
 // ============================================================================
@@ -115,8 +123,21 @@ pub struct GcResult {
     /// silently). Tracked separately from `skipped_recent` and metered via
     /// `nora_gc_stat_failures_total` so it can be alerted on.
     pub stat_failures: usize,
+    /// Docker objects were kept because the manifest graph could not be read.
+    pub docker_mark_failed: bool,
     /// Proxy-cache eviction result (#866).
     pub proxy_cache_eviction: ProxyCacheEviction,
+}
+
+impl GcResult {
+    /// Whether the pass took anything out of the store: orphans, metadata phantoms or
+    /// proxy-cache files. In a dry run the counters are what would go, so the caller asks
+    /// only of a pass that applied.
+    pub fn removed_anything(&self) -> bool {
+        self.deleted > 0
+            || self.metadata_phantoms_removed > 0
+            || self.proxy_cache_eviction.evicted_files > 0
+    }
 }
 
 // ============================================================================
@@ -154,6 +175,7 @@ pub async fn run_gc(
     // Docker orphan detection (existing logic)
     let docker_result = detect_docker_orphans(storage).await;
     total_candidates += docker_result.total;
+    let docker_mark_failed = docker_result.failed;
     all_orphans.extend(docker_result.orphans);
 
     // Checksum orphan detection (Maven, npm, PyPI)
@@ -273,8 +295,8 @@ pub async fn run_gc(
         );
     }
 
-    // Proxy-cache eviction (#866): size-based LRU for proxy-cached rpm/deb files,
-    // NuGet packages and npm tarballs (see `evict_proxy_cache`).
+    // Proxy-cache eviction (#866): size-based LRU for proxy-cached rpm/deb and
+    // Hugging Face files, NuGet packages and npm tarballs (see `evict_proxy_cache`).
     let proxy_cache_eviction = evict_proxy_cache(
         storage,
         publish_locks,
@@ -333,6 +355,7 @@ pub async fn run_gc(
         metadata_phantoms_removed,
         skipped_recent,
         stat_failures,
+        docker_mark_failed,
         proxy_cache_eviction,
     }
 }
@@ -344,6 +367,12 @@ pub async fn run_gc(
 struct DetectionResult {
     total: usize,
     orphans: Vec<String>,
+}
+
+struct DockerDetectionResult {
+    total: usize,
+    orphans: Vec<String>,
+    failed: bool,
 }
 
 /// Extract config.digest + layers[].digest into `referenced`, and
@@ -361,10 +390,20 @@ fn collect_manifest_refs(
     {
         referenced.insert(digest.to_string());
     }
-    // layer digests
-    if let Some(layers) = json.get("layers").and_then(|v| v.as_array()) {
+    // Image layers and OCI artifact blobs.
+    for field in ["layers", "blobs"] {
+        if let Some(layers) = json.get(field).and_then(|v| v.as_array()) {
+            for layer in layers {
+                if let Some(digest) = layer.get("digest").and_then(|v| v.as_str()) {
+                    referenced.insert(digest.to_string());
+                }
+            }
+        }
+    }
+    // Docker schema 1 uses fsLayers[].blobSum.
+    if let Some(layers) = json.get("fsLayers").and_then(|v| v.as_array()) {
         for layer in layers {
-            if let Some(digest) = layer.get("digest").and_then(|v| v.as_str()) {
+            if let Some(digest) = layer.get("blobSum").and_then(|v| v.as_str()) {
                 referenced.insert(digest.to_string());
             }
         }
@@ -379,35 +418,16 @@ fn collect_manifest_refs(
     }
 }
 
-/// Extract config.digest + layers[].digest into `referenced` (blob refs only,
-/// no sub-manifest traversal).
-fn collect_blob_refs(json: &serde_json::Value, referenced: &mut HashSet<String>) {
-    if let Some(digest) = json
-        .get("config")
-        .and_then(|c| c.get("digest"))
-        .and_then(|v| v.as_str())
-    {
-        referenced.insert(digest.to_string());
-    }
-    if let Some(layers) = json.get("layers").and_then(|v| v.as_array()) {
-        for layer in layers {
-            if let Some(digest) = layer.get("digest").and_then(|v| v.as_str()) {
-                referenced.insert(digest.to_string());
-            }
-        }
-    }
-}
-
 /// True if `ref_name` is a digest reference (sha256:… or sha512:…), not a tag.
 fn is_digest_ref(ref_name: &str) -> bool {
     ref_name.starts_with("sha256:") || ref_name.starts_with("sha512:")
 }
 
-async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
-    let keys = storage.list("docker/").await.unwrap_or_else(|e| {
-        tracing::error!("GC: storage.list(docker/) failed: {}", e);
-        Vec::new()
-    });
+async fn detect_docker_orphans(storage: &Storage) -> DockerDetectionResult {
+    let keys = match storage.list("docker/").await {
+        Ok(keys) => keys,
+        Err(_) => return docker_mark_failure(0, "cannot list Docker objects"),
+    };
 
     let mut blobs: Vec<String> = Vec::new();
     let mut all_manifest_keys: Vec<String> = Vec::new();
@@ -424,56 +444,121 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
         }
     }
 
-    // Step 1: Identify tag manifests (filename does NOT start with sha256:/sha512:)
-    let tag_manifests: Vec<&String> = all_manifest_keys
-        .iter()
-        .filter(|k| {
-            let filename = k.rsplit('/').next().unwrap_or("");
-            let ref_name = filename.strip_suffix(".json").unwrap_or(filename);
-            !is_digest_ref(ref_name)
-        })
-        .collect();
+    let total = blobs.len();
+    let mut manifests = HashMap::new();
+    let mut referrers: HashMap<String, Vec<String>> = HashMap::new();
+    let mut pending = Vec::new();
 
-    // Step 2: Read tag manifests, collect referenced blob digests.
-    // For manifest lists, also collect sub-manifest digests to resolve in step 3.
-    let mut referenced = HashSet::new();
-    let mut sub_manifest_digests: HashSet<String> = HashSet::new();
-    // The digest-named aliases of the tag manifests themselves: the OCI
-    // distribution spec keeps content pullable by digest whenever it is
-    // pullable by tag, so these files are roots too (#949).
-    let mut tag_manifest_digests: HashSet<String> = HashSet::new();
-
-    for key in &tag_manifests {
-        if let Ok(data) = storage.get(key).await {
+    // Read the entire manifest set before marking. Untagged manifests may be
+    // subject-bearing referrers; a failed read or parse leaves an incomplete
+    // graph, never evidence that their layers are unreferenced.
+    for key in &all_manifest_keys {
+        let data = match storage.get(key).await {
+            Ok(data) => data,
+            Err(_) => return docker_mark_failure(total, key),
+        };
+        let json: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(&data) {
+            Ok(json) if json.is_object() => json,
+            _ => return docker_mark_failure(total, key),
+        };
+        let Some((repo, filename)) = key.rsplit_once("/manifests/") else {
+            return docker_mark_failure(total, key);
+        };
+        let ref_name = filename.strip_suffix(".json").unwrap_or(filename);
+        if !is_digest_ref(ref_name) {
             use sha2::Digest;
-            tag_manifest_digests.insert(format!(
-                "sha256:{}",
+            pending.push(key.clone());
+            // A tagged manifest and its content-addressed aliases are roots,
+            // including when only the tag file is present in local fixtures.
+            pending.push(format!(
+                "{repo}/manifests/sha256:{}.json",
                 hex::encode(sha2::Sha256::digest(&data))
             ));
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
-                collect_manifest_refs(&json, &mut referenced, &mut sub_manifest_digests);
+            pending.push(format!(
+                "{repo}/manifests/sha512:{}.json",
+                hex::encode(sha2::Sha512::digest(&data))
+            ));
+        }
+        if let Some(subject) = json
+            .get("subject")
+            .and_then(|subject| subject.get("digest"))
+            .and_then(|digest| digest.as_str())
+        {
+            referrers
+                .entry(format!("{repo}/manifests/{subject}.json"))
+                .or_default()
+                .push(key.clone());
+        }
+        manifests.insert(key.clone(), json);
+    }
+
+    // Walk to a fixed point rather than imposing an index-depth limit. Both
+    // forward index/subject edges and reverse subject->referrer edges stay in
+    // their repository: the same digest in another repository is a separate
+    // object. The visited set also terminates subject/index cycles.
+    let mut reachable = HashSet::new();
+    let mut referenced_blobs = HashSet::new();
+    while let Some(key) = pending.pop() {
+        if !reachable.insert(key.clone()) {
+            continue;
+        }
+        if let Some(children) = referrers.get(&key) {
+            pending.extend(children.iter().cloned());
+        }
+        let Some(json) = manifests.get(&key) else {
+            continue; // A virtual content-addressed alias of a tagged manifest.
+        };
+        let Some((repo, _)) = key.rsplit_once("/manifests/") else {
+            return docker_mark_failure(total, &key);
+        };
+        let mut blobs = HashSet::new();
+        let mut children = HashSet::new();
+        collect_manifest_refs(json, &mut blobs, &mut children);
+        // A referenced blob may be stored under this repository's key or, for a
+        // namespaced repository, under the un-namespaced legacy key that the serve
+        // path falls back to (storage_get_reader_with_fallback). Protect both so GC keeps
+        // a blob the server would still serve. strip_docker_namespace only drops a
+        // leading registry host (a first segment containing '.'), so genuinely
+        // distinct repositories do not collide and #984 cross-repo isolation holds.
+        let legacy_repo = repo
+            .strip_prefix("docker/")
+            .map(|name| {
+                format!(
+                    "docker/{}",
+                    crate::registry::docker::strip_docker_namespace(name)
+                )
+            })
+            .filter(|legacy| legacy.as_str() != repo);
+        for digest in blobs {
+            referenced_blobs.insert(format!("{repo}/blobs/{digest}"));
+            if let Some(ref legacy) = legacy_repo {
+                referenced_blobs.insert(format!("{legacy}/blobs/{digest}"));
             }
+        }
+        for digest in children {
+            let child_key = format!("{repo}/manifests/{digest}.json");
+            // A child absent from local storage is not corruption: a pull-through
+            // cache holds only the platforms clients actually pulled, so a cached
+            // multi-arch index routinely lists children that were never fetched.
+            // Skip it rather than abort — its own blobs are absent too, and any
+            // blob it shares with a present sibling stays reachable through that
+            // sibling. Aborting here would stop GC from ever collecting on a cache
+            // that holds any partial index. A manifest that IS present but cannot
+            // be read or parsed still aborts the sweep (handled when reading it).
+            if manifests.contains_key(&child_key) {
+                pending.push(child_key);
+            }
+        }
+        if let Some(subject) = json
+            .get("subject")
+            .and_then(|subject| subject.get("digest"))
+            .and_then(|digest| digest.as_str())
+        {
+            pending.push(format!("{repo}/manifests/{subject}.json"));
         }
     }
 
-    // Step 3: Resolve sub-manifests (manifest list entries) — these are
-    // digest-keyed but reachable from a tag, so their blobs must be kept.
-    for key in &all_manifest_keys {
-        let filename = key.rsplit('/').next().unwrap_or("");
-        let ref_name = filename.strip_suffix(".json").unwrap_or(filename);
-        if sub_manifest_digests.contains(ref_name) {
-            if let Ok(data) = storage.get(key).await {
-                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
-                    // Only collect blob refs, not further sub-manifests (2 levels deep enough)
-                    collect_blob_refs(&json, &mut referenced);
-                }
-            }
-        }
-    }
-
-    // Step 4: Detect orphaned digest manifests — digest-keyed manifests not
-    // reachable from any tag (neither directly tagged nor a sub-manifest of a
-    // tagged manifest list).
+    // Only unreachable digest manifests and their sidecars may be swept.
     let meta_sidecars: HashSet<&String> = keys
         .iter()
         .filter(|k| k.contains("/manifests/") && ends_with_ci(k, ".meta.json"))
@@ -487,10 +572,7 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
     for key in &all_manifest_keys {
         let filename = key.rsplit('/').next().unwrap_or("");
         let ref_name = filename.strip_suffix(".json").unwrap_or(filename);
-        if is_digest_ref(ref_name)
-            && !sub_manifest_digests.contains(ref_name)
-            && !tag_manifest_digests.contains(ref_name)
-        {
+        if is_digest_ref(ref_name) && !reachable.contains(key) {
             orphan_digest_manifests.push(key.clone());
             // Reap the .meta.json sidecar with its manifest (#949): it is
             // invisible to detection on its own, so it would leak forever.
@@ -508,22 +590,33 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
         }
     }
 
-    let total = blobs.len();
     let mut orphans: Vec<String> = blobs
         .into_iter()
-        .filter(|key| {
-            key.rsplit('/')
-                .next()
-                .map(|digest| !referenced.contains(digest))
-                .unwrap_or(false)
-        })
+        .filter(|key| !referenced_blobs.contains(key))
         .collect();
 
     // Append orphaned digest manifests — they will be sorted after blobs by
     // the caller (run_gc's #305 invariant: blobs before manifests).
     orphans.extend(orphan_digest_manifests);
 
-    DetectionResult { total, orphans }
+    DockerDetectionResult {
+        total,
+        orphans,
+        failed: false,
+    }
+}
+
+fn docker_mark_failure(total: usize, key: &str) -> DockerDetectionResult {
+    warn!(
+        key,
+        "GC: cannot establish Docker manifest reachability; keeping all Docker objects"
+    );
+    GC_DOCKER_MARK_FAILURES.inc();
+    DockerDetectionResult {
+        total,
+        orphans: Vec::new(),
+        failed: true,
+    }
 }
 
 // ============================================================================
@@ -677,24 +770,51 @@ async fn detect_cargo_orphans(storage: &Storage) -> DetectionResult {
         tracing::error!("GC: storage.list(cargo/) failed: {}", e);
         Vec::new()
     });
-    let mut crate_files: HashSet<String> = HashSet::new(); // "name/version"
-    let mut index_entries: HashSet<String> = HashSet::new(); // "name"
+    let mut crate_files: HashSet<String> = HashSet::new(); // names with a .crate
     let mut crate_keys: Vec<String> = Vec::new();
-    let mut index_keys: Vec<String> = Vec::new();
+    // Names any index key speaks for: the index, NORA's upstream copy, the assembled index, an
+    // entry. A .crate is kept while one of them names its crate.
+    let mut indexed: HashSet<String> = HashSet::new();
+    // cargo/index/<prefix>/<name>, with its crate's name
+    let mut index_keys: Vec<(String, String)> = Vec::new();
     let mut index_entry_keys: Vec<String> = Vec::new(); // per-version cargo/index-entries/ (#39)
 
+    // cargo/index-upstream/<prefix>/<name> (NORA's copy of an upstream's index) and
+    // cargo/index-assembled/<prefix>/<name> (the index NORA assembled from entries): collected
+    // with the crate, like its index.
+    let mut per_crate_keys: Vec<(String, String)> = Vec::new();
+    // cargo/_names/<canon>: the spelling a crate was published under, kept while any stored name has
+    // that canon. `_names` cannot be a crate (a crate name starts with a letter or digit), so no
+    // crate's files share the prefix.
+    let mut name_records: Vec<(String, String)> = Vec::new();
+
     for key in &keys {
-        if key.starts_with("cargo/index-entries/") {
-            // cargo/index-entries/XX/XX/name/version.json — the scan-regenerate source of truth
+        if let Some(canon) = key
+            .strip_prefix("cargo/_names/")
+            .filter(|canon| is_crate_name(canon))
+        {
+            name_records.push((key.clone(), canon.to_string()));
+            continue;
+        }
+        let per_crate = key
+            .strip_prefix("cargo/index-upstream/")
+            .or_else(|| key.strip_prefix("cargo/index-assembled/"));
+        if let Some(rest) = per_crate {
+            if let Some(name) = rest.rsplit('/').next().filter(|n| is_crate_name(n)) {
+                per_crate_keys.push((key.clone(), name.to_string()));
+                indexed.insert(name.to_string());
+            }
+        } else if let Some(rest) = key.strip_prefix("cargo/index-entries/") {
+            // cargo/index-entries/<prefix>/<name>/<version>.json — the scan-regenerate source of truth
             index_entry_keys.push(key.clone());
-        } else if key.starts_with("cargo/index/") {
-            // cargo/index/XX/XX/name
-            if let Some(name) = key
-                .strip_prefix("cargo/index/")
-                .and_then(|s| s.split('/').nth(2))
-            {
-                index_entries.insert(name.to_string());
-                index_keys.push(key.clone());
+            if let Some(name) = rest.rsplit('/').nth(1).filter(|n| is_crate_name(n)) {
+                indexed.insert(name.to_string());
+            }
+        } else if let Some(rest) = key.strip_prefix("cargo/index/") {
+            // cargo/index/<prefix>/<name>; the prefix is one segment for one- and two-letter names
+            if let Some(name) = rest.rsplit('/').next().filter(|n| is_crate_name(n)) {
+                index_keys.push((key.clone(), name.to_string()));
+                indexed.insert(name.to_string());
             }
         } else if ends_with_ci(key, ".crate") {
             // cargo/name/version/name-version.crate
@@ -710,48 +830,82 @@ async fn detect_cargo_orphans(storage: &Storage) -> DetectionResult {
         }
     }
 
-    let total = crate_keys.len() + index_keys.len();
+    let total = crate_keys.len() + index_keys.len() + per_crate_keys.len() + name_records.len();
     let mut orphans = Vec::new();
 
+    // An upstream copy or an assembled index of a crate with no .crate stored, like its index.
+    for (key, name) in &per_crate_keys {
+        if !crate_files.contains(name) {
+            info!("Cargo orphan index: {} (no .crate files)", key);
+            orphans.push(key.clone());
+        }
+    }
+
     // Index entries without any .crate files
-    for key in &index_keys {
-        if let Some(name) = key
-            .strip_prefix("cargo/index/")
-            .and_then(|s| s.split('/').nth(2))
-        {
-            if !crate_files.contains(name) {
-                info!("Cargo orphan index: {} (no .crate files)", key);
-                orphans.push(key.clone());
-                // Also remove the per-version entry keys for this fully-deleted crate (#39
-                // layout), else a later publish's regenerate would resurrect index lines that
-                // point at missing .crate files.
-                let entries_prefix = format!(
-                    "{}/",
-                    key.replacen("cargo/index/", "cargo/index-entries/", 1)
-                );
-                for ek in &index_entry_keys {
-                    if ek.starts_with(&entries_prefix) {
-                        orphans.push(ek.clone());
-                    }
+    for (key, name) in &index_keys {
+        if !crate_files.contains(name) {
+            info!("Cargo orphan index: {} (no .crate files)", key);
+            orphans.push(key.clone());
+            // Also remove the per-version entry keys for this fully-deleted crate (#39
+            // layout), else a later publish's regenerate would resurrect index lines that
+            // point at missing .crate files.
+            let entries_prefix = format!(
+                "{}/",
+                key.replacen("cargo/index/", "cargo/index-entries/", 1)
+            );
+            for ek in &index_entry_keys {
+                if ek.starts_with(&entries_prefix) {
+                    orphans.push(ek.clone());
                 }
             }
         }
     }
 
-    // .crate files without index entry
+    // .crate files no index key names
     for key in &crate_keys {
         let parts: Vec<&str> = key
             .strip_prefix("cargo/")
             .unwrap_or(key)
             .split('/')
             .collect();
-        if parts.len() >= 2 && !index_entries.contains(parts[0]) {
+        if parts.len() >= 2 && !indexed.contains(parts[0]) {
             info!("Cargo orphan crate: {} (no index entry)", key);
             orphans.push(key.clone());
         }
     }
 
+    // A name record no stored name has the canon of: its crate is gone (here, or in this pass).
+    let removed: HashSet<&String> = orphans.iter().collect();
+    let live: HashSet<String> = crate_keys
+        .iter()
+        .filter(|key| !removed.contains(key))
+        .filter_map(|key| key.strip_prefix("cargo/")?.split('/').next())
+        .map(crate::registry::canonical_crate_name)
+        .chain(
+            index_keys
+                .iter()
+                .chain(per_crate_keys.iter())
+                .filter(|(key, _)| !removed.contains(key))
+                .map(|(_, name)| crate::registry::canonical_crate_name(name)),
+        )
+        .collect();
+    for (key, canon) in &name_records {
+        if !live.contains(canon) {
+            info!("Cargo orphan name record: {} (no crate of that name)", key);
+            orphans.push(key.clone());
+        }
+    }
+
     DetectionResult { total, orphans }
+}
+
+/// A crate name as the registry accepts it: letters, digits, `-` and `_`. A key whose last segment
+/// is not one (a file NORA keeps beside the index) speaks for no crate.
+fn is_crate_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 // ============================================================================
@@ -1071,7 +1225,9 @@ async fn evict_pypi_companions(storage: &Storage, key: &str) {
 /// - npm tarballs with a cache provenance sidecar (#1055): only an upstream
 ///   fetch writes one, a publish does not;
 /// - PyPI files with a provenance marker (C22), likewise written only by an
-///   upstream fetch; an uploaded file never has one.
+///   upstream fetch; an uploaded file never has one;
+/// - every file under `hf/`: the Hugging Face format is pull-through only, with no
+///   hosted files, sidecars or indexes (#579), so a repo named `repodata` is no index.
 ///
 /// A package in `curation.internal_namespaces` is never fetched upstream, so a
 /// copy of one is the only copy: it is never evicted.
@@ -1094,7 +1250,7 @@ async fn evict_proxy_cache(
     let mut proxy_files: Vec<(String, u64, u64)> = Vec::new(); // (key, size, mtime)
     let mut sidecar_covered: HashSet<String> = HashSet::new();
 
-    for prefix in ["rpm/", "deb/"] {
+    for prefix in ["rpm/", "deb/", "hf/"] {
         let entries = match storage.list_with_meta(prefix).await {
             Ok(e) => e,
             Err(e) => {
@@ -1118,6 +1274,10 @@ async fn evict_proxy_cache(
 
         // Second pass: identify proxy-only files
         for (key, meta) in &entries {
+            if prefix == "hf/" {
+                proxy_files.push((key.clone(), meta.size, meta.modified));
+                continue;
+            }
             // Skip .nora-meta/ entries themselves
             if key.contains("/.nora-meta/") {
                 continue;
@@ -1307,6 +1467,7 @@ mod tests {
             metadata_phantoms_removed: 0,
             skipped_recent: 0,
             stat_failures: 0,
+            docker_mark_failed: false,
             proxy_cache_eviction: ProxyCacheEviction::default(),
         };
         assert_eq!(result.total_candidates, 0);
@@ -1333,6 +1494,378 @@ mod tests {
     }
 
     // -- Docker GC tests --
+
+    #[tokio::test]
+    async fn test_gc_docker_keeps_subject_referrers() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let image =
+            serde_json::json!({"config":{"digest":"sha256:image-config"},"layers":[]}).to_string();
+        let digest = format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(image.as_bytes()))
+        );
+        storage
+            .put("docker/proof/manifests/release.json", image.as_bytes())
+            .await
+            .unwrap();
+        let image_key = format!("docker/proof/manifests/{digest}.json");
+        storage.put(&image_key, image.as_bytes()).await.unwrap();
+        let attestation_key = "docker/proof/manifests/sha256:attestation.json";
+        let attestation = serde_json::json!({
+            "artifactType":"application/vnd.in-toto+json",
+            "subject":{"digest":digest},
+            "layers":[{"digest":"sha256:provenance"}]
+        });
+        storage
+            .put(attestation_key, attestation.to_string().as_bytes())
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:image-config", b"config")
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:provenance", b"provenance")
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:unused", b"unused")
+            .await
+            .unwrap();
+
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
+        assert_eq!(result.deleted, 1, "only the unrelated orphan is deleted");
+        assert!(storage.get(&image_key).await.is_ok());
+        assert!(storage.get(attestation_key).await.is_ok());
+        assert!(storage
+            .get("docker/proof/blobs/sha256:provenance")
+            .await
+            .is_ok());
+        assert!(storage
+            .get("docker/proof/blobs/sha256:unused")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_gc_docker_failed_manifest_read_aborts_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let key = "docker/proof/manifests/release.json";
+        storage
+            .put(key, br#"{"layers":[{"digest":"sha256:required"}]}"#)
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:required", b"required")
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:unused", b"unused")
+            .await
+            .unwrap();
+        // Change the bytes without their integrity pin: the real storage GET fails.
+        std::fs::write(
+            dir.path().join(key),
+            br#"{"layers":[{"digest":"sha256:changed"}]}"#,
+        )
+        .unwrap();
+        assert!(storage.get(key).await.is_err());
+
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
+        assert_eq!(
+            result.deleted, 0,
+            "an incomplete mark must not sweep Docker objects"
+        );
+        assert!(result.docker_mark_failed);
+        assert!(storage
+            .get("docker/proof/blobs/sha256:required")
+            .await
+            .is_ok());
+        assert!(storage
+            .get("docker/proof/blobs/sha256:unused")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_gc_docker_invalid_manifest_aborts_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage
+            .put("docker/proof/manifests/release.json", b"invalid JSON")
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:required", b"required")
+            .await
+            .unwrap();
+
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
+        assert_eq!(
+            result.deleted, 0,
+            "unparseable manifests cannot prove blobs are unused"
+        );
+        assert!(result.docker_mark_failed);
+        assert!(storage
+            .get("docker/proof/blobs/sha256:required")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_gc_docker_traverses_nested_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for (name, child) in [
+            ("release", "sha256:level1"),
+            ("sha256:level1", "sha256:level2"),
+            ("sha256:level2", "sha256:image"),
+        ] {
+            let manifest = serde_json::json!({"manifests":[{"digest":child}]}).to_string();
+            storage
+                .put(
+                    &format!("docker/proof/manifests/{name}.json"),
+                    manifest.as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        storage
+            .put(
+                "docker/proof/manifests/sha256:image.json",
+                br#"{"layers":[{"digest":"sha256:required"}]}"#,
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:required", b"required")
+            .await
+            .unwrap();
+
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
+        assert_eq!(
+            result.deleted, 0,
+            "index depth must not make reachable layers collectible"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gc_docker_references_are_repository_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage
+            .put(
+                "docker/live/manifests/release.json",
+                br#"{"layers":[{"digest":"sha256:shared"}]}"#,
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/live/blobs/sha256:shared", b"same content")
+            .await
+            .unwrap();
+        storage
+            .put("docker/unused/blobs/sha256:shared", b"same content")
+            .await
+            .unwrap();
+
+        run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
+        assert!(storage.get("docker/live/blobs/sha256:shared").await.is_ok());
+        assert!(storage
+            .get("docker/unused/blobs/sha256:shared")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_gc_docker_missing_index_child_does_not_abort_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage
+            .put(
+                "docker/proof/manifests/release.json",
+                br#"{"manifests":[{"digest":"sha256:missing"}]}"#,
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:unused", b"unused")
+            .await
+            .unwrap();
+        // A child the index lists but local storage does not hold — e.g. a
+        // platform a pull-through cache never fetched — is not corruption and must
+        // not abort the sweep. The absent child has no present blobs of its own,
+        // so an unreferenced blob stays collectible and marking does not fail.
+        // (A manifest that IS present but cannot be read or parsed still aborts:
+        // see test_gc_docker_invalid_manifest_aborts_sweep and
+        // test_gc_docker_failed_manifest_read_aborts_sweep.)
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
+        assert!(!result.docker_mark_failed);
+        assert_eq!(result.deleted, 1, "the unreferenced blob is collectible");
+        assert!(storage
+            .get("docker/proof/blobs/sha256:unused")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_gc_docker_subject_cycles_terminate_and_orphan_groups_are_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for (repo, tagged) in [("live", true), ("unused", false)] {
+            let a = br#"{"subject":{"digest":"sha256:b"},"layers":[{"digest":"sha256:layer-a"}]}"#;
+            let b = br#"{"subject":{"digest":"sha256:a"},"layers":[{"digest":"sha256:layer-b"}]}"#;
+            storage
+                .put(&format!("docker/{repo}/manifests/sha256:a.json"), a)
+                .await
+                .unwrap();
+            storage
+                .put(&format!("docker/{repo}/manifests/sha256:b.json"), b)
+                .await
+                .unwrap();
+            if tagged {
+                storage
+                    .put(&format!("docker/{repo}/manifests/release.json"), a)
+                    .await
+                    .unwrap();
+            }
+            storage
+                .put(&format!("docker/{repo}/blobs/sha256:layer-a"), b"a")
+                .await
+                .unwrap();
+            storage
+                .put(&format!("docker/{repo}/blobs/sha256:layer-b"), b"b")
+                .await
+                .unwrap();
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_gc(
+                &storage,
+                &test_publish_locks(),
+                false,
+                0,
+                false,
+                0,
+                &no_curation(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(!result.docker_mark_failed);
+        assert_eq!(
+            result.deleted, 4,
+            "only the unrooted subject group is deleted"
+        );
+        for suffix in [
+            "manifests/sha256:a.json",
+            "manifests/sha256:b.json",
+            "blobs/sha256:layer-a",
+            "blobs/sha256:layer-b",
+        ] {
+            assert!(storage.get(&format!("docker/live/{suffix}")).await.is_ok());
+            assert!(storage
+                .get(&format!("docker/unused/{suffix}"))
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gc_docker_keeps_schema1_layers_and_artifact_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage
+            .put(
+                "docker/proof/manifests/legacy.json",
+                br#"{"schemaVersion":1,"fsLayers":[{"blobSum":"sha256:legacy"}]}"#,
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                "docker/proof/manifests/artifact.json",
+                br#"{"blobs":[{"digest":"sha256:artifact"}]}"#,
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:legacy", b"legacy")
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:artifact", b"artifact")
+            .await
+            .unwrap();
+        let result = run_gc(
+            &storage,
+            &test_publish_locks(),
+            false,
+            0,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
+        assert_eq!(result.deleted, 0);
+    }
 
     #[tokio::test]
     async fn test_gc_empty_storage() {
@@ -2495,6 +3028,169 @@ mod tests {
         assert!(result.orphan_keys[0].ends_with(".mod"));
     }
 
+    /// Rows G1/G2: a crate's name record (`cargo/_names/<canon>`) is kept while a stored crate has that
+    /// canon in any spelling, and collected with the last one; a record no crate has the canon of is
+    /// an orphan.
+    #[tokio::test]
+    async fn a_name_record_lives_and_goes_with_its_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for key in [
+            // my-crate: published and alive; its record is kept.
+            "cargo/index/my/-c/my-crate",
+            "cargo/index-entries/my/-c/my-crate/1.0.0.json",
+            "cargo/my-crate/1.0.0/my-crate-1.0.0.crate",
+            "cargo/_names/my-crate",
+            // gone-crate: its index has no .crate left, so it goes, and its record with it.
+            "cargo/index/go/ne/gone_crate",
+            "cargo/index-entries/go/ne/gone_crate/1.0.0.json",
+            "cargo/_names/gone-crate",
+            // a record no crate has the canon of.
+            "cargo/_names/never-published",
+            // a crate named `names` (it exists on crates.io): its files are a crate's, not records.
+            "cargo/index/na/me/names",
+            "cargo/index-entries/na/me/names/0.14.0.json",
+            "cargo/names/0.14.0/names-0.14.0.crate",
+            "cargo/names/metadata.json",
+            "cargo/_names/names",
+        ] {
+            storage.put(key, b"x").await.unwrap();
+        }
+        let result = detect_cargo_orphans(&storage).await;
+        assert!(!result
+            .orphans
+            .contains(&"cargo/_names/my-crate".to_string()));
+        assert!(result
+            .orphans
+            .contains(&"cargo/_names/gone-crate".to_string()));
+        assert!(result
+            .orphans
+            .contains(&"cargo/_names/never-published".to_string()));
+        assert!(!result
+            .orphans
+            .contains(&"cargo/my-crate/1.0.0/my-crate-1.0.0.crate".to_string()));
+        for key in [
+            "cargo/index/na/me/names",
+            "cargo/index-entries/na/me/names/0.14.0.json",
+            "cargo/names/0.14.0/names-0.14.0.crate",
+            "cargo/names/metadata.json",
+            "cargo/_names/names",
+        ] {
+            assert!(
+                !result.orphans.contains(&key.to_string()),
+                "{key} collected"
+            );
+        }
+    }
+
+    /// An orphan index takes its own entries with it, never those of a crate whose name it starts.
+    #[tokio::test]
+    async fn an_orphan_index_takes_only_its_own_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for key in [
+            "cargo/index/se/rd/serde",
+            "cargo/index-entries/se/rd/serde/1.0.0.json",
+            "cargo/index/se/rd/serde-derive",
+            "cargo/index-entries/se/rd/serde-derive/1.0.0.json",
+            "cargo/serde-derive/1.0.0/serde-derive-1.0.0.crate",
+        ] {
+            storage.put(key, b"x").await.unwrap();
+        }
+        let result = detect_cargo_orphans(&storage).await;
+        assert!(result
+            .orphans
+            .contains(&"cargo/index/se/rd/serde".to_string()));
+        assert!(result
+            .orphans
+            .contains(&"cargo/index-entries/se/rd/serde/1.0.0.json".to_string()));
+        for key in [
+            "cargo/index/se/rd/serde-derive",
+            "cargo/index-entries/se/rd/serde-derive/1.0.0.json",
+            "cargo/serde-derive/1.0.0/serde-derive-1.0.0.crate",
+        ] {
+            assert!(!result.orphans.contains(&key.to_string()), "{key}");
+        }
+    }
+
+    /// A crate file is kept while any index key names its crate — the index, NORA's upstream copy,
+    /// the assembled index or a per-version entry — whatever the name's length; a crate file with
+    /// none is an orphan.
+    #[tokio::test]
+    async fn a_crate_file_with_any_index_key_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for key in [
+            "cargo/index-upstream/it/oa/itoa",
+            "cargo/itoa/1.0.11/itoa-1.0.11.crate",
+            "cargo/index-assembled/pu/b1/pub1",
+            "cargo/pub1/0.1.0/pub1-0.1.0.crate",
+            "cargo/index-entries/pu/b2/pub2/0.1.0.json",
+            "cargo/pub2/0.1.0/pub2-0.1.0.crate",
+            "cargo/index/1/a",
+            "cargo/a/0.1.0/a-0.1.0.crate",
+            "cargo/index/2/ab",
+            "cargo/ab/0.1.0/ab-0.1.0.crate",
+            "cargo/lone/1.0.0/lone-1.0.0.crate",
+            "cargo/index/config.json",
+        ] {
+            storage.put(key, b"x").await.unwrap();
+        }
+        let result = detect_cargo_orphans(&storage).await;
+        for key in [
+            "cargo/itoa/1.0.11/itoa-1.0.11.crate",
+            "cargo/pub1/0.1.0/pub1-0.1.0.crate",
+            "cargo/pub2/0.1.0/pub2-0.1.0.crate",
+            "cargo/a/0.1.0/a-0.1.0.crate",
+            "cargo/ab/0.1.0/ab-0.1.0.crate",
+            "cargo/index-upstream/it/oa/itoa",
+            "cargo/index/1/a",
+            "cargo/index/config.json",
+        ] {
+            assert!(
+                !result.orphans.contains(&key.to_string()),
+                "{key} taken for an orphan"
+            );
+        }
+        assert!(result
+            .orphans
+            .contains(&"cargo/lone/1.0.0/lone-1.0.0.crate".to_string()));
+    }
+
+    /// NORA's upstream copy of a crate's index and the index it assembled are collected like the
+    /// index itself: an orphan when no `.crate` of that crate is stored, kept when one is (one- and
+    /// two-letter names included).
+    #[tokio::test]
+    async fn cargo_upstream_copy_is_an_orphan_without_crate_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for key in [
+            "cargo/index-upstream/se/rd/serde",
+            "cargo/index-upstream/to/ki/tokio",
+            "cargo/index-upstream/1/a",
+            "cargo/index-upstream/1/b",
+            "cargo/index-assembled/se/rd/serde",
+            "cargo/index-assembled/to/ki/tokio",
+            "cargo/index-assembled/2/cd",
+            "cargo/tokio/1.0.0/tokio-1.0.0.crate",
+            "cargo/a/0.1.0/a-0.1.0.crate",
+        ] {
+            storage.put(key, b"x").await.unwrap();
+        }
+        let result = detect_cargo_orphans(&storage).await;
+        for (key, orphan) in [
+            ("cargo/index-upstream/se/rd/serde", true),
+            ("cargo/index-upstream/to/ki/tokio", false),
+            ("cargo/index-upstream/1/a", false),
+            ("cargo/index-upstream/1/b", true),
+            ("cargo/index-assembled/se/rd/serde", true),
+            ("cargo/index-assembled/to/ki/tokio", false),
+            ("cargo/index-assembled/2/cd", true),
+        ] {
+            assert_eq!(result.orphans.contains(&key.to_string()), orphan, "{key}");
+        }
+    }
+
     #[tokio::test]
     async fn test_gc_cargo_matching_index_no_orphans() {
         let dir = tempfile::tempdir().unwrap();
@@ -3422,6 +4118,45 @@ mod tests {
         assert!(storage.get("deb/repo/dists/stable/InRelease").await.is_ok());
     }
 
+    /// Hugging Face files (#579) count toward the same cap as rpm/deb, oldest first across
+    /// formats, and every one is evictable: hf has no hosted files or indexes, so a repo
+    /// named `repodata` is no exemption.
+    #[tokio::test]
+    async fn test_evict_proxy_cache_counts_hf_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let storage = Storage::new_local(data.to_str().unwrap());
+        let payload = vec![0u8; 100];
+        let keys = [
+            "hf/models/org/repodata/blobs/0000000000000000000000000000000000000000",
+            "rpm/repo/Packages/old-1.0.rpm",
+            "hf/models/gpt2/blobs/1111111111111111111111111111111111111111",
+            "hf/models/org/model/blobs/2222222222222222222222222222222222222222222222222222222222222222",
+        ];
+        for (i, key) in keys.iter().enumerate() {
+            storage.put(key, &payload).await.unwrap();
+            let mtime = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_000_000 + i as u64 * 1000);
+            std::fs::File::options()
+                .write(true)
+                .open(data.join(key))
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        }
+        let result =
+            evict_proxy_cache(&storage, &test_publish_locks(), 150, false, &no_curation()).await;
+        assert_eq!(result.total_bytes, 400);
+        assert_eq!(
+            result.evicted_files, 3,
+            "the three oldest go, across formats"
+        );
+        for key in &keys[..3] {
+            assert!(storage.get(key).await.is_err(), "{key} survived");
+        }
+        assert!(storage.get(keys[3]).await.is_ok());
+    }
+
     /// Both rpm/ and deb/ proxy files count toward the same cap.
     #[tokio::test]
     async fn test_evict_proxy_cache_mixed_rpm_deb() {
@@ -3450,5 +4185,230 @@ mod tests {
         assert_eq!(result.total_bytes, 400);
         assert_eq!(result.evicted_files, 2);
         assert_eq!(result.bytes_freed, 200);
+    }
+}
+
+#[cfg(test)]
+mod docker_gc_reachability {
+    //! Independent reachability checks for Docker GC (#1079): a pull-through
+    //! cache holds only the platforms clients pulled, and a cross-repo mount
+    //! lands its blob before its manifest. Both must stay correct.
+    use super::*;
+    use std::sync::Arc;
+
+    fn locks() -> PublishLocks {
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn no_curation() -> crate::curation::CurationEngine {
+        crate::curation::CurationEngine::new(crate::config::CurationConfig::default())
+    }
+
+    fn digest(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+    }
+
+    async fn put(storage: &Storage, key: &str, bytes: &[u8]) {
+        storage.put(key, bytes).await.unwrap();
+    }
+
+    /// A manifest stored as a client pushes it: under its digest, and under `tag` if given.
+    async fn manifest(
+        storage: &Storage,
+        repo: &str,
+        tag: Option<&str>,
+        json: serde_json::Value,
+    ) -> String {
+        let bytes = json.to_string().into_bytes();
+        let d = digest(&bytes);
+        put(
+            storage,
+            &format!("docker/{repo}/manifests/{d}.json"),
+            &bytes,
+        )
+        .await;
+        if let Some(tag) = tag {
+            put(
+                storage,
+                &format!("docker/{repo}/manifests/{tag}.json"),
+                &bytes,
+            )
+            .await;
+        }
+        d
+    }
+
+    fn image(config: &str, layers: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config, "size": 1},
+            "layers": layers.iter().map(|d| serde_json::json!({"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": d, "size": 1})).collect::<Vec<_>>(),
+        })
+    }
+
+    fn index(children: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": children.iter().map(|d| serde_json::json!({"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": d, "size": 1})).collect::<Vec<_>>(),
+        })
+    }
+
+    async fn blobs(storage: &Storage, repo: &str, digests: &[&str]) {
+        for d in digests {
+            put(storage, &format!("docker/{repo}/blobs/{d}"), d.as_bytes()).await;
+        }
+    }
+
+    /// The keys a dry run would delete.
+    async fn would_delete(storage: &Storage) -> Vec<String> {
+        run_gc(storage, &locks(), true, 0, false, 0, &no_curation())
+            .await
+            .orphan_keys
+    }
+
+    fn kept(deleted: &[String], keys: &[String]) {
+        for key in keys {
+            assert!(
+                !deleted.contains(key),
+                "{key} would be deleted; deleted: {deleted:?}"
+            );
+        }
+    }
+
+    fn walkdir_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files
+    }
+
+    const ORPHAN: &str = "docker/app/blobs/sha256:0rphan";
+
+    // A pull-through cache holds only the platforms clients pulled: the index's other children
+    // are not here, which is no reason to stop collecting.
+    #[tokio::test]
+    async fn an_index_child_not_held_does_not_stop_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        blobs(&storage, "app", &["sha256:cfg", "sha256:layer"]).await;
+        put(&storage, ORPHAN, b"x").await;
+        let pulled = manifest(
+            &storage,
+            "app",
+            None,
+            image("sha256:cfg", &["sha256:layer"]),
+        )
+        .await;
+        let arm = format!("sha256:{}", "a".repeat(64));
+        let ppc = format!("sha256:{}", "b".repeat(64));
+        manifest(
+            &storage,
+            "app",
+            Some("latest"),
+            index(&[&pulled, &arm, &ppc]),
+        )
+        .await;
+
+        let deleted = would_delete(&storage).await;
+        kept(
+            &deleted,
+            &[
+                format!("docker/app/manifests/{pulled}.json"),
+                "docker/app/blobs/sha256:cfg".to_string(),
+                "docker/app/blobs/sha256:layer".to_string(),
+            ],
+        );
+        assert!(
+            deleted.contains(&ORPHAN.to_string()),
+            "GC stopped over children it does not hold: {deleted:?}"
+        );
+    }
+
+    // `POST /v2/b/blobs/uploads/?mount=L&from=a` links the blob into `b` (a hard link on local
+    // storage); the manifest that references it in `b` lands next. GC between the two must keep
+    // it — a freshly linked object is stamped current so the grace window covers it.
+    #[tokio::test]
+    async fn a_blob_mounted_into_a_repository_survives_until_its_manifest_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        let storage = Storage::new_local(path.to_str().unwrap());
+        blobs(&storage, "a", &["sha256:cfg", "sha256:shared"]).await;
+        manifest(
+            &storage,
+            "a",
+            Some("v1"),
+            image("sha256:cfg", &["sha256:shared"]),
+        )
+        .await;
+        // An hour old, as a layer pushed long ago is.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for entry in walkdir_files(&path) {
+            std::fs::File::options()
+                .write(true)
+                .open(&entry)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        storage
+            .copy(
+                "docker/a/blobs/sha256:shared",
+                "docker/b/blobs/sha256:shared",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, &locks(), false, 600, false, 0, &no_curation()).await;
+        assert!(
+            storage.get("docker/b/blobs/sha256:shared").await.is_ok(),
+            "a mounted blob was deleted before its manifest landed: {:?}",
+            result.orphan_keys
+        );
+    }
+
+    // A namespaced manifest can reference a blob stranded at the legacy
+    // (un-namespaced) key — a partial key migration, or a flat blob still served
+    // through the ns→legacy read fallback (storage_get_reader_with_fallback). The server
+    // serves it; GC must keep it, mirroring the fallback the serve path honors.
+    #[tokio::test]
+    async fn a_namespaced_manifest_keeps_its_legacy_keyed_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        put(&storage, "docker/library/nginx/blobs/sha256:cfg", b"cfg").await;
+        put(
+            &storage,
+            "docker/library/nginx/blobs/sha256:layer",
+            b"layer",
+        )
+        .await;
+        manifest(
+            &storage,
+            "docker.io/library/nginx",
+            Some("latest"),
+            image("sha256:cfg", &["sha256:layer"]),
+        )
+        .await;
+
+        let deleted = would_delete(&storage).await;
+        kept(
+            &deleted,
+            &[
+                "docker/library/nginx/blobs/sha256:cfg".to_string(),
+                "docker/library/nginx/blobs/sha256:layer".to_string(),
+            ],
+        );
     }
 }

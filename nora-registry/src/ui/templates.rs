@@ -119,10 +119,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
     };
     let activity_log = render_activity_log(&activity_rows, t);
 
-    // Format uptime
-    let hours = data.uptime_seconds / 3600;
-    let mins = (data.uptime_seconds % 3600) / 60;
-    let uptime_str = format!("{}h {}m", hours, mins);
+    let uptime_str = format_uptime(data.uptime_seconds, t);
 
     // Render bragging footer (demo builds only)
     #[cfg(feature = "demo")]
@@ -189,7 +186,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
         bragging_footer,
     );
 
-    let polling_script = render_polling_script();
+    let polling_script = render_polling_script(t);
     layout_dark(
         t.dashboard_title,
         &content,
@@ -1916,6 +1913,7 @@ fn get_registry_icon(registry_type: &str) -> &'static str {
         Some(RegistryType::Rpm) => icons::RPM,
         Some(RegistryType::Deb) => icons::DEB,
         Some(RegistryType::Cpan) => icons::CPAN,
+        Some(RegistryType::HuggingFace) => icons::HF,
         None => {
             r#"<path fill="currentColor" d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>"#
         }
@@ -1940,6 +1938,7 @@ fn get_registry_title(registry_type: &str) -> &'static str {
         Some(RegistryType::Rpm) => "RPM (yum/dnf)",
         Some(RegistryType::Deb) => "Debian (APT)",
         Some(RegistryType::Cpan) => "CPAN",
+        Some(RegistryType::HuggingFace) => "Hugging Face Hub",
         None => "Registry",
     }
 }

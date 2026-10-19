@@ -205,7 +205,9 @@ impl CurationEngine {
         let Some(publish_ts) = published else {
             return false;
         };
-        let (threshold, _) = filter.threshold(registry);
+        let Some((threshold, _)) = filter.threshold(registry) else {
+            return false;
+        };
         if crate::cache_ttl::now_unix() as i64 - publish_ts >= threshold
             || filter.allowed(registry, name, version)
         {
@@ -227,7 +229,9 @@ impl CurationEngine {
 
     /// `registry`'s min-release-age in seconds, `None` when none is configured.
     pub fn min_release_age_secs(&self, registry: RegistryType) -> Option<i64> {
-        self.min_age.as_ref().map(|f| f.threshold(registry).0)
+        self.min_age
+            .as_ref()
+            .and_then(|f| f.threshold(registry).map(|(secs, _)| secs))
     }
 
     /// The date min-release-age judges a proxied version by when its trusted upstream
@@ -273,6 +277,21 @@ impl CurationEngine {
         self.config.mode != CurationMode::Off
     }
 
+    /// Whether curation reads a download's name: it is on (audit logs what it would refuse),
+    /// or a namespace filter is set (it runs even with curation off). A format that learns an
+    /// alias's canonical name from its upstream, for curation to read, asks only when this
+    /// holds.
+    pub fn reads_names(&self) -> bool {
+        self.is_active() || self.namespace_filter.is_some()
+    }
+
+    /// Whether a download can be refused by its name: curation enforces, or a namespace filter
+    /// is set (its blocks are never audit-only). Where this does not hold, a name curation
+    /// cannot learn costs the download nothing.
+    pub fn can_refuse_names(&self) -> bool {
+        self.config.mode == CurationMode::Enforce || self.namespace_filter.is_some()
+    }
+
     /// Access raw metrics counters.
     pub fn metrics(&self) -> &CurationMetrics {
         &self.metrics
@@ -302,13 +321,16 @@ impl CurationEngine {
         result
     }
 
-    fn evaluate_inner(&self, request: &FilterRequest) -> EvaluationResult {
+    /// The chain's decision for a request — namespace isolation, the mode, a bypass token, then
+    /// the filters in order (the first that does not skip decides) — with nothing counted or
+    /// logged. `evaluate` counts it; `integrity_applies` asks it about hashes it does not have, so
+    /// both read one chain.
+    fn decide(&self, request: &FilterRequest) -> EvaluationResult {
         // Namespace isolation: ALWAYS active, even in Off mode.
         // Prevents dependency confusion regardless of curation config.
         if let Some(ref ns_filter) = self.namespace_filter {
             let decision = ns_filter.evaluate(request);
             if let Decision::Block { .. } = &decision {
-                self.metrics.blocked.fetch_add(1, Ordering::Relaxed);
                 return EvaluationResult {
                     decision,
                     decided_by: Some(ns_filter.name().to_string()),
@@ -316,7 +338,6 @@ impl CurationEngine {
                 };
             }
         }
-
         // Mode=Off: no-op
         if self.config.mode == CurationMode::Off {
             return EvaluationResult {
@@ -325,35 +346,19 @@ impl CurationEngine {
                 audited: false,
             };
         }
-
         // Bypass token
         if request.bypass {
-            self.metrics.allowed.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                registry = %request.registry,
-                package = %request.name,
-                "[SECURITY] Curation bypassed via token"
-            );
             return EvaluationResult {
                 decision: Decision::Allow,
                 decided_by: Some("bypass".to_string()),
                 audited: false,
             };
         }
-
-        // Track integrity presence
-        if request.integrity.is_none() {
-            self.metrics
-                .without_integrity
-                .fetch_add(1, Ordering::Relaxed);
-        }
-
         // Run filter chain
         for filter in &self.filters {
             let decision = filter.evaluate(request);
             match &decision {
                 Decision::Allow => {
-                    self.metrics.allowed.fetch_add(1, Ordering::Relaxed);
                     return EvaluationResult {
                         decision,
                         decided_by: Some(filter.name().to_string()),
@@ -361,29 +366,52 @@ impl CurationEngine {
                     };
                 }
                 Decision::Block { .. } => {
-                    let audited = self.config.mode == CurationMode::Audit;
-                    if audited {
-                        self.metrics.allowed.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        self.metrics.blocked.fetch_add(1, Ordering::Relaxed);
-                    }
                     return EvaluationResult {
                         decision,
                         decided_by: Some(filter.name().to_string()),
-                        audited,
+                        audited: self.config.mode == CurationMode::Audit,
                     };
                 }
                 Decision::Skip => continue,
             }
         }
-
         // All filters skipped → Allow
-        self.metrics.allowed.fetch_add(1, Ordering::Relaxed);
         EvaluationResult {
             decision: Decision::Allow,
             decided_by: None,
             audited: false,
         }
+    }
+
+    fn evaluate_inner(&self, request: &FilterRequest) -> EvaluationResult {
+        let result = self.decide(request);
+        let namespace_block = matches!(result.decision, Decision::Block { .. })
+            && self.namespace_filter.as_ref().map(|f| f.name()) == result.decided_by.as_deref();
+        if namespace_block {
+            self.metrics.blocked.fetch_add(1, Ordering::Relaxed);
+        } else if self.config.mode == CurationMode::Off {
+            // nothing counted
+        } else if request.bypass {
+            self.metrics.allowed.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                registry = %request.registry,
+                package = %request.name,
+                "[SECURITY] Curation bypassed via token"
+            );
+        } else {
+            // Track integrity presence
+            if request.integrity.is_none() {
+                self.metrics
+                    .without_integrity
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if matches!(result.decision, Decision::Block { .. }) && !result.audited {
+                self.metrics.blocked.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.metrics.allowed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result
     }
 }
 
@@ -583,6 +611,43 @@ pub fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
     }
 
     None
+}
+
+/// Whether a check of this artifact's bytes could refuse them: in enforce mode, the filter chain
+/// (the same one `verify_integrity` reads, first non-skip decides) blocks it on integrity for a
+/// hash other than its own. A serve that cannot hash what it sends (a range
+/// of a stored file) stands down for such an artifact and reads the whole file first. Nothing is
+/// counted or logged.
+pub fn integrity_applies(
+    engine: &CurationEngine,
+    registry: RegistryType,
+    name: &str,
+    version: Option<&str>,
+) -> bool {
+    if engine.config.mode != CurationMode::Enforce {
+        return false;
+    }
+    // Two hashes no file can both have: a pin matches at most one, so one of them is refused.
+    [
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    ]
+    .iter()
+    .any(|probe| {
+        let request = FilterRequest {
+            registry,
+            upstream: None,
+            name: name.to_string(),
+            version: RequestVersion::named(version),
+            integrity: Some((*probe).to_string()),
+            bypass: false,
+            publish_date: None,
+        };
+        // The chain `verify_integrity` reads, asked about a hash this file cannot have.
+        let result = engine.decide(&request);
+        !result.audited
+            && matches!(&result.decision, Decision::Block { rule, .. } if rule.contains("integrity"))
+    })
 }
 
 /// Verify artifact integrity after download (post-download phase, issue #189).
@@ -1230,6 +1295,8 @@ pub fn curation_version(registry: RegistryType, version: &str) -> String {
         RegistryType::Npm => npm_version_key(version).unwrap_or_else(|| version.to_string()),
         RegistryType::Go => go_version_key(version).unwrap_or_else(|| version.to_string()),
         RegistryType::PubDart => pub_version_key(version).unwrap_or_else(|| version.to_string()),
+        // A Hub commit is hex, served in lower case.
+        RegistryType::HuggingFace => version.to_lowercase(),
         _ => version.to_string(),
     }
 }
@@ -1261,7 +1328,8 @@ fn rule_version_matches(registry: RegistryType, rule: &str, version: &str) -> bo
 
 /// A package name in the form its registry looks it up: PyPI per PEP 503, NuGet and Terraform
 /// in lowercase (NuGet ids resolve without case; Terraform lowercases provider names and
-/// registry.terraform.io answers provider and module paths in any case), cargo as crates.io's
+/// registry.terraform.io answers provider and module paths in any case), Hugging Face repo ids
+/// in lowercase (the Hub answers `Org/Model` with a redirect to `org/model`), cargo as crates.io's
 /// `canon_crate_name` (lowercase, `-` as `_`: `Evil-Crate` and `evil_crate` are one crate),
 /// every other registry as written. Requests,
 /// rules, allowlist entries and internal namespaces are compared in this form, so a rule written
@@ -1270,7 +1338,9 @@ fn rule_version_matches(registry: RegistryType, rule: &str, version: &str) -> bo
 pub fn curation_name(registry: RegistryType, name: &str) -> String {
     match registry {
         RegistryType::PyPI => pep503_normalize(name),
-        RegistryType::Nuget | RegistryType::Terraform => name.to_lowercase(),
+        RegistryType::Nuget | RegistryType::Terraform | RegistryType::HuggingFace => {
+            name.to_lowercase()
+        }
         RegistryType::Cargo => name.to_lowercase().replace('-', "_"),
         _ => name.to_string(),
     }
@@ -1379,7 +1449,7 @@ impl IntoResponse for BlockedResponse {
             version: self.version.clone(),
         };
         let version_str = self.version.as_deref().unwrap_or("*");
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "error": "blocked_by_policy",
             "error_version": "v1",
             "context": {
@@ -1395,6 +1465,16 @@ impl IntoResponse for BlockedResponse {
             ),
             "docs": CURATION_DOCS_URL
         });
+        // Docker clients read only the OCI distribution error format (`errors`); without it they
+        // report "no error details found" and the reason is lost. The refusal adds it beside the
+        // fields above, which stay where scripts read them.
+        if self.registry == RegistryType::Docker {
+            body["errors"] = serde_json::json!([{
+                "code": "DENIED",
+                "message": format!("blocked by policy: {}", self.reason),
+                "detail": body["context"].clone(),
+            }]);
+        }
 
         let mut response = (StatusCode::FORBIDDEN, axum::Json(body)).into_response();
         let headers = response.headers_mut();
@@ -1912,20 +1992,22 @@ pub fn parse_duration(s: &str) -> Result<i64, String> {
     Ok(total)
 }
 
-/// Filter that blocks packages published less than `min_age_secs` ago.
+/// Filter that blocks packages published less than a minimum age ago.
 ///
-/// If `publish_date` is `None` (unknown), the filter returns `Skip` and defers to
-/// the digest quarantine (see `evaluate`). Supports per-registry overrides: if a
-/// registry has its own threshold, it takes precedence over the global
-/// `min_age_secs`. Versions on the per-registry `allow` list
-/// (`[curation.<registry>] allow = ["name@version", "name", "prefix*"]`, see
+/// The minimum is per registry: a registry's own `[curation.<registry>]
+/// min_release_age` if it has one, else the global `min_release_age`. A registry
+/// with neither is not filtered by age — and a per-registry value needs no global
+/// one to apply (#1098). If `publish_date` is `None` (unknown), the filter defers
+/// (`Skip`) to the digest quarantine (#741). Versions on the per-registry `allow`
+/// list (`[curation.<registry>] allow = ["name@version", "name", "prefix*"]`, see
 /// [`AllowEntry`]) are exempt from the age check only; the digest quarantine, the
 /// blocklist and internal namespaces still apply to them.
 #[derive(Clone)]
 pub struct MinReleaseAgeFilter {
-    min_age_secs: i64,
-    label: String,
-    /// Per-registry override thresholds (seconds).
+    /// The global threshold (seconds, label): the default for registries
+    /// without their own.
+    default: Option<(i64, String)>,
+    /// Per-registry thresholds (seconds, label).
     overrides: std::collections::HashMap<RegistryType, (i64, String)>,
     /// Exact versions exempt from the age check: (registry, name, version), normalized,
     /// to the entry as configured.
@@ -2053,10 +2135,12 @@ impl AllowEntry {
 }
 
 impl MinReleaseAgeFilter {
+    /// A filter with a global threshold only (unit tests; the server builds it
+    /// with [`Self::from_config`]).
+    #[cfg(test)]
     pub fn new(min_age_secs: i64, label: &str) -> Self {
         Self {
-            min_age_secs,
-            label: label.to_string(),
+            default: Some((min_age_secs, label.to_string())),
             overrides: std::collections::HashMap::new(),
             allow: std::collections::HashMap::new(),
             allow_patterns: Vec::new(),
@@ -2079,19 +2163,98 @@ impl MinReleaseAgeFilter {
         Ok(())
     }
 
-    /// Add a per-registry override. If `registry` has its own min_release_age,
-    /// it will be used instead of the global default.
-    pub fn add_override(&mut self, registry: RegistryType, age_secs: i64, label: String) {
-        self.overrides.insert(registry, (age_secs, label));
+    /// The filter `cfg` asks for: the global `min_release_age` as the default and
+    /// each `[curation.<registry>] min_release_age` as that registry's own
+    /// threshold; `None` when no value is set anywhere. The one builder for
+    /// startup, SIGHUP reload, `curation explain` and the test state.
+    ///
+    /// A value that does not parse is left out and returned by its key and value,
+    /// for the caller to refuse (enforce) or log.
+    pub fn from_config(cfg: &crate::config::CurationConfig) -> (Option<Self>, Vec<String>) {
+        let mut problems = Vec::new();
+        let mut parse = |key: String, value: &str| match parse_duration(value) {
+            Ok(secs) => Some((secs, value.to_string())),
+            Err(e) => {
+                problems.push(format!("{key}=\"{value}\": {e}"));
+                None
+            }
+        };
+        let default = cfg
+            .min_release_age
+            .as_deref()
+            .and_then(|value| parse("curation.min_release_age".to_string(), value));
+        let mut overrides = std::collections::HashMap::new();
+        for &rt in RegistryType::all() {
+            let Some(value) = cfg
+                .registry_override(rt)
+                .and_then(|o| o.min_release_age.as_deref())
+            else {
+                continue;
+            };
+            if let Some(threshold) = parse(format!("curation.{rt}.min_release_age"), value) {
+                overrides.insert(rt, threshold);
+            }
+        }
+        if default.is_none() && overrides.is_empty() {
+            return (None, problems);
+        }
+        let mut filter = Self {
+            default,
+            overrides,
+            allow: std::collections::HashMap::new(),
+            allow_patterns: Vec::new(),
+        };
+        // An invalid allow entry is dropped: that version stays held, never wrongly
+        // let through (config validation reports it, an error under NORA_CONFIG_STRICT).
+        for &rt in RegistryType::all() {
+            for entry in cfg
+                .registry_override(rt)
+                .map(|o| o.allow.as_slice())
+                .unwrap_or_default()
+            {
+                if let Err(e) = filter.add_allow(rt, entry) {
+                    tracing::error!(error = %e, "Invalid min-release-age allow entry");
+                }
+            }
+        }
+        (Some(filter), problems)
+    }
+
+    /// The global threshold `(seconds, value)` when no registry has its own: the
+    /// configuration `curation explain` and the start-up log describe as before
+    /// per-registry values applied on their own (#1098).
+    pub fn global_only(&self) -> Option<(i64, &str)> {
+        match &self.default {
+            Some((secs, label)) if self.overrides.is_empty() => Some((*secs, label.as_str())),
+            _ => None,
+        }
+    }
+
+    /// The thresholds for a log line: `"7d (npm: 3d)"`, or `"npm: 3d"` without a
+    /// global value.
+    pub fn summary(&self) -> String {
+        let overrides: Vec<String> = RegistryType::all()
+            .iter()
+            .filter_map(|rt| {
+                self.overrides
+                    .get(rt)
+                    .map(|(_, label)| format!("{rt}: {label}"))
+            })
+            .collect();
+        match (&self.default, overrides.is_empty()) {
+            (Some((_, label)), true) => label.clone(),
+            (Some((_, label)), false) => format!("{label} ({})", overrides.join(", ")),
+            (None, _) => overrides.join(", "),
+        }
     }
 
     /// The threshold (seconds) and its label for `registry`: a per-registry
-    /// override takes precedence over the global default.
-    fn threshold(&self, registry: RegistryType) -> (i64, &str) {
-        match self.overrides.get(&registry) {
-            Some((secs, lbl)) => (*secs, lbl.as_str()),
-            None => (self.min_age_secs, self.label.as_str()),
-        }
+    /// override takes precedence over the global default; `None` when `registry` has no threshold of its own and there is no global one.
+    fn threshold(&self, registry: RegistryType) -> Option<(i64, &str)> {
+        self.overrides
+            .get(&registry)
+            .or(self.default.as_ref())
+            .map(|(secs, lbl)| (*secs, lbl.as_str()))
     }
 
     /// Whether `name@version` is on `registry`'s allow list.
@@ -2140,7 +2303,10 @@ impl ProxyFilter for MinReleaseAgeFilter {
     }
 
     fn evaluate(&self, request: &FilterRequest) -> Decision {
-        let (threshold, label) = self.threshold(request.registry);
+        let Some((threshold, label)) = self.threshold(request.registry) else {
+            // Neither a value of its own nor a global one: not filtered by age.
+            return Decision::Skip;
+        };
 
         let Some(publish_ts) = request.publish_date else {
             // Defer to digest-quarantine — the unspoofable first-seen holder
@@ -2199,6 +2365,28 @@ mod tests {
     use super::*;
     use crate::config::{CurationConfig, CurationMode, CurationOnFailure};
     use sha2::Digest;
+
+    #[test]
+    fn names_are_read_when_curation_is_on_and_refused_when_it_enforces() {
+        let with_namespace = |config: &CurationConfig| {
+            let mut engine = CurationEngine::new(config.clone());
+            engine.set_namespace_filter(Box::new(NamespaceFilter::new(vec!["acme/*".into()])));
+            engine
+        };
+        let mut config = CurationConfig::default();
+        let off = CurationEngine::new(config.clone());
+        assert!(!off.reads_names() && !off.can_refuse_names());
+        let ns = with_namespace(&config);
+        assert!(ns.reads_names() && ns.can_refuse_names());
+        config.mode = CurationMode::Audit;
+        let audit = CurationEngine::new(config.clone());
+        assert!(audit.reads_names() && !audit.can_refuse_names());
+        let ns = with_namespace(&config);
+        assert!(ns.reads_names() && ns.can_refuse_names());
+        config.mode = CurationMode::Enforce;
+        let enforce = CurationEngine::new(config);
+        assert!(enforce.reads_names() && enforce.can_refuse_names());
+    }
 
     /// A test filter that always allows.
     struct AllowAllFilter;
@@ -2657,6 +2845,49 @@ mod tests {
             response.headers().get("x-nora-reason").unwrap(),
             "known-vulnerable"
         );
+    }
+
+    /// A docker refusal carries the OCI distribution error a docker client prints (#1149), and keeps
+    /// every field of the refusal body where scripts read them; other registries' bodies are as
+    /// they were, without `errors`.
+    #[tokio::test]
+    async fn a_docker_refusal_is_also_an_oci_error() {
+        let docker = refusal_body(BlockedResponse {
+            rule: "min-release-age".to_string(),
+            reason: "package is 0h old (minimum: 7d)".to_string(),
+            registry: RegistryType::Docker,
+            package: "corp/app".to_string(),
+            version: Some("1.0".to_string()),
+        })
+        .await;
+        assert_eq!(docker["errors"][0]["code"], "DENIED");
+        assert_eq!(
+            docker["errors"][0]["message"],
+            "blocked by policy: package is 0h old (minimum: 7d)"
+        );
+        assert_eq!(docker["errors"][0]["detail"]["package"], "corp/app");
+        assert_eq!(docker["error"], "blocked_by_policy");
+        assert_eq!(docker["error_version"], "v1");
+        assert_eq!(
+            docker["context"]["reason"],
+            "package is 0h old (minimum: 7d)"
+        );
+        assert!(docker["hint"]
+            .as_str()
+            .unwrap()
+            .contains("docker:corp/app@1.0"));
+        for registry in [
+            RegistryType::Npm,
+            RegistryType::PyPI,
+            RegistryType::Maven,
+            RegistryType::Cargo,
+            RegistryType::Go,
+            RegistryType::Raw,
+        ] {
+            let body = refusal_body(refusal(registry, "p", Some("1"))).await;
+            assert!(body.get("errors").is_none(), "{registry}: {body}");
+            assert_eq!(body["error"], "blocked_by_policy", "{registry}");
+        }
     }
 
     /// The JSON body of a refusal, as a client reads it.

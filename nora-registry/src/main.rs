@@ -1,6 +1,8 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 #![deny(clippy::unwrap_used)]
+// The storage boundary lists of clippy.toml are denied by ui/ and registry/ only.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
 #![warn(clippy::large_stack_frames, clippy::large_futures)]
 // Test code is linted under `--all-targets` but is not held to the production
@@ -255,6 +257,135 @@ enum CurationCommand {
 /// holding a `publish_lock` (handlers never touch `cleanup_lock`).
 pub type PublishLocks = Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 
+/// One GC pass of the scheduler. A pass that removed anything marks every repository index
+/// stale, so the dashboard, `/api/ui/stats` and the artifact gauges show the store and not
+/// what it held before the pass; a write marks its own registry the same way.
+#[allow(clippy::too_many_arguments)]
+async fn gc_pass(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    repo_index: &RepoIndex,
+    dry_run: bool,
+    grace_secs: u64,
+    npm_is_proxy: bool,
+    proxy_cache_max_bytes: u64,
+    curation: &curation::CurationEngine,
+) -> gc::GcResult {
+    let result = gc::run_gc(
+        storage,
+        publish_locks,
+        dry_run,
+        grace_secs,
+        npm_is_proxy,
+        proxy_cache_max_bytes,
+        curation,
+    )
+    .await;
+    if !dry_run && result.removed_anything() {
+        repo_index.invalidate_all();
+    }
+    result
+}
+
+/// The line the GC scheduler logs when a pass ends. Files evicted by
+/// `[gc] proxy_cache_max_bytes` are counted apart from the orphans: they are neither in
+/// `deleted` nor in its `bytes_freed`.
+fn gc_done_line(result: &gc::GcResult, dry_run: bool) -> String {
+    let eviction = &result.proxy_cache_eviction;
+    if dry_run {
+        // A dry pass deletes nothing: its counts are what a real pass would take.
+        return format!(
+            "GC scheduler: dry run in {:.1}s — {} orphans ({} bytes would be freed), {} would be evicted from the proxy cache ({} bytes), {} metadata phantoms, {} skipped (grace)",
+            result.duration_secs,
+            result.orphaned,
+            result.bytes_freed,
+            eviction.evicted_files,
+            eviction.bytes_freed,
+            result.metadata_phantoms_removed,
+            result.skipped_recent
+        );
+    }
+    format!(
+        "GC scheduler: done in {:.1}s — {} orphans ({} deleted, {} bytes freed), {} evicted from the proxy cache ({} bytes freed), {} metadata phantoms, {} skipped (grace)",
+        result.duration_secs,
+        result.orphaned,
+        result.deleted,
+        result.bytes_freed,
+        eviction.evicted_files,
+        eviction.bytes_freed,
+        result.metadata_phantoms_removed,
+        result.skipped_recent
+    )
+}
+
+/// One retention pass of the scheduler; a pass that deleted keys marks every repository
+/// index stale, as `gc_pass` does. A pass that found versions to delete leaves one audit
+/// entry: `retention-apply` when it deleted them, `retention-dry-run` when `dry_run` only
+/// planned it, so the trail never records a deletion that did not happen.
+async fn retention_pass(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    repo_index: &RepoIndex,
+    signer: Option<&signing::RepoSigner>,
+    rules: &[config::RetentionRule],
+    dry_run: bool,
+    audit: &AuditLog,
+) -> retention::RetentionResult {
+    let result = retention::run_retention(storage, publish_locks, signer, rules, dry_run).await;
+    if !dry_run && result.deleted_keys > 0 {
+        repo_index.invalidate_all();
+    }
+    if result.planned > 0 {
+        audit.log(audit::AuditEntry::new(
+            if dry_run {
+                "retention-dry-run"
+            } else {
+                "retention-apply"
+            },
+            "scheduler",
+            &format!("{} versions", result.planned),
+            "*",
+            &if dry_run {
+                // Nothing was deleted: the bytes are what an applied pass would free.
+                format!(
+                    "would_free_bytes={} duration={:.1}s",
+                    result.bytes_freed, result.duration_secs
+                )
+            } else {
+                format!(
+                    "keys={} bytes_freed={} duration={:.1}s",
+                    result.deleted_keys, result.bytes_freed, result.duration_secs
+                )
+            },
+        ));
+    }
+    result
+}
+
+/// Set `nora_artifacts_total` and the per-registry `nora_storage_bytes` from the
+/// repository index, first starting a rebuild of each enabled registry's index that a
+/// restart, a write or a cleanup pass marked stale, as a read of `/api/ui/stats` does. An
+/// index nothing touched since its last rebuild is served from memory without a storage
+/// round-trip; a stale one costs one listing of its registry.
+async fn refresh_artifact_gauges(state: &AppState) {
+    let repo_index = &state.repo_index;
+    // Rebuilds start in the background and are waited for a bounded time: a stale index
+    // still sets its gauges, the rebuilt one at the next tick.
+    repo_index
+        .settle(state.enabled_registries.iter().copied(), state)
+        .await;
+    for (rt, count) in repo_index.counts() {
+        metrics::ARTIFACTS_TOTAL
+            .with_label_values(&[rt.as_str()])
+            .set(count as i64);
+    }
+    for (rt, bytes) in repo_index.sizes() {
+        metrics::STORAGE_BYTES
+            .with_label_values(&[rt.as_str()])
+            .set(bytes as i64);
+    }
+}
+
 /// Get or create a per-key publish lock for TOCTOU protection.
 ///
 /// Used by both `AppState::publish_lock()` and GC metadata cleanup to ensure
@@ -287,6 +418,11 @@ pub struct AppState {
     pub docker_auth: Arc<registry::DockerAuth>,
     pub repo_index: Arc<RepoIndex>,
     pub http_client: reqwest::Client,
+    /// The same client, except that it never follows a redirect: for a format whose answer
+    /// depends on what each hop said (hf: the commit rides on the Hub's redirect).
+    pub http_client_no_redirect: reqwest::Client,
+    /// Canonical repo ids the Hugging Face upstream named, for curation of aliases (#579).
+    pub hf_canonical_ids: Arc<registry::hf::CanonicalIds>,
     pub upload_sessions: Arc<RwLock<HashMap<String, registry::docker::UploadSession>>>,
     /// Per-key publish locks for TOCTOU protection (immutable releases)
     publish_locks: PublishLocks,
@@ -460,11 +596,13 @@ const USER_AGENT: &str = concat!("nora/", env!("CARGO_PKG_VERSION"));
 /// (used by `nora mirror` for long-running downloads). When `no_proxy` is true
 /// the client ignores any `HTTP(S)_PROXY` env — required for loopback probes
 /// (the healthcheck) that must reach the local server directly, not via an
-/// upstream proxy.
+/// upstream proxy. `redirect` is reqwest's own default (`Policy::default()`) for
+/// every client but the one in [`build_no_redirect_client`].
 fn build_http_client(
     tls: &TlsConfig,
     timeout: Option<std::time::Duration>,
     no_proxy: bool,
+    redirect: reqwest::redirect::Policy,
 ) -> reqwest::Client {
     // A black-holed upstream fails the connect in seconds instead of eating the
     // whole per-request timeout (twice, with the proxy retry).
@@ -474,7 +612,8 @@ fn build_http_client(
     let mut builder = reqwest::ClientBuilder::new()
         .user_agent(USER_AGENT)
         .connect_timeout(std::time::Duration::from_secs(10))
-        .pool_idle_timeout(std::time::Duration::from_secs(30));
+        .pool_idle_timeout(std::time::Duration::from_secs(30))
+        .redirect(redirect);
 
     if let Some(t) = timeout {
         builder = builder.timeout(t);
@@ -507,6 +646,14 @@ fn build_http_client(
     }
 
     builder.build().expect("Failed to build HTTP client")
+}
+
+/// The client that never follows a redirect, for a format whose answer depends on what each
+/// hop said (hf: the commit rides on the Hub's redirect). Built by [`build_http_client`]
+/// (custom CA, user agent, proxy settings); the test context builds it here too, so the
+/// tests run against the very client the server uses.
+pub(crate) fn build_no_redirect_client(tls: &TlsConfig) -> reqwest::Client {
+    build_http_client(tls, None, false, reqwest::redirect::Policy::none())
 }
 
 /// Build the `/health` probe URL from the configured listen host. Wildcard
@@ -555,6 +702,7 @@ async fn run_healthcheck(timeout_secs: u64) -> i32 {
         &TlsConfig::default(),
         Some(std::time::Duration::from_secs(timeout_secs)),
         true,
+        reqwest::redirect::Policy::default(),
     );
     match client.get(&url).send().await {
         // /health returns 200 when healthy, 503 when storage is unreachable.
@@ -1275,6 +1423,9 @@ async fn main() {
             println!("  Orphaned:          {}", result.orphaned);
             println!("  Deleted:           {}", result.deleted);
             println!("  Bytes freed:       {}", result.bytes_freed);
+            if result.docker_mark_failed {
+                println!("  Docker sweep:      skipped (manifest graph incomplete; all Docker objects kept)");
+            }
             if result.skipped_recent > 0 {
                 println!(
                     "  Skipped (grace):   {} (younger than {}s — likely in-flight uploads)",
@@ -1311,6 +1462,9 @@ async fn main() {
                     .map(|(name, count)| format!("{} ({} files)", name, count))
                     .collect();
                 println!("\nNote: GC does not scan: {}", parts.join(", "));
+            }
+            if result.docker_mark_failed {
+                std::process::exit(1);
             }
         }
         Some(Commands::RetentionPlan) => {
@@ -1419,6 +1573,7 @@ async fn main() {
                 &config.tls,
                 Some(std::time::Duration::from_secs(300)),
                 false,
+                reqwest::redirect::Policy::default(),
             );
             if let Err(e) = mirror::run_mirror(format, &registry, concurrency, json, &client).await
             {
@@ -1671,65 +1826,6 @@ fn build_signer(
     None
 }
 
-/// Load per-registry min_release_age overrides from CurationConfig into the filter.
-fn load_registry_overrides(
-    filter: &mut curation::MinReleaseAgeFilter,
-    curation_config: &config::CurationConfig,
-) {
-    let registry_overrides: &[(RegistryType, &config::RegistryCurationOverride)] = &[
-        (RegistryType::Npm, &curation_config.npm),
-        (RegistryType::PyPI, &curation_config.pypi),
-        (RegistryType::Cargo, &curation_config.cargo),
-        (RegistryType::Go, &curation_config.go),
-        (RegistryType::Docker, &curation_config.docker),
-        (RegistryType::Maven, &curation_config.maven),
-        (RegistryType::Gems, &curation_config.gems),
-        (RegistryType::Terraform, &curation_config.terraform),
-        (RegistryType::Ansible, &curation_config.ansible),
-        (RegistryType::Nuget, &curation_config.nuget),
-        (RegistryType::PubDart, &curation_config.pub_dart),
-        (RegistryType::Conan, &curation_config.conan),
-        (RegistryType::Rpm, &curation_config.rpm),
-        (RegistryType::Deb, &curation_config.deb),
-        (RegistryType::Cpan, &curation_config.cpan),
-    ];
-
-    for (registry, override_cfg) in registry_overrides {
-        if let Some(ref age_str) = override_cfg.min_release_age {
-            match curation::parse_duration(age_str) {
-                Ok(secs) => {
-                    filter.add_override(*registry, secs, age_str.clone());
-                    tracing::info!(
-                        registry = %registry,
-                        min_age = %age_str,
-                        seconds = secs,
-                        "Per-registry min-release-age override loaded"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        registry = %registry,
-                        value = %age_str,
-                        error = %e,
-                        "Invalid per-registry min_release_age"
-                    );
-                }
-            }
-        }
-        // An invalid entry is dropped: that version stays held, never wrongly let through.
-        for entry in &override_cfg.allow {
-            match filter.add_allow(*registry, entry) {
-                Ok(()) => tracing::info!(
-                    registry = %registry,
-                    entry = %entry,
-                    "min-release-age allow entry loaded"
-                ),
-                Err(e) => tracing::error!(error = %e, "Invalid min-release-age allow entry"),
-            }
-        }
-    }
-}
-
 fn run_curation_validate(file: &Path) {
     let content = match std::fs::read_to_string(file) {
         Ok(c) => c,
@@ -1873,15 +1969,11 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
         }
     };
 
-    // Build engine with configured filters
-    let mut engine = curation::CurationEngine::new(config.curation.clone());
-
+    // What is configured, for the reader. The decision below comes from the engine the server
+    // builds (`build_curation_engine`), so explain answers what the server would decide.
     if let Some(ref path) = config.curation.blocklist_path {
         match curation::BlocklistFilter::from_file(path) {
-            Ok(filter) => {
-                println!("Blocklist: {} ({} rules)", path, filter.rule_count());
-                engine.add_filter(Box::new(filter));
-            }
+            Ok(filter) => println!("Blocklist: {} ({} rules)", path, filter.rule_count()),
             Err(e) => println!("Blocklist: {} (ERROR: {})", path, e),
         }
     } else {
@@ -1890,39 +1982,43 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
 
     if let Some(ref path) = config.curation.allowlist_path {
         match curation::AllowlistFilter::from_file(path, config.curation.require_integrity) {
-            Ok(filter) => {
-                println!("Allowlist: {} ({} entries)", path, filter.entry_count());
-                engine.add_filter(Box::new(filter));
-            }
+            Ok(filter) => println!("Allowlist: {} ({} entries)", path, filter.entry_count()),
             Err(e) => println!("Allowlist: {} (ERROR: {})", path, e),
         }
     } else {
         println!("Allowlist: not configured");
     }
 
-    if !config.curation.internal_namespaces.is_empty() {
-        let ns_filter = curation::NamespaceFilter::new(config.curation.internal_namespaces.clone());
-        println!("Namespaces: {} patterns", ns_filter.pattern_count());
-        engine.set_namespace_filter(Box::new(ns_filter));
-    } else {
+    if config.curation.internal_namespaces.is_empty() {
         println!("Namespaces: not configured");
+    } else {
+        println!(
+            "Namespaces: {} patterns",
+            config.curation.internal_namespaces.len()
+        );
     }
 
-    let mut min_age = None;
-    if let Some(ref age_str) = config.curation.min_release_age {
-        match curation::parse_duration(age_str) {
-            Ok(secs) => {
-                let mut filter = curation::MinReleaseAgeFilter::new(secs, age_str);
-                load_registry_overrides(&mut filter, &config.curation);
-                println!("Min-release-age: {} ({}s)", age_str, secs);
-                engine.add_filter(Box::new(filter.clone()));
-                min_age = Some(filter);
-            }
-            Err(e) => println!("Min-release-age: {} (ERROR: {})", age_str, e),
-        }
-    } else {
-        println!("Min-release-age: not configured");
+    let (min_age, problems) = curation::MinReleaseAgeFilter::from_config(&config.curation);
+    for problem in &problems {
+        println!("Min-release-age: ERROR: {}", problem);
     }
+    match &min_age {
+        Some(filter) => match filter.global_only() {
+            Some((secs, value)) => println!("Min-release-age: {} ({}s)", value, secs),
+            None => println!("Min-release-age: {}", filter.summary()),
+        },
+        None if problems.is_empty() => println!("Min-release-age: not configured"),
+        None => {}
+    }
+
+    let engine = match build_curation_engine(config) {
+        Ok(engine) => engine,
+        Err(e) => {
+            println!("Mode: {}", config.curation.mode);
+            println!("Decision: the server refuses this configuration and does not start: {e}");
+            std::process::exit(78);
+        }
+    };
 
     println!("Mode: {}", config.curation.mode);
     println!("---");
@@ -2467,7 +2563,13 @@ async fn run_server(mut config: Config, storage: Storage) {
     // Warn about plaintext credentials in config.toml
     config.warn_plaintext_credentials();
 
-    let http_client = build_http_client(&config.tls, None, false);
+    let http_client = build_http_client(
+        &config.tls,
+        None,
+        false,
+        reqwest::redirect::Policy::default(),
+    );
+    let http_client_no_redirect = build_no_redirect_client(&config.tls);
     log_outbound_proxy();
 
     // Initialize Docker auth with shared HTTP client (includes custom CA certs)
@@ -2508,56 +2610,38 @@ async fn run_server(mut config: Config, storage: Storage) {
     // the flags at their defaults, so rpm/deb 404. (#856)
     config.apply_enabled_registries(&enabled_registries);
 
+    // An open proxy is announced on every start (#1135): written down, it is the operator's
+    // decision; left at the default, 1.5.0 refuses to start with it, and the gauge lets an alert
+    // see that before the upgrade does.
+    let curation_mode_implicit = match config.curation_mode_notice() {
+        Some(config::CurationModeNotice::Implicit(proxies)) => {
+            let names: Vec<&str> = proxies.iter().map(|rt| rt.as_str()).collect();
+            warn!(
+                registries = %names.join(", "),
+                "curation.mode is not set and proxy registries are enabled: upstream packages are served unchecked. From 1.5.0 NORA will not start without curation.mode; set it (NORA_CURATION_MODE or [curation] mode) to \"off\" to keep this behaviour, or to \"audit\" or \"enforce\""
+            );
+            true
+        }
+        Some(config::CurationModeNotice::ExplicitOff(proxies)) => {
+            let names: Vec<&str> = proxies.iter().map(|rt| rt.as_str()).collect();
+            warn!(
+                registries = %names.join(", "),
+                "curation.mode=off is set: upstream packages are served unchecked"
+            );
+            false
+        }
+        None => false,
+    };
+    metrics::CONFIG_DEPRECATED
+        .with_label_values(&["curation_mode_implicit"])
+        .set(i64::from(curation_mode_implicit));
+
     // Make the enabled set available to the UI sidebar so its nav lists exactly
     // the enabled registries (matching the dashboard body). Set once, immutable.
     ui::components::set_enabled_registries(enabled_registries.clone());
 
     // Registry routes — only merge enabled registries
-    let mut registry_routes = Router::new();
-    for reg in &enabled_registries {
-        match reg {
-            RegistryType::Docker => {
-                registry_routes = registry_routes.merge(registry::docker_routes())
-            }
-            RegistryType::Maven => {
-                registry_routes = registry_routes.merge(registry::maven_routes())
-            }
-            RegistryType::Npm => registry_routes = registry_routes.merge(registry::npm_routes()),
-            RegistryType::Cargo => {
-                registry_routes = registry_routes.merge(registry::cargo_routes())
-            }
-            RegistryType::PyPI => registry_routes = registry_routes.merge(registry::pypi_routes()),
-            RegistryType::Raw => registry_routes = registry_routes.merge(registry::raw_routes()),
-            RegistryType::Go => registry_routes = registry_routes.merge(registry::go_routes()),
-            RegistryType::Gems => registry_routes = registry_routes.merge(registry::gems_routes()),
-            RegistryType::Terraform => {
-                registry_routes = registry_routes.merge(registry::terraform_routes())
-            }
-            RegistryType::Ansible => {
-                registry_routes = registry_routes.merge(registry::ansible_routes())
-            }
-            RegistryType::Nuget => {
-                registry_routes = registry_routes
-                    .merge(registry::nuget_routes())
-                    .merge(registry::nuget_alias_routes())
-            }
-            RegistryType::PubDart => {
-                registry_routes = registry_routes.merge(registry::pub_dart_routes())
-            }
-            RegistryType::Conan => {
-                registry_routes = registry_routes.merge(registry::conan_routes())
-            }
-            #[cfg(feature = "rpm")]
-            RegistryType::Rpm => registry_routes = registry_routes.merge(registry::rpm_routes()),
-            #[cfg(feature = "deb")]
-            RegistryType::Deb => registry_routes = registry_routes.merge(registry::deb_routes()),
-            // Compiled out: `Config::enabled_registries` never returns it.
-            #[cfg(not(all(feature = "rpm", feature = "deb")))]
-            #[allow(unreachable_patterns)]
-            RegistryType::Rpm | RegistryType::Deb => {}
-            RegistryType::Cpan => registry_routes = registry_routes.merge(registry::cpan_routes()),
-        }
-    }
+    let registry_routes = registry_routes(&enabled_registries);
 
     // Routes WITHOUT rate limiting (health, metrics, UI)
     let public_routes = Router::new()
@@ -2667,6 +2751,8 @@ async fn run_server(mut config: Config, storage: Storage) {
         docker_auth: Arc::new(docker_auth),
         repo_index: Arc::new(RepoIndex::new()),
         http_client,
+        http_client_no_redirect,
+        hf_canonical_ids: Arc::default(),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         reloadable,
@@ -2719,6 +2805,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         let rules = state.config.retention.rules.clone();
         let dry_run = state.config.retention.dry_run;
         let audit = state.audit.clone();
+        let repo_index = state.repo_index.clone();
         cleanup_passes.push(cleanup::CleanupPass {
             name: "retention",
             interval: std::time::Duration::from_secs(state.config.retention.interval),
@@ -2728,36 +2815,26 @@ async fn run_server(mut config: Config, storage: Storage) {
                 let signer = signer.clone();
                 let rules = rules.clone();
                 let audit = audit.clone();
+                let repo_index = repo_index.clone();
                 async move {
                     info!(
                         dry_run = dry_run,
                         "Retention scheduler: starting periodic run"
                     );
-                    let result = retention::run_retention(
+                    let result = retention_pass(
                         &storage,
                         &publish_locks,
+                        &repo_index,
                         signer.as_deref(),
                         &rules,
                         dry_run,
+                        &audit,
                     )
                     .await;
                     info!(
                         "Retention scheduler: done in {:.1}s — {} versions, {} keys, {} bytes freed",
                         result.duration_secs, result.planned, result.deleted_keys, result.bytes_freed
                     );
-
-                    if result.planned > 0 {
-                        audit.log(audit::AuditEntry::new(
-                            "retention-apply",
-                            "scheduler",
-                            &format!("{} versions", result.planned),
-                            "*",
-                            &format!(
-                                "keys={} bytes_freed={} duration={:.1}s",
-                                result.deleted_keys, result.bytes_freed, result.duration_secs
-                            ),
-                        ));
-                    }
                 }
                 .boxed()
             }),
@@ -2797,6 +2874,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         let npm_is_proxy = !state.config.npm.upstream_urls().is_empty();
         let proxy_cache_max_bytes = state.config.gc.proxy_cache_max_bytes;
         let reloadable = Arc::clone(&state.reloadable);
+        let repo_index = state.repo_index.clone();
         cleanup_passes.push(cleanup::CleanupPass {
             name: "gc",
             interval: std::time::Duration::from_secs(state.config.gc.interval),
@@ -2805,14 +2883,21 @@ async fn run_server(mut config: Config, storage: Storage) {
                 let publish_locks = publish_locks.clone();
                 // The current (SIGHUP-reloadable) internal namespaces, for eviction.
                 let curation = reloadable.load_full();
+                let repo_index = repo_index.clone();
                 async move {
                     info!("GC scheduler: starting periodic run");
-                    let result = gc::run_gc(&storage, &publish_locks, dry_run, grace_secs, npm_is_proxy, proxy_cache_max_bytes, &curation.curation_engine).await;
-                    info!(
-                        "GC scheduler: done in {:.1}s — {} orphans, {} deleted, {} bytes freed, {} metadata phantoms, {} skipped (grace)",
-                        result.duration_secs, result.orphaned, result.deleted, result.bytes_freed,
-                        result.metadata_phantoms_removed, result.skipped_recent
-                    );
+                    let result = gc_pass(
+                        &storage,
+                        &publish_locks,
+                        &repo_index,
+                        dry_run,
+                        grace_secs,
+                        npm_is_proxy,
+                        proxy_cache_max_bytes,
+                        &curation.curation_engine,
+                    )
+                    .await;
+                    info!("{}", gc_done_line(&result, dry_run));
                 }
                 .boxed()
             }),
@@ -2878,6 +2963,28 @@ async fn run_server(mut config: Config, storage: Storage) {
     // ...and streamed raw uploads a crash cut off mid-request.
     if state.config.raw.enabled {
         registry::raw::cleanup_upload_temp_dir(&state.config.storage.path);
+    }
+    // ...and Hugging Face cache fills a crash cut off mid-file.
+    if state.config.hf.enabled {
+        registry::hf::cleanup_fill_temp_dir(&state.config.storage.path);
+    }
+
+    // Cargo: the name record of every crate published before records existed (`-` and `_` name one
+    // crate), before the first request: until then another spelling of such a crate would reach the
+    // upstream, and a publish of it would pass. A panic there must not take the server down.
+    if state.enabled_registries.contains(&RegistryType::Cargo) {
+        let started = std::time::Instant::now();
+        let rebuilt =
+            std::panic::AssertUnwindSafe(registry::rebuild_cargo_name_records(&state.storage))
+                .catch_unwind()
+                .await;
+        match rebuilt {
+            Ok(()) => tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "cargo name records checked"
+            ),
+            Err(e) => tracing::error!(panic = ?e, "cargo name-record rebuild panicked"),
+        }
     }
 
     let listener = bind_listener(&state.config.server.host, state.config.server.port)
@@ -2973,18 +3080,16 @@ async fn run_server(mut config: Config, storage: Storage) {
                 metrics_state.storage.refresh_reachability().await;
                 // Samples nora_storage_reachable without waiting for a /ready probe.
                 metrics_state.storage.health_check().await;
-                // Per-registry artifact counts + logical bytes from the cached index,
-                // plus process uptime (#446). The "total" storage_bytes label above is
+                // Per-registry artifact counts + logical bytes from the index, plus
+                // process uptime (#446). The "total" storage_bytes label (its own task) is
                 // the full physical footprint; per-registry is summed artifact size.
-                for (rt, count) in metrics_state.repo_index.counts() {
-                    metrics::ARTIFACTS_TOTAL
-                        .with_label_values(&[rt.as_str()])
-                        .set(count as i64);
-                }
-                for (rt, bytes) in metrics_state.repo_index.sizes() {
-                    metrics::STORAGE_BYTES
-                        .with_label_values(&[rt.as_str()])
-                        .set(bytes as i64);
+                // A panic in an index builder must not end this loop: it also flushes
+                // tokens and expires upload sessions.
+                let gauges = std::panic::AssertUnwindSafe(refresh_artifact_gauges(&metrics_state))
+                    .catch_unwind()
+                    .await;
+                if let Err(e) = gauges {
+                    tracing::error!(panic = ?e, "artifact gauge refresh panicked");
                 }
                 metrics::UPTIME_SECONDS.set(metrics_state.start_time.elapsed().as_secs() as i64);
             }
@@ -2998,6 +3103,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                 let spool_dir = metrics_state.config.server.spool_dir(&storage_path);
                 tokio::task::spawn_blocking(move || {
                     registry::docker::cleanup_proxy_temp_dir(&storage_path);
+                    registry::hf::cleanup_fill_temp_dir(&storage_path);
                     // Reclaim upload temp files orphaned by a storage-write failure
                     // without waiting for a restart. cleanup_expired_sessions only
                     // frees temps still tracked by a live (expired) session, so an
@@ -3475,21 +3581,84 @@ fn build_curation_engine(config: &Config) -> Result<curation::CurationEngine, St
         info!(patterns = count, "Namespace isolation filter loaded");
     }
 
-    // Load min-release-age filter if configured
-    if let Some(ref age_str) = config.curation.min_release_age {
-        match curation::parse_duration(age_str) {
-            Ok(secs) => {
-                let mut filter = curation::MinReleaseAgeFilter::new(secs, age_str);
-                load_registry_overrides(&mut filter, &config.curation);
-                engine.set_min_release_age(filter);
-                info!(min_age = %age_str, seconds = secs, "Min-release-age filter loaded");
+    // Load the min-release-age filter if the global value or any per-registry one
+    // is set: a per-registry value applies on its own (#1098).
+    let (min_age, problems) = curation::MinReleaseAgeFilter::from_config(&config.curation);
+    if enforce && !problems.is_empty() {
+        return Err(format!("invalid min_release_age: {}", problems.join("; ")));
+    }
+    for problem in &problems {
+        error!(problem = %problem, "Invalid min_release_age");
+    }
+    if let Some(filter) = min_age {
+        match filter.global_only() {
+            Some((secs, value)) => {
+                info!(min_age = %value, seconds = secs, "Min-release-age filter loaded")
             }
-            Err(e) if enforce => return Err(format!("invalid min_release_age {age_str}: {e}")),
-            Err(e) => error!(value = %age_str, error = %e, "Invalid min_release_age"),
+            None => info!(min_age = %filter.summary(), "Min-release-age filter loaded"),
         }
+        engine.set_min_release_age(filter);
     }
 
     Ok(engine)
+}
+
+/// The routes of the enabled registries — one assembly for the server and the tests, so a test
+/// reaches every route a client does (the NuGet aliases included).
+fn registry_routes(enabled: &HashSet<RegistryType>) -> Router<AppState> {
+    let mut registry_routes = Router::new();
+    for reg in enabled {
+        match reg {
+            RegistryType::Docker => {
+                registry_routes = registry_routes.merge(registry::docker_routes())
+            }
+            RegistryType::Maven => {
+                registry_routes = registry_routes.merge(registry::maven_routes())
+            }
+            RegistryType::Npm => registry_routes = registry_routes.merge(registry::npm_routes()),
+            RegistryType::Cargo => {
+                registry_routes = registry_routes.merge(registry::cargo_routes())
+            }
+            RegistryType::PyPI => registry_routes = registry_routes.merge(registry::pypi_routes()),
+            RegistryType::Raw => registry_routes = registry_routes.merge(registry::raw_routes()),
+            RegistryType::Go => registry_routes = registry_routes.merge(registry::go_routes()),
+            RegistryType::Gems => registry_routes = registry_routes.merge(registry::gems_routes()),
+            RegistryType::Terraform => {
+                registry_routes = registry_routes.merge(registry::terraform_routes())
+            }
+            RegistryType::Ansible => {
+                registry_routes = registry_routes.merge(registry::ansible_routes())
+            }
+            RegistryType::Nuget => {
+                registry_routes = registry_routes
+                    .merge(registry::nuget_routes())
+                    .merge(registry::nuget_alias_routes())
+            }
+            RegistryType::PubDart => {
+                registry_routes = registry_routes.merge(registry::pub_dart_routes())
+            }
+            RegistryType::Conan => {
+                registry_routes = registry_routes.merge(registry::conan_routes())
+            }
+            #[cfg(feature = "rpm")]
+            RegistryType::Rpm => registry_routes = registry_routes.merge(registry::rpm_routes()),
+            #[cfg(feature = "deb")]
+            RegistryType::Deb => registry_routes = registry_routes.merge(registry::deb_routes()),
+            // Compiled out: `Config::enabled_registries` never returns it.
+            #[cfg(not(all(feature = "rpm", feature = "deb")))]
+            #[allow(unreachable_patterns)]
+            RegistryType::Rpm | RegistryType::Deb => {}
+            RegistryType::Cpan => registry_routes = registry_routes.merge(registry::cpan_routes()),
+            RegistryType::HuggingFace => {
+                tracing::info!(
+                    "Hugging Face proxy enabled: public models only (datasets answer 501), \
+                     files over plain HTTP (Xet is never proxied)"
+                );
+                registry_routes = registry_routes.merge(registry::hf_routes())
+            }
+        }
+    }
+    registry_routes
 }
 
 /// Print note about registries that have data but no retention rules configured.
@@ -3693,6 +3862,93 @@ mod curation_reload_tests {
         let config = config_with_allowlist(CurationMode::Off, path.to_str().unwrap().into());
         assert!(build_curation_engine(&config).is_ok());
     }
+
+    /// Ages given in seconds, keyed by registry: what the engine decides for a
+    /// release of that age.
+    fn blocked(config: &Config, registry: crate::curation::RegistryType, age_secs: i64) -> bool {
+        use crate::curation::{Decision, FilterRequest, RequestVersion};
+        let engine = build_curation_engine(config).expect("engine builds");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let result = engine.evaluate(&FilterRequest {
+            registry,
+            upstream: None,
+            name: "pkg".to_string(),
+            version: RequestVersion::named(Some("1.0.0")),
+            integrity: None,
+            bypass: false,
+            publish_date: Some(now - age_secs),
+        });
+        match result.decision {
+            Decision::Block { rule, .. } => {
+                assert_eq!(rule, "min-release-age");
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn enforce() -> Config {
+        Config {
+            curation: CurationConfig {
+                mode: CurationMode::Enforce,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// #1098: a per-registry minimum age without a global one is applied to its
+    /// registry, and only to it.
+    #[test]
+    fn a_per_registry_min_release_age_alone_is_applied_to_its_registry() {
+        use crate::curation::RegistryType;
+        let mut config = enforce();
+        config.curation.npm.min_release_age = Some("3d".to_string());
+        assert!(blocked(&config, RegistryType::Npm, 3_600));
+        assert!(!blocked(&config, RegistryType::Npm, 4 * 86_400));
+        for other in [RegistryType::PyPI, RegistryType::Cargo, RegistryType::Raw] {
+            assert!(!blocked(&config, other, 3_600), "{other}");
+        }
+    }
+
+    /// With a global value, an override applies to its registry and the global
+    /// value to the others — every registry that has an override, cpan included.
+    #[test]
+    fn an_override_applies_to_its_registry_and_the_global_value_to_the_others() {
+        use crate::curation::RegistryType;
+        let mut config = enforce();
+        config.curation.min_release_age = Some("1h".to_string());
+        config.curation.npm.min_release_age = Some("3d".to_string());
+        config.curation.cpan.min_release_age = Some("3d".to_string());
+        config.curation.pypi.min_release_age = Some("1d".to_string());
+        let two_hours = 2 * 3_600;
+        assert!(blocked(&config, RegistryType::Npm, two_hours));
+        assert!(blocked(&config, RegistryType::Cpan, two_hours));
+        assert!(blocked(&config, RegistryType::PyPI, two_hours));
+        assert!(!blocked(&config, RegistryType::PyPI, 2 * 86_400));
+        assert!(!blocked(&config, RegistryType::Cargo, two_hours));
+        assert!(blocked(&config, RegistryType::Cargo, 1_800));
+    }
+
+    /// In enforce mode an unparsable per-registry value refuses the build and
+    /// names the value, as an unparsable global one does — it is never dropped.
+    #[test]
+    fn enforce_rejects_an_unparsable_per_registry_min_release_age() {
+        // With a global value and without one: the per-registry value is read either way.
+        for global in [Some("7d"), None] {
+            let mut config = enforce();
+            config.curation.min_release_age = global.map(str::to_string);
+            config.curation.npm.min_release_age = Some("3x".to_string());
+            let err = build_curation_engine(&config).err().unwrap_or_else(|| {
+                panic!("global {global:?}: an unparsable value must refuse the build")
+            });
+            assert!(err.contains("curation.npm.min_release_age"), "{err}");
+            assert!(err.contains("3x"), "{err}");
+        }
+    }
 }
 
 /// the production stack is `request_layers` plus exactly metrics and
@@ -3738,5 +3994,419 @@ mod middleware_stack_whitelist {
             1,
             "only DefaultBodyLimit"
         );
+    }
+}
+
+#[cfg(test)]
+mod cleanup_pass_tests {
+    //! A scheduled GC or retention pass that takes files out of the store marks the
+    //! repository indexes stale: the dashboard counts what is there after the pass.
+    use super::*;
+    #[cfg(feature = "rpm")]
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn locks() -> PublishLocks {
+        Arc::new(parking_lot::Mutex::new(HashMap::new()))
+    }
+
+    #[cfg(feature = "rpm")]
+    fn no_curation() -> curation::CurationEngine {
+        curation::CurationEngine::new(config::CurationConfig::default())
+    }
+
+    #[cfg(feature = "rpm")]
+    /// `n` proxy-cached rpm files of 100 bytes, the first one the oldest.
+    async fn rpm_cache(data: &Path, n: u32) -> Storage {
+        let storage = Storage::new_local(data.to_str().unwrap());
+        for i in 0..n {
+            let key = format!("rpm/repo/Packages/{i}-1.0.rpm");
+            storage.put(&key, &[0u8; 100]).await.unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(data.join(&key))
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000 + u64::from(i) * 1000))
+                .unwrap();
+        }
+        storage
+    }
+
+    /// A context serving `storage`: its index is the one the passes mark stale.
+    fn context(storage: Storage) -> test_helpers::TestContext {
+        test_helpers::create_test_context_with_storage(storage)
+    }
+
+    /// What the index counts for `registry` once every pending rebuild has finished.
+    async fn counted(state: &AppState, registry: &str) -> usize {
+        let rt = RegistryType::from_str_opt(registry).unwrap();
+        state.repo_index.rebuild(rt, state).await;
+        state
+            .repo_index
+            .get(registry, state)
+            .await
+            .iter()
+            .map(|r| r.versions)
+            .sum()
+    }
+
+    #[cfg(feature = "rpm")]
+    #[tokio::test]
+    async fn a_gc_pass_that_evicts_marks_the_index_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(rpm_cache(dir.path(), 5).await);
+        let (storage, index) = (&ctx.state.storage, &ctx.state.repo_index);
+        assert_eq!(counted(&ctx.state, "rpm").await, 5);
+        let result = gc_pass(
+            storage,
+            &locks(),
+            index,
+            false,
+            0,
+            false,
+            300,
+            &no_curation(),
+        )
+        .await;
+        assert_eq!(result.proxy_cache_eviction.evicted_files, 2);
+        assert_eq!(counted(&ctx.state, "rpm").await, 3);
+    }
+
+    #[cfg(feature = "rpm")]
+    #[tokio::test]
+    async fn a_dry_gc_pass_leaves_the_store_and_its_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(rpm_cache(dir.path(), 5).await);
+        let (storage, index) = (&ctx.state.storage, &ctx.state.repo_index);
+        assert_eq!(counted(&ctx.state, "rpm").await, 5);
+        let result = gc_pass(
+            storage,
+            &locks(),
+            index,
+            true,
+            0,
+            false,
+            300,
+            &no_curation(),
+        )
+        .await;
+        assert_eq!(
+            result.proxy_cache_eviction.evicted_files, 2,
+            "what would go"
+        );
+        assert!(storage.get("rpm/repo/Packages/0-1.0.rpm").await.is_ok());
+        assert_eq!(counted(&ctx.state, "rpm").await, 5);
+    }
+
+    #[tokio::test]
+    async fn a_retention_pass_that_deletes_marks_the_index_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, rules) = go_versions(dir.path()).await;
+        let ctx = context(storage);
+        let (storage, index) = (&ctx.state.storage, &ctx.state.repo_index);
+        let before = counted(&ctx.state, "go").await;
+        assert!(before >= 3, "{before}");
+        let audit = AuditLog::new(dir.path().to_str().unwrap(), audit::AuditMode::Off);
+        let result = retention_pass(storage, &locks(), index, None, &rules, false, &audit).await;
+        assert_eq!(result.planned, 2);
+        let after = counted(&ctx.state, "go").await;
+        assert_eq!(
+            after,
+            before / 3,
+            "one version of three left: {before} -> {after}"
+        );
+    }
+
+    /// Three go module versions and a `keep_last = 1` rule: a pass finds two to delete.
+    async fn go_versions(data: &Path) -> (Storage, Vec<config::RetentionRule>) {
+        let storage = Storage::new_local(data.to_str().unwrap());
+        for ver in ["v1.0.0", "v2.0.0", "v3.0.0"] {
+            for ext in ["info", "mod", "zip"] {
+                let key = format!("go/github.com/user/repo/@v/{ver}.{ext}");
+                storage.put(&key, b"x").await.unwrap();
+            }
+        }
+        let rules = vec![config::RetentionRule {
+            registry: "go".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            include_tags: Vec::new(),
+            exclude_tags: Vec::new(),
+        }];
+        (storage, rules)
+    }
+
+    /// The actions a retention pass wrote to `audit.jsonl` under `audit_dir`.
+    async fn audited_actions(
+        storage: &Storage,
+        rules: &[config::RetentionRule],
+        dry_run: bool,
+        audit_dir: &Path,
+    ) -> Vec<String> {
+        let audit = AuditLog::new(audit_dir.to_str().unwrap(), audit::AuditMode::File);
+        let result = retention_pass(
+            storage,
+            &locks(),
+            &RepoIndex::new(),
+            None,
+            rules,
+            dry_run,
+            &audit,
+        )
+        .await;
+        assert_eq!(result.planned, 2, "two of three versions are due");
+        let path = audit.path().clone();
+        audit.shutdown().await;
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+                format!(
+                    "{} {}",
+                    entry["action"].as_str().unwrap(),
+                    entry["detail"].as_str().unwrap()
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_dry_retention_pass_is_not_audited_as_applied() {
+        let data = tempfile::tempdir().unwrap();
+        let audit_dir = tempfile::tempdir().unwrap();
+        let (storage, rules) = go_versions(data.path()).await;
+        let actions = audited_actions(&storage, &rules, true, audit_dir.path()).await;
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(
+            actions[0].starts_with("retention-dry-run would_free_bytes="),
+            "{actions:?}"
+        );
+        assert!(
+            !actions[0].contains("bytes_freed") && !actions[0].contains("keys="),
+            "{actions:?}"
+        );
+        assert!(
+            storage
+                .get("go/github.com/user/repo/@v/v1.0.0.zip")
+                .await
+                .is_ok(),
+            "a dry run deletes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_applied_retention_pass_is_audited_as_applied() {
+        let data = tempfile::tempdir().unwrap();
+        let audit_dir = tempfile::tempdir().unwrap();
+        let (storage, rules) = go_versions(data.path()).await;
+        let actions = audited_actions(&storage, &rules, false, audit_dir.path()).await;
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(
+            actions[0].starts_with("retention-apply keys=6 bytes_freed="),
+            "{actions:?}"
+        );
+        assert!(storage
+            .get("go/github.com/user/repo/@v/v1.0.0.zip")
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn the_gc_done_line_names_the_proxy_cache_evictions_apart_from_the_orphans() {
+        let result = gc::GcResult {
+            total_candidates: 10,
+            orphaned: 3,
+            deleted: 2,
+            bytes_freed: 700,
+            orphan_keys: Vec::new(),
+            duration_secs: 0.5,
+            uncovered: Vec::new(),
+            metadata_phantoms_removed: 1,
+            skipped_recent: 1,
+            stat_failures: 0,
+            docker_mark_failed: false,
+            proxy_cache_eviction: gc::ProxyCacheEviction {
+                total_bytes: 9_000,
+                evicted_files: 5,
+                bytes_freed: 4_096,
+            },
+        };
+        let line = gc_done_line(&result, false);
+        assert!(
+            line.contains("3 orphans (2 deleted, 700 bytes freed)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("5 evicted from the proxy cache (4096 bytes freed)"),
+            "{line}"
+        );
+        // A dry pass freed nothing: the line says what an applied pass would.
+        let dry = gc_done_line(&result, true);
+        assert!(dry.contains("dry run"), "{dry}");
+        assert!(dry.contains("700 bytes would be freed"), "{dry}");
+        assert!(
+            dry.contains("5 would be evicted from the proxy cache (4096 bytes)"),
+            "{dry}"
+        );
+        assert!(
+            !dry.contains("deleted") && !dry.contains("bytes freed"),
+            "{dry}"
+        );
+    }
+
+    #[cfg(feature = "rpm")]
+    fn artifacts_gauge(rt: RegistryType) -> i64 {
+        metrics::ARTIFACTS_TOTAL
+            .with_label_values(&[rt.as_str()])
+            .get()
+    }
+
+    #[cfg(feature = "rpm")]
+    fn bytes_gauge(rt: RegistryType) -> i64 {
+        metrics::STORAGE_BYTES
+            .with_label_values(&[rt.as_str()])
+            .get()
+    }
+
+    #[cfg(feature = "rpm")]
+    /// Maintenance ticks until the rpm gauge reads `expected`: a tick waits for a rebuild
+    /// a bounded time, so the gauge may follow one tick later. Fails after five seconds.
+    async fn tick_until(state: &AppState, expected: i64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            refresh_artifact_gauges(state).await;
+            if artifacts_gauge(RegistryType::Rpm) == expected {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rpm gauge {} never reached {expected}",
+                artifacts_gauge(RegistryType::Rpm)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(feature = "rpm")]
+    /// The only test that sets the per-registry gauges: they are process-wide.
+    #[tokio::test]
+    async fn the_artifact_gauges_follow_the_store_without_a_read_of_the_ui() {
+        let (storage, ops) = test_helpers::op_counting_storage();
+        // Five proxy-cached rpm repositories of one 100-byte file each, and go data
+        // of a registry that is not enabled.
+        for i in 0..5 {
+            storage
+                .put(&format!("rpm/repo{i}/Packages/{i}-1.0.rpm"), &[0u8; 100])
+                .await
+                .unwrap();
+        }
+        storage
+            .put("go/github.com/user/repo/@v/v1.0.0.zip", b"x")
+            .await
+            .unwrap();
+        let enabled: HashSet<RegistryType> = [RegistryType::Rpm].into_iter().collect();
+        // A fresh process: nothing has read the index yet.
+        let ctx = test_helpers::create_test_context_with_storage(storage);
+        // The enable-set is given here, not resolved from the config: that reads
+        // NORA_REGISTRIES_ENABLE, which config tests running beside this one set.
+        let mut state = ctx.state.clone();
+        state.enabled_registries = Arc::new(enabled);
+        let state = &state;
+        let (storage, index) = (&state.storage, &state.repo_index);
+
+        ops.reset();
+        tick_until(state, 5).await;
+        assert_eq!(bytes_gauge(RegistryType::Rpm), 500);
+        assert_eq!(
+            ops.snapshot(),
+            [("list_with_meta", 1)].into_iter().collect(),
+            "one listing, of the enabled registry only"
+        );
+
+        ops.reset();
+        refresh_artifact_gauges(state).await;
+        assert_eq!(
+            ops.total(),
+            0,
+            "nothing changed: no storage round-trip, {:?}",
+            ops.snapshot()
+        );
+        assert_eq!(artifacts_gauge(RegistryType::Rpm), 5);
+
+        // A write marks its registry stale, as every handler does.
+        storage
+            .put("rpm/repo5/Packages/5-1.0.rpm", &[0u8; 100])
+            .await
+            .unwrap();
+        index.invalidate("rpm");
+        tick_until(state, 6).await;
+        assert_eq!(bytes_gauge(RegistryType::Rpm), 600);
+
+        // A GC pass evicts the proxy cache down to 300 bytes.
+        let result = gc_pass(
+            storage,
+            &locks(),
+            index,
+            false,
+            0,
+            false,
+            300,
+            &no_curation(),
+        )
+        .await;
+        assert_eq!(result.proxy_cache_eviction.evicted_files, 3);
+        tick_until(state, 3).await;
+        assert_eq!(bytes_gauge(RegistryType::Rpm), 300);
+    }
+}
+
+/// The cargo name records (`-` and `_` name one crate) of a store from an older release are written
+/// before the server listens: a request before them would reach the upstream for another spelling of
+/// a published crate, and a publish of it would pass. Needles are built at run time so this text
+/// does not match.
+#[cfg(test)]
+mod cargo_name_records_before_listening {
+    fn squash(s: &str) -> String {
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// Whether `run_server` rebuilds the records, awaited, before it binds the listener.
+    fn rebuilt_before_binding(code: &str) -> bool {
+        let code = squash(code);
+        let Some(start) = code.find(&["async", "fnrun_server("].concat()) else {
+            return false;
+        };
+        let body = &code[start..];
+        let rebuild =
+            body.find(&["registry::rebuild_cargo_name_records", "(&state.storage))"].concat());
+        let bind = body.find(&["letlistener=bind_listener", "(&state.config.server.host"].concat());
+        matches!((rebuild, bind), (Some(r), Some(b)) if r < b)
+    }
+
+    #[test]
+    fn the_records_are_rebuilt_before_the_listener_binds() {
+        assert!(rebuilt_before_binding(include_str!("main.rs")));
+    }
+
+    // Controls: without the call, or with it after the bind, the check refuses.
+    #[test]
+    fn the_check_refuses_a_missing_or_late_rebuild() {
+        let src = include_str!("main.rs");
+        let call = ["registry::rebuild_cargo_name_records", "(&state.storage)"].concat();
+        let missing = src.replace(&call, "std::future::ready(())");
+        assert!(!rebuilt_before_binding(&missing));
+        let bound = [".expect(\"Failed to", " bind\");"].concat();
+        let at = missing.find(&bound).unwrap() + bound.len();
+        let late = format!(
+            "{}\n    let _ = {call});\n{}",
+            &missing[..at],
+            &missing[at..]
+        );
+        assert!(!rebuilt_before_binding(&late));
     }
 }
