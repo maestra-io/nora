@@ -1,0 +1,7 @@
+# Accepted gitleaks findings: test fixtures, never real credentials.
+# auth/mod.rs: the JWT of rejected_credentials_are_logged_without_the_secret (a made-up token)
+e5eb0f51c2560fdc9acf2f203cfb6f0ce823a141:nora-registry/src/auth/mod.rs:jwt:3699
+# auth/teleport.rs: TEST_EC_PRIVATE_KEY, the test signing key of the Teleport JWT tests
+b188f16b3bd9a91ef2e5b3f3ebc6ad07f5a7dea4:nora-registry/src/auth/teleport.rs:private-key:247
+# registry/nuget/hosted.rs: TEST_RSA_PRIVATE_KEY, the test signing key of the OIDC tests
+be8c0b6a6db6147c5e9d55f125461569570b1793:nora-registry/src/registry/nuget/hosted.rs:private-key:2221
