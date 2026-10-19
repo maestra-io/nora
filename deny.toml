@@ -17,6 +17,15 @@ ignore = [
     # object_store ships quick-xml >=0.41. Tracking: #799
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # zip <9 `ZipArchive::extract` / `ZipStreamReader::extract`: symlink targets
+    # outside the destination, Unix permissions applied through symlinks, SUID/SGID
+    # bits preserved. NORA never extracts an archive to disk: wheel METADATA and
+    # .nuspec are read by name with `by_name().take()` into memory, and ZipWriter
+    # only produces test fixtures. Fix is the zip 3 -> 9 major bump, tracked
+    # separately (maestra-io/nora, allocator-regression follow-up, 19.10.2026).
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]
 
 [licenses]
