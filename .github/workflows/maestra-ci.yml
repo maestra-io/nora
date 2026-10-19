@@ -79,13 +79,13 @@ jobs:
       - name: Run tests
         run: cargo test --package nora-registry --locked
 
-      # maestra-release.yml builds with --no-default-features (no rpm/deb):
+      # maestra-release.yml builds with --no-default-features --features mimalloc (no rpm/deb):
       # hold the shipped feature set to the same gates.
       - name: Clippy (release features)
-        run: cargo clippy -p nora-registry --all-targets --no-default-features --locked -- -D warnings
+        run: cargo clippy -p nora-registry --all-targets --no-default-features --features mimalloc --locked -- -D warnings
 
       - name: Run tests (release features)
-        run: cargo test --package nora-registry --no-default-features --locked
+        run: cargo test --package nora-registry --no-default-features --features mimalloc --locked
 
   # Vendored Helm chart (maestra/charts/nora, see its MAESTRA-CHART.md).
   chart:

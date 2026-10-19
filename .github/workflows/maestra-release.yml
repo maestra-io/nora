@@ -58,10 +58,14 @@ jobs:
 
       # --no-default-features: packages.maestra.io serves neither rpm nor deb, so
       # their parsers and the rpgp signer stay out of the image (~100 crates).
+      # `mimalloc` is a default feature too, so it has to come back explicitly:
+      # 1.3.6-maestra.1/.2 shipped without it and the musl allocator lock returned
+      # (stime/utime 4.6, 0.03-0.07 core-s per request, NoraHighLatency x10, 16-19.10.2026).
+      # The Dockerfile refuses a build whose binary has no mimalloc.
       - name: Build image
         env:
           TAG: ${{ steps.tag.outputs.value }}
-        run: docker build --pull --build-arg CARGO_FEATURES=--no-default-features -t "local/nora:${TAG}" .
+        run: docker build --pull --build-arg CARGO_FEATURES="--no-default-features --features mimalloc" -t "local/nora:${TAG}" .
 
       - name: Push to ECR us-west-2
         uses: maestra-io/github-actions/push-to-aws-ecr-repository@8c2c0dd908663f5e9fc15844b050891610ee24c8 # v1.6.0
