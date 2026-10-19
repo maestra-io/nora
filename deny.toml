@@ -19,10 +19,11 @@ ignore = [
     "RUSTSEC-2026-0195",
     # zip <9 `ZipArchive::extract` / `ZipStreamReader::extract`: symlink targets
     # outside the destination, Unix permissions applied through symlinks, SUID/SGID
-    # bits preserved. NORA never extracts an archive to disk: wheel METADATA and
-    # .nuspec are read by name with `by_name().take()` into memory, and ZipWriter
-    # only produces test fixtures. Fix is the zip 3 -> 9 major bump, tracked
-    # separately (maestra-io/nora, allocator-regression follow-up, 19.10.2026).
+    # bits preserved. NORA itself is on zip 9; the only zip <9 left in the lockfile
+    # is the build-dependency of utoipa-swagger-ui 9.0.2 (pins zip ^3.0), whose
+    # build.rs unpacks the crate's own vendored swagger-ui bundle, not user input.
+    # Remove when utoipa-swagger-ui ships with zip 9 (juhaku/utoipa#1645, merged
+    # 17.10.2026, unreleased; needs the utoipa 5 -> 6 bump alongside).
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",

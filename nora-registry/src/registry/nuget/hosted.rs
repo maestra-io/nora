@@ -1973,8 +1973,9 @@ fn parse_nupkg(data: impl Read + Seek) -> Result<Nuspec, String> {
         .map_err(|e| format!("package is not a valid zip archive: {e}"))?;
     let names: Vec<String> = zip
         .file_names()
+        .flatten()
         .filter(|n| !n.contains('/') && ends_with_ci(n, ".nuspec"))
-        .map(str::to_string)
+        .map(std::borrow::Cow::into_owned)
         .collect();
     let [name] = names.as_slice() else {
         return Err(format!(
