@@ -1609,11 +1609,12 @@ pub(crate) fn wheel_core_metadata(data: impl std::io::Read + std::io::Seek) -> O
     let mut zip = zip::ZipArchive::new(data).ok()?;
     let names: Vec<String> = zip
         .file_names()
+        .flatten()
         .filter(|n| {
             n.split_once('/')
                 .is_some_and(|(dir, rest)| rest == "METADATA" && dir.ends_with(".dist-info"))
         })
-        .map(str::to_string)
+        .map(std::borrow::Cow::into_owned)
         .collect();
     let [name] = names.as_slice() else {
         return None;

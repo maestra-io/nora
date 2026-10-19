@@ -68,7 +68,7 @@ arc-swap = "1"
 memchr = "2"
 quick-xml = "0.41"
 # Reads the .nuspec out of a pushed .nupkg; already in the tree via utoipa-swagger-ui.
-zip = { version = "3", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 # Dual-stack TCP bind: clear IPV6_V6ONLY so a `::` listener also accepts IPv4 (#574).
 socket2 = "0.6"
 # rpm/deb format crates and the OpenPGP index signer: optional, see [features].
