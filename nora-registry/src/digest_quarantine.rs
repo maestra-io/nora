@@ -42,6 +42,8 @@ pub(crate) const SNAPSHOT_KEY: &str = ".nora-quarantine-snapshot.json";
 
 /// Concurrent storage requests while loading or importing the ledger.
 const LOAD_CONCURRENCY: usize = 32;
+/// Upper bound on the background ledger load (listing + reads + snapshot).
+const LOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Stale entry TTL: entries older than 90 days are pruned on startup.
 const PRUNE_TTL_SECS: i64 = 90 * 24 * 3600;
@@ -174,6 +176,47 @@ impl DigestStore {
             entries: Arc::new(RwLock::new(entries)),
             storage,
         }
+    }
+
+    /// [`Self::load`] off the startup path: the store starts empty and serves at
+    /// once, the ledger is merged in when the walk over `storage` finishes
+    /// (bounded by `LOAD_DEADLINE`; past it the walk is dropped and logged).
+    /// Until then a known digest reads as new, so an enforcing quarantine may
+    /// hold a cached version for one more TTL; the listener never waits on R2.
+    /// Maestra: on 20.10.2026 the blocking load kept packages.maestra.io from
+    /// binding its port for minutes on a slow R2 listing, and the startup probe
+    /// killed the pod in a loop.
+    pub fn load_in_background(storage: Storage, storage_path: &str) -> Self {
+        let store = Self::empty(storage.clone());
+        let legacy = Path::new(storage_path).join(LEDGER_FILE);
+        let entries = Arc::clone(&store.entries);
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            match tokio::time::timeout(LOAD_DEADLINE, load_entries(&storage, &legacy)).await {
+                Ok(loaded) => {
+                    let mut map = entries.write();
+                    for (key, entry) in loaded {
+                        // An entry recorded meanwhile keeps the older first_seen.
+                        match map.get(&key) {
+                            Some(live) if live.first_seen <= entry.first_seen => {}
+                            _ => {
+                                map.insert(key, entry);
+                            }
+                        }
+                    }
+                    info!(
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        entries = map.len(),
+                        "Quarantine store merged into the live map"
+                    );
+                }
+                Err(_) => error!(
+                    deadline_secs = LOAD_DEADLINE.as_secs(),
+                    "Quarantine store load did not finish, serving without the ledger (fail-open)"
+                ),
+            }
+        });
+        store
     }
 
     /// Create an empty store (for tests or when quarantine is off).

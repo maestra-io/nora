@@ -2756,7 +2756,10 @@ async fn run_server(mut config: Config, storage: Storage) {
     // a fail-open the check-only cache-serve gate cannot catch (#765). The
     // predicate is the same one config validation uses, so they cannot diverge.
     let digest_store = if config.any_quarantine_active() {
-        Arc::new(digest_quarantine::DigestStore::load(storage.clone(), &storage_path).await)
+        Arc::new(digest_quarantine::DigestStore::load_in_background(
+            storage.clone(),
+            &storage_path,
+        ))
     } else {
         Arc::new(digest_quarantine::DigestStore::empty(storage.clone()))
     };
