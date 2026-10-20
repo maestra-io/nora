@@ -394,7 +394,7 @@ pub async fn api_search(
                     format!("/ui/{}/{}", registry_type, encode_uri_component(&repo.name));
                 format!(
                     r#"
-                <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
+                <tr class="hover:bg-slate-700 cursor-pointer" data-href="{}" onclick="window.location=this.dataset.href">
                     <td class="px-3 md:px-6 py-3 md:py-4">
                         <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
                     </td>
@@ -403,13 +403,13 @@ pub async fn api_search(
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
                 </tr>
             "#,
-                    detail_url,
+                    html_escape(&detail_url),
                     folder_icon,
-                    detail_url,
+                    html_escape(&detail_url),
                     html_escape(&repo.name),
                     repo.versions,
                     format_size(repo.size),
-                    &repo.updated
+                    html_escape(&repo.updated)
                 )
             })
             .collect::<Vec<_>>()
@@ -2129,6 +2129,28 @@ pub async fn get_raw_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo
 mod tests {
     use super::*;
     use crate::test_helpers::{create_test_context_with_storage_and_config, op_counting_storage};
+
+    /// The HTMX search rows follow the #1167 rule of the full pages: a stored name reaches
+    /// the fragment encoded in its link and escaped in its text, never inside inline script.
+    #[tokio::test]
+    async fn a_hostile_name_never_reaches_a_search_row_raw() {
+        const H: &str = "h\"q'l<g>t";
+        let ctx = crate::test_helpers::create_test_context();
+        ctx.state
+            .storage
+            .put(&format!("raw/{H}/f.bin"), b"x")
+            .await
+            .unwrap();
+        let axum::response::Html(html) = api_search(
+            State(ctx.state.clone()),
+            Path("raw".to_string()),
+            Query(SearchQuery { q: None }),
+        )
+        .await;
+        assert!(html.contains("data-href="), "{html}");
+        assert!(!html.contains(H), "{html}");
+        assert!(!html.contains("window.location='"), "{html}");
+    }
 
     const N: usize = 100;
 

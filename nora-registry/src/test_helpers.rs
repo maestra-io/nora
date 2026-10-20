@@ -787,6 +787,7 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         end: u64,
     ) -> crate::storage::Result<(
         u64,
+        Option<String>,
         std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
     )> {
         self.counts.hit("get_range", key);
