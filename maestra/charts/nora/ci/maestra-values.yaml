@@ -26,6 +26,8 @@ imagePullSecrets:
 
 # s3 mode: /data is an emptyDir with scratch only, so the pod is not pinned to
 # one node (a node-local PVC kept it on node 02 for a 42 min outage, 19.10).
+# Migrating a deployment: one start on the old PVC first, so nora imports
+# /data/tokens and quarantine.jsonl into the bucket; then disable it.
 persistence:
   enabled: false
 

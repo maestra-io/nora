@@ -6,10 +6,14 @@ kind: Deployment
 {{- fail (printf "terminationGracePeriodSeconds (%d) must cover preStopSleepSeconds (%d) + config.server.shutdown_timeout (%d) + 10 s scheduler wait = %d, or the kubelet SIGKILLs nora before it drains audit and flushes tokens" (int .Values.terminationGracePeriodSeconds) (int .Values.preStopSleepSeconds) $drain $needed) }}
 {{- end }}
 {{- if not (or .Values.persistence.enabled .Values.persistence.allowEphemeral) }}
-{{- if ne .Values.config.storage.mode "s3" }}
-{{- fail (printf "persistence.enabled=false with config.storage.mode=%s puts /data on an emptyDir: the artifacts (storage.path) live there and every pod restart deletes them. Use storage.mode=s3, keep persistence.enabled=true, or set persistence.allowEphemeral=true to accept that." .Values.config.storage.mode) }}
+{{- /* extraEnv NORA_* values override config.toml (a Secret's cannot be seen here). */}}
+{{- $env := dict }}
+{{- range .Values.extraEnv }}{{ if hasKey . "value" }}{{ $_ := set $env .name (toString .value | lower) }}{{ end }}{{ end }}
+{{- $mode := get $env "NORA_STORAGE_MODE" | default .Values.config.storage.mode }}
+{{- if ne $mode "s3" }}
+{{- fail (printf "persistence.enabled=false with config.storage.mode=%s puts /data on an emptyDir: the artifacts (storage.path) live there and every pod restart deletes them. Use storage.mode=s3, keep persistence.enabled=true, or set persistence.allowEphemeral=true to accept that." $mode) }}
 {{- end }}
-{{- if has (.Values.config.audit.mode | default "file") (list "file" "both") }}
+{{- if has (get $env "NORA_AUDIT_LOG" | default .Values.config.audit.mode | default "file") (list "file" "both") }}
 {{- fail "persistence.enabled=false with config.audit.mode file/both puts audit.jsonl (storage.path) on an emptyDir and every pod restart deletes it. Use audit.mode=stdout, keep persistence.enabled=true, or set persistence.allowEphemeral=true to accept that." }}
 {{- end }}
 {{- end }}

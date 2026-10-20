@@ -371,7 +371,7 @@ resources:
 
 ### Backup and restore (Maestra)
 
-With `storage.mode: s3` everything durable is in the bucket; `nora backup` / `nora restore` cover `.nora-tokens/` and `.nora-quarantine/` too. Archives of the removed backup CronJob (`s3://<bucket>/.nora-backup/<ts>.tar.gz`, `data/tokens/*.json` + `data/storage/quarantine.jsonl`) still restore: extract them into `auth.token_storage` / `storage.path` in the pod and restart the container (an emptyDir survives that); the next start imports them.
+With `storage.mode: s3` everything durable is in the bucket. A backup is `kubectl exec deploy/nora -- nora backup --output /tmp/nora.tar.gz` copied out of the pod (`kubectl cp`); `nora restore --input <archive>` brings it back, `.nora-tokens/` and `.nora-quarantine/` included. Legacy archives of the removed backup CronJob (`s3://<bucket>/.nora-backup/<ts>.tar.gz`, `data/tokens/*.json` + `data/storage/quarantine.jsonl`) still restore: extract them into `auth.token_storage` / `storage.path` in the pod and restart the container (an emptyDir survives that); the next start imports them.
 
 ## S3 Storage
 

@@ -537,6 +537,18 @@ tests:
       - failedTemplate:
           errorPattern: "config.audit.mode file/both"
 
+  - it: refuses an audit file set by extraEnv on an emptyDir
+    template: templates/deployment.yaml
+    set:
+      config.storage.mode: s3
+      persistence.enabled: false
+      extraEnv:
+        - name: NORA_AUDIT_LOG
+          value: File
+    asserts:
+      - failedTemplate:
+          errorPattern: "config.audit.mode file/both"
+
   - it: allows local mode on an emptyDir only when explicitly accepted
     template: templates/deployment.yaml
     set:
