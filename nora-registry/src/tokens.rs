@@ -315,11 +315,7 @@ impl TokenStore {
                 return Vec::new();
             }
         };
-        let ids = keys.iter().filter_map(|k| {
-            k.strip_prefix(STORAGE_PREFIX)
-                .and_then(|n| n.strip_suffix(".json"))
-                .filter(|id| is_valid_hash_prefix(id))
-        });
+        let ids = keys.iter().filter_map(|k| record_id(k));
         let records = futures::future::join_all(
             ids.map(|id| async move { (id, self.storage.get(&record_key(id)).await) }),
         )
@@ -543,6 +539,17 @@ impl TokenStore {
 /// issues on case-sensitive filesystems.
 fn is_valid_hash_prefix(s: &str) -> bool {
     s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A token record key (`.nora-tokens/<16hex>.json`), not one of the state objects.
+pub fn is_record_key(key: &str) -> bool {
+    record_id(key).is_some()
+}
+
+fn record_id(key: &str) -> Option<&str> {
+    key.strip_prefix(STORAGE_PREFIX)
+        .and_then(|n| n.strip_suffix(".json"))
+        .filter(|id| is_valid_hash_prefix(id))
 }
 
 /// Store a token record from a pre-storage backup archive (`.nora-local/tokens/<name>`)

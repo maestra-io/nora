@@ -68,6 +68,27 @@ pub async fn migrate(
         );
     }
 
+    // Maestra: copying skips keys the destination has, so a token revoked in the
+    // source after an earlier run would stay valid there. A token record the source
+    // no longer has is deleted from the destination.
+    for key in to
+        .list_internal(crate::tokens::STORAGE_PREFIX)
+        .await
+        .map_err(|e| format!("failed to list destination: {e}"))?
+    {
+        if !crate::tokens::is_record_key(&key) || keys.contains(&key) {
+            continue;
+        }
+        if options.dry_run {
+            println!("Would delete revoked token record {key}");
+        } else {
+            to.delete(&key)
+                .await
+                .map_err(|e| format!("failed to delete revoked token {key}: {e}"))?;
+            println!("Deleted revoked token record {key}");
+        }
+    }
+
     if keys.is_empty() {
         println!("No artifacts found in source storage.");
         return Ok(MigrateStats::default());
@@ -255,6 +276,49 @@ mod tests {
         assert_eq!(stats.migrated, 1);
         let (user, _) = TokenStore::new(dst).verify_token(&raw).await.unwrap();
         assert_eq!(user, "ci");
+    }
+
+    /// A token revoked in the source after an earlier migration does not stay
+    /// valid in the destination on the next run; the destination's other token
+    /// state objects are left alone.
+    #[tokio::test]
+    async fn test_migrate_drops_tokens_revoked_since_last_run() {
+        use crate::tokens::{Role, TokenStore};
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+        let src = Storage::new_local(src_dir.path().to_str().unwrap());
+        let dst = Storage::new_local(dst_dir.path().to_str().unwrap());
+        let source = TokenStore::new(src.clone());
+        let kept = source
+            .create_token("a", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let revoked = source
+            .create_token("b", 30, None, Role::Read)
+            .await
+            .unwrap();
+        migrate(&src, &dst, MigrateOptions::default())
+            .await
+            .unwrap();
+        let state = ".nora-tokens/legacy_imported.json";
+        dst.put(state, b"[]").await.unwrap();
+
+        let id = source.list_tokens("b").await[0].file_id.clone();
+        source.revoke_token(&id).await.unwrap();
+        let dry = MigrateOptions { dry_run: true };
+        migrate(&src, &dst, dry).await.unwrap();
+        assert!(TokenStore::new(dst.clone())
+            .verify_token(&revoked)
+            .await
+            .is_ok());
+        migrate(&src, &dst, MigrateOptions::default())
+            .await
+            .unwrap();
+
+        let target = TokenStore::new(dst.clone());
+        assert!(target.verify_token(&kept).await.is_ok());
+        assert!(target.verify_token(&revoked).await.is_err());
+        assert!(dst.stat(state).await.is_some());
     }
 
     #[tokio::test]
