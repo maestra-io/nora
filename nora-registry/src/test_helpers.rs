@@ -328,7 +328,7 @@ fn build_context_full(
     };
 
     let tokens = if auth_enabled {
-        Some(TokenStore::new(tempdir.path().join("tokens").as_path()))
+        Some(TokenStore::new(storage.clone()))
     } else {
         None
     };

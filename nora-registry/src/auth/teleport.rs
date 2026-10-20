@@ -575,9 +575,16 @@ AJvDZc4Bbdm5PNsOvQZYEIacnJLnu7vP0RqnkhSbTJ0lRhSmCMjFDCjQ
             .as_ref()
             .unwrap()
             .verify_token(&token)
+            .await
             .unwrap();
         assert_eq!((owner.as_str(), role), ("alice", Role::Write));
-        let mine = ctx.state.tokens.as_ref().unwrap().list_tokens("alice");
+        let mine = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .list_tokens("alice")
+            .await;
         assert_eq!(mine.len(), 1);
 
         // Another user's token is invisible to alice: revoke answers 404.
@@ -586,8 +593,15 @@ AJvDZc4Bbdm5PNsOvQZYEIacnJLnu7vP0RqnkhSbTJ0lRhSmCMjFDCjQ
             .as_ref()
             .unwrap()
             .create_token("carol", 1, None, Role::Read)
+            .await
             .unwrap();
-        let carol_id = ctx.state.tokens.as_ref().unwrap().list_tokens("carol")[0]
+        let carol_id = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .list_tokens("carol")
+            .await[0]
             .file_id
             .clone();
         let revoke = |id: String| {
@@ -613,6 +627,7 @@ AJvDZc4Bbdm5PNsOvQZYEIacnJLnu7vP0RqnkhSbTJ0lRhSmCMjFDCjQ
             .as_ref()
             .unwrap()
             .verify_token(&token)
+            .await
             .is_err());
     }
 
@@ -697,6 +712,7 @@ AJvDZc4Bbdm5PNsOvQZYEIacnJLnu7vP0RqnkhSbTJ0lRhSmCMjFDCjQ
             .as_ref()
             .unwrap()
             .verify_token(token)
+            .await
             .unwrap();
         assert_eq!((owner.as_str(), role), ("alice", Role::Write));
 
@@ -751,6 +767,7 @@ AJvDZc4Bbdm5PNsOvQZYEIacnJLnu7vP0RqnkhSbTJ0lRhSmCMjFDCjQ
             .as_ref()
             .unwrap()
             .create_token("ci", 1, None, Role::Read)
+            .await
             .unwrap();
         let basic = format!("Basic {}", STANDARD.encode(format!("x:{token}")));
         let resp = get(&ctx, "/raw/some/file", vec![("authorization", basic)]).await;

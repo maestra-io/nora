@@ -653,7 +653,7 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
                     }
                 } else if let Some(token) = auth_val.strip_prefix("Bearer ") {
                     if let Some(ref token_store) = state.tokens {
-                        if let Ok((user, role)) = token_store.verify_token(token) {
+                        if let Ok((user, role)) = token_store.verify_token(token).await {
                             request
                                 .extensions_mut()
                                 .insert(NamespaceAuthority::Unrestricted);
@@ -787,7 +787,7 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
     if let Some(token) = auth_header.strip_prefix("Bearer ") {
         // 1. Try opaque token (nra_ prefix)
         if let Some(ref token_store) = state.tokens {
-            match token_store.verify_token(token) {
+            match token_store.verify_token(token).await {
                 Ok((user, role)) => {
                     if is_write_method(request.method()) && !is_npm_audit && !role.can_write() {
                         return (StatusCode::FORBIDDEN, "Read-only token").into_response();
@@ -988,13 +988,16 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
     } else {
         request.method().clone()
     };
+    // The token store reads storage (async), so its verdict is taken here, only when
+    // decide_basic_auth would ask for it: htpasswd did not match.
+    let token_verdict = match &state.tokens {
+        Some(store) if !htpasswd_matched => Some(store.verify_token(password).await),
+        _ => None,
+    };
     let decision = decide_basic_auth(
         encoded,
         htpasswd.map(|_| move |_: &str, _: &str| htpasswd_matched),
-        state
-            .tokens
-            .as_ref()
-            .map(|store| move |password: &str| store.verify_token(password)),
+        token_verdict.map(|verdict| move |_: &str| verdict),
         &gate_method,
         is_admin,
     );
@@ -1229,8 +1232,10 @@ async fn try_basic_auth(
     let (username, password) = decoded.split_once(':')?;
     // An API token as the password is checked first, without paying a bcrypt.
     if password.starts_with("nra_") {
-        if let Some(Ok(identity)) = state.tokens.as_ref().map(|ts| ts.verify_token(password)) {
-            return Some(identity);
+        if let Some(store) = &state.tokens {
+            if let Ok(identity) = store.verify_token(password).await {
+                return Some(identity);
+            }
         }
     }
     htpasswd_ok(htpasswd, username, password).await.then(|| {
@@ -2308,6 +2313,7 @@ mod integration_tests {
             .as_ref()
             .unwrap()
             .create_token("ci", 30, None, crate::tokens::Role::Write)
+            .await
             .unwrap();
         for _ in 0..10 {
             assert_eq!(
@@ -2334,6 +2340,7 @@ mod integration_tests {
             .as_ref()
             .unwrap()
             .create_token("admin", 30, None, crate::tokens::Role::Write)
+            .await
             .unwrap();
         // Docker sends Basic base64("<user>:<token>"); the username is ignored.
         let header_val = format!("Basic {}", STANDARD.encode(format!("token:{token}")));
@@ -2359,6 +2366,7 @@ mod integration_tests {
             .as_ref()
             .unwrap()
             .create_token("admin", 30, None, crate::tokens::Role::Read)
+            .await
             .unwrap();
         let header_val = format!("Basic {}", STANDARD.encode(format!("token:{token}")));
         let response = send_with_headers(
@@ -2372,14 +2380,19 @@ mod integration_tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
-    /// Path of a stored token's on-disk file inside a test context.
-    fn token_file_path(ctx: &crate::test_helpers::TestContext, token: &str) -> std::path::PathBuf {
+    /// The storage key of a token's record.
+    fn token_key(token: &str) -> String {
         use sha2::Digest;
         let prefix = hex::encode(sha2::Sha256::digest(token.as_bytes()));
-        ctx._tempdir
-            .path()
-            .join("tokens")
-            .join(format!("{}.json", &prefix[..16]))
+        format!("{}{}.json", crate::tokens::STORAGE_PREFIX, &prefix[..16])
+    }
+
+    async fn put_token_record(ctx: &crate::test_helpers::TestContext, token: &str, body: &[u8]) {
+        ctx.state
+            .storage
+            .put(&token_key(token), body)
+            .await
+            .unwrap();
     }
 
     /// A token-store read failure (torn/corrupt file, I/O error) is an outage,
@@ -2396,10 +2409,11 @@ mod integration_tests {
             .as_ref()
             .unwrap()
             .create_token("ci", 30, None, crate::tokens::Role::Read)
+            .await
             .unwrap();
         // Corrupt the file the way a torn in-place rewrite would. The token was
         // never verified, so the in-memory cache is cold and the disk is read.
-        std::fs::write(token_file_path(&ctx, &token), "{\"token_ha").unwrap();
+        put_token_record(&ctx, &token, b"{\"token_ha").await;
 
         let header_val = format!("Basic {}", STANDARD.encode(format!("ci:{token}")));
         let response = send_with_headers(
@@ -2424,8 +2438,9 @@ mod integration_tests {
             .as_ref()
             .unwrap()
             .create_token("ci", 30, None, crate::tokens::Role::Read)
+            .await
             .unwrap();
-        std::fs::write(token_file_path(&ctx, &token), "{\"token_ha").unwrap();
+        put_token_record(&ctx, &token, b"{\"token_ha").await;
 
         let header_val = format!("Bearer {token}");
         let response = send_with_headers(
@@ -2458,7 +2473,7 @@ mod integration_tests {
         assert!(ctx.state.tokens.is_some(), "token store present");
         // Corrupt the file the store would read for this password: reaching it at
         // all yields a Storage error (→503). htpasswd-first never reads it.
-        std::fs::write(token_file_path(&ctx, "nra_witness"), "{\"token_ha").unwrap();
+        put_token_record(&ctx, "nra_witness", b"{\"token_ha").await;
 
         let header_val = basic_header("svc", "nra_witness");
         let response = send_with_headers(
@@ -2476,7 +2491,7 @@ mod integration_tests {
 
     /// Write a legacy token file (unsalted SHA-256 hash) for `token`: the first
     /// time the store reads it, it rewrites the file with an Argon2 hash.
-    fn write_legacy_token(ctx: &crate::test_helpers::TestContext, token: &str, owner: &str) {
+    async fn write_legacy_token(ctx: &crate::test_helpers::TestContext, token: &str, owner: &str) {
         use sha2::Digest;
         let info = serde_json::json!({
             "token_hash": hex::encode(sha2::Sha256::digest(token.as_bytes())),
@@ -2487,13 +2502,12 @@ mod integration_tests {
             "description": null,
             "role": "admin",
         });
-        std::fs::write(token_file_path(ctx, token), info.to_string()).unwrap();
+        put_token_record(ctx, token, info.to_string().as_bytes()).await;
     }
 
-    fn token_file_migrated(ctx: &crate::test_helpers::TestContext, token: &str) -> bool {
-        std::fs::read_to_string(token_file_path(ctx, token))
-            .unwrap()
-            .contains("$argon2")
+    async fn token_file_migrated(ctx: &crate::test_helpers::TestContext, token: &str) -> bool {
+        let record = ctx.state.storage.get(&token_key(token)).await.unwrap();
+        String::from_utf8_lossy(&record).contains("$argon2")
     }
 
     /// htpasswd matched → the token store is not read at all, not even for a
@@ -2505,11 +2519,17 @@ mod integration_tests {
     #[tokio::test]
     async fn test_basic_auth_htpasswd_match_never_reads_token_store() {
         let ctx = create_test_context_with_auth(&[("svc", "nra_witness")]);
-        write_legacy_token(&ctx, "nra_witness", "token-owner");
-        write_legacy_token(&ctx, "nra_control", "token-owner");
+        write_legacy_token(&ctx, "nra_witness", "token-owner").await;
+        write_legacy_token(&ctx, "nra_control", "token-owner").await;
         let store = ctx.state.tokens.as_ref().unwrap();
-        assert_eq!(store.verify_token("nra_control").unwrap().0, "token-owner");
-        assert!(token_file_migrated(&ctx, "nra_control"), "witness control");
+        assert_eq!(
+            store.verify_token("nra_control").await.unwrap().0,
+            "token-owner"
+        );
+        assert!(
+            token_file_migrated(&ctx, "nra_control").await,
+            "witness control"
+        );
 
         let header_val = basic_header("svc", "nra_witness");
         let response = send_with_headers(
@@ -2539,7 +2559,7 @@ mod integration_tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         assert!(
-            !token_file_migrated(&ctx, "nra_witness"),
+            !token_file_migrated(&ctx, "nra_witness").await,
             "htpasswd matched, yet the token store read the password's token file"
         );
     }
@@ -2558,12 +2578,13 @@ mod integration_tests {
     /// instead of the token's owner shows.
     const TOKEN_OWNER: &str = "ci-bot";
 
-    fn mint(ctx: &crate::test_helpers::TestContext, role: crate::tokens::Role) -> String {
+    async fn mint(ctx: &crate::test_helpers::TestContext, role: crate::tokens::Role) -> String {
         ctx.state
             .tokens
             .as_ref()
             .unwrap()
             .create_token(TOKEN_OWNER, 30, None, role)
+            .await
             .unwrap()
     }
 
@@ -2590,7 +2611,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_basic_auth_api_token_without_htpasswd() {
         let ctx = create_test_context_without_htpasswd();
-        let token = mint(&ctx, crate::tokens::Role::Write);
+        let token = mint(&ctx, crate::tokens::Role::Write).await;
         let header_val = basic_header("docker", &token);
 
         let response = send_with_headers(
@@ -2632,7 +2653,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_ui_token_create_write_caller_cannot_mint_admin() {
         let ctx = create_test_context_without_htpasswd();
-        let write_token = mint(&ctx, crate::tokens::Role::Write);
+        let write_token = mint(&ctx, crate::tokens::Role::Write).await;
         let header_val = basic_header("victim-admin", &write_token);
         let response = send_with_headers(
             &ctx.app,
@@ -2653,7 +2674,13 @@ mod integration_tests {
         );
         // Nothing was minted: only the original write token remains.
         assert_eq!(
-            ctx.state.tokens.as_ref().unwrap().list_all_tokens().len(),
+            ctx.state
+                .tokens
+                .as_ref()
+                .unwrap()
+                .list_all_tokens()
+                .await
+                .len(),
             1,
             "a token was created despite the 403"
         );
@@ -2664,7 +2691,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_ui_token_create_owner_is_the_caller_not_the_basic_username() {
         let ctx = create_test_context_without_htpasswd();
-        let write_token = mint(&ctx, crate::tokens::Role::Write);
+        let write_token = mint(&ctx, crate::tokens::Role::Write).await;
         let header_val = basic_header("not-the-owner", &write_token);
         let response = send_with_headers(
             &ctx.app,
@@ -2685,6 +2712,7 @@ mod integration_tests {
             .as_ref()
             .unwrap()
             .list_all_tokens()
+            .await
             .into_iter()
             .map(|t| t.user)
             .collect();
@@ -2701,7 +2729,7 @@ mod integration_tests {
     #[tokio::test]
     async fn ui_token_create_owner_is_exactly_the_token_owner() {
         let ctx = create_test_context_without_htpasswd();
-        let write_token = mint(&ctx, crate::tokens::Role::Write);
+        let write_token = mint(&ctx, crate::tokens::Role::Write).await;
         let header_val = basic_header("not-the-owner", &write_token);
         let response = send_with_headers(
             &ctx.app,
@@ -2722,6 +2750,7 @@ mod integration_tests {
             .as_ref()
             .unwrap()
             .list_all_tokens()
+            .await
             .into_iter()
             .map(|t| t.user)
             .collect();
@@ -2746,6 +2775,7 @@ mod integration_tests {
             .as_ref()
             .unwrap()
             .create_token("admin", 30, None, crate::tokens::Role::Write)
+            .await
             .unwrap();
         let header_val = basic_header("docker", &write_token);
         let response = send_with_headers(
@@ -2766,7 +2796,13 @@ mod integration_tests {
             "a write identity named 'admin' minted an admin token via the UI"
         );
         assert_eq!(
-            ctx.state.tokens.as_ref().unwrap().list_all_tokens().len(),
+            ctx.state
+                .tokens
+                .as_ref()
+                .unwrap()
+                .list_all_tokens()
+                .await
+                .len(),
             1,
             "a token was created despite the 403"
         );
@@ -2780,7 +2816,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_basic_auth_read_only_token_cannot_write_without_htpasswd() {
         let ctx = create_test_context_without_htpasswd();
-        let token = mint(&ctx, crate::tokens::Role::Read);
+        let token = mint(&ctx, crate::tokens::Role::Read).await;
         let header_val = basic_header("docker", &token);
         let tracker = &ctx.state.auth_failures;
 
@@ -2828,9 +2864,10 @@ mod integration_tests {
                 Some("theirs".into()),
                 crate::tokens::Role::Read,
             )
+            .await
             .unwrap();
-        let write = basic_header("docker", &mint(&ctx, crate::tokens::Role::Write));
-        let admin = basic_header("docker", &mint(&ctx, crate::tokens::Role::Admin));
+        let write = basic_header("docker", &mint(&ctx, crate::tokens::Role::Write).await);
+        let admin = basic_header("docker", &mint(&ctx, crate::tokens::Role::Admin).await);
 
         let response = send_with_headers(
             &ctx.app,
@@ -2871,7 +2908,7 @@ mod integration_tests {
             (crate::tokens::Role::Write, StatusCode::FORBIDDEN),
             (crate::tokens::Role::Admin, StatusCode::OK),
         ] {
-            let header_val = basic_header("docker", &mint(&ctx, role.clone()));
+            let header_val = basic_header("docker", &mint(&ctx, role.clone()).await);
             let response = send_with_headers(
                 &ctx.app,
                 Method::POST,
@@ -2892,8 +2929,8 @@ mod integration_tests {
     #[tokio::test]
     async fn test_basic_auth_token_store_error_returns_503_without_htpasswd() {
         let ctx = create_test_context_without_htpasswd();
-        let token = mint(&ctx, crate::tokens::Role::Read);
-        std::fs::write(token_file_path(&ctx, &token), "{\"token_ha").unwrap();
+        let token = mint(&ctx, crate::tokens::Role::Read).await;
+        put_token_record(&ctx, &token, b"{\"token_ha").await;
 
         one_failure_from_lockout(&ctx.state.auth_failures, "docker");
         let response = send_with_headers(
@@ -2921,12 +2958,11 @@ mod integration_tests {
     async fn test_basic_auth_bad_token_without_htpasswd_is_401_and_not_counted() {
         let ctx = create_test_context_without_htpasswd();
         let tracker = &ctx.state.auth_failures;
-        let expired = mint(&ctx, crate::tokens::Role::Write);
-        let path = token_file_path(&ctx, &expired);
-        let mut info: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let expired = mint(&ctx, crate::tokens::Role::Write).await;
+        let record = ctx.state.storage.get(&token_key(&expired)).await.unwrap();
+        let mut info: serde_json::Value = serde_json::from_slice(&record).unwrap();
         info["expires_at"] = 0.into();
-        std::fs::write(&path, info.to_string()).unwrap();
+        put_token_record(&ctx, &expired, info.to_string().as_bytes()).await;
 
         let bad = [
             "nra_00000000000000000000000000000000".to_string(),
@@ -2953,7 +2989,7 @@ mod integration_tests {
         }
 
         one_failure_from_lockout(tracker, "docker");
-        let token = mint(&ctx, crate::tokens::Role::Read);
+        let token = mint(&ctx, crate::tokens::Role::Read).await;
         let response = send_with_headers(
             &ctx.app,
             Method::GET,
@@ -3013,6 +3049,7 @@ mod integration_tests {
             .as_ref()
             .unwrap()
             .create_token("ci", 30, None, crate::tokens::Role::Read)
+            .await
             .unwrap();
         let bearer = format!("Bearer {token}");
         let basic = format!("Basic {}", STANDARD.encode(format!("ci:{token}")));
@@ -3282,7 +3319,7 @@ mod integration_tests {
         assert!(body.contains("CI Pipeline"), "List should show description");
 
         // Get file_id from the token store directly for revoke test
-        let tokens = ctx.state.tokens.as_ref().unwrap().list_all_tokens();
+        let tokens = ctx.state.tokens.as_ref().unwrap().list_all_tokens().await;
         assert_eq!(tokens.len(), 1);
         let file_id = &tokens[0].file_id;
 
@@ -3299,7 +3336,7 @@ mod integration_tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         // Verify token is gone
-        let tokens = ctx.state.tokens.as_ref().unwrap().list_all_tokens();
+        let tokens = ctx.state.tokens.as_ref().unwrap().list_all_tokens().await;
         assert_eq!(tokens.len(), 0);
     }
 
@@ -3334,6 +3371,7 @@ mod integration_tests {
         let store = ctx.state.tokens.as_ref().unwrap();
         let write_token = store
             .create_token("ci", 30, None, crate::tokens::Role::Write)
+            .await
             .unwrap();
         let spoofed = format!(
             "Basic {}",
@@ -3345,8 +3383,8 @@ mod integration_tests {
 
         let response = ui_create_token(&ctx, &spoofed, "write").await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(store.list_tokens("mallory").is_empty());
-        assert_eq!(store.list_tokens("ci").len(), 2);
+        assert!(store.list_tokens("mallory").await.is_empty());
+        assert_eq!(store.list_tokens("ci").await.len(), 2);
 
         // htpasswd identities are Write-role: no admin mint either.
         let basic = format!("Basic {}", STANDARD.encode("admin:secret"));
@@ -3363,9 +3401,11 @@ mod integration_tests {
         let store = ctx.state.tokens.as_ref().unwrap();
         let boss = store
             .create_token("boss", 30, None, crate::tokens::Role::Admin)
+            .await
             .unwrap();
         let eve = store
             .create_token("eve", 30, None, crate::tokens::Role::Admin)
+            .await
             .unwrap();
 
         let response = ui_create_token(&ctx, &format!("Bearer {}", eve), "admin").await;
@@ -3373,7 +3413,7 @@ mod integration_tests {
 
         let response = ui_create_token(&ctx, &format!("Bearer {}", boss), "admin").await;
         assert_eq!(response.status(), StatusCode::OK);
-        let minted = store.list_tokens("boss");
+        let minted = store.list_tokens("boss").await;
         assert_eq!(minted.len(), 2);
         assert!(minted.iter().all(|t| t.role == crate::tokens::Role::Admin));
     }
@@ -3444,7 +3484,7 @@ mod integration_tests {
             StatusCode::FORBIDDEN
         );
         assert_eq!(api_mint("viewer", "pw", "read").await, StatusCode::OK);
-        let minted = store.list_tokens("viewer");
+        let minted = store.list_tokens("viewer").await;
         assert_eq!(minted.len(), 1);
         assert_eq!(minted[0].role, crate::tokens::Role::Read);
         assert_eq!(api_mint("admin", "secret", "write").await, StatusCode::OK);
@@ -3454,11 +3494,12 @@ mod integration_tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let read_token = store
             .create_token("ro", 30, None, crate::tokens::Role::Read)
+            .await
             .unwrap();
         let response = ui_create_token(&ctx, &format!("Bearer {read_token}"), "write").await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(store.list_tokens("viewer").len(), 1);
-        assert_eq!(store.list_tokens("ro").len(), 1);
+        assert_eq!(store.list_tokens("viewer").await.len(), 1);
+        assert_eq!(store.list_tokens("ro").await.len(), 1);
     }
 }
 
@@ -3621,9 +3662,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             // the `enabled` tweak comes from `customize`), leaving OIDC
             // identities' token operations untested. Mirror prod so the store is
             // present for an OIDC caller that reaches a token handler.
-            tokens: Some(crate::tokens::TokenStore::new(
-                ctx._tempdir.path().join("tokens").as_path(),
-            )),
+            tokens: Some(crate::tokens::TokenStore::new(ctx.state.storage.clone())),
             metrics: Arc::new(crate::dashboard_metrics::DashboardMetrics::new()),
             activity: Arc::new(crate::activity_log::ActivityLog::new(50)),
             audit: ctx.state.audit.clone(),
@@ -3862,6 +3901,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
                 .as_ref()
                 .unwrap()
                 .list_all_tokens()
+                .await
                 .is_empty(),
             "a token was minted for a scoped caller despite the 403"
         );
@@ -3921,6 +3961,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
                 .as_ref()
                 .unwrap()
                 .list_all_tokens()
+                .await
                 .is_empty(),
             "a token was minted for a scoped admin despite the 403"
         );
@@ -3952,7 +3993,13 @@ Jd74nq6dNCjpWG4drIsyhqX+
             "an unrestricted admin must still be able to mint via the admin route"
         );
         assert_eq!(
-            ctx.state.tokens.as_ref().unwrap().list_all_tokens().len(),
+            ctx.state
+                .tokens
+                .as_ref()
+                .unwrap()
+                .list_all_tokens()
+                .await
+                .len(),
             1,
             "exactly one token minted by the unrestricted admin"
         );
@@ -4011,6 +4058,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
                 .as_ref()
                 .unwrap()
                 .list_all_tokens()
+                .await
                 .is_empty(),
             "a token was minted despite the 403"
         );
@@ -4750,6 +4798,7 @@ mod web_surface_gating_tests {
             .as_ref()
             .unwrap()
             .create_token("ci", 30, None, crate::tokens::Role::Write)
+            .await
             .unwrap();
         let good = format!("Basic {}", STANDARD.encode(format!("token:{token}")));
         let resp = send_with_headers(
@@ -4905,6 +4954,7 @@ mod web_surface_gating_tests {
             .as_ref()
             .unwrap()
             .create_token("admin", 30, None, crate::tokens::Role::Write)
+            .await
             .unwrap();
 
         let header_val = format!("Bearer {token}");

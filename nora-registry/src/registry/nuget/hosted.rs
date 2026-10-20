@@ -3353,6 +3353,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         let tokens = ctx.state.tokens.as_ref().unwrap();
         let read = tokens
             .create_token("ci", 1, None, crate::tokens::Role::Read)
+            .await
             .unwrap();
         assert_eq!(
             push(&ctx.app, &pkg, &[("X-NuGet-ApiKey", &read)]).await,
@@ -3360,6 +3361,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         );
         let write = tokens
             .create_token("ci", 1, None, crate::tokens::Role::Write)
+            .await
             .unwrap();
         assert_eq!(
             push(&ctx.app, &pkg, &[("X-NuGet-ApiKey", &write)]).await,
