@@ -194,6 +194,7 @@ impl DigestStore {
             let started = std::time::Instant::now();
             match tokio::time::timeout(LOAD_DEADLINE, load_entries(&storage, &legacy)).await {
                 Ok(loaded) => {
+                    let cutoff = Utc::now().timestamp() - PRUNE_TTL_SECS;
                     let mut map = entries.write();
                     for (key, entry) in loaded {
                         // An entry recorded meanwhile keeps the older first_seen.
@@ -204,6 +205,9 @@ impl DigestStore {
                             }
                         }
                     }
+                    // A record() that adopted a stale object the walk then pruned
+                    // would read as Mature until restart: apply the same cutoff here.
+                    map.retain(|_, entry| entry.first_seen >= cutoff);
                     info!(
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         entries = map.len(),
