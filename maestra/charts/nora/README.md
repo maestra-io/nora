@@ -69,7 +69,7 @@ No PodDisruptionBudget: with one replica, `minAvailable: 1` / `maxUnavailable: 0
 | `persistence.accessModes` | Access modes | `[ReadWriteOnce]` |
 | `persistence.allowEphemeral` | Allow `storage.mode: s3` without a PVC | `false` |
 
-Keep persistence on in every storage mode. `/data` holds nora's local state even with S3: API tokens (`auth.token_storage`), the digest-quarantine ledger and the audit file (under `storage.path`) and, unless `spool.enabled`, the disk spools. Only artifacts go to the bucket. With `persistence.enabled: false` `/data` is an emptyDir and every pod restart deletes all API tokens, so the chart refuses `storage.mode: s3` without persistence unless `persistence.allowEphemeral: true`.
+Keep persistence on in every storage mode. `/data` holds nora's local state even with S3: API tokens (`auth.token_storage`), the audit file (under `storage.path`) and, unless `spool.enabled`, the disk spools. Artifacts and the digest-quarantine ledger (`.nora-quarantine/`; a legacy `<storage.path>/quarantine.jsonl` is imported at every start) go to the bucket. With `persistence.enabled: false` `/data` is an emptyDir and every pod restart deletes all API tokens, so the chart refuses `storage.mode: s3` without persistence unless `persistence.allowEphemeral: true`.
 
 ### NORA Configuration
 
@@ -371,7 +371,7 @@ resources:
 
 ### Backup and restore (Maestra)
 
-With `storage.mode: s3` the artifacts are in the bucket, but the API token records (`auth.token_storage`) and the digest-quarantine ledger (`<storage.path>/quarantine.jsonl`) live only on the `/data` volume. Losing it (node loss with a node-local volume, recreating the PVC to resize it) voids every `nra_` token. `backup.enabled` adds a CronJob that archives both and uploads `<prefix><UTC timestamp>.tar.gz` to `config.storage.bucket` with the same endpoint and credentials (the `s3Credentials` files or the `NORA_STORAGE_S3_*` keys of `existingSecret`), then keeps the newest `backup.keep`. RPO = the schedule interval.
+With `storage.mode: s3` the artifacts are in the bucket, but the API token records (`auth.token_storage`) live only on the `/data` volume (the digest-quarantine ledger is in the bucket; the job still archives a legacy `<storage.path>/quarantine.jsonl`, which nora imports at start). Losing it (node loss with a node-local volume, recreating the PVC to resize it) voids every `nra_` token. `backup.enabled` adds a CronJob that archives both and uploads `<prefix><UTC timestamp>.tar.gz` to `config.storage.bucket` with the same endpoint and credentials (the `s3Credentials` files or the `NORA_STORAGE_S3_*` keys of `existingSecret`), then keeps the newest `backup.keep`. RPO = the schedule interval.
 
 The job mounts the ReadWriteOnce data PVC read-only next to the running pod: RWO limits a volume to one node, not one pod, and a required podAffinity on the nora pod schedules the job onto that node (a node-local PV pins it there anyway). It needs nora running (Recreate rollouts make it wait); `startingDeadlineSeconds` is an hour.
 

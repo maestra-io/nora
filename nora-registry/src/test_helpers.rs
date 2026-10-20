@@ -416,7 +416,7 @@ fn build_context_full(
         ),
     };
     let state = AppState {
-        storage,
+        storage: storage.clone(),
         spool: Arc::new(crate::registry::SpoolBudget::new(&config)),
         config: Arc::new(config),
         enabled_registries: enabled_registries.clone(),
@@ -444,7 +444,9 @@ fn build_context_full(
         proxy_coalesce: crate::proxy_coalesce::InflightMap::new(),
         artifact_flights: crate::proxy_coalesce::InflightMap::new(),
         blob_flights: crate::proxy_coalesce::InflightMap::new(),
-        digest_store: Arc::new(crate::digest_quarantine::DigestStore::empty(&storage_path)),
+        digest_store: Arc::new(crate::digest_quarantine::DigestStore::empty(
+            storage.clone(),
+        )),
         signer,
         leak_finders,
         cancel_token: tokio_util::sync::CancellationToken::new(),

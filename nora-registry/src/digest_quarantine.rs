@@ -8,23 +8,40 @@
 //! providing a time-based supply chain defense for registries that lack
 //! upstream publish dates (e.g. Docker/OCI).
 //!
-//! Persistence: append-only JSONL file, compacted on startup via atomic rewrite.
-//! Fail-open: corrupt or missing JSONL → empty store, all pulls pass.
+//! Persistence: one object per entry under [`ENTRY_PREFIX`] in the storage
+//! backend, written with `put_if_absent` (first writer wins, also across
+//! replicas), plus a boot-time snapshot of the whole map so a start reads one
+//! object and a listing instead of one GET per entry. A legacy
+//! `{storage.path}/quarantine.jsonl` is imported at every boot.
+//! Fail-open: unreadable entries or a failed listing → those digests unknown.
 
+use axum::body::Bytes;
 use chrono::Utc;
+use futures::StreamExt;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use axum::http::{header, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-/// Ledger file name under `storage.path`.
+use crate::storage::{Storage, StorageError};
+
+/// Legacy ledger file name under `storage.path`, imported at boot (Maestra).
 pub const LEDGER_FILE: &str = "quarantine.jsonl";
+
+/// Per-entry objects: `.nora-quarantine/<registry>/<digest>` = the [`DigestEntry`] JSON.
+pub(crate) const ENTRY_PREFIX: &str = ".nora-quarantine/";
+
+/// The compacted map plus `as_of`, rewritten at each boot. Outside [`ENTRY_PREFIX`],
+/// so backup and migrate never carry it: a store without it reads every entry once.
+pub(crate) const SNAPSHOT_KEY: &str = ".nora-quarantine-snapshot.json";
+
+/// Concurrent storage requests while loading or importing the ledger.
+const LOAD_CONCURRENCY: usize = 32;
 
 /// Stale entry TTL: entries older than 90 days are pruned on startup.
 const PRUNE_TTL_SECS: i64 = 90 * 24 * 3600;
@@ -119,96 +136,58 @@ impl QuarantineStatus {
 // Digest Store
 // ============================================================================
 
-/// In-memory digest store backed by an append-only JSONL file.
+/// In-memory digest store backed by per-entry objects in the storage backend.
 ///
 /// Thread-safe via `parking_lot::RwLock`. Reads (check) take a shared lock,
 /// writes (record) take an exclusive lock with double-check pattern.
 pub struct DigestStore {
-    entries: RwLock<HashMap<String, DigestEntry>>,
-    path: PathBuf,
+    entries: Arc<RwLock<HashMap<String, DigestEntry>>>,
+    storage: Storage,
+}
+
+/// The [`SNAPSHOT_KEY`] document.
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    /// Unix time the snapshot was written.
+    as_of: i64,
+    entries: Vec<DigestEntry>,
+}
+
+fn map_key(registry: &str, digest: &str) -> String {
+    format!("{}:{}", registry, digest)
+}
+
+fn entry_key(entry: &DigestEntry) -> String {
+    format!("{ENTRY_PREFIX}{}/{}", entry.registry, entry.digest)
 }
 
 impl DigestStore {
-    /// Load existing entries from JSONL, prune stale (>90d), compact file.
+    /// Load the ledger from `storage`: import a legacy `{storage_path}/quarantine.jsonl`,
+    /// read the snapshot plus every entry recorded since it, prune stale (>90d)
+    /// entries and their objects, and write a fresh snapshot.
     ///
-    /// Fail-open: corrupt lines are skipped, missing file → empty store.
-    pub fn load(storage_path: &str) -> Self {
-        let path = PathBuf::from(storage_path).join(LEDGER_FILE);
-        let mut entries = HashMap::new();
-
-        if path.exists() {
-            match File::open(&path) {
-                Ok(file) => {
-                    let reader = BufReader::new(file);
-                    let now = Utc::now().timestamp();
-                    let cutoff = now - PRUNE_TTL_SECS;
-                    let mut skipped = 0u32;
-
-                    for line in reader.lines() {
-                        let line = match line {
-                            Ok(l) => l,
-                            Err(e) => {
-                                warn!(error = %e, "Skipping unreadable quarantine line");
-                                skipped += 1;
-                                continue;
-                            }
-                        };
-                        if line.trim().is_empty() {
-                            continue;
-                        }
-                        match serde_json::from_str::<DigestEntry>(&line) {
-                            Ok(entry) => {
-                                if entry.first_seen >= cutoff {
-                                    let key = format!("{}:{}", entry.registry, entry.digest);
-                                    entries.entry(key).or_insert(entry);
-                                }
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "Skipping unparsable quarantine entry");
-                                skipped += 1;
-                            }
-                        }
-                    }
-
-                    info!(
-                        path = %path.display(),
-                        entries = entries.len(),
-                        skipped = skipped,
-                        "Quarantine store loaded"
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        path = %path.display(),
-                        error = %e,
-                        "Failed to open quarantine file, starting empty (fail-open)"
-                    );
-                }
-            }
-
-            // Compact: atomic rewrite removes duplicates and pruned entries
-            atomic_rewrite(&path, &entries);
-        }
-
+    /// Fail-open: unreadable entries are skipped, a failed listing → empty store.
+    pub async fn load(storage: Storage, storage_path: &str) -> Self {
+        let legacy = Path::new(storage_path).join(LEDGER_FILE);
+        let entries = load_entries(&storage, &legacy).await;
         Self {
-            entries: RwLock::new(entries),
-            path,
+            entries: Arc::new(RwLock::new(entries)),
+            storage,
         }
     }
 
     /// Create an empty store (for tests or when quarantine is off).
-    pub fn empty(storage_path: &str) -> Self {
-        let path = PathBuf::from(storage_path).join(LEDGER_FILE);
+    pub fn empty(storage: Storage) -> Self {
         Self {
-            entries: RwLock::new(HashMap::new()),
-            path,
+            entries: Arc::new(RwLock::new(HashMap::new())),
+            storage,
         }
     }
 
     /// Record a proxy-fetched digest. Returns the entry (existing or new).
     ///
     /// Idempotent: if the digest already exists, the original entry is returned.
-    /// New entries are appended to JSONL asynchronously.
+    /// New entries are written to storage asynchronously.
     /// `first_seen` overrides the recorded first-seen timestamp with a trusted
     /// upstream release date (only when `server.trust_upstream_dates` is set and
     /// the registry caches one, #750); `None` uses NORA's own clock — the
@@ -221,7 +200,7 @@ impl DigestStore {
         upstream: &str,
         first_seen: Option<i64>,
     ) -> DigestEntry {
-        let key = format!("{}:{}", registry, digest);
+        let key = map_key(registry, digest);
 
         // Fast path: read lock
         {
@@ -246,8 +225,38 @@ impl DigestStore {
         };
 
         entries.insert(key, entry.clone());
-        append_jsonl(&self.path, &entry);
+        drop(entries);
+        self.persist(entry.clone());
         entry
+    }
+
+    /// Write a new entry off the request path. The object is created once: when it
+    /// exists already (another replica, or a pod that started before it), the stored
+    /// entry is the ledger's and replaces the one just recorded in memory.
+    fn persist(&self, entry: DigestEntry) {
+        let storage = self.storage.clone();
+        let entries = Arc::clone(&self.entries);
+        tokio::spawn(async move {
+            let key = entry_key(&entry);
+            let Some(body) = entry_body(&entry) else {
+                return;
+            };
+            match storage.put_if_absent(&key, body).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    if let Some(stored) = read_entry(&storage, &key).await {
+                        entries
+                            .write()
+                            .insert(map_key(&stored.registry, &stored.digest), stored);
+                    }
+                }
+                Err(e) => error!(
+                    key = %key,
+                    error = %e,
+                    "Failed to persist quarantine entry (fail-open)"
+                ),
+            }
+        });
     }
 
     // NOTE: the ledger records PROXY-fetched content only. Locally-pushed artifacts
@@ -260,7 +269,7 @@ impl DigestStore {
     /// Check quarantine status for a digest.
     #[must_use = "ignoring quarantine status may serve blocked artifacts"]
     pub fn check(&self, registry: &str, digest: &str, quarantine_secs: i64) -> QuarantineStatus {
-        let key = format!("{}:{}", registry, digest);
+        let key = map_key(registry, digest);
         let entries = self.entries.read();
 
         match entries.get(&key) {
@@ -473,100 +482,222 @@ fn quarantine_forbidden(
 }
 
 // ============================================================================
-// JSONL I/O helpers
+// Storage I/O helpers
 // ============================================================================
 
-/// Append a single entry to the JSONL file (async via spawn_blocking).
-fn append_jsonl(path: &Path, entry: &DigestEntry) {
-    let path = path.to_path_buf();
-    let json = match serde_json::to_string(entry) {
-        Ok(j) => j,
-        Err(_) => return,
-    };
-
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = append_jsonl_line(&path, &json) {
-            error!(
-                path = %path.display(),
-                error = %e,
-                "Failed to append quarantine entry (fail-open)"
-            );
-        }
-    });
+/// The stored body of an entry.
+fn entry_body(entry: &DigestEntry) -> Option<Bytes> {
+    serde_json::to_vec(entry).ok().map(Bytes::from)
 }
 
-/// Append `json` as one line, in one write, after a newline-terminated tail.
-///
-/// `writeln!` on an unbuffered File was two syscalls (the JSON, then the
-/// newline); a SIGKILL between them (a Recreate rollout) left a line without
-/// its newline, the next append glued onto it and `load` dropped both entries
-/// ("trailing characters", 1-3 per restart on iota). A single write of the
-/// whole line cannot be split by a kill, and an unterminated tail left by an
-/// earlier torn write gets its newline first, so at most that fragment is
-/// lost, never the records after it.
-fn append_jsonl_line(path: &Path, json: &str) -> std::io::Result<()> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    let line = if tail_is_terminated(path)? {
-        format!("{json}\n")
-    } else {
-        format!("\n{json}\n")
-    };
-    file.write_all(line.as_bytes())?;
-    file.flush()
-}
-
-/// True when `path` is missing, empty, or ends with a newline.
-pub(crate) fn tail_is_terminated(path: &Path) -> std::io::Result<bool> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(e) => return Err(e),
-    };
-    if file.metadata()?.len() == 0 {
-        return Ok(true);
-    }
-    file.seek(SeekFrom::End(-1))?;
-    let mut last = [0u8; 1];
-    file.read_exact(&mut last)?;
-    Ok(last[0] == b'\n')
-}
-
-/// Rewrite JSONL atomically: write temp file → fsync → rename.
-///
-/// Crash-safe: partial write leaves the old file intact.
-fn atomic_rewrite(path: &Path, entries: &HashMap<String, DigestEntry>) {
-    if entries.is_empty() {
-        let _ = fs::remove_file(path);
-        return;
-    }
-
-    let tmp_path = path.with_extension("jsonl.tmp");
-
-    match File::create(&tmp_path) {
-        Ok(mut file) => {
-            for entry in entries.values() {
-                if let Ok(json) = serde_json::to_string(entry) {
-                    let _ = writeln!(file, "{}", json);
-                }
+/// One per-entry object; `None` when missing or unreadable.
+async fn read_entry(storage: &Storage, key: &str) -> Option<DigestEntry> {
+    match storage.get(key).await {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                warn!(key = %key, error = %e, "Skipping unparsable quarantine entry");
+                None
             }
-            if file.flush().is_ok() && file.sync_all().is_ok() {
-                if let Err(e) = fs::rename(&tmp_path, path) {
-                    error!(error = %e, "Failed to rename quarantine temp file");
-                    let _ = fs::remove_file(&tmp_path);
-                }
-            } else {
-                let _ = fs::remove_file(&tmp_path);
-            }
-        }
+        },
+        Err(StorageError::NotFound) => None,
         Err(e) => {
-            error!(error = %e, "Failed to create quarantine temp file");
+            warn!(key = %key, error = %e, "Skipping unreadable quarantine entry");
+            None
         }
     }
+}
+
+/// Every per-entry object key; `None` (logged) when the listing fails.
+async fn list_entries(storage: &Storage) -> Option<HashSet<String>> {
+    match storage.list_internal(ENTRY_PREFIX).await {
+        Ok(keys) => Some(keys.into_iter().collect()),
+        Err(e) => {
+            error!(error = %e, "Failed to list quarantine entries, starting empty (fail-open)");
+            None
+        }
+    }
+}
+
+/// The snapshot's entries by object key; empty when missing or unreadable.
+async fn read_snapshot(storage: &Storage) -> HashMap<String, DigestEntry> {
+    let snapshot = match storage.get(SNAPSHOT_KEY).await {
+        Ok(bytes) => match serde_json::from_slice::<Snapshot>(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "Unparsable quarantine snapshot, reading every entry");
+                return HashMap::new();
+            }
+        },
+        Err(StorageError::NotFound) => return HashMap::new(),
+        Err(e) => {
+            warn!(error = %e, "Unreadable quarantine snapshot, reading every entry");
+            return HashMap::new();
+        }
+    };
+    snapshot
+        .entries
+        .into_iter()
+        .map(|e| (entry_key(&e), e))
+        .collect()
+}
+
+/// Write every ledger line of `jsonl` (the legacy file format) to its per-entry
+/// object, keeping its `first_seen`. The first line of a digest wins, as it did in
+/// the file; stale (>90d) lines are dropped. `overwrite` replaces an existing object
+/// (a restore: the backup's time wins), otherwise the stored object wins. Keys in
+/// `present` cost no request. Returns (entries written, already present, failed).
+pub(crate) async fn import_jsonl(
+    storage: &Storage,
+    jsonl: &[u8],
+    present: &HashSet<String>,
+    overwrite: bool,
+) -> (Vec<DigestEntry>, usize, usize) {
+    let cutoff = Utc::now().timestamp() - PRUNE_TTL_SECS;
+    let mut seen = HashSet::new();
+    let mut todo = Vec::new();
+    let mut already = 0;
+    for line in jsonl.split(|b| *b == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let entry: DigestEntry = match serde_json::from_slice(line) {
+            Ok(entry) => entry,
+            Err(e) => {
+                warn!(error = %e, "Skipping unparsable quarantine line");
+                continue;
+            }
+        };
+        let key = entry_key(&entry);
+        if entry.first_seen < cutoff || !seen.insert(key.clone()) {
+            continue;
+        }
+        if present.contains(&key) {
+            already += 1;
+            continue;
+        }
+        todo.push((key, entry));
+    }
+    let results: Vec<_> = futures::stream::iter(todo)
+        .map(|(key, entry)| async move {
+            let result = match entry_body(&entry) {
+                Some(body) if overwrite => storage.put_bytes(&key, body).await.map(|()| true),
+                Some(body) => storage.put_if_absent(&key, body).await,
+                None => Ok(false),
+            };
+            (key, entry, result)
+        })
+        .buffer_unordered(LOAD_CONCURRENCY)
+        .collect()
+        .await;
+    let mut written = Vec::new();
+    let mut failed = 0;
+    for (key, entry, result) in results {
+        match result {
+            Ok(true) => written.push(entry),
+            Ok(false) => already += 1,
+            Err(e) => {
+                error!(key = %key, error = %e, "Failed to import quarantine entry");
+                failed += 1;
+            }
+        }
+    }
+    (written, already, failed)
+}
+
+/// [`DigestStore::load`]: the map keyed `registry:digest`.
+async fn load_entries(storage: &Storage, legacy: &Path) -> HashMap<String, DigestEntry> {
+    let Some(mut listed) = list_entries(storage).await else {
+        return HashMap::new();
+    };
+    // Snapshot entries by object key, plus what the import below writes.
+    let mut known = read_snapshot(storage).await;
+
+    // Maestra: the ledger was a file on the volume. Imported at every boot while it is
+    // there; only lines with no object yet cost a request.
+    match tokio::fs::read(legacy).await {
+        Ok(data) => {
+            let (written, present, failed) = import_jsonl(storage, &data, &listed, false).await;
+            info!(
+                failed = failed,
+                "imported {} quarantine entries from {}, {} already present",
+                written.len(),
+                legacy.display(),
+                present
+            );
+            for entry in written {
+                let key = entry_key(&entry);
+                listed.insert(key.clone());
+                known.insert(key, entry);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(path = %legacy.display(), error = %e, "Cannot read legacy quarantine ledger")
+        }
+    }
+
+    // The listing decides membership: a snapshot entry without its object was
+    // pruned by another start. Entries recorded since the snapshot are read here.
+    let missing: Vec<String> = listed
+        .iter()
+        .filter(|k| !known.contains_key(*k))
+        .cloned()
+        .collect();
+    let fetched = missing.len();
+    let read: Vec<(String, Option<DigestEntry>)> = futures::stream::iter(missing)
+        .map(|key| async move {
+            let entry = read_entry(storage, &key).await;
+            (key, entry)
+        })
+        .buffer_unordered(LOAD_CONCURRENCY)
+        .collect()
+        .await;
+    for (key, entry) in read {
+        if let Some(entry) = entry {
+            known.insert(key, entry);
+        }
+    }
+
+    let cutoff = Utc::now().timestamp() - PRUNE_TTL_SECS;
+    let mut entries = HashMap::new();
+    let mut stale = Vec::new();
+    for key in listed {
+        match known.remove(&key) {
+            Some(entry) if entry.first_seen < cutoff => stale.push(key),
+            Some(entry) => {
+                entries.insert(map_key(&entry.registry, &entry.digest), entry);
+            }
+            None => {}
+        }
+    }
+    let pruned = stale.len();
+    for key in stale {
+        if let Err(e) = storage.delete(&key).await {
+            warn!(key = %key, error = %e, "Failed to delete stale quarantine entry");
+        }
+    }
+
+    let snapshot = Snapshot {
+        as_of: Utc::now().timestamp(),
+        entries: entries.values().cloned().collect(),
+    };
+    match serde_json::to_vec(&snapshot) {
+        Ok(body) => {
+            if let Err(e) = storage.put(SNAPSHOT_KEY, &body).await {
+                warn!(error = %e, "Failed to write quarantine snapshot");
+            }
+        }
+        Err(e) => warn!(error = %e, "Failed to encode quarantine snapshot"),
+    }
+
+    info!(
+        entries = entries.len(),
+        fetched = fetched,
+        pruned = pruned,
+        "Quarantine store loaded"
+    );
+    entries
 }
 
 // ============================================================================
@@ -577,31 +708,31 @@ fn atomic_rewrite(path: &Path, entries: &HashMap<String, DigestEntry>) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use tempfile::TempDir;
 
-    /// A torn append (the JSON written, the kill before its newline) must not
-    /// swallow the next record: the append terminates the tail first, so only
-    /// the fragment is unparsable and the new entry loads.
-    #[test]
-    fn append_after_a_torn_tail_keeps_the_new_entry_parsable() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("quarantine.jsonl");
-        std::fs::write(&path, b"{\"registry\":\"npm\",\"digest\":\"sha256:torn").unwrap();
-        assert!(!tail_is_terminated(&path).unwrap());
-        let entry = DigestEntry {
-            registry: "nuget".to_string(),
-            digest: "sha256:aa".to_string(),
-            first_seen: 1,
-            upstream: "cache".to_string(),
-        };
-        append_jsonl_line(&path, &serde_json::to_string(&entry).unwrap()).unwrap();
-        assert!(tail_is_terminated(&path).unwrap());
-        let text = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2, "{text:?}");
-        assert!(serde_json::from_str::<DigestEntry>(lines[0]).is_err());
-        let loaded: DigestEntry = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(loaded.digest, "sha256:aa");
+    fn storage(tmp: &TempDir) -> Storage {
+        Storage::new_local(tmp.path().to_str().unwrap())
+    }
+
+    /// Wait for the object `record` writes from a spawned task.
+    async fn wait_for(storage: &Storage, key: &str) {
+        for _ in 0..500 {
+            if storage.stat(key).await.is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{key} was never written");
+    }
+
+    fn entry(digest: &str, first_seen: i64) -> DigestEntry {
+        DigestEntry {
+            registry: "docker".into(),
+            digest: digest.into(),
+            first_seen,
+            upstream: "up".into(),
+        }
     }
 
     #[test]
@@ -671,10 +802,10 @@ mod tests {
         assert_eq!(QuarantineMode::default(), QuarantineMode::Off);
     }
 
-    #[test]
-    fn test_check_unknown_digest_is_new() {
+    #[tokio::test]
+    async fn test_check_unknown_digest_is_new() {
         let tmp = TempDir::new().unwrap();
-        let store = DigestStore::empty(tmp.path().to_str().unwrap());
+        let store = DigestStore::empty(storage(&tmp));
 
         let status = store.check("docker", "sha256:abc123", 86400);
         assert_eq!(status, QuarantineStatus::New);
@@ -683,7 +814,7 @@ mod tests {
     #[tokio::test]
     async fn test_record_then_check_pending() {
         let tmp = TempDir::new().unwrap();
-        let store = DigestStore::empty(tmp.path().to_str().unwrap());
+        let store = DigestStore::empty(storage(&tmp));
 
         store.record("docker", "sha256:abc123", "registry-1.docker.io", None);
 
@@ -700,7 +831,7 @@ mod tests {
     #[tokio::test]
     async fn test_record_then_check_mature_zero_ttl() {
         let tmp = TempDir::new().unwrap();
-        let store = DigestStore::empty(tmp.path().to_str().unwrap());
+        let store = DigestStore::empty(storage(&tmp));
 
         store.record("docker", "sha256:abc123", "registry-1.docker.io", None);
 
@@ -717,7 +848,7 @@ mod tests {
         // blocks only `Pending`, so a local push is served and can never set the
         // first-seen clock for — or mature — a digest on the proxy path.
         let tmp = TempDir::new().unwrap();
-        let store = DigestStore::empty(tmp.path().to_str().unwrap());
+        let store = DigestStore::empty(storage(&tmp));
 
         let status = store.check("docker", "sha256:never_seen", 86400);
         assert_eq!(status, QuarantineStatus::New);
@@ -726,7 +857,7 @@ mod tests {
     #[tokio::test]
     async fn test_record_idempotent() {
         let tmp = TempDir::new().unwrap();
-        let store = DigestStore::empty(tmp.path().to_str().unwrap());
+        let store = DigestStore::empty(storage(&tmp));
 
         let entry1 = store.record("docker", "sha256:abc", "upstream1", None);
         let entry2 = store.record("docker", "sha256:abc", "upstream2", None);
@@ -739,7 +870,7 @@ mod tests {
     #[tokio::test]
     async fn test_registry_isolation() {
         let tmp = TempDir::new().unwrap();
-        let store = DigestStore::empty(tmp.path().to_str().unwrap());
+        let store = DigestStore::empty(storage(&tmp));
 
         store.record("docker", "sha256:abc", "docker-upstream", None);
         store.record("npm", "sha256:abc", "npmjs.org", None);
@@ -753,7 +884,7 @@ mod tests {
         // first_seen is that date — so a package released long ago is immediately
         // Mature (served), not held as "new to this mirror".
         let tmp = TempDir::new().unwrap();
-        let store = DigestStore::empty(tmp.path().to_str().unwrap());
+        let store = DigestStore::empty(storage(&tmp));
         let two_years_ago = Utc::now().timestamp() - 2 * 365 * 86400;
 
         store.record(
@@ -783,13 +914,13 @@ mod tests {
         assert_eq!(store.len(), 2);
     }
 
-    #[test]
-    fn test_persistence_roundtrip() {
+    /// A legacy `quarantine.jsonl` is imported into storage at boot.
+    #[tokio::test]
+    async fn test_persistence_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().to_str().unwrap();
         let jsonl_path = tmp.path().join("quarantine.jsonl");
 
-        // Write JSONL directly (bypass async spawn_blocking in record())
         let now = Utc::now().timestamp();
         let entries = [
             DigestEntry {
@@ -813,22 +944,30 @@ mod tests {
             file.flush().unwrap();
         }
 
-        let store = DigestStore::load(path);
+        let store = DigestStore::load(storage(&tmp), path).await;
         assert_eq!(store.len(), 2);
+        assert_eq!(
+            storage(&tmp)
+                .list_internal(ENTRY_PREFIX)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
 
         let status = store.check("docker", "sha256:aaa", 86400);
         assert!(matches!(status, QuarantineStatus::Pending { .. }));
     }
 
-    #[test]
-    fn test_load_empty_dir() {
+    #[tokio::test]
+    async fn test_load_empty_dir() {
         let tmp = TempDir::new().unwrap();
-        let store = DigestStore::load(tmp.path().to_str().unwrap());
+        let store = DigestStore::load(storage(&tmp), tmp.path().to_str().unwrap()).await;
         assert_eq!(store.len(), 0);
     }
 
-    #[test]
-    fn test_load_corrupt_file_fail_open() {
+    #[tokio::test]
+    async fn test_load_corrupt_file_fail_open() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("quarantine.jsonl");
 
@@ -841,12 +980,12 @@ mod tests {
         });
         std::fs::write(&path, format!("not json\n{}\ngarbage\n", valid)).unwrap();
 
-        let store = DigestStore::load(tmp.path().to_str().unwrap());
+        let store = DigestStore::load(storage(&tmp), tmp.path().to_str().unwrap()).await;
         assert_eq!(store.len(), 1);
     }
 
-    #[test]
-    fn test_prune_stale_entries() {
+    #[tokio::test]
+    async fn test_prune_stale_entries() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("quarantine.jsonl");
 
@@ -864,7 +1003,7 @@ mod tests {
         });
         std::fs::write(&path, format!("{}\n{}\n", old, fresh)).unwrap();
 
-        let store = DigestStore::load(tmp.path().to_str().unwrap());
+        let store = DigestStore::load(storage(&tmp), tmp.path().to_str().unwrap()).await;
         assert_eq!(store.len(), 1);
 
         assert!(matches!(
@@ -890,29 +1029,169 @@ mod tests {
         assert_eq!(QuarantineStatus::Mature.header_value(), "mature");
     }
 
-    #[test]
-    fn test_atomic_rewrite_compacts_duplicates() {
+    #[tokio::test]
+    async fn test_import_keeps_one_object_per_digest() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("quarantine.jsonl");
 
         let now = Utc::now().timestamp();
-        let entry = serde_json::json!({
+        let first = serde_json::json!({
+            "registry": "docker", "digest": "sha256:dup",
+            "first_seen": now - 100, "upstream": "up"
+        });
+        let later = serde_json::json!({
             "registry": "docker", "digest": "sha256:dup",
             "first_seen": now, "upstream": "up"
         });
-        std::fs::write(&path, format!("{}\n{}\n{}\n", entry, entry, entry)).unwrap();
+        std::fs::write(&path, format!("{}\n{}\n{}\n", first, later, later)).unwrap();
 
-        let store = DigestStore::load(tmp.path().to_str().unwrap());
+        let store = DigestStore::load(storage(&tmp), tmp.path().to_str().unwrap()).await;
         assert_eq!(store.len(), 1);
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(content.lines().count(), 1);
+        assert_eq!(
+            store.record("docker", "sha256:dup", "x", None).first_seen,
+            now - 100,
+            "the first line of a digest wins"
+        );
+        assert_eq!(
+            storage(&tmp)
+                .list_internal(ENTRY_PREFIX)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
-    #[test]
-    fn test_empty_store_is_empty() {
+    /// (a) A recorded entry outlives the process: a store loaded later over the same
+    /// storage holds it with the same first-seen.
+    #[tokio::test]
+    async fn test_record_survives_a_new_store() {
         let tmp = TempDir::new().unwrap();
-        let store = DigestStore::empty(tmp.path().to_str().unwrap());
+        let first_seen = Utc::now().timestamp() - 3600;
+        let store = DigestStore::empty(storage(&tmp));
+        store.record("npm", "sha256:aa", "registry.npmjs.org", Some(first_seen));
+        wait_for(&storage(&tmp), ".nora-quarantine/npm/sha256:aa").await;
+        drop(store);
+
+        let reloaded = DigestStore::load(storage(&tmp), "/nonexistent").await;
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(
+            reloaded
+                .record("npm", "sha256:aa", "other", None)
+                .first_seen,
+            first_seen
+        );
+        // A third start reads it from the snapshot the second one wrote.
+        assert!(storage(&tmp).stat(SNAPSHOT_KEY).await.is_some());
+        let third = DigestStore::load(storage(&tmp), "/nonexistent").await;
+        assert_eq!(
+            third.record("npm", "sha256:aa", "other", None).first_seen,
+            first_seen
+        );
+    }
+
+    /// Two replicas record the same digest: the first object wins, and the
+    /// second replica adopts its first-seen.
+    #[tokio::test]
+    async fn test_second_writer_adopts_the_stored_first_seen() {
+        let tmp = TempDir::new().unwrap();
+        let early = Utc::now().timestamp() - 5 * 86400;
+        let a = DigestStore::empty(storage(&tmp));
+        a.record("docker", "sha256:bb", "up", Some(early));
+        wait_for(&storage(&tmp), ".nora-quarantine/docker/sha256:bb").await;
+
+        let b = DigestStore::empty(storage(&tmp));
+        b.record("docker", "sha256:bb", "up", None);
+        for _ in 0..500 {
+            if b.check("docker", "sha256:bb", 86400) == QuarantineStatus::Mature {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the second store never adopted the stored first-seen");
+    }
+
+    /// (b) The boot import runs at every start: a second run writes nothing and
+    /// the original first-seen stays, also after a later re-recording.
+    #[tokio::test]
+    async fn test_boot_import_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let original = Utc::now().timestamp() - 2 * 86400;
+        std::fs::write(
+            tmp.path().join(LEDGER_FILE),
+            format!(
+                "{}\n",
+                serde_json::to_string(&entry("sha256:cc", original)).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let first = DigestStore::load(storage(&tmp), dir).await;
+        assert_eq!(first.len(), 1);
+        drop(first);
+        let second = DigestStore::load(storage(&tmp), dir).await;
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            second.record("docker", "sha256:cc", "x", None).first_seen,
+            original
+        );
+        assert_eq!(
+            storage(&tmp).list_internal(ENTRY_PREFIX).await.unwrap(),
+            vec![".nora-quarantine/docker/sha256:cc".to_string()]
+        );
+
+        // Not even a conditional write: the key is listed already.
+        let listed = list_entries(&storage(&tmp)).await.unwrap();
+        let data = std::fs::read(tmp.path().join(LEDGER_FILE)).unwrap();
+        let (written, present, failed) = import_jsonl(&storage(&tmp), &data, &listed, false).await;
+        assert_eq!((written.len(), present, failed), (0, 1, 0));
+        // Without the listing, put_if_absent keeps the stored object.
+        let newer = entry("sha256:cc", Utc::now().timestamp());
+        let line = serde_json::to_vec(&newer).unwrap();
+        let (written, present, _) =
+            import_jsonl(&storage(&tmp), &line, &HashSet::new(), false).await;
+        assert_eq!((written.len(), present), (0, 1));
+        let stored = read_entry(&storage(&tmp), ".nora-quarantine/docker/sha256:cc").await;
+        assert_eq!(stored.unwrap().first_seen, original);
+    }
+
+    /// (c) A start prunes entries past 90 days: the object goes, and so does the
+    /// snapshot line.
+    #[tokio::test]
+    async fn test_prune_deletes_object_and_snapshot_omits_it() {
+        let tmp = TempDir::new().unwrap();
+        let st = storage(&tmp);
+        let now = Utc::now().timestamp();
+        for e in [
+            entry("sha256:old", now - 91 * 86400),
+            entry("sha256:new", now),
+        ] {
+            st.put(&entry_key(&e), &serde_json::to_vec(&e).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let store = DigestStore::load(st.clone(), "/nonexistent").await;
+        assert_eq!(store.len(), 1);
+        assert!(st
+            .stat(".nora-quarantine/docker/sha256:old")
+            .await
+            .is_none());
+        assert!(st
+            .stat(".nora-quarantine/docker/sha256:new")
+            .await
+            .is_some());
+        let snapshot: Snapshot =
+            serde_json::from_slice(&st.get(SNAPSHOT_KEY).await.unwrap()).unwrap();
+        let digests: Vec<_> = snapshot.entries.iter().map(|e| e.digest.as_str()).collect();
+        assert_eq!(digests, vec!["sha256:new"]);
+    }
+
+    #[tokio::test]
+    async fn test_empty_store_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let store = DigestStore::empty(storage(&tmp));
         assert!(store.is_empty());
         assert_eq!(store.len(), 0);
     }

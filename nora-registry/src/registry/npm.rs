@@ -1024,8 +1024,13 @@ pub(crate) fn first_seen_key(metadata_key: &str) -> String {
 /// Version → Unix time NORA first saw it listed in an upstream packument.
 type FirstSeen = std::collections::BTreeMap<String, i64>;
 
-/// The internal state carried by backup and migrate along with what `list()` shows.
-pub(crate) const INTERNAL_PREFIXES: &[&str] = &[ORIGINS_PREFIX, FIRST_SEEN_PREFIX];
+/// The internal state carried by backup and migrate along with what `list()` shows,
+/// with the digest-quarantine ledger's entries (Maestra).
+pub(crate) const INTERNAL_PREFIXES: &[&str] = &[
+    ORIGINS_PREFIX,
+    FIRST_SEEN_PREFIX,
+    crate::digest_quarantine::ENTRY_PREFIX,
+];
 
 /// Whether release ages come from the first-seen ledger: upstream dates are not trusted
 /// and curation runs. Otherwise nothing reads it, and nothing is written.

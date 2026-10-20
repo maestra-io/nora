@@ -123,8 +123,8 @@ impl FileSink {
         {
             self.rotate();
         }
-        // One write per line (see digest_quarantine::append_jsonl): a kill
-        // between the JSON and the newline would glue the next entry onto it.
+        // One write per line: a kill between the JSON and the newline would glue
+        // the next entry onto it.
         if let Err(e) = self.file.write_all(format!("{json}\n").as_bytes()) {
             tracing::error!(error = %e, "Audit log write failed");
         }
@@ -166,6 +166,23 @@ fn open_append(path: &Path) -> std::io::Result<fs::File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
+/// True when `path` is missing, empty, or ends with a newline.
+fn tail_is_terminated(path: &Path) -> std::io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(e),
+    };
+    if file.metadata()?.len() == 0 {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] == b'\n')
+}
+
 pub struct AuditLog {
     path: PathBuf,
     mode: AuditMode,
@@ -204,11 +221,9 @@ impl AuditLog {
                 Ok(mut file) => {
                     info!(path = %path.display(), mode = ?mode, "Audit log initialized");
                     let mut size = file.metadata().map(|m| m.len()).unwrap_or(0);
-                    // A tail torn by a kill (see digest_quarantine::append_jsonl_line)
-                    // gets its newline once here, so the next entry starts a line.
-                    if !crate::digest_quarantine::tail_is_terminated(&path).unwrap_or(true)
-                        && file.write_all(b"\n").is_ok()
-                    {
+                    // A tail torn by a kill gets its newline once here, so the next
+                    // entry starts a line.
+                    if !tail_is_terminated(&path).unwrap_or(true) && file.write_all(b"\n").is_ok() {
                         size += 1;
                     }
                     Some(FileSink {

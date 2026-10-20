@@ -10,7 +10,7 @@ The first commit on this path is the verbatim copy; every later commit is ours. 
 - The whole `[auth]` section: `trusted_proxies`, `admin_users`, `docker_anon_pull`, `public_web_ui`, `public_metrics`, `token_cache_ttl`, provider `namespace_scope` / `namespace_scope_enforcement`, rule `namespace_scope`; explicit provider `enabled: false` kept. Fork keys `read_only_users`, `htpasswd_allowed_peers`, `[auth.teleport]`.
 - `[curation]` `quarantine`, `quarantine_ttl`, `internal_namespaces`, per-registry `[curation.<registry>]` (`registries:`, incl. `allow`); `min_release_age` without a quarantine fails the render. Every `[gc]` / `[audit]` key, `[npm]` / `[pypi]` scalars, `extraToml`.
 - `networkPolicy` (NetworkPolicy or CiliumNetworkPolicy), `metrics.serviceMonitor`, `metrics.prometheusRule` (`files/prometheus-rules.yml` = `deploy/prometheus-rules.yml`, CI `cmp`), `backup` CronJob (tokens + ledger to the bucket).
-- `storage.mode: s3` refuses `persistence.enabled: false` (tokens, quarantine ledger, audit live on `/data`) unless `persistence.allowEphemeral`; `token_storage: /data/tokens`.
+- `storage.mode: s3` refuses `persistence.enabled: false` (tokens and audit live on `/data`; the quarantine ledger is in the bucket) unless `persistence.allowEphemeral`; `token_storage: /data/tokens`.
 - `config.storage.s3Credentials.existingSecret` → directory mount + `s3_credentials_dir` (fork-only key, see `MAESTRA.md`).
 - `existingSecret` is an `envFrom` secretRef (nora never read the mounted `secrets.toml`); `extraVolumes` / `extraVolumeMounts`.
 - `[audit] mode` (default `stdout`), `[circuit_breaker]` (on), `[nuget]` (`metadata_proxy_timeout` 15 s), extra `[server]` keys.
