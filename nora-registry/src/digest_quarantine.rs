@@ -273,7 +273,12 @@ impl DigestStore {
 
         entries.insert(key, entry.clone());
         drop(entries);
-        self.persist(entry.clone());
+        // A trusted upstream date past the prune TTL is Mature from the start:
+        // the object would only be read and deleted again by the next boot walk
+        // (563 of them on 20.10.2026 made that walk outlive the startup probe).
+        if entry.first_seen >= Utc::now().timestamp() - PRUNE_TTL_SECS {
+            self.persist(entry.clone());
+        }
         entry
     }
 
@@ -719,11 +724,15 @@ async fn load_entries(storage: &Storage, legacy: &Path) -> HashMap<String, Diges
         }
     }
     let pruned = stale.len();
-    for key in stale {
-        if let Err(e) = storage.delete(&key).await {
-            warn!(key = %key, error = %e, "Failed to delete stale quarantine entry");
-        }
-    }
+    futures::stream::iter(stale)
+        .map(|key| async move {
+            if let Err(e) = storage.delete(&key).await {
+                warn!(key = %key, error = %e, "Failed to delete stale quarantine entry");
+            }
+        })
+        .buffer_unordered(LOAD_CONCURRENCY)
+        .collect::<Vec<()>>()
+        .await;
 
     let snapshot = Snapshot {
         as_of: Utc::now().timestamp(),
