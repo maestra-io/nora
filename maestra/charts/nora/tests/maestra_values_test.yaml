@@ -85,3 +85,23 @@ tests:
             name: internal
             containerPort: 9100
             protocol: TCP
+
+  - it: runs without a PVC and leaves a lost node after 30 s
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: data
+            emptyDir: {}
+      - equal:
+          path: spec.template.spec.tolerations
+          value:
+            - key: node.kubernetes.io/not-ready
+              operator: Exists
+              effect: NoExecute
+              tolerationSeconds: 30
+            - key: node.kubernetes.io/unreachable
+              operator: Exists
+              effect: NoExecute
+              tolerationSeconds: 30

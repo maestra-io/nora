@@ -61,7 +61,7 @@ Changes meant for upstream: branch from `main`, cherry-pick, open the PR against
 
 ## Helm chart
 
-`maestra/charts/nora`: upstream getnora-io/helm-charts `charts/nora` vendored with our fixes (Recreate, full `[auth]` incl. Teleport, full `[curation]`, PVC-safe S3 mode, `s3_credentials_dir`, envFrom secrets, network policy, ServiceMonitor/PrometheusRule, token backup CronJob). Provenance, differences and re-sync: `maestra/charts/nora/MAESTRA-CHART.md`.
+`maestra/charts/nora`: upstream getnora-io/helm-charts `charts/nora` vendored with our fixes (Recreate, full `[auth]` incl. Teleport, full `[curation]`, PVC-free S3 mode, `s3_credentials_dir`, envFrom secrets, network policy, ServiceMonitor/PrometheusRule). Provenance, differences and re-sync: `maestra/charts/nora/MAESTRA-CHART.md`.
 
 ## Runbooks
 

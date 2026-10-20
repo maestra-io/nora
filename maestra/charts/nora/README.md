@@ -67,9 +67,9 @@ No PodDisruptionBudget: with one replica, `minAvailable: 1` / `maxUnavailable: 0
 | `persistence.size` | PVC size | `10Gi` |
 | `persistence.storageClass` | Storage class | `""` |
 | `persistence.accessModes` | Access modes | `[ReadWriteOnce]` |
-| `persistence.allowEphemeral` | Allow `storage.mode: s3` without a PVC | `false` |
+| `persistence.allowEphemeral` | Allow `storage.mode: local` (or `audit.mode` file/both) without a PVC | `false` |
 
-Keep persistence on in every storage mode. `/data` holds nora's local state even with S3: API tokens (`auth.token_storage`), the audit file (under `storage.path`) and, unless `spool.enabled`, the disk spools. Artifacts and the digest-quarantine ledger (`.nora-quarantine/`; a legacy `<storage.path>/quarantine.jsonl` is imported at every start) go to the bucket. With `persistence.enabled: false` `/data` is an emptyDir and every pod restart deletes all API tokens, so the chart refuses `storage.mode: s3` without persistence unless `persistence.allowEphemeral: true`.
+`storage.mode: s3` needs no PVC: artifacts, API tokens (`.nora-tokens/`) and the digest-quarantine ledger (`.nora-quarantine/`) are in the bucket, and `/data` (an emptyDir with `persistence.enabled: false`) keeps only scratch: upload temp dirs, the spools unless `spool.enabled`, and legacy `auth.token_storage` / `<storage.path>/quarantine.jsonl` files, imported at every start. `storage.mode: local` keeps the artifacts (and `audit.mode` file/both the audit file) on `/data`, so the chart refuses those without persistence unless `persistence.allowEphemeral: true`.
 
 ### NORA Configuration
 
@@ -371,39 +371,13 @@ resources:
 
 ### Backup and restore (Maestra)
 
-With `storage.mode: s3` the artifacts are in the bucket, but the API token records (`auth.token_storage`) live only on the `/data` volume (the digest-quarantine ledger is in the bucket; the job still archives a legacy `<storage.path>/quarantine.jsonl`, which nora imports at start). Losing it (node loss with a node-local volume, recreating the PVC to resize it) voids every `nra_` token. `backup.enabled` adds a CronJob that archives both and uploads `<prefix><UTC timestamp>.tar.gz` to `config.storage.bucket` with the same endpoint and credentials (the `s3Credentials` files or the `NORA_STORAGE_S3_*` keys of `existingSecret`), then keeps the newest `backup.keep`. RPO = the schedule interval.
-
-The job mounts the ReadWriteOnce data PVC read-only next to the running pod: RWO limits a volume to one node, not one pod, and a required podAffinity on the nora pod schedules the job onto that node (a node-local PV pins it there anyway). It needs nora running (Recreate rollouts make it wait); `startingDeadlineSeconds` is an hour.
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `backup.enabled` | Add the CronJob (`storage.mode: s3`, persistence on) | `false` |
-| `backup.schedule` | Cron schedule | `17 3 * * *` |
-| `backup.prefix` | Key prefix in the bucket (`.nora-` keys are hidden from nora's own listings) | `.nora-backup/` |
-| `backup.keep` | Archives kept | `14` |
-| `backup.image` | Uploader image with `aws` and `/bin/sh` (the tar runs in the nora image) | `public.ecr.aws/aws-cli/aws-cli:2.22.35` |
-| `backup.resources` | Both containers | `128Mi` |
-
-Restore (new PVC, or after a node loss):
-
-```bash
-kubectl scale deploy/nora --replicas=0
-# a shell pod with the data PVC at /data and the bucket credentials, then:
-aws --endpoint-url "$S3_URL" s3 ls "s3://$BUCKET/.nora-backup/"            # newest last
-aws --endpoint-url "$S3_URL" s3 cp "s3://$BUCKET/.nora-backup/<ts>.tar.gz" /tmp/b.tar.gz
-tar -xzf /tmp/b.tar.gz -C /          # writes /data/tokens/*.json and /data/storage/quarantine.jsonl
-chown -R 1000:1000 /data/tokens /data/storage/quarantine.jsonl
-kubectl scale deploy/nora --replicas=1
-```
-
-Tokens minted after the archive are lost (re-mint them); revocations after it come back (revoke again).
+With `storage.mode: s3` everything durable is in the bucket; `nora backup` / `nora restore` cover `.nora-tokens/` and `.nora-quarantine/` too. Archives of the removed backup CronJob (`s3://<bucket>/.nora-backup/<ts>.tar.gz`, `data/tokens/*.json` + `data/storage/quarantine.jsonl`) still restore: extract them into `auth.token_storage` / `storage.path` in the pod and restart the container (an emptyDir survives that); the next start imports them.
 
 ## S3 Storage
 
 ```yaml
 persistence:
-  enabled: true      # tokens, quarantine ledger, audit file: see Persistence
-  size: 1Gi
+  enabled: false     # s3 mode keeps only scratch on /data: see Persistence
 
 config:
   storage:
@@ -504,7 +478,7 @@ Tests live in `charts/nora/tests/`:
 | `serviceaccount_test.yaml` | create/skip, annotations |
 | `test_connection_test.yaml` | `helm test` hook pod |
 | `maestra_values_test.yaml` | `ci/maestra-values.yaml` renders every key of the live packages.maestra.io `config.toml` |
-| `networkpolicy_test.yaml`, `monitoring_test.yaml`, `backup_cronjob_test.yaml` | Maestra templates |
+| `networkpolicy_test.yaml`, `monitoring_test.yaml` | Maestra templates |
 
 ### Post-install hook
 

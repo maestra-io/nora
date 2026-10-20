@@ -5,7 +5,8 @@
 # chart's values: everything the postRenderer, the separate
 # nora-config-maestra ConfigMap and those manifests do today. Deliberate
 # additions over the live config: [gc] with a proxy-cache cap (C22), the
-# backup CronJob (C72), the deploy/prometheus-rules.yml alerts (C77). Used by
+# deploy/prometheus-rules.yml alerts (C77), no PVC (tokens and the quarantine
+# ledger are in the bucket, #86/#87) and fast eviction from a lost node. Used by
 # CI (helm lint / template, tests/maestra_values_test.yaml asserts the
 # rendered config.toml) and as the target values when the HelmRelease moves
 # to this chart; the switch then deletes config.toml, network-policy.yaml and
@@ -23,15 +24,26 @@ image:
 imagePullSecrets:
   - name: image-pull
 
+# s3 mode: /data is an emptyDir with scratch only, so the pod is not pinned to
+# one node (a node-local PVC kept it on node 02 for a 42 min outage, 19.10).
 persistence:
-  enabled: true
-  size: 1Gi
-  storageClass: local-data
+  enabled: false
 
-# Spools off the 1Gi PVC: a torch-class wheel or a NuGet push can no longer fill
-# the volume that holds tokens (R2-05).
+# Spools on their own size-limited emptyDir (R2-05).
 spool:
   enabled: true
+
+# Evicted 30 s after its node goes NotReady/unreachable instead of the 300 s
+# default: nothing ties the pod to a node any more.
+tolerations:
+  - key: node.kubernetes.io/not-ready
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 30
+  - key: node.kubernetes.io/unreachable
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 30
 
 resources:
   requests:
@@ -300,23 +312,3 @@ metrics:
                 /ready follows R2 reachability from a periodic bucket LIST; flapping
                 means R2 errors or slow listings. Check nora_storage_operations_total
                 errors and the pod log.
-          - alert: NoraTokenVolumeFilling
-            expr: max by (namespace, persistentvolumeclaim) (kubelet_volume_stats_used_bytes{namespace="nora"} / kubelet_volume_stats_capacity_bytes{namespace="nora"}) > 0.8
-            for: 30m
-            labels:
-              severity: warning
-              product: platform
-              feature: nora
-              component: storage
-              service: nora
-            annotations:
-              summary: nora PVC {{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }} full
-              description: >-
-                The local volume holds API tokens (the quarantine ledger is in the
-                bucket, audit goes to stdout). A full volume fails token minting. Find what grew
-                under /data and raise persistence.size.
-
-# Tokens live only on the node-local PVC (C72; the quarantine ledger is in the bucket): daily to
-# s3://nora-packages-iota/.nora-backup/, 14 kept. RPO 24 h.
-backup:
-  enabled: true
