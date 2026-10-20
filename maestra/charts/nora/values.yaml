@@ -100,8 +100,10 @@ httpRoute:
       filters: []
 
 # -- /data holds nora's local state in EVERY storage mode: API tokens
-# (auth.token_storage), the digest-quarantine ledger and audit.jsonl (under
-# storage.path) and, unless spool.enabled, the disk spools. With
+# (auth.token_storage), audit.jsonl (under storage.path) and, unless
+# spool.enabled, the disk spools; the digest-quarantine ledger is in the
+# storage backend (.nora-quarantine/), a legacy quarantine.jsonl is imported
+# at start. With
 # storage.mode=s3 only artifacts go to the bucket, so keep the volume: an
 # emptyDir loses every API token on each restart. The chart refuses s3 mode
 # without persistence unless allowEphemeral is set.
@@ -403,7 +405,7 @@ extraVolumeMounts: []
 # -- Dedicated volume for nora's disk spools: proxied artifacts above
 # config.server.stream_threshold_mb (16), NuGet pushes and PyPI uploads. An
 # emptyDir with sizeLimit at mountPath, rendered as server.spool_dir, so a
-# spool never fills /data (tokens, quarantine ledger). server.spool_max_mb
+# spool never fills /data (tokens). server.spool_max_mb
 # defaults to 7/8 of sizeLimitMb (past sizeLimit the kubelet evicts the pod);
 # a transfer over it is a 503 + Retry-After. The container gets an
 # ephemeral-storage request of sizeLimitMb and a limit of sizeLimitMb + 1Gi
@@ -463,8 +465,9 @@ metrics:
     extraGroups: []
 
 # -- Maestra: scheduled backup of the local state that is NOT in the bucket:
-# API token records (auth.token_storage) and the quarantine ledger
-# (storage.path/quarantine.jsonl). A CronJob tars them from the data PVC
+# API token records (auth.token_storage) and a legacy quarantine ledger
+# (storage.path/quarantine.jsonl; the live ledger is in the bucket under
+# .nora-quarantine/). A CronJob tars them from the data PVC
 # (mounted read-only; RWO admits a second pod on the same node, and a required
 # podAffinity on the nora pod puts it there) and uploads the archive to
 # s3://<config.storage.bucket>/<prefix><timestamp>.tar.gz with the

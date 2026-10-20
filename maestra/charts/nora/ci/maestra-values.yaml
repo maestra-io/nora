@@ -29,7 +29,7 @@ persistence:
   storageClass: local-data
 
 # Spools off the 1Gi PVC: a torch-class wheel or a NuGet push can no longer fill
-# the volume that holds tokens and the quarantine ledger (R2-05).
+# the volume that holds tokens (R2-05).
 spool:
   enabled: true
 
@@ -312,11 +312,11 @@ metrics:
             annotations:
               summary: nora PVC {{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }} full
               description: >-
-                The local volume holds API tokens and the quarantine ledger (audit
-                goes to stdout). A full volume fails token minting. Find what grew
+                The local volume holds API tokens (the quarantine ledger is in the
+                bucket, audit goes to stdout). A full volume fails token minting. Find what grew
                 under /data and raise persistence.size.
 
-# Tokens + quarantine ledger live only on the node-local PVC (C72): daily to
+# Tokens live only on the node-local PVC (C72; the quarantine ledger is in the bucket): daily to
 # s3://nora-packages-iota/.nora-backup/, 14 kept. RPO 24 h.
 backup:
   enabled: true

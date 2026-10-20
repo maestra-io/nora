@@ -665,7 +665,6 @@ pub(crate) fn build_no_redirect_client(tls: &TlsConfig) -> reqwest::Client {
 fn local_state(config: &Config) -> backup::LocalState {
     backup::LocalState {
         token_dir: PathBuf::from(&config.auth.token_storage),
-        state_dir: PathBuf::from(&config.storage.path),
     }
 }
 
@@ -2684,7 +2683,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     let audit_mode = config.audit.mode.clone();
     let audit_rotation = audit::Rotation::from(&config.audit);
 
-    // Initialize digest quarantine store. Load the durable on-disk store whenever
+    // Initialize digest quarantine store. Load the durable store (in `storage`) whenever
     // ANY quarantine is effectively active — global OR a per-registry override
     // (e.g. docker-only [curation.docker] quarantine). Gating on the global field
     // alone built an empty() store for per-registry-only configs, so after a
@@ -2692,9 +2691,9 @@ async fn run_server(mut config: Config, storage: Storage) {
     // a fail-open the check-only cache-serve gate cannot catch (#765). The
     // predicate is the same one config validation uses, so they cannot diverge.
     let digest_store = if config.any_quarantine_active() {
-        Arc::new(digest_quarantine::DigestStore::load(&storage_path))
+        Arc::new(digest_quarantine::DigestStore::load(storage.clone(), &storage_path).await)
     } else {
-        Arc::new(digest_quarantine::DigestStore::empty(&storage_path))
+        Arc::new(digest_quarantine::DigestStore::empty(storage.clone()))
     };
 
     let oidc_validator = if config.auth.oidc.enabled {
