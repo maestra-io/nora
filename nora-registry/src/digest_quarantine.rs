@@ -42,6 +42,8 @@ pub(crate) const SNAPSHOT_KEY: &str = ".nora-quarantine-snapshot.json";
 
 /// Concurrent storage requests while loading or importing the ledger.
 const LOAD_CONCURRENCY: usize = 32;
+/// Upper bound on the background ledger load (listing + reads + snapshot).
+const LOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Stale entry TTL: entries older than 90 days are pruned on startup.
 const PRUNE_TTL_SECS: i64 = 90 * 24 * 3600;
@@ -176,6 +178,51 @@ impl DigestStore {
         }
     }
 
+    /// [`Self::load`] off the startup path: the store starts empty and serves at
+    /// once, the ledger is merged in when the walk over `storage` finishes
+    /// (bounded by `LOAD_DEADLINE`; past it the walk is dropped and logged).
+    /// Until then a known digest reads as new, so an enforcing quarantine may
+    /// hold a cached version for one more TTL; the listener never waits on R2.
+    /// Maestra: on 20.10.2026 the blocking load kept packages.maestra.io from
+    /// binding its port for minutes on a slow R2 listing, and the startup probe
+    /// killed the pod in a loop.
+    pub fn load_in_background(storage: Storage, storage_path: &str) -> Self {
+        let store = Self::empty(storage.clone());
+        let legacy = Path::new(storage_path).join(LEDGER_FILE);
+        let entries = Arc::clone(&store.entries);
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            match tokio::time::timeout(LOAD_DEADLINE, load_entries(&storage, &legacy)).await {
+                Ok(loaded) => {
+                    let cutoff = Utc::now().timestamp() - PRUNE_TTL_SECS;
+                    let mut map = entries.write();
+                    for (key, entry) in loaded {
+                        // An entry recorded meanwhile keeps the older first_seen.
+                        match map.get(&key) {
+                            Some(live) if live.first_seen <= entry.first_seen => {}
+                            _ => {
+                                map.insert(key, entry);
+                            }
+                        }
+                    }
+                    // A record() that adopted a stale object the walk then pruned
+                    // would read as Mature until restart: apply the same cutoff here.
+                    map.retain(|_, entry| entry.first_seen >= cutoff);
+                    info!(
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        entries = map.len(),
+                        "Quarantine store merged into the live map"
+                    );
+                }
+                Err(_) => error!(
+                    deadline_secs = LOAD_DEADLINE.as_secs(),
+                    "Quarantine store load did not finish, serving without the ledger (fail-open)"
+                ),
+            }
+        });
+        store
+    }
+
     /// Create an empty store (for tests or when quarantine is off).
     pub fn empty(storage: Storage) -> Self {
         Self {
@@ -226,7 +273,12 @@ impl DigestStore {
 
         entries.insert(key, entry.clone());
         drop(entries);
-        self.persist(entry.clone());
+        // A trusted upstream date past the prune TTL is Mature from the start:
+        // the object would only be read and deleted again by the next boot walk
+        // (563 of them on 20.10.2026 made that walk outlive the startup probe).
+        if entry.first_seen >= Utc::now().timestamp() - PRUNE_TTL_SECS {
+            self.persist(entry.clone());
+        }
         entry
     }
 
@@ -672,11 +724,15 @@ async fn load_entries(storage: &Storage, legacy: &Path) -> HashMap<String, Diges
         }
     }
     let pruned = stale.len();
-    for key in stale {
-        if let Err(e) = storage.delete(&key).await {
-            warn!(key = %key, error = %e, "Failed to delete stale quarantine entry");
-        }
-    }
+    futures::stream::iter(stale)
+        .map(|key| async move {
+            if let Err(e) = storage.delete(&key).await {
+                warn!(key = %key, error = %e, "Failed to delete stale quarantine entry");
+            }
+        })
+        .buffer_unordered(LOAD_CONCURRENCY)
+        .collect::<Vec<()>>()
+        .await;
 
     let snapshot = Snapshot {
         as_of: Utc::now().timestamp(),
