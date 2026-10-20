@@ -73,6 +73,7 @@ tests:
     template: templates/deployment.yaml
     set:
       persistence.enabled: false
+      persistence.allowEphemeral: true
     asserts:
       - contains:
           path: spec.template.spec.volumes
@@ -500,20 +501,57 @@ tests:
           path: metadata.annotations["reloader.stakater.com/auto"]
           value: "true"
 
-  # Maestra: s3 mode keeps the /data volume (C12/C72)
-  - it: refuses s3 mode without persistence
+  # Maestra: s3 mode needs no PVC (#86/#87); local mode keeps artifacts on /data
+  - it: renders s3 mode without persistence on an emptyDir /data, no allowEphemeral
     template: templates/deployment.yaml
     set:
       config.storage.mode: s3
       persistence.enabled: false
     asserts:
-      - failedTemplate:
-          errorPattern: "persistence.enabled=false with config.storage.mode=s3"
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: data
+            emptyDir: {}
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: data
+            mountPath: /data
 
-  - it: allows s3 mode on an emptyDir only when explicitly accepted
+  - it: refuses local mode without persistence
+    template: templates/deployment.yaml
+    set:
+      persistence.enabled: false
+    asserts:
+      - failedTemplate:
+          errorPattern: "persistence.enabled=false with config.storage.mode=local"
+
+  - it: refuses an audit file on an emptyDir
     template: templates/deployment.yaml
     set:
       config.storage.mode: s3
+      config.audit.mode: both
+      persistence.enabled: false
+    asserts:
+      - failedTemplate:
+          errorPattern: "config.audit.mode file/both"
+
+  - it: refuses an audit file set by extraEnv on an emptyDir
+    template: templates/deployment.yaml
+    set:
+      config.storage.mode: s3
+      persistence.enabled: false
+      extraEnv:
+        - name: NORA_AUDIT_LOG
+          value: File
+    asserts:
+      - failedTemplate:
+          errorPattern: "config.audit.mode file/both"
+
+  - it: allows local mode on an emptyDir only when explicitly accepted
+    template: templates/deployment.yaml
+    set:
       persistence.enabled: false
       persistence.allowEphemeral: true
     asserts:

@@ -99,14 +99,12 @@ httpRoute:
             value: /
       filters: []
 
-# -- /data holds nora's local state in EVERY storage mode: API tokens
-# (auth.token_storage), audit.jsonl (under storage.path) and, unless
-# spool.enabled, the disk spools; the digest-quarantine ledger is in the
-# storage backend (.nora-quarantine/), a legacy quarantine.jsonl is imported
-# at start. With
-# storage.mode=s3 only artifacts go to the bucket, so keep the volume: an
-# emptyDir loses every API token on each restart. The chart refuses s3 mode
-# without persistence unless allowEphemeral is set.
+# -- /data: the PVC, or an emptyDir when disabled. storage.mode=s3 needs no
+# PVC: tokens (.nora-tokens/) and the quarantine ledger (.nora-quarantine/) are
+# in the bucket, /data keeps only scratch (upload temp dirs, the spool unless
+# spool.enabled) and the legacy token / quarantine.jsonl files imported at
+# start. local mode keeps the artifacts there, so the chart refuses it (and
+# audit.mode file/both) without persistence unless allowEphemeral is set.
 persistence:
   enabled: true
   allowEphemeral: false
@@ -190,7 +188,9 @@ config:
     htpasswd_file: ""
     # -- Allow unauthenticated read (pull/browse); writes still require auth.
     anonymous_read: false
-    # -- Legacy API token directory: tokens now live in the storage backend (`.nora-tokens/`), and each boot imports the `<16hex>.json` files found here once, so a missing directory is fine.
+    # -- Legacy API token directory: tokens live in the storage backend
+    # (`.nora-tokens/`); each boot imports the `<16hex>.json` files found here
+    # once, so a missing or empty directory (emptyDir) is fine.
     token_storage: "/data/tokens"
     # -- Client IPs/CIDRs whose X-Forwarded-For is honoured (list or
     # comma-separated string). nora keys the auth lockout and every rate
@@ -405,7 +405,7 @@ extraVolumeMounts: []
 # -- Dedicated volume for nora's disk spools: proxied artifacts above
 # config.server.stream_threshold_mb (16), NuGet pushes and PyPI uploads. An
 # emptyDir with sizeLimit at mountPath, rendered as server.spool_dir, so a
-# spool never fills /data (tokens). server.spool_max_mb
+# spool never fills /data. server.spool_max_mb
 # defaults to 7/8 of sizeLimitMb (past sizeLimit the kubelet evicts the pod);
 # a transfer over it is a 503 + Retry-After. The container gets an
 # ephemeral-storage request of sizeLimitMb and a limit of sizeLimitMb + 1Gi
@@ -463,36 +463,3 @@ metrics:
     additionalRuleLabels: {}
     # -- More rule groups, verbatim (site-specific alerts).
     extraGroups: []
-
-# -- Maestra: scheduled backup of the local state that is NOT in the bucket:
-# API token records (auth.token_storage) and a legacy quarantine ledger
-# (storage.path/quarantine.jsonl; the live ledger is in the bucket under
-# .nora-quarantine/). A CronJob tars them from the data PVC
-# (mounted read-only; RWO admits a second pod on the same node, and a required
-# podAffinity on the nora pod puts it there) and uploads the archive to
-# s3://<config.storage.bucket>/<prefix><timestamp>.tar.gz with the
-# config.storage endpoint and credentials, keeping the newest `keep`.
-# config.storage.mode s3 only. Restore: README "Backup and restore".
-backup:
-  enabled: false
-  schedule: "17 3 * * *"
-  # -- Object key prefix inside config.storage.bucket. nora never lists or
-  # serves it (no registry path starts with it).
-  prefix: ".nora-backup/"
-  # -- Archives kept (older ones deleted after each upload).
-  keep: 14
-  # -- Job deadline (seconds), including waiting for the data volume to mount.
-  activeDeadlineSeconds: 900
-  # -- Uploader image: anything with `aws` and /bin/sh; the tar runs in the
-  # nora image. 2.22.x: before aws-cli 2.23 made checksum trailers the
-  # default, which some S3-compatible stores reject (the script also sets
-  # AWS_REQUEST_CHECKSUM_CALCULATION=when_required).
-  image:
-    repository: public.ecr.aws/aws-cli/aws-cli
-    tag: "2.22.35"
-  resources:
-    requests:
-      cpu: 10m
-      memory: 128Mi
-    limits:
-      memory: 128Mi
