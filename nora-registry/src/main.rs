@@ -661,13 +661,6 @@ pub(crate) fn build_no_redirect_client(tls: &TlsConfig) -> reqwest::Client {
 /// Both wildcards probe `127.0.0.1`: a `::` server is dual-stack (or falls back
 /// to `0.0.0.0`), so IPv4 loopback reaches it in every case, whereas `::1` would
 /// miss the fallback.
-/// Node-local state `nora backup` / `nora restore` carry next to the artifacts.
-fn local_state(config: &Config) -> backup::LocalState {
-    backup::LocalState {
-        token_dir: PathBuf::from(&config.auth.token_storage),
-    }
-}
-
 fn healthcheck_url(host: &str, port: u16) -> String {
     let h = match host {
         "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
@@ -1386,13 +1379,13 @@ async fn main() {
             run_server(config, storage).await;
         }
         Some(Commands::Backup { output }) => {
-            if let Err(e) = backup::create_backup(&storage, &output, &local_state(&config)).await {
+            if let Err(e) = backup::create_backup(&storage, &output).await {
                 error!("Backup failed: {}", e);
                 std::process::exit(1);
             }
         }
         Some(Commands::Restore { input }) => {
-            if let Err(e) = backup::restore_backup(&storage, &input, &local_state(&config)).await {
+            if let Err(e) = backup::restore_backup(&storage, &input).await {
                 error!("Restore failed: {}", e);
                 std::process::exit(1);
             }
@@ -2529,29 +2522,18 @@ async fn run_server(mut config: Config, storage: Storage) {
         );
     }
 
-    // Initialize token store if auth is enabled
+    // Initialize token store if auth is enabled. Maestra: tokens live in the
+    // storage backend (`.nora-tokens/`); `auth.token_storage` is only the legacy
+    // directory whose token files are imported at boot (a missing one is fine).
     let tokens = if config.auth.enabled {
-        let token_path = Path::new(&config.auth.token_storage);
-        // Fail fast: with auth enabled a token store that cannot create/write its
-        // directory is unusable. Surface it at boot with the resolved path instead
-        // of swallowing the mkdir error and failing later with a bare ENOENT on the
-        // first POST /api/tokens (#816). Under a systemd sandbox a relative
-        // token_storage resolves outside ReadWritePaths and is not writable.
-        if let Err(e) = std::fs::create_dir_all(token_path) {
-            error!(
-                path = %config.auth.token_storage,
-                error = %e,
-                "Cannot create token storage directory — auth is enabled but tokens cannot be \
-                 persisted. Set NORA_AUTH_TOKEN_STORAGE to a writable absolute path (e.g. \
-                 /var/lib/nora/tokens, inside the service's ReadWritePaths)."
-            );
-            std::process::exit(1);
-        }
-        info!(path = %config.auth.token_storage, "Token storage initialized");
-        Some(TokenStore::with_cache_ttl(
-            token_path,
+        let store = TokenStore::with_cache_ttl(
+            storage.clone(),
             std::time::Duration::from_secs(config.auth.token_cache_ttl),
-        ))
+        );
+        store
+            .import_legacy_dir(Path::new(&config.auth.token_storage))
+            .await;
+        Some(store)
     } else {
         None
     };

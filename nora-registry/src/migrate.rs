@@ -56,8 +56,11 @@ pub async fn migrate(
         .map_err(|e| format!("failed to list source: {e}"))?;
     // npm cache provenance (#1055) and first-seen times sit under internal prefixes that
     // list() hides; without them the destination refetches every owned-scope object from
-    // its owner, and every npm release age starts over.
-    for prefix in crate::registry::npm::INTERNAL_PREFIXES {
+    // its owner, and every npm release age starts over. API tokens (Maestra) too.
+    for prefix in crate::registry::npm::INTERNAL_PREFIXES
+        .iter()
+        .chain(&[crate::tokens::STORAGE_PREFIX])
+    {
         keys.extend(
             from.list_internal(prefix)
                 .await
@@ -230,6 +233,28 @@ mod tests {
             &dst.get(&first_seen_key(key)).await.unwrap()[..],
             br#"{"1.0.0":1700000000}"#
         );
+    }
+
+    /// API tokens (Maestra) are internal keys too: a migrated token verifies.
+    #[tokio::test]
+    async fn test_migrate_carries_tokens() {
+        use crate::tokens::{Role, TokenStore};
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+        let src = Storage::new_local(src_dir.path().to_str().unwrap());
+        let dst = Storage::new_local(dst_dir.path().to_str().unwrap());
+        let raw = TokenStore::new(src.clone())
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+
+        let stats = migrate(&src, &dst, MigrateOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(stats.migrated, 1);
+        let (user, _) = TokenStore::new(dst).verify_token(&raw).await.unwrap();
+        assert_eq!(user, "ci");
     }
 
     #[tokio::test]

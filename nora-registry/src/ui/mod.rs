@@ -1029,8 +1029,8 @@ async fn tokens_page(
     // Owner-scope: non-admins see only their own tokens; admins see all
     // (GHSA-78cx-cfhm-rgmx — cross-user token enumeration).
     let tokens = match &state.tokens {
-        Some(store) if role.0.can_admin() => store.list_all_tokens(),
-        Some(store) => store.list_tokens(&user.0),
+        Some(store) if role.0.can_admin() => store.list_all_tokens().await,
+        Some(store) => store.list_tokens(&user.0).await,
         None => vec![],
     };
 
@@ -1211,7 +1211,10 @@ async fn tokens_create(
     };
 
     let detail = format!("role={} ttl_days={}", granted_role, ttl_days);
-    match store.create_token(&user, ttl_days, description, granted_role) {
+    match store
+        .create_token(&user, ttl_days, description, granted_role)
+        .await
+    {
         Ok(raw_token) => {
             state
                 .audit
@@ -1259,8 +1262,8 @@ async fn tokens_list(
     // Owner-scope: non-admins see only their own tokens; admins see all
     // (GHSA-78cx-cfhm-rgmx — cross-user token enumeration).
     let tokens = match &state.tokens {
-        Some(store) if role.0.can_admin() => store.list_all_tokens(),
-        Some(store) => store.list_tokens(&user.0),
+        Some(store) if role.0.can_admin() => store.list_all_tokens().await,
+        Some(store) => store.list_tokens(&user.0).await,
         None => vec![],
     };
 
@@ -1307,19 +1310,20 @@ async fn tokens_revoke(
     if !is_admin
         && !store
             .list_tokens(&user.0)
+            .await
             .iter()
             .any(|t| t.file_id == file_id)
     {
         return (StatusCode::NOT_FOUND, Html("Token not found".to_string()));
     }
 
-    match store.revoke_token(&file_id) {
+    match store.revoke_token(&file_id).await {
         Ok(()) => {
             // Return refreshed token list (same owner-scope as the list view)
             let tokens = if is_admin {
-                store.list_all_tokens()
+                store.list_all_tokens().await
             } else {
-                store.list_tokens(&user.0)
+                store.list_tokens(&user.0).await
             };
             (
                 StatusCode::OK,

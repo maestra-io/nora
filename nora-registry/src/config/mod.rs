@@ -1236,11 +1236,11 @@ impl Config {
         // The token_storage hint fires whenever auth is enabled with a relative
         // path, regardless of config source: env-only (systemd) starts have
         // config_path=None yet are exactly where a relative token_storage resolves
-        // outside ReadWritePaths and breaks token writes (#816).
+        // somewhere else (#816). Maestra: it is the legacy token import directory.
         if self.auth.enabled && !self.auth.token_storage.starts_with('/') {
             warnings.push(format!(
-                "auth.token_storage=\"{}\" is relative — will resolve from CWD (under systemd it \
-                 resolves outside ReadWritePaths and token writes fail). Set an absolute path, e.g. \
+                "auth.token_storage=\"{}\" is relative — will resolve from CWD, and the boot \
+                 import of legacy token files reads that directory. Set an absolute path, e.g. \
                  NORA_AUTH_TOKEN_STORAGE=/var/lib/nora/tokens",
                 self.auth.token_storage
             ));

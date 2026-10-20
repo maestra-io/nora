@@ -152,7 +152,7 @@ The chart mounts the Secret at `/etc/nora/users.htpasswd` and sets `htpasswd_fil
 | `config.auth.enabled` | Enable authentication | `false` |
 | `config.auth.htpasswd_file` | Explicit htpasswd path in the container | `""` (auto when Secret is set) |
 | `config.auth.anonymous_read` | Allow unauthenticated reads | `false` |
-| `config.auth.token_storage` | API token storage path (keep it on the `/data` volume) | `/data/tokens` |
+| `config.auth.token_storage` | Legacy API token directory: tokens live in the storage backend (`.nora-tokens/`) and each boot imports the token files found here once | `/data/tokens` |
 | `config.auth.htpasswd.existingSecret` | Secret with htpasswd file | `""` |
 | `config.auth.htpasswd.secretKey` | Key in the Secret | `users.htpasswd` |
 | `config.auth.htpasswd.mountPath` | Mount directory | `/etc/nora` |

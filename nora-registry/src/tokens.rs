@@ -1,15 +1,17 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
+use crate::storage::{Storage, StorageError};
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+use axum::body::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
@@ -23,6 +25,20 @@ use std::time::{Duration, Instant};
 /// Overridable per-store via [`TokenStore::with_cache_ttl`] (config
 /// `auth.token_cache_ttl`) to bound the cross-replica revocation window.
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Maestra: storage prefix of the token state. One immutable record per token
+/// (`<16hex>.json`) plus [`LAST_USED_KEY`] and [`IMPORTED_KEY`]. `.nora-` keys are
+/// internal: hidden from `Storage::list`, walked with `list_internal`.
+pub const STORAGE_PREFIX: &str = ".nora-tokens/";
+/// `{id: unix secs}` of every token's last use, merged into listings.
+const LAST_USED_KEY: &str = ".nora-tokens/last_used.json";
+/// Ids of the `auth.token_storage` files already imported once, so a token revoked
+/// after the import is not brought back by the next boot.
+const IMPORTED_KEY: &str = ".nora-tokens/legacy_imported.json";
+
+fn record_key(id: &str) -> String {
+    format!("{STORAGE_PREFIX}{id}.json")
+}
 
 /// Cached verification result
 #[derive(Clone)]
@@ -68,13 +84,15 @@ impl Role {
     }
 }
 
-/// API Token metadata stored on disk
+/// API token record, stored as `.nora-tokens/<16hex>.json`. Written once at creation
+/// (and by the legacy SHA-256 -> Argon2 rewrite), never by the last_used flush.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenInfo {
     pub token_hash: String,
     pub user: String,
     pub created_at: u64,
     pub expires_at: u64,
+    /// Set only in records written before last_used moved to [`LAST_USED_KEY`].
     pub last_used: Option<u64>,
     pub description: Option<String>,
     #[serde(default = "default_role")]
@@ -100,43 +118,28 @@ pub struct TokenListEntry {
 /// Token store for managing API tokens
 #[derive(Clone)]
 pub struct TokenStore {
-    storage_path: PathBuf,
+    storage: Storage,
     /// In-memory cache: SHA256(token) -> verified result (avoids Argon2 per request)
     cache: Arc<RwLock<HashMap<String, CachedToken>>>,
-    /// How long a cached verification is trusted before the slow path re-checks
-    /// disk. Shorter = smaller cross-replica revocation window.
+    /// How long a cached verification is trusted before the slow path re-reads
+    /// storage. Shorter = smaller cross-replica revocation window.
     cache_ttl: Duration,
     /// Pending last_used updates: file_id_prefix -> timestamp (flushed periodically)
     pending_last_used: Arc<RwLock<HashMap<String, u64>>>,
 }
 
 impl TokenStore {
-    /// Create a new token store with the default verify-cache TTL.
-    pub fn new(storage_path: &Path) -> Self {
-        Self::with_cache_ttl(storage_path, DEFAULT_CACHE_TTL)
+    /// Create a new token store over `storage` with the default verify-cache TTL.
+    pub fn new(storage: Storage) -> Self {
+        Self::with_cache_ttl(storage, DEFAULT_CACHE_TTL)
     }
 
     /// Create a token store with an explicit verify-cache TTL. A shorter TTL
     /// bounds the window in which a token revoked on another replica is still
     /// served from this replica's cache.
-    pub fn with_cache_ttl(storage_path: &Path, cache_ttl: Duration) -> Self {
-        // Ensure directory exists with restricted permissions. The serve path
-        // fail-fasts on this in main.rs (#816); this is best-effort for library /
-        // standalone use, but surface a diagnostic rather than swallowing the error
-        // so a non-writable path is never silently broken until the first write.
-        if let Err(e) = fs::create_dir_all(storage_path) {
-            tracing::warn!(
-                path = %storage_path.display(),
-                error = %e,
-                "TokenStore: could not create storage directory — token writes will fail"
-            );
-        }
-        #[cfg(unix)]
-        {
-            let _ = fs::set_permissions(storage_path, fs::Permissions::from_mode(0o700));
-        }
+    pub fn with_cache_ttl(storage: Storage, cache_ttl: Duration) -> Self {
         Self {
-            storage_path: storage_path.to_path_buf(),
+            storage,
             cache: Arc::new(RwLock::new(HashMap::new())),
             cache_ttl,
             pending_last_used: Arc::new(RwLock::new(HashMap::new())),
@@ -145,7 +148,7 @@ impl TokenStore {
 
     /// Generate a new API token for a user. `ttl_days` is clamped to
     /// `1..=MAX_TOKEN_TTL_DAYS` for every caller (an unbounded value overflows).
-    pub fn create_token(
+    pub async fn create_token(
         &self,
         user: &str,
         ttl_days: u64,
@@ -159,7 +162,7 @@ impl TokenStore {
             Uuid::new_v4().to_string().replace("-", "")
         );
         let token_hash = hash_token_argon2(&raw_token)?;
-        // Use SHA256 of token as filename (deterministic, for lookup)
+        // Use SHA256 of token as the record id (deterministic, for lookup)
         let file_id = sha256_hex(&raw_token);
 
         let now = SystemTime::now()
@@ -180,20 +183,25 @@ impl TokenStore {
             role,
         };
 
-        // Save to file with restricted permissions
-        let file_path = self.storage_path.join(format!("{}.json", &file_id[..16]));
         let json =
-            serde_json::to_string_pretty(&info).map_err(|e| TokenError::Storage(e.to_string()))?;
-        write_token_file(&file_path, &json).map_err(|e| TokenError::Storage(e.to_string()))?;
-
-        Ok(raw_token)
+            serde_json::to_vec_pretty(&info).map_err(|e| TokenError::Storage(e.to_string()))?;
+        // Never overwrite a record: an existing one is a 64-bit id collision.
+        match self
+            .storage
+            .put_if_absent(&record_key(&file_id[..16]), Bytes::from(json))
+            .await
+        {
+            Ok(true) => Ok(raw_token),
+            Ok(false) => Err(TokenError::Storage("token id collision".into())),
+            Err(e) => Err(TokenError::Storage(e.to_string())),
+        }
     }
 
     /// Verify a token and return user info if valid.
     ///
     /// Uses an in-memory cache to avoid Argon2 verification on every request.
     /// The `last_used` timestamp is updated in batch via `flush_last_used()`.
-    pub fn verify_token(&self, token: &str) -> Result<(String, Role), TokenError> {
+    pub async fn verify_token(&self, token: &str) -> Result<(String, Role), TokenError> {
         if !token.starts_with(TOKEN_PREFIX) {
             return Err(TokenError::InvalidFormat);
         }
@@ -221,19 +229,18 @@ impl TokenStore {
             }
         }
 
-        // Slow path: read from disk and verify Argon2
-        let file_path = self.storage_path.join(format!("{}.json", &cache_key[..16]));
-
-        let content = match fs::read_to_string(&file_path) {
+        // Slow path: one storage read and Argon2. Misses are not cached (no negative
+        // cache): an unknown token costs a read each time, and brute force is bounded
+        // by the auth rate limiter, not here.
+        let key = record_key(&cache_key[..16]);
+        let content = match self.storage.get(&key).await {
             Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(TokenError::NotFound);
-            }
+            Err(StorageError::NotFound) => return Err(TokenError::NotFound),
             Err(e) => return Err(TokenError::Storage(e.to_string())),
         };
 
         let mut info: TokenInfo =
-            serde_json::from_str(&content).map_err(|e| TokenError::Storage(e.to_string()))?;
+            serde_json::from_slice(&content).map_err(|e| TokenError::Storage(e.to_string()))?;
 
         // Verify hash: try Argon2id first, fall back to legacy SHA256
         let hash_valid = if info.token_hash.starts_with("$argon2") {
@@ -245,8 +252,8 @@ impl TokenStore {
                 // Migrate to Argon2id
                 if let Ok(new_hash) = hash_token_argon2(token) {
                     info.token_hash = new_hash;
-                    if let Ok(json) = serde_json::to_string_pretty(&info) {
-                        let _ = write_token_file(&file_path, &json);
+                    if let Ok(json) = serde_json::to_vec_pretty(&info) {
+                        let _ = self.storage.put(&key, &json).await;
                     }
                 }
                 true
@@ -269,7 +276,7 @@ impl TokenStore {
             return Err(TokenError::Expired);
         }
 
-        // Populate cache (key must match lookup at line 180: full 64-char SHA-256 hex)
+        // Populate cache (key must match the fast-path lookup: full 64-char SHA-256 hex)
         self.cache.write().insert(
             cache_key.clone(),
             CachedToken {
@@ -289,53 +296,80 @@ impl TokenStore {
     }
 
     /// List all tokens for a user (returns TokenListEntry with file_id)
-    pub fn list_tokens(&self, user: &str) -> Vec<TokenListEntry> {
+    pub async fn list_tokens(&self, user: &str) -> Vec<TokenListEntry> {
         self.list_all_tokens()
+            .await
             .into_iter()
             .filter(|t| t.user == user)
             .collect()
     }
 
     /// List all tokens across all users (for admin UI)
-    pub fn list_all_tokens(&self) -> Vec<TokenListEntry> {
-        let mut tokens = Vec::new();
-
-        if let Ok(entries) = fs::read_dir(&self.storage_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                let file_id = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                if file_id.is_empty() {
-                    continue;
-                }
-                if let Ok(content) = fs::read_to_string(&path) {
-                    if let Ok(info) = serde_json::from_str::<TokenInfo>(&content) {
-                        tokens.push(TokenListEntry {
-                            file_id,
-                            user: info.user,
-                            role: info.role,
-                            created_at: info.created_at,
-                            expires_at: info.expires_at,
-                            last_used: info.last_used,
-                            description: info.description,
-                        });
-                    }
-                }
+    // ponytail: one GET per record, concurrently; fine for hundreds of tokens, an
+    // in-memory index if it ever has to serve thousands.
+    pub async fn list_all_tokens(&self) -> Vec<TokenListEntry> {
+        let keys = match self.storage.list_internal(STORAGE_PREFIX).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                tracing::warn!(error = %e, "token list failed");
+                return Vec::new();
             }
+        };
+        let ids = keys.iter().filter_map(|k| {
+            k.strip_prefix(STORAGE_PREFIX)
+                .and_then(|n| n.strip_suffix(".json"))
+                .filter(|id| is_valid_hash_prefix(id))
+        });
+        let records = futures::future::join_all(
+            ids.map(|id| async move { (id, self.storage.get(&record_key(id)).await) }),
+        )
+        .await;
+        let last_used: HashMap<String, u64> = self
+            .read_state(LAST_USED_KEY)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+
+        let mut tokens = Vec::new();
+        for (id, content) in records {
+            let Some(info) = content
+                .ok()
+                .and_then(|c| serde_json::from_slice::<TokenInfo>(&c).ok())
+            else {
+                continue;
+            };
+            tokens.push(TokenListEntry {
+                file_id: id.to_string(),
+                user: info.user,
+                role: info.role,
+                created_at: info.created_at,
+                expires_at: info.expires_at,
+                last_used: last_used.get(id).copied().or(info.last_used),
+                description: info.description,
+            });
         }
 
         tokens.sort_by_key(|t| std::cmp::Reverse(t.created_at));
         tokens
     }
 
-    /// Flush pending last_used timestamps to disk (async to avoid blocking runtime).
+    /// A small state object: `None` when it does not exist yet.
+    async fn read_state(&self, key: &str) -> Result<Option<Bytes>, StorageError> {
+        match self.storage.get(key).await {
+            Ok(b) => Ok(Some(b)),
+            Err(StorageError::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Flush pending last_used timestamps to [`LAST_USED_KEY`]: one read and one
+    /// write, only when a token was used since the last flush. Records are never
+    /// rewritten, so a flush cannot bring back a token revoked meanwhile.
     /// Called periodically by background task (every 30s).
+    // ponytail: replicas flushing at once can drop each other's stamps (advisory
+    // data), and ids of revoked tokens stay in the map (a few bytes each).
     pub async fn flush_last_used(&self) {
         let pending: HashMap<String, u64> = {
             let mut map = self.pending_last_used.write();
@@ -346,33 +380,29 @@ impl TokenStore {
             return;
         }
 
-        for (file_prefix, timestamp) in &pending {
-            let file_path = self.storage_path.join(format!("{}.json", file_prefix));
-            let content = match tokio::fs::read_to_string(&file_path).await {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let mut info: TokenInfo = match serde_json::from_str(&content) {
-                Ok(i) => i,
-                Err(_) => continue,
-            };
-            info.last_used = Some(*timestamp);
-            // Atomic replace (write temp + rename), NOT an in-place `fs::write`:
-            // this runs every 30s for every active token while `verify_token`
-            // reads the same file on its cache-miss path. An in-place write
-            // truncates first, so a concurrent read can observe a torn/empty
-            // file — a VALID token then 401s ("Invalid username or password")
-            // until a clean read repopulates the verify cache.
-            if let Ok(json) = serde_json::to_string_pretty(&info) {
-                let tmp = file_path.with_extension("json.tmp");
-                if tokio::fs::write(&tmp, &json).await.is_ok() {
-                    set_file_permissions_600(&tmp);
-                    let _ = tokio::fs::rename(&tmp, &file_path).await;
-                }
+        // A map that does not parse is rebuilt; one that cannot be read is not
+        // overwritten (that would drop every other token's stamp).
+        let mut map: HashMap<String, u64> = match self.read_state(LAST_USED_KEY).await {
+            Ok(b) => b
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(error = %e, "token last_used read failed, flush skipped");
+                return;
             }
+        };
+        for (id, ts) in &pending {
+            let stamp = map.entry(id.clone()).or_insert(0);
+            *stamp = (*stamp).max(*ts);
         }
-
-        tracing::debug!(count = pending.len(), "Flushed pending last_used updates");
+        let result = match serde_json::to_vec(&map) {
+            Ok(json) => self.storage.put(LAST_USED_KEY, &json).await,
+            Err(e) => Err(StorageError::Io(std::io::Error::other(e))),
+        };
+        match result {
+            Ok(()) => tracing::debug!(count = pending.len(), "Flushed pending last_used updates"),
+            Err(e) => tracing::warn!(error = %e, "token last_used flush failed"),
+        }
     }
 
     /// Remove a token from the in-memory cache (called on revoke).
@@ -389,94 +419,146 @@ impl TokenStore {
     /// `hash_prefix` must be exactly 16 lowercase hexadecimal characters (the
     /// first 16 chars of SHA-256(token)). Anything else is rejected to prevent
     /// path-traversal attacks via crafted prefixes like `../../etc/passwd`.
-    pub fn revoke_token(&self, hash_prefix: &str) -> Result<(), TokenError> {
-        // SECURITY: validate format before building filesystem path
+    pub async fn revoke_token(&self, hash_prefix: &str) -> Result<(), TokenError> {
+        // SECURITY: validate format before building a storage key
         if !is_valid_hash_prefix(hash_prefix) {
             return Err(TokenError::NotFound);
         }
-        let file_path = self.storage_path.join(format!("{}.json", hash_prefix));
-
-        // TOCTOU fix: try remove directly
-        match fs::remove_file(&file_path) {
+        let key = record_key(hash_prefix);
+        // An object-store delete of a missing key succeeds, so ask first.
+        match self.storage.stat(&key).await {
+            Some(_) => {}
+            None => return Err(TokenError::NotFound),
+        }
+        match self.storage.delete(&key).await {
             Ok(()) => {
                 self.invalidate_cache(hash_prefix);
                 Ok(())
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(TokenError::NotFound),
+            Err(StorageError::NotFound) => Err(TokenError::NotFound),
             Err(e) => Err(TokenError::Storage(e.to_string())),
         }
     }
 
     /// Revoke all tokens for a user
-    pub fn revoke_all_for_user(&self, user: &str) -> usize {
+    pub async fn revoke_all_for_user(&self, user: &str) -> usize {
         let mut count = 0;
+        for token in self.list_tokens(user).await {
+            if self.revoke_token(&token.file_id).await.is_ok() {
+                count += 1;
+            }
+        }
+        count
+    }
 
-        if let Ok(entries) = fs::read_dir(&self.storage_path) {
-            for entry in entries.flatten() {
-                if let Ok(content) = fs::read_to_string(entry.path()) {
-                    if let Ok(info) = serde_json::from_str::<TokenInfo>(&content) {
-                        if info.user == user && fs::remove_file(entry.path()).is_ok() {
-                            count += 1;
-                        }
-                    }
+    /// Maestra: import the token files of the pre-storage layout (`<16hex>.json` in
+    /// `auth.token_storage`) at boot. Each file is imported at most once, and never
+    /// over an existing record; the files stay. A missing directory is a no-op.
+    /// Returns (imported now, imported before or already present).
+    pub async fn import_legacy_dir(&self, dir: &Path) -> (usize, usize) {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0),
+            Err(e) => {
+                tracing::error!(dir = %dir.display(), error = %e, "legacy token import: cannot read directory");
+                return (0, 0);
+            }
+        };
+        // Unreadable set: import nothing rather than re-import a revoked token.
+        let done = match self.read_state(IMPORTED_KEY).await {
+            Ok(None) => Ok(BTreeSet::new()),
+            Ok(Some(b)) => serde_json::from_slice(&b).map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let mut done: BTreeSet<String> = match done {
+            Ok(set) => set,
+            Err(e) => {
+                tracing::error!(error = %e, "legacy token import: cannot read {IMPORTED_KEY}");
+                return (0, 0);
+            }
+        };
+        let before = done.len();
+        let (mut imported, mut present, mut failed) = (0, 0, 0);
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(id) = name
+                .strip_suffix(".json")
+                .filter(|id| is_valid_hash_prefix(id))
+            else {
+                continue;
+            };
+            if done.contains(id) {
+                present += 1;
+                continue;
+            }
+            let data = match fs::read(entry.path()) {
+                Ok(d) if serde_json::from_slice::<TokenInfo>(&d).is_ok() => d,
+                _ => {
+                    tracing::warn!(file = %entry.path().display(), "legacy token import: unreadable token file skipped");
+                    failed += 1;
+                    continue;
+                }
+            };
+            match self
+                .storage
+                .put_if_absent(&record_key(id), Bytes::from(data))
+                .await
+            {
+                Ok(true) => imported += 1,
+                Ok(false) => present += 1,
+                Err(e) => {
+                    tracing::warn!(id, error = %e, "legacy token import failed");
+                    failed += 1;
+                    continue;
+                }
+            }
+            done.insert(id.to_string());
+        }
+        if imported + present + failed == 0 {
+            return (0, 0);
+        }
+        if done.len() != before {
+            if let Ok(json) = serde_json::to_vec(&done) {
+                if let Err(e) = self.storage.put(IMPORTED_KEY, &json).await {
+                    tracing::warn!(error = %e, "legacy token import: cannot write {IMPORTED_KEY}");
                 }
             }
         }
-
-        // Evict cached entries for this user so revoked tokens fail immediately
-        if count > 0 {
-            self.cache.write().retain(|_, v| v.user != user);
-        }
-
-        count
+        tracing::info!(
+            dir = %dir.display(),
+            imported,
+            present,
+            failed,
+            "imported {imported} tokens from {}, {present} already present",
+            dir.display()
+        );
+        (imported, present)
     }
 }
 
 /// Validate a hash prefix: must be exactly 16 lowercase hex characters (`[0-9a-f]`).
 ///
-/// Token files are named `{sha256(token)[..16]}.json` (always lowercase via
+/// Token records are keyed `{sha256(token)[..16]}.json` (always lowercase via
 /// `hex::encode`). We restrict to lowercase only to prevent case-mismatch
 /// issues on case-sensitive filesystems.
 fn is_valid_hash_prefix(s: &str) -> bool {
     s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Token record files (`<16hex>.json`, Argon2 hashes, never raw tokens) in
-/// `dir`, for `nora backup`. A missing directory has no records.
-pub fn export_records(dir: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    let mut out = Vec::new();
-    for entry in entries {
-        let name = entry?.file_name().to_string_lossy().into_owned();
-        if is_record_name(&name) {
-            out.push((name.clone(), fs::read(dir.join(&name))?));
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
-/// Write a record from a backup into `dir` (0700) as a 0600 file, replacing a
-/// record of the same name. The name and body come from an archive, so both
-/// are checked: a flat `<16hex>.json` name and a parsable [`TokenInfo`].
-pub fn import_record(dir: &Path, name: &str, data: &[u8]) -> Result<(), String> {
-    if !is_record_name(name) {
+/// Store a token record from a pre-storage backup archive (`.nora-local/tokens/<name>`)
+/// under [`STORAGE_PREFIX`], replacing a record of the same name. The name and body
+/// come from an archive, so both are checked: a flat `<16hex>.json` name and a
+/// parsable [`TokenInfo`].
+pub async fn import_record(storage: &Storage, name: &str, data: &[u8]) -> Result<(), String> {
+    if !name.strip_suffix(".json").is_some_and(is_valid_hash_prefix) {
         return Err(format!("not a token record name: {name:?}"));
     }
     serde_json::from_slice::<TokenInfo>(data)
         .map_err(|e| format!("token record {name} is not valid: {e}"))?;
-    let json = std::str::from_utf8(data).map_err(|e| format!("token record {name}: {e}"))?;
-    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
-    write_token_file(&dir.join(name), json).map_err(|e| format!("token record {name}: {e}"))
-}
-
-fn is_record_name(name: &str) -> bool {
-    name.strip_suffix(".json").is_some_and(is_valid_hash_prefix)
+    storage
+        .put(&format!("{STORAGE_PREFIX}{name}"), data)
+        .await
+        .map_err(|e| format!("token record {name}: {e}"))
 }
 
 /// Hash a token using Argon2id with random salt
@@ -506,27 +588,6 @@ fn sha256_hex(input: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Set file permissions to 600 (owner read/write only)
-fn set_file_permissions_600(path: &Path) {
-    #[cfg(unix)]
-    {
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    }
-}
-
-/// Write a token file atomically: temp file in the same directory, permissions
-/// fixed, then rename over the target. `verify_token` reads these files on its
-/// cache-miss path while background rewrites happen, and a plain `fs::write`
-/// truncates in place — a concurrent reader can observe a torn/empty file and
-/// fail a valid token. Listings skip the temp name (extension is `tmp`, not
-/// `json`), and `is_valid_hash_prefix` keeps it out of revoke paths.
-fn write_token_file(path: &Path, json: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json)?;
-    set_file_permissions_600(&tmp);
-    fs::rename(&tmp, path)
-}
-
 #[derive(Debug, Error)]
 pub enum TokenError {
     #[error("Invalid token format")]
@@ -548,13 +609,29 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_create_token() {
+    /// A local-backend storage in `dir` (the token state lives in storage).
+    fn local(dir: &TempDir) -> Storage {
+        Storage::new_local(dir.path().to_str().unwrap())
+    }
+
+    async fn read_record(storage: &Storage, token: &str) -> TokenInfo {
+        let key = record_key(&sha256_hex(token)[..16]);
+        serde_json::from_slice(&storage.get(&key).await.unwrap()).unwrap()
+    }
+
+    async fn write_record(storage: &Storage, id: &str, info: &TokenInfo) {
+        let json = serde_json::to_vec_pretty(info).unwrap();
+        storage.put(&record_key(id), &json).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_create_token() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let store = TokenStore::new(local(&temp_dir));
 
         let token = store
             .create_token("testuser", 30, Some("Test token".to_string()), Role::Write)
+            .await
             .unwrap();
 
         assert!(token.starts_with("nra_"));
@@ -563,70 +640,84 @@ mod tests {
 
     /// Every mint path goes through `create_token`, so the TTL clamp lives there:
     /// 0 becomes one day and an overflowing `u64::MAX` becomes 10 years.
-    #[test]
-    fn test_create_token_clamps_ttl() {
+    #[tokio::test]
+    async fn test_create_token_clamps_ttl() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
-        store.create_token("zero", 0, None, Role::Read).unwrap();
+        let store = TokenStore::new(local(&temp_dir));
+        store
+            .create_token("zero", 0, None, Role::Read)
+            .await
+            .unwrap();
         store
             .create_token("huge", u64::MAX, None, Role::Read)
+            .await
             .unwrap();
 
-        let ttl_of = |user: &str| {
-            let t = &store.list_tokens(user)[0];
-            (t.expires_at - t.created_at) / 86400
-        };
-        assert_eq!(ttl_of("zero"), 1);
-        assert_eq!(ttl_of("huge"), MAX_TOKEN_TTL_DAYS);
+        for (user, days) in [("zero", 1), ("huge", MAX_TOKEN_TTL_DAYS)] {
+            let t = &store.list_tokens(user).await[0];
+            assert_eq!((t.expires_at - t.created_at) / 86400, days);
+        }
     }
 
     /// The verify-cache TTL bounds the cross-replica revocation window. Two
-    /// stores share one token dir (= two HA replicas, each with its own in-memory
+    /// stores share one storage (= two HA replicas, each with its own in-memory
     /// cache). A token revoked on replica A is still served from replica B's cache
     /// until B's `cache_ttl` elapses — and a short TTL bounds exactly that window.
-    #[test]
-    fn cache_ttl_bounds_cross_replica_revocation_window() {
-        use std::thread::sleep;
+    #[tokio::test]
+    async fn cache_ttl_bounds_cross_replica_revocation_window() {
         let dir = TempDir::new().unwrap();
-        let replica_a = TokenStore::new(dir.path());
-        let replica_b = TokenStore::with_cache_ttl(dir.path(), Duration::from_secs(1));
+        let replica_a = TokenStore::new(local(&dir));
+        let replica_b =
+            TokenStore::with_cache_ttl(replica_a.storage.clone(), Duration::from_secs(1));
 
-        let token = replica_a.create_token("u", 30, None, Role::Write).unwrap();
+        let token = replica_a
+            .create_token("u", 30, None, Role::Write)
+            .await
+            .unwrap();
 
         // B verifies and caches the token.
-        assert!(replica_b.verify_token(&token).is_ok());
+        assert!(replica_b.verify_token(&token).await.is_ok());
 
-        // A revokes it (removes the on-disk token + clears A's cache). B's cache is
+        // A revokes it (deletes the record + clears A's cache). B's cache is
         // untouched — there is no cross-pod invalidation.
         let hash_prefix = sha256_hex(&token)[..16].to_string();
-        replica_a.revoke_token(&hash_prefix).unwrap();
+        replica_a.revoke_token(&hash_prefix).await.unwrap();
 
         // WITHIN cache_ttl, B still serves the revoked token from cache — the
         // documented window.
         assert!(
-            replica_b.verify_token(&token).is_ok(),
+            replica_b.verify_token(&token).await.is_ok(),
             "within cache_ttl, B serves from cache (bounded window)"
         );
 
-        // After cache_ttl, B's entry is stale -> slow path re-reads disk -> the
+        // After cache_ttl, B's entry is stale -> slow path re-reads storage -> the
         // revoked (deleted) token is rejected. The TTL bounds the window.
-        sleep(Duration::from_millis(1100));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
         assert!(
-            matches!(replica_b.verify_token(&token), Err(TokenError::NotFound)),
-            "after cache_ttl, B re-reads disk and rejects the revoked token"
+            matches!(
+                replica_b.verify_token(&token).await,
+                Err(TokenError::NotFound)
+            ),
+            "after cache_ttl, B re-reads storage and rejects the revoked token"
         );
     }
 
-    #[test]
-    fn test_token_hash_is_argon2() {
+    #[tokio::test]
+    async fn test_token_hash_is_argon2() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let storage = local(&temp_dir);
+        let store = TokenStore::new(storage.clone());
 
-        let _token = store
+        let token = store
             .create_token("testuser", 30, None, Role::Write)
+            .await
             .unwrap();
 
-        let tokens = store.list_all_tokens();
+        assert!(read_record(&storage, &token)
+            .await
+            .token_hash
+            .starts_with("$argon2"));
+        let tokens = store.list_all_tokens().await;
         // Verify file_id is a hex prefix, not an Argon2 hash
         assert!(
             tokens[0].file_id.chars().all(|c| c.is_ascii_hexdigit()),
@@ -636,62 +727,82 @@ mod tests {
         assert_eq!(tokens[0].file_id.len(), 16);
     }
 
-    #[test]
-    fn test_verify_valid_token() {
+    #[tokio::test]
+    async fn test_verify_valid_token() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let store = TokenStore::new(local(&temp_dir));
 
         let token = store
             .create_token("testuser", 30, None, Role::Write)
+            .await
             .unwrap();
-        let (user, role) = store.verify_token(&token).unwrap();
+        let (user, role) = store.verify_token(&token).await.unwrap();
 
         assert_eq!(user, "testuser");
         assert_eq!(role, Role::Write);
     }
 
-    #[test]
-    fn test_verify_invalid_format() {
+    /// A token minted before a restart verifies on the next process: a new store
+    /// over the same storage, with a cold cache.
+    #[tokio::test]
+    async fn token_verifies_after_restart() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let token = TokenStore::new(local(&temp_dir))
+            .create_token("ci", 30, None, Role::Write)
+            .await
+            .unwrap();
 
-        let result = store.verify_token("invalid_token");
+        let restarted = TokenStore::new(local(&temp_dir));
+        assert_eq!(
+            restarted.verify_token(&token).await.unwrap(),
+            ("ci".to_string(), Role::Write)
+        );
+        assert_eq!(restarted.list_tokens("ci").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_verify_invalid_format() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(local(&temp_dir));
+
+        let result = store.verify_token("invalid_token").await;
         assert!(matches!(result, Err(TokenError::InvalidFormat)));
     }
 
-    #[test]
-    fn test_verify_not_found() {
+    #[tokio::test]
+    async fn test_verify_not_found() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let store = TokenStore::new(local(&temp_dir));
 
-        let result = store.verify_token("nra_00000000000000000000000000000000");
+        let result = store
+            .verify_token("nra_00000000000000000000000000000000")
+            .await;
         assert!(matches!(result, Err(TokenError::NotFound)));
     }
 
-    #[test]
-    fn test_verify_expired_token() {
+    #[tokio::test]
+    async fn test_verify_expired_token() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let storage = local(&temp_dir);
+        let store = TokenStore::new(storage.clone());
 
         let token = store
             .create_token("testuser", 1, None, Role::Write)
+            .await
             .unwrap();
-        let file_id = sha256_hex(&token);
-        let file_path = temp_dir.path().join(format!("{}.json", &file_id[..16]));
-
-        let content = std::fs::read_to_string(&file_path).unwrap();
-        let mut info: TokenInfo = serde_json::from_str(&content).unwrap();
+        let mut info = read_record(&storage, &token).await;
         info.expires_at = 0;
-        std::fs::write(&file_path, serde_json::to_string(&info).unwrap()).unwrap();
+        write_record(&storage, &sha256_hex(&token)[..16], &info).await;
 
-        let result = store.verify_token(&token);
+        let result = store.verify_token(&token).await;
         assert!(matches!(result, Err(TokenError::Expired)));
     }
 
-    #[test]
-    fn test_legacy_sha256_migration() {
+    #[tokio::test]
+    async fn test_legacy_sha256_migration() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let storage = local(&temp_dir);
+        let store = TokenStore::new(storage.clone());
 
         // Simulate a legacy token with SHA256 hash
         let raw_token = "nra_00112233445566778899aabbccddeeff";
@@ -712,74 +823,82 @@ mod tests {
             description: None,
             role: Role::Read,
         };
-
-        let file_path = temp_dir.path().join(format!("{}.json", &file_id[..16]));
-        fs::write(&file_path, serde_json::to_string_pretty(&info).unwrap()).unwrap();
+        write_record(&storage, &file_id[..16], &info).await;
 
         // Verify should work with legacy hash
-        let (user, role) = store.verify_token(raw_token).unwrap();
+        let (user, role) = store.verify_token(raw_token).await.unwrap();
         assert_eq!(user, "legacyuser");
         assert_eq!(role, Role::Read);
 
         // After verification, hash should be migrated to Argon2id
-        let content = fs::read_to_string(&file_path).unwrap();
-        let updated: TokenInfo = serde_json::from_str(&content).unwrap();
+        let updated = read_record(&storage, raw_token).await;
         assert!(updated.token_hash.starts_with("$argon2"));
     }
 
-    #[test]
-    fn test_file_permissions() {
+    #[tokio::test]
+    async fn test_list_tokens() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let store = TokenStore::new(local(&temp_dir));
 
-        let token = store
-            .create_token("testuser", 30, None, Role::Write)
+        store
+            .create_token("user1", 30, None, Role::Write)
+            .await
+            .unwrap();
+        store
+            .create_token("user1", 30, None, Role::Write)
+            .await
+            .unwrap();
+        store
+            .create_token("user2", 30, None, Role::Read)
+            .await
             .unwrap();
 
-        let file_id = sha256_hex(&token);
-        let file_path = temp_dir.path().join(format!("{}.json", &file_id[..16]));
-
-        #[cfg(unix)]
-        {
-            let metadata = fs::metadata(&file_path).unwrap();
-            let mode = metadata.permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
-        }
-    }
-
-    #[test]
-    fn test_list_tokens() {
-        let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
-
-        store.create_token("user1", 30, None, Role::Write).unwrap();
-        store.create_token("user1", 30, None, Role::Write).unwrap();
-        store.create_token("user2", 30, None, Role::Read).unwrap();
-
-        let user1_tokens = store.list_tokens("user1");
+        let user1_tokens = store.list_tokens("user1").await;
         assert_eq!(user1_tokens.len(), 2);
 
-        let user2_tokens = store.list_tokens("user2");
+        let user2_tokens = store.list_tokens("user2").await;
         assert_eq!(user2_tokens.len(), 1);
 
-        let unknown_tokens = store.list_tokens("unknown");
+        let unknown_tokens = store.list_tokens("unknown").await;
         assert_eq!(unknown_tokens.len(), 0);
     }
 
-    #[test]
-    fn test_list_all_tokens() {
+    /// Token keys are internal: no registry walk (`Storage::list`) sees them.
+    #[tokio::test]
+    async fn test_token_keys_hidden_from_list() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let storage = local(&temp_dir);
+        let store = TokenStore::new(storage.clone());
+        let token = store.create_token("u", 30, None, Role::Read).await.unwrap();
+        store.verify_token(&token).await.unwrap();
+        store.flush_last_used().await;
+
+        assert!(storage.list("").await.unwrap().is_empty());
+        assert_eq!(
+            storage.list_internal(STORAGE_PREFIX).await.unwrap().len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_all_tokens() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(local(&temp_dir));
 
         store
             .create_token("user1", 30, Some("Token A".to_string()), Role::Write)
+            .await
             .unwrap();
-        store.create_token("user2", 30, None, Role::Read).unwrap();
+        store
+            .create_token("user2", 30, None, Role::Read)
+            .await
+            .unwrap();
         store
             .create_token("user1", 30, Some("Token B".to_string()), Role::Admin)
+            .await
             .unwrap();
 
-        let all = store.list_all_tokens();
+        let all = store.list_all_tokens().await;
         assert_eq!(all.len(), 3);
 
         // All file_ids should be 16 hex chars
@@ -789,97 +908,149 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_file_id_matches_revoke() {
+    #[tokio::test]
+    async fn test_file_id_matches_revoke() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let store = TokenStore::new(local(&temp_dir));
 
         let token = store
             .create_token("testuser", 30, None, Role::Write)
+            .await
             .unwrap();
 
         // Get file_id from list
-        let entries = store.list_all_tokens();
+        let entries = store.list_all_tokens().await;
         assert_eq!(entries.len(), 1);
         let file_id = &entries[0].file_id;
 
         // Revoke using file_id from list
-        store.revoke_token(file_id).unwrap();
+        store.revoke_token(file_id).await.unwrap();
 
         // Token should be gone
-        assert!(store.verify_token(&token).is_err());
-        assert_eq!(store.list_all_tokens().len(), 0);
+        assert!(store.verify_token(&token).await.is_err());
+        assert_eq!(store.list_all_tokens().await.len(), 0);
     }
 
-    #[test]
-    fn test_revoke_token() {
+    #[tokio::test]
+    async fn test_revoke_token() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let store = TokenStore::new(local(&temp_dir));
 
         let token = store
             .create_token("testuser", 30, None, Role::Write)
+            .await
             .unwrap();
         let file_id = sha256_hex(&token);
         let hash_prefix = &file_id[..16];
 
-        assert!(store.verify_token(&token).is_ok());
+        assert!(store.verify_token(&token).await.is_ok());
 
-        store.revoke_token(hash_prefix).unwrap();
+        store.revoke_token(hash_prefix).await.unwrap();
 
-        let result = store.verify_token(&token);
+        let result = store.verify_token(&token).await;
         assert!(matches!(result, Err(TokenError::NotFound)));
     }
 
-    #[test]
-    fn test_revoke_nonexistent_token() {
+    #[tokio::test]
+    async fn test_revoke_nonexistent_token() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let store = TokenStore::new(local(&temp_dir));
 
-        let result = store.revoke_token("nonexistent12345");
+        let result = store.revoke_token("nonexistent12345").await;
+        assert!(matches!(result, Err(TokenError::NotFound)));
+        let result = store.revoke_token("0123456789abcdef").await;
         assert!(matches!(result, Err(TokenError::NotFound)));
     }
 
-    #[test]
-    fn test_revoke_all_for_user() {
+    #[tokio::test]
+    async fn test_revoke_all_for_user() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let store = TokenStore::new(local(&temp_dir));
 
-        store.create_token("user1", 30, None, Role::Write).unwrap();
-        store.create_token("user1", 30, None, Role::Write).unwrap();
-        store.create_token("user2", 30, None, Role::Read).unwrap();
+        store
+            .create_token("user1", 30, None, Role::Write)
+            .await
+            .unwrap();
+        store
+            .create_token("user1", 30, None, Role::Write)
+            .await
+            .unwrap();
+        store
+            .create_token("user2", 30, None, Role::Read)
+            .await
+            .unwrap();
 
-        let revoked = store.revoke_all_for_user("user1");
+        let revoked = store.revoke_all_for_user("user1").await;
         assert_eq!(revoked, 2);
 
-        assert_eq!(store.list_tokens("user1").len(), 0);
-        assert_eq!(store.list_tokens("user2").len(), 1);
+        assert_eq!(store.list_tokens("user1").await.len(), 0);
+        assert_eq!(store.list_tokens("user2").await.len(), 1);
     }
 
     #[tokio::test]
     async fn test_token_updates_last_used() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let store = TokenStore::new(local(&temp_dir));
 
         let token = store
             .create_token("testuser", 30, None, Role::Write)
+            .await
             .unwrap();
 
-        store.verify_token(&token).unwrap();
+        store.verify_token(&token).await.unwrap();
 
         // last_used is deferred — flush to persist
         store.flush_last_used().await;
 
-        let tokens = store.list_tokens("testuser");
+        let tokens = store.list_tokens("testuser").await;
         assert!(tokens[0].last_used.is_some());
+        // and survives a restart
+        let restarted = TokenStore::new(store.storage.clone());
+        assert_eq!(
+            restarted.list_tokens("testuser").await[0].last_used,
+            tokens[0].last_used
+        );
     }
 
-    #[test]
-    fn test_verify_cache_hit() {
+    /// The flush writes only the last_used map, never a record: a token revoked
+    /// between its use and the next flush stays revoked (the old per-record
+    /// rewrite renamed a fresh copy over the deleted file and brought it back).
+    #[tokio::test]
+    async fn revoke_then_flush_does_not_resurrect() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let storage = local(&temp_dir);
+        let store = TokenStore::new(storage.clone());
+        let token = store
+            .create_token("ci", 30, None, Role::Write)
+            .await
+            .unwrap();
+        let record = read_record(&storage, &token).await;
+
+        // Used (a pending last_used), then revoked before the flush.
+        store.verify_token(&token).await.unwrap();
+        let id = &sha256_hex(&token)[..16];
+        store.revoke_token(id).await.unwrap();
+        store.flush_last_used().await;
+
+        assert!(storage.stat(&record_key(id)).await.is_none());
+        assert!(store.list_all_tokens().await.is_empty());
+        let cold = TokenStore::new(storage.clone());
+        assert!(matches!(
+            cold.verify_token(&token).await,
+            Err(TokenError::NotFound)
+        ));
+        // A flush never touched the record before the revoke either.
+        assert_eq!(record.last_used, None);
+    }
+
+    #[tokio::test]
+    async fn test_verify_cache_hit() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(local(&temp_dir));
 
         let token = store
             .create_token("testuser", 30, None, Role::Write)
+            .await
             .unwrap();
 
         assert_eq!(
@@ -888,8 +1059,8 @@ mod tests {
             "cache should be empty before first verify"
         );
 
-        // First call: cold (disk + Argon2)
-        let (user1, role1) = store.verify_token(&token).unwrap();
+        // First call: cold (storage + Argon2)
+        let (user1, role1) = store.verify_token(&token).await.unwrap();
         assert_eq!(
             store.cache.read().len(),
             1,
@@ -897,7 +1068,7 @@ mod tests {
         );
 
         // Second call: should hit cache (no Argon2)
-        let (user2, role2) = store.verify_token(&token).unwrap();
+        let (user2, role2) = store.verify_token(&token).await.unwrap();
         assert_eq!(store.cache.read().len(), 1, "cache size unchanged on hit");
 
         assert_eq!(user1, user2);
@@ -913,63 +1084,73 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_revoke_invalidates_cache() {
+    #[tokio::test]
+    async fn test_revoke_invalidates_cache() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let store = TokenStore::new(local(&temp_dir));
 
         let token = store
             .create_token("testuser", 30, None, Role::Write)
+            .await
             .unwrap();
         let file_id = sha256_hex(&token);
         let hash_prefix = &file_id[..16];
 
         // Populate cache
-        assert!(store.verify_token(&token).is_ok());
+        assert!(store.verify_token(&token).await.is_ok());
 
         // Revoke
-        store.revoke_token(hash_prefix).unwrap();
+        store.revoke_token(hash_prefix).await.unwrap();
 
         // Cache should be invalidated
-        let result = store.verify_token(&token);
+        let result = store.verify_token(&token).await;
         assert!(matches!(result, Err(TokenError::NotFound)));
     }
 
-    #[test]
-    fn test_revoke_all_clears_cache() {
+    #[tokio::test]
+    async fn test_revoke_all_clears_cache() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let store = TokenStore::new(local(&temp_dir));
 
-        let token1 = store.create_token("alice", 30, None, Role::Write).unwrap();
-        let token2 = store.create_token("alice", 30, None, Role::Read).unwrap();
-        let token3 = store.create_token("bob", 30, None, Role::Write).unwrap();
+        let token1 = store
+            .create_token("alice", 30, None, Role::Write)
+            .await
+            .unwrap();
+        let token2 = store
+            .create_token("alice", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let token3 = store
+            .create_token("bob", 30, None, Role::Write)
+            .await
+            .unwrap();
 
         // Populate cache for all tokens
-        store.verify_token(&token1).unwrap();
-        store.verify_token(&token2).unwrap();
-        store.verify_token(&token3).unwrap();
+        store.verify_token(&token1).await.unwrap();
+        store.verify_token(&token2).await.unwrap();
+        store.verify_token(&token3).await.unwrap();
         assert_eq!(store.cache.read().len(), 3);
 
         // Revoke all tokens for alice
-        let revoked = store.revoke_all_for_user("alice");
+        let revoked = store.revoke_all_for_user("alice").await;
         assert_eq!(revoked, 2);
 
         // Alice's cache entries should be gone, bob's should remain
         assert_eq!(store.cache.read().len(), 1);
         assert!(
-            store.verify_token(&token3).is_ok(),
+            store.verify_token(&token3).await.is_ok(),
             "bob's token should still work"
         );
         assert!(
-            store.verify_token(&token1).is_err(),
+            store.verify_token(&token1).await.is_err(),
             "alice's token should be revoked"
         );
     }
 
-    #[test]
-    fn test_token_with_description() {
+    #[tokio::test]
+    async fn test_token_with_description() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let store = TokenStore::new(local(&temp_dir));
 
         store
             .create_token(
@@ -978,9 +1159,10 @@ mod tests {
                 Some("CI/CD Pipeline".to_string()),
                 Role::Admin,
             )
+            .await
             .unwrap();
 
-        let tokens = store.list_tokens("testuser");
+        let tokens = store.list_tokens("testuser").await;
         assert_eq!(tokens[0].description, Some("CI/CD Pipeline".to_string()));
     }
 
@@ -1005,70 +1187,104 @@ mod tests {
         assert!(!is_valid_hash_prefix("zzzzzzzzzzzzzzzz")); // non-hex
     }
 
-    /// A corrupt/torn token file must surface as `Storage`, not `NotFound` —
+    /// A corrupt token record must surface as `Storage`, not `NotFound` —
     /// the auth middleware maps `Storage` to 503 (retryable outage) and
-    /// everything else to 401 (credential verdict). Misclassifying a torn file
-    /// as `NotFound` turns a storage blip into an auth denial.
-    #[test]
-    fn verify_reports_storage_error_on_corrupt_file() {
+    /// everything else to 401 (credential verdict). Misclassifying a corrupt
+    /// record as `NotFound` turns a storage blip into an auth denial.
+    #[tokio::test]
+    async fn verify_reports_storage_error_on_corrupt_file() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
-        let token = store.create_token("ci", 30, None, Role::Read).unwrap();
+        let storage = local(&temp_dir);
+        let store = TokenStore::new(storage.clone());
+        let token = store
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
 
-        // Corrupt the on-disk file the way a torn in-place write would.
-        let file = temp_dir
-            .path()
-            .join(format!("{}.json", &sha256_hex(&token)[..16]));
-        std::fs::write(&file, "{\"token_ha").unwrap();
+        let key = record_key(&sha256_hex(&token)[..16]);
+        storage.put(&key, b"{\"token_ha").await.unwrap();
 
         assert!(matches!(
-            store.verify_token(&token),
+            store.verify_token(&token).await,
             Err(TokenError::Storage(_))
         ));
     }
 
-    /// `flush_last_used` must leave the token file whole (atomic replace) with
-    /// the timestamp applied, and clean up its temp file — a verify racing the
-    /// flush then can never observe a truncated file from NORA's own writes.
+    /// The boot import copies each legacy `<16hex>.json` file into storage once:
+    /// a second boot imports nothing, an existing record is never overwritten,
+    /// and a token revoked after the import is not brought back. Other files are
+    /// ignored, and a missing directory is a no-op.
     #[tokio::test]
-    async fn flush_last_used_replaces_file_atomically() {
+    async fn legacy_dir_import_is_idempotent() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
-        let token = store.create_token("ci", 30, None, Role::Read).unwrap();
+        let storage = local(&temp_dir);
+        let legacy = TempDir::new().unwrap();
 
-        // Schedules a pending last_used update.
-        store.verify_token(&token).unwrap();
-        store.flush_last_used().await;
+        // Two token files of the old layout, one stray file.
+        let old = TokenStore::new(Storage::new_local(legacy.path().to_str().unwrap()));
+        let t1 = old.create_token("a", 30, None, Role::Write).await.unwrap();
+        let t2 = old.create_token("b", 30, None, Role::Read).await.unwrap();
+        for t in [&t1, &t2] {
+            let id = &sha256_hex(t)[..16];
+            let src = legacy.path().join(record_key(id));
+            fs::copy(&src, legacy.path().join(format!("{id}.json"))).unwrap();
+        }
+        fs::write(legacy.path().join("notes.json"), "{}").unwrap();
 
-        let prefix = &sha256_hex(&token)[..16];
-        let file = temp_dir.path().join(format!("{prefix}.json"));
-        let info: TokenInfo =
-            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-        assert!(info.last_used.is_some(), "flush must apply the timestamp");
-        assert!(
-            !temp_dir.path().join(format!("{prefix}.json.tmp")).exists(),
-            "temp file must be renamed away, not left behind"
+        let store = TokenStore::new(storage.clone());
+        assert_eq!(
+            store
+                .import_legacy_dir(&legacy.path().join("missing"))
+                .await,
+            (0, 0)
         );
-        // And the token still verifies from disk (fresh store = no warm cache).
-        let cold = TokenStore::new(temp_dir.path());
-        assert!(cold.verify_token(&token).is_ok());
+        assert_eq!(store.import_legacy_dir(legacy.path()).await, (2, 0));
+        assert_eq!(store.verify_token(&t1).await.unwrap().0, "a");
+        assert_eq!(store.verify_token(&t2).await.unwrap().0, "b");
+
+        // Next boot: nothing new.
+        let next = TokenStore::new(storage.clone());
+        assert_eq!(next.import_legacy_dir(legacy.path()).await, (0, 2));
+
+        // Revoked after the import: the file is still there, the token stays gone.
+        next.revoke_token(&sha256_hex(&t1)[..16]).await.unwrap();
+        let after = TokenStore::new(storage.clone());
+        assert_eq!(after.import_legacy_dir(legacy.path()).await, (0, 2));
+        assert!(matches!(
+            after.verify_token(&t1).await,
+            Err(TokenError::NotFound)
+        ));
+        assert!(legacy
+            .path()
+            .join(format!("{}.json", &sha256_hex(&t1)[..16]))
+            .exists());
+
+        // A record already in storage is never overwritten by a file of the same id.
+        let fresh = TempDir::new().unwrap();
+        let fresh_store = TokenStore::new(local(&fresh));
+        let id2 = &sha256_hex(&t2)[..16];
+        let mut theirs = read_record(&storage, &t2).await;
+        theirs.user = "kept".into();
+        write_record(&fresh_store.storage, id2, &theirs).await;
+        assert_eq!(fresh_store.import_legacy_dir(legacy.path()).await, (1, 1));
+        assert_eq!(fresh_store.verify_token(&t2).await.unwrap().0, "kept");
     }
 
-    #[test]
-    fn test_revoke_rejects_path_traversal() {
+    #[tokio::test]
+    async fn test_revoke_rejects_path_traversal() {
         let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
+        let store = TokenStore::new(local(&temp_dir));
 
         // Create a decoy file that path traversal would target
         let decoy = temp_dir.path().join("../decoy.json");
         let _ = std::fs::write(&decoy, "should not be deleted");
 
         // Attempt path traversal
-        let result = store.revoke_token("../decoy");
+        let result = store.revoke_token("../decoy").await;
         assert!(matches!(result, Err(TokenError::NotFound)));
-        let result = store.revoke_token("../../etc/passwd");
+        let result = store.revoke_token("../../etc/passwd").await;
         assert!(matches!(result, Err(TokenError::NotFound)));
-        let result = store.revoke_token("");
+        let result = store.revoke_token("").await;
         assert!(matches!(result, Err(TokenError::NotFound)));
     }
 }

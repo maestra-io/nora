@@ -251,7 +251,10 @@ async fn admin_create_token(
     };
 
     let role_label = role.to_string();
-    match token_store.create_token(&req.username, ttl_days, req.description, role) {
+    match token_store
+        .create_token(&req.username, ttl_days, req.description, role)
+        .await
+    {
         Ok(token) => {
             // Audit the mint with actor + target + role + ttl (never the token itself).
             let detail = format!("role={} ttl_days={}", role_label, ttl_days);
@@ -286,12 +289,13 @@ mod tests {
 
     const URI: &str = "/api/v1/admin/reindex";
 
-    fn mint(ctx: &TestContext, role: Role) -> String {
+    async fn mint(ctx: &TestContext, role: Role) -> String {
         ctx.state
             .tokens
             .as_ref()
             .expect("token store enabled")
             .create_token("tester", 30, None, role)
+            .await
             .expect("create token")
     }
 
@@ -324,21 +328,21 @@ mod tests {
     #[tokio::test]
     async fn admin_token_accepted() {
         let ctx = create_test_context_with_auth(&[]);
-        let tok = mint(&ctx, Role::Admin);
+        let tok = mint(&ctx, Role::Admin).await;
         assert_eq!(post_bearer(&ctx, URI, &tok).await, StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
     async fn write_token_forbidden() {
         let ctx = create_test_context_with_auth(&[]);
-        let tok = mint(&ctx, Role::Write);
+        let tok = mint(&ctx, Role::Write).await;
         assert_eq!(post_bearer(&ctx, URI, &tok).await, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
     async fn read_token_forbidden() {
         let ctx = create_test_context_with_auth(&[]);
-        let tok = mint(&ctx, Role::Read);
+        let tok = mint(&ctx, Role::Read).await;
         assert_eq!(post_bearer(&ctx, URI, &tok).await, StatusCode::FORBIDDEN);
     }
 
@@ -372,7 +376,7 @@ mod tests {
         // #737 lets an API token ride in as the Basic password; a write token via
         // Basic must still be blocked on admin paths, not just on Bearer.
         let ctx = create_test_context_with_auth(&[("alice", "pw")]);
-        let tok = mint(&ctx, Role::Write);
+        let tok = mint(&ctx, Role::Write).await;
         assert_eq!(
             post_basic(&ctx, URI, &format!("x:{tok}")).await,
             StatusCode::FORBIDDEN
@@ -384,7 +388,7 @@ mod tests {
         // A genuine admin token via the Basic password (Docker/twine/Maven style)
         // must still reach the admin endpoint.
         let ctx = create_test_context_with_auth(&[("alice", "pw")]);
-        let tok = mint(&ctx, Role::Admin);
+        let tok = mint(&ctx, Role::Admin).await;
         assert_eq!(
             post_basic(&ctx, URI, &format!("x:{tok}")).await,
             StatusCode::ACCEPTED
@@ -394,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_registry_bad_request() {
         let ctx = create_test_context_with_auth(&[]);
-        let tok = mint(&ctx, Role::Admin);
+        let tok = mint(&ctx, Role::Admin).await;
         let status = post_bearer(&ctx, "/api/v1/admin/reindex?registry=crago", &tok).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
@@ -402,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn scoped_registry_accepted() {
         let ctx = create_test_context_with_auth(&[]);
-        let tok = mint(&ctx, Role::Admin);
+        let tok = mint(&ctx, Role::Admin).await;
         let status = post_bearer(&ctx, "/api/v1/admin/reindex?registry=cargo", &tok).await;
         assert_eq!(status, StatusCode::ACCEPTED);
     }
@@ -410,7 +414,7 @@ mod tests {
     #[tokio::test]
     async fn second_call_debounced() {
         let ctx = create_test_context_with_auth(&[]);
-        let tok = mint(&ctx, Role::Admin);
+        let tok = mint(&ctx, Role::Admin).await;
         assert_eq!(post_bearer(&ctx, URI, &tok).await, StatusCode::ACCEPTED);
         // Immediate second call lands inside the debounce window.
         assert_eq!(
@@ -424,7 +428,7 @@ mod tests {
         // Regression pin: the legacy /raw/-/reindex must NOT be swept into the
         // admin gate — a write token still works there.
         let ctx = create_test_context_with_auth(&[]);
-        let tok = mint(&ctx, Role::Write);
+        let tok = mint(&ctx, Role::Write).await;
         let status = post_bearer(&ctx, "/raw/-/reindex", &tok).await;
         assert_eq!(status, StatusCode::OK);
     }
@@ -459,7 +463,7 @@ mod tests {
     async fn admin_mint_admin_token_end_to_end() {
         use crate::test_helpers::body_bytes;
         let ctx = create_test_context_with_auth(&[]);
-        let admin = mint(&ctx, Role::Admin);
+        let admin = mint(&ctx, Role::Admin).await;
         let auth = format!("Bearer {admin}");
         let resp = send_with_headers(
             &ctx.app,
@@ -487,7 +491,7 @@ mod tests {
     #[tokio::test]
     async fn admin_mint_write_token_forbidden() {
         let ctx = create_test_context_with_auth(&[]);
-        let tok = mint(&ctx, Role::Write);
+        let tok = mint(&ctx, Role::Write).await;
         assert_eq!(
             post_json_bearer(&ctx, &tok, r#"{"username":"svc","role":"admin"}"#).await,
             StatusCode::FORBIDDEN
@@ -497,7 +501,7 @@ mod tests {
     #[tokio::test]
     async fn admin_mint_read_token_forbidden() {
         let ctx = create_test_context_with_auth(&[]);
-        let tok = mint(&ctx, Role::Read);
+        let tok = mint(&ctx, Role::Read).await;
         assert_eq!(
             post_json_bearer(&ctx, &tok, r#"{"username":"svc","role":"admin"}"#).await,
             StatusCode::FORBIDDEN
@@ -525,7 +529,7 @@ mod tests {
     #[tokio::test]
     async fn admin_mint_invalid_role_bad_request() {
         let ctx = create_test_context_with_auth(&[]);
-        let tok = mint(&ctx, Role::Admin);
+        let tok = mint(&ctx, Role::Admin).await;
         assert_eq!(
             post_json_bearer(&ctx, &tok, r#"{"username":"svc","role":"superuser"}"#).await,
             StatusCode::BAD_REQUEST
@@ -536,7 +540,7 @@ mod tests {
     #[tokio::test]
     async fn admin_mint_zero_ttl_bad_request() {
         let ctx = create_test_context_with_auth(&[]);
-        let tok = mint(&ctx, Role::Admin);
+        let tok = mint(&ctx, Role::Admin).await;
         assert_eq!(
             post_json_bearer(
                 &ctx,
@@ -554,7 +558,7 @@ mod tests {
     async fn admin_mint_echoes_clamped_ttl() {
         use crate::test_helpers::body_bytes;
         let ctx = create_test_context_with_auth(&[]);
-        let tok = mint(&ctx, Role::Admin);
+        let tok = mint(&ctx, Role::Admin).await;
         let auth = format!("Bearer {tok}");
         let resp = send_with_headers(
             &ctx.app,

@@ -148,7 +148,10 @@ async fn create_token(
 
     let ttl_days = req.ttl_days.clamp(1, MAX_TOKEN_TTL_DAYS);
     let detail = format!("role={} ttl_days={}", role, ttl_days);
-    match token_store.create_token(&req.username, ttl_days, req.description, role) {
+    match token_store
+        .create_token(&req.username, ttl_days, req.description, role)
+        .await
+    {
         Ok(token) => {
             state.audit.log(AuditEntry::new(
                 "token_mint",
@@ -164,7 +167,7 @@ async fn create_token(
             .into_response()
         }
         Err(e) => {
-            // e.g. a read-only token_storage: the client only sees the 500.
+            // e.g. a failed storage write: the client only sees the 500.
             tracing::error!(user = %req.username, error = %e, "token mint failed: cannot store the token record");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
@@ -218,6 +221,7 @@ async fn list_tokens(
 
     let tokens: Vec<TokenListItem> = token_store
         .list_tokens(&req.username)
+        .await
         .into_iter()
         .map(|t| TokenListItem {
             hash_prefix: t.file_id,
@@ -289,13 +293,14 @@ async fn revoke_token(
     // (GHSA-78cx-cfhm-rgmx — cross-user token revocation).
     if !token_store
         .list_tokens(&req.username)
+        .await
         .iter()
         .any(|t| t.file_id == req.hash_prefix)
     {
         return (StatusCode::NOT_FOUND, "Token not found").into_response();
     }
 
-    match token_store.revoke_token(&req.hash_prefix) {
+    match token_store.revoke_token(&req.hash_prefix).await {
         Ok(()) => (StatusCode::OK, "Token revoked").into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     }

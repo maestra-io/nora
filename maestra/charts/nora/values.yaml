@@ -190,7 +190,7 @@ config:
     htpasswd_file: ""
     # -- Allow unauthenticated read (pull/browse); writes still require auth.
     anonymous_read: false
-    # -- API token storage path. Keep it on the /data volume (see persistence).
+    # -- Legacy API token directory: tokens now live in the storage backend (`.nora-tokens/`), and each boot imports the `<16hex>.json` files found here once, so a missing directory is fine.
     token_storage: "/data/tokens"
     # -- Client IPs/CIDRs whose X-Forwarded-For is honoured (list or
     # comma-separated string). nora keys the auth lockout and every rate

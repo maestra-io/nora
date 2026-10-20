@@ -5,12 +5,12 @@
 //!
 //! Exports all artifacts to a tar.gz file and restores from backups.
 //!
-//! Node-local state that lives outside the storage backend rides along under
-//! [`LOCAL_PREFIX`]: the API token records (Argon2 hashes). The digest quarantine
-//! ledger is in storage (`.nora-quarantine/`); an archive from before that carries
-//! it as `.nora-local/quarantine.jsonl`, which a restore writes into storage. The
-//! repository signing key is deliberately left out (`test_backup_omits_signing_key`):
-//! keep it in a secret store.
+//! API token records (Argon2 hashes, `.nora-tokens/`) and the digest quarantine
+//! ledger (`.nora-quarantine/`) are internal storage keys and ride along with the
+//! artifacts. An archive from before they moved to storage carries them under
+//! [`LOCAL_PREFIX`] (`tokens/<16hex>.json`, `quarantine.jsonl`), which a restore
+//! writes into storage. The repository signing key is deliberately left out
+//! (`test_backup_omits_signing_key`): keep it in a secret store.
 
 use crate::digest_quarantine::{self, LEDGER_FILE};
 use crate::storage::Storage;
@@ -37,16 +37,10 @@ pub struct BackupMetadata {
     pub storage_backend: String,
 }
 
-/// Archive prefix for node-local state. `.nora-` keys are internal, so no
-/// artifact key can collide with it.
+/// Archive prefix of node-local state in archives from before it moved to storage.
+/// `.nora-` keys are internal, so no artifact key can collide with it.
 const LOCAL_PREFIX: &str = ".nora-local/";
 const LOCAL_TOKENS: &str = "tokens/";
-
-/// Where node-local state lives on this node: read by backup, written by restore.
-pub struct LocalState {
-    /// `auth.token_storage`: one `<16hex>.json` record per token.
-    pub token_dir: PathBuf,
-}
 
 /// Statistics returned after backup
 #[derive(Debug)]
@@ -54,8 +48,6 @@ pub struct BackupStats {
     pub artifact_count: usize,
     pub total_bytes: u64,
     pub output_size: u64,
-    /// Token records.
-    pub local_files: usize,
 }
 
 /// Statistics returned after restore
@@ -67,11 +59,7 @@ pub struct RestoreStats {
 }
 
 /// Create a backup of all artifacts to a tar.gz file
-pub async fn create_backup(
-    storage: &Storage,
-    output: &Path,
-    local: &LocalState,
-) -> Result<BackupStats, String> {
+pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupStats, String> {
     println!("Creating backup to: {}", output.display());
     println!("Storage backend: {}", storage.backend_name());
 
@@ -84,8 +72,11 @@ pub async fn create_backup(
     // npm cache provenance (#1055) and first-seen times sit under internal prefixes that
     // list() hides. Without them a restored owned scope is not trusted — refetched from
     // its owner, and served by no one while that owner is down — and every npm release
-    // age starts over.
-    for prefix in crate::registry::npm::INTERNAL_PREFIXES {
+    // age starts over. API tokens (Maestra) are internal keys too.
+    for prefix in crate::registry::npm::INTERNAL_PREFIXES
+        .iter()
+        .chain(&[tokens::STORAGE_PREFIX])
+    {
         keys.extend(
             storage
                 .list_internal(prefix)
@@ -169,19 +160,6 @@ pub async fn create_backup(
         pb.inc(1);
     }
 
-    let mut local_files = 0;
-    let records = tokens::export_records(&local.token_dir).map_err(|e| {
-        format!(
-            "Failed to read tokens in {}: {}",
-            local.token_dir.display(),
-            e
-        )
-    })?;
-    for (name, data) in records {
-        append_local(&mut archive, &format!("{LOCAL_TOKENS}{name}"), &data)?;
-        local_files += 1;
-    }
-
     // Add metadata.json
     let metadata = BackupMetadata {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -242,13 +220,11 @@ pub async fn create_backup(
         artifact_count,
         total_bytes,
         output_size,
-        local_files,
     };
 
     println!();
     println!("Backup complete:");
     println!("  Artifacts: {}", stats.artifact_count);
-    println!("  Local state: {} (tokens)", stats.local_files);
     println!("  Total data: {} bytes", stats.total_bytes);
     println!("  Backup file: {} bytes", stats.output_size);
     println!(
@@ -263,37 +239,8 @@ pub async fn create_backup(
     Ok(stats)
 }
 
-/// Append a node-local file under [`LOCAL_PREFIX`], 0600.
-fn append_local<W: std::io::Write>(
-    archive: &mut Builder<W>,
-    name: &str,
-    data: &[u8],
-) -> Result<(), String> {
-    let mut header = Header::new_gnu();
-    header.set_size(data.len() as u64);
-    header.set_mode(0o600);
-    header.set_mtime(Utc::now().timestamp().max(0) as u64);
-    header.set_cksum();
-    archive
-        .append_data(&mut header, format!("{LOCAL_PREFIX}{name}"), data)
-        .map_err(|e| format!("Failed to add {} to archive: {}", name, e))
-}
-
-/// Write one node-local entry (`name` is the path after [`LOCAL_PREFIX`]) back
-/// to this node. Anything but a token record is refused.
-fn restore_local(local: &LocalState, name: &str, data: Vec<u8>) -> Result<(), String> {
-    match name.strip_prefix(LOCAL_TOKENS) {
-        Some(record) => tokens::import_record(&local.token_dir, record, &data),
-        None => Err(format!("Unknown local-state entry {LOCAL_PREFIX}{name}")),
-    }
-}
-
 /// Restore artifacts from a backup file
-pub async fn restore_backup(
-    storage: &Storage,
-    input: &Path,
-    local: &LocalState,
-) -> Result<RestoreStats, String> {
+pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreStats, String> {
     println!("Restoring from: {}", input.display());
     println!("Storage backend: {}", storage.backend_name());
 
@@ -394,7 +341,11 @@ pub async fn restore_backup(
             continue;
         }
         if let Some(name) = path.strip_prefix(LOCAL_PREFIX) {
-            restore_local(local, name, data)?;
+            // Older archives: a token record goes into storage; anything else is refused.
+            match name.strip_prefix(LOCAL_TOKENS) {
+                Some(record) => tokens::import_record(storage, record, &data).await?,
+                None => return Err(format!("Unknown local-state entry {path}")),
+            }
             local_files += 1;
             pb.inc(1);
             continue;
@@ -433,7 +384,7 @@ pub async fn restore_backup(
     println!("Restore complete:");
     println!("  Artifacts: {}", stats.artifact_count);
     println!(
-        "  Local state: {} (tokens, quarantine ledger)",
+        "  Local state: {} (older archive: tokens, quarantine ledger)",
         stats.local_files
     );
     println!("  Total data: {} bytes", stats.total_bytes);
@@ -446,12 +397,6 @@ pub async fn restore_backup(
 mod tests {
     use super::*;
     use std::fs;
-
-    fn local(dir: &Path) -> LocalState {
-        LocalState {
-            token_dir: dir.join("tokens"),
-        }
-    }
 
     #[test]
     fn test_backup_metadata_serialization() {
@@ -506,9 +451,7 @@ mod tests {
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
         let output = dir.path().join("backup.tar.gz");
 
-        let stats = create_backup(&storage, &output, &local(dir.path()))
-            .await
-            .unwrap();
+        let stats = create_backup(&storage, &output).await.unwrap();
         assert_eq!(stats.artifact_count, 0);
         assert_eq!(stats.total_bytes, 0);
         assert!(output.exists());
@@ -537,7 +480,7 @@ mod tests {
         let root = dir.path().join("data");
         let storage = Storage::new_local(root.to_str().unwrap());
 
-        let err = restore_backup(&storage, &archive_path, &local(dir.path()))
+        let err = restore_backup(&storage, &archive_path)
             .await
             .expect_err("an entry in the staging directory must be refused");
         assert!(
@@ -564,14 +507,12 @@ mod tests {
 
         // Create backup
         let backup_file = dir.path().join("backup.tar.gz");
-        let backup_stats = create_backup(&storage, &backup_file, &local(dir.path()))
-            .await
-            .unwrap();
+        let backup_stats = create_backup(&storage, &backup_file).await.unwrap();
         assert_eq!(backup_stats.artifact_count, 2);
 
         // Restore to different storage
         let restore_storage = Storage::new_local(dir.path().join("restored").to_str().unwrap());
-        let restore_stats = restore_backup(&restore_storage, &backup_file, &local(dir.path()))
+        let restore_stats = restore_backup(&restore_storage, &backup_file)
             .await
             .unwrap();
         assert_eq!(restore_stats.artifact_count, 2);
@@ -599,13 +540,9 @@ mod tests {
             .unwrap();
 
         let backup_file = dir.path().join("backup.tar.gz");
-        create_backup(&storage, &backup_file, &local(dir.path()))
-            .await
-            .unwrap();
+        create_backup(&storage, &backup_file).await.unwrap();
         let restored = Storage::new_local(dir.path().join("restored").to_str().unwrap());
-        restore_backup(&restored, &backup_file, &local(dir.path()))
-            .await
-            .unwrap();
+        restore_backup(&restored, &backup_file).await.unwrap();
 
         assert_eq!(
             &restored.get(&origin_key(key)).await.unwrap()[..],
@@ -629,13 +566,9 @@ mod tests {
             .unwrap();
 
         let backup_file = dir.path().join("backup.tar.gz");
-        create_backup(&storage, &backup_file, &local(dir.path()))
-            .await
-            .unwrap();
+        create_backup(&storage, &backup_file).await.unwrap();
         let restored = Storage::new_local(dir.path().join("restored").to_str().unwrap());
-        restore_backup(&restored, &backup_file, &local(dir.path()))
-            .await
-            .unwrap();
+        restore_backup(&restored, &backup_file).await.unwrap();
 
         assert_eq!(
             &restored.get(&first_seen_key(key)).await.unwrap()[..],
@@ -666,9 +599,7 @@ mod tests {
         std::fs::write(root.join(".signing/nora.key"), b"SECRET-SIGNING-KEY").unwrap();
 
         let output = dir.path().join("backup.tar.gz");
-        let stats = create_backup(&storage, &output, &local(dir.path()))
-            .await
-            .unwrap();
+        let stats = create_backup(&storage, &output).await.unwrap();
 
         // Only the real artifact is backed up, not the key.
         assert_eq!(
@@ -694,9 +625,9 @@ mod tests {
         );
     }
 
-    /// Tokens live on the node's disk, outside the storage backend; a backup must
-    /// carry them, and the quarantine ledger's objects, and a restore onto a fresh
-    /// node must bring back tokens that verify and the original first-seen times.
+    /// Tokens and the quarantine ledger are internal keys `list()` hides; a backup
+    /// must carry them, and a restore onto a fresh node must bring back tokens that
+    /// verify and the original first-seen times.
     #[tokio::test]
     async fn test_backup_restore_carries_tokens_and_quarantine_ledger() {
         use crate::digest_quarantine::{DigestStore, QuarantineStatus};
@@ -704,11 +635,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let src = tempfile::tempdir().unwrap();
-        let src_local = local(src.path());
         let storage = Storage::new_local(src.path().join("data").to_str().unwrap());
         storage.put("raw/a/1.bin", b"artifact").await.unwrap();
-        let raw = TokenStore::new(&src_local.token_dir)
+        let raw = TokenStore::new(storage.clone())
             .create_token("ci", 30, Some("deploy".into()), Role::Write)
+            .await
             .unwrap();
         let ledger = DigestStore::empty(storage.clone());
         let old = chrono::Utc::now().timestamp() - 10 * 86400;
@@ -727,18 +658,17 @@ mod tests {
         }
 
         let backup_file = src.path().join("backup.tar.gz");
-        let stats = create_backup(&storage, &backup_file, &src_local)
-            .await
-            .unwrap();
-        assert_eq!(stats.artifact_count, 2, "the artifact and the ledger entry");
-        assert_eq!(stats.local_files, 1);
+        let stats = create_backup(&storage, &backup_file).await.unwrap();
+        assert_eq!(
+            stats.artifact_count, 3,
+            "the artifact, the token record and the ledger entry"
+        );
         let mode = fs::metadata(&backup_file).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "archive carries token hashes");
 
-        // Fresh node: no token dir. It already re-recorded the digest with a fresh
+        // Fresh node: no tokens. It already re-recorded the digest with a fresh
         // first-seen, saw one more since the backup, and wrote its snapshot.
         let dst = tempfile::tempdir().unwrap();
-        let dst_local = local(dst.path());
         let restored = Storage::new_local(dst.path().join("data").to_str().unwrap());
         let fresh = DigestStore::empty(restored.clone());
         fresh.record("docker", "sha256:aa", "u", None);
@@ -761,20 +691,15 @@ mod tests {
             2
         );
 
-        let rstats = restore_backup(&restored, &backup_file, &dst_local)
-            .await
-            .unwrap();
-        assert_eq!(rstats.artifact_count, 2);
-        assert_eq!(rstats.local_files, 1);
+        let rstats = restore_backup(&restored, &backup_file).await.unwrap();
+        assert_eq!(rstats.artifact_count, 3);
+        assert_eq!(rstats.local_files, 0);
 
-        let (user, role) = TokenStore::new(&dst_local.token_dir)
+        let (user, role) = TokenStore::new(restored.clone())
             .verify_token(&raw)
+            .await
             .expect("restored token must verify");
         assert_eq!((user.as_str(), role), ("ci", Role::Write));
-        for entry in fs::read_dir(&dst_local.token_dir).unwrap() {
-            let mode = entry.unwrap().metadata().unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
 
         let ledger = DigestStore::load(restored, "/nonexistent").await;
         assert_eq!(
@@ -827,9 +752,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        let stats = restore_backup(&storage, &archive_path, &local(dir.path()))
-            .await
-            .unwrap();
+        let stats = restore_backup(&storage, &archive_path).await.unwrap();
         assert_eq!((stats.artifact_count, stats.local_files), (0, 1));
         let ledger = DigestStore::load(storage, "/nonexistent").await;
         assert_eq!(
@@ -861,14 +784,46 @@ mod tests {
                 tar.into_inner().unwrap().finish().unwrap();
             }
             let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
-            restore_backup(&storage, &archive_path, &local(dir.path()))
+            restore_backup(&storage, &archive_path)
                 .await
                 .expect_err(name);
-            let written = fs::read_dir(dir.path().join("tokens"))
-                .map(|d| d.count())
-                .unwrap_or(0);
-            assert_eq!(written, 0, "{name} wrote a token record");
+            let written = storage.list_internal(tokens::STORAGE_PREFIX).await.unwrap();
+            assert!(written.is_empty(), "{name} wrote a token record");
             assert!(storage.list("").await.unwrap().is_empty(), "{name}");
         }
+    }
+
+    /// An archive from before tokens moved into storage carries them as
+    /// `.nora-local/tokens/<16hex>.json`: restore puts them under the token prefix.
+    #[tokio::test]
+    async fn restore_brings_old_archive_tokens_into_storage() {
+        use crate::tokens::{Role, TokenStore};
+        let dir = tempfile::tempdir().unwrap();
+        let minted = Storage::new_local(dir.path().join("old").to_str().unwrap());
+        let raw = TokenStore::new(minted.clone())
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let key = minted.list_internal(tokens::STORAGE_PREFIX).await.unwrap()[0].clone();
+        let body = minted.get(&key).await.unwrap();
+        let name = key.strip_prefix(tokens::STORAGE_PREFIX).unwrap();
+
+        let archive_path = dir.path().join("old.tar.gz");
+        {
+            let gz = GzEncoder::new(File::create(&archive_path).unwrap(), Compression::default());
+            let mut tar = tar::Builder::new(gz);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o600);
+            header.set_cksum();
+            tar.append_data(&mut header, format!(".nora-local/tokens/{name}"), &body[..])
+                .unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let stats = restore_backup(&storage, &archive_path).await.unwrap();
+        assert_eq!(stats.local_files, 1);
+        let (user, _) = TokenStore::new(storage).verify_token(&raw).await.unwrap();
+        assert_eq!(user, "ci");
     }
 }
