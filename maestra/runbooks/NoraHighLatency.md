@@ -143,6 +143,9 @@ q 'sum by (operation) (increase(nora_storage_operations_total{status="error"}[10
 
 # Repo index rebuild after start (npm took 21s on 12.10 with 3399 packages)
 kubectl --context "$CTX" -n nora logs "$(pod_of | awk '{print $1}')" --since=30m | grep 'Index rebuilt'
+
+# npm packuments rebuilt from per-version keys (one R2 read per version, under the publish lock)
+q 'sum by (pod) (increase(nora_packument_rebuilt_total[30m]))'
 ```
 
 | Signature | Cause | Act |
@@ -152,6 +155,7 @@ kubectl --context "$CTX" -n nora logs "$(pod_of | awk '{print $1}')" --since=30m
 | upstream p99 ≈ HTTP p99 for one registry | upstream slow | nothing to fix in nora; confirm on the upstream's status page |
 | `get`/`get_reader` errors well above baseline | R2 problem | see `NoraStorageUnreachable` / `NoraReadinessFlapping` |
 | `Index rebuilt` `elapsed_ms` in tens of seconds | cold start | transient; only matters if restarts repeat |
+| `nora_packument_rebuilt_total` rising right after a rollout to a new version, p99 up only for npm | first read of each hosted packument after an upgrade that changed what counts as a current packument (1.4.0, nora#1152: provenance record required) rebuilds it once (19.10: 66 packages in 5 min) | transient; the counter stops when every read package is rebuilt. A counter still rising later means the stored packument keeps failing the check (the record write fails: `failed to record an assembled packument` in the log) |
 
 Baselines: storage `get` errors are never zero (12.10 12:00 UTC: 2880 `get` + 1564
 `get_reader` errors/h with p99 2.1s) — compare against that, not against 0.
@@ -225,6 +229,7 @@ After the pod is Ready (`pod_of`), at least 10 minutes of traffic:
 
 | Date (UTC) | Object | Cause | Category | What helped | Thread |
 |---|---|---|---|---|---|
+| 19.10.2026 22:45–22:56, 1 firing | nora `1.4.0-maestra.1`, iota, pod started 22:40 | upgrade cold start: 1.4.0 serves a hosted npm packument only with an "assembled by NORA" provenance record, so older packuments were rebuilt on first read (66 in 22:44:54–22:50, `nora_packument_rebuilt_total`), plus the npm index rebuild took 30 s. Traffic was 0.2–0.4 rps, so p99 ≥ 10s on npm was a couple of slow requests; CPU per request 0.0046 core-s (allocator fine) | upgrade cold start | nothing: resolved on its own at 22:56. 11:18 UTC 20.10: rebuild counter +0 over 12 h, p99 2.37s at 37 rps, 0 restarts | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1792450260631689> |
 | 16–19.10.2026, 10 firings (16.10 ×1, 17.10 ×4, 18.10 ×3, 19.10 ×1) | nora `1.3.6-maestra.1/.2`, iota | the 1.3.6 release was built `--no-default-features` after nora#23 moved `mimalloc` into `default`: the image lost the allocator and the 12.10 musl malloc lock came back. CPU per request 0.004 → 0.03–0.07 core-s, `stime/utime` 4.6 on node 02, p99 ≥ 9s on NuGet bursts of only 15–25 rps while traffic itself had dropped 6–12× (170 → 12–28 GB/day) after the CI cache-mount sweep | allocator regression | nora#76: release and CI gates build `--no-default-features --features mimalloc`, Dockerfile refuses a binary without mimalloc; `1.3.6-maestra.3` (fluxcd#23672). Traffic side, same week: NuGet cache mount in ~180 repo Dockerfiles + test-job cache (github-actions #146/#147/#149/#151/#153): warm image legs 300 → 0.2 MB, test jobs 210 → 0 MB | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1792399381398669> |
 | 12.10.2026 16:05–16:10 | nora `1.3.3-maestra.10`, iota node 02 | NuGet CI burst up to 413 rps; every artifact read from R2 filled the node's 1 Gbit `eno5` (982 Mbit/s rx, 98%), responses 637 Mbit/s on `eno6`; CPU 1.5–1.8 cores, 0.006 core-s/request; 3.6–7 rps of NuGet > 10s, no 5xx | network link saturated | ended with the burst. Follow-up 13.10: Cilium bandwidth manager on iota (kubernetes-clusters#165) + 800M/800M pod quota (fluxcd#22471); verified with 2×16 parallel downloads from nodes 01/03: `eno5` rx ~805 Mbit/s, 256/256 OK | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1791821141024479> |
 | 12.10.2026 14:15–15:07, 4 firings | nora `1.3.3-maestra.9`, iota | musl static-pie build (Alpine builder) using musl's malloc with one global lock; at ~200 rps all 32 tokio workers spun on it: `perf` 85% `native_queued_spin_lock_slowpath`, 10–26 cores, node load 26, p99 ≥ 10s, p90 3.9s, p50 60ms, no 5xx. OOMKilled at 2Gi in parallel, with a JWKS rejection burst after each restart | allocator contention + OOM | mimalloc global allocator (maestra-io/nora#53, release `v1.3.3-maestra.10`, fluxcd#22246, rolled 15:08); memory 2Gi→4Gi (fluxcd#22241). After: 0.2–0.5 cores at 75–112 rps, p99 2.1s, node load 3 | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1791814920896829> |
