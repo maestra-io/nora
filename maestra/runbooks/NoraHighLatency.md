@@ -184,7 +184,12 @@ Baselines: storage `get` errors are never zero (12.10 12:00 UTC: 2880 `get` + 15
   (`kubectl --context "$CTX" -n nora rollout restart deploy/nora`, Recreate strategy, ~20s outage) after
   confirming the bandwidth manager is on. Raising the cap costs the node's other tenants
   (traefik, backups) their headroom; the real fix for repeated bursts is a local hot cache
-  in nora so repeated restores stop reading R2 (open, not built).
+  in nora so repeated restores stop reading R2 (open, not built). Find the client
+  before accepting the burst: `sum by (registry, result) (increase(nora_cache_requests_total[10m]))`
+  all `hit` while the link is full means CI jobs missed their own cache; list the
+  org's runs in the window (`gh api "repos/maestra-io/<repo>/actions/runs?created=<from>..<to>"`
+  over repos pushed in the last hour) and grep the job log for `Cache not found`
+  (21.10.2026: a Renovate wave over the frontend repos).
 
 ## Act
 
@@ -225,6 +230,7 @@ After the pod is Ready (`pod_of`), at least 10 minutes of traffic:
 
 | Date (UTC) | Object | Cause | Category | What helped | Thread |
 |---|---|---|---|---|---|
+| 21.10.2026 10:20–10:25 | nora `1.3.6-maestra.3`, iota node 02 | Renovate wave over ~15 frontend repos (09:51–10:19, ~70 `pr` runs of `mcf-build.yml`): `node_modules` was cached under the exact lockfile hash and `~/.npm` not at all, so every bump ran a full `npm ci` (2534 packages, 6 min). npm 176 rps, 99k tarballs and 66 GB from R2 in 10 min, all nora `cache_hit`; `eno5` rx 908 Mbit/s, npm p99 5.1s; CPU 0.007 core-s/request | network link saturated (client-side cache miss) | ended with the wave. github-actions#184: on a `node_modules` miss `mcf-build` and `npm-package-publish` restore `~/.npm/_cacache` by key prefix (RunsOn magic cache), so a new lockfile fetches only changed packages | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1792578041939979> |
 | 16–19.10.2026, 10 firings (16.10 ×1, 17.10 ×4, 18.10 ×3, 19.10 ×1) | nora `1.3.6-maestra.1/.2`, iota | the 1.3.6 release was built `--no-default-features` after nora#23 moved `mimalloc` into `default`: the image lost the allocator and the 12.10 musl malloc lock came back. CPU per request 0.004 → 0.03–0.07 core-s, `stime/utime` 4.6 on node 02, p99 ≥ 9s on NuGet bursts of only 15–25 rps while traffic itself had dropped 6–12× (170 → 12–28 GB/day) after the CI cache-mount sweep | allocator regression | nora#76: release and CI gates build `--no-default-features --features mimalloc`, Dockerfile refuses a binary without mimalloc; `1.3.6-maestra.3` (fluxcd#23672). Traffic side, same week: NuGet cache mount in ~180 repo Dockerfiles + test-job cache (github-actions #146/#147/#149/#151/#153): warm image legs 300 → 0.2 MB, test jobs 210 → 0 MB | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1792399381398669> |
 | 12.10.2026 16:05–16:10 | nora `1.3.3-maestra.10`, iota node 02 | NuGet CI burst up to 413 rps; every artifact read from R2 filled the node's 1 Gbit `eno5` (982 Mbit/s rx, 98%), responses 637 Mbit/s on `eno6`; CPU 1.5–1.8 cores, 0.006 core-s/request; 3.6–7 rps of NuGet > 10s, no 5xx | network link saturated | ended with the burst. Follow-up 13.10: Cilium bandwidth manager on iota (kubernetes-clusters#165) + 800M/800M pod quota (fluxcd#22471); verified with 2×16 parallel downloads from nodes 01/03: `eno5` rx ~805 Mbit/s, 256/256 OK | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1791821141024479> |
 | 12.10.2026 14:15–15:07, 4 firings | nora `1.3.3-maestra.9`, iota | musl static-pie build (Alpine builder) using musl's malloc with one global lock; at ~200 rps all 32 tokio workers spun on it: `perf` 85% `native_queued_spin_lock_slowpath`, 10–26 cores, node load 26, p99 ≥ 10s, p90 3.9s, p50 60ms, no 5xx. OOMKilled at 2Gi in parallel, with a JWKS rejection burst after each restart | allocator contention + OOM | mimalloc global allocator (maestra-io/nora#53, release `v1.3.3-maestra.10`, fluxcd#22246, rolled 15:08); memory 2Gi→4Gi (fluxcd#22241). After: 0.2–0.5 cores at 75–112 rps, p99 2.1s, node load 3 | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1791814920896829> |
