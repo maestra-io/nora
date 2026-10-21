@@ -27,8 +27,8 @@ nuget.org registration with its catalog `packageHash` (sha512), origin `nuget.or
 npm only, missing only (ART_TOKEN + NORA_TOKEN, read is enough on nora): the `@mindbox-cloud/*`
 versions in Artifactory `npm-local` that nora does not host yet. GitLab pipelines still publish
 there (the RU contour) and their tags reach GitHub with the GitLab syncs, so semantic-release on
-GitHub never publishes those versions to nora: the daily sync
-(.github/workflows/maestra-sync-artifactory-npm.yml) imports them byte-exact.
+GitHub never published those versions to nora. The scheduled import of them was removed
+(2026-10-21, version collisions with our own releases); run this by hand for a one-off gap only.
 
     ART_TOKEN=... NORA_TOKEN=... uv run maestra/scripts/import/enumerate.py --npm-missing-only --out manifest.json
 """
