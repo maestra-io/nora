@@ -17,9 +17,12 @@ name: Maestra sync Artifactory npm
 # GitHub OIDC token for nora (fluxcd nora role rule for maestra/main: write,
 # namespace_scope mindbox.* and @mindbox-cloud/*).
 
+# Manual only since 2026-10-21: the hourly import put Mindbox's GitLab builds into the
+# same package names our GitHub semantic-release publishes, so the two version lines
+# collided. maestra-io repos now sync from GitLab without its tags (skillz
+# mindbox-upstream-sync), so GitHub releases every version they pin. Run on dispatch
+# only for a one-off gap, and only after checking the version is not ours to release.
 on:
-  schedule:
-    - cron: "41 * * * *"
   workflow_dispatch:
 
 permissions:
