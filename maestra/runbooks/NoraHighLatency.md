@@ -186,9 +186,10 @@ Baselines: storage `get` errors are never zero (12.10 12:00 UTC: 2880 `get` + 15
   (traefik, backups) their headroom; the real fix for repeated bursts is a local hot cache
   in nora so repeated restores stop reading R2 (open, not built). Find the client
   before accepting the burst: `sum by (registry, result) (increase(nora_cache_requests_total[10m]))`
-  all `hit` while the link is full means CI jobs missed their own cache; list the
-  org's runs in the window (`gh api "repos/maestra-io/<repo>/actions/runs?created=<from>..<to>"`
-  over repos pushed in the last hour) and grep the job log for `Cache not found`
+  all `hit` while the link is full only says clients re-download what nora already
+  holds. Attribute it to CI cache misses after both: the org's runs in the window
+  (`gh api --paginate "repos/maestra-io/<repo>/actions/runs?created=<from>..<to>&per_page=100"`
+  over repos pushed in the last hour) and `Cache not found` in their install job logs
   (21.10.2026: a Renovate wave over the frontend repos).
 
 ## Act
