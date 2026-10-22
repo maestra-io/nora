@@ -1916,7 +1916,7 @@ async fn upstream_metadata(
         // #68 namespace isolation: an internal-namespace package is never revalidated
         // upstream (dependency confusion); it is owned locally.
         if fresh || internal {
-            return packument_response(headers, data, &base, hide);
+            return shared_packument_response(state, headers, name, data, &base, hide).await;
         }
         // Single-flight: a CI fleet stampeding one expired packument revalidates it once (#595).
         let refetch = || refetch_metadata(state, path, name, cache_key, &from_key, packument);
@@ -1932,7 +1932,7 @@ async fn upstream_metadata(
         // Filtered on the fresh document, `time` included: the cached copy may predate
         // the version it brings (R2-16).
         if let Some(refreshed) = refreshed {
-            return packument_response(headers, refreshed, &base, hide);
+            return shared_packument_response(state, headers, name, refreshed, &base, hide).await;
         }
         if state.config.npm.serve_stale {
             tracing::warn!(registry = "npm", path = %path, "npm upstream unavailable, serving stale metadata");
@@ -2008,7 +2008,7 @@ async fn upstream_metadata(
                     tracing::warn!(key = %cache_key, error = ?e, "npm proxy: failed to cache metadata");
                 }
             }
-            packument_response(headers, rewritten, &base, hide)
+            shared_packument_response(state, headers, name, rewritten, &base, hide).await
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         // The upstream answered "no such package": a real 404.
@@ -3622,8 +3622,40 @@ fn packument_response(
     nora_base: &str,
     hide: HideYoung<'_>,
 ) -> Response {
-    let (body, content_type) = packument_body(headers, data, nora_base, hide);
+    rendered_packument_response(packument_body(headers, data, nora_base, hide))
+}
 
+/// [`packument_response`] for a proxied packument: a render that parses the document is
+/// done once per document and variant and shared by concurrent and repeated requests
+/// (`crate::packument_memo`), so a CI fleet asking for one large packument holds one
+/// parsed copy instead of one per request. A body served as is skips the memo.
+async fn shared_packument_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    name: &str,
+    data: Bytes,
+    nora_base: &str,
+    hide: HideYoung<'_>,
+) -> Response {
+    let install_v1 = wants_install_v1(headers);
+    let filtered = hide.is_some_and(|(engine, _)| engine.metadata_filter_active());
+    if !install_v1 && !filtered {
+        return packument_response(headers, data, nora_base, hide);
+    }
+    let variant = match (install_v1, filtered) {
+        (true, true) => "install-v1,filtered",
+        (true, false) => "install-v1",
+        (false, _) => "filtered",
+    };
+    let key = crate::packument_memo::PackumentMemo::key(name, variant, &data);
+    let rendered = state
+        .packument_memo
+        .render(&key, || packument_body(headers, data, nora_base, hide))
+        .await;
+    rendered_packument_response(rendered)
+}
+
+fn rendered_packument_response((body, content_type): (Bytes, &'static str)) -> Response {
     (
         StatusCode::OK,
         [
