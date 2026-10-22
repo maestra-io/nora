@@ -1074,12 +1074,38 @@ pub(crate) async fn proxy_fetch_artifact(
     auth: Option<UpstreamAuth<'_>>,
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<(ProxyBody, bool), ProxyError> {
+    proxy_fetch_artifact_with(
+        state,
+        &state.http_client,
+        key,
+        registry,
+        url,
+        timeout_secs,
+        auth,
+        scope,
+    )
+    .await
+}
+
+/// [`proxy_fetch_artifact`] over `client` instead of the shared one (helm: an
+/// SSRF-guarded client for a host the upstream's index names).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn proxy_fetch_artifact_with(
+    state: &AppState,
+    client: &reqwest::Client,
+    key: &str,
+    registry: &'static str,
+    url: &str,
+    timeout_secs: u64,
+    auth: Option<UpstreamAuth<'_>>,
+    scope: impl Into<BreakerScope<'_>>,
+) -> Result<(ProxyBody, bool), ProxyError> {
     let spool = state.spool.as_ref();
     let threshold = state.config.server.stream_threshold();
     let cap = state.config.server.proxy_max_artifact();
     let timeout = Duration::from_secs(timeout_secs);
     let fetch = proxy_fetch_core(
-        &state.http_client,
+        client,
         url,
         timeout,
         true,

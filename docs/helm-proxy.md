@@ -55,8 +55,9 @@ spec:
 ## Routes
 
 - `GET|HEAD /helm/<name>/index.yaml`: the upstream index, filtered (below). One
-  refresh per repo runs at a time; an upstream failure, a 404 included, serves the last
-  copy (`x-nora-stale: true`) while `serve_stale` is on. Every chart
+  refresh per repo runs at a time and requests arriving meanwhile get the last copy;
+  an upstream failure, a 404 included, serves the last copy (`x-nora-stale: true`)
+  while `serve_stale` is on. Every chart
   URL in it is rewritten to the relative `charts/<chart>/<chart>-<version>.tgz`, so
   clients download through NORA whatever host the upstream names (GitHub releases for
   many repositories). The body is JSON, which is valid YAML; Helm, Flux and Renovate
@@ -65,7 +66,10 @@ spec:
   it from the URL the cached upstream index names for that chart and version (never
   from client input; https only, plain http only from an upstream configured as http),
   refuses a body whose sha256 differs from the index `digest` (502, not cached), sends
-  the upstream credential only to the upstream's own origin, and caches it under
+  the upstream credential only to the upstream's own origin, reaches any other host
+  through an SSRF guard (no loopback, private, link-local or metadata address, on the
+  first request or any redirect hop; `allow_private_chart_hosts = true` lifts it for a
+  lab), and caches it under
   `helm/charts/<chart>/<name>/`. A version with no `digest` in the index is left out
   of the served index and not fetched (seen 22.10.2026 only on a few pre-2021
   external-dns and metrics-server versions).
@@ -83,6 +87,10 @@ spec:
   have for the whole window, so trust is per repo and off by default. For a trusted repo
   younger versions are left out of the index and refused on download; with
   `server.trust_upstream_dates` the quarantine clock is also seeded from `created`.
+- **Cached charts and the index**: a cached chart of a repo outside `trust_created` is
+  served without asking the upstream; in a `trust_created` repo it needs the index (a
+  stale copy will do) for its date, and without one the request fails rather than skip
+  the release age.
 - **Internal namespaces**: a chart name matching `curation.internal_namespaces` is left
   out of every index and never fetched from an upstream (403).
 - Blocklist, allowlist pins and `allow` exemptions apply by chart name, as elsewhere.

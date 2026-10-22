@@ -30,6 +30,11 @@ pub struct HelmConfig {
     /// ory, crossplane), which would hold every version they have.
     #[serde(default)]
     pub trust_created: Vec<String>,
+    /// Let a chart URL the index names on another host than the upstream's reach
+    /// loopback, private and link-local addresses (off: such a fetch is refused, so a
+    /// compromised index cannot aim NORA at internal services).
+    #[serde(default)]
+    pub allow_private_chart_hosts: bool,
 }
 
 impl Default for HelmConfig {
@@ -41,6 +46,7 @@ impl Default for HelmConfig {
             metadata_ttl: 300,
             serve_stale: true,
             trust_created: Vec::new(),
+            allow_private_chart_hosts: false,
         }
     }
 }

@@ -236,6 +236,25 @@ fn same_origin(a: &str, b: &str) -> bool {
     }
 }
 
+/// The client for a chart on a host the upstream's index names: it never connects to a
+/// loopback, private, link-local or metadata address, on the first request or on any
+/// redirect hop (DNS pinned; the `nora import` guard, `crate::import::http`).
+fn guarded_client(state: &AppState) -> Result<&'static reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            crate::import::http::build_import_client(
+                &state.config.tls,
+                Duration::from_secs(10),
+                Duration::from_secs(state.config.helm.proxy_timeout.max(1)),
+                false,
+            )
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
 fn upstream<'a>(state: &'a AppState, repo: &str) -> Option<&'a RepoProxyEntry> {
     state.config.helm.proxies.get(repo)
 }
@@ -289,9 +308,18 @@ async fn fresh_index(state: &AppState, key: &str) -> Option<IndexFile> {
     parse_cached_index(state.storage.get(key).await.ok()?).await
 }
 
+/// The last cached index of `key` whatever its age, when `serve_stale` allows it.
+async fn stale_index(state: &AppState, key: &str) -> Option<IndexFile> {
+    if !state.config.helm.serve_stale {
+        return None;
+    }
+    parse_cached_index(state.storage.get(key).await.ok()?).await
+}
+
 /// The upstream index of `repo` (JSON form) and whether it is a stale copy, or the
-/// response to give when there is none. One refresh per repo runs at a time: requests
-/// arriving meanwhile wait for it and read what it cached.
+/// response to give when there is none. One refresh per repo runs at a time: a request
+/// arriving meanwhile gets the stale copy at once, or (with none) waits for the
+/// refresh and reads what it cached.
 async fn load_index(
     state: &AppState,
     repo: &str,
@@ -302,7 +330,15 @@ async fn load_index(
         return Ok((index, false));
     }
     let lock = state.publish_lock(&key);
-    let _refresh = lock.lock().await;
+    let _refresh = match lock.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            if let Some(index) = stale_index(state, &key).await {
+                return Ok((index, true));
+            }
+            lock.lock().await
+        }
+    };
     if let Some(index) = fresh_index(state, &key).await {
         return Ok((index, false));
     }
@@ -342,13 +378,9 @@ async fn load_index(
         Err(e) => e,
     };
     // Any failure, a 404 included (a static host mid-deploy), falls back to the last copy.
-    if state.config.helm.serve_stale {
-        if let Ok(data) = state.storage.get(&key).await {
-            if let Some(index) = parse_cached_index(data).await {
-                tracing::warn!(registry = "helm", repo, error = ?err, "Helm upstream error, serving stale index");
-                return Ok((index, true));
-            }
-        }
+    if let Some(index) = stale_index(state, &key).await {
+        tracing::warn!(registry = "helm", repo, error = ?err, "Helm upstream error, serving stale index");
+        return Ok((index, true));
     }
     Err(match err {
         ProxyError::NotFound => StatusCode::NOT_FOUND.into_response(),
@@ -438,21 +470,29 @@ async fn chart(
         return response;
     }
 
-    // The index names the chart's date, digest and upstream URL; a cached chart is
-    // still served when the index cannot be had.
-    let entry = load_index(&state, &repo, up).await.map(|(index, _)| {
+    // The index names the chart's date, digest and upstream URL. A cached chart needs
+    // it only for its date, which only a `trust_created` repo has: there the index (a
+    // stale copy will do) is required, as serving without the date would skip the
+    // release age; elsewhere a cached chart is served without asking the upstream.
+    let lookup = |index: IndexFile| {
         index
             .entries
             .get(&name)
             .and_then(|versions| versions.iter().find(|v| v.version == version).cloned())
-    });
+    };
+    let dated = dated(&state, &repo);
+    let mut entry = None;
+    if dated {
+        match load_index(&state, &repo, up).await {
+            Ok((index, _)) => entry = Some(lookup(index)),
+            Err(response) => return response,
+        }
+    }
     // `created` dates a chart only in a repo that does not re-stamp it: there it is the
     // release age, and with `trust_upstream_dates` also the quarantine's first seen.
     let created = entry
         .as_ref()
-        .ok()
         .and_then(Option::as_ref)
-        .filter(|_| dated(&state, &repo))
         .and_then(ChartVersion::created_unix);
     let publish_date = created.filter(|_| state.config.server.trust_upstream_dates);
 
@@ -516,11 +556,16 @@ async fn chart(
     }
 
     let entry = match entry {
-        Ok(Some(entry)) => entry,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Some(entry) => entry,
         // No index and no copy: the upstream's failure, not a 404 Helm would read as
         // "no such version".
-        Err(response) => return response,
+        None => match load_index(&state, &repo, up).await {
+            Ok((index, _)) => lookup(index),
+            Err(response) => return response,
+        },
+    };
+    let Some(entry) = entry else {
+        return StatusCode::NOT_FOUND.into_response();
     };
     // Without a digest nothing vouches for the archive (and the index leaves it out).
     let Some(expected) = entry.sha256() else {
@@ -533,14 +578,30 @@ async fn chart(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    // The upstream's credential goes to its own origin only, never to a host its index names.
-    let auth = if same_origin(&url, up.url()) {
-        up.auth().map(UpstreamAuth::Basic)
+    // The upstream's credential goes to its own origin only, never to a host its index
+    // names; such a host is reached through the SSRF guard.
+    let own_origin = same_origin(&url, up.url());
+    let auth = own_origin
+        .then(|| up.auth().map(UpstreamAuth::Basic))
+        .flatten();
+    let client = if own_origin || state.config.helm.allow_private_chart_hosts {
+        &state.http_client
+    } else if crate::import::http::is_blocked_url_host(&url, false) {
+        // An IP literal never reaches the guard's resolver: checked here.
+        tracing::warn!(repo, chart = %name, version, url = %url, "Helm index names a chart on a loopback/private address, refusing it");
+        return StatusCode::BAD_GATEWAY.into_response();
     } else {
-        None
+        match guarded_client(&state) {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::error!(error = %e, "helm: no SSRF-guarded client, refusing a third-party chart host");
+                return StatusCode::BAD_GATEWAY.into_response();
+            }
+        }
     };
-    let (data, fetched) = match crate::registry::proxy_fetch_artifact(
+    let (data, fetched) = match crate::registry::proxy_fetch_artifact_with(
         &state,
+        client,
         &key,
         "helm",
         &url,
@@ -890,6 +951,8 @@ mod integration_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.helm.enabled = true;
             cfg.helm.proxies.insert("demo".into(), entry);
+            // The file host is another local mock server.
+            cfg.helm.allow_private_chart_hosts = true;
         });
 
         let doc = index_json(&ctx).await;
@@ -999,6 +1062,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.helm.enabled = true;
             cfg.helm.proxies.insert("demo".into(), entry);
+            cfg.helm.allow_private_chart_hosts = true;
         });
         let resp = send(
             &ctx.app,
@@ -1012,6 +1076,36 @@ mod integration_tests {
             StatusCode::OK,
             "the other host got no credential"
         );
+    }
+
+    #[tokio::test]
+    async fn an_index_cannot_aim_nora_at_a_private_address() {
+        let files = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"one".to_vec()))
+            .expect(0)
+            .mount(&files)
+            .await;
+        let index = index_yaml(&[(
+            "1.0.0",
+            OLD,
+            &format!("{}/demo-1.0.0.tgz", files.uri()),
+            b"one",
+        )]);
+        let up = upstream(&index).await;
+        let entry = proxy(&up);
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.helm.enabled = true;
+            cfg.helm.proxies.insert("demo".into(), entry);
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/helm/demo/charts/demo/demo-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
