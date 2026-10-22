@@ -812,6 +812,27 @@ pub async fn leak_detection_middleware(
         None => haystack,
     };
 
+    // Docker manifests: the only fields a client follows are descriptor `urls`
+    // (layers, config, index entries). Annotations such as
+    // `org.opencontainers.image.base.name: gcr.io/distroless/…` are text and name
+    // an upstream in nearly every distroless-based image (NoraUpstreamUrlLeak on
+    // ghcr/cloudnative-pg, 22.10.2026). Not JSON → scan the raw bytes (over-report).
+    let urls_only: Vec<u8>;
+    // Only a served manifest: an OCI error body (`errors[].message`/`detail`) may
+    // quote the upstream and keeps the full scan.
+    let haystack = match (parts.status.is_success()
+        && detect_registry(&path) == "docker"
+        && path.contains("/manifests/"))
+    .then(|| docker_manifest_urls(haystack))
+    .flatten()
+    {
+        Some(b) => {
+            urls_only = b;
+            &urls_only[..]
+        }
+        None => haystack,
+    };
+
     if let Some((registry, hostname)) = state.leak_finders.scan(haystack) {
         UPSTREAM_URL_LEAK_TOTAL.with_label_values(&[registry]).inc();
         tracing::warn!(
@@ -839,6 +860,42 @@ fn strip_npm_readmes(body: &[u8]) -> Option<Vec<u8>> {
         }
     }
     serde_json::to_vec(&doc).ok()
+}
+
+/// Every `urls` entry of a Docker/OCI manifest or index, newline-joined: the
+/// descriptor fields a client dereferences (layers, config, manifests). Annotations
+/// and media types are text. None when the body is not a JSON object.
+fn docker_manifest_urls(body: &[u8]) -> Option<Vec<u8>> {
+    let doc: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = doc.as_object()?;
+    let mut out = Vec::new();
+    let mut push_urls = |d: &serde_json::Value| {
+        for u in d
+            .get("urls")
+            .and_then(|u| u.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Some(u) = u.as_str() {
+                out.extend_from_slice(u.as_bytes());
+                out.push(b'\n');
+            }
+        }
+    };
+    if let Some(c) = obj.get("config") {
+        push_urls(c);
+    }
+    for key in ["layers", "manifests"] {
+        for d in obj
+            .get(key)
+            .and_then(|l| l.as_array())
+            .into_iter()
+            .flatten()
+        {
+            push_urls(d);
+        }
+    }
+    Some(out)
 }
 
 /// Decompress gzip bytes; returns None on failure or if decompressed size exceeds limit.
@@ -1014,6 +1071,30 @@ mod tests {
         let (registry, hostname) = result.unwrap();
         assert_eq!(registry, "nuget");
         assert_eq!(hostname, "api.nuget.org");
+    }
+
+    /// A base-image annotation names gcr.io in nearly every distroless image; only
+    /// descriptor `urls` reach a client (ghcr/cloudnative-pg index, 22.10.2026).
+    #[test]
+    fn docker_manifest_scans_only_descriptor_urls() {
+        let finders = LeakFinders::new(vec![("docker".to_string(), "gcr.io".to_string())]);
+        let index = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json",
+            "manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aa","size":1,"platform":{"os":"linux","architecture":"amd64"}}],
+            "annotations":{"org.opencontainers.image.base.name":"gcr.io/distroless/static-debian13:nonroot@sha256:e2e9"}}"#;
+        assert!(
+            finders.scan(index).is_some(),
+            "the raw body does name gcr.io"
+        );
+        let urls = docker_manifest_urls(index).unwrap();
+        assert!(finders.scan(&urls).is_none());
+
+        let foreign_layer = br#"{"schemaVersion":2,"config":{"digest":"sha256:cc","size":1},
+            "layers":[{"digest":"sha256:bb","size":1,"urls":["https://gcr.io/v2/foo/blobs/sha256:bb"]}]}"#;
+        let urls = docker_manifest_urls(foreign_layer).unwrap();
+        assert_eq!(finders.scan(&urls), Some(("docker", "gcr.io")));
+
+        assert!(docker_manifest_urls(b"not json").is_none());
+        assert!(docker_manifest_urls(b"[1,2]").is_none());
     }
 
     #[test]
@@ -1312,6 +1393,68 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let after = UPSTREAM_URL_LEAK_TOTAL.with_label_values(&["nuget"]).get();
         assert!(after > before, "leak counter not incremented");
+    }
+
+    /// Through the real middleware: a served manifest whose only upstream mention is
+    /// a base-image annotation is clean; an OCI error body naming the upstream counts.
+    #[tokio::test]
+    async fn docker_manifest_annotation_clean_but_error_body_counts() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+        let mut ctx = crate::test_helpers::create_test_context();
+        ctx.state.leak_finders =
+            LeakFinders::new(vec![("docker".to_string(), "gcr.io".to_string())]);
+        let state = ctx.state.clone();
+        const JSON: [(axum::http::header::HeaderName, &str); 1] =
+            [(axum::http::header::CONTENT_TYPE, "application/json")];
+        let app = axum::Router::new()
+            .route(
+                "/v2/ghcr/x/manifests/sha256:aa",
+                get(move || async move {
+                    (JSON, r#"{"schemaVersion":2,"manifests":[{"digest":"sha256:bb","size":1}],"annotations":{"org.opencontainers.image.base.name":"gcr.io/distroless/static:nonroot"}}"#)
+                }),
+            )
+            .route(
+                "/v2/ghcr/y/manifests/missing",
+                get(move || async move {
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        JSON,
+                        r#"{"errors":[{"code":"MANIFEST_UNKNOWN","message":"see https://gcr.io/v2/y/manifests/missing"}]}"#,
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                leak_detection_middleware,
+            ))
+            .with_state(state);
+        let counter = UPSTREAM_URL_LEAK_TOTAL.with_label_values(&["docker"]);
+        let req = |uri: &str| {
+            axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        let before = counter.get();
+        let resp = app
+            .clone()
+            .oneshot(req("/v2/ghcr/x/manifests/sha256:aa"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(counter.get(), before, "annotation must not count as a leak");
+
+        let resp = app
+            .oneshot(req("/v2/ghcr/y/manifests/missing"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        assert!(
+            counter.get() > before,
+            "error body naming the upstream must count"
+        );
     }
 
     #[tokio::test]
