@@ -1375,6 +1375,28 @@ async fn evict_proxy_cache(
         Err(e) => tracing::error!("GC proxy-cache: listing pypi provenance markers failed: {e}"),
     }
 
+    evict_oldest(
+        storage,
+        publish_locks,
+        proxy_files,
+        max_bytes,
+        dry_run,
+        "Proxy-cache",
+    )
+    .await
+}
+
+/// Evict `proxy_files` (key, size, mtime) oldest-first until their total is within
+/// `max_bytes`. `what` names the cache in the log line.
+async fn evict_oldest(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    mut proxy_files: Vec<(String, u64, u64)>,
+    max_bytes: u64,
+    dry_run: bool,
+    what: &str,
+) -> ProxyCacheEviction {
+    use crate::registry::npm::origin_key;
     let total_bytes: u64 = proxy_files.iter().map(|(_, s, _)| s).sum();
 
     if total_bytes <= max_bytes {
@@ -1421,7 +1443,8 @@ async fn evict_proxy_cache(
     }
 
     info!(
-        "Proxy-cache eviction{}: {} files, {} bytes freed (was {} / cap {})",
+        "{} eviction{}: {} files, {} bytes freed (was {} / cap {})",
+        what,
         if dry_run { " (dry-run)" } else { "" },
         evicted,
         bytes_freed,
@@ -1434,6 +1457,50 @@ async fn evict_proxy_cache(
         evicted_files: evicted,
         bytes_freed,
     }
+}
+
+/// Evict proxy-cached Docker blobs when their total size exceeds `max_bytes`
+/// (`[gc] docker_proxy_cache_max_bytes`), oldest-cached first like
+/// [`evict_proxy_cache`]. A proxied image is stored under `docker/<namespace>/`, the
+/// resolved namespace of its upstream; a pushed one under `docker/<name>/`, so only
+/// keys below a configured upstream namespace are candidates, and only their blobs
+/// (manifests are small and the tag revalidation reads them). An evicted layer is
+/// fetched from the upstream again on its next pull.
+pub async fn evict_docker_proxy_cache(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    max_bytes: u64,
+    namespaces: &[String],
+    dry_run: bool,
+) -> ProxyCacheEviction {
+    if max_bytes == 0 || namespaces.is_empty() {
+        return ProxyCacheEviction::default();
+    }
+    let prefixes: Vec<String> = namespaces
+        .iter()
+        .map(|ns| format!("docker/{ns}/"))
+        .collect();
+    let entries = match storage.list_with_meta("docker/").await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("GC docker proxy-cache: list_with_meta(docker/) failed: {e}");
+            return ProxyCacheEviction::default();
+        }
+    };
+    let proxy_files = entries
+        .into_iter()
+        .filter(|(key, _)| key.contains("/blobs/") && prefixes.iter().any(|p| key.starts_with(p)))
+        .map(|(key, meta)| (key, meta.size, meta.modified))
+        .collect();
+    evict_oldest(
+        storage,
+        publish_locks,
+        proxy_files,
+        max_bytes,
+        dry_run,
+        "Docker proxy-cache",
+    )
+    .await
 }
 
 // ============================================================================
@@ -3851,6 +3918,53 @@ mod tests {
         assert!(storage.get("rpm/repo/Packages/2-1.0.rpm").await.is_ok());
         assert!(storage.get("rpm/repo/Packages/3-1.0.rpm").await.is_ok());
         assert!(storage.get("rpm/repo/Packages/4-1.0.rpm").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn docker_proxy_cache_evicts_oldest_proxied_blobs_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let storage = Storage::new_local(data.to_str().unwrap());
+        let blob = |ns: &str, i: u32| format!("docker/{ns}/library/alpine/blobs/sha256:{i:064}");
+        for i in 0..3u32 {
+            put_aged(&storage, &data, &blob("docker.io", i), 100, u64::from(i)).await;
+        }
+        put_aged(&storage, &data, &blob("ghcr.io", 3), 100, 3).await;
+        // Proxied manifest, a pushed image and an unconfigured namespace: never candidates.
+        let manifest = "docker/docker.io/library/alpine/manifests/3.20.json";
+        let pushed = "docker/team/app/blobs/sha256:".to_string() + &"a".repeat(64);
+        let other = blob("quay.io", 9);
+        for key in [manifest, pushed.as_str(), other.as_str()] {
+            put_aged(&storage, &data, key, 1000, 0).await;
+        }
+        let namespaces = ["docker.io".to_string(), "ghcr.io".to_string()];
+
+        let preview =
+            evict_docker_proxy_cache(&storage, &test_publish_locks(), 250, &namespaces, true).await;
+        assert_eq!((preview.total_bytes, preview.evicted_files), (400, 2));
+        assert!(
+            storage.get(&blob("docker.io", 0)).await.is_ok(),
+            "dry run deletes nothing"
+        );
+
+        let off =
+            evict_docker_proxy_cache(&storage, &test_publish_locks(), 0, &namespaces, false).await;
+        assert_eq!(off.evicted_files, 0, "0 = disabled");
+
+        let result =
+            evict_docker_proxy_cache(&storage, &test_publish_locks(), 250, &namespaces, false)
+                .await;
+        assert_eq!(
+            (result.total_bytes, result.evicted_files, result.bytes_freed),
+            (400, 2, 200)
+        );
+        assert!(storage.get(&blob("docker.io", 0)).await.is_err());
+        assert!(storage.get(&blob("docker.io", 1)).await.is_err());
+        assert!(storage.get(&blob("docker.io", 2)).await.is_ok());
+        assert!(storage.get(&blob("ghcr.io", 3)).await.is_ok());
+        for key in [manifest, pushed.as_str(), other.as_str()] {
+            assert!(storage.get(key).await.is_ok(), "{key} kept");
+        }
     }
 
     /// Store `size` bytes at `key` with an mtime that orders it by `age` (0 = oldest).

@@ -113,6 +113,15 @@ spec:
           env:
             - name: NORA_CONFIG_PATH
               value: /config/config.toml
+            {{- range $i, $u := .Values.config.docker.upstreams }}
+            {{- with $u.authSecret }}
+            - name: NORA_DOCKER_UPSTREAM_AUTH_{{ $i }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "config.docker.upstreams[].authSecret.name is required" .name }}
+                  key: {{ .key | default "auth" }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

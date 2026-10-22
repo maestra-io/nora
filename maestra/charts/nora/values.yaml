@@ -161,17 +161,31 @@ config:
     s3_credentials_dir: ""
   docker:
     proxy_timeout: 60
-    # -- Docker upstream registries for proxy/cache.
-    # Upstream auth belongs in a Secret (existingSecret / extraEnvFrom with
-    # NORA_DOCKER_PROXIES="url|user:token,..."), not inline here.
+    # -- Other [docker] scalars rendered as is, e.g. default_action ("deny":
+    # 403 for a name no upstream prefix/namespace matches), read_timeout,
+    # metadata_ttl, serve_stale. Enable the registry in registries.enable.
+    # default_action: deny
+    # -- Docker upstream registries for proxy/cache: url, prefix (first path
+    # segment that routes to it: packages.example/<prefix>/<image>), namespace
+    # (storage namespace and hostname form; default = host without
+    # registry-1./registry., so set it for registry.k8s.io), authSecret
+    # {name, key (default "auth")}: a Secret value "user:token", passed as env
+    # NORA_DOCKER_UPSTREAM_AUTH_<index> and rendered as auth_env (Maestra fork).
+    # An inline `auth` is refused: it would land in the ConfigMap.
     upstreams: []
     #  - url: https://registry-1.docker.io
-    #  - url: https://private.registry.io
-    #    auth: "user:token"
+    #    prefix: docker-hub
+    #    namespace: docker.io
+    #    authSecret: {name: nora-docker-hub, key: auth}
+    #  - url: https://registry.k8s.io
+    #    prefix: k8s
+    #    namespace: registry.k8s.io
   # -- [gc], every key rendered as is: enabled, interval (s), dry_run,
   # grace_secs (orphan age floor, nora default 604800), proxy_cache_max_bytes
   # (cap on proxy-cached npm tarballs, PyPI files, NuGet .nupkg/.nuspec and
-  # rpm/deb; oldest evicted first by the gc pass; nora default 0 = no cap).
+  # rpm/deb; oldest evicted first by the gc pass; nora default 0 = no cap),
+  # docker_proxy_cache_max_bytes (Maestra fork: separate cap on image layers
+  # cached from docker upstreams; 0 = no cap).
   # Eviction runs only inside the gc pass, so a cap needs enabled: true.
   gc:
     enabled: true
@@ -223,7 +237,10 @@ config:
     #  require_for_ui: true
     # -- Optional, rendered only when set (nora defaults in brackets):
     # docker_anon_pull (false), public_web_ui (false), public_metrics (true),
-    # token_cache_ttl (300).
+    # token_cache_ttl (300). docker_anon_pull: true serves image pulls with no
+    # credential at all (anyone who reaches /v2/); to keep pulls authenticated,
+    # give pullers (trow, imagePullSecrets) a read `nra_` token instead, sent
+    # as the Basic password.
     # docker_anon_pull: false
     # public_web_ui: false
     # public_metrics: true
@@ -343,6 +360,12 @@ config:
     #    min_release_age: 3d
     #    quarantine_ttl: 3d
     #    allow: ["Newtonsoft.Json@13.0.4", "Microsoft.NETCore.*"]
+    #  docker:
+    #    quarantine: observe
+    #    quarantine_ttl: 3d
+    #    # Required with a global min_release_age: docker dates a proxied tag by
+    #    # nora's own fetch, so any age > 0 refuses the second pull of a tag.
+    #    min_release_age: 0d
     # -- Blocklist JSON. Mount from an existing Secret or ConfigMap (same pattern
     # as config.auth.htpasswd). When existingSecret/existingConfigMap is set,
     # blocklist_path is auto-wired to <mountPath>/<key>, so the path is never

@@ -809,7 +809,9 @@ impl Config {
             value_set: self
                 .curation
                 .registry_override(rt)
-                .is_some_and(|o| o.min_release_age.is_some()),
+                .and_then(|o| o.min_release_age.as_deref())
+                // "0d" turns the registry's age check off: not a control.
+                .is_some_and(|v| crate::curation::parse_duration_or_zero(v) != Ok(0)),
             dated: release_date_check(rt),
             enabled: self.enabled_registries_legacy().contains(&rt),
             proxy: self.is_enabled_proxy(rt),
@@ -846,6 +848,7 @@ impl Config {
         // Docker upstreams
         for (i, upstream) in self.docker.upstreams.iter().enumerate() {
             if upstream.auth.is_some()
+                && upstream.auth_env.is_none()
                 && std::env::var("NORA_DOCKER_PROXIES").is_err()
                 && std::env::var("NORA_DOCKER_UPSTREAMS").is_err()
             {
@@ -1477,6 +1480,13 @@ impl Config {
                 &["blobs", "manifests", "tags", "uploads", "_catalog", "v2"];
             let mut seen_prefixes = std::collections::HashSet::new();
             for (i, upstream) in self.docker.upstreams.iter().enumerate() {
+                if let Some(var) = &upstream.auth_env {
+                    if upstream.auth.is_none() {
+                        errors.push(format!(
+                            "docker.upstreams[{i}]: auth_env names {var}, which is unset or empty"
+                        ));
+                    }
+                }
                 if let Some(ref prefix) = upstream.prefix {
                     if prefix.is_empty() {
                         errors.push(format!(
@@ -3757,6 +3767,48 @@ proxies = [
     }
 
     #[test]
+    fn docker_upstream_auth_env_reads_the_credential_and_rejects_a_missing_one() {
+        let _lock = env_lock();
+        std::env::remove_var("NORA_DOCKER_PROXIES");
+        std::env::remove_var("NORA_DOCKER_UPSTREAMS");
+        let toml = r#"
+            [docker]
+            default_action = "deny"
+
+            [[docker.upstreams]]
+            url = "https://registry-1.docker.io"
+            prefix = "docker-hub"
+            namespace = "docker.io"
+            auth_env = "NORA_TEST_DOCKER_HUB_AUTH"
+
+            [[docker.upstreams]]
+            url = "https://ghcr.io"
+            prefix = "ghcr"
+        "#;
+        std::env::set_var("NORA_TEST_DOCKER_HUB_AUTH", "user:token");
+        let mut config: Config = toml::from_str(toml).unwrap();
+        config.apply_env_overrides().unwrap();
+        assert_eq!(
+            crate::secrets::expose_opt(&config.docker.upstreams[0].auth),
+            Some("user:token")
+        );
+        assert!(config.docker.upstreams[1].auth.is_none());
+        let (_, errors) = config.validate();
+        assert!(!errors.iter().any(|e| e.contains("auth_env")), "{errors:?}");
+
+        std::env::remove_var("NORA_TEST_DOCKER_HUB_AUTH");
+        let mut config: Config = toml::from_str(toml).unwrap();
+        config.apply_env_overrides().unwrap();
+        assert!(config.docker.upstreams[0].auth.is_none());
+        let (_, errors) = config.validate();
+        assert!(
+            errors.iter().any(|e| e
+                == "docker.upstreams[0]: auth_env names NORA_TEST_DOCKER_HUB_AUTH, which is unset or empty"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
     fn test_env_override_docker_proxies_and_backward_compat() {
         let _lock = env_lock();
         // Test new NORA_DOCKER_PROXIES name
@@ -5341,6 +5393,40 @@ proxies = [
             assert_eq!(
                 flagged, !consumer_ok,
                 "validator flagged {s:?}={flagged}, but consumer parse_duration Ok={consumer_ok}"
+            );
+        }
+    }
+
+    /// A registry's own `min_release_age = "0d"` turns its age check off (not an
+    /// error, not a control); a zero global age or quarantine TTL is still an error.
+    #[test]
+    fn a_zero_registry_min_release_age_is_off_and_other_zero_durations_are_errors() {
+        let _lock = env_lock();
+        let config = curation_toml("curation.docker.min_release_age", "0d", "enforce");
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("curation.docker.min_release_age")),
+            "{errors:?}"
+        );
+        assert!(
+            !config
+                .registry_min_age_facts(crate::curation::RegistryType::Docker)
+                .value_set
+        );
+        for key in [
+            "curation.min_release_age",
+            "curation.quarantine_ttl",
+            "curation.docker.quarantine_ttl",
+        ] {
+            let config = curation_toml(key, "0d", "audit");
+            let (_, errors) = config.validate_with_config_path(None);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains(&format!("{key}=\"0d\" is not a duration"))),
+                "{key}: {errors:?}"
             );
         }
     }

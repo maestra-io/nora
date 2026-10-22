@@ -65,7 +65,26 @@ config:
     internal_port: 9100
 
   registries:
-    enable: ["nuget", "npm", "pypi"]
+    enable: ["nuget", "npm", "pypi", "docker"]
+
+  # Docker proxy for the clusters (issues-maestra#1649): one prefix per
+  # upstream, packages.maestra.io/<prefix>/<image>; deny = 403 for any other
+  # name. Docker Hub authenticated from a Secret (VaultStaticSecret).
+  docker:
+    proxy_timeout: 60
+    default_action: deny
+    upstreams:
+      - url: https://registry-1.docker.io
+        prefix: docker-hub
+        namespace: docker.io
+        authSecret:
+          name: nora-docker-hub
+          key: auth
+      - url: https://ghcr.io
+        prefix: ghcr
+      - url: https://registry.k8s.io
+        prefix: k8s
+        namespace: registry.k8s.io
 
   storage:
     mode: s3
@@ -90,6 +109,7 @@ config:
     enabled: true
     interval: 86400
     proxy_cache_max_bytes: 107374182400
+    docker_proxy_cache_max_bytes: 322122547200
 
   auth:
     enabled: true
@@ -185,6 +205,10 @@ config:
       nuget:
         min_release_age: 3d
         quarantine_ttl: 3d
+      docker:
+        quarantine: observe
+        quarantine_ttl: 3d
+        min_release_age: 0d
 
 # fluxcd network-policy.yaml (+ the Teleport agent rule and `host` egress of
 # fluxcd#22173). Cilium: traefik-public is hostNetwork, reachable only as the
