@@ -1193,6 +1193,9 @@ pub async fn get_generic_detail(
         Some(RegistryType::Ansible) => {
             get_ansible_detail(storage, &name_lower, show_prerelease, show_all).await
         }
+        Some(RegistryType::Terraform) => {
+            get_terraform_detail(storage, &name_lower, show_prerelease, show_all).await
+        }
         Some(RegistryType::Cpan) => {
             get_cpan_detail(storage, &name_lower, show_prerelease, show_all).await
         }
@@ -1641,6 +1644,52 @@ async fn get_pub_detail(
 
 /// Ansible Galaxy collection detail: list versions of `{ns}.{name}`.
 /// Files stored as `ansible/download/{ns}-{name}-{ver}.tar.gz`.
+/// Terraform: `terraform/download/{ns}/{type}/{ver}/{file}.zip`, one zip per os/arch,
+/// summed into one row per version. `name` is `{ns}/{type}`.
+async fn get_terraform_detail(
+    storage: &Storage,
+    name: &str,
+    show_prerelease: bool,
+    show_all: bool,
+) -> PackageDetail {
+    let prefix = format!("terraform/download/{}/", name);
+    let keys = storage.list_with_meta(&prefix).await.unwrap_or_default();
+    let mut by_version: std::collections::BTreeMap<String, (u64, u64)> =
+        std::collections::BTreeMap::new();
+    for (key, meta) in &keys {
+        let Some((version, file)) = key
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.split_once('/'))
+        else {
+            continue;
+        };
+        if version.is_empty() || !file.ends_with(".zip") || file.contains('/') {
+            continue;
+        }
+        let entry = by_version.entry(version.to_string()).or_insert((0, 0));
+        entry.0 += meta.size;
+        entry.1 = entry.1.max(meta.modified);
+    }
+    let mut versions: Vec<VersionInfo> = by_version
+        .into_iter()
+        .map(|(version, (size, modified))| VersionInfo {
+            version,
+            size,
+            published: format_timestamp(modified),
+            cached: true,
+        })
+        .collect();
+    versions.sort_by(|a, b| b.version.cmp(&a.version));
+    let (versions, prerelease_count, total_stable) =
+        apply_prerelease_filter(versions, show_prerelease, show_all);
+    PackageDetail {
+        versions,
+        prerelease_count,
+        total_stable,
+        metadata: PackageMetadata::default(),
+    }
+}
+
 async fn get_ansible_detail(
     storage: &Storage,
     name: &str,

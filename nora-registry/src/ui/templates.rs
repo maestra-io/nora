@@ -1329,11 +1329,8 @@ pub fn render_package_detail(
         ),
         Some(RegistryType::Gems) => format!("gem install {} --source {}/gems", name, base_url),
         Some(RegistryType::Terraform) => format!(
-            "# In required_providers block:\n  source = \"{}/terraform/{}\"",
-            base_url
-                .trim_start_matches("https://")
-                .trim_start_matches("http://"),
-            name
+            "# ~/.terraformrc (or TF_CLI_CONFIG_FILE):\nprovider_installation {{\n  network_mirror {{\n    url     = \"{}/terraform/\"\n    include = [\"registry.terraform.io/{}\"]\n  }}\n  direct {{ exclude = [\"registry.terraform.io/{}\"] }}\n}}",
+            base_url, name, name
         ),
         Some(RegistryType::Ansible) => format!("ansible-galaxy collection install {}", name),
         Some(RegistryType::PubDart) => format!(

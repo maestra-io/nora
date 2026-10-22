@@ -147,7 +147,7 @@ pub fn routes() -> Router<AppState> {
         .route("/ui/cpan", get(cpan_browse_root))
         .route("/ui/cpan/{*path}", get(cpan_browse))
         .route("/ui/gems/{name}", get(generic_registry_detail))
-        .route("/ui/terraform/{name}", get(generic_registry_detail))
+        .route("/ui/terraform/{*name}", get(generic_registry_detail))
         // Token management UI (protected by auth middleware)
         .route("/ui/tokens", get(tokens_page))
         // Maestra: developer setup guide
