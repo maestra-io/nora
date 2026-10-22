@@ -1328,6 +1328,11 @@ pub fn render_package_detail(
             name, base_url
         ),
         Some(RegistryType::Gems) => format!("gem install {} --source {}/gems", name, base_url),
+        // Terraform accepts only an https: network mirror; an http: base URL cannot
+        // be pasted into provider_installation, so say that instead.
+        Some(RegistryType::Terraform) if !base_url.starts_with("https://") => {
+            "# Terraform requires an https: network mirror; serve this registry over TLS first.".to_string()
+        }
         Some(RegistryType::Terraform) => format!(
             "# ~/.terraformrc (or TF_CLI_CONFIG_FILE):\nprovider_installation {{\n  network_mirror {{\n    url     = \"{}/terraform/\"\n    include = [\"registry.terraform.io/{}\"]\n  }}\n  direct {{ exclude = [\"registry.terraform.io/{}\"] }}\n}}",
             base_url, name, name

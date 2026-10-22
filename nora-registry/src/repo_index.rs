@@ -593,7 +593,9 @@ async fn build_terraform_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
             continue;
         };
         let parts: Vec<&str> = rest.splitn(4, '/').collect();
-        if parts.len() < 4 {
+        // Only `{ns}/{type}/{ver}/{file}.zip`: a zip under an extra directory is not a
+        // provider package, and the detail page would reject it anyway.
+        if parts.len() < 4 || parts[3].contains('/') {
             continue;
         }
         let entry = packages
@@ -1081,6 +1083,7 @@ mod tests {
             ("terraform/download/cloudflare/cloudflare/4.0.0/x.zip", b"xx"),
             ("terraform/providers/hashicorp/aws/versions.json", b"{}"),
             ("terraform/download/broken.zip", b"x"),
+            ("terraform/download/hashicorp/aws/5.2.0/nested/x.zip", b"x"),
         ] {
             storage.put(key, body).await.unwrap();
         }
