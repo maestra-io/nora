@@ -805,6 +805,8 @@ pub mod icons {
     pub const CPAN: &str = r#"<path fill="currentColor" fill-rule="evenodd" d="M12.72 1.68h-.48l-.48.24L.96 15.84v.72l1.2 1.2 1.68.48.24 1.44.72.96 13.44.24 1.2-.96-.72-1.44v-.24l.96-.48.72.48.72-.24 1.2-.48.72-.72v-.72L14.64 6.24l.72-1.92-.24-.48-.48.24-3.36 6.24-.24.24-.24-.24.48-1.68 2.64-4.56v-.96l-.72-.48-4.56 6.48-4.8 5.04-1.92 1.68 6.72-7.44 4.32-6.24zM18.24 16.8H6.48l-.96.24-.96.72h-.24l7.2-6.72 1.2-1.44z"/>"#;
     /// A plain isometric cube: a neutral mark for model repositories, not a brand logo.
     pub const HF: &str = r#"<path fill="currentColor" d="M12 2 3 7v10l9 5 9-5V7zm0 2.3L18.7 8 12 11.7 5.3 8zM5 9.7l6 3.3v6.7l-6-3.3zm8 10V13l6-3.3v6.7z"/>"#;
+    /// A plain ship's wheel: a neutral mark for chart repositories, not a brand logo.
+    pub const HELM: &str = r#"<path fill="currentColor" d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 2a8 8 0 1 1 0 16 8 8 0 0 1 0-16zm-1 2v4.17A2 2 0 0 0 10.17 11H6v2h4.17a2 2 0 0 0 .83.83V18h2v-4.17a2 2 0 0 0 .83-.83H18v-2h-4.17a2 2 0 0 0-.83-.83V6z"/>"#;
 }
 
 /// Format file size in human-readable format

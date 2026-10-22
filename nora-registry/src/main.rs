@@ -2473,6 +2473,7 @@ mod rate_limited_routes_tests {
             (RegistryType::Deb, "/deb/x/x.html"),
             (RegistryType::Cpan, "/cpan/modules/03modlist.data.gz"),
             (RegistryType::HuggingFace, "/hf/api/models/x/y"),
+            (RegistryType::Helm, "/helm/x/index.yaml"),
         ];
         let covered: std::collections::HashSet<_> = routes.iter().map(|(rt, _)| *rt).collect();
         assert_eq!(
@@ -3768,6 +3769,7 @@ fn registry_routes(enabled: &HashSet<RegistryType>) -> Router<AppState> {
             #[allow(unreachable_patterns)]
             RegistryType::Rpm | RegistryType::Deb => {}
             RegistryType::Cpan => registry_routes = registry_routes.merge(registry::cpan_routes()),
+            RegistryType::Helm => registry_routes = registry_routes.merge(registry::helm_routes()),
             RegistryType::HuggingFace => {
                 tracing::info!(
                     "Hugging Face proxy enabled: public models only (datasets answer 501), \

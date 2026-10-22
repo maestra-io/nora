@@ -26,7 +26,7 @@ pub struct GcConfig {
     /// only during a read-only maintenance window with no concurrent writes.
     #[serde(default = "default_gc_grace")]
     pub grace_secs: u64,
-    /// Maximum bytes for proxy-cached artifacts: rpm/deb packages, Hugging Face files, NuGet
+    /// Maximum bytes for proxy-cached artifacts: rpm/deb packages, Hugging Face files, Helm charts, NuGet
     /// `.nupkg`/`.nuspec` under `nuget/flatcontainer/`, and npm tarballs and PyPI
     /// files fetched from an upstream. When the total exceeds this cap, GC evicts the oldest
     /// files (by mtime) until usage is within budget; hosted packages and

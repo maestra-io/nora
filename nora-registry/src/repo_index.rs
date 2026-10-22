@@ -323,6 +323,10 @@ async fn build(reg_type: RegistryType, state: &AppState) -> Option<Vec<RepoInfo>
         RegistryType::Rpm | RegistryType::Deb => Some(Vec::new()),
         RegistryType::Cpan => build_cpan_index(storage).await,
         RegistryType::HuggingFace => build_hf_index(storage).await,
+        RegistryType::Helm => {
+            let (p, s) = crate::registry::helm::INDEX_PATTERN;
+            build_generic_index(storage, p, s).await
+        }
     }
 }
 
