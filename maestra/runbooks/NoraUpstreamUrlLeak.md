@@ -60,6 +60,11 @@ Output shape: `<time> {"<registry>":<N>}` per window; `<pod> start=<time> restar
      links nora rewrites or passes through: confirm in nora's OWN response (step 3) that none is left, else **rewriter
      gap**. Third > 0 = the host sits in another field: `jq` for it, that is the rewriter gap or the new pass-through
      entry. Matching only after `://` does not cover READMEs with full URLs, so it was never the fix.
+   - docker (`registry=docker`, path `…/manifests/…`): since `1.4.1-maestra.9` (#105) the detector scans only the
+     `urls` of `config`, `layers[]` and `manifests[]` descriptors of a 2xx manifest; annotations such as
+     `org.opencontainers.image.base.name: gcr.io/…` (ghcr `cloudnative-pg` index, 22.10.2026) cannot fire it. An OCI
+     error body (4xx/5xx) is still scanned whole, so a `gcr.io` in an upstream error message counts: read the path
+     and status of the WARN line.
 4. Step 5 lists a fix merged before the alert; compare its release with the running `image` tag (step 2): merged but not
    running = wait for the release, the alert repeats until then.
 
