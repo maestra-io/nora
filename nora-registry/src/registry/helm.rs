@@ -30,7 +30,7 @@ use crate::audit::AuditEntry;
 use crate::cache_ttl::is_within_ttl;
 use crate::circuit_breaker::BreakerScope;
 use crate::config::{RepoProxyEntry, UpstreamAuth};
-use crate::registry::{circuit_open_response, proxy_error_response, proxy_fetch, ProxyError};
+use crate::registry::{circuit_open_response, proxy_error_response, ProxyError};
 use crate::registry_type::RegistryType;
 use crate::AppState;
 use axum::{
@@ -43,7 +43,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use sha2::Digest;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -60,12 +59,13 @@ pub fn routes() -> Router<AppState> {
 }
 
 /// A chart repository index. Helm's own fields are typed as strings, so a scalar such
-/// as `version: 1.10` keeps its spelling; everything else passes through as is.
+/// as `version: 1.10` keeps its spelling; everything else passes through as is. A null
+/// entry or field is skipped as Helm skips it, not a reason to refuse the whole index.
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexFile {
     #[serde(rename = "apiVersion", default)]
     api_version: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "entries_without_nulls")]
     entries: BTreeMap<String, Vec<ChartVersion>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     generated: Option<String>,
@@ -75,9 +75,9 @@ struct IndexFile {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChartVersion {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     version: String,
     #[serde(
         rename = "appVersion",
@@ -95,13 +95,40 @@ struct ChartVersion {
     created: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     digest: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     urls: Vec<String>,
     #[serde(flatten)]
     extra: Map<String, Value>,
 }
 
+fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+fn entries_without_nulls<'de, D>(d: D) -> Result<BTreeMap<String, Vec<ChartVersion>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = BTreeMap::<String, Option<Vec<Option<ChartVersion>>>>::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .map(|(name, versions)| (name, versions.into_iter().flatten().flatten().collect()))
+        .collect())
+}
+
 impl ChartVersion {
+    /// The index digest as hex sha256 (`helm repo index` writes it bare; `sha256:`
+    /// accepted), if the entry has one.
+    fn sha256(&self) -> Option<&str> {
+        let d = self.digest.as_deref()?;
+        let d = d.strip_prefix("sha256:").unwrap_or(d);
+        (!d.is_empty()).then_some(d)
+    }
+
     fn created_unix(&self) -> Option<i64> {
         self.created
             .as_deref()
@@ -156,7 +183,7 @@ fn chart_file(name: &str, version: &str) -> String {
 /// Hide internal-namespace charts, versions whose digest is `held`, and (when the
 /// repo's `created` is `dated`) versions younger than `min_release_age`; point every
 /// chart URL back at NORA. A version NORA could not serve (a name or version it does
-/// not route) is left out.
+/// not route, or no digest to check the archive against) is left out.
 fn render_index(
     engine: &crate::curation::CurationEngine,
     index: &mut IndexFile,
@@ -171,7 +198,7 @@ fn render_index(
         }
         versions.retain(|v| {
             is_valid_chart_version(&v.version)
-                && !v.digest.as_deref().is_some_and(&held)
+                && v.sha256().is_some_and(|d| !held(d))
                 && !(dated
                     && engine.hides_from_metadata(
                         RegistryType::Helm,
@@ -188,11 +215,13 @@ fn render_index(
 }
 
 /// The URL of a chart `url` from the index of the upstream at `base`: relative URLs
-/// resolve against the repository URL as Helm resolves them; only http(s) is fetched.
+/// resolve against the repository URL as Helm resolves them. Only https is fetched,
+/// or plain http from an upstream configured as plain http.
 fn resolve_chart_url(base: &str, url: &str) -> Option<String> {
     let base = reqwest::Url::parse(&format!("{}/", base.trim_end_matches('/'))).ok()?;
     let resolved = base.join(url).ok()?;
-    matches!(resolved.scheme(), "http" | "https").then(|| resolved.to_string())
+    (resolved.scheme() == "https" || (resolved.scheme() == "http" && base.scheme() == "http"))
+        .then(|| resolved.to_string())
 }
 
 /// True when both URLs have the same scheme, host and port.
@@ -205,16 +234,6 @@ fn same_origin(a: &str, b: &str) -> bool {
         }
         _ => false,
     }
-}
-
-/// Whether `data` is what the index digest (hex sha256, optionally `sha256:`) names.
-/// An index without a digest names nothing to check.
-fn digest_matches(expected: Option<&str>, data: &[u8]) -> bool {
-    let Some(expected) = expected.filter(|d| !d.is_empty()) else {
-        return true;
-    };
-    let expected = expected.strip_prefix("sha256:").unwrap_or(expected);
-    hex::encode(sha2::Sha256::digest(data)).eq_ignore_ascii_case(expected)
 }
 
 fn upstream<'a>(state: &'a AppState, repo: &str) -> Option<&'a RepoProxyEntry> {
@@ -243,67 +262,74 @@ fn quarantine(state: &AppState) -> (crate::digest_quarantine::QuarantineMode, i6
     )
 }
 
-/// The ledger key of an index digest (hex sha256, optionally `sha256:`).
-fn ledger_digest(digest: &str) -> String {
-    format!(
-        "sha256:{}",
-        digest
-            .strip_prefix("sha256:")
-            .unwrap_or(digest)
-            .to_lowercase()
-    )
+/// The ledger key of an index digest (hex sha256).
+fn ledger_digest(sha256: &str) -> String {
+    format!("sha256:{}", sha256.to_lowercase())
 }
 
 fn index_key(repo: &str) -> String {
     format!("helm/index/{repo}.json")
 }
 
+/// Parse the cached JSON form of an index off the async runtime (several MB for the
+/// largest repositories).
+async fn parse_cached_index(data: Bytes) -> Option<IndexFile> {
+    tokio::task::spawn_blocking(move || serde_json::from_slice(&data).ok())
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The cached index of `key` if it is younger than `metadata_ttl`.
+async fn fresh_index(state: &AppState, key: &str) -> Option<IndexFile> {
+    let meta = state.storage.stat(key).await?;
+    if !is_within_ttl(meta.modified, state.config.helm.metadata_ttl) {
+        return None;
+    }
+    parse_cached_index(state.storage.get(key).await.ok()?).await
+}
+
 /// The upstream index of `repo` (JSON form) and whether it is a stale copy, or the
-/// response to give when there is none.
+/// response to give when there is none. One refresh per repo runs at a time: requests
+/// arriving meanwhile wait for it and read what it cached.
 async fn load_index(
     state: &AppState,
     repo: &str,
     up: &RepoProxyEntry,
 ) -> Result<(IndexFile, bool), Response> {
     let key = index_key(repo);
-    let cached = state.storage.get(&key).await.ok();
-    if let Some(ref data) = cached {
-        if let Some(meta) = state.storage.stat(&key).await {
-            if is_within_ttl(meta.modified, state.config.helm.metadata_ttl) {
-                if let Ok(index) = serde_json::from_slice(data) {
-                    return Ok((index, false));
-                }
-            }
-        }
+    if let Some(index) = fresh_index(state, &key).await {
+        return Ok((index, false));
     }
-    let stale = || {
-        cached
-            .as_ref()
-            .filter(|_| state.config.helm.serve_stale)
-            .and_then(|data| serde_json::from_slice::<IndexFile>(data).ok())
-    };
+    let lock = state.publish_lock(&key);
+    let _refresh = lock.lock().await;
+    if let Some(index) = fresh_index(state, &key).await {
+        return Ok((index, false));
+    }
 
     let base = up.url().trim_end_matches('/');
     let url = format!("{base}/index.yaml");
-    let fetched = proxy_fetch(
+    let fetched = crate::registry::proxy_fetch_capped(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.helm.proxy_timeout),
         up.auth().map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         BreakerScope::upstream(RegistryType::Helm, up.url()),
+        MAX_INDEX_BYTES as u64,
     )
     .await;
     let err = match fetched {
-        Ok(body) => match tokio::task::spawn_blocking(move || parse_index_yaml(&body)).await {
-            Ok(Ok(index)) => {
-                match serde_json::to_vec(&index) {
-                    Ok(json) => {
-                        if let Err(e) = state.storage.put(&key, &json).await {
-                            tracing::warn!(key = %key, error = %e, "helm: failed to cache index");
-                        }
-                    }
-                    Err(e) => tracing::warn!(repo, error = %e, "helm: index not serializable"),
+        Ok(body) => match tokio::task::spawn_blocking(move || {
+            let index = parse_index_yaml(&body)?;
+            let json = serde_json::to_vec(&index).map_err(|e| e.to_string())?;
+            Ok::<_, String>((index, json))
+        })
+        .await
+        {
+            Ok(Ok((index, json))) => {
+                if let Err(e) = state.storage.put(&key, &json).await {
+                    tracing::warn!(key = %key, error = %e, "helm: failed to cache index");
                 }
                 return Ok((index, false));
             }
@@ -313,14 +339,19 @@ async fn load_index(
             }
             Err(e) => ProxyError::Network(e.to_string()),
         },
-        Err(ProxyError::NotFound) => return Err(StatusCode::NOT_FOUND.into_response()),
         Err(e) => e,
     };
-    if let Some(index) = stale() {
-        tracing::warn!(registry = "helm", repo, error = ?err, "Helm upstream error, serving stale index");
-        return Ok((index, true));
+    // Any failure, a 404 included (a static host mid-deploy), falls back to the last copy.
+    if state.config.helm.serve_stale {
+        if let Ok(data) = state.storage.get(&key).await {
+            if let Some(index) = parse_cached_index(data).await {
+                tracing::warn!(registry = "helm", repo, error = ?err, "Helm upstream error, serving stale index");
+                return Ok((index, true));
+            }
+        }
     }
     Err(match err {
+        ProxyError::NotFound => StatusCode::NOT_FOUND.into_response(),
         ProxyError::CircuitOpen(reg) => circuit_open_response(&reg),
         e => proxy_error_response("helm", &url, &e),
     })
@@ -338,12 +369,12 @@ async fn index(State(state): State<AppState>, Path(repo): Path<String>) -> Respo
     let enforce = matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce);
     // Only a digest already seen and still young is held: an unseen one must stay
     // visible, or nothing would ever fetch it and start its clock.
-    let held = |digest: &str| {
+    let held = |sha256: &str| {
         enforce
             && matches!(
                 state
                     .digest_store
-                    .check("helm", &ledger_digest(digest), q_secs),
+                    .check("helm", &ledger_digest(sha256), q_secs),
                 crate::digest_quarantine::QuarantineStatus::Pending { .. }
             )
     };
@@ -353,9 +384,9 @@ async fn index(State(state): State<AppState>, Path(repo): Path<String>) -> Respo
         dated(&state, &repo),
         held,
     );
-    let body = match serde_json::to_vec(&index) {
-        Ok(body) => body,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let body = match tokio::task::spawn_blocking(move || serde_json::to_vec(&index)).await {
+        Ok(Ok(body)) => body,
+        _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let mut response = (
         StatusCode::OK,
@@ -409,16 +440,18 @@ async fn chart(
 
     // The index names the chart's date, digest and upstream URL; a cached chart is
     // still served when the index cannot be had.
-    let entry = match load_index(&state, &repo, up).await {
-        Ok((index, _)) => index
+    let entry = load_index(&state, &repo, up).await.map(|(index, _)| {
+        index
             .entries
             .get(&name)
-            .and_then(|versions| versions.iter().find(|v| v.version == version).cloned()),
-        Err(_) => None,
-    };
-    // `created` dates a chart only in a repo that does not re-stamp it.
+            .and_then(|versions| versions.iter().find(|v| v.version == version).cloned())
+    });
+    // `created` dates a chart only in a repo that does not re-stamp it: there it is the
+    // release age, and with `trust_upstream_dates` also the quarantine's first seen.
     let created = entry
         .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
         .filter(|_| dated(&state, &repo))
         .and_then(ChartVersion::created_unix);
     let publish_date = created.filter(|_| state.config.server.trust_upstream_dates);
@@ -430,7 +463,7 @@ async fn chart(
         RegistryType::Helm,
         &name,
         crate::curation::RequestVersion::Known(version.to_string()),
-        publish_date,
+        created,
     ) {
         return response;
     }
@@ -439,18 +472,20 @@ async fn chart(
     let key = format!("helm/charts/{name}/{repo}/{file}");
     let label = format!("{repo}/{file}");
 
-    if let Ok(outcome) = state.storage.get_verified(&key).await {
-        use nora_registry::verified::{verified_body, GateOutcome};
-        let data = match outcome {
-            GateOutcome::Verified(blob) => verified_body(blob),
-            GateOutcome::Unpinned(blob) => blob.into_inner(),
-        };
-        if let Some(response) = crate::curation::verify_integrity(
+    // Integrity-gated: a copy failing its pin is dropped and refetched, a storage
+    // fault answers 503.
+    let cached = match crate::registry::read_cached_artifact(&state, "helm", &key, false).await {
+        Ok(cached) => cached,
+        Err(response) => return response,
+    };
+    if let Some(cached) = cached {
+        let digest = cached.digest();
+        if let Some(response) = crate::curation::verify_integrity_by_hash(
             engine,
             RegistryType::Helm,
             &name,
             Some(version),
-            &data,
+            &digest,
         ) {
             return response;
         }
@@ -465,10 +500,10 @@ async fn chart(
         state
             .audit
             .log(AuditEntry::new("cache_hit", "proxy", "", "helm", ""));
-        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_digest(
             &state.digest_store,
             "helm",
-            &data,
+            &digest,
             &q_mode,
             q_secs,
             "cache",
@@ -476,10 +511,19 @@ async fn chart(
         ) {
             return resp;
         }
-        return chart_response(data.to_vec());
+        let len = cached.len();
+        return chart_response(len, cached.into_body(&state, "helm", &key, false));
     }
 
-    let Some(entry) = entry else {
+    let entry = match entry {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        // No index and no copy: the upstream's failure, not a 404 Helm would read as
+        // "no such version".
+        Err(response) => return response,
+    };
+    // Without a digest nothing vouches for the archive (and the index leaves it out).
+    let Some(expected) = entry.sha256() else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(url) = entry
@@ -495,28 +539,35 @@ async fn chart(
     } else {
         None
     };
-    let data = match proxy_fetch(
-        &state.http_client,
+    let (data, fetched) = match crate::registry::proxy_fetch_artifact(
+        &state,
+        &key,
+        "helm",
         &url,
-        Duration::from_secs(state.config.helm.proxy_timeout),
+        state.config.helm.proxy_timeout,
         auth,
-        &state.circuit_breaker,
         BreakerScope::upstream(RegistryType::Helm, up.url()),
     )
     .await
     {
-        Ok(data) => data,
+        Ok(fetched) => fetched,
         Err(e) => return proxy_error_response("helm", &url, &e),
     };
     // The index published the chart's digest: a body that does not match it (truncated,
     // corrupted, swapped) is neither served nor cached.
-    if !digest_matches(entry.digest.as_deref(), &data) {
-        tracing::warn!(repo, chart = %name, version, url = %url, "Helm chart does not match the index digest, refusing it");
+    let sha256 = data.sha256();
+    if !sha256.eq_ignore_ascii_case(expected) {
+        tracing::warn!(repo, chart = %name, version, url = %url, %expected, actual = %sha256, "Helm chart does not match the index digest, refusing it");
         return StatusCode::BAD_GATEWAY.into_response();
     }
-    if let Some(response) =
-        crate::curation::verify_integrity(engine, RegistryType::Helm, &name, Some(version), &data)
-    {
+    let digest = format!("sha256:{sha256}");
+    if let Some(response) = crate::curation::verify_integrity_by_hash(
+        engine,
+        RegistryType::Helm,
+        &name,
+        Some(version),
+        &digest,
+    ) {
         return response;
     }
     state.metrics.record_download("helm");
@@ -530,11 +581,21 @@ async fn chart(
     state
         .audit
         .log(AuditEntry::new("proxy_fetch", "proxy", "", "helm", ""));
-    state.spawn_cache_immutable("helm", key, Bytes::from(data.clone()));
-    if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+    // Only the caller whose fetch ran caches; coalesced followers share its body.
+    if fetched {
+        let (cache_state, cache_key, body) = (state.clone(), key.clone(), data.clone());
+        tokio::spawn(async move {
+            match body.cache(&cache_state, &cache_key, true).await {
+                Ok(true) => cache_state.repo_index.invalidate("helm"),
+                Ok(false) => {}
+                Err(e) => crate::record_cache_write_error("helm", &cache_key, &e),
+            }
+        });
+    }
+    if let Some(resp) = crate::digest_quarantine::proxy_gate_digest(
         &state.digest_store,
         "helm",
-        &data,
+        &digest,
         &q_mode,
         q_secs,
         &url,
@@ -542,10 +603,17 @@ async fn chart(
     ) {
         return resp;
     }
-    chart_response(data)
+    let len = data.len();
+    match data.into_body(&key).await {
+        Ok(body) => chart_response(len, body),
+        Err(e) => {
+            tracing::warn!(key = %key, error = %e, "helm: spooled chart unreadable");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
-fn chart_response(data: Vec<u8>) -> Response {
+fn chart_response(len: u64, body: axum::body::Body) -> Response {
     (
         StatusCode::OK,
         [
@@ -557,8 +625,9 @@ fn chart_response(data: Vec<u8>) -> Response {
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=31536000, immutable"),
             ),
+            (header::CONTENT_LENGTH, HeaderValue::from(len)),
         ],
-        data,
+        body,
     )
         .into_response()
 }
@@ -568,6 +637,7 @@ fn chart_response(data: Vec<u8>) -> Response {
 mod tests {
     use super::*;
     use crate::config::{Config, CurationMode};
+    use sha2::Digest;
 
     const INDEX: &str = r#"apiVersion: v1
 entries:
@@ -583,10 +653,17 @@ entries:
     annotations:
       artifacthub.io/license: Apache-2.0
   - created: "2999-01-01T00:00:00Z"
+    digest: def
     name: cert-manager
     urls:
     - https://example.com/cert-manager-v1.11.0.tgz
     version: 1.10
+  - name: cert-manager
+    urls:
+    - cert-manager-0.1.0.tgz
+    version: 0.1.0
+  - null
+  empty: null
 generated: "2024-01-01T00:00:00Z"
 serverInfo:
   contextPath: /x
@@ -618,6 +695,12 @@ serverInfo:
             "Apache-2.0"
         );
         assert_eq!(index.extra["serverInfo"]["contextPath"], "/x");
+        // A null item or list is skipped, as Helm skips it.
+        assert_eq!(versions.len(), 3);
+        assert!(index.entries["empty"].is_empty());
+        let lenient = parse_index_yaml(b"apiVersion: v1\nentries:\n  a:\n  - name: a\n    version: 1.0.0\n    urls: null\n    digest: null\n").unwrap();
+        assert!(lenient.entries["a"][0].urls.is_empty());
+        assert_eq!(lenient.entries["a"][0].sha256(), None);
         // The JSON form reads back as the same index (what is cached and served).
         let json = serde_json::to_vec(&index).unwrap();
         let back: IndexFile = serde_json::from_slice(&json).unwrap();
@@ -631,8 +714,13 @@ serverInfo:
         let e = engine(|_| {});
         let mut index = parse_index_yaml(INDEX.as_bytes()).unwrap();
         render_index(&e, &mut index, false, |_| false);
+        assert!(!index.entries.contains_key("empty"));
         let v = &index.entries["cert-manager"];
-        assert_eq!(v.len(), 2, "an undated repo's created hides nothing");
+        assert_eq!(
+            v.len(),
+            2,
+            "an undated repo's created hides nothing; no digest, not served"
+        );
         assert_eq!(v[0].urls, ["charts/cert-manager/cert-manager-v1.10.0.tgz"]);
         assert_eq!(v[1].urls, ["charts/cert-manager/cert-manager-1.10.tgz"]);
 
@@ -682,17 +770,28 @@ serverInfo:
         );
         assert_eq!(resolve_chart_url(base, "file:///etc/passwd"), None);
         assert_eq!(resolve_chart_url(base, "ftp://x/a.tgz"), None);
+        // Plain http only from an upstream configured as plain http.
+        assert_eq!(resolve_chart_url(base, "http://x/a.tgz"), None);
+        assert_eq!(
+            resolve_chart_url("http://charts.lan", "http://x/a.tgz").unwrap(),
+            "http://x/a.tgz"
+        );
     }
 
     #[test]
-    fn checks_the_index_digest() {
+    fn reads_the_index_digest() {
         let sha = hex::encode(sha2::Sha256::digest(b"chart"));
-        assert!(digest_matches(Some(&sha), b"chart"));
-        assert!(digest_matches(Some(&sha.to_uppercase()), b"chart"));
-        assert!(digest_matches(Some(&format!("sha256:{sha}")), b"chart"));
-        assert!(!digest_matches(Some(&sha), b"other"));
-        assert!(digest_matches(None, b"anything"), "no digest to check");
-        assert!(digest_matches(Some(""), b"anything"));
+        let mut v = parse_index_yaml(INDEX.as_bytes()).unwrap().entries["cert-manager"][0].clone();
+        for (digest, read) in [
+            (Some(sha.clone()), Some(sha.as_str())),
+            (Some(format!("sha256:{sha}")), Some(sha.as_str())),
+            (Some(String::new()), None),
+            (Some("sha256:".to_string()), None),
+            (None, None),
+        ] {
+            v.digest = digest;
+            assert_eq!(v.sha256(), read);
+        }
         assert_eq!(
             ledger_digest(&sha.to_uppercase()),
             format!("sha256:{sha}"),
@@ -993,6 +1092,8 @@ mod integration_tests {
                 }
                 cfg.curation.mode = CurationMode::Enforce;
                 cfg.curation.helm.min_release_age = Some("3d".into());
+                // The age comes from `created` itself, not the quarantine seeding.
+                cfg.server.trust_upstream_dates = false;
             });
             let listed = index_json(&ctx).await["entries"]["demo"]
                 .as_array()
@@ -1017,14 +1118,36 @@ mod integration_tests {
 
     #[tokio::test]
     async fn a_stale_index_is_served_when_the_upstream_fails() {
-        let index = index_yaml(&[("1.0.0", OLD, "demo-1.0.0.tgz", b"one")]);
+        for failure in [500, 404] {
+            let index = index_yaml(&[("1.0.0", OLD, "demo-1.0.0.tgz", b"one")]);
+            let up = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repo/index.yaml"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(index))
+                .up_to_n_times(1)
+                .mount(&up)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repo/index.yaml"))
+                .respond_with(ResponseTemplate::new(failure))
+                .mount(&up)
+                .await;
+            let entry = proxy(&up);
+            let ctx = create_test_context_with_config(|cfg| {
+                cfg.helm.enabled = true;
+                cfg.helm.metadata_ttl = 0;
+                cfg.helm.proxies.insert("demo".into(), entry);
+            });
+            index_json(&ctx).await;
+            let resp = send(&ctx.app, Method::GET, "/helm/demo/index.yaml", "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "upstream {failure}");
+            assert_eq!(resp.headers()["x-nora-stale"], "true");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_upstream_outage_is_not_a_missing_chart() {
         let up = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repo/index.yaml"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(index))
-            .up_to_n_times(1)
-            .mount(&up)
-            .await;
         Mock::given(method("GET"))
             .and(path("/repo/index.yaml"))
             .respond_with(ResponseTemplate::new(500))
@@ -1033,13 +1156,19 @@ mod integration_tests {
         let entry = proxy(&up);
         let ctx = create_test_context_with_config(|cfg| {
             cfg.helm.enabled = true;
-            cfg.helm.metadata_ttl = 0;
             cfg.helm.proxies.insert("demo".into(), entry);
         });
-        index_json(&ctx).await;
-        let resp = send(&ctx.app, Method::GET, "/helm/demo/index.yaml", "").await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers()["x-nora-stale"], "true");
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/helm/demo/charts/demo/demo-1.0.0.tgz",
+            "",
+        )
+        .await;
+        // No index and no cached copy: the upstream's error, never a 404 that Helm
+        // and Flux read as "no such version".
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(resp.status().is_server_error(), "{}", resp.status());
     }
 
     #[tokio::test]

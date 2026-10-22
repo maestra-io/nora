@@ -619,6 +619,44 @@ pub(crate) async fn proxy_fetch(
     .await
 }
 
+/// [`proxy_fetch_bytes`] refusing a body above `cap` bytes, on its `Content-Length` or
+/// as soon as the running count crosses it, instead of buffering it whole.
+pub(crate) async fn proxy_fetch_capped(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+    cap: u64,
+) -> Result<Bytes, ProxyError> {
+    proxy_fetch_core(
+        client,
+        url,
+        timeout,
+        false,
+        auth,
+        None,
+        move |mut r| async move {
+            let too_large = || ProxyError::Spool(SpoolError::TooLarge(cap));
+            if r.content_length().is_some_and(|n| n > cap) {
+                return Err(too_large());
+            }
+            let mut body = Vec::new();
+            while let Some(chunk) = r.chunk().await.map_err(transport_error)? {
+                body.extend_from_slice(&chunk);
+                if body.len() as u64 > cap {
+                    return Err(too_large());
+                }
+            }
+            Ok(Bytes::from(body))
+        },
+        cb,
+        scope,
+    )
+    .await
+}
+
 /// [`proxy_fetch`] returning the body as one refcounted `Bytes`, so the
 /// response and the cache write can share it instead of each copying it.
 pub(crate) async fn proxy_fetch_bytes(
@@ -1257,7 +1295,8 @@ impl CachedArtifact {
 /// whose last line is the digest it cached, as GC's eviction reads it) proves one,
 /// and only while that digest is still the object's pin.
 pub(crate) async fn is_proxied_copy(storage: &crate::Storage, key: &str) -> bool {
-    if key.starts_with("nuget/flatcontainer/") {
+    // Pull-through only: nothing is published under these.
+    if key.starts_with("nuget/flatcontainer/") || key.starts_with("helm/charts/") {
         return true;
     }
     let Ok(record) = storage.get(&npm::origin_key(key)).await else {
@@ -2003,6 +2042,7 @@ mod tests {
         let storage = &ctx.state.storage;
         let digest = |b: &[u8]| hex::encode(sha2::Sha256::digest(b));
         assert!(is_proxied_copy(storage, "nuget/flatcontainer/a/1.0.0/a.1.0.0.nupkg").await);
+        assert!(is_proxied_copy(storage, "helm/charts/demo/repo/demo-1.0.0.tgz").await);
 
         let tgz = "npm/a/tarballs/a-1.0.0.tgz";
         storage.put(tgz, b"published").await.unwrap();

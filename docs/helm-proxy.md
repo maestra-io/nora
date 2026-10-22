@@ -54,16 +54,21 @@ spec:
 
 ## Routes
 
-- `GET|HEAD /helm/<name>/index.yaml`: the upstream index, filtered (below). Every chart
+- `GET|HEAD /helm/<name>/index.yaml`: the upstream index, filtered (below). One
+  refresh per repo runs at a time; an upstream failure, a 404 included, serves the last
+  copy (`x-nora-stale: true`) while `serve_stale` is on. Every chart
   URL in it is rewritten to the relative `charts/<chart>/<chart>-<version>.tgz`, so
   clients download through NORA whatever host the upstream names (GitHub releases for
   many repositories). The body is JSON, which is valid YAML; Helm, Flux and Renovate
   read it as `index.yaml`.
 - `GET|HEAD /helm/<name>/charts/<chart>/<chart>-<version>.tgz`: the chart. NORA fetches
   it from the URL the cached upstream index names for that chart and version (never
-  from client input; http(s) only), refuses a body whose sha256 differs from the index
-  `digest` (502, not cached), sends the upstream credential only to the upstream's own
-  origin, and caches it under `helm/charts/<chart>/<name>/`.
+  from client input; https only, plain http only from an upstream configured as http),
+  refuses a body whose sha256 differs from the index `digest` (502, not cached), sends
+  the upstream credential only to the upstream's own origin, and caches it under
+  `helm/charts/<chart>/<name>/`. A version with no `digest` in the index is left out
+  of the served index and not fetched (seen 22.10.2026 only on a few pre-2021
+  external-dns and metrics-server versions).
 
 ## Controls
 
@@ -88,6 +93,7 @@ Metrics carry `registry="helm"`: downloads, cache hits and misses,
 `nora_quarantine_holds_total`, `nora_artifacts_total` (charts by name). Cached charts
 count against `gc.proxy_cache_max_bytes`; the cached indexes (`helm/index/`) do not.
 
-Known limits: the index is re-parsed from its cached JSON on every request; a chart
-version re-published upstream with new content keeps serving the first cached copy;
-upstream indexes are refetched whole after `metadata_ttl` (no conditional request).
+Known limits: the index is re-parsed from its cached JSON on every request (off the
+async runtime; ~14 ms for prometheus-community's 6.5 MB index); a chart version
+re-published upstream with new content keeps serving the first cached copy; upstream indexes are refetched whole after `metadata_ttl` (no conditional
+request) and capped at 128 MiB.
