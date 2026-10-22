@@ -598,8 +598,16 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
         // token, and the client that needs that answer has no credentials yet.
         let npm_login =
             *request.method() == axum::http::Method::PUT && path.starts_with("/npm/-/user/");
+        // Terraform package downloads carry no credentials; metadata served to an
+        // authenticated client names them by signed URLs (registry/terraform.rs).
+        let tf_signed_download =
+            matches!(
+                *request.method(),
+                axum::http::Method::GET | axum::http::Method::HEAD
+            ) && crate::registry::terraform::download_signature_valid(path, request.uri().query());
         let open = is_public_path(path)
             || npm_login
+            || tf_signed_download
             || (is_web_surface(path) && (config.anonymous_read || config.public_web_ui))
             || (path == "/metrics" && config.public_metrics);
         // Probes and metrics never validate credentials: a Basic header there

@@ -21,8 +21,14 @@
 //! Client config (network mirror; note: Terraform requires an `https:` URL):
 //!   In ~/.terraformrc:
 //!     provider_installation {
-//!       network_mirror { url = "https://nora.example.com/terraform/" }
+//!       network_mirror {
+//!         url     = "https://nora.example.com/terraform/"
+//!         include = ["registry.terraform.io/*/*"]  # one upstream: other hosts go direct
+//!       }
+//!       direct { exclude = ["registry.terraform.io/*/*"] }
 //!     }
+//!   With auth on: TF_TOKEN_nora_example_com=<token> (metadata only; package files are
+//!   served by signed URL, see DOWNLOAD_PREFIX).
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
@@ -45,6 +51,76 @@ use std::time::Duration;
 
 /// Storage prefix and file suffix for repo index scanning.
 pub const INDEX_PATTERN: (&str, &str) = ("terraform/", ".zip");
+
+// ── Signed package download URLs (Maestra) ────────────────────────────
+//
+// Terraform sends no credentials when it downloads a provider package: neither the
+// network mirror's archive `url` nor the registry protocol's `download_url` /
+// `shasums_url` get the host's token, so a NORA with auth answers them 401 (measured
+// with Terraform 1.13 and latest). Metadata served to an authenticated client
+// therefore names these files by short-lived HMAC-signed URLs, and the auth layer
+// admits a GET on DOWNLOAD_PREFIX that carries a valid signature. The key is random
+// per process: a restart only invalidates URLs handed out in the last hour.
+
+/// The path prefix of provider package files (archives, SHA256SUMS, .sig).
+pub(crate) const DOWNLOAD_PREFIX: &str = "/terraform/v1/providers/download/";
+/// How long a signed download URL stays valid.
+const SIGNED_URL_TTL_SECS: u64 = 3600;
+
+static SIGNING_KEY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(rand::random);
+
+/// Hex HMAC-SHA256 over `path` and `exp` with the process key.
+fn download_signature(path: &str, exp: u64) -> String {
+    use sha2::{Digest, Sha256};
+    let (mut ipad, mut opad) = ([0x36u8; 64], [0x5cu8; 64]);
+    for (i, b) in SIGNING_KEY.iter().enumerate() {
+        ipad[i] ^= b;
+        opad[i] ^= b;
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(path.as_bytes());
+    inner.update(b"\n");
+    inner.update(exp.to_string().as_bytes());
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner.finalize());
+    hex::encode(outer.finalize())
+}
+
+/// `url` with a signature query when it names a provider package file, else unchanged.
+fn sign_download_url(url: &str) -> String {
+    let Some(start) = url.find(DOWNLOAD_PREFIX) else {
+        return url.to_string();
+    };
+    let exp = crate::cache_ttl::now_unix() + SIGNED_URL_TTL_SECS;
+    let sig = download_signature(&url[start..], exp);
+    format!("{url}?nora_exp={exp}&nora_sig={sig}")
+}
+
+/// Whether a request for `path` with `query` carries a valid, unexpired download signature.
+pub(crate) fn download_signature_valid(path: &str, query: Option<&str>) -> bool {
+    use subtle::ConstantTimeEq;
+    if !path.starts_with(DOWNLOAD_PREFIX) {
+        return false;
+    }
+    let (mut exp, mut sig) = (None, None);
+    for pair in query.unwrap_or_default().split('&') {
+        match pair.split_once('=') {
+            Some(("nora_exp", v)) => exp = v.parse::<u64>().ok(),
+            Some(("nora_sig", v)) => sig = Some(v),
+            _ => {}
+        }
+    }
+    let (Some(exp), Some(sig)) = (exp, sig) else {
+        return false;
+    };
+    exp >= crate::cache_ttl::now_unix()
+        && download_signature(path, exp)
+            .as_bytes()
+            .ct_eq(sig.as_bytes())
+            .into()
+}
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -208,7 +284,7 @@ async fn provider_versions(
             if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
                 state.metrics.record_download("terraform");
                 state.metrics.record_cache_hit("terraform");
-                return with_json(data.to_vec());
+                return with_json(serve_versions(&state, &ns, &ptype, internal, data).await);
             }
         }
     }
@@ -263,8 +339,9 @@ async fn provider_versions(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "proxy", "", "terraform", ""));
 
-            state.spawn_cache("terraform", storage_key, Bytes::from(text.clone()));
-            with_json(text.into_bytes())
+            let served = serve_versions(&state, &ns, &ptype, internal, text.as_bytes()).await;
+            state.spawn_cache("terraform", storage_key, Bytes::from(text));
+            with_json(served)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -978,6 +1055,7 @@ async fn mirror_provider_index(
         Err(resp) => return *resp,
     };
 
+    let versions_json = hide_young_versions(&state, &ns, &ptype, internal, versions_json).await;
     let mirror = build_mirror_index(&versions_json);
     debug_assert!(
         mirror
@@ -1064,7 +1142,7 @@ async fn mirror_provider_version(
             Ok(Some((url, Some(shasum)))) => {
                 archives.insert(
                     format!("{}_{}", os, arch),
-                    serde_json::json!({ "url": url, "hashes": [format!("zh:{}", shasum)] }),
+                    serde_json::json!({ "url": sign_download_url(&url), "hashes": [format!("zh:{}", shasum)] }),
                 );
             }
             Ok(_) => {}
@@ -1297,18 +1375,17 @@ fn terraform_upstream_is_official(state: &AppState) -> bool {
     upstream_url(state).is_some_and(|u| url_is_official_terraform(&u))
 }
 
-/// Best-effort release date for a Terraform provider version via the
-/// registry.terraform.io `/v2` API. The *standard* provider protocol exposes no
-/// date (neither `versions` nor `download/{os}/{arch}` carry one — verified
-/// against the live API), so this v2 endpoint is the only trusted source, and it
-/// only exists on the official registry. Any failure → `None`.
-async fn fetch_terraform_registry_date(
+/// Best-effort release dates of every version of a Terraform provider via the
+/// registry.terraform.io `/v2` API, by version. The *standard* provider protocol
+/// exposes no date (neither `versions` nor `download/{os}/{arch}` carry one —
+/// verified against the live API), so this v2 endpoint is the only trusted source,
+/// and it only exists on the official registry. Any failure → `None`.
+async fn fetch_terraform_registry_dates(
     client: &reqwest::Client,
     ns: &str,
     ptype: &str,
-    ver: &str,
     timeout_secs: u64,
-) -> Option<i64> {
+) -> Option<std::collections::HashMap<String, i64>> {
     let url = format!(
         "https://registry.terraform.io/v2/providers/{}/{}?include=provider-versions",
         ns, ptype
@@ -1323,18 +1400,131 @@ async fn fetch_terraform_registry_date(
         return None;
     }
     let json: serde_json::Value = resp.json().await.ok()?;
-    let included = json.get("included")?.as_array()?;
-    for item in included {
-        let attrs = match item.get("attributes") {
-            Some(a) => a,
-            None => continue,
+    Some(parse_registry_dates(&json))
+}
+
+/// `version → published-at` (unix seconds) from a `/v2/providers/…?include=provider-versions` body.
+fn parse_registry_dates(json: &serde_json::Value) -> std::collections::HashMap<String, i64> {
+    let mut dates = std::collections::HashMap::new();
+    for item in json
+        .get("included")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(attrs) = item.get("attributes") else {
+            continue;
         };
-        if attrs.get("version").and_then(|v| v.as_str()) == Some(ver) {
-            let date_str = attrs.get("published-at").and_then(|v| v.as_str())?;
-            return crate::curation::parse_iso8601_to_unix(date_str);
+        if let (Some(version), Some(date)) = (
+            attrs.get("version").and_then(|v| v.as_str()),
+            attrs
+                .get("published-at")
+                .and_then(|v| v.as_str())
+                .and_then(crate::curation::parse_iso8601_to_unix),
+        ) {
+            dates.insert(version.to_string(), date);
         }
     }
-    None
+    dates
+}
+
+/// Release date of one provider version via [`fetch_terraform_registry_dates`].
+async fn fetch_terraform_registry_date(
+    client: &reqwest::Client,
+    ns: &str,
+    ptype: &str,
+    ver: &str,
+    timeout_secs: u64,
+) -> Option<i64> {
+    fetch_terraform_registry_dates(client, ns, ptype, timeout_secs)
+        .await?
+        .get(ver)
+        .copied()
+}
+
+/// Q04 for Terraform (Maestra): drop the versions `min_release_age` refuses from a
+/// provider version list (`{"versions":[{"version":..},..]}`), so a client resolving a
+/// constraint picks the newest allowed version instead of failing on the refused
+/// download (Terraform reports that 403 as "rejected the given authentication
+/// credentials"). Dated by the official registry's `/v2` API, regardless of
+/// `trust_upstream_dates` (hiding cannot let a version through); an internal provider,
+/// another upstream or a failed date query hides nothing (the download gate still applies).
+async fn hide_young_versions(
+    state: &AppState,
+    ns: &str,
+    ptype: &str,
+    internal: bool,
+    mut versions_json: serde_json::Value,
+) -> serde_json::Value {
+    let engine = &state.curation().curation_engine;
+    if internal
+        || !engine.metadata_filter_active()
+        || engine
+            .min_release_age_secs(crate::curation::RegistryType::Terraform)
+            .is_none()
+        || !terraform_upstream_is_official(state)
+    {
+        return versions_json;
+    }
+    let Some(dates) = fetch_terraform_registry_dates(
+        &state.http_client,
+        ns,
+        ptype,
+        state.config.terraform.proxy_timeout,
+    )
+    .await
+    else {
+        return versions_json;
+    };
+    drop_hidden_versions(
+        engine,
+        &provider_identity(ns, ptype),
+        &mut versions_json,
+        &dates,
+    );
+    versions_json
+}
+
+/// Remove from `versions_json` every version `engine` hides from metadata, by `dates`.
+fn drop_hidden_versions(
+    engine: &crate::curation::CurationEngine,
+    provider: &str,
+    versions_json: &mut serde_json::Value,
+    dates: &std::collections::HashMap<String, i64>,
+) {
+    if let Some(versions) = versions_json
+        .get_mut("versions")
+        .and_then(|v| v.as_array_mut())
+    {
+        versions.retain(|entry| {
+            let Some(version) = entry.get("version").and_then(|v| v.as_str()) else {
+                return true;
+            };
+            !engine.hides_from_metadata(
+                crate::curation::RegistryType::Terraform,
+                provider,
+                version,
+                dates.get(version).copied(),
+            )
+        });
+    }
+}
+
+/// [`hide_young_versions`] over raw version-list bytes; unparsable bytes pass unchanged.
+async fn serve_versions(
+    state: &AppState,
+    ns: &str,
+    ptype: &str,
+    internal: bool,
+    data: &[u8],
+) -> Vec<u8> {
+    match serde_json::from_slice::<serde_json::Value>(data) {
+        Ok(json) => {
+            serde_json::to_vec(&hide_young_versions(state, ns, ptype, internal, json).await)
+                .unwrap_or_else(|_| data.to_vec())
+        }
+        Err(_) => data.to_vec(),
+    }
 }
 
 /// Release date for the quarantine first-seen clock (#748/#750).
@@ -1683,7 +1873,8 @@ fn rewrite_module_source_url(
     }
 }
 
-/// Strip internal `_nora_*` fields from cached metadata before sending to clients.
+/// Strip internal `_nora_*` fields from cached metadata before sending to clients,
+/// and sign its package URLs (see [`sign_download_url`]).
 ///
 /// The cached JSON contains `_nora_upstream_url`, `_nora_upstream_shasums_url`, and
 /// `_nora_upstream_shasums_sig_url` — needed internally by `resolve_upstream_download_url`
@@ -1692,6 +1883,11 @@ fn strip_nora_internal_fields(data: &[u8]) -> Vec<u8> {
     if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(data) {
         if let Some(obj) = json.as_object_mut() {
             obj.retain(|k, _| !k.starts_with("_nora_"));
+            for key in ["download_url", "shasums_url", "shasums_signature_url"] {
+                if let Some(serde_json::Value::String(url)) = obj.get_mut(key) {
+                    *url = sign_download_url(url);
+                }
+            }
         }
         serde_json::to_vec(&json).unwrap_or_else(|_| data.to_vec())
     } else {
@@ -4190,5 +4386,166 @@ mod terraform_release_age_decided {
                 assert_eq!(resp.status(), expected, "{url}");
             }
         }
+    }
+}
+
+/// Maestra: signed package download URLs and young-version hiding.
+#[cfg(test)]
+mod maestra_tests {
+    use super::*;
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_auth_and_config, send, send_with_headers,
+    };
+    use axum::http::Method;
+    use base64::Engine;
+
+    const ZIP: &str =
+        "/terraform/v1/providers/download/hashicorp/null/3.2.3/terraform-provider-null_3.2.3_linux_amd64.zip";
+
+    #[test]
+    fn signed_url_round_trip() {
+        let url = sign_download_url(&format!("https://packages.example{ZIP}"));
+        let (path, query) = url
+            .strip_prefix("https://packages.example")
+            .unwrap()
+            .split_once('?')
+            .unwrap();
+        assert_eq!(path, ZIP);
+        assert!(download_signature_valid(path, Some(query)));
+        // Another file, a changed expiry, a tampered or missing signature: refused.
+        let other = ZIP.replace("linux_amd64", "linux_arm64");
+        assert!(!download_signature_valid(&other, Some(query)));
+        let exp: u64 = query
+            .split('&')
+            .find_map(|p| p.strip_prefix("nora_exp="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let sig = download_signature(ZIP, exp);
+        let later = format!("nora_exp={}&nora_sig={sig}", exp + 1);
+        assert!(!download_signature_valid(ZIP, Some(&later)));
+        let tampered = format!("nora_exp={exp}&nora_sig={}0", &sig[..sig.len() - 1]);
+        assert!(!download_signature_valid(ZIP, Some(&tampered)));
+        assert!(!download_signature_valid(
+            ZIP,
+            Some(&format!("nora_exp={exp}"))
+        ));
+        assert!(!download_signature_valid(ZIP, None));
+        // Expired, though correctly signed.
+        let past = crate::cache_ttl::now_unix() - 1;
+        let expired = format!("nora_exp={past}&nora_sig={}", download_signature(ZIP, past));
+        assert!(!download_signature_valid(ZIP, Some(&expired)));
+        // Only provider package paths are ever admitted.
+        let meta = "/terraform/registry.terraform.io/hashicorp/null/index.json";
+        let q = format!("nora_exp={exp}&nora_sig={}", download_signature(meta, exp));
+        assert!(!download_signature_valid(meta, Some(&q)));
+        // URLs outside the download prefix are not touched.
+        let index =
+            "https://packages.example/terraform/registry.terraform.io/hashicorp/null/index.json";
+        assert_eq!(sign_download_url(index), index);
+    }
+
+    /// With auth on, the archive URL a mirror client gets is signed, and only that URL
+    /// downloads without credentials (Terraform sends none for a package).
+    #[tokio::test]
+    async fn signed_archive_url_downloads_without_credentials() {
+        let ctx = create_test_context_with_auth_and_config(&[("ci", "pw")], |cfg| {
+            cfg.terraform.enabled = true;
+        });
+        let storage = &ctx.state.storage;
+        storage
+            .put(
+                "terraform/providers/hashicorp/null/versions.json",
+                br#"{"versions":[{"version":"3.2.3","platforms":[{"os":"linux","arch":"amd64"}]}]}"#,
+            )
+            .await
+            .unwrap();
+        let meta =
+            format!(r#"{{"download_url":"http://localhost:4000{ZIP}","shasum":"deadbeef"}}"#);
+        storage
+            .put(
+                "terraform/providers/hashicorp/null/3.2.3/linux_amd64.json",
+                meta.as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                "terraform/download/hashicorp/null/3.2.3/terraform-provider-null_3.2.3_linux_amd64.zip",
+                b"zip-binary",
+            )
+            .await
+            .unwrap();
+
+        let version_json = "/terraform/registry.terraform.io/hashicorp/null/3.2.3.json";
+        assert_eq!(
+            send(&ctx.app, Method::GET, version_json, "").await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("ci:pw")
+        );
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            version_json,
+            vec![("authorization", &basic)],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let url = json["archives"]["linux_amd64"]["url"].as_str().unwrap();
+        let signed = &url[url.find(DOWNLOAD_PREFIX).unwrap()..];
+        assert!(
+            signed.starts_with(ZIP) && signed.contains("nora_sig="),
+            "{url}"
+        );
+
+        let resp = send(&ctx.app, Method::GET, signed, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"zip-binary");
+        assert_eq!(
+            send(&ctx.app, Method::GET, ZIP, "").await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn registry_dates_and_hiding() {
+        let now = crate::cache_ttl::now_unix() as i64;
+        let iso = |ts: i64| {
+            chrono::DateTime::from_timestamp(ts, 0)
+                .unwrap()
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string()
+        };
+        let v2 = serde_json::json!({"included": [
+            {"attributes": {"version": "1.0.0", "published-at": iso(now - 10 * 86400)}},
+            {"attributes": {"version": "1.1.0", "published-at": iso(now - 3600)}},
+            {"attributes": {"version": "1.2.0"}},
+        ]});
+        let dates = parse_registry_dates(&v2);
+        assert_eq!(dates.len(), 2);
+        assert!((dates["1.0.0"] - (now - 10 * 86400)).abs() <= 1);
+
+        let mut engine = crate::curation::CurationEngine::new(crate::config::CurationConfig {
+            mode: crate::config::CurationMode::Enforce,
+            ..Default::default()
+        });
+        engine.set_min_release_age(crate::curation::MinReleaseAgeFilter::new(3 * 86400, "3d"));
+        let mut versions = serde_json::json!({"versions": [
+            {"version": "1.0.0"}, {"version": "1.1.0"}, {"version": "1.2.0"}
+        ]});
+        drop_hidden_versions(&engine, "hashicorp/null", &mut versions, &dates);
+        let kept: Vec<_> = versions["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["version"].as_str().unwrap())
+            .collect();
+        // The young version is hidden; an undated one is left to the download gate.
+        assert_eq!(kept, ["1.0.0", "1.2.0"]);
     }
 }
