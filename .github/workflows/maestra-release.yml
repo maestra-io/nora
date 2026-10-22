@@ -69,7 +69,7 @@ jobs:
 
       - name: ECR login us-west-2
         id: ecr
-        uses: maestra-io/github-actions/push-to-aws-ecr-repository@b68a3d398ded49d3985408c9f56a2a5ba912ffb1 # v1.46.0
+        uses: maestra-io/github-actions/push-to-aws-ecr-repository@b6860e93f543e9167634066a8d27773f77ed8fb7 # v1.47.2
         with:
           awsRegion: us-west-2
           repositories: nora
