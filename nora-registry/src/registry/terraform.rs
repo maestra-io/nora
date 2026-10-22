@@ -4424,7 +4424,10 @@ mod maestra_tests {
         let sig = download_signature(ZIP, exp);
         let later = format!("nora_exp={}&nora_sig={sig}", exp + 1);
         assert!(!download_signature_valid(ZIP, Some(&later)));
-        let tampered = format!("nora_exp={exp}&nora_sig={}0", &sig[..sig.len() - 1]);
+        // Flip the last hex digit: a fixed replacement equals the real signature one time
+        // in sixteen (CI on #103, 22.10.2026).
+        let last = if sig.ends_with('0') { '1' } else { '0' };
+        let tampered = format!("nora_exp={exp}&nora_sig={}{last}", &sig[..sig.len() - 1]);
         assert!(!download_signature_valid(ZIP, Some(&tampered)));
         assert!(!download_signature_valid(
             ZIP,

@@ -294,10 +294,7 @@ async fn build(reg_type: RegistryType, state: &AppState) -> Option<Vec<RepoInfo>
         RegistryType::Raw => build_raw_index(storage).await,
         RegistryType::Nuget => build_nuget_index(state).await,
         RegistryType::Gems => build_gems_index(storage).await,
-        RegistryType::Terraform => {
-            let (p, s) = crate::registry::terraform::INDEX_PATTERN;
-            build_generic_index(storage, p, s).await
-        }
+        RegistryType::Terraform => build_terraform_index(storage).await,
         RegistryType::Ansible => {
             let (p, s) = crate::registry::ansible::INDEX_PATTERN;
             build_generic_index(storage, p, s).await
@@ -580,6 +577,40 @@ async fn build_raw_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     // Directories first (alphabetical), then files (alphabetical)
     result.sort_by(|a, b| a.is_file.cmp(&b.is_file).then_with(|| a.name.cmp(&b.name)));
     Some(result)
+}
+
+/// Terraform: provider packages live at `terraform/download/{ns}/{type}/{ver}/{file}.zip`
+/// (one zip per os/arch), so the repo is `{ns}/{type}` and the count is distinct
+/// versions. The generic builder took the first segment and showed one repo, "download".
+async fn build_terraform_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let (prefix, suffix) = crate::registry::terraform::INDEX_PATTERN;
+    let prefix = format!("{prefix}download/");
+    let keys = list_keys(storage, &prefix).await?;
+    let mut packages: HashMap<String, (std::collections::HashSet<String>, u64, u64)> =
+        HashMap::new();
+    for (key, meta) in &keys {
+        let Some(rest) = key.strip_prefix(&prefix).filter(|_| key.ends_with(suffix)) else {
+            continue;
+        };
+        let parts: Vec<&str> = rest.splitn(4, '/').collect();
+        // Only `{ns}/{type}/{ver}/{file}.zip`: a zip under an extra directory is not a
+        // provider package, and the detail page would reject it anyway.
+        if parts.len() < 4 || parts[3].contains('/') {
+            continue;
+        }
+        let entry = packages
+            .entry(format!("{}/{}", parts[0], parts[1]))
+            .or_insert_with(|| (std::collections::HashSet::new(), 0, 0));
+        entry.0.insert(parts[2].to_string());
+        entry.1 += meta.size;
+        entry.2 = entry.2.max(meta.modified);
+    }
+    Some(to_sorted_vec(
+        packages
+            .into_iter()
+            .map(|(k, (v, size, modified))| (k, (v.len(), size, modified)))
+            .collect(),
+    ))
 }
 
 /// Generic index builder: groups files under `prefix` by first path segment.
@@ -1037,6 +1068,38 @@ mod tests {
         assert_eq!(
             got,
             vec![("gpt2".to_string(), 1, 1), ("org/model".to_string(), 2, 8)]
+        );
+    }
+
+    /// Terraform repos are `{ns}/{type}`, counted by distinct version across os/arch zips.
+    #[tokio::test]
+    async fn terraform_index_groups_by_namespace_and_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for (key, body) in [
+            ("terraform/download/hashicorp/aws/5.0.0/terraform-provider-aws_5.0.0_linux_amd64.zip", &b"12345"[..]),
+            ("terraform/download/hashicorp/aws/5.0.0/terraform-provider-aws_5.0.0_darwin_arm64.zip", b"123"),
+            ("terraform/download/hashicorp/aws/5.1.0/terraform-provider-aws_5.1.0_linux_amd64.zip", b"1"),
+            ("terraform/download/cloudflare/cloudflare/4.0.0/x.zip", b"xx"),
+            ("terraform/providers/hashicorp/aws/versions.json", b"{}"),
+            ("terraform/download/broken.zip", b"x"),
+            ("terraform/download/hashicorp/aws/5.2.0/nested/x.zip", b"x"),
+        ] {
+            storage.put(key, body).await.unwrap();
+        }
+        let mut got: Vec<(String, usize, u64)> = build_terraform_index(&storage)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.name.clone(), r.versions, r.size))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("cloudflare/cloudflare".to_string(), 1, 2),
+                ("hashicorp/aws".to_string(), 2, 9)
+            ]
         );
     }
 
