@@ -1944,6 +1944,17 @@ impl ProxyFilter for NamespaceFilter {
 /// Supported formats: `"7d"` (days), `"24h"` (hours), `"1w"` (weeks).
 /// Multiple units can be combined: `"1w2d"` = 9 days.
 pub fn parse_duration(s: &str) -> Result<i64, String> {
+    match parse_duration_or_zero(s)? {
+        0 => Err("duration must be greater than zero".to_string()),
+        total => Ok(total),
+    }
+}
+
+/// [`parse_duration`] that also takes a zero (`"0d"`): `[curation.<registry>]
+/// min_release_age = "0d"` turns the age check off for that registry, global
+/// value or not (docker dates a proxied tag by NORA's own fetch, so any age
+/// holds its second pull).
+pub fn parse_duration_or_zero(s: &str) -> Result<i64, String> {
     if s.is_empty() {
         return Err("empty duration string".to_string());
     }
@@ -1983,10 +1994,6 @@ pub fn parse_duration(s: &str) -> Result<i64, String> {
             "trailing number '{}' without unit (use d/h/w)",
             num_buf
         ));
-    }
-
-    if total == 0 {
-        return Err("duration must be greater than zero".to_string());
     }
 
     Ok(total)
@@ -2191,8 +2198,11 @@ impl MinReleaseAgeFilter {
             else {
                 continue;
             };
-            if let Some(threshold) = parse(format!("curation.{rt}.min_release_age"), value) {
-                overrides.insert(rt, threshold);
+            match parse_duration_or_zero(value) {
+                Ok(secs) => {
+                    overrides.insert(rt, (secs, value.to_string()));
+                }
+                Err(e) => problems.push(format!("curation.{rt}.min_release_age=\"{value}\": {e}")),
             }
         }
         if default.is_none() && overrides.is_empty() {
@@ -2249,11 +2259,13 @@ impl MinReleaseAgeFilter {
     }
 
     /// The threshold (seconds) and its label for `registry`: a per-registry
-    /// override takes precedence over the global default; `None` when `registry` has no threshold of its own and there is no global one.
+    /// override takes precedence over the global default; `None` when `registry` has no threshold of its own and there is no global one,
+    /// or its own is zero (age check off).
     fn threshold(&self, registry: RegistryType) -> Option<(i64, &str)> {
         self.overrides
             .get(&registry)
             .or(self.default.as_ref())
+            .filter(|(secs, _)| *secs > 0)
             .map(|(secs, lbl)| (*secs, lbl.as_str()))
     }
 

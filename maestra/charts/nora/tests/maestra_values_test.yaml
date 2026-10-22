@@ -18,13 +18,13 @@ tests:
           pattern: '\[server\]\nhost = "0\.0\.0\.0"\nport = 4000\npublic_url = "https://packages\.maestra\.io"\nbody_limit_mb = 256\ninternal_port = 9100\nspool_dir = "/spool"\nspool_max_mb = 3584\ntrust_upstream_dates = true\n'
       - matchRegex:
           path: data["config.toml"]
-          pattern: '\[registries\]\nenable = \["nuget", "npm", "pypi"\]\n'
+          pattern: '\[registries\]\nenable = \["nuget", "npm", "pypi", "docker"\]\n'
       - matchRegex:
           path: data["config.toml"]
           pattern: '\[storage\]\nmode = "s3"\npath = "/data/storage"\ns3_url = "https://7409859d029eee9a1aa7b88360259e00\.r2\.cloudflarestorage\.com"\nbucket = "nora-packages-iota"\ns3_region = "auto"\ns3_credentials_dir = "/r2-creds"\n'
       - matchRegex:
           path: data["config.toml"]
-          pattern: '\[gc\]\nenabled = true\ninterval = 86400\nproxy_cache_max_bytes = 107374182400\n'
+          pattern: '\[gc\]\ndocker_proxy_cache_max_bytes = 322122547200\nenabled = true\ninterval = 86400\nproxy_cache_max_bytes = 107374182400\n'
       - matchRegex:
           path: data["config.toml"]
           pattern: '\[auth\]\nenabled = true\nhtpasswd_file = "/etc/nora/users\.htpasswd"\ntoken_storage = "/data/tokens"\nanonymous_read = false\ntrusted_proxies = "10\.60\.8\.0/24,10\.62\.0\.0/16"\nadmin_users = \["admin"\]\nhtpasswd_allowed_peers = "127\.0\.0\.1,::1"\n'
@@ -45,7 +45,13 @@ tests:
           pattern: '\[rate_limit\]\nenabled = true\nauth_rps = 1\nauth_burst = 5\nupload_rps = 200\nupload_burst = 500\ngeneral_rps = 100\ngeneral_burst = 200\n'
       - matchRegex:
           path: data["config.toml"]
-          pattern: '\[curation\]\nmode = "audit"\non_failure = "closed"\nmin_release_age = "7d"\nquarantine = "observe"\nquarantine_ttl = "7d"\ninternal_namespaces = \["maestra\.\*","@mindbox-cloud/\*","mindbox-ml-commons","python-mindbox-sdk","python-mindbox-chat-ast","mindbox-finance-mcp"\]\n\n\[curation\.nuget\]\nmin_release_age = "3d"\nquarantine_ttl = "3d"\n'
+          pattern: '\[curation\]\nmode = "audit"\non_failure = "closed"\nmin_release_age = "7d"\nquarantine = "observe"\nquarantine_ttl = "7d"\ninternal_namespaces = \["maestra\.\*","@mindbox-cloud/\*","mindbox-ml-commons","python-mindbox-sdk","python-mindbox-chat-ast","mindbox-finance-mcp"\]\n\n\[curation\.docker\]\nmin_release_age = "0d"\nquarantine = "observe"\nquarantine_ttl = "3d"\n\n\[curation\.nuget\]\nmin_release_age = "3d"\nquarantine_ttl = "3d"\n'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[docker\]\nproxy_timeout = 60\ndefault_action = "deny"\n\n\[\[docker\.upstreams\]\]\nurl = "https://registry-1\.docker\.io"\nprefix = "docker-hub"\nnamespace = "docker\.io"\nauth_env = "NORA_DOCKER_UPSTREAM_AUTH_0"\n\n\[\[docker\.upstreams\]\]\nurl = "https://ghcr\.io"\nprefix = "ghcr"\n\n\[\[docker\.upstreams\]\]\nurl = "https://registry\.k8s\.io"\nprefix = "k8s"\nnamespace = "registry\.k8s\.io"\n\n'
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'auth = '
 
   - it: scrapes /metrics on the internal port (R2-53)
     template: templates/servicemonitor.yaml
@@ -69,6 +75,28 @@ tests:
       - equal:
           path: spec.ingress[2].toPorts[0].ports[0].port
           value: "9100"
+
+  - it: passes the Docker Hub credential from its Secret, never through the ConfigMap
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: NORA_DOCKER_UPSTREAM_AUTH_0
+            valueFrom:
+              secretKeyRef:
+                name: nora-docker-hub
+                key: auth
+
+  - it: refuses an inline docker upstream credential
+    template: templates/deployment.yaml
+    set:
+      config.docker.upstreams:
+        - url: https://registry-1.docker.io
+          auth: "user:token"
+    asserts:
+      - failedTemplate:
+          errorPattern: "would put the credential in the ConfigMap"
 
   - it: keeps kubelet probes on the public port
     template: templates/deployment.yaml

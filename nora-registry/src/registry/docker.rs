@@ -5343,6 +5343,7 @@ mod integration_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: upstream.uri(),
                 auth: None,
+                auth_env: None,
                 namespace: None,
                 prefix: None,
             }];
@@ -5431,6 +5432,7 @@ mod integration_tests {
                     .map(|url| DockerUpstream {
                         url,
                         auth: None,
+                        auth_env: None,
                         namespace: None,
                         prefix: None,
                     })
@@ -5460,6 +5462,7 @@ mod integration_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
+                auth_env: None,
                 namespace: None,
                 prefix: None,
             }];
@@ -5594,6 +5597,7 @@ mod integration_tests {
         let upstream = |url: String, prefix: Option<&str>| DockerUpstream {
             url,
             auth: None,
+            auth_env: None,
             namespace: None,
             prefix: prefix.map(str::to_string),
         };
@@ -5721,6 +5725,7 @@ mod integration_tests {
         let upstream = DockerUpstream {
             url: server.uri(),
             auth: None,
+            auth_env: None,
             namespace: None,
             prefix: None,
         };
@@ -5837,6 +5842,7 @@ mod integration_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: uri,
                 auth: None,
+                auth_env: None,
                 namespace: None,
                 prefix: None,
             }];
@@ -5927,6 +5933,7 @@ mod integration_tests {
         let upstream = DockerUpstream {
             url: server.uri(),
             auth: None,
+            auth_env: None,
             namespace: None,
             prefix: None,
         };
@@ -6002,6 +6009,7 @@ mod integration_tests {
         let upstream = DockerUpstream {
             url: "http://127.0.0.1:9".to_string(),
             auth: None,
+            auth_env: None,
             namespace: None,
             prefix: None,
         };
@@ -6036,6 +6044,7 @@ mod integration_tests {
         let upstream = DockerUpstream {
             url: "http://127.0.0.1:9".to_string(),
             auth: None,
+            auth_env: None,
             namespace: None,
             prefix: None,
         };
@@ -6308,6 +6317,7 @@ mod integration_tests {
             let upstream = DockerUpstream {
                 url: server.uri(),
                 auth: None,
+                auth_env: None,
                 namespace: None,
                 prefix: None,
             };
@@ -6370,6 +6380,66 @@ mod integration_tests {
                 resp.status(),
                 expected,
                 "pushed {pushed_at}, manifest kept {manifest_kept}, proxied {proxied_at}"
+            );
+        }
+    }
+
+    /// The second pull of a proxied tag is dated by NORA's own first fetch, so a global
+    /// `min_release_age` holds it (403) until the tag is that old; `[curation.docker]
+    /// min_release_age = "0d"` turns the age check off for docker alone (200).
+    #[tokio::test]
+    async fn docker_zero_min_release_age_lets_the_second_pull_of_a_fresh_tag_through() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for (docker_age, expected) in [(None, StatusCode::FORBIDDEN), (Some("0d"), StatusCode::OK)]
+        {
+            use crate::config::DockerUpstream;
+            let upstream = DockerUpstream {
+                url: "http://127.0.0.1:9".to_string(),
+                auth: None,
+                auth_env: None,
+                namespace: None,
+                prefix: None,
+            };
+            let ns = upstream.resolved_namespace();
+            let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+                cfg.docker.upstreams = vec![upstream];
+                cfg.curation.mode = crate::config::CurationMode::Enforce;
+                cfg.curation.min_release_age = Some("7d".to_string());
+                cfg.curation.docker.min_release_age = docker_age.map(str::to_string);
+            });
+            let storage = &ctx.state.storage;
+            storage
+                .put(
+                    &super::manifest_key(Some(&ns), "corp/app", "1.0"),
+                    &table_manifest(UPSTREAM_CFG),
+                )
+                .await
+                .unwrap();
+            let cached = super::ImageMetadata {
+                push_timestamp: now,
+                ..Default::default()
+            };
+            storage
+                .put(
+                    &super::manifest_meta_key(Some(&ns), "corp/app", "1.0"),
+                    &serde_json::to_vec(&cached).unwrap(),
+                )
+                .await
+                .unwrap();
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                "/v2/corp/app/manifests/1.0",
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                expected,
+                "docker min_release_age {docker_age:?}"
             );
         }
     }
@@ -6784,6 +6854,7 @@ mod integration_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
+                auth_env: None,
                 namespace: Some("docker.io".into()),
                 prefix: None,
             }];
@@ -7255,6 +7326,7 @@ mod integration_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
+                auth_env: None,
                 namespace: Some("docker.io".into()),
                 prefix: None,
             }];
@@ -7335,6 +7407,7 @@ mod integration_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
+                auth_env: None,
                 namespace: Some("docker.io".into()),
                 prefix: None,
             }];
@@ -8594,6 +8667,7 @@ mod integration_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
+                auth_env: None,
                 namespace: None,
                 prefix: None,
             }];
@@ -8845,12 +8919,14 @@ mod integration_tests {
                 DockerUpstream {
                     url: "http://127.0.0.1:1".into(), // upstream A (will be tripped)
                     auth: None,
+                    auth_env: None,
                     namespace: None,
                     prefix: None,
                 },
                 DockerUpstream {
                     url: "http://127.0.0.1:2".into(), // upstream B (stays closed)
                     auth: None,
+                    auth_env: None,
                     namespace: None,
                     prefix: None,
                 },
@@ -8991,6 +9067,7 @@ mod integration_tests {
         let upstreams = vec![crate::config::DockerUpstream {
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
+            auth_env: None,
             namespace: Some("docker.io".to_string()),
             prefix: Some("docker-hub".to_string()),
         }];
@@ -9008,6 +9085,7 @@ mod integration_tests {
         let upstreams = vec![crate::config::DockerUpstream {
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
+            auth_env: None,
             namespace: Some("docker.io".to_string()),
             prefix: None,
         }];
@@ -9034,6 +9112,7 @@ mod integration_tests {
         let upstreams = vec![crate::config::DockerUpstream {
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
+            auth_env: None,
             namespace: Some("docker.io".to_string()),
             prefix: None,
         }];
@@ -9104,12 +9183,14 @@ mod integration_tests {
             crate::config::DockerUpstream {
                 url: "https://registry-1.docker.io".to_string(),
                 auth: None,
+                auth_env: None,
                 namespace: Some("docker.io".to_string()),
                 prefix: Some("docker-hub".to_string()),
             },
             crate::config::DockerUpstream {
                 url: "https://ghcr.io".to_string(),
                 auth: None,
+                auth_env: None,
                 namespace: Some("ghcr.io".to_string()),
                 prefix: Some("ghcr".to_string()),
             },
@@ -9138,12 +9219,14 @@ mod integration_tests {
             crate::config::DockerUpstream {
                 url: "https://registry-1.docker.io".to_string(),
                 auth: None,
+                auth_env: None,
                 namespace: Some("docker.io".to_string()),
                 prefix: Some("docker-hub".to_string()),
             },
             crate::config::DockerUpstream {
                 url: "https://ghcr.io".to_string(),
                 auth: None,
+                auth_env: None,
                 namespace: Some("ghcr.io".to_string()),
                 prefix: Some("ghcr".to_string()),
             },
@@ -9174,6 +9257,7 @@ mod integration_tests {
         let upstreams = vec![crate::config::DockerUpstream {
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
+            auth_env: None,
             namespace: Some("docker.io".to_string()),
             prefix: None,
         }];
@@ -9191,6 +9275,7 @@ mod integration_tests {
         let upstreams = vec![crate::config::DockerUpstream {
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
+            auth_env: None,
             namespace: Some("docker.io".to_string()),
             prefix: Some("hub".to_string()),
         }];
@@ -9242,6 +9327,7 @@ mod integration_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: upstream.uri(),
                 auth: None,
+                auth_env: None,
                 namespace: None,
                 prefix: None,
             }];
@@ -9326,6 +9412,7 @@ mod integration_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: upstream.uri(),
                 auth: None,
+                auth_env: None,
                 namespace: None,
                 prefix: None,
             }];
@@ -9381,6 +9468,7 @@ mod integration_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: upstream.uri(),
                 auth: None,
+                auth_env: None,
                 namespace: None,
                 prefix: None,
             }];
@@ -9502,6 +9590,7 @@ mod integration_tests {
             // Reserved port on localhost — connect fails fast, no real network.
             url: "http://127.0.0.1:9".to_string(),
             auth: None,
+            auth_env: None,
             namespace: None,
             prefix: None,
         }
@@ -9718,6 +9807,7 @@ mod stream_spool_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: upstream,
                 auth: None,
+                auth_env: None,
                 namespace: None,
                 prefix: None,
             }];
@@ -10112,6 +10202,7 @@ mod stream_spool_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: upstream,
                 auth: None,
+                auth_env: None,
                 namespace: None,
                 prefix: None,
             }];
@@ -10358,6 +10449,7 @@ mod upstream_resume_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url,
                 auth: None,
+                auth_env: None,
                 namespace: None,
                 prefix: None,
             }];
@@ -10644,6 +10736,7 @@ mod upstream_resume_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: upstream_url,
                 auth: None,
+                auth_env: None,
                 namespace: None,
                 prefix: None,
             }];
@@ -10963,6 +11056,7 @@ mod blob_single_flight_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url,
                 auth: None,
+                auth_env: None,
                 namespace: None,
                 prefix: None,
             }];
@@ -11350,6 +11444,7 @@ mod upstream_failure_cases {
                 cfg.docker.upstreams = vec![DockerUpstream {
                     url,
                     auth: None,
+                    auth_env: None,
                     namespace: None,
                     prefix: None,
                 }];
@@ -11393,6 +11488,7 @@ mod upstream_failure_edge_cases {
                 cfg.docker.upstreams = vec![DockerUpstream {
                     url,
                     auth: None,
+                    auth_env: None,
                     namespace: None,
                     prefix: None,
                 }];
@@ -11492,6 +11588,7 @@ mod hosted_pull_stats_and_re_push {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
+                auth_env: None,
                 namespace: Some("docker.io".into()),
                 prefix: None,
             }];
@@ -11608,6 +11705,7 @@ mod hosted_pull_stats_and_re_push {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
+                auth_env: None,
                 namespace: Some("docker.io".into()),
                 prefix: None,
             }];
@@ -11796,6 +11894,7 @@ mod hosted_pull_stats_every_writer_takes_the_lock {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
+                auth_env: None,
                 namespace: Some("docker.io".into()),
                 prefix: None,
             }];
@@ -12067,6 +12166,7 @@ mod hosted_pull_stats_after_a_delete {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
+                auth_env: None,
                 namespace: Some("docker.io".into()),
                 prefix: None,
             }];
@@ -12261,6 +12361,7 @@ mod manifest_before_metadata_one_lock_order {
                 vec![DockerUpstream {
                     url: "http://127.0.0.1:1".into(),
                     auth: None,
+                    auth_env: None,
                     namespace: Some("docker.io".into()),
                     prefix: None,
                 }]

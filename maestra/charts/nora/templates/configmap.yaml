@@ -59,12 +59,23 @@ data:
     {{- if or .Values.config.docker.upstreams .Values.config.docker.proxy_timeout }}
     [docker]
     proxy_timeout = {{ .Values.config.docker.proxy_timeout | default 60 }}
-    {{- range .Values.config.docker.upstreams }}
+    {{- with include "nora.tomlScalars" (omit .Values.config.docker "proxy_timeout" "upstreams") | trim }}
+    {{- . | nindent 4 }}
+    {{- end }}
+    {{- range $i, $u := .Values.config.docker.upstreams }}
+    {{- if $u.auth }}
+    {{- fail (printf "config.docker.upstreams[%d].auth would put the credential in the ConfigMap: use authSecret {name, key} (or auth_env)" $i) }}
+    {{- end }}
 
     [[docker.upstreams]]
-    url = {{ .url | quote }}
-    {{- if .auth }}
-    auth = {{ .auth | quote }}
+    url = {{ required "config.docker.upstreams[].url is required" $u.url | quote }}
+    {{- range $k := list "prefix" "namespace" }}
+    {{- with get $u $k }}
+    {{ $k }} = {{ . | quote }}
+    {{- end }}
+    {{- end }}
+    {{- with include "nora.docker.authEnv" (list $i $u) }}
+    auth_env = {{ . | quote }}
     {{- end }}
     {{- end }}
     {{- end }}

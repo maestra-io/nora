@@ -1002,6 +1002,7 @@ mod tests {
         config.docker.upstreams = vec![crate::config::DockerUpstream {
             url: "https://registry-1.docker.io".into(),
             auth: None,
+            auth_env: None,
             namespace: None,
             prefix: None,
         }];
@@ -1356,6 +1357,7 @@ mod integration_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url,
                 auth: None,
+                auth_env: None,
                 namespace: None,
                 prefix: None,
             }];

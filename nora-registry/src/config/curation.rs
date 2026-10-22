@@ -338,14 +338,17 @@ impl CurationConfig {
     /// in every mode (#1099): the quarantine fell back to 14 days on one without a
     /// word, and outside enforce mode an unparsable minimum age was only logged.
     pub fn duration_errors(&self) -> Vec<String> {
+        // (key, value, a zero turns it off): only a registry's own min_release_age.
         let mut durations = vec![
             (
                 "curation.min_release_age".to_string(),
                 self.min_release_age.as_deref(),
+                false,
             ),
             (
                 "curation.quarantine_ttl".to_string(),
                 self.quarantine_ttl.as_deref(),
+                false,
             ),
         ];
         for &rt in RegistryType::all() {
@@ -353,18 +356,25 @@ impl CurationConfig {
                 durations.push((
                     format!("curation.{rt}.min_release_age"),
                     section.min_release_age.as_deref(),
+                    true,
                 ));
                 durations.push((
                     format!("curation.{rt}.quarantine_ttl"),
                     section.quarantine_ttl.as_deref(),
+                    false,
                 ));
             }
         }
         durations
             .into_iter()
-            .filter_map(|(key, value)| {
+            .filter_map(|(key, value, zero_ok)| {
                 let value = value?;
-                let error = crate::curation::parse_duration(value).err()?;
+                let parsed = if zero_ok {
+                    crate::curation::parse_duration_or_zero(value)
+                } else {
+                    crate::curation::parse_duration(value)
+                };
+                let error = parsed.err()?;
                 Some(format!("{key}=\"{value}\" is not a duration: {error}"))
             })
             .collect()

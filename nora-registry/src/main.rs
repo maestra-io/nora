@@ -269,6 +269,7 @@ async fn gc_pass(
     grace_secs: u64,
     npm_is_proxy: bool,
     proxy_cache_max_bytes: u64,
+    docker_cache: (u64, &[String]),
     curation: &curation::CurationEngine,
 ) -> gc::GcResult {
     let result = gc::run_gc(
@@ -281,10 +282,37 @@ async fn gc_pass(
         curation,
     )
     .await;
-    if !dry_run && result.removed_anything() {
+    let docker = gc::evict_docker_proxy_cache(
+        storage,
+        publish_locks,
+        docker_cache.0,
+        docker_cache.1,
+        dry_run,
+    )
+    .await;
+    if !dry_run && (result.removed_anything() || docker.evicted_files > 0) {
         repo_index.invalidate_all();
     }
     result
+}
+
+/// Storage namespaces of the Docker upstreams (`docker/<ns>/` holds what each proxied),
+/// for `[gc] docker_proxy_cache_max_bytes`; none while Docker is disabled. Reads the
+/// resolved enable-set (`NORA_REGISTRIES_ENABLE`, `[registries].enable`), which `nora gc`
+/// never applies to `docker.enabled`.
+fn docker_proxy_namespaces(config: &config::Config) -> Vec<String> {
+    if !config
+        .enabled_registries_quiet()
+        .contains(&RegistryType::Docker)
+    {
+        return Vec::new();
+    }
+    config
+        .docker
+        .upstreams
+        .iter()
+        .map(|u| u.resolved_namespace())
+        .collect()
 }
 
 /// The line the GC scheduler logs when a pass ends. Files evicted by
@@ -1410,7 +1438,27 @@ async fn main() {
                 &curation,
             )
             .await;
+            let docker = gc::evict_docker_proxy_cache(
+                &storage,
+                &cli_publish_locks,
+                config.gc.docker_proxy_cache_max_bytes,
+                &docker_proxy_namespaces(&config),
+                dry_run,
+            )
+            .await;
             println!("GC Summary{}:", if dry_run { " (dry-run)" } else { "" });
+            if docker.evicted_files > 0 {
+                println!(
+                    "  Docker proxy cache: {} blobs, {} bytes {}",
+                    docker.evicted_files,
+                    docker.bytes_freed,
+                    if dry_run {
+                        "would be evicted"
+                    } else {
+                        "evicted"
+                    }
+                );
+            }
             println!("  Candidates:       {}", result.total_candidates);
             println!("  Orphaned:          {}", result.orphaned);
             println!("  Deleted:           {}", result.deleted);
@@ -2940,6 +2988,8 @@ async fn run_server(mut config: Config, storage: Storage) {
         let grace_secs = state.config.gc.grace_secs;
         let npm_is_proxy = !state.config.npm.upstream_urls().is_empty();
         let proxy_cache_max_bytes = state.config.gc.proxy_cache_max_bytes;
+        let docker_cache_max_bytes = state.config.gc.docker_proxy_cache_max_bytes;
+        let docker_namespaces = docker_proxy_namespaces(&state.config);
         let reloadable = Arc::clone(&state.reloadable);
         let repo_index = state.repo_index.clone();
         cleanup_passes.push(cleanup::CleanupPass {
@@ -2951,6 +3001,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                 // The current (SIGHUP-reloadable) internal namespaces, for eviction.
                 let curation = reloadable.load_full();
                 let repo_index = repo_index.clone();
+                let docker_namespaces = docker_namespaces.clone();
                 async move {
                     info!("GC scheduler: starting periodic run");
                     let result = gc_pass(
@@ -2961,6 +3012,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                         grace_secs,
                         npm_is_proxy,
                         proxy_cache_max_bytes,
+                        (docker_cache_max_bytes, &docker_namespaces),
                         &curation.curation_engine,
                     )
                     .await;
@@ -4076,6 +4128,33 @@ mod cleanup_pass_tests {
     //! A scheduled GC or retention pass that takes files out of the store marks the
     //! repository indexes stale: the dashboard counts what is there after the pass.
     use super::*;
+
+    /// `nora gc` never applies the enable-set to `docker.enabled`: Docker enabled only by
+    /// `[registries].enable` still has its proxy namespaces capped.
+    #[test]
+    fn docker_proxy_namespaces_follow_the_resolved_enable_set() {
+        let _env = crate::test_env::env_lock();
+        let mut config = Config::default();
+        config.docker.enabled = false;
+        config.docker.upstreams = vec![config::DockerUpstream {
+            url: "https://registry-1.docker.io".into(),
+            auth: None,
+            auth_env: None,
+            namespace: Some("docker.io".into()),
+            prefix: Some("docker-hub".into()),
+        }];
+        config.registries = Some(config::RegistriesSection {
+            enable: Some(config::EnableSpec::from_env_str("npm")),
+        });
+        assert!(docker_proxy_namespaces(&config).is_empty());
+        config.registries = Some(config::RegistriesSection {
+            enable: Some(config::EnableSpec::from_env_str("docker,npm")),
+        });
+        assert_eq!(
+            docker_proxy_namespaces(&config),
+            vec!["docker.io".to_string()]
+        );
+    }
     #[cfg(feature = "rpm")]
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -4138,6 +4217,7 @@ mod cleanup_pass_tests {
             0,
             false,
             300,
+            (0, &[]),
             &no_curation(),
         )
         .await;
@@ -4160,6 +4240,7 @@ mod cleanup_pass_tests {
             0,
             false,
             300,
+            (0, &[]),
             &no_curation(),
         )
         .await;
@@ -4426,6 +4507,7 @@ mod cleanup_pass_tests {
             0,
             false,
             300,
+            (0, &[]),
             &no_curation(),
         )
         .await;

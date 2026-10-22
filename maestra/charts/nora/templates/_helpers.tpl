@@ -138,3 +138,12 @@ valid TOML for strings, numbers, booleans and string arrays).
 {{ $k }} = {{ toJson $v }}
 {{- end }}
 {{- end }}
+
+{{/*
+Env var carrying the credential of docker upstream (list index upstream): the
+explicit auth_env, or NORA_DOCKER_UPSTREAM_AUTH_<index> filled from authSecret.
+*/}}
+{{- define "nora.docker.authEnv" -}}
+{{- $i := index . 0 }}{{- $u := index . 1 }}
+{{- if $u.authSecret }}NORA_DOCKER_UPSTREAM_AUTH_{{ $i }}{{- else if $u.auth_env }}{{ $u.auth_env }}{{- end }}
+{{- end }}

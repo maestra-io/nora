@@ -192,7 +192,7 @@ tests:
       config.docker.upstreams:
         - url: https://registry-1.docker.io
         - url: https://private.registry.io
-          auth: user:token
+          auth_env: PRIVATE_REGISTRY_AUTH
     asserts:
       - matchRegex:
           path: data["config.toml"]
@@ -202,7 +202,7 @@ tests:
           pattern: 'url = "https://registry-1\.docker\.io"'
       - matchRegex:
           path: data["config.toml"]
-          pattern: 'auth = "user:token"'
+          pattern: 'auth_env = "PRIVATE_REGISTRY_AUTH"'
 
   - it: renders retention rules
     set:

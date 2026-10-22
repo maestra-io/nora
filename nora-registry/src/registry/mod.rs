@@ -3434,6 +3434,7 @@ mod first_download_integrity {
                 c.docker.upstreams = vec![crate::config::DockerUpstream {
                     url: u,
                     auth: None,
+                    auth_env: None,
                     namespace: None,
                     prefix: None,
                 }];
@@ -3528,6 +3529,7 @@ mod first_download_integrity {
                 c.docker.upstreams = vec![crate::config::DockerUpstream {
                     url: u,
                     auth: None,
+                    auth_env: None,
                     namespace: None,
                     prefix: None,
                 }];
@@ -4589,6 +4591,7 @@ mod upstream_failure_matrix {
             .map(|url| DockerUpstream {
                 url,
                 auth: None,
+                auth_env: None,
                 namespace: None,
                 prefix: None,
             })

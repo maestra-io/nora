@@ -53,6 +53,10 @@ pub struct DockerUpstream {
     pub url: String,
     #[serde(default, skip_serializing)]
     pub auth: Option<ProtectedString>,
+    /// Name of the environment variable holding `user:token` for this upstream, read at
+    /// startup into `auth` (keeps the credential out of config.toml / the ConfigMap).
+    #[serde(default)]
+    pub auth_env: Option<String>,
     #[serde(default)]
     pub namespace: Option<String>,
     #[serde(default)]
@@ -105,6 +109,7 @@ fn default_docker_upstreams() -> Vec<DockerUpstream> {
     vec![DockerUpstream {
         url: "https://registry-1.docker.io".to_string(),
         auth: None,
+        auth_env: None,
         namespace: None,
         prefix: None,
     }]
@@ -183,6 +188,7 @@ impl DockerConfig {
                     DockerUpstream {
                         url: parts[0].to_string(),
                         auth,
+                        auth_env: None,
                         namespace: None,
                         prefix,
                     }
@@ -193,6 +199,15 @@ impl DockerConfig {
                     "Docker upstream credentials passed via NORA_DOCKER_PROXIES environment variable. \
                      For production use config.toml with [[docker.upstreams]] and mount credentials from a Kubernetes Secret."
                 );
+            }
+        }
+        // `auth_env` credentials are read once, here; validation rejects a missing one.
+        for upstream in &mut self.upstreams {
+            if let Some(var) = &upstream.auth_env {
+                upstream.auth = env::var(var)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(ProtectedString::from);
             }
         }
     }

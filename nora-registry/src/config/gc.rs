@@ -34,6 +34,13 @@ pub struct GcConfig {
     /// Env: `NORA_GC_PROXY_CACHE_MAX_BYTES`.
     #[serde(default)]
     pub proxy_cache_max_bytes: u64,
+    /// Maximum bytes for Docker image layers cached from an upstream (under
+    /// `docker/<upstream namespace>/`); pushed images are never evicted. Separate from
+    /// `proxy_cache_max_bytes` so image layers never evict package files. Oldest-cached
+    /// blobs go first; an evicted layer is fetched again on its next pull. 0 = disabled
+    /// (default). Env: `NORA_GC_DOCKER_PROXY_CACHE_MAX_BYTES`.
+    #[serde(default)]
+    pub docker_proxy_cache_max_bytes: u64,
 }
 
 fn default_gc_interval() -> u64 {
@@ -56,6 +63,7 @@ impl Default for GcConfig {
             dry_run: false,
             grace_secs: default_gc_grace(),
             proxy_cache_max_bytes: 0,
+            docker_proxy_cache_max_bytes: 0,
         }
     }
 }
@@ -80,6 +88,13 @@ impl GcConfig {
                 "NORA_GC_PROXY_CACHE_MAX_BYTES",
                 &val,
                 &mut self.proxy_cache_max_bytes,
+            );
+        }
+        if let Ok(val) = env::var("NORA_GC_DOCKER_PROXY_CACHE_MAX_BYTES") {
+            super::parse_env_warn(
+                "NORA_GC_DOCKER_PROXY_CACHE_MAX_BYTES",
+                &val,
+                &mut self.docker_proxy_cache_max_bytes,
             );
         }
     }
