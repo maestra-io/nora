@@ -812,6 +812,23 @@ pub async fn leak_detection_middleware(
         None => haystack,
     };
 
+    // Docker manifests: the only fields a client follows are descriptor `urls`
+    // (layers, config, index entries). Annotations such as
+    // `org.opencontainers.image.base.name: gcr.io/distroless/…` are text and name
+    // an upstream in nearly every distroless-based image (NoraUpstreamUrlLeak on
+    // ghcr/cloudnative-pg, 22.10.2026). Not JSON → scan the raw bytes (over-report).
+    let urls_only: Vec<u8>;
+    let haystack = match (detect_registry(&path) == "docker" && path.contains("/manifests/"))
+        .then(|| docker_manifest_urls(haystack))
+        .flatten()
+    {
+        Some(b) => {
+            urls_only = b;
+            &urls_only[..]
+        }
+        None => haystack,
+    };
+
     if let Some((registry, hostname)) = state.leak_finders.scan(haystack) {
         UPSTREAM_URL_LEAK_TOTAL.with_label_values(&[registry]).inc();
         tracing::warn!(
@@ -839,6 +856,42 @@ fn strip_npm_readmes(body: &[u8]) -> Option<Vec<u8>> {
         }
     }
     serde_json::to_vec(&doc).ok()
+}
+
+/// Every `urls` entry of a Docker/OCI manifest or index, newline-joined: the
+/// descriptor fields a client dereferences (layers, config, manifests). Annotations
+/// and media types are text. None when the body is not a JSON object.
+fn docker_manifest_urls(body: &[u8]) -> Option<Vec<u8>> {
+    let doc: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = doc.as_object()?;
+    let mut out = Vec::new();
+    let mut push_urls = |d: &serde_json::Value| {
+        for u in d
+            .get("urls")
+            .and_then(|u| u.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Some(u) = u.as_str() {
+                out.extend_from_slice(u.as_bytes());
+                out.push(b'\n');
+            }
+        }
+    };
+    if let Some(c) = obj.get("config") {
+        push_urls(c);
+    }
+    for key in ["layers", "manifests"] {
+        for d in obj
+            .get(key)
+            .and_then(|l| l.as_array())
+            .into_iter()
+            .flatten()
+        {
+            push_urls(d);
+        }
+    }
+    Some(out)
 }
 
 /// Decompress gzip bytes; returns None on failure or if decompressed size exceeds limit.
@@ -1014,6 +1067,30 @@ mod tests {
         let (registry, hostname) = result.unwrap();
         assert_eq!(registry, "nuget");
         assert_eq!(hostname, "api.nuget.org");
+    }
+
+    /// A base-image annotation names gcr.io in nearly every distroless image; only
+    /// descriptor `urls` reach a client (ghcr/cloudnative-pg index, 22.10.2026).
+    #[test]
+    fn docker_manifest_scans_only_descriptor_urls() {
+        let finders = LeakFinders::new(vec![("docker".to_string(), "gcr.io".to_string())]);
+        let index = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json",
+            "manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aa","size":1,"platform":{"os":"linux","architecture":"amd64"}}],
+            "annotations":{"org.opencontainers.image.base.name":"gcr.io/distroless/static-debian13:nonroot@sha256:e2e9"}}"#;
+        assert!(
+            finders.scan(index).is_some(),
+            "the raw body does name gcr.io"
+        );
+        let urls = docker_manifest_urls(index).unwrap();
+        assert!(finders.scan(&urls).is_none());
+
+        let foreign_layer = br#"{"schemaVersion":2,"config":{"digest":"sha256:cc","size":1},
+            "layers":[{"digest":"sha256:bb","size":1,"urls":["https://gcr.io/v2/foo/blobs/sha256:bb"]}]}"#;
+        let urls = docker_manifest_urls(foreign_layer).unwrap();
+        assert_eq!(finders.scan(&urls), Some(("docker", "gcr.io")));
+
+        assert!(docker_manifest_urls(b"not json").is_none());
+        assert!(docker_manifest_urls(b"[1,2]").is_none());
     }
 
     #[test]
