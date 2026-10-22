@@ -369,6 +369,8 @@ pub struct Config {
     #[serde(default)]
     pub hf: HfConfig,
     #[serde(default)]
+    pub helm: HelmConfig,
+    #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -424,6 +426,7 @@ pub(crate) fn legacy_enable_var(rt: RegistryType) -> &'static str {
         RegistryType::Deb => "NORA_DEB_ENABLED",
         RegistryType::Cpan => "NORA_CPAN_ENABLED",
         RegistryType::HuggingFace => "NORA_HF_ENABLED",
+        RegistryType::Helm => "NORA_HELM_ENABLED",
     }
 }
 
@@ -445,7 +448,8 @@ pub(crate) fn release_date_check(rt: RegistryType) -> ReleaseDateCheck {
         | RegistryType::Ansible
         | RegistryType::Nuget
         | RegistryType::PubDart
-        | RegistryType::Conan => ReleaseDateCheck::Dated,
+        | RegistryType::Conan
+        | RegistryType::Helm => ReleaseDateCheck::Dated,
     }
 }
 
@@ -628,6 +632,7 @@ impl Config {
                 RegistryType::Deb => self.deb.enabled = on,
                 RegistryType::Cpan => self.cpan.enabled = on,
                 RegistryType::HuggingFace => self.hf.enabled = on,
+                RegistryType::Helm => self.helm.enabled = on,
             }
         }
     }
@@ -686,6 +691,9 @@ impl Config {
         if self.hf.enabled {
             set.insert(RegistryType::HuggingFace);
         }
+        if self.helm.enabled {
+            set.insert(RegistryType::Helm);
+        }
         if set.is_empty() {
             tracing::warn!("No registries enabled! All registries are disabled.");
         }
@@ -741,6 +749,7 @@ impl Config {
             RegistryType::Deb => self.deb.enabled && !self.deb.proxies.is_empty(),
             RegistryType::Cpan => self.cpan.enabled && self.cpan.proxy.is_some(),
             RegistryType::HuggingFace => self.hf.enabled && self.hf.proxy.is_some(),
+            RegistryType::Helm => self.helm.enabled && !self.helm.proxies.is_empty(),
         }
     }
 
@@ -782,6 +791,7 @@ impl Config {
             // nothing in it enforces a quarantine; counting it would be the same phantom
             // control as Raw.
             RegistryType::HuggingFace => return QuarantineMode::Off,
+            RegistryType::Helm => self.curation.helm.quarantine.as_ref(),
         };
         per.or(global).cloned().unwrap_or(QuarantineMode::Off)
     }
@@ -1022,6 +1032,8 @@ impl Config {
         }
 
         // RPM/DEB per-repo proxies: BTreeMap<repo, RepoProxyEntry>
+        // Not helm: an index names its upstream host as content (a dependency's
+        // `repository`, a chart's `home`), while every chart URL NORA serves is rewritten.
         for (name, proxies) in [("rpm", &self.rpm.proxies), ("deb", &self.deb.proxies)] {
             for entry in proxies.values() {
                 if let Some(host) = extract_host(entry.url()) {
@@ -1454,6 +1466,28 @@ impl Config {
             ));
         }
 
+        // A helm repo is served at `/helm/<name>/`: the name is one plain path segment,
+        // and `trust_created` can only name a configured repo.
+        for name in self.helm.proxies.keys() {
+            if name.is_empty()
+                || name.starts_with('.')
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            {
+                errors.push(format!(
+                    "helm.proxies name {name:?} is not a plain path segment (letters, digits, '-', '_', '.')"
+                ));
+            }
+        }
+        for name in &self.helm.trust_created {
+            if !self.helm.proxies.contains_key(name) {
+                warnings.push(format!(
+                    "helm.trust_created names {name:?}, which is not in [helm.proxies]: it trusts nothing"
+                ));
+            }
+        }
+
         // 8b. Per-registry `allow` entries (Maestra fork): an entry nora cannot read
         // exempts nothing (the versions it meant stay held), so it is a warning and
         // is refused under NORA_CONFIG_STRICT. `*` alone, an empty prefix, a `*`
@@ -1715,6 +1749,7 @@ impl Config {
         self.deb.apply_env_overrides();
         self.cpan.apply_env_overrides();
         self.hf.apply_env_overrides();
+        self.helm.apply_env_overrides();
 
         // Rate limit, GC, retention
         self.rate_limit.apply_env_overrides();
@@ -3049,7 +3084,12 @@ proxies = [
         }
         assert_eq!(
             maps,
-            ["circuit_breaker.overrides", "deb.proxies", "rpm.proxies"],
+            [
+                "circuit_breaker.overrides",
+                "deb.proxies",
+                "helm.proxies",
+                "rpm.proxies"
+            ],
             "only name-keyed maps may refuse a typo key; a struct here hides its typos"
         );
     }
@@ -4448,6 +4488,7 @@ proxies = [
             &mut config.curation.rpm,
             &mut config.curation.deb,
             &mut config.curation.cpan,
+            &mut config.curation.helm,
         ] {
             o.quarantine = Some(QuarantineMode::Off);
         }
@@ -4664,6 +4705,7 @@ proxies = [
             (RegistryType::Deb, NoNameOrDate),
             (RegistryType::Cpan, NoDate),
             (RegistryType::HuggingFace, NoDate),
+            (RegistryType::Helm, Dated),
         ];
         assert_eq!(expected.len(), RegistryType::all().len());
         for (rt, check) in expected {
@@ -4693,6 +4735,7 @@ proxies = [
             (RegistryType::Rpm, "[rpm]\nenabled = true\n[rpm.proxies]\nfedora = \"https://repo.example.com/fedora\"\n", none),
             (RegistryType::Deb, "[deb]\nenabled = true\n[deb.proxies]\ndebian = \"https://deb.debian.org/debian\"\n", none),
             (RegistryType::Cpan, "[cpan]\nenabled = true\nproxy = \"https://www.cpan.org\"\n", none),
+            (RegistryType::Helm, "[helm]\nenabled = true\n[helm.proxies]\njetstack = \"https://charts.jetstack.io\"\n", none),
         ]
     }
 
@@ -4718,6 +4761,7 @@ proxies = [
             RegistryType::Cpan => (c.cpan.enabled, c.cpan.proxy) = (true, None),
             RegistryType::Raw => c.raw.enabled = true,
             RegistryType::HuggingFace => (c.hf.enabled, c.hf.proxy) = (true, None),
+            RegistryType::Helm => (c.helm.enabled, c.helm.proxies) = (true, Default::default()),
         }
     }
 
@@ -4741,6 +4785,7 @@ proxies = [
             RegistryType::Cpan => c.cpan.enabled = false,
             RegistryType::Raw => c.raw.enabled = false,
             RegistryType::HuggingFace => c.hf.enabled = false,
+            RegistryType::Helm => c.helm.enabled = false,
         }
     }
 
@@ -5156,6 +5201,7 @@ proxies = [
             RegistryType::Deb => Some("DEB"),
             RegistryType::Cpan => Some("CPAN"),
             RegistryType::HuggingFace => None,
+            RegistryType::Helm => Some("HELM"),
         }
     }
 

@@ -13,6 +13,7 @@ pub mod docker;
 pub mod docker_auth;
 pub(crate) mod gems;
 mod go;
+pub(crate) mod helm;
 pub(crate) mod hf;
 mod maven;
 pub(crate) mod npm;
@@ -41,6 +42,7 @@ pub use docker::routes as docker_routes;
 pub use docker_auth::DockerAuth;
 pub use gems::routes as gems_routes;
 pub use go::routes as go_routes;
+pub use helm::routes as helm_routes;
 pub use hf::routes as hf_routes;
 pub use maven::routes as maven_routes;
 pub use npm::routes as npm_routes;
@@ -4709,6 +4711,7 @@ mod curation_label_whitelist {
         ("docker.rs", RegistryType::Docker, include_str!("docker.rs")),
         ("gems.rs", RegistryType::Gems, include_str!("gems.rs")),
         ("go.rs", RegistryType::Go, include_str!("go.rs")),
+        ("helm.rs", RegistryType::Helm, include_str!("helm.rs")),
         ("hf.rs", RegistryType::HuggingFace, include_str!("hf.rs")),
         ("maven.rs", RegistryType::Maven, include_str!("maven.rs")),
         ("npm.rs", RegistryType::Npm, include_str!("npm.rs")),
