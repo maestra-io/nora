@@ -297,9 +297,14 @@ async fn gc_pass(
 }
 
 /// Storage namespaces of the Docker upstreams (`docker/<ns>/` holds what each proxied),
-/// for `[gc] docker_proxy_cache_max_bytes`; none while Docker is disabled.
+/// for `[gc] docker_proxy_cache_max_bytes`; none while Docker is disabled. Reads the
+/// resolved enable-set (`NORA_REGISTRIES_ENABLE`, `[registries].enable`), which `nora gc`
+/// never applies to `docker.enabled`.
 fn docker_proxy_namespaces(config: &config::Config) -> Vec<String> {
-    if !config.docker.enabled {
+    if !config
+        .enabled_registries_quiet()
+        .contains(&RegistryType::Docker)
+    {
         return Vec::new();
     }
     config
@@ -4123,6 +4128,33 @@ mod cleanup_pass_tests {
     //! A scheduled GC or retention pass that takes files out of the store marks the
     //! repository indexes stale: the dashboard counts what is there after the pass.
     use super::*;
+
+    /// `nora gc` never applies the enable-set to `docker.enabled`: Docker enabled only by
+    /// `[registries].enable` still has its proxy namespaces capped.
+    #[test]
+    fn docker_proxy_namespaces_follow_the_resolved_enable_set() {
+        let _env = crate::test_env::env_lock();
+        let mut config = Config::default();
+        config.docker.enabled = false;
+        config.docker.upstreams = vec![config::DockerUpstream {
+            url: "https://registry-1.docker.io".into(),
+            auth: None,
+            auth_env: None,
+            namespace: Some("docker.io".into()),
+            prefix: Some("docker-hub".into()),
+        }];
+        config.registries = Some(config::RegistriesSection {
+            enable: Some(config::EnableSpec::from_env_str("npm")),
+        });
+        assert!(docker_proxy_namespaces(&config).is_empty());
+        config.registries = Some(config::RegistriesSection {
+            enable: Some(config::EnableSpec::from_env_str("docker,npm")),
+        });
+        assert_eq!(
+            docker_proxy_namespaces(&config),
+            vec!["docker.io".to_string()]
+        );
+    }
     #[cfg(feature = "rpm")]
     use std::time::{Duration, UNIX_EPOCH};
 

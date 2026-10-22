@@ -512,7 +512,7 @@ impl Config {
 
     /// [`Self::enabled_registries`] without logging: `load` resolves it before validation,
     /// and `main` logs the selection once at start.
-    fn enabled_registries_quiet(&self) -> HashSet<RegistryType> {
+    pub(crate) fn enabled_registries_quiet(&self) -> HashSet<RegistryType> {
         self.resolve_enabled_registries(env::var("NORA_REGISTRIES_ENABLE").ok(), false)
     }
 

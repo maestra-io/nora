@@ -1489,7 +1489,14 @@ pub async fn evict_docker_proxy_cache(
     };
     let proxy_files = entries
         .into_iter()
-        .filter(|(key, _)| key.contains("/blobs/") && prefixes.iter().any(|p| key.starts_with(p)))
+        // `docker/<ns>/<repo…>/blobs/…`: a repository after the namespace, so a pushed image
+        // named like the namespace (`docker/<ns>/blobs/…`) is never taken for a proxied one.
+        .filter(|(key, _)| {
+            prefixes.iter().any(|p| {
+                key.strip_prefix(p.as_str())
+                    .is_some_and(|rest| rest.contains("/blobs/"))
+            })
+        })
         .map(|(key, meta)| (key, meta.size, meta.modified))
         .collect();
     evict_oldest(
@@ -3933,8 +3940,16 @@ mod tests {
         // Proxied manifest, a pushed image and an unconfigured namespace: never candidates.
         let manifest = "docker/docker.io/library/alpine/manifests/3.20.json";
         let pushed = "docker/team/app/blobs/sha256:".to_string() + &"a".repeat(64);
+        // A pushed image named like an upstream namespace: its blobs sit right under it.
+        let pushed_ns_named = "docker/docker.io/blobs/sha256:".to_string() + &"b".repeat(64);
         let other = blob("quay.io", 9);
-        for key in [manifest, pushed.as_str(), other.as_str()] {
+        let kept = [
+            manifest,
+            pushed.as_str(),
+            pushed_ns_named.as_str(),
+            other.as_str(),
+        ];
+        for key in kept {
             put_aged(&storage, &data, key, 1000, 0).await;
         }
         let namespaces = ["docker.io".to_string(), "ghcr.io".to_string()];
@@ -3962,7 +3977,7 @@ mod tests {
         assert!(storage.get(&blob("docker.io", 1)).await.is_err());
         assert!(storage.get(&blob("docker.io", 2)).await.is_ok());
         assert!(storage.get(&blob("ghcr.io", 3)).await.is_ok());
-        for key in [manifest, pushed.as_str(), other.as_str()] {
+        for key in kept {
             assert!(storage.get(key).await.is_ok(), "{key} kept");
         }
     }
