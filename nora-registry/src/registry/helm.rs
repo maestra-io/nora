@@ -236,7 +236,7 @@ fn same_origin(a: &str, b: &str) -> bool {
     }
 }
 
-/// The client for a chart on a host the upstream's index names: it never connects to a
+/// The client for every chart download: it never connects to a
 /// loopback, private, link-local or metadata address, on the first request or on any
 /// redirect hop (DNS pinned; the `nora import` guard, `crate::import::http`).
 fn guarded_client(state: &AppState) -> Result<&'static reqwest::Client, String> {
@@ -579,12 +579,12 @@ async fn chart(
         return StatusCode::NOT_FOUND.into_response();
     };
     // The upstream's credential goes to its own origin only, never to a host its index
-    // names; such a host is reached through the SSRF guard.
-    let own_origin = same_origin(&url, up.url());
-    let auth = own_origin
+    // names. Every chart, the upstream's own included, is fetched through the SSRF
+    // guard: an own-origin URL may still redirect to a private address.
+    let auth = same_origin(&url, up.url())
         .then(|| up.auth().map(UpstreamAuth::Basic))
         .flatten();
-    let client = if own_origin || state.config.helm.allow_private_chart_hosts {
+    let client = if state.config.helm.allow_private_chart_hosts {
         &state.http_client
     } else if crate::import::http::is_blocked_url_host(&url, false) {
         // An IP literal never reaches the guard's resolver: checked here.
@@ -594,7 +594,7 @@ async fn chart(
         match guarded_client(&state) {
             Ok(client) => client,
             Err(e) => {
-                tracing::error!(error = %e, "helm: no SSRF-guarded client, refusing a third-party chart host");
+                tracing::error!(error = %e, "helm: no SSRF-guarded client, refusing a chart");
                 return StatusCode::BAD_GATEWAY.into_response();
             }
         }
@@ -1016,6 +1016,8 @@ mod integration_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.helm.enabled = true;
             cfg.helm.proxies.insert("demo".into(), entry);
+            // mock upstreams listen on loopback
+            cfg.helm.allow_private_chart_hosts = true;
         });
         let resp = send(
             &ctx.app,
@@ -1109,6 +1111,40 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn an_own_origin_chart_cannot_redirect_nora_to_a_private_address() {
+        let files = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"one".to_vec()))
+            .expect(0)
+            .mount(&files)
+            .await;
+        let up = upstream(&index_yaml(&[("1.0.0", OLD, "demo-1.0.0.tgz", b"one")])).await;
+        Mock::given(method("GET"))
+            .and(path("/repo/demo-1.0.0.tgz"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/demo-1.0.0.tgz", files.uri())),
+            )
+            .mount(&up)
+            .await;
+        let entry = proxy(&up);
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.helm.enabled = true;
+            cfg.helm.proxies.insert("demo".into(), entry);
+        });
+        // The upstream's own chart goes through the guard as well (here it already
+        // refuses the loopback upstream; per-hop redirect checks: import::http).
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/helm/demo/charts/demo/demo-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
     async fn the_quarantine_holds_a_new_chart_and_hides_it_from_the_index() {
         let index = index_yaml(&[
             ("1.0.0", OLD, "demo-1.0.0.tgz", b"one"),
@@ -1124,6 +1160,8 @@ mod integration_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.helm.enabled = true;
             cfg.helm.proxies.insert("demo".into(), entry);
+            // mock upstreams listen on loopback
+            cfg.helm.allow_private_chart_hosts = true;
             cfg.curation.helm.quarantine = Some(QuarantineMode::Enforce);
             cfg.curation.helm.quarantine_ttl = Some("3d".into());
         });
@@ -1181,6 +1219,8 @@ mod integration_tests {
             let ctx = create_test_context_with_config(|cfg| {
                 cfg.helm.enabled = true;
                 cfg.helm.proxies.insert("demo".into(), entry);
+                // mock upstreams listen on loopback
+                cfg.helm.allow_private_chart_hosts = true;
                 if trusted {
                     cfg.helm.trust_created = vec!["demo".into()];
                 }
@@ -1231,6 +1271,8 @@ mod integration_tests {
                 cfg.helm.enabled = true;
                 cfg.helm.metadata_ttl = 0;
                 cfg.helm.proxies.insert("demo".into(), entry);
+                // mock upstreams listen on loopback
+                cfg.helm.allow_private_chart_hosts = true;
             });
             index_json(&ctx).await;
             let resp = send(&ctx.app, Method::GET, "/helm/demo/index.yaml", "").await;
@@ -1251,6 +1293,8 @@ mod integration_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.helm.enabled = true;
             cfg.helm.proxies.insert("demo".into(), entry);
+            // mock upstreams listen on loopback
+            cfg.helm.allow_private_chart_hosts = true;
         });
         let resp = send(
             &ctx.app,
@@ -1273,6 +1317,8 @@ mod integration_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.helm.enabled = true;
             cfg.helm.proxies.insert("demo".into(), entry);
+            // mock upstreams listen on loopback
+            cfg.helm.allow_private_chart_hosts = true;
             cfg.curation.internal_namespaces = vec!["demo".into()];
         });
         let resp = send(

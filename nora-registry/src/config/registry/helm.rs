@@ -30,9 +30,10 @@ pub struct HelmConfig {
     /// ory, crossplane), which would hold every version they have.
     #[serde(default)]
     pub trust_created: Vec<String>,
-    /// Let a chart URL the index names on another host than the upstream's reach
-    /// loopback, private and link-local addresses (off: such a fetch is refused, so a
-    /// compromised index cannot aim NORA at internal services).
+    /// Let chart downloads reach loopback, private and link-local addresses, on the
+    /// first request or any redirect hop (off: refused, so a compromised upstream or
+    /// index cannot aim NORA at internal services). Needed for an upstream on a
+    /// private address.
     #[serde(default)]
     pub allow_private_chart_hosts: bool,
 }

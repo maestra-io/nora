@@ -66,10 +66,11 @@ spec:
   it from the URL the cached upstream index names for that chart and version (never
   from client input; https only, plain http only from an upstream configured as http),
   refuses a body whose sha256 differs from the index `digest` (502, not cached), sends
-  the upstream credential only to the upstream's own origin, reaches any other host
-  through an SSRF guard (no loopback, private, link-local or metadata address, on the
-  first request or any redirect hop; `allow_private_chart_hosts = true` lifts it for a
-  lab), and caches it under
+  the upstream credential only to the upstream's own origin, downloads every chart
+  (the upstream's own included, which may redirect anywhere) through an SSRF guard (no
+  loopback, private, link-local or metadata address, on the first request or any
+  redirect hop; `allow_private_chart_hosts = true` lifts it for a lab or an upstream
+  on a private address), and caches it under
   `helm/charts/<chart>/<name>/`. A version with no `digest` in the index is left out
   of the served index and not fetched (seen 22.10.2026 only on a few pre-2021
   external-dns and metrics-server versions).
