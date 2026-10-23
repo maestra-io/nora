@@ -1889,14 +1889,42 @@ async fn upstream_metadata(
         if !cached_copy_trusted(state, path, key, name, None).await {
             continue;
         }
+        // Single-flight: a CI fleet asking for one big packument at once reads it from
+        // storage once, not once per client — 46 concurrent reads of a 39 MB `vite`
+        // packument held ~1.8 GB (OOM 2026-10-23). Only a successful read is shared: on
+        // any other outcome every caller reads, and answers, on its own as before.
+        let shared = if packument && state.config.server.proxy_coalesce {
+            let budget = crate::proxy_coalesce::follower_budget(state.config.npm.proxy_timeout);
+            state
+                .proxy_coalesce
+                // Its own metrics label: `npm` counts followers spared an upstream fetch.
+                .coalesced(
+                    &format!("cache-read:{key}"),
+                    "npm_cache",
+                    budget,
+                    || async {
+                        match cache_read(
+                            state.storage.get_verified(key).await,
+                            "npm",
+                            key,
+                            internal,
+                        ) {
+                            Ok(Some(outcome)) => Some(verified_data(outcome)),
+                            _ => None,
+                        }
+                    },
+                )
+                .await
+        } else {
+            None
+        };
+        if let Some(data) = shared {
+            cached = Some((data, key.to_string()));
+            break;
+        }
         match cache_read(state.storage.get_verified(key).await, "npm", key, internal) {
             Ok(Some(outcome)) => {
-                use nora_registry::verified::{verified_body, GateOutcome};
-                let data = match outcome {
-                    GateOutcome::Verified(blob) => verified_body(blob),
-                    GateOutcome::Unpinned(blob) => blob.into_inner(),
-                };
-                cached = Some((data, key.to_string()));
+                cached = Some((verified_data(outcome), key.to_string()));
                 break;
             }
             Ok(None) => {}
@@ -3565,6 +3593,15 @@ fn abbreviate_packument(doc: &serde_json::Value) -> Option<Vec<u8>> {
     out.insert("versions".to_string(), serde_json::Value::Object(versions));
 
     serde_json::to_vec(&serde_json::Value::Object(out)).ok()
+}
+
+/// The bytes of a cache read that passed its gate, pinned or not.
+fn verified_data(outcome: nora_registry::verified::GateOutcome) -> Bytes {
+    use nora_registry::verified::{verified_body, GateOutcome};
+    match outcome {
+        GateOutcome::Verified(blob) => verified_body(blob),
+        GateOutcome::Unpinned(blob) => blob.into_inner(),
+    }
 }
 
 /// The part of a packument the abbreviated form and the Q04 filter read: the
@@ -7983,6 +8020,77 @@ mod index_cost_tests {
         assert_eq!(packument_fetches().await, 1, "the tarball reuses the cache");
         assert_eq!(ops.calls("get", meta), 0, "{:?}", ops.snapshot());
         assert_eq!(ops.calls("get", "npm/pkg/upstream/dates.json"), 1);
+    }
+
+    /// OOM 2026-10-23: a CI fleet asking for one big cached packument at once reads it
+    /// from storage once — the followers share the leader's bytes, not one copy each.
+    #[tokio::test]
+    async fn concurrent_packument_requests_read_the_cache_once() {
+        assert_eq!(concurrent_packument_reads(true).await, 1, "one shared read");
+    }
+
+    /// The kill-switch `server.proxy_coalesce = false`: every request reads on its own.
+    #[tokio::test]
+    async fn concurrent_packument_reads_without_coalescing() {
+        assert_eq!(concurrent_packument_reads(false).await, 8, "one read each");
+    }
+
+    /// Storage reads of the packument for 8 concurrent abbreviated GETs, all overlapping
+    /// in a parked read; every client must get the same 200 document.
+    async fn concurrent_packument_reads(coalesce: bool) -> usize {
+        use crate::test_helpers::{body_bytes, create_test_context_with_storage_and_config};
+        use std::sync::Arc;
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.npm.proxy = Some("http://127.0.0.1:9".to_string());
+            cfg.npm.metadata_ttl = 3600;
+            cfg.server.proxy_coalesce = coalesce;
+        });
+        let meta = "npm/pkg/upstream/packument.json";
+        let packument = serde_json::json!({
+            "name": "pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": { "1.0.0": { "name": "pkg", "version": "1.0.0", "dist": {} } },
+            "time": { "1.0.0": iso_ago(30 * 86400) }
+        });
+        ctx.state
+            .storage
+            .put(meta, &serde_json::to_vec(&packument).unwrap())
+            .await
+            .unwrap();
+        ops.reset();
+        ops.stall_gets(Some(meta));
+
+        const M: usize = 8;
+        let app = Arc::new(ctx.app.clone());
+        let corgi = vec![("accept", "application/vnd.npm.install-v1+json")];
+        let handles: Vec<_> = (0..M)
+            .map(|_| {
+                let (app, corgi) = (Arc::clone(&app), corgi.clone());
+                tokio::spawn(async move {
+                    let resp = send_with_headers(&app, Method::GET, "/npm/pkg", corgi, "").await;
+                    (resp.status(), body_bytes(resp).await)
+                })
+            })
+            .collect();
+        // Every request reaches the read (a reader parks in it) before it is released.
+        for _ in 0..200 {
+            if ops.calls("get", meta) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        ops.stall_gets(None);
+
+        let mut bodies = std::collections::BTreeSet::new();
+        for handle in handles {
+            let (status, body) = handle.await.unwrap();
+            assert_eq!(status, StatusCode::OK);
+            bodies.insert(body.to_vec());
+        }
+        assert_eq!(bodies.len(), 1, "every client gets the same document");
+        ops.calls("get", meta)
     }
 
     /// R2-21: a publish that fails after its first write leaves nothing behind —
