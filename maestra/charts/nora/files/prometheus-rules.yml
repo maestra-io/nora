@@ -22,8 +22,12 @@ groups:
           summary: "NORA error rate above 5%"
 
       - alert: NoraHighLatency
+        # Only above 5 rps: at night traffic is ~2 rps, so the p99 is a handful of
+        # requests and one short storage stall fires it (23.10.2026, 7 slow npm
+        # requests at 2.1 rps). Every real incident ran at 7-413 rps.
         expr: >-
           histogram_quantile(0.99, sum by (le) (rate(nora_http_request_duration_seconds_bucket[5m]))) > 5
+          and on() sum(rate(nora_http_request_duration_seconds_count[5m])) > 5
         for: 5m
         labels:
           severity: warning

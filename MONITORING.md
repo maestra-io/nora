@@ -112,7 +112,7 @@ The dashboard includes a `registry` template variable to filter by specific prot
 | Alert | Fires when | Severity |
 |-------|------------|----------|
 | `NoraHighErrorRate` | 5xx share of `nora_http_requests_total` above 5% for 5m | warning |
-| `NoraHighLatency` | p99 of `nora_http_request_duration_seconds` above 5s for 5m | warning |
+| `NoraHighLatency` | p99 of `nora_http_request_duration_seconds` above 5s for 5m, while traffic is above 5 rps | warning |
 | `NoraCircuitBreakerOpen` | `nora_circuit_breaker_state == 1` for 1m | critical |
 | `NoraCacheLowHitRate` | hit share of `nora_cache_requests_total` below 50% for 15m | warning |
 | `NoraUpstreamUrlLeak` | any `nora_response_upstream_url_leak_total` increase for 5m (NuGet catalog0 `@id`s are not counted) | critical |
