@@ -3567,6 +3567,141 @@ fn abbreviate_packument(doc: &serde_json::Value) -> Option<Vec<u8>> {
     serde_json::to_vec(&serde_json::Value::Object(out)).ok()
 }
 
+/// The part of a packument the abbreviated form and the Q04 filter read: the
+/// [`INSTALL_V1_TOP_FIELDS`], `time`, and per version the [`INSTALL_V1_VERSION_FIELDS`].
+/// Everything else (readme, per-version descriptions, scripts, maintainers) is skipped
+/// while parsing, never built as a `Value`: a whole `vite` packument (39 MB) parsed into
+/// a `Value` held ~120 MB per request, and ~300 concurrent installs OOMKilled a 4Gi pod
+/// (2026-10-23). `None` when the body is not a JSON object, as a failed full parse.
+fn install_v1_view(data: &[u8]) -> Option<serde_json::Value> {
+    use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visitor};
+    use serde_json::{Map, Value};
+
+    /// A version manifest cut to the install-v1 fields. A manifest that is not an
+    /// object becomes `null`: `abbreviate_packument` skips it either way.
+    struct Manifest;
+    impl<'de> DeserializeSeed<'de> for Manifest {
+        type Value = Value;
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+            d.deserialize_any(self)
+        }
+    }
+    impl<'de> Visitor<'de> for Manifest {
+        type Value = Value;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a version manifest")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+            let mut kept = Map::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if INSTALL_V1_VERSION_FIELDS.contains(&key.as_str()) {
+                    let value = map.next_value::<Value>()?;
+                    kept.insert(key, value);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(Value::Object(kept))
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(Value::Null)
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+        fn visit_str<E>(self, _: &str) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+        fn visit_unit<E>(self) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+    }
+
+    /// `versions`: every version kept, each manifest cut by [`Manifest`]. Not an
+    /// object: kept as parsed, `abbreviate_packument` ignores it as before.
+    struct Versions;
+    impl<'de> DeserializeSeed<'de> for Versions {
+        type Value = Value;
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+            d.deserialize_any(self)
+        }
+    }
+    impl<'de> Visitor<'de> for Versions {
+        type Value = Value;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a versions map")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+            let mut versions = Map::new();
+            while let Some(version) = map.next_key::<String>()? {
+                let manifest = map.next_value_seed(Manifest)?;
+                versions.insert(version, manifest);
+            }
+            Ok(Value::Object(versions))
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(Value::Null)
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+        fn visit_str<E>(self, _: &str) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+        fn visit_unit<E>(self) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+    }
+
+    struct Packument;
+    impl<'de> Visitor<'de> for Packument {
+        type Value = Value;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a packument object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+            let mut out = Map::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "versions" {
+                    let versions = map.next_value_seed(Versions)?;
+                    out.insert(key, versions);
+                } else if key == "time" || INSTALL_V1_TOP_FIELDS.contains(&key.as_str()) {
+                    let value = map.next_value::<Value>()?;
+                    out.insert(key, value);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(Value::Object(out))
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_slice(data);
+    let doc = de.deserialize_map(Packument).ok()?;
+    de.end().ok()?;
+    Some(doc)
+}
+
 /// Q04 filter of a proxied packument: the curation engine and the package name.
 type HideYoung<'a> = Option<(&'a crate::curation::CurationEngine, &'a str)>;
 
@@ -3585,7 +3720,9 @@ fn packument_body(
 ) -> (Bytes, &'static str) {
     let install_v1 = wants_install_v1(headers);
     let hide = hide.filter(|(engine, _)| engine.metadata_filter_active());
-    let parsed = if install_v1 || hide.is_some() {
+    let parsed = if install_v1 {
+        install_v1_view(&data)
+    } else if hide.is_some() {
         serde_json::from_slice::<serde_json::Value>(&data).ok()
     } else {
         None
@@ -3666,6 +3803,72 @@ fn with_content_type(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The slim parse serves the same abbreviated packument as the whole-document parse,
+    /// with and without the Q04 filter, and never builds the skipped fields.
+    #[tokio::test]
+    async fn test_install_v1_view_matches_full_parse() {
+        use crate::test_helpers::create_test_context_with_config;
+        let ago = |secs: i64| {
+            (chrono::Utc::now() - chrono::Duration::seconds(secs))
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string()
+        };
+        let manifest = |v: &str| {
+            serde_json::json!({
+                "name": "pkg", "version": v, "description": "x".repeat(4096),
+                "readme": "r".repeat(4096), "scripts": { "test": "jest" },
+                "dependencies": { "a": "^1" }, "peerDependenciesMeta": { "b": { "optional": true } },
+                "engines": { "node": ">=18" }, "os": ["linux"], "cpu": ["x64"],
+                "dist": { "tarball": "https://registry.npmjs.org/pkg/-/pkg.tgz", "integrity": "sha512-x" },
+                "maintainers": [{ "name": "m" }], "_npmUser": { "name": "m" }
+            })
+        };
+        let packument = serde_json::json!({
+            "_id": "pkg", "_rev": "1-a", "name": "pkg", "readme": "R".repeat(65536),
+            "description": "d", "maintainers": [{ "name": "m" }], "users": { "u": true },
+            "dist-tags": { "latest": "1.1.0", "stable": "1.0.0" },
+            "modified": ago(3600),
+            "time": { "created": ago(90 * 86400), "modified": ago(3600),
+                      "1.0.0": ago(30 * 86400), "1.1.0": ago(3600) },
+            "versions": { "1.0.0": manifest("1.0.0"), "1.1.0": manifest("1.1.0"), "0.0.1": "broken" }
+        });
+        let data = serde_json::to_vec(&packument).unwrap();
+
+        let slim = install_v1_view(&data).unwrap();
+        assert!(slim.get("readme").is_none() && slim.get("_rev").is_none());
+        assert!(slim["versions"]["1.0.0"].get("readme").is_none());
+        assert!(slim["versions"]["1.0.0"].get("scripts").is_none());
+        assert_eq!(
+            abbreviate_packument(&slim),
+            abbreviate_packument(&serde_json::from_slice(&data).unwrap())
+        );
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+        });
+        let engine = &ctx.state.curation().curation_engine;
+        assert!(engine.metadata_filter_active());
+        let mut full: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        let mut slim = install_v1_view(&data).unwrap();
+        assert!(crate::metadata_filter::npm_packument(
+            engine, "pkg", &mut full
+        ));
+        assert!(crate::metadata_filter::npm_packument(
+            engine, "pkg", &mut slim
+        ));
+        let expected = abbreviate_packument(&full).unwrap();
+        assert_eq!(abbreviate_packument(&slim).unwrap(), expected);
+        let served: serde_json::Value = serde_json::from_slice(&expected).unwrap();
+        assert!(served["versions"].get("1.1.0").is_none());
+        assert_eq!(served["dist-tags"]["latest"], "1.0.0");
+
+        // Not an object, or not JSON: no view, the body is served unchanged as before.
+        assert!(install_v1_view(b"[1, 2]").is_none());
+        assert!(install_v1_view(b"{\"name\": ").is_none());
+        assert!(install_v1_view(b"{} trailing").is_none());
+    }
 
     #[test]
     fn test_rewrite_tarball_urls_regular_package() {
