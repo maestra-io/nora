@@ -15,7 +15,7 @@ history: frequencies unknown.
 
 | Alert | Expression | `for` | Meaning |
 |---|---|---|---|
-| `NoraHighLatency` | `histogram_quantile(0.99, sum by (le) (rate(nora_http_request_duration_seconds_bucket[5m]))) > 5` | 5m | p99 of all nora HTTP requests (every registry together) above 5s |
+| `NoraHighLatency` | `histogram_quantile(0.99, sum by (le) (rate(nora_http_request_duration_seconds_bucket[5m]))) > 5 and on() sum(rate(nora_http_request_duration_seconds_count[5m])) > 5` | 5m | p99 of all nora HTTP requests (every registry together) above 5s, only while nora serves more than 5 rps |
 
 Defined in `deploy/prometheus-rules.yml`, copied byte-for-byte to
 `maestra/charts/nora/files/prometheus-rules.yml` (CI `cmp`s them). The cluster gets
@@ -26,6 +26,10 @@ annotation change reaches the cluster only with the next nora release + fluxcd b
   top finite bucket is 10s, so **p99 = 10 means "≥ 10s"**, not 10s.
 - Normal p99 is **~2–2.5s**, p50 ~1ms (measured 10:00, 13:00, 15:16 UTC 12.10.2026).
 - The quantile is over all registries; one slow registry is enough to fire.
+- Below 5 rps the alert is muted: at night (~2 rps) seven slow requests made the p99 on
+  23.10.2026 (a ~3 min R2 stall, 00:57–01:00 UTC). A backtest over 12–22.10 kept every
+  real incident (lowest firing point 7 rps, 17.10). A storage outage at low traffic is
+  still caught by `NoraStorageUnreachable` and the storage error alerts.
 - An OOM restart resets the counters, so the alert **flaps**: on 12.10 it fired four
   times between 14:15 and 15:07 UTC (Rootly `pyaioJ`, `QH0utM`, `884gFi`, `be6MaV`).
   A resolve is not a recovery — check Step 1 before closing.
@@ -231,6 +235,7 @@ After the pod is Ready (`pod_of`), at least 10 minutes of traffic:
 
 | Date (UTC) | Object | Cause | Category | What helped | Thread |
 |---|---|---|---|---|---|
+| 23.10.2026 01:02–01:08 | nora `1.4.1-maestra.9`, iota node 03 | every R2 operation stalled for ~3 min (00:57–01:00: `get ok` 335 → 19/min, then 32 `get` errors at 01:01) while nora served only 2.1 rps; 7 of 421 npm requests > 10s made the global p99. CPU 0.025 cores, `eno5` rx ≤ 31 Mbit/s, no restart, no Cloudflare R2 incident; stall cause not established | low-traffic false positive | resolved on its own; rule now fires only above 5 rps | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1792717381201449> |
 | 21.10.2026 10:20–10:25 | nora `1.3.6-maestra.3`, iota node 02 | Renovate wave over ~15 frontend repos (09:51–10:19, ~70 `pr` runs of `mcf-build.yml`): `node_modules` was cached under the exact lockfile hash and `~/.npm` not at all, so every bump ran a full `npm ci` (2534 packages, 6 min). npm 176 rps, 99k tarballs and 66 GB from R2 in 10 min, all nora `cache_hit`; `eno5` rx 908 Mbit/s, npm p99 5.1s; CPU 0.007 core-s/request | network link saturated (client-side cache miss) | ended with the wave. github-actions#184: on a `node_modules` miss `mcf-build` and `npm-package-publish` restore `~/.npm/_cacache` by key prefix (RunsOn magic cache), so a new lockfile fetches only changed packages | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1792578041939979> |
 | 16–19.10.2026, 10 firings (16.10 ×1, 17.10 ×4, 18.10 ×3, 19.10 ×1) | nora `1.3.6-maestra.1/.2`, iota | the 1.3.6 release was built `--no-default-features` after nora#23 moved `mimalloc` into `default`: the image lost the allocator and the 12.10 musl malloc lock came back. CPU per request 0.004 → 0.03–0.07 core-s, `stime/utime` 4.6 on node 02, p99 ≥ 9s on NuGet bursts of only 15–25 rps while traffic itself had dropped 6–12× (170 → 12–28 GB/day) after the CI cache-mount sweep | allocator regression | nora#76: release and CI gates build `--no-default-features --features mimalloc`, Dockerfile refuses a binary without mimalloc; `1.3.6-maestra.3` (fluxcd#23672). Traffic side, same week: NuGet cache mount in ~180 repo Dockerfiles + test-job cache (github-actions #146/#147/#149/#151/#153): warm image legs 300 → 0.2 MB, test jobs 210 → 0 MB | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1792399381398669> |
 | 12.10.2026 16:05–16:10 | nora `1.3.3-maestra.10`, iota node 02 | NuGet CI burst up to 413 rps; every artifact read from R2 filled the node's 1 Gbit `eno5` (982 Mbit/s rx, 98%), responses 637 Mbit/s on `eno6`; CPU 1.5–1.8 cores, 0.006 core-s/request; 3.6–7 rps of NuGet > 10s, no 5xx | network link saturated | ended with the burst. Follow-up 13.10: Cilium bandwidth manager on iota (kubernetes-clusters#165) + 800M/800M pod quota (fluxcd#22471); verified with 2×16 parallel downloads from nodes 01/03: `eno5` rx ~805 Mbit/s, 256/256 OK | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1791821141024479> |
