@@ -575,6 +575,8 @@ pub struct OpCounts {
     log: std::sync::Mutex<Vec<(&'static str, String)>>,
     /// Listings under this prefix park (see [`stall_lists`](Self::stall_lists)).
     stalled_lists: tokio::sync::watch::Sender<Option<String>>,
+    /// Gets of this key park (see [`stall_gets`](Self::stall_gets)).
+    stalled_gets: tokio::sync::watch::Sender<Option<String>>,
 }
 
 impl OpCounts {
@@ -598,6 +600,17 @@ impl OpCounts {
     /// again with `None`: a listing that takes minutes, as a large registry's does on R2.
     pub fn stall_lists(&self, prefix: Option<&str>) {
         self.stalled_lists.send_replace(prefix.map(str::to_string));
+    }
+
+    /// Make every `get` of exactly `key` park after it is counted, until called again
+    /// with `None`: a slow read of a big object, so concurrent callers overlap in it.
+    pub fn stall_gets(&self, key: Option<&str>) {
+        self.stalled_gets.send_replace(key.map(str::to_string));
+    }
+
+    async fn wait_get_unstalled(&self, key: &str) {
+        let mut rx = self.stalled_gets.subscribe();
+        let _ = rx.wait_for(|k| k.as_deref() != Some(key)).await;
     }
 
     async fn wait_unstalled(&self, prefix: &str) {
@@ -700,6 +713,7 @@ impl crate::storage::StorageBackend for OpCountingBackend {
 
     async fn get(&self, key: &str) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
         self.counts.hit("get", key);
+        self.counts.wait_get_unstalled(key).await;
         self.inner.get(key).await
     }
 
