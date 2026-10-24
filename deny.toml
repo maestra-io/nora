@@ -27,6 +27,14 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    # crypto-bigint <0.7.6: non-constant-time operations. The only crypto-bigint
+    # in the lockfile is 0.5.5, transitive via pgp (rpgp) through cx448 and
+    # elliptic-curve 0.13 (p256/k256/p384/p521); the fix is only in 0.7.x, which
+    # elliptic-curve 0.13 cannot take. NORA's own pgp operation is index signing
+    # with an Ed25519 key (signing.rs), which never goes through crypto-bigint;
+    # the deb/rpm pgp verification is test-only. Remove when pgp moves to
+    # elliptic-curve 0.14 / crypto-bigint 0.7.
+    "RUSTSEC-2026-0387",
 ]
 
 [licenses]
