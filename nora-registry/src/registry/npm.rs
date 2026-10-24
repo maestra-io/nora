@@ -1523,6 +1523,13 @@ async fn published_state(storage: &crate::Storage, name: &str) -> Published {
         // read must not hand its name to an upstream.
         Ok(keys) if keys.is_empty() => {
             let key = published_packument_key(name);
+            // The record decides first: without one naming NORA the document cannot be one it
+            // assembled, whatever its bytes. The same key holds the upstream copy a release
+            // before 1.4.0 cached (`legacy_cache_key`), megabytes per package, and this runs
+            // on every proxied tarball, packument and audit name.
+            if !recorded_as_assembled(storage, &key).await {
+                return Published::No;
+            }
             match storage.get(&key).await {
                 Ok(data) if is_assembled_by_nora(storage, &key, &data).await => {
                     tracing::warn!(registry = "npm", package = %name, "npm: no published versions listed beside an assembled packument");
@@ -1583,6 +1590,17 @@ fn assembled_by_nora(record: Option<&str>, stored_digest: &str) -> bool {
         .is_some_and(|(origin, digest)| {
             origin == ASSEMBLED_BY_NORA && !digest.is_empty() && digest == stored_digest
         })
+}
+
+/// Whether the provenance record of `key` names [`ASSEMBLED_BY_NORA`]: the part of
+/// [`assembled_by_nora`] that needs neither the document nor its digest.
+async fn recorded_as_assembled(storage: &crate::Storage, key: &str) -> bool {
+    let record = storage.get(&origin_key(key)).await.ok();
+    record
+        .as_deref()
+        .and_then(|r| std::str::from_utf8(r).ok())
+        .and_then(|r| r.split_once('\n'))
+        .is_some_and(|(origin, _)| origin == ASSEMBLED_BY_NORA)
 }
 
 /// [`assembled_by_nora`] for the object at `key` holding `data`.
@@ -8020,6 +8038,71 @@ mod index_cost_tests {
         assert_eq!(packument_fetches().await, 1, "the tarball reuses the cache");
         assert_eq!(ops.calls("get", meta), 0, "{:?}", ops.snapshot());
         assert_eq!(ops.calls("get", "npm/pkg/upstream/dates.json"), 1);
+    }
+
+    /// OOM 2026-10-23: the upstream copy a release before 1.4.0 cached at
+    /// `npm/<name>/metadata.json` is never read to learn that a proxied package is not
+    /// published here: no provenance record names NORA, so nothing it holds could change
+    /// the answer. It was read in full on every tarball, packument and audit name.
+    #[tokio::test]
+    async fn legacy_upstream_copy_is_not_read_to_rule_out_a_published_package() {
+        use crate::test_helpers::create_test_context_with_storage_and_config;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let packument = serde_json::json!({
+            "name": "pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": { "1.0.0": { "name": "pkg", "version": "1.0.0", "dist": {} } },
+            "time": { "1.0.0": iso_ago(30 * 86400) }
+        });
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(packument.clone()))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pkg/-/pkg-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tgz".to_vec()))
+            .mount(&upstream)
+            .await;
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+            cfg.server.trust_upstream_dates = true;
+            // As in production: the audit body is screened for published names.
+            cfg.curation.internal_namespaces = vec!["@corp/*".to_string()];
+        });
+        // Cached by this release first, as on us-iota: the upstream copy sits at its
+        // current key, the old release's copy beside it.
+        let resp = send(&ctx.app, Method::GET, "/npm/pkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = send(&ctx.app, Method::GET, "/npm/pkg/-/pkg-1.0.0.tgz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let legacy = crate::registry::npm::legacy_cache_key("pkg");
+        ctx.state
+            .storage
+            .put(&legacy, &serde_json::to_vec(&packument).unwrap())
+            .await
+            .unwrap();
+
+        ops.reset();
+        let resp = send(&ctx.app, Method::GET, "/npm/pkg/-/pkg-1.0.0.tgz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = send(&ctx.app, Method::GET, "/npm/pkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/advisories/bulk",
+            r#"{"pkg":["1.0.0"]}"#,
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(ops.calls("get", &legacy), 0, "{:?}", ops.snapshot());
     }
 
     /// OOM 2026-10-23: a CI fleet asking for one big cached packument at once reads it
