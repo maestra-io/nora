@@ -3697,6 +3697,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             artifact_flights: crate::proxy_coalesce::InflightMap::new(),
             spool: ctx.state.spool.clone(),
             blob_flights: crate::proxy_coalesce::InflightMap::new(),
+            packument_memo: Arc::default(),
             digest_store: ctx.state.digest_store.clone(),
             signer: ctx.state.signer.clone(),
             leak_finders: ctx.state.leak_finders.clone(),
