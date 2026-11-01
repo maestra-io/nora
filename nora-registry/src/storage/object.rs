@@ -53,6 +53,49 @@ async fn bounded<T>(
     })
 }
 
+/// Cloudflare's edge, not R2 itself, sometimes answers a request with `409 Conflict` and a
+/// plain-text body `error code: 1001` (an edge DNS resolution error) for a few seconds.
+/// object_store maps every 409 to `AlreadyExists` and does not retry it, so a GET of a
+/// cached artifact became a 503 to the client and a conditional PUT read as «already
+/// there» (packages.maestra.io, 01.11.2026). A real conflict from R2 carries an S3 XML
+/// body, never this marker.
+const CF_EDGE_ERROR_MARKER: &str = "error code: 1001";
+/// Pauses before each retry of an edge error: four attempts in about 1.4 s.
+const EDGE_RETRY_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+];
+
+fn is_cf_edge_error(e: &object_store::Error) -> bool {
+    matches!(
+        e,
+        object_store::Error::AlreadyExists { .. } | object_store::Error::Generic { .. }
+    ) && e.to_string().contains(CF_EDGE_ERROR_MARKER)
+}
+
+/// [`bounded`], retried while the store answers a Cloudflare edge error. Each attempt
+/// gets the full `limit`; any other outcome is returned as is.
+async fn bounded_edge_retry<T, F, Fut>(limit: Duration, mut op: F) -> object_store::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = object_store::Result<T>>,
+{
+    let mut backoff = EDGE_RETRY_BACKOFF.iter();
+    loop {
+        match bounded(limit, op()).await {
+            Err(e) if is_cf_edge_error(&e) => match backoff.next() {
+                Some(pause) => {
+                    tracing::warn!(error = %e, "object store edge error, retrying");
+                    tokio::time::sleep(*pause).await;
+                }
+                None => return Err(e),
+            },
+            other => return other,
+        }
+    }
+}
+
 /// A LIST walk has no fixed size (its cost grows with the prefix), so it gets no total
 /// bound. Each next entry must arrive within `idle` instead: entries come a page at a
 /// time, so this bounds every page request, and a connection that goes silent mid-walk
@@ -470,9 +513,11 @@ impl StorageBackend for ObjectStorage {
             attributes: pin_attributes(sha256),
             ..Default::default()
         };
-        bounded(BODY_OP_TIMEOUT, self.store.put_opts(&path, payload, opts))
-            .await
-            .map_err(map_err)?;
+        bounded_edge_retry(BODY_OP_TIMEOUT, || {
+            self.store.put_opts(&path, payload.clone(), opts.clone())
+        })
+        .await
+        .map_err(map_err)?;
         Ok(())
     }
 
@@ -486,8 +531,11 @@ impl StorageBackend for ObjectStorage {
             ..Default::default()
         };
         let payload = PutPayload::from(data.clone());
-        match bounded(BODY_OP_TIMEOUT, self.store.put_opts(&path, payload, opts)).await {
+        let put = || self.store.put_opts(&path, payload.clone(), opts.clone());
+        match bounded_edge_retry(BODY_OP_TIMEOUT, put).await {
             Ok(_) => Ok(true),
+            // An edge error that outlived the retries is not an answer about the object.
+            Err(e) if is_cf_edge_error(&e) => Err(map_err(e)),
             Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
             // A store configured without conditional writes: check, then write.
             Err(object_store::Error::NotImplemented { .. }) => {
@@ -503,13 +551,13 @@ impl StorageBackend for ObjectStorage {
     async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
-        let result = match bounded(METADATA_OP_TIMEOUT, self.store.get(&path)).await {
+        let result = match bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get(&path)).await {
             Ok(result) => result,
             Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
                 // Fallback: try legacy _at_ encoding for pre-#534 data.
                 // Only needed when key contains @, since otherwise both schemes produce the same output.
                 let legacy_path = Path::from(encode_object_key_legacy(key));
-                bounded(METADATA_OP_TIMEOUT, self.store.get(&legacy_path))
+                bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get(&legacy_path))
                     .await
                     .map_err(map_err)?
             }
@@ -528,20 +576,22 @@ impl StorageBackend for ObjectStorage {
             ..Default::default()
         };
         let path = Path::from(encode_object_key(key));
-        let result = match bounded(METADATA_OP_TIMEOUT, self.store.get_opts(&path, head())).await {
-            Ok(r) => r,
-            Err(_) if key.contains('@') => {
-                // Fallback: try legacy _at_ encoding for pre-#534 data.
-                let legacy_path = Path::from(encode_object_key_legacy(key));
-                bounded(
-                    METADATA_OP_TIMEOUT,
-                    self.store.get_opts(&legacy_path, head()),
-                )
+        let result =
+            match bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get_opts(&path, head()))
                 .await
-                .ok()?
-            }
-            Err(_) => return None,
-        };
+            {
+                Ok(r) => r,
+                Err(_) if key.contains('@') => {
+                    // Fallback: try legacy _at_ encoding for pre-#534 data.
+                    let legacy_path = Path::from(encode_object_key_legacy(key));
+                    bounded_edge_retry(METADATA_OP_TIMEOUT, || {
+                        self.store.get_opts(&legacy_path, head())
+                    })
+                    .await
+                    .ok()?
+                }
+                Err(_) => return None,
+            };
         read_pin(&result.attributes)
     }
 
@@ -551,18 +601,19 @@ impl StorageBackend for ObjectStorage {
         // 404. So the object is looked up first, under the legacy `_at_` encoding too, as `get`
         // and `stat` do, and an absent one is NotFound here as well.
         let path = Path::from(encode_object_key(key));
-        let target = match bounded(METADATA_OP_TIMEOUT, self.store.head(&path)).await {
+        let target = match bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.head(&path)).await
+        {
             Ok(_) => path,
             Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
                 let legacy = Path::from(encode_object_key_legacy(key));
-                bounded(METADATA_OP_TIMEOUT, self.store.head(&legacy))
+                bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.head(&legacy))
                     .await
                     .map_err(map_err)?;
                 legacy
             }
             Err(e) => return Err(map_err(e)),
         };
-        bounded(METADATA_OP_TIMEOUT, self.store.delete(&target))
+        bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.delete(&target))
             .await
             .map_err(map_err)?;
         Ok(())
@@ -627,12 +678,12 @@ impl StorageBackend for ObjectStorage {
     async fn stat(&self, key: &str) -> Option<FileMeta> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
-        let meta = match bounded(METADATA_OP_TIMEOUT, self.store.head(&path)).await {
+        let meta = match bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.head(&path)).await {
             Ok(m) => m,
             Err(_) if key.contains('@') => {
                 // Fallback: try legacy _at_ encoding for pre-#534 data
                 let legacy_path = Path::from(encode_object_key_legacy(key));
-                bounded(METADATA_OP_TIMEOUT, self.store.head(&legacy_path))
+                bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.head(&legacy_path))
                     .await
                     .ok()?
             }
@@ -777,7 +828,7 @@ impl StorageBackend for ObjectStorage {
         // user metadata, so `dst` inherits the pin without re-writing it.
         let from_path = Path::from(encode_object_key(src));
         let to_path = Path::from(encode_object_key(dst));
-        bounded(BODY_OP_TIMEOUT, self.store.copy(&from_path, &to_path))
+        bounded_edge_retry(BODY_OP_TIMEOUT, || self.store.copy(&from_path, &to_path))
             .await
             .map_err(map_err)
     }
@@ -788,11 +839,11 @@ impl StorageBackend for ObjectStorage {
     ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
-        let result = match bounded(METADATA_OP_TIMEOUT, self.store.get(&path)).await {
+        let result = match bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get(&path)).await {
             Ok(r) => r,
             Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
                 let legacy_path = Path::from(encode_object_key_legacy(key));
-                bounded(METADATA_OP_TIMEOUT, self.store.get(&legacy_path))
+                bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get(&legacy_path))
                     .await
                     .map_err(map_err)?
             }
@@ -817,20 +868,22 @@ impl StorageBackend for ObjectStorage {
             ..Default::default()
         };
         let path = Path::from(encode_object_key(key));
-        let result =
-            match bounded(METADATA_OP_TIMEOUT, self.store.get_opts(&path, make_opts())).await {
-                Ok(r) => r,
-                Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
-                    let legacy_path = Path::from(encode_object_key_legacy(key));
-                    bounded(
-                        METADATA_OP_TIMEOUT,
-                        self.store.get_opts(&legacy_path, make_opts()),
-                    )
-                    .await
-                    .map_err(map_err)?
-                }
-                Err(e) => return Err(map_err(e)),
-            };
+        let result = match bounded_edge_retry(METADATA_OP_TIMEOUT, || {
+            self.store.get_opts(&path, make_opts())
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
+                let legacy_path = Path::from(encode_object_key_legacy(key));
+                bounded_edge_retry(METADATA_OP_TIMEOUT, || {
+                    self.store.get_opts(&legacy_path, make_opts())
+                })
+                .await
+                .map_err(map_err)?
+            }
+            Err(e) => return Err(map_err(e)),
+        };
         let size = result.meta.size;
         // The ranged GET answers with the object's attributes: the pin of the version read.
         let pin = read_pin(&result.attributes);
@@ -1482,6 +1535,65 @@ mod tests {
         let err = bounded(limit, hung).await.unwrap_err();
         assert!(matches!(map_err(err), StorageError::Network(_)));
         assert!(bounded(METADATA_OP_TIMEOUT, async { Ok(1) }).await.is_ok());
+    }
+
+    /// The error object_store builds from a 409, with the body R2 answered on 01.11.2026.
+    fn conflict(body: &str) -> object_store::Error {
+        object_store::Error::AlreadyExists {
+            path: "nuget/flatcontainer/x/1.0.0/x.1.0.0.nupkg".into(),
+            source: format!(
+                "Error performing GET https://r2.example/x.1.0.0.nupkg in 5ms - \
+                 Server returned non-2xx status code: 409 Conflict: {body}"
+            )
+            .into(),
+        }
+    }
+
+    /// Calls `bounded_edge_retry` over an op that answers `fail` the first `failures`
+    /// times and Ok after, and returns the outcome with the number of calls made.
+    async fn run_edge_retry(
+        failures: usize,
+        fail: fn() -> object_store::Error,
+    ) -> (object_store::Result<u8>, usize) {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = bounded_edge_retry(METADATA_OP_TIMEOUT, || {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if n < failures {
+                    Err(fail())
+                } else {
+                    Ok(7)
+                }
+            }
+        })
+        .await;
+        (result, calls.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_edge_error_is_retried_until_the_store_answers() {
+        let (result, calls) = run_edge_retry(2, || conflict("error code: 1001\n")).await;
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_edge_error_that_outlives_the_retries_is_returned() {
+        let (result, calls) = run_edge_retry(usize::MAX, || conflict("error code: 1001\n")).await;
+        assert!(is_cf_edge_error(&result.unwrap_err()));
+        assert_eq!(calls, EDGE_RETRY_BACKOFF.len() + 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_real_conflict_is_not_retried() {
+        let (result, calls) = run_edge_retry(usize::MAX, || {
+            conflict("<Error><Code>OperationAborted</Code></Error>")
+        })
+        .await;
+        let err = result.unwrap_err();
+        assert!(matches!(err, object_store::Error::AlreadyExists { .. }));
+        assert!(!is_cf_edge_error(&err));
+        assert_eq!(calls, 1);
     }
 
     /// C15: a read body that stops arriving fails after `idle`, but a consumer that
