@@ -1489,11 +1489,16 @@ impl Config {
         }
         for u in &self.docker.upstreams {
             if u.trust_upstream_dates && u.date_source().is_none() {
-                warnings.push(format!(
+                let msg = format!(
                     "docker.upstreams {:?} sets trust_upstream_dates, but {} publishes no date NORA reads (Docker Hub, quay.io, registry.k8s.io and gcr.io do): first-seen applies",
                     u.url,
                     u.resolved_namespace()
-                ));
+                );
+                if config_strict_from_env() {
+                    errors.push(msg);
+                } else {
+                    warnings.push(msg);
+                }
             }
         }
 
@@ -1805,6 +1810,15 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("ghcr.io publishes no date")),
             "{warnings:?}"
+        );
+        std::env::set_var("NORA_CONFIG_STRICT", "true");
+        let (_, strict) = ghcr.validate();
+        std::env::remove_var("NORA_CONFIG_STRICT");
+        assert!(
+            strict
+                .iter()
+                .any(|e| e.contains("ghcr.io publishes no date")),
+            "strict refuses: {strict:?}"
         );
         let (quay, _) = parse_config(&toml("https://quay.io")).unwrap();
         assert!(quay.docker.upstreams[0].trust_upstream_dates);

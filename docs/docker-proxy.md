@@ -26,7 +26,7 @@ are used, never the image's own `created` (the builder writes it: 1970 for exter
 | Docker Hub (`docker.io`) | `hub.docker.com/v2/repositories/<repo>/tags/<tag>` `tag_last_pushed` | a tag request, when the tag still names the fetched digest |
 | quay.io | `/api/v1/repository/<repo>/tag/?specificTag=<tag>` `last_modified` | the same |
 | registry.k8s.io, gcr.io, mirror.gcr.io | `/v2/<repo>/tags/list` `manifest.<digest>.timeUploadedMs` | tag and digest requests |
-| ghcr.io, mcr.microsoft.com, public.ecr.aws, others | none | first-seen; `trust_upstream_dates` there only logs a config warning |
+| ghcr.io, mcr.microsoft.com, public.ecr.aws, others | none | first-seen; `trust_upstream_dates` there is a config warning (an error under `NORA_CONFIG_STRICT`) |
 
 A date is looked up once per manifest digest, when the quarantine sees it for the first
 time; the ledger keeps the result. A failed lookup (429, 5xx, timeout, a tag that moved,
