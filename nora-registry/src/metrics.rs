@@ -250,6 +250,21 @@ pub static STORAGE_OPERATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create STORAGE_OPERATIONS metric at startup")
 });
 
+/// Wall-clock of one storage backend call, by operation. `get` and `put` cover the whole
+/// body, `get_reader` / `get_range` only the open (the stream is paced by the download
+/// client), `list*` the whole walk. `nora_storage_operations_total` counts the calls, so
+/// a store that answered slowly but without errors was invisible: NoraHighLatency on
+/// 23.10 and 02.11.2026 ended with the stall cause not established.
+pub static STORAGE_OPERATION_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "nora_storage_operation_duration_seconds",
+        "Storage backend call wall-clock by operation (get/put: whole body; get_reader/get_range: open only; list: whole walk)",
+        &["operation"],
+        vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]
+    )
+    .expect("failed to create STORAGE_OPERATION_DURATION_SECONDS metric at startup")
+});
+
 /// OIDC namespace_scope enforcement decisions, by provider and decision.
 /// `decision` is one of: allow | deny | would_deny (audit mode). Lets operators
 /// watch a staged rollout before switching a provider from audit to enforce (#583).

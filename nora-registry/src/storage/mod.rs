@@ -8,7 +8,10 @@ pub use local::LocalStorage;
 pub(crate) use local::NameTaken;
 pub use object::ObjectStorage;
 
-use crate::metrics::{STORAGE_GET_BYTES, STORAGE_OPERATIONS, STORAGE_VERIFY_DURATION_SECONDS};
+use crate::metrics::{
+    STORAGE_GET_BYTES, STORAGE_OPERATIONS, STORAGE_OPERATION_DURATION_SECONDS,
+    STORAGE_VERIFY_DURATION_SECONDS,
+};
 use crate::validation::{listing_key, validate_storage_key, ValidationError};
 use async_trait::async_trait;
 use axum::body::Bytes;
@@ -300,6 +303,17 @@ impl Storage {
         Self { inner }
     }
 
+    /// One backend call, observed into [`STORAGE_OPERATION_DURATION_SECONDS`] under
+    /// `operation` whatever its outcome (`nora_storage_operations_total` carries the status).
+    async fn timed<T>(operation: &'static str, call: impl std::future::Future<Output = T>) -> T {
+        let started = std::time::Instant::now();
+        let out = call.await;
+        STORAGE_OPERATION_DURATION_SECONDS
+            .with_label_values(&[operation])
+            .observe(started.elapsed().as_secs_f64());
+        out
+    }
+
     pub async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         self.put_bytes(key, Bytes::copy_from_slice(data)).await
     }
@@ -308,7 +322,7 @@ impl Storage {
     /// uploaded from that one refcounted buffer, never copied.
     pub async fn put_bytes(&self, key: &str, data: Bytes) -> Result<()> {
         let hash = Self::hash_for_put(key, &data).await?;
-        let result = self.inner.put_bytes(key, data, &hash).await;
+        let result = Self::timed("put", self.inner.put_bytes(key, data, &hash)).await;
         Self::count_put(&result);
         result
     }
@@ -318,7 +332,7 @@ impl Storage {
     /// [`StorageBackend::put_if_absent`]). `Ok(false)`: the key existed, nothing written.
     pub async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<bool> {
         let hash = Self::hash_for_put(key, &data).await?;
-        let result = self.inner.put_if_absent(key, data, &hash).await;
+        let result = Self::timed("put", self.inner.put_if_absent(key, data, &hash)).await;
         Self::count_put(&result);
         result
     }
@@ -351,7 +365,7 @@ impl Storage {
     /// and the pin they were checked against (`None` = open-world key).
     async fn get_pinned(&self, key: &str) -> Result<(Bytes, Option<String>)> {
         validate_storage_key(key)?;
-        let (data, pin) = match self.inner.get(key).await {
+        let (data, pin) = match Self::timed("get", self.inner.get(key)).await {
             Ok(v) => v,
             Err(e) => {
                 STORAGE_OPERATIONS
@@ -524,7 +538,7 @@ impl Storage {
 
     pub async fn delete(&self, key: &str) -> Result<()> {
         validate_storage_key(key)?;
-        match self.inner.delete(key).await {
+        match Self::timed("delete", self.inner.delete(key)).await {
             Ok(()) => {
                 STORAGE_OPERATIONS
                     .with_label_values(&["delete", "ok"])
@@ -545,7 +559,7 @@ impl Storage {
         if !prefix.is_empty() {
             validate_storage_key(listing_key(prefix))?;
         }
-        let keys = match self.inner.list(prefix).await {
+        let keys = match Self::timed("list", self.inner.list(prefix)).await {
             Ok(keys) => {
                 STORAGE_OPERATIONS.with_label_values(&["list", "ok"]).inc();
                 keys
@@ -568,7 +582,7 @@ impl Storage {
     /// provenance (#1055).
     pub async fn list_internal(&self, prefix: &str) -> Result<Vec<String>> {
         validate_storage_key(listing_key(prefix))?;
-        let keys = match self.inner.list(prefix).await {
+        let keys = match Self::timed("list", self.inner.list(prefix)).await {
             Ok(keys) => {
                 STORAGE_OPERATIONS.with_label_values(&["list", "ok"]).inc();
                 keys
@@ -593,7 +607,7 @@ impl Storage {
         if !prefix.is_empty() {
             validate_storage_key(listing_key(prefix))?;
         }
-        let entries = match self.inner.list_with_meta(prefix).await {
+        let entries = match Self::timed("list_with_meta", self.inner.list_with_meta(prefix)).await {
             Ok(entries) => {
                 STORAGE_OPERATIONS
                     .with_label_values(&["list_with_meta", "ok"])
@@ -617,7 +631,7 @@ impl Storage {
         if validate_storage_key(key).is_err() {
             return None;
         }
-        let meta = self.inner.stat(key).await;
+        let meta = Self::timed("stat", self.inner.stat(key)).await;
         // `status` distinguishes a found object from an absent one: the backend
         // collapses "not there" and "call failed" into `None`, so labelling a miss
         // as `error` would poison error-rate alerting with ordinary 404s.
@@ -652,7 +666,7 @@ impl Storage {
         if validate_storage_key(key).is_err() {
             return None;
         }
-        let pin = self.inner.pin(key).await;
+        let pin = Self::timed("pin", self.inner.pin(key)).await;
         // `miss` is the open-world case (no pin recorded) as well as an absent key —
         // the backend cannot tell them apart, and neither is an error.
         STORAGE_OPERATIONS
@@ -725,7 +739,7 @@ impl Storage {
     pub async fn put_from_path(&self, key: &str, src: &Path, sha256: Option<&str>) -> Result<()> {
         validate_storage_key(key)?;
         let sha256 = sha256.map(str::to_ascii_lowercase);
-        match self.inner.put_from_path(key, src, sha256.as_deref()).await {
+        match Self::timed("put", self.inner.put_from_path(key, src, sha256.as_deref())).await {
             Ok(()) => {
                 STORAGE_OPERATIONS.with_label_values(&["put", "ok"]).inc();
                 Ok(())
@@ -749,7 +763,7 @@ impl Storage {
         validate_storage_key(src)?;
         validate_storage_key(dst)?;
         let sha256 = sha256.map(str::to_ascii_lowercase);
-        match self.inner.copy(src, dst, sha256.as_deref()).await {
+        match Self::timed("copy", self.inner.copy(src, dst, sha256.as_deref())).await {
             Ok(()) => {
                 STORAGE_OPERATIONS.with_label_values(&["copy", "ok"]).inc();
                 Ok(())
@@ -774,7 +788,7 @@ impl Storage {
         key: &str,
     ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         validate_storage_key(key)?;
-        match self.inner.get_reader(key).await {
+        match Self::timed("get_reader", self.inner.get_reader(key)).await {
             Ok(reader) => {
                 STORAGE_OPERATIONS
                     .with_label_values(&["get_reader", "ok"])
@@ -798,7 +812,7 @@ impl Storage {
         end: u64,
     ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         validate_storage_key(key)?;
-        match self.inner.get_range(key, start, end).await {
+        match Self::timed("get_range", self.inner.get_range(key, start, end)).await {
             Ok(r) => {
                 STORAGE_OPERATIONS
                     .with_label_values(&["get_range", "ok"])
@@ -1162,6 +1176,34 @@ mod tests {
                 >= verify_before + 1,
             "get() of a pinned key must observe the verify duration"
         );
+    }
+
+    /// A backend call of every shape (put, buffered get, open-for-stream, list, stat) is
+    /// timed under its operation: the only per-operation latency the object store exposes.
+    #[tokio::test]
+    async fn every_backend_call_observes_its_duration() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let key = "raw/timed/app.bin";
+        let count = |op: &str| {
+            STORAGE_OPERATION_DURATION_SECONDS
+                .with_label_values(&[op])
+                .get_sample_count()
+        };
+        let before: Vec<_> = ["put", "get", "get_reader", "list", "stat"]
+            .map(|op| (op, count(op)))
+            .to_vec();
+
+        storage.put(key, b"time-me").await.unwrap();
+        storage.get(key).await.unwrap();
+        storage.get_reader(key).await.unwrap();
+        storage.list("raw/timed/").await.unwrap();
+        storage.stat(key).await.unwrap();
+
+        // `>=`: global metrics, other tests share the labels under parallel execution.
+        for (op, n) in before {
+            assert!(count(op) >= n + 1, "{op} must observe its duration");
+        }
     }
 
     /// Regression for #604: the streaming write path `put_from_path()` — the one
