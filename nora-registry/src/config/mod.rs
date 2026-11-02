@@ -1487,6 +1487,15 @@ impl Config {
                 ));
             }
         }
+        for u in &self.docker.upstreams {
+            if u.trust_upstream_dates && u.date_source().is_none() {
+                warnings.push(format!(
+                    "docker.upstreams {:?} sets trust_upstream_dates, but {} publishes no date NORA reads (Docker Hub, quay.io, registry.k8s.io and gcr.io do): first-seen applies",
+                    u.url,
+                    u.resolved_namespace()
+                ));
+            }
+        }
 
         // 8b. Per-registry `allow` entries (Maestra fork): an entry nora cannot read
         // exempts nothing (the versions it meant stay held), so it is a warning and

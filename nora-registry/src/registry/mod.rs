@@ -11,6 +11,7 @@ pub(crate) mod cpan;
 pub(crate) mod deb;
 pub mod docker;
 pub mod docker_auth;
+mod docker_dates;
 pub(crate) mod gems;
 mod go;
 pub(crate) mod helm;
@@ -3500,6 +3501,7 @@ mod first_download_integrity {
             "/v2/corp/app/manifests/1.0",
             |c, u| {
                 c.docker.upstreams = vec![crate::config::DockerUpstream {
+                    trust_upstream_dates: false,
                     url: u,
                     auth: None,
                     auth_env: None,
@@ -3595,6 +3597,7 @@ mod first_download_integrity {
             "/v2/app/manifests/1.0",
             |c, u| {
                 c.docker.upstreams = vec![crate::config::DockerUpstream {
+                    trust_upstream_dates: false,
                     url: u,
                     auth: None,
                     auth_env: None,
@@ -4657,6 +4660,7 @@ mod upstream_failure_matrix {
         cfg.docker.upstreams = urls
             .into_iter()
             .map(|url| DockerUpstream {
+                trust_upstream_dates: false,
                 url,
                 auth: None,
                 auth_env: None,

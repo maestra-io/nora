@@ -61,6 +61,34 @@ pub struct DockerUpstream {
     pub namespace: Option<String>,
     #[serde(default)]
     pub prefix: Option<String>,
+    /// Date a manifest NORA sees for the first time by the registry's own publish date
+    /// ([`DateSource`]), so an image published longer than the quarantine TTL ago is not
+    /// held as new to this mirror. Off by default: NORA's own first-seen clock.
+    #[serde(default)]
+    pub trust_upstream_dates: bool,
+}
+
+/// Where a registry publishes the date a manifest was pushed, read by the registry
+/// itself (never the image's own `created`, which the builder sets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateSource {
+    /// Docker Hub `hub.docker.com/v2/repositories/<repo>/tags/<tag>` `tag_last_pushed`.
+    HubTagLastPushed,
+    /// quay.io `/api/v1/repository/<repo>/tag/?specificTag=<tag>` `last_modified`.
+    QuayLastModified,
+    /// registry.k8s.io / gcr.io `/v2/<repo>/tags/list` `manifest.<digest>.timeUploadedMs`.
+    GcrTimeUploaded,
+}
+
+impl DateSource {
+    /// The `source` label and log field.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::HubTagLastPushed => "hub_tag_last_pushed",
+            Self::QuayLastModified => "quay_last_modified",
+            Self::GcrTimeUploaded => "gcr_time_uploaded",
+        }
+    }
 }
 
 impl DockerUpstream {
@@ -69,6 +97,20 @@ impl DockerUpstream {
             return ns.clone();
         }
         extract_docker_namespace(&self.url)
+    }
+
+    /// The registry's date source, by the upstream's namespace (its host); `None` for a
+    /// registry that publishes no date NORA reads (ghcr.io, mcr, public.ecr.aws, ...).
+    pub fn date_source(&self) -> Option<DateSource> {
+        match self.resolved_namespace().as_str() {
+            "docker.io" | "index.docker.io" => Some(DateSource::HubTagLastPushed),
+            "quay.io" => Some(DateSource::QuayLastModified),
+            "registry.k8s.io" | "k8s.io" | "gcr.io" | "mirror.gcr.io" => {
+                Some(DateSource::GcrTimeUploaded)
+            }
+            ns if ns.ends_with(".gcr.io") => Some(DateSource::GcrTimeUploaded),
+            _ => None,
+        }
     }
 }
 
@@ -107,6 +149,7 @@ fn default_docker_metadata_ttl() -> i64 {
 /// divergence class — a bare default on a `Vec` yields an empty list).
 fn default_docker_upstreams() -> Vec<DockerUpstream> {
     vec![DockerUpstream {
+        trust_upstream_dates: false,
         url: "https://registry-1.docker.io".to_string(),
         auth: None,
         auth_env: None,
@@ -186,6 +229,7 @@ impl DockerConfig {
                         }
                     });
                     DockerUpstream {
+                        trust_upstream_dates: false,
                         url: parts[0].to_string(),
                         auth,
                         auth_env: None,

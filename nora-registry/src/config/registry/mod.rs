@@ -163,7 +163,9 @@ pub use self::cpan::CpanConfig;
 pub use self::deb::DebConfig;
 // Re-export all Docker types including extract_docker_namespace (public API surface)
 #[allow(unused_imports)]
-pub use self::docker::{extract_docker_namespace, DefaultAction, DockerConfig, DockerUpstream};
+pub use self::docker::{
+    extract_docker_namespace, DateSource, DefaultAction, DockerConfig, DockerUpstream,
+};
 pub use self::gems::GemsConfig;
 pub use self::go::GoConfig;
 pub use self::helm::HelmConfig;

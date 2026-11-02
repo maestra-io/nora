@@ -1000,6 +1000,7 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.pypi.proxy = Some("https://pypi.org/simple/".into());
         config.docker.upstreams = vec![crate::config::DockerUpstream {
+            trust_upstream_dates: false,
             url: "https://registry-1.docker.io".into(),
             auth: None,
             auth_env: None,
@@ -1355,6 +1356,7 @@ mod integration_tests {
             cfg.circuit_breaker.failure_threshold = 1;
             cfg.circuit_breaker.reset_timeout = 3600;
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url,
                 auth: None,
                 auth_env: None,

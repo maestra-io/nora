@@ -203,6 +203,20 @@ tests:
       - matchRegex:
           path: data["config.toml"]
           pattern: 'auth_env = "PRIVATE_REGISTRY_AUTH"'
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'trust_upstream_dates'
+
+  - it: renders trust_upstream_dates on the upstream that sets it
+    set:
+      config.docker.upstreams:
+        - url: https://quay.io
+          namespace: quay.io
+          trust_upstream_dates: true
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'url = "https://quay\.io"\n\s*namespace = "quay\.io"\n\s*trust_upstream_dates = true'
 
   - it: renders retention rules
     set:

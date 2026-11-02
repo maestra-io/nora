@@ -172,6 +172,9 @@ config:
     # {name, key (default "auth")}: a Secret value "user:token", passed as env
     # NORA_DOCKER_UPSTREAM_AUTH_<index> and rendered as auth_env (Maestra fork).
     # An inline `auth` is refused: it would land in the ConfigMap.
+    # trust_upstream_dates: true dates a manifest nora sees first by the
+    # registry's own publish date (Docker Hub, quay.io, registry.k8s.io, gcr.io;
+    # docs/docker-proxy.md), so an image older than the quarantine TTL passes.
     upstreams: []
     #  - url: https://registry-1.docker.io
     #    prefix: docker-hub
