@@ -1791,6 +1791,30 @@ mod tests {
     use crate::secrets::ProtectedString;
     use crate::test_env::env_lock;
 
+    /// `trust_upstream_dates` on a registry that publishes no date is a warning, not silence.
+    #[test]
+    fn trust_upstream_dates_without_a_date_source_warns() {
+        let _lock = env_lock();
+        let toml = |url: &str| {
+            format!("[[docker.upstreams]]\nurl = \"{url}\"\ntrust_upstream_dates = true\n")
+        };
+        let (ghcr, _) = parse_config(&toml("https://ghcr.io")).unwrap();
+        let (warnings, _) = ghcr.validate();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("ghcr.io publishes no date")),
+            "{warnings:?}"
+        );
+        let (quay, _) = parse_config(&toml("https://quay.io")).unwrap();
+        assert!(quay.docker.upstreams[0].trust_upstream_dates);
+        let (warnings, _) = quay.validate();
+        assert!(
+            !warnings.iter().any(|w| w.contains("trust_upstream_dates")),
+            "{warnings:?}"
+        );
+    }
+
     /// #1135: whether `curation.mode` was written down is read from the file and from
     /// `NORA_CURATION_MODE`; the startup notice follows it while proxy registries are enabled.
     #[test]
