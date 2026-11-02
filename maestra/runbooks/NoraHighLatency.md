@@ -106,7 +106,7 @@ Reading it:
   is 15.8 MB and takes 1.3–3 s normally; 64–194 s on 02.11 was a stall, not size.
 
 Store latency itself: `nora_storage_operation_duration_seconds{operation}` (since
-`1.4.1-maestra.14`, nora#113) — `histogram_quantile(0.99, sum by (le, operation)
+`1.4.1-maestra.15`, nora#113) — `histogram_quantile(0.99, sum by (le, operation)
 (rate(nora_storage_operation_duration_seconds_bucket[5m])))`. Before it only the call
 counts existed, which is why 23.10 and 02.11 closed without a cause.
 
