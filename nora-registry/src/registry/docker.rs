@@ -732,13 +732,61 @@ fn quarantine_forbidden(
         [
             (
                 HeaderName::from_static("x-nora-quarantine"),
-                status.header_value(),
+                status.header_value().to_string(),
             ),
-            (header::CONTENT_TYPE, "application/json"),
+            (
+                HeaderName::from_static("x-nora-quarantine-until"),
+                quarantine_until.to_string(),
+            ),
+            (header::CONTENT_TYPE, "application/json".to_string()),
         ],
         body.to_string(),
     )
         .into_response()
+}
+
+/// The quarantine verdict on a served (200) manifest, in the headers the 403 carries, so a
+/// client can read it under `observe` too (fluxcd `scripts/nora-image-check.py`):
+/// `x-nora-quarantine: pending` plus `x-nora-quarantine-until` (unix seconds) while the
+/// digest is still within the TTL, `mature` once admitted: past the TTL, dated past it by
+/// the registry (`trust_upstream_dates`), quarantine off, or served without a proxy record
+/// (a local push). A 403 keeps the headers [`quarantine_forbidden`] set.
+fn with_quarantine_verdict(state: &AppState, mut resp: Response) -> Response {
+    if resp.status() != StatusCode::OK {
+        return resp;
+    }
+    let Some(digest) = resp
+        .headers()
+        .get("docker-content-digest")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+    else {
+        return resp;
+    };
+    let (q_mode, q_secs) = resolve_quarantine(state);
+    let held = match q_mode {
+        crate::digest_quarantine::QuarantineMode::Off => None,
+        _ => match state.digest_store.check("docker", &digest, q_secs) {
+            crate::digest_quarantine::QuarantineStatus::Pending { remaining_secs } => {
+                Some(remaining_secs)
+            }
+            _ => None,
+        },
+    };
+    let headers = resp.headers_mut();
+    let verdict = if held.is_some() { "pending" } else { "mature" };
+    headers.insert(
+        HeaderName::from_static("x-nora-quarantine"),
+        axum::http::HeaderValue::from_static(verdict),
+    );
+    if let Some(remaining) = held {
+        let until = chrono::Utc::now().timestamp() + remaining;
+        headers.insert(
+            HeaderName::from_static("x-nora-quarantine-until"),
+            axum::http::HeaderValue::from(until),
+        );
+    }
+    resp
 }
 
 /// Build a 404 `MANIFEST_UNKNOWN` response per the OCI Distribution Spec.
@@ -869,9 +917,9 @@ fn quarantine_proxy_fetch_gate(state: &AppState, digest: &str, upstream: &str) -
     None
 }
 
-/// Record a verified proxy-fetched blob as first seen now. Docker quarantine never
-/// trusts an upstream date (digest-addressed) — always NORA's own clock, preserving the
-/// GHSA-4j4m fix. Idempotent: an existing record keeps its timestamp.
+/// Record a verified proxy-fetched blob as first seen now. A blob never carries an
+/// upstream date of its own (only a manifest naming it dates it, #112) — NORA's own
+/// clock, preserving the GHSA-4j4m fix. Idempotent: an existing record keeps its timestamp.
 fn quarantine_record_verified(state: &AppState, digest: &str, upstream: &str) {
     let (q_mode, _) = resolve_quarantine(state);
     if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
@@ -885,9 +933,9 @@ fn quarantine_record_verified(state: &AppState, digest: &str, upstream: &str) {
 /// it enforce held one level at a time, because a client asks for a child only once its
 /// parent is served: the index for a TTL, then the platform manifest, then the blobs —
 /// three TTLs for a multi-arch image. The names come from bytes hashed to the manifest
-/// digest, and the date is NORA's own first sight of that manifest, never an upstream
-/// date, so no child matures before NORA first saw something naming it. Idempotent: a
-/// digest already recorded keeps its own first-seen.
+/// digest, and the date is the manifest's own first-seen: NORA's first sight of it, or
+/// the registry's publish date under `trust_upstream_dates`, so no child is older than
+/// what names it. Idempotent: a digest already recorded keeps its own first-seen.
 fn quarantine_record_referenced(
     state: &AppState,
     manifest: &[u8],
@@ -1063,11 +1111,12 @@ async fn docker_v2_dispatch(
         return match method {
             Method::GET | Method::HEAD => {
                 let resp = get_manifest(
-                    state,
+                    state.clone(),
                     headers,
                     Path((name.to_string(), reference.to_string())),
                 )
                 .await;
+                let resp = with_quarantine_verdict(&state, resp);
                 if method == Method::HEAD {
                     let (parts, _) = resp.into_parts();
                     Response::from_parts(parts, axum::body::Body::empty())
@@ -2119,11 +2168,61 @@ async fn try_fetch_and_cache(
                 // Quarantine: record digest, check status
                 let (q_mode, q_secs) = resolve_quarantine(state);
                 if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
-                    let entry = state
-                        .digest_store
-                        .record("docker", &digest, &upstream.url, None);
+                    let first_sight = matches!(
+                        state.digest_store.check("docker", &digest, q_secs),
+                        crate::digest_quarantine::QuarantineStatus::New
+                    );
+                    // First sight under `trust_upstream_dates`: the registry's own publish
+                    // date starts the clock, so an image older than the TTL is not new here.
+                    let mut dated = None;
+                    if let Some(source) = upstream
+                        .date_source()
+                        .filter(|_| first_sight && upstream.trust_upstream_dates)
+                    {
+                        dated = super::docker_dates::published_at(
+                            state,
+                            upstream,
+                            source,
+                            upstream_name,
+                            reference,
+                            &digest,
+                        )
+                        .await
+                        .map(|at| (at, source.label()));
+                    }
+                    let entry = state.digest_store.record(
+                        "docker",
+                        &digest,
+                        &upstream.url,
+                        dated.map(|(at, _)| at),
+                    );
                     quarantine_record_referenced(state, &data, &upstream.url, entry.first_seen);
                     let q_status = state.digest_store.check("docker", &digest, q_secs);
+                    if first_sight {
+                        let source = dated.map_or("first_seen", |(_, source)| source);
+                        let status = if matches!(
+                            q_status,
+                            crate::digest_quarantine::QuarantineStatus::Mature
+                        ) {
+                            "mature"
+                        } else {
+                            "held"
+                        };
+                        let ns = upstream.resolved_namespace();
+                        crate::metrics::DOCKER_QUARANTINE_FIRST_SIGHT_TOTAL
+                            .with_label_values(&[ns.as_str(), source, status])
+                            .inc();
+                        tracing::info!(
+                            digest = %digest,
+                            name = %upstream_name,
+                            reference = %reference,
+                            upstream = %upstream.url,
+                            source,
+                            first_seen = entry.first_seen,
+                            status,
+                            "Quarantine: first sight of a proxied manifest"
+                        );
+                    }
                     match &q_status {
                         crate::digest_quarantine::QuarantineStatus::Mature => {}
                         _ => {
@@ -5375,6 +5474,7 @@ mod integration_tests {
             .await;
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url: upstream.uri(),
                 auth: None,
                 auth_env: None,
@@ -5464,6 +5564,7 @@ mod integration_tests {
                 cfg.docker.upstreams = entries
                     .into_iter()
                     .map(|url| DockerUpstream {
+                        trust_upstream_dates: false,
                         url,
                         auth: None,
                         auth_env: None,
@@ -5494,6 +5595,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.serve_stale = false;
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -5629,6 +5731,7 @@ mod integration_tests {
                 .set_body_bytes(body.to_vec())
         };
         let upstream = |url: String, prefix: Option<&str>| DockerUpstream {
+            trust_upstream_dates: false,
             url,
             auth: None,
             auth_env: None,
@@ -5757,6 +5860,7 @@ mod integration_tests {
             .mount(&server)
             .await;
         let upstream = DockerUpstream {
+            trust_upstream_dates: false,
             url: server.uri(),
             auth: None,
             auth_env: None,
@@ -5874,6 +5978,7 @@ mod integration_tests {
         let uri = server.uri();
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url: uri,
                 auth: None,
                 auth_env: None,
@@ -5965,6 +6070,7 @@ mod integration_tests {
             .mount(&server)
             .await;
         let upstream = DockerUpstream {
+            trust_upstream_dates: false,
             url: server.uri(),
             auth: None,
             auth_env: None,
@@ -6041,6 +6147,7 @@ mod integration_tests {
         use crate::config::DockerUpstream;
         let (storage, ops) = crate::test_helpers::op_counting_storage();
         let upstream = DockerUpstream {
+            trust_upstream_dates: false,
             url: "http://127.0.0.1:9".to_string(),
             auth: None,
             auth_env: None,
@@ -6076,6 +6183,7 @@ mod integration_tests {
         use sha2::Digest;
         let (storage, ops) = crate::test_helpers::op_counting_storage();
         let upstream = DockerUpstream {
+            trust_upstream_dates: false,
             url: "http://127.0.0.1:9".to_string(),
             auth: None,
             auth_env: None,
@@ -6349,6 +6457,7 @@ mod integration_tests {
                 .mount(&server)
                 .await;
             let upstream = DockerUpstream {
+                trust_upstream_dates: false,
                 url: server.uri(),
                 auth: None,
                 auth_env: None,
@@ -6431,6 +6540,7 @@ mod integration_tests {
         {
             use crate::config::DockerUpstream;
             let upstream = DockerUpstream {
+                trust_upstream_dates: false,
                 url: "http://127.0.0.1:9".to_string(),
                 auth: None,
                 auth_env: None,
@@ -6886,6 +6996,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -7358,6 +7469,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -7439,6 +7551,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -8699,6 +8812,7 @@ mod integration_tests {
             cfg.circuit_breaker.reset_timeout = 3600;
             // Unreachable upstream
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -8951,6 +9065,7 @@ mod integration_tests {
             cfg.circuit_breaker.reset_timeout = 3600;
             cfg.docker.upstreams = vec![
                 DockerUpstream {
+                    trust_upstream_dates: false,
                     url: "http://127.0.0.1:1".into(), // upstream A (will be tripped)
                     auth: None,
                     auth_env: None,
@@ -8958,6 +9073,7 @@ mod integration_tests {
                     prefix: None,
                 },
                 DockerUpstream {
+                    trust_upstream_dates: false,
                     url: "http://127.0.0.1:2".into(), // upstream B (stays closed)
                     auth: None,
                     auth_env: None,
@@ -9099,6 +9215,7 @@ mod integration_tests {
     #[test]
     fn test_canonicalize_prefix_routing() {
         let upstreams = vec![crate::config::DockerUpstream {
+            trust_upstream_dates: false,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             auth_env: None,
@@ -9117,6 +9234,7 @@ mod integration_tests {
     #[test]
     fn test_canonicalize_hostname_detection() {
         let upstreams = vec![crate::config::DockerUpstream {
+            trust_upstream_dates: false,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             auth_env: None,
@@ -9144,6 +9262,7 @@ mod integration_tests {
     #[test]
     fn test_canonicalize_fallback() {
         let upstreams = vec![crate::config::DockerUpstream {
+            trust_upstream_dates: false,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             auth_env: None,
@@ -9215,6 +9334,7 @@ mod integration_tests {
     fn test_canonicalize_multi_upstream() {
         let upstreams = vec![
             crate::config::DockerUpstream {
+                trust_upstream_dates: false,
                 url: "https://registry-1.docker.io".to_string(),
                 auth: None,
                 auth_env: None,
@@ -9222,6 +9342,7 @@ mod integration_tests {
                 prefix: Some("docker-hub".to_string()),
             },
             crate::config::DockerUpstream {
+                trust_upstream_dates: false,
                 url: "https://ghcr.io".to_string(),
                 auth: None,
                 auth_env: None,
@@ -9251,6 +9372,7 @@ mod integration_tests {
     fn test_canonicalize_deny_mode_blocks_unmatched() {
         let upstreams = vec![
             crate::config::DockerUpstream {
+                trust_upstream_dates: false,
                 url: "https://registry-1.docker.io".to_string(),
                 auth: None,
                 auth_env: None,
@@ -9258,6 +9380,7 @@ mod integration_tests {
                 prefix: Some("docker-hub".to_string()),
             },
             crate::config::DockerUpstream {
+                trust_upstream_dates: false,
                 url: "https://ghcr.io".to_string(),
                 auth: None,
                 auth_env: None,
@@ -9289,6 +9412,7 @@ mod integration_tests {
     #[test]
     fn test_canonicalize_deny_mode_allows_known_hostname() {
         let upstreams = vec![crate::config::DockerUpstream {
+            trust_upstream_dates: false,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             auth_env: None,
@@ -9307,6 +9431,7 @@ mod integration_tests {
     #[test]
     fn test_denied_response_format() {
         let upstreams = vec![crate::config::DockerUpstream {
+            trust_upstream_dates: false,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             auth_env: None,
@@ -9359,6 +9484,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url: upstream.uri(),
                 auth: None,
                 auth_env: None,
@@ -9444,6 +9570,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url: upstream.uri(),
                 auth: None,
                 auth_env: None,
@@ -9541,6 +9668,7 @@ mod integration_tests {
         let enforcing = || {
             create_test_context_with_config(|cfg| {
                 cfg.docker.upstreams = vec![DockerUpstream {
+                    trust_upstream_dates: false,
                     url: upstream.uri(),
                     auth: None,
                     auth_env: None,
@@ -9595,6 +9723,313 @@ mod integration_tests {
         }
     }
 
+    /// `trust_upstream_dates` (issues-maestra#1649): the registry's own publish date
+    /// starts the quarantine clock of a manifest NORA sees for the first time; anything
+    /// short of a usable past date leaves NORA's first-seen. Driven through quay.io's
+    /// tag API (`/api/v1/repository/<repo>/tag/`), which the upstream host serves itself.
+    mod trust_upstream_dates {
+        use super::*;
+        use crate::config::DockerUpstream;
+        use crate::digest_quarantine::QuarantineMode;
+        use crate::test_helpers::{create_test_context_with_config, TestContext};
+        use axum::response::Response;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const TAG_API: &str = "/api/v1/repository/library/demo/tag/";
+
+        fn sha(b: &[u8]) -> String {
+            format!("sha256:{}", hex::encode(sha2::Sha256::digest(b)))
+        }
+
+        /// An image (manifest + one layer) at `library/demo:v1`, served by a mock upstream.
+        async fn upstream_with_image() -> (MockServer, Vec<u8>, Vec<u8>) {
+            let layer = b"layer bytes".to_vec();
+            let image = format!(
+                r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{l}","size":11}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{l}","size":11}}]}}"#,
+                l = sha(&layer)
+            )
+            .into_bytes();
+            let server = MockServer::start().await;
+            for (route, body, ct) in [
+                (
+                    "manifests/v1".to_string(),
+                    image.clone(),
+                    "application/vnd.oci.image.manifest.v1+json",
+                ),
+                (
+                    format!("manifests/{}", sha(&image)),
+                    image.clone(),
+                    "application/vnd.oci.image.manifest.v1+json",
+                ),
+                (
+                    format!("blobs/{}", sha(&layer)),
+                    layer.clone(),
+                    "application/octet-stream",
+                ),
+            ] {
+                Mock::given(method("GET"))
+                    .and(path(format!("/v2/library/demo/{route}")))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("Content-Type", ct)
+                            .set_body_bytes(body),
+                    )
+                    .mount(&server)
+                    .await;
+            }
+            (server, image, layer)
+        }
+
+        /// quay's answer for tag `v1`: `digest`, last modified `at` (unix seconds).
+        fn quay_tag(digest: &str, at: i64) -> serde_json::Value {
+            let when = chrono::DateTime::from_timestamp(at, 0)
+                .unwrap()
+                .to_rfc2822();
+            serde_json::json!({"tags": [{"name": "v1", "manifest_digest": digest, "last_modified": when}]})
+        }
+
+        fn context(server: &MockServer, trust: bool, mode: QuarantineMode) -> TestContext {
+            let url = server.uri();
+            create_test_context_with_config(move |cfg| {
+                cfg.docker.upstreams = vec![DockerUpstream {
+                    trust_upstream_dates: trust,
+                    url: url.clone(),
+                    auth: None,
+                    auth_env: None,
+                    namespace: Some("quay.io".into()),
+                    prefix: None,
+                }];
+                cfg.curation.quarantine = Some(mode);
+                cfg.curation.quarantine_ttl = Some("3d".to_string());
+            })
+        }
+
+        async fn get(ctx: &TestContext, rest: &str) -> StatusCode {
+            let uri = format!("/v2/library/demo/{rest}");
+            send(&ctx.app, Method::GET, &uri, Body::empty())
+                .await
+                .status()
+        }
+
+        fn days_ago(d: i64) -> i64 {
+            chrono::Utc::now().timestamp() - d * 86400
+        }
+
+        #[tokio::test]
+        async fn a_registry_date_older_than_the_ttl_admits_the_image_at_once() {
+            let (server, image, layer) = upstream_with_image().await;
+            Mock::given(method("GET"))
+                .and(path(TAG_API))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(quay_tag(&sha(&image), days_ago(30))),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let ctx = context(&server, true, QuarantineMode::Enforce);
+            assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::OK);
+            // What the manifest names matures with it (#112), and the date is looked up once:
+            // the ledger keeps it for the digest.
+            assert_eq!(
+                get(&ctx, &format!("blobs/{}", sha(&layer))).await,
+                StatusCode::OK
+            );
+            assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::OK);
+            assert_eq!(
+                get(&ctx, &format!("manifests/{}", sha(&image))).await,
+                StatusCode::OK
+            );
+        }
+
+        #[tokio::test]
+        async fn a_fresh_image_is_held_from_its_registry_date() {
+            let (server, image, _) = upstream_with_image().await;
+            let pushed = days_ago(1);
+            Mock::given(method("GET"))
+                .and(path(TAG_API))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(quay_tag(&sha(&image), pushed)),
+                )
+                .mount(&server)
+                .await;
+            let ctx = context(&server, true, QuarantineMode::Enforce);
+            assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::FORBIDDEN);
+            let entry = ctx
+                .state
+                .digest_store
+                .record("docker", &sha(&image), "x", None);
+            assert_eq!(
+                entry.first_seen, pushed,
+                "the clock starts at the registry's date"
+            );
+        }
+
+        /// No usable date — the tag names another digest, a date in the future, the API
+        /// throttled or down — leaves NORA's first-seen: held, never a failed pull.
+        #[tokio::test]
+        async fn anything_but_a_past_date_for_this_digest_leaves_first_seen() {
+            for label in ["another digest", "future date", "throttled", "down"] {
+                let (server, image, _) = upstream_with_image().await;
+                let answer = match label {
+                    "another digest" => ResponseTemplate::new(200)
+                        .set_body_json(quay_tag(&sha(b"another manifest"), days_ago(30))),
+                    "future date" => ResponseTemplate::new(200)
+                        .set_body_json(quay_tag(&sha(&image), days_ago(-30))),
+                    "throttled" => ResponseTemplate::new(429),
+                    _ => ResponseTemplate::new(503),
+                };
+                Mock::given(method("GET"))
+                    .and(path(TAG_API))
+                    .respond_with(answer)
+                    .mount(&server)
+                    .await;
+                let before = chrono::Utc::now().timestamp();
+                let enforcing = context(&server, true, QuarantineMode::Enforce);
+                assert_eq!(
+                    get(&enforcing, "manifests/v1").await,
+                    StatusCode::FORBIDDEN,
+                    "{label}"
+                );
+                let entry = enforcing
+                    .state
+                    .digest_store
+                    .record("docker", &sha(&image), "x", None);
+                assert!(
+                    entry.first_seen >= before,
+                    "{label}: first-seen, not {}",
+                    entry.first_seen
+                );
+                let observing = context(&server, true, QuarantineMode::Observe);
+                assert_eq!(
+                    get(&observing, "manifests/v1").await,
+                    StatusCode::OK,
+                    "{label}"
+                );
+            }
+        }
+
+        /// The verdict rides on every manifest answer, 200 included, so `observe` can be
+        /// read by a client: pending + until while held, mature once admitted.
+        #[tokio::test]
+        async fn the_quarantine_verdict_is_on_every_manifest_answer() {
+            let verdict = |r: &Response| {
+                let h = |n: &str| r.headers().get(n).map(|v| v.to_str().unwrap().to_owned());
+                (
+                    r.status(),
+                    h("x-nora-quarantine"),
+                    h("x-nora-quarantine-until"),
+                )
+            };
+            let in_three_days = || chrono::Utc::now().timestamp() + 3 * 86400;
+            let (server, image, _) = upstream_with_image().await;
+            Mock::given(method("GET"))
+                .and(path(TAG_API))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(quay_tag(&sha(&image), days_ago(30))),
+                )
+                .mount(&server)
+                .await;
+            for m in [Method::GET, Method::HEAD] {
+                // observe, first sight, no trusted date: served, pending until first-seen + TTL.
+                let fresh = context(&server, false, QuarantineMode::Observe);
+                let r = send(
+                    &fresh.app,
+                    m.clone(),
+                    "/v2/library/demo/manifests/v1",
+                    Body::empty(),
+                )
+                .await;
+                let (status, v, until) = verdict(&r);
+                assert_eq!(
+                    (status, v.as_deref()),
+                    (StatusCode::OK, Some("pending")),
+                    "{m}"
+                );
+                let until: i64 = until.expect("until").parse().unwrap();
+                assert!((until - in_three_days()).abs() < 60, "{m}: {until}");
+                // the same digest again, now by digest: still pending
+                let r = send(
+                    &fresh.app,
+                    m.clone(),
+                    &format!("/v2/library/demo/manifests/{}", sha(&image)),
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(verdict(&r).1.as_deref(), Some("pending"), "{m}");
+
+                // observe, dated 30 days ago by the registry: mature, no until.
+                let old = context(&server, true, QuarantineMode::Observe);
+                let r = send(
+                    &old.app,
+                    m.clone(),
+                    "/v2/library/demo/manifests/v1",
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(
+                    verdict(&r),
+                    (StatusCode::OK, Some("mature".into()), None),
+                    "{m}"
+                );
+
+                // quarantine off: mature.
+                let off = context(&server, false, QuarantineMode::Off);
+                let r = send(
+                    &off.app,
+                    m.clone(),
+                    "/v2/library/demo/manifests/v1",
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(
+                    verdict(&r),
+                    (StatusCode::OK, Some("mature".into()), None),
+                    "{m}"
+                );
+
+                // enforce: the 403 keeps its value and now names the end of the hold too.
+                let held = context(&server, false, QuarantineMode::Enforce);
+                let r = send(
+                    &held.app,
+                    m.clone(),
+                    "/v2/library/demo/manifests/v1",
+                    Body::empty(),
+                )
+                .await;
+                let (status, v, until) = verdict(&r);
+                assert_eq!(
+                    (status, v.as_deref()),
+                    (StatusCode::FORBIDDEN, Some("pending")),
+                    "{m}"
+                );
+                let until: i64 = until.expect("until").parse().unwrap();
+                assert!((until - in_three_days()).abs() < 60, "{m}: {until}");
+            }
+        }
+
+        /// Off by default, and a digest reference has no tag to ask quay about.
+        #[tokio::test]
+        async fn no_lookup_without_trust_or_without_a_tag() {
+            let (server, image, _) = upstream_with_image().await;
+            Mock::given(method("GET"))
+                .and(path(TAG_API))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(quay_tag(&sha(&image), days_ago(30))),
+                )
+                .expect(0)
+                .mount(&server)
+                .await;
+            let untrusted = context(&server, false, QuarantineMode::Enforce);
+            assert_eq!(get(&untrusted, "manifests/v1").await, StatusCode::FORBIDDEN);
+            let by_digest = context(&server, true, QuarantineMode::Enforce);
+            assert_eq!(
+                get(&by_digest, &format!("manifests/{}", sha(&image))).await,
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+
     /// Positive control for the integrity check: when the upstream bytes hash to
     /// the requested digest, the blob is verified, cached, and streamed back to
     /// the client via the get_reader path (#580) with a 200.
@@ -9617,6 +10052,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url: upstream.uri(),
                 auth: None,
                 auth_env: None,
@@ -9738,6 +10174,7 @@ mod integration_tests {
 
     fn unreachable_upstream() -> crate::config::DockerUpstream {
         crate::config::DockerUpstream {
+            trust_upstream_dates: false,
             // Reserved port on localhost — connect fails fast, no real network.
             url: "http://127.0.0.1:9".to_string(),
             auth: None,
@@ -9956,6 +10393,7 @@ mod stream_spool_tests {
         use crate::config::DockerUpstream;
         create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url: upstream,
                 auth: None,
                 auth_env: None,
@@ -10351,6 +10789,7 @@ mod stream_spool_tests {
         let upstream = slow_blob_upstream(blob.clone(), 2, Duration::from_millis(50)).await;
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url: upstream,
                 auth: None,
                 auth_env: None,
@@ -10598,6 +11037,7 @@ mod upstream_resume_tests {
         create_test_context_with_config(move |cfg| {
             cfg.docker.proxy_timeout = proxy_timeout;
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url,
                 auth: None,
                 auth_env: None,
@@ -10885,6 +11325,7 @@ mod upstream_resume_tests {
             cfg.circuit_breaker.failure_threshold = 1;
             cfg.docker.proxy_timeout = 5;
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url: upstream_url,
                 auth: None,
                 auth_env: None,
@@ -11205,6 +11646,7 @@ mod blob_single_flight_tests {
             cfg.curation.blocklist_path = Some(bl);
             cfg.curation.bypass_token = Some(ProtectedString::from("let-me-in"));
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url,
                 auth: None,
                 auth_env: None,
@@ -11593,6 +12035,7 @@ mod upstream_failure_cases {
             let url = flip.uri();
             let ctx = create_test_context_with_config(move |cfg| {
                 cfg.docker.upstreams = vec![DockerUpstream {
+                    trust_upstream_dates: false,
                     url,
                     auth: None,
                     auth_env: None,
@@ -11637,6 +12080,7 @@ mod upstream_failure_edge_cases {
             let url = bad.uri();
             let ctx = create_test_context_with_config(move |cfg| {
                 cfg.docker.upstreams = vec![DockerUpstream {
+                    trust_upstream_dates: false,
                     url,
                     auth: None,
                     auth_env: None,
@@ -11737,6 +12181,7 @@ mod hosted_pull_stats_and_re_push {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -11854,6 +12299,7 @@ mod hosted_pull_stats_and_re_push {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -12043,6 +12489,7 @@ mod hosted_pull_stats_every_writer_takes_the_lock {
         use sha2::Digest as _;
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -12315,6 +12762,7 @@ mod hosted_pull_stats_after_a_delete {
     fn ctx() -> crate::test_helpers::TestContext {
         crate::test_helpers::create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -12510,6 +12958,7 @@ mod manifest_before_metadata_one_lock_order {
         let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = if upstream_ns {
                 vec![DockerUpstream {
+                    trust_upstream_dates: false,
                     url: "http://127.0.0.1:1".into(),
                     auth: None,
                     auth_env: None,

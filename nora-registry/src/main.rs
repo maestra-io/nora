@@ -4139,6 +4139,7 @@ mod cleanup_pass_tests {
         let mut config = Config::default();
         config.docker.enabled = false;
         config.docker.upstreams = vec![config::DockerUpstream {
+            trust_upstream_dates: false,
             url: "https://registry-1.docker.io".into(),
             auth: None,
             auth_env: None,

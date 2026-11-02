@@ -133,6 +133,19 @@ pub static QUARANTINE_HOLDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create QUARANTINE_HOLDS_TOTAL metric at startup")
 });
 
+/// Docker manifests the quarantine saw for the first time, by upstream namespace, by
+/// what dated them (`source`: a registry publish date under `trust_upstream_dates`, or
+/// `first_seen` = NORA's own clock) and by whether that date already matured them
+/// (`status`: `mature` = admitted at once, `held`).
+pub static DOCKER_QUARANTINE_FIRST_SIGHT_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_docker_quarantine_first_sight_total",
+        "Docker manifests first seen by the quarantine, by upstream, date source and status",
+        &["upstream", "source", "status"]
+    )
+    .expect("failed to create DOCKER_QUARANTINE_FIRST_SIGHT_TOTAL metric at startup")
+});
+
 /// Conditional revalidations where upstream answered 304 Not Modified — the
 /// cached body was reused and no body bytes were downloaded (#596).
 pub static PROXY_UPSTREAM_304_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {

@@ -628,6 +628,7 @@ async fn docker_internal_manifest_miss_get_404_not_403() {
     let ctx = create_test_context_with_config(|c| {
         c.curation.internal_namespaces = vec!["internal/**".to_string()];
         c.docker.upstreams = vec![DockerUpstream {
+            trust_upstream_dates: false,
             url: BLACKHOLE.to_string(),
             auth: None,
             auth_env: None,
@@ -662,6 +663,7 @@ async fn docker_internal_manifest_miss_head_404_not_403() {
     let ctx = create_test_context_with_config(|c| {
         c.curation.internal_namespaces = vec!["internal/**".to_string()];
         c.docker.upstreams = vec![DockerUpstream {
+            trust_upstream_dates: false,
             url: BLACKHOLE.to_string(),
             auth: None,
             auth_env: None,
@@ -690,6 +692,7 @@ async fn docker_internal_referrers_tag_miss_head_404() {
     let ctx = create_test_context_with_config(|c| {
         c.curation.internal_namespaces = vec!["internal/**".to_string()];
         c.docker.upstreams = vec![DockerUpstream {
+            trust_upstream_dates: false,
             url: BLACKHOLE.to_string(),
             auth: None,
             auth_env: None,
@@ -719,6 +722,7 @@ async fn docker_internal_blob_miss_get_404_and_head_agrees() {
     let ctx = create_test_context_with_config(|c| {
         c.curation.internal_namespaces = vec!["internal/**".to_string()];
         c.docker.upstreams = vec![DockerUpstream {
+            trust_upstream_dates: false,
             url: BLACKHOLE.to_string(),
             auth: None,
             auth_env: None,
@@ -937,6 +941,7 @@ async fn an_internal_name_never_reaches_a_recording_upstream_dates_included() {
         c.terraform.proxy = Some(uri.clone());
         c.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(uri.clone())];
         c.docker.upstreams = vec![crate::config::DockerUpstream {
+            trust_upstream_dates: false,
             url: uri,
             auth: None,
             auth_env: None,
