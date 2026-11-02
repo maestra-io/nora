@@ -72,7 +72,43 @@ are cheap and normal; do not chase them.
 **Branch:** CPU per request ≥ ~0.05 or pod CPU in whole cores while rps is in the
 hundreds → Step 2 (CPU contention). CPU per request flat (12.10 16:00: 0.006 at 413 rps,
 1.5–1.8 cores) and p99 high → Step 2b (network link) before Step 3. p99 high only for
-one registry → Step 3.
+one registry → Step 3. In every case run Step 1b too: it names the slow requests.
+
+## Step 1b — Which requests were slow: the Traefik access log
+
+The histogram says how many requests were slow, not which. iota's Traefik writes every
+`packages.maestra.io` request to VictoriaLogs (`tp-victorialogs-ingress-logs-iota`,
+`Duration`/`OriginDuration` in ns, `DownstreamContentSize`, `ClientHost`); one query
+lists the slow ones with path, size and client:
+
+```bash
+V(){ timeout 60 gcx api "/api/datasources/proxy/uid/tp-victorialogs-ingress-logs-iota/select/logsql/query?query=$(jq -rn --arg q "$1" '$q|@uri')"; }
+V '_time:[<from>, <to>] RequestHost:"packages.maestra.io" | stats count() n, count() if (Duration:>5000000000) slow'
+V '_time:[<from>, <to>] RequestHost:"packages.maestra.io" Duration:>5000000000
+   | fields _time, RequestMethod, RequestPath, DownstreamStatus, Duration, OriginDuration, DownstreamContentSize, ClientHost
+   | sort by (Duration desc) | limit 60' \
+| jq -r '[._time[11:19], .RequestMethod, ((.Duration|tonumber)/1e9|floor), .DownstreamContentSize, .ClientHost, .RequestPath] | @tsv'
+V '_time:[<from>, <to>] RequestHost:"packages.maestra.io" RequestPath:"/npm/<pkg>" | fields _time, Duration, DownstreamContentSize, ClientHost | sort by (_time desc) | limit 40'   # the same path on a quiet hour = its normal cost
+```
+
+Reading it:
+
+- `OriginDuration == Duration` → the time was spent in nora (or in the store behind it),
+  not in Traefik. For a body of a few MB the client paces the stream (backpressure),
+  so a large packument to a slow laptop is a slow request too; a **small body (KBs)
+  taking seconds** cannot be the client — it is nora or the store.
+- `ClientHost` `23.81.177.42` / `23.81.164.132` / `142.234.84.1` are iota's own nodes
+  01/02/03: in-cluster clients (ARC runners, code-intelligence) SNAT'd to the node's
+  public address, not the internet. `44.x`/`52.x`/`13.x` are RunsOn (AWS).
+- Several unrelated requests from different clients slow in the **same second** → a
+  shared stall (the store, or something process-wide in nora), not one heavy client.
+- Compare each slow path with its own quiet-hour cost (third query): `/npm/typescript`
+  is 15.8 MB and takes 1.3–3 s normally; 64–194 s on 02.11 was a stall, not size.
+
+Store latency itself: `nora_storage_operation_duration_seconds{operation}` (since
+`1.4.1-maestra.14`, nora#112) — `histogram_quantile(0.99, sum by (le, operation)
+(rate(nora_storage_operation_duration_seconds_bucket[5m])))`. Before it only the call
+counts existed, which is why 23.10 and 02.11 closed without a cause.
 
 ## Step 2 — CPU contention: profile the process on the node
 
@@ -196,6 +232,14 @@ Baselines: storage `get` errors are never zero (12.10 12:00 UTC: 2880 `get` + 15
   over repos pushed in the last hour) and `Cache not found` in their install job logs
   (21.10.2026: a Renovate wave over the frontend repos).
 
+- **4e. No branch matched** (CPU per request flat, link idle, no restart, upstream quiet,
+  breaker closed, node network clean) and Step 1b shows small bodies taking seconds in
+  shared stalls: the store is the suspect. Read
+  `nora_storage_operation_duration_seconds` by operation over the window; check
+  Cloudflare status; nothing to roll back, the alert resolves with the stall. If the
+  histogram is flat while HTTP is slow, the stall is inside nora: take the Step 2 `perf`
+  sample during the next firing (even at low CPU it shows where the workers wait).
+
 ## Act
 
 All changes go through PRs, never by hand:
@@ -235,6 +279,7 @@ After the pod is Ready (`pod_of`), at least 10 minutes of traffic:
 
 | Date (UTC) | Object | Cause | Category | What helped | Thread |
 |---|---|---|---|---|---|
+| 02.11.2026 13:15–13:26 | nora `1.4.1-maestra.13`, iota node 03 | p99 7.6 s at 15 rps (npm GET ≥ 10 s at 1.9 rps, nuget 5.2 s at 12 rps), p90 1.1 s, p50 0.6 s; CPU 0.11 cores (0.0076 core-s/req), `eno5` rx 47 Mbit/s, no restart, upstream 0.4 req/min, breaker 0, node 03 retransmits < 0.4 %, conntrack 10 %, CoreDNS p99 10 ms, no Cilium drops, R2 edge 40–190 ms from the node. Traefik: 182 of 15 992 requests > 5 s, all `OriginDuration == Duration`: `/npm/typescript` (15.8 MB) 194/71/64 s vs 1.3–3 s normally, nuget `flatcontainer/*/index.json` (2–50 KB) 8–55 s, npm tarballs (2–30 KB) 8–17 s; stalls shared across clients in the same second (13:11, 13:40). No object_store retry lines in the pod log (it logs them at `info`). Second bump 13:40–13:42 stayed `pending` | shared stall, store or process-wide; cause not measurable (no per-operation store latency) | resolved on its own. nora#112: `nora_storage_operation_duration_seconds`; runbook Step 1b (Traefik access log) and 4e | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1793625380880529> |
 | 23.10.2026 01:02–01:08 | nora `1.4.1-maestra.9`, iota node 03 | every R2 operation stalled for ~3 min (00:57–01:00: `get ok` 335 → 19/min, then 32 `get` errors at 01:01) while nora served only 2.1 rps; 7 of 421 npm requests > 10s made the global p99. CPU 0.025 cores, `eno5` rx ≤ 31 Mbit/s, no restart, no Cloudflare R2 incident; stall cause not established | low-traffic false positive | resolved on its own; rule now fires only above 5 rps | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1792717381201449> |
 | 21.10.2026 10:20–10:25 | nora `1.3.6-maestra.3`, iota node 02 | Renovate wave over ~15 frontend repos (09:51–10:19, ~70 `pr` runs of `mcf-build.yml`): `node_modules` was cached under the exact lockfile hash and `~/.npm` not at all, so every bump ran a full `npm ci` (2534 packages, 6 min). npm 176 rps, 99k tarballs and 66 GB from R2 in 10 min, all nora `cache_hit`; `eno5` rx 908 Mbit/s, npm p99 5.1s; CPU 0.007 core-s/request | network link saturated (client-side cache miss) | ended with the wave. github-actions#184: on a `node_modules` miss `mcf-build` and `npm-package-publish` restore `~/.npm/_cacache` by key prefix (RunsOn magic cache), so a new lockfile fetches only changed packages | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1792578041939979> |
 | 16–19.10.2026, 10 firings (16.10 ×1, 17.10 ×4, 18.10 ×3, 19.10 ×1) | nora `1.3.6-maestra.1/.2`, iota | the 1.3.6 release was built `--no-default-features` after nora#23 moved `mimalloc` into `default`: the image lost the allocator and the 12.10 musl malloc lock came back. CPU per request 0.004 → 0.03–0.07 core-s, `stime/utime` 4.6 on node 02, p99 ≥ 9s on NuGet bursts of only 15–25 rps while traffic itself had dropped 6–12× (170 → 12–28 GB/day) after the CI cache-mount sweep | allocator regression | nora#76: release and CI gates build `--no-default-features --features mimalloc`, Dockerfile refuses a binary without mimalloc; `1.3.6-maestra.3` (fluxcd#23672). Traffic side, same week: NuGet cache mount in ~180 repo Dockerfiles + test-job cache (github-actions #146/#147/#149/#151/#153): warm image legs 300 → 0.2 MB, test jobs 210 → 0 MB | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1792399381398669> |
