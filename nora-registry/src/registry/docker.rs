@@ -732,13 +732,61 @@ fn quarantine_forbidden(
         [
             (
                 HeaderName::from_static("x-nora-quarantine"),
-                status.header_value(),
+                status.header_value().to_string(),
             ),
-            (header::CONTENT_TYPE, "application/json"),
+            (
+                HeaderName::from_static("x-nora-quarantine-until"),
+                quarantine_until.to_string(),
+            ),
+            (header::CONTENT_TYPE, "application/json".to_string()),
         ],
         body.to_string(),
     )
         .into_response()
+}
+
+/// The quarantine verdict on a served (200) manifest, in the headers the 403 carries, so a
+/// client can read it under `observe` too (fluxcd `scripts/nora-image-check.py`):
+/// `x-nora-quarantine: pending` plus `x-nora-quarantine-until` (unix seconds) while the
+/// digest is still within the TTL, `mature` once admitted: past the TTL, dated past it by
+/// the registry (`trust_upstream_dates`), quarantine off, or served without a proxy record
+/// (a local push). A 403 keeps the headers [`quarantine_forbidden`] set.
+fn with_quarantine_verdict(state: &AppState, mut resp: Response) -> Response {
+    if resp.status() != StatusCode::OK {
+        return resp;
+    }
+    let Some(digest) = resp
+        .headers()
+        .get("docker-content-digest")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+    else {
+        return resp;
+    };
+    let (q_mode, q_secs) = resolve_quarantine(state);
+    let held = match q_mode {
+        crate::digest_quarantine::QuarantineMode::Off => None,
+        _ => match state.digest_store.check("docker", &digest, q_secs) {
+            crate::digest_quarantine::QuarantineStatus::Pending { remaining_secs } => {
+                Some(remaining_secs)
+            }
+            _ => None,
+        },
+    };
+    let headers = resp.headers_mut();
+    let verdict = if held.is_some() { "pending" } else { "mature" };
+    headers.insert(
+        HeaderName::from_static("x-nora-quarantine"),
+        axum::http::HeaderValue::from_static(verdict),
+    );
+    if let Some(remaining) = held {
+        let until = chrono::Utc::now().timestamp() + remaining;
+        headers.insert(
+            HeaderName::from_static("x-nora-quarantine-until"),
+            axum::http::HeaderValue::from(until),
+        );
+    }
+    resp
 }
 
 /// Build a 404 `MANIFEST_UNKNOWN` response per the OCI Distribution Spec.
@@ -1063,11 +1111,12 @@ async fn docker_v2_dispatch(
         return match method {
             Method::GET | Method::HEAD => {
                 let resp = get_manifest(
-                    state,
+                    state.clone(),
                     headers,
                     Path((name.to_string(), reference.to_string())),
                 )
                 .await;
+                let resp = with_quarantine_verdict(&state, resp);
                 if method == Method::HEAD {
                     let (parts, _) = resp.into_parts();
                     Response::from_parts(parts, axum::body::Body::empty())
@@ -9683,6 +9732,7 @@ mod integration_tests {
         use crate::config::DockerUpstream;
         use crate::digest_quarantine::QuarantineMode;
         use crate::test_helpers::{create_test_context_with_config, TestContext};
+        use axum::response::Response;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -9856,6 +9906,105 @@ mod integration_tests {
                     StatusCode::OK,
                     "{label}"
                 );
+            }
+        }
+
+        /// The verdict rides on every manifest answer, 200 included, so `observe` can be
+        /// read by a client: pending + until while held, mature once admitted.
+        #[tokio::test]
+        async fn the_quarantine_verdict_is_on_every_manifest_answer() {
+            let verdict = |r: &Response| {
+                let h = |n: &str| r.headers().get(n).map(|v| v.to_str().unwrap().to_owned());
+                (
+                    r.status(),
+                    h("x-nora-quarantine"),
+                    h("x-nora-quarantine-until"),
+                )
+            };
+            let in_three_days = || chrono::Utc::now().timestamp() + 3 * 86400;
+            let (server, image, _) = upstream_with_image().await;
+            Mock::given(method("GET"))
+                .and(path(TAG_API))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(quay_tag(&sha(&image), days_ago(30))),
+                )
+                .mount(&server)
+                .await;
+            for m in [Method::GET, Method::HEAD] {
+                // observe, first sight, no trusted date: served, pending until first-seen + TTL.
+                let fresh = context(&server, false, QuarantineMode::Observe);
+                let r = send(
+                    &fresh.app,
+                    m.clone(),
+                    "/v2/library/demo/manifests/v1",
+                    Body::empty(),
+                )
+                .await;
+                let (status, v, until) = verdict(&r);
+                assert_eq!(
+                    (status, v.as_deref()),
+                    (StatusCode::OK, Some("pending")),
+                    "{m}"
+                );
+                let until: i64 = until.expect("until").parse().unwrap();
+                assert!((until - in_three_days()).abs() < 60, "{m}: {until}");
+                // the same digest again, now by digest: still pending
+                let r = send(
+                    &fresh.app,
+                    m.clone(),
+                    &format!("/v2/library/demo/manifests/{}", sha(&image)),
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(verdict(&r).1.as_deref(), Some("pending"), "{m}");
+
+                // observe, dated 30 days ago by the registry: mature, no until.
+                let old = context(&server, true, QuarantineMode::Observe);
+                let r = send(
+                    &old.app,
+                    m.clone(),
+                    "/v2/library/demo/manifests/v1",
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(
+                    verdict(&r),
+                    (StatusCode::OK, Some("mature".into()), None),
+                    "{m}"
+                );
+
+                // quarantine off: mature.
+                let off = context(&server, false, QuarantineMode::Off);
+                let r = send(
+                    &off.app,
+                    m.clone(),
+                    "/v2/library/demo/manifests/v1",
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(
+                    verdict(&r),
+                    (StatusCode::OK, Some("mature".into()), None),
+                    "{m}"
+                );
+
+                // enforce: the 403 keeps its value and now names the end of the hold too.
+                let held = context(&server, false, QuarantineMode::Enforce);
+                let r = send(
+                    &held.app,
+                    m.clone(),
+                    "/v2/library/demo/manifests/v1",
+                    Body::empty(),
+                )
+                .await;
+                let (status, v, until) = verdict(&r);
+                assert_eq!(
+                    (status, v.as_deref()),
+                    (StatusCode::FORBIDDEN, Some("pending")),
+                    "{m}"
+                );
+                let until: i64 = until.expect("until").parse().unwrap();
+                assert!((until - in_three_days()).abs() < 60, "{m}: {until}");
             }
         }
 

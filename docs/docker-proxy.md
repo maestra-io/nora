@@ -41,3 +41,14 @@ repository (registry.k8s.io promotes reviewed images only).
 (`hub_tag_last_pushed`, `quay_last_modified`, `gcr_time_uploaded` or `first_seen`) and
 `status` (`mature` = admitted at once, `held`), and counts
 `nora_docker_quarantine_first_sight_total{upstream, source, status}`.
+
+### The verdict on every manifest answer
+
+Every manifest `GET` and `HEAD` returns the quarantine verdict, so a client can read it
+under `observe`, where nothing is refused (fluxcd `scripts/nora-image-check.py`):
+
+| answer | `x-nora-quarantine` | `x-nora-quarantine-until` |
+|---|---|---|
+| 200, digest still inside the TTL | `pending` | unix seconds the hold ends |
+| 200, admitted (past the TTL, dated past it by the registry, quarantine off, or a local push with no proxy record) | `mature` | absent |
+| 403 under `enforce` | `pending` or `new`, as before | unix seconds the hold ends |
