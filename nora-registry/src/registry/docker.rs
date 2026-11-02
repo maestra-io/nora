@@ -880,6 +880,39 @@ fn quarantine_record_verified(state: &AppState, digest: &str, upstream: &str) {
     state.digest_store.record("docker", digest, upstream, None);
 }
 
+/// Start the quarantine clock of every digest a proxied manifest names (an index's
+/// manifests, an image's config and layers) at the manifest's own first-seen. Without
+/// it enforce held one level at a time, because a client asks for a child only once its
+/// parent is served: the index for a TTL, then the platform manifest, then the blobs —
+/// three TTLs for a multi-arch image. The names come from bytes hashed to the manifest
+/// digest, and the date is NORA's own first sight of that manifest, never an upstream
+/// date, so no child matures before NORA first saw something naming it. Idempotent: a
+/// digest already recorded keeps its own first-seen.
+fn quarantine_record_referenced(
+    state: &AppState,
+    manifest: &[u8],
+    upstream: &str,
+    first_seen: i64,
+) {
+    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(manifest) else {
+        return;
+    };
+    let listed = ["manifests", "layers"]
+        .iter()
+        .filter_map(|k| doc[*k].as_array())
+        .flatten();
+    for named in listed.chain(std::iter::once(&doc["config"])) {
+        if let Some(d) = named["digest"]
+            .as_str()
+            .filter(|d| validate_digest(d).is_ok())
+        {
+            state
+                .digest_store
+                .record("docker", d, upstream, Some(first_seen));
+        }
+    }
+}
+
 /// Docker v2 routes.
 /// Uses a `{*rest}` wildcard to support image names with arbitrary path depth
 /// (e.g., `library/astra/ubi18-cpp122`), per OCI Distribution spec.
@@ -2086,9 +2119,10 @@ async fn try_fetch_and_cache(
                 // Quarantine: record digest, check status
                 let (q_mode, q_secs) = resolve_quarantine(state);
                 if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
-                    state
+                    let entry = state
                         .digest_store
                         .record("docker", &digest, &upstream.url, None);
+                    quarantine_record_referenced(state, &data, &upstream.url, entry.first_seen);
                     let q_status = state.digest_store.check("docker", &digest, q_secs);
                     match &q_status {
                         crate::digest_quarantine::QuarantineStatus::Mature => {}
@@ -9442,6 +9476,123 @@ mod integration_tests {
             manifest_new.as_slice(),
             "a proxied tag with an outdated cached manifest must revalidate and return the upstream version (#638)"
         );
+    }
+
+    /// A proxied manifest dates every digest it names at its own first-seen, so under
+    /// enforce a multi-arch image waits one TTL, not one per level (index, platform
+    /// manifest, blobs). RED before: the platform manifest read as new when the client
+    /// asked for it after the index matured, and was held for another TTL.
+    #[tokio::test]
+    async fn quarantine_dates_what_a_manifest_names_at_its_own_first_seen() {
+        use crate::config::DockerUpstream;
+        use crate::digest_quarantine::{QuarantineMode, QuarantineStatus};
+        use crate::test_helpers::{create_test_context_with_config, TestContext};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let sha = |b: &[u8]| format!("sha256:{}", hex::encode(sha2::Sha256::digest(b)));
+        let config = br#"{"architecture":"amd64","os":"linux"}"#.to_vec();
+        let layer = b"layer bytes".to_vec();
+        let image = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{}","size":{}}}]}}"#,
+            sha(&config),
+            config.len(),
+            sha(&layer),
+            layer.len()
+        )
+        .into_bytes();
+        let index = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{}","size":{},"platform":{{"architecture":"amd64","os":"linux"}}}}]}}"#,
+            sha(&image),
+            image.len()
+        )
+        .into_bytes();
+
+        let upstream = MockServer::start().await;
+        let index_ct = "application/vnd.oci.image.index.v1+json";
+        for (route, body, ct) in [
+            ("manifests/latest".to_string(), index.clone(), index_ct),
+            (
+                format!("manifests/{}", sha(&image)),
+                image.clone(),
+                "application/vnd.oci.image.manifest.v1+json",
+            ),
+            (
+                format!("blobs/{}", sha(&config)),
+                config.clone(),
+                "application/octet-stream",
+            ),
+            (
+                format!("blobs/{}", sha(&layer)),
+                layer.clone(),
+                "application/octet-stream",
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/library/demo/{route}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Type", ct)
+                        .set_body_bytes(body),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        let enforcing = || {
+            create_test_context_with_config(|cfg| {
+                cfg.docker.upstreams = vec![DockerUpstream {
+                    url: upstream.uri(),
+                    auth: None,
+                    auth_env: None,
+                    namespace: None,
+                    prefix: None,
+                }];
+                cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+                cfg.curation.quarantine_ttl = Some("1h".to_string());
+            })
+        };
+        async fn status(ctx: &TestContext, rest: String) -> StatusCode {
+            let uri = format!("/v2/library/demo/{rest}");
+            send(&ctx.app, Method::GET, &uri, Body::empty())
+                .await
+                .status()
+        }
+
+        // First sight: the index is held, and what it names is already counting, not new.
+        let fresh = enforcing();
+        assert_eq!(
+            status(&fresh, "manifests/latest".into()).await,
+            StatusCode::FORBIDDEN
+        );
+        assert!(matches!(
+            fresh.state.digest_store.check("docker", &sha(&image), 3600),
+            QuarantineStatus::Pending { .. }
+        ));
+
+        // An index NORA first saw two hours ago: the index, then the platform manifest,
+        // then its blobs are served in one pass, each dated by what named it.
+        let aged = enforcing();
+        let two_hours_ago = chrono::Utc::now().timestamp() - 7200;
+        aged.state
+            .digest_store
+            .record("docker", &sha(&index), "seed", Some(two_hours_ago));
+        assert_eq!(
+            status(&aged, "manifests/latest".into()).await,
+            StatusCode::OK,
+            "index"
+        );
+        assert_eq!(
+            status(&aged, format!("manifests/{}", sha(&image))).await,
+            StatusCode::OK,
+            "the platform manifest the index named"
+        );
+        for blob in [&config, &layer] {
+            assert_eq!(
+                status(&aged, format!("blobs/{}", sha(blob))).await,
+                StatusCode::OK,
+                "a blob the platform manifest named"
+            );
+        }
     }
 
     /// Positive control for the integrity check: when the upstream bytes hash to
