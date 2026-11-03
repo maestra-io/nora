@@ -64,7 +64,11 @@ Output shape: `<time> {"<registry>":<N>}` per window; `<pod> start=<time> restar
      `urls` of `config`, `layers[]` and `manifests[]` descriptors of a 2xx manifest; annotations such as
      `org.opencontainers.image.base.name: gcr.io/…` (ghcr `cloudnative-pg` index, 22.10.2026) cannot fire it. An OCI
      error body (4xx/5xx) is still scanned whole, so a `gcr.io` in an upstream error message counts: read the path
-     and status of the WARN line.
+     and status of the WARN line. Since `1.4.1-maestra.18` a descriptor whose `mediaType` is a foreign /
+     non-distributable layer (`*.foreign.diff.tar.gzip`, `*.layer.nondistributable.*`) is skipped: Windows base
+     layers are fetched from their `urls` by spec and a manifest is content-addressed, so nora cannot rewrite them
+     (`docker-hub/golang:1.13.15` windowsservercore manifests pointing at `mcr.microsoft.com`, 03.11.2026). On an
+     older `image` (step 2) that firing is the known false positive: wait for the release.
 4. Step 5 lists a fix merged before the alert; compare its release with the running `image` tag (step 2): merged but not
    running = wait for the release, the alert repeats until then.
 
