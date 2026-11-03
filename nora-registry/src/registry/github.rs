@@ -461,9 +461,10 @@ pub(crate) struct Asset<'a> {
 pub(crate) async fn serve_asset(state: &AppState, headers: &HeaderMap, a: Asset<'_>) -> Response {
     let reg = a.registry.as_str();
     let engine = &state.curation().curation_engine;
-    let publish_date = a
-        .published
-        .filter(|_| state.config.server.trust_upstream_dates);
+    let publish_date = crate::digest_quarantine::first_seen_seed(
+        state.config.server.trust_upstream_dates,
+        a.published,
+    );
     if let Some(response) = crate::curation::check_download(
         engine,
         state.bypass_token().as_deref(),
