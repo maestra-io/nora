@@ -212,6 +212,32 @@ pub fn pypi_index(
     Some(kept.concat().into_bytes())
 }
 
+/// A Galaxy v3 versions page (`data[]` of `{version, created_at}`): drop the young
+/// entries, so `ansible-galaxy install` resolves a range like `>=8.0.0` to the newest
+/// mature version instead of the fresh one the tarball gate then refuses. `meta` and
+/// the paging `links` stay as the upstream sent them: the client walks `links.next`
+/// and reads only `data`.
+pub fn ansible_versions(engine: &CurationEngine, name: &str, body: &[u8]) -> Option<Vec<u8>> {
+    let mut doc: Value = serde_json::from_slice(body).ok()?;
+    let data = doc.get_mut("data")?.as_array_mut()?;
+    let before = data.len();
+    data.retain(|e| {
+        let Some(version) = e.get("version").and_then(Value::as_str) else {
+            return true;
+        };
+        let published = e
+            .get("created_at")
+            .or_else(|| e.get("created"))
+            .and_then(Value::as_str)
+            .and_then(parse_iso8601_to_unix);
+        !engine.hides_from_metadata(RegistryType::Ansible, name, version, published)
+    });
+    if data.len() == before {
+        return None;
+    }
+    serde_json::to_vec(&doc).ok()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -547,5 +573,64 @@ mod tests {
         let resp = send(&ctx.app, Method::GET, "/simple/corp-lib/", "").await;
         let html = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
         assert!(html.contains("corp_lib-1.0.tar.gz"), "{html}");
+    }
+
+    // ── Ansible Galaxy ──
+
+    async fn galaxy_ctx(mode: CurationMode) -> (MockServer, crate::test_helpers::TestContext) {
+        let upstream = MockServer::start().await;
+        let v = |n: &str, ago: i64| {
+            json!({ "version": n, "created_at": iso_ago(ago),
+            "href": format!("/api/v3/plugin/ansible/content/published/collections/index/community/general/versions/{n}/") })
+        };
+        let page = json!({
+            "meta": { "count": 3 },
+            "links": { "first": null, "previous": null, "next": null, "last": null },
+            "data": [v("14.0.0", YOUNG), v("13.5.0", OLD), v("12.0.0", OLD + 10)]
+        });
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v3/plugin/ansible/content/published/collections/index/community/general/versions/",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.ansible.enabled = true;
+            cfg.ansible.proxy = Some(uri);
+            cooldown(cfg, mode);
+        });
+        (upstream, ctx)
+    }
+
+    async fn galaxy_versions(ctx: &crate::test_helpers::TestContext) -> Vec<String> {
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/ansible/v3/collections/community/general/versions/",
+            "",
+        )
+        .await;
+        json_of(resp).await["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["version"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn ansible_versions_hide_young_collections() {
+        let (_up, ctx) = galaxy_ctx(CurationMode::Enforce).await;
+        assert_eq!(galaxy_versions(&ctx).await, ["13.5.0", "12.0.0"]);
+        // Served again from the cache: still filtered.
+        assert_eq!(galaxy_versions(&ctx).await, ["13.5.0", "12.0.0"]);
+    }
+
+    #[tokio::test]
+    async fn ansible_versions_audit_mode_keeps_young_collections() {
+        let (_up, ctx) = galaxy_ctx(CurationMode::Audit).await;
+        assert_eq!(galaxy_versions(&ctx).await, ["14.0.0", "13.5.0", "12.0.0"]);
     }
 }

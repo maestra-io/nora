@@ -184,13 +184,31 @@ async fn version_list(
         None => format!("ansible/metadata/{}/{}/versions.json", ns, name),
     };
 
-    proxy_json(
+    let package = format!("{}.{}", ns, name);
+    let resp = proxy_json(
         &state,
         &url,
-        &format!("{}.{}/versions", ns, name),
+        &format!("{}/versions", package),
         &cache_key,
-        Some(&format!("{}.{}", ns, name)),
+        Some(&package),
     )
+    .await;
+    // Q04: hide collection versions younger than min_release_age (metadata_filter).
+    let curation = state.curation();
+    let engine = &curation.curation_engine;
+    if resp.status() != StatusCode::OK
+        || !engine.metadata_filter_active()
+        || crate::curation::is_internal_namespace(
+            engine,
+            crate::curation::RegistryType::Ansible,
+            &package,
+        )
+    {
+        return resp;
+    }
+    crate::metadata_filter::rewrite_body(resp, |body| {
+        crate::metadata_filter::ansible_versions(engine, &package, body)
+    })
     .await
 }
 
