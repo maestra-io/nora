@@ -516,11 +516,13 @@ async fn registration_index(
 
     if state.config.nuget.serve_stale {
         if let Some(ref data) = cached_data {
-            refresh_in_background(&state, &storage_key, &url, Some(id_lower.clone()));
+            refresh_in_background(&state, &storage_key, &url);
+            state.metrics.record_download("nuget");
+            state.metrics.record_cache_hit("nuget");
             let text = String::from_utf8_lossy(data);
-            return with_json_stale(
+            return mark_stale(with_json_gzip(
                 rewrite_registration_urls(&text, &upstream, &base_url).into_bytes(),
-            );
+            ));
         }
     }
     let rewrite = Some((upstream.as_str(), base_url.as_str()));
@@ -628,11 +630,13 @@ async fn registration_page(
     let activity = Some(format!("{}/page/{}/{}", id_lower, lower, upper));
     if state.config.nuget.serve_stale {
         if let Some(ref data) = cached_data {
-            refresh_in_background(&state, &storage_key, &url, activity);
+            refresh_in_background(&state, &storage_key, &url);
+            state.metrics.record_download("nuget");
+            state.metrics.record_cache_hit("nuget");
             let text = String::from_utf8_lossy(data);
-            return with_json_stale(
+            return mark_stale(with_json_gzip(
                 rewrite_registration_urls(&text, &upstream, &base_url).into_bytes(),
-            );
+            ));
         }
     }
     match refresh_metadata(&state, &storage_key, &url, activity).await {
@@ -734,7 +738,9 @@ async fn version_list(state: AppState, id: &str) -> Response {
     let activity = Some(format!("{}/versions", id_lower));
     if state.config.nuget.serve_stale {
         if let Some(ref data) = cached_data {
-            refresh_in_background(&state, &storage_key, &url, activity);
+            refresh_in_background(&state, &storage_key, &url);
+            state.metrics.record_download("nuget");
+            state.metrics.record_cache_hit("nuget");
             return with_json_stale(data.to_vec());
         }
     }
@@ -755,15 +761,44 @@ async fn version_list(state: AppState, id: &str) -> Response {
 /// wave (NoraHighLatency 03.11.2026). Concurrent refreshes of one key coalesce in
 /// `refresh_metadata`, so a wave starts one flight. The callers gate it on
 /// `serve_stale`: an operator who turned that off wants nothing past its TTL served.
-fn refresh_in_background(state: &AppState, storage_key: &str, url: &str, activity: Option<String>) {
+///
+/// The caller counts the response it served; the refresh is nora's own read (no
+/// `activity`). An upstream 404 drops the cached document and its validators: the
+/// synchronous path answered 404 for it, and a stale copy would otherwise be served,
+/// and refreshed in vain, forever. Any other failure keeps the stale copy.
+fn refresh_in_background(state: &AppState, storage_key: &str, url: &str) {
     let state = state.clone();
     let storage_key = storage_key.to_string();
     let url = url.to_string();
     tokio::spawn(async move {
-        if let Err(e) = refresh_metadata(&state, &storage_key, &url, activity).await {
-            tracing::debug!(key = %storage_key, error = ?e, "background NuGet metadata refresh failed");
+        match refresh_metadata(&state, &storage_key, &url, None).await {
+            Ok(_) => {}
+            Err(ProxyError::NotFound) => {
+                let _ = state.storage.delete(&storage_key).await;
+                let _ = state
+                    .storage
+                    .delete(&crate::registry::validators_key(&storage_key))
+                    .await;
+            }
+            Err(e) => {
+                tracing::debug!(key = %storage_key, error = ?e, "background NuGet metadata refresh failed");
+            }
         }
     });
+}
+
+/// A response served past its TTL: clients must not cache it, and `x-nora-stale` says so.
+fn mark_stale(mut resp: Response) -> Response {
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=0, must-revalidate"),
+    );
+    headers.insert(
+        axum::http::header::HeaderName::from_static("x-nora-stale"),
+        HeaderValue::from_static("true"),
+    );
+    resp
 }
 
 /// Refresh the cached metadata document at `storage_key` (registration index or
@@ -1587,7 +1622,12 @@ struct HiddenEntry {
 const HIDDEN_MEMO_MAX: usize = 4096;
 
 /// [`compute_hidden_versions`], memoized in [`HiddenMemo`].
-async fn hidden_versions(state: &AppState, id: &str, last_page_only: bool) -> Arc<HashSet<String>> {
+async fn hidden_versions(
+    state: &AppState,
+    id: &str,
+    last_page_only: bool,
+    listed: Option<&HashSet<String>>,
+) -> Arc<HashSet<String>> {
     let ttl = std::time::Duration::from_secs(state.config.nuget.metadata_ttl.max(0) as u64);
     let curation = Arc::as_ptr(&*state.curation()) as usize;
     let memo = &state.nuget_hosted.hidden.0;
@@ -1597,7 +1637,7 @@ async fn hidden_versions(state: &AppState, id: &str, last_page_only: bool) -> Ar
             return e.hidden.clone();
         }
     }
-    let hidden = Arc::new(compute_hidden_versions(state, id, last_page_only).await);
+    let hidden = Arc::new(compute_hidden_versions(state, id, last_page_only, listed).await);
     if !ttl.is_zero() {
         let mut memo = memo.lock();
         if memo.len() >= HIDDEN_MEMO_MAX {
@@ -1622,12 +1662,20 @@ async fn hidden_versions(state: &AppState, id: &str, last_page_only: bool) -> Ar
 /// documents (cached by their bounds, fetched once, concurrently). `last_page_only`
 /// reads only the newest page: search results show many IDs at once, and a fresh
 /// version almost always lands there.
+///
+/// `listed` is the version list the caller is about to serve. A stale index that
+/// dates every one of them is used as is and refreshed behind the response (publish
+/// dates do not change), so the client does not wait on the store and upstream chain
+/// (NoraHighLatency 03.11.2026). A listed version the stale index does not know may
+/// be new, and young: then the index is refreshed first, as without `listed`.
 async fn compute_hidden_versions(
     state: &AppState,
     id: &str,
     last_page_only: bool,
+    listed: Option<&HashSet<String>>,
 ) -> HashSet<String> {
     let index_key = registration_key(id);
+    let index_path = format!("{id}/index.json");
     let ttl = state.config.nuget.metadata_ttl;
     let fresh = match state.storage.stat(&index_key).await {
         Some(m) if fresh_within_ttl(&state.storage, &index_key, m.modified, ttl).await => {
@@ -1635,20 +1683,46 @@ async fn compute_hidden_versions(
         }
         _ => None,
     };
-    let index = match fresh {
-        Some(doc) => Some(doc),
-        None => {
-            match fetch_registration_doc(state, &index_key, &format!("{id}/index.json")).await {
-                Some(doc) => Some(doc),
-                None => read_json(&state.storage, &index_key).await,
+    if fresh.is_none() && state.config.nuget.serve_stale {
+        if let (Some(listed), Some(stored)) = (listed, read_json(&state.storage, &index_key).await)
+        {
+            let leaves = registration_leaves(state, id, &stored, last_page_only).await;
+            let known: HashSet<String> = leaves
+                .iter()
+                .filter_map(|l| entry_version(l.get("catalogEntry")?))
+                .collect();
+            if listed.is_subset(&known) {
+                let (bg, key, path) = (state.clone(), index_key.clone(), index_path.clone());
+                tokio::spawn(async move { fetch_registration_doc(&bg, &key, &path).await });
+                return hidden_leaves(state, id, &leaves).await;
             }
         }
+    }
+    let index = match fresh {
+        Some(doc) => Some(doc),
+        None => match fetch_registration_doc(state, &index_key, &index_path).await {
+            Some(doc) => Some(doc),
+            None => read_json(&state.storage, &index_key).await,
+        },
     };
-    let Some(pages) = index
-        .as_ref()
-        .and_then(|d| d.get("items")?.as_array().cloned())
-    else {
+    let Some(index) = index else {
         return HashSet::new();
+    };
+    let leaves = registration_leaves(state, id, &index, last_page_only).await;
+    hidden_leaves(state, id, &leaves).await
+}
+
+/// The leaves of a registration `index`: its inlined pages, else the page documents
+/// (cached by their bounds, fetched once, concurrently); only the newest page with
+/// `last_page_only`.
+async fn registration_leaves(
+    state: &AppState,
+    id: &str,
+    index: &serde_json::Value,
+    last_page_only: bool,
+) -> Vec<serde_json::Value> {
+    let Some(pages) = index.get("items").and_then(|i| i.as_array()).cloned() else {
+        return Vec::new();
     };
     let skip = if last_page_only {
         pages.len().saturating_sub(1)
@@ -1676,14 +1750,22 @@ async fn compute_hidden_versions(
         }
     }))
     .await;
-    let leaves = docs
-        .iter()
+    docs.into_iter()
         .flatten()
-        .filter_map(|d| d.get("items")?.as_array())
-        .flatten();
+        .filter_map(|d| d.get("items")?.as_array().cloned())
+        .flatten()
+        .collect()
+}
+
+/// The versions among `leaves` that metadata must hide.
+async fn hidden_leaves(
+    state: &AppState,
+    id: &str,
+    leaves: &[serde_json::Value],
+) -> HashSet<String> {
     // ponytail: unbounded join; only undated leaves committed within min_release_age
     // fetch (once each), a semaphore if an upstream without commitTimeStamp shows up.
-    futures::future::join_all(leaves.map(|leaf| leaf_hidden(state, id, leaf)))
+    futures::future::join_all(leaves.iter().map(|leaf| leaf_hidden(state, id, leaf)))
         .await
         .into_iter()
         .flatten()
@@ -1727,7 +1809,7 @@ async fn registration_index_filtered(
     if resp.status() != StatusCode::OK || !filters_metadata(&state, &id_lower).await {
         return resp;
     }
-    let hidden = hidden_versions(&state, &id_lower, false).await;
+    let hidden = hidden_versions(&state, &id_lower, false, None).await;
     crate::metadata_filter::rewrite_body(resp, |b| filter_registration(&hidden, b)).await
 }
 
@@ -1740,7 +1822,7 @@ async fn registration_page_filtered(
     if resp.status() != StatusCode::OK || !filters_metadata(&state, &id_lower).await {
         return resp;
     }
-    let hidden = hidden_versions(&state, &id_lower, false).await;
+    let hidden = hidden_versions(&state, &id_lower, false, None).await;
     crate::metadata_filter::rewrite_body(resp, |b| filter_registration(&hidden, b)).await
 }
 
@@ -1751,7 +1833,24 @@ async fn version_list_filtered(state: AppState, id: &str) -> Response {
     if resp.status() != StatusCode::OK || !filters_metadata(&state, &id_lower).await {
         return resp;
     }
-    let hidden = hidden_versions(&state, &id_lower, false).await;
+    // The versions about to be served: a stale registration index that dates all of
+    // them is good enough (compute_hidden_versions). Unparsed → None, the full path.
+    let (parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let listed: Option<HashSet<String>> = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|d| {
+            d.get("versions")?.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_lowercase)
+                    .collect()
+            })
+        });
+    let hidden = hidden_versions(&state, &id_lower, false, listed.as_ref()).await;
+    let resp = Response::from_parts(parts, axum::body::Body::from(bytes));
     crate::metadata_filter::rewrite_body(resp, |b| drop_versions(b, "versions", &hidden)).await
 }
 
@@ -1761,7 +1860,7 @@ async fn filter_autocomplete_versions(state: &AppState, id: &str, body: String) 
     if !filters_metadata(state, &id_lower).await {
         return body.into_bytes();
     }
-    let hidden = hidden_versions(state, &id_lower, false).await;
+    let hidden = hidden_versions(state, &id_lower, false, None).await;
     drop_versions(body.as_bytes(), "data", &hidden).unwrap_or_else(|| body.into_bytes())
 }
 
@@ -1788,7 +1887,7 @@ async fn filter_search_results(state: &AppState, body: String) -> Vec<u8> {
         .collect();
     let hidden = futures::future::join_all(ids.iter().map(|id| async move {
         if filters_metadata(state, id).await {
-            hidden_versions(state, id, true).await
+            hidden_versions(state, id, true, None).await
         } else {
             Arc::default()
         }
@@ -3041,6 +3140,8 @@ mod integration_tests {
             resp.headers().get("x-nora-stale").map(|v| v.as_bytes()),
             Some(b"true".as_slice())
         );
+        // RegistrationsBaseUrl/3.6.0 is gzip, stale or not.
+        assert_eq!(resp.headers()["content-encoding"], "gzip");
     }
 
     /// A NuGet proxy whose upstream refuses connections: dates come from the cache only.
@@ -3853,7 +3954,7 @@ mod integration_tests {
     /// re-uploaded), under the handlers' single-flight.
     #[tokio::test]
     async fn test_q04_stale_registration_revalidates_once_conditionally() {
-        use crate::registry::{validators_key, write_validators, Validators};
+        use crate::registry::{write_validators, Validators};
         use crate::test_helpers::{
             create_test_context_with_storage_and_config, op_counting_storage,
         };
@@ -3903,6 +4004,9 @@ mod integration_tests {
         );
         assert_eq!(a, serde_json::json!(["1.0.0"]));
         assert_eq!(b, a);
+        // The stale index dates both listed versions, so it is revalidated behind the
+        // responses: wait for its 304 stamp.
+        wait_for_stamp(st, key).await;
         let reg_requests: Vec<_> = upstream
             .received_requests()
             .await
@@ -3912,11 +4016,154 @@ mod integration_tests {
             .collect();
         assert_eq!(reg_requests.len(), 1, "one flight for both requests");
         assert!(reg_requests[0].headers.contains_key("if-none-match"));
-        let sidecar = st.get(&validators_key(key)).await.unwrap();
-        assert!(String::from_utf8_lossy(&sidecar).contains("validated_at"));
         // Puts: the flat index (fetched once, coalesced) and the 304 stamp. Never the
         // registration body.
         assert_eq!(ops.snapshot().get("put"), Some(&2), "{:?}", ops.snapshot());
+    }
+
+    /// A Q04 context over `upstream`: every metadata document always stale, 7d cooldown.
+    fn stale_cooldown_ctx(upstream: &wiremock::MockServer) -> crate::test_helpers::TestContext {
+        let uri = upstream.uri();
+        create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.nuget.metadata_ttl = 0;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+        })
+    }
+
+    /// The stale registration index is not trusted for a version it does not know: the
+    /// flat list from upstream carries 1.1.0 (10 minutes old), the cached index only
+    /// 1.0.0. Hiding is decided on the refreshed index, so 1.1.0 stays hidden; judged
+    /// on the stale one it would pass the 7d cooldown unseen.
+    #[tokio::test]
+    async fn test_q04_stale_index_missing_a_listed_version_is_refreshed_first() {
+        let upstream = wiremock::MockServer::start().await;
+        mount_json(
+            &upstream,
+            "/v3-flatcontainer/new.pkg/index.json",
+            serde_json::json!({ "versions": ["1.0.0", "1.1.0"] }),
+        )
+        .await;
+        mount_json(
+            &upstream,
+            "/v3/registration5-gz-semver2/new.pkg/index.json",
+            serde_json::json!({ "items": [{ "items": [
+                leaf("1.0.0", &iso_ago(30 * 86400)), leaf("1.1.0", &iso_ago(600))
+            ] }] }),
+        )
+        .await;
+        let ctx = stale_cooldown_ctx(&upstream);
+        let stale = serde_json::json!({ "items": [{ "items": [
+            leaf("1.0.0", &iso_ago(30 * 86400))
+        ] }] });
+        ctx.state
+            .storage
+            .put(
+                &super::registration_key("new.pkg"),
+                stale.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            flat_versions(&ctx, "new.pkg").await,
+            serde_json::json!(["1.0.0"])
+        );
+    }
+
+    /// A stale registration index that dates every listed version is used as is: the
+    /// flat list does not wait for its (slow) refresh.
+    #[tokio::test]
+    async fn test_q04_stale_index_dating_listed_versions_does_not_wait() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let upstream = wiremock::MockServer::start().await;
+        let index = serde_json::json!({ "items": [{ "items": [
+            leaf("1.0.0", &iso_ago(30 * 86400))
+        ] }] });
+        Mock::given(method("GET"))
+            .and(path("/v3/registration5-gz-semver2/old.pkg/index.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(index.clone())
+                    .set_delay(std::time::Duration::from_secs(5)),
+            )
+            .mount(&upstream)
+            .await;
+        mount_json(
+            &upstream,
+            "/v3-flatcontainer/old.pkg/index.json",
+            serde_json::json!({ "versions": ["1.0.0"] }),
+        )
+        .await;
+        let ctx = stale_cooldown_ctx(&upstream);
+        let st = &ctx.state.storage;
+        st.put(
+            &super::registration_key("old.pkg"),
+            index.to_string().as_bytes(),
+        )
+        .await
+        .unwrap();
+        st.put(
+            "nuget/flatcontainer/old.pkg/index.json",
+            br#"{"versions":["1.0.0"]}"#,
+        )
+        .await
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            flat_versions(&ctx, "old.pkg").await,
+            serde_json::json!(["1.0.0"])
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "waited {:?} on the registration refresh",
+            started.elapsed()
+        );
+    }
+
+    /// An upstream 404 in a background refresh drops the stale copy and its validators:
+    /// it is served once more (the response is already out), then the ID is a 404, as
+    /// the synchronous path answers.
+    #[tokio::test]
+    async fn test_nuget_background_404_drops_the_stale_document() {
+        use crate::registry::{validators_key, write_validators, Validators};
+        use wiremock::matchers::any;
+        use wiremock::{Mock, ResponseTemplate};
+        let upstream = wiremock::MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.nuget.metadata_ttl = 0;
+        });
+        let key = "nuget/flatcontainer/gone.pkg/index.json";
+        let st = &ctx.state.storage;
+        st.put(key, br#"{"versions":["1.0.0"]}"#).await.unwrap();
+        let v = Validators {
+            etag: Some("\"g1\"".to_string()),
+            last_modified: None,
+        };
+        write_validators(st, key, &v).await;
+        let uri = "/nuget/v3/flatcontainer/gone.pkg/index.json";
+
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["x-nora-stale"], "true");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while st.stat(key).await.is_some() || st.stat(&validators_key(key)).await.is_some() {
+            assert!(tokio::time::Instant::now() < deadline, "stale copy kept");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     /// R2-30: within `metadata_ttl` a proxied ID's hidden versions are not recomputed

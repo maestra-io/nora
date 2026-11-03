@@ -110,8 +110,12 @@ Reading it:
 
 `nora_storage_operation_duration_seconds{operation}` (since `1.4.1-maestra.15`,
 nora#113; before it only call counts existed, which is why 23.10 and 02.11 closed
-without a cause). `stat` is a HEAD with no body, so its latency is the store's
-round-trip and nothing else:
+without a cause). `stat` is a HEAD with no body: its time is store round-trips with
+no transfer. One `stat` can be more than one round-trip: a key with `@` gets a second
+HEAD when the first misses, and a Cloudflare edge error (`409`, `error code: 1001`) is
+retried up to four times with 200–800 ms pauses. So a slow `stat` p99 alone is "the
+store or its edge", and the shape below (every operation shifted together) is what
+points at the store:
 
 ```bash
 q 'histogram_quantile(0.5, sum by (le, operation) (rate(nora_storage_operation_duration_seconds_bucket[10m])))'
@@ -128,7 +132,10 @@ kubectl --context "$CTX" -n nora logs "$(pod_of | awk '{print $1}')" --since=1h 
 Reading it:
 
 - **Every operation shifted at once, `stat` included, with 0 errors, 0 retries and
-  nora/node CPU idle (Step 2)** → the store or the path to it is slow. Nothing in nora
+  nora/node CPU idle (Step 2)** → the store or the path to it is slow. A failed `stat`
+  is counted as `status="miss"`, not `error` (the backend cannot tell "absent" from
+  "call failed"), so 0 `stat` errors proves nothing: judge failures by `get`/`put`
+  errors, a `miss` rate above its usual level, and the retry lines in the log. Nothing in nora
   to fix; check the Cloudflare status page for R2 / the `wnam` hint, note the window
   and move to Step 4e. `NoraStorageSlow` fires on this shape.
 - `get`/`put` slow while `stat` is normal → bodies are slow, not round-trips: the link
