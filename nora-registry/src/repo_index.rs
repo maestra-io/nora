@@ -332,6 +332,10 @@ async fn build(reg_type: RegistryType, state: &AppState) -> Option<Vec<RepoInfo>
             let (p, s) = crate::registry::github::INDEX_PATTERN;
             build_generic_index(storage, p, s).await
         }
+        RegistryType::Hashicorp => {
+            let (p, s) = crate::registry::hashicorp::INDEX_PATTERN;
+            build_generic_index(storage, p, s).await
+        }
     }
 }
 

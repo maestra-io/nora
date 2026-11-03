@@ -21,12 +21,16 @@
 //! guard, every redirect hop pinned to that host, the API host and GitHub's asset CDN,
 //! cached under `github/releases/{owner}/{repo}/{tag}/` and held by the first-seen
 //! digest quarantine like any proxy artifact.
+//!
+//! The release-record cache, the pinned client and the download tail ([`serve_asset`])
+//! are shared with the HashiCorp releases proxy (`registry/hashicorp.rs`).
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::cache_ttl::is_within_ttl;
 use crate::circuit_breaker::BreakerScope;
-use crate::config::UpstreamAuth;
+use crate::config::{RegistryCurationOverride, UpstreamAuth};
+use crate::digest_quarantine::QuarantineMode;
 use crate::registry::{circuit_open_response, proxy_error_response, ProxyError};
 use crate::registry_type::RegistryType;
 use crate::AppState;
@@ -37,16 +41,17 @@ use axum::{
     routing::get,
     Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::time::Duration;
 
 /// Cached assets, one directory per owner: the repo index counts them by owner.
 pub const INDEX_PATTERN: (&str, &str) = ("github/releases/", "");
 
-/// Largest release record read from the API (a release with hundreds of assets is
+/// Largest release record read from an API (a release with hundreds of assets is
 /// well under 1 MiB).
-const MAX_RELEASE_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
 
 /// GitHub's release asset CDN: where `github.com/…/releases/download/…` redirects.
 const ASSET_CDN_HOSTS: [&str; 2] = [
@@ -83,6 +88,11 @@ struct ApiAsset {
     digest: Option<String>,
 }
 
+/// `s` as a lowercase hex sha256, when it is one.
+pub(crate) fn hex_sha256(s: &str) -> Option<String> {
+    (s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_ascii_lowercase())
+}
+
 impl Release {
     fn from_api(body: &[u8]) -> Result<Self, String> {
         let api: ApiRelease = serde_json::from_slice(body).map_err(|e| e.to_string())?;
@@ -103,8 +113,7 @@ impl Release {
                     .digest
                     .as_deref()
                     .and_then(|d| d.strip_prefix("sha256:"))
-                    .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
-                    .map(str::to_ascii_lowercase);
+                    .and_then(hex_sha256);
                 (file, sha256)
             })
             .collect();
@@ -143,7 +152,7 @@ fn is_valid_tag(s: &str) -> bool {
 }
 
 /// An asset file name: letters, digits, `-`, `_`, `.`, `+`, not `.`-led, no `..`.
-fn is_valid_asset(s: &str) -> bool {
+pub(crate) fn is_valid_asset(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 255
         && !s.starts_with('.')
@@ -153,7 +162,7 @@ fn is_valid_asset(s: &str) -> bool {
 }
 
 /// `base` with `segments` appended, each percent-encoded (a `/` in a tag is `%2F`).
-fn join_segments(base: &str, segments: &[&str]) -> Option<String> {
+pub(crate) fn join_segments(base: &str, segments: &[&str]) -> Option<String> {
     let mut url = reqwest::Url::parse(base).ok()?;
     if !matches!(url.scheme(), "https" | "http") {
         return None;
@@ -170,29 +179,30 @@ fn tag_key(tag: &str) -> String {
     tag.replace('/', "%2F")
 }
 
-/// The hosts an asset download may reach, its redirects included.
-fn allowed_hosts(state: &AppState) -> Vec<String> {
-    let cfg = &state.config.github;
-    [cfg.download_url.as_str(), cfg.api_url.as_str()]
-        .iter()
+/// The hosts of `urls`, plus `extra`.
+pub(crate) fn hosts_of(urls: &[&str], extra: &[&str]) -> Vec<String> {
+    urls.iter()
         .filter_map(|u| reqwest::Url::parse(u).ok()?.host_str().map(str::to_string))
-        .chain(ASSET_CDN_HOSTS.iter().map(|h| h.to_string()))
+        .chain(extra.iter().map(|h| h.to_string()))
         .collect()
 }
 
-/// The client for every GitHub request: SSRF-guarded (no loopback, private,
-/// link-local or metadata address, DNS pinned) and redirected only within
-/// [`allowed_hosts`]. Built once per distinct setting (one in a server; tests vary it).
-fn guarded_client(state: &AppState) -> Result<reqwest::Client, String> {
+/// The upstream settings a release proxy fetches with.
+pub(crate) struct Upstream {
+    pub allow_private: bool,
+    pub timeout: u64,
+    /// The only hosts a request may reach, its redirects included.
+    pub hosts: Vec<String>,
+}
+
+/// The client for every request of `up`: SSRF-guarded (no loopback, private,
+/// link-local or metadata address, DNS pinned) and redirected only within its hosts.
+/// Built once per distinct setting (one per proxy in a server; tests vary it).
+fn pinned_client(state: &AppState, up: &Upstream) -> Result<reqwest::Client, String> {
     type Key = (bool, u64, Vec<String>);
     static CLIENTS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<Key, reqwest::Client>>> =
         std::sync::LazyLock::new(Default::default);
-    let cfg = &state.config.github;
-    let key = (
-        cfg.allow_private_hosts,
-        cfg.proxy_timeout,
-        allowed_hosts(state),
-    );
+    let key = (up.allow_private, up.timeout, up.hosts.clone());
     let mut clients = CLIENTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -202,137 +212,149 @@ fn guarded_client(state: &AppState) -> Result<reqwest::Client, String> {
     let client = crate::import::http::build_host_pinned_client(
         &state.config.tls,
         Duration::from_secs(10),
-        Duration::from_secs(cfg.proxy_timeout.max(1)),
-        cfg.allow_private_hosts,
-        key.2.clone(),
+        Duration::from_secs(up.timeout.max(1)),
+        up.allow_private,
+        up.hosts.clone(),
     )?;
     clients.insert(key, client.clone());
     Ok(client)
 }
 
-/// The client for `url`, or the answer when `url` may not be fetched.
-fn client_for(state: &AppState, url: &str) -> Result<reqwest::Client, StatusCode> {
-    if !state.config.github.allow_private_hosts
-        && crate::import::http::is_blocked_url_host(url, false)
-    {
+/// The client for `url`, or the status to answer when `url` may not be fetched.
+pub(crate) fn client_for(
+    state: &AppState,
+    up: &Upstream,
+    url: &str,
+) -> Result<reqwest::Client, StatusCode> {
+    if !up.allow_private && crate::import::http::is_blocked_url_host(url, false) {
         // An IP literal never reaches the guard's resolver: checked here.
-        tracing::warn!(url = %url, "github: upstream is a loopback/private address, refusing it");
+        tracing::warn!(url = %url, "release proxy: upstream is a loopback/private address, refusing it");
         return Err(StatusCode::BAD_GATEWAY);
     }
-    guarded_client(state).map_err(|e| {
-        tracing::error!(error = %e, "github: no SSRF-guarded client, refusing a download");
+    pinned_client(state, up).map_err(|e| {
+        tracing::error!(error = %e, "release proxy: no SSRF-guarded client, refusing a download");
         StatusCode::BAD_GATEWAY
     })
 }
 
-/// The effective `(mode, ttl_secs)` of the github quarantine.
-fn quarantine(state: &AppState) -> (crate::digest_quarantine::QuarantineMode, i64) {
+fn github_upstream(state: &AppState) -> Upstream {
+    let cfg = &state.config.github;
+    Upstream {
+        allow_private: cfg.allow_private_hosts,
+        timeout: cfg.proxy_timeout,
+        hosts: hosts_of(&[&cfg.download_url, &cfg.api_url], &ASSET_CDN_HOSTS),
+    }
+}
+
+/// The effective `(mode, ttl_secs)` of a registry's quarantine.
+pub(crate) fn quarantine(
+    state: &AppState,
+    own: &RegistryCurationOverride,
+) -> (QuarantineMode, i64) {
     let curation = &state.config.curation;
     crate::digest_quarantine::resolve_global(
-        curation
-            .github
-            .quarantine
-            .as_ref()
-            .or(curation.quarantine.as_ref()),
-        curation
-            .github
-            .quarantine_ttl
+        own.quarantine.as_ref().or(curation.quarantine.as_ref()),
+        own.quarantine_ttl
             .as_deref()
             .or(curation.quarantine_ttl.as_deref()),
     )
 }
 
-fn release_key(owner: &str, repo: &str, tag: &str) -> String {
-    format!("github/meta/{owner}/{repo}/{}.json", tag_key(tag))
-}
-
-async fn cached_release(state: &AppState, key: &str, fresh: bool) -> Option<Release> {
-    if fresh {
+async fn cached_record<T: DeserializeOwned>(
+    state: &AppState,
+    key: &str,
+    ttl: Option<i64>,
+) -> Option<T> {
+    if let Some(ttl) = ttl {
         let meta = state.storage.stat(key).await?;
-        if !is_within_ttl(meta.modified, state.config.github.metadata_ttl) {
+        if !is_within_ttl(meta.modified, ttl) {
             return None;
         }
     }
     serde_json::from_slice(&state.storage.get(key).await.ok()?).ok()
 }
 
-/// The release record of `owner/repo@tag`, or the response to give when there is none.
-/// One refresh per release runs at a time; a request arriving meanwhile gets the stale
+/// The release record under `key`, fetched by `fetch` (which names the URL it failed
+/// on) once `ttl` seconds have passed, or the response to give when there is none.
+/// One refresh per record runs at a time; a request arriving meanwhile gets the stale
 /// copy at once, or (with none) waits for the refresh. Any upstream failure falls back
-/// to the last copy: the record only dates the release and lists its digests.
-async fn load_release(
+/// to the last copy: a record only dates a release and lists its digests.
+pub(crate) async fn load_record<T, F, Fut>(
     state: &AppState,
-    owner: &str,
-    repo: &str,
-    tag: &str,
-) -> Result<Release, Response> {
-    let key = release_key(owner, repo, tag);
-    if let Some(release) = cached_release(state, &key, true).await {
-        return Ok(release);
+    registry: &'static str,
+    key: &str,
+    ttl: i64,
+    fetch: F,
+) -> Result<T, Response>
+where
+    T: Serialize + DeserializeOwned,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, (String, ProxyError)>>,
+{
+    if let Some(record) = cached_record(state, key, Some(ttl)).await {
+        return Ok(record);
     }
-    let lock = state.publish_lock(&key);
+    let lock = state.publish_lock(key);
     let _refresh = match lock.try_lock() {
         Ok(guard) => guard,
         Err(_) => {
-            if let Some(release) = cached_release(state, &key, false).await {
-                return Ok(release);
+            if let Some(record) = cached_record(state, key, None).await {
+                return Ok(record);
             }
             lock.lock().await
         }
     };
-    if let Some(release) = cached_release(state, &key, true).await {
-        return Ok(release);
+    if let Some(record) = cached_record(state, key, Some(ttl)).await {
+        return Ok(record);
     }
-
-    let cfg = &state.config.github;
-    let Some(url) = join_segments(
-        &cfg.api_url,
-        &["repos", owner, repo, "releases", "tags", tag],
-    ) else {
-        return Err(StatusCode::BAD_GATEWAY.into_response());
-    };
-    let client = client_for(state, &url).map_err(IntoResponse::into_response)?;
-    let fetched = crate::registry::proxy_fetch_capped(
-        &client,
-        &url,
-        Duration::from_secs(cfg.proxy_timeout),
-        cfg.token.as_deref().map(UpstreamAuth::Bearer),
-        &state.circuit_breaker,
-        BreakerScope::upstream(RegistryType::Github, &cfg.api_url),
-        MAX_RELEASE_BYTES,
-    )
-    .await;
-    let err = match fetched {
-        Ok(body) => match Release::from_api(&body) {
-            Ok(release) => {
-                match serde_json::to_vec(&release) {
-                    Ok(json) => {
-                        if let Err(e) = state.storage.put(&key, &json).await {
-                            tracing::warn!(key = %key, error = %e, "github: failed to cache a release record");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(key = %key, error = %e, "github: release record not serializable")
+    let (url, err) = match fetch().await {
+        Ok(record) => {
+            match serde_json::to_vec(&record) {
+                Ok(json) => {
+                    if let Err(e) = state.storage.put(key, &json).await {
+                        tracing::warn!(registry, key = %key, error = %e, "failed to cache a release record");
                     }
                 }
-                return Ok(release);
+                Err(e) => {
+                    tracing::warn!(registry, key = %key, error = %e, "release record not serializable")
+                }
             }
-            Err(e) => {
-                tracing::warn!(url = %url, error = %e, "github: release record unreadable");
-                ProxyError::Upstream(502)
-            }
-        },
-        Err(e) => e,
+            return Ok(record);
+        }
+        Err(failed) => failed,
     };
-    if let Some(release) = cached_release(state, &key, false).await {
-        tracing::warn!(registry = "github", url = %url, error = ?err, "GitHub API error, using the stale release record");
-        return Ok(release);
+    if let Some(record) = cached_record(state, key, None).await {
+        tracing::warn!(registry, url = %url, error = ?err, "release API error, using the stale release record");
+        return Ok(record);
     }
     Err(match err {
         ProxyError::NotFound => StatusCode::NOT_FOUND.into_response(),
         ProxyError::CircuitOpen(reg) => circuit_open_response(&reg),
-        e => proxy_error_response("github", &url, &e),
+        e => proxy_error_response(registry, &url, &e),
     })
+}
+
+/// GET `url` capped at [`MAX_RECORD_BYTES`], the URL named on failure.
+pub(crate) async fn fetch_record(
+    state: &AppState,
+    up: &Upstream,
+    registry: RegistryType,
+    url: &str,
+    auth: Option<UpstreamAuth<'_>>,
+) -> Result<axum::body::Bytes, (String, ProxyError)> {
+    let fail = |e| (url.to_string(), e);
+    let client = client_for(state, up, url).map_err(|_| fail(ProxyError::Upstream(502)))?;
+    crate::registry::proxy_fetch_capped(
+        &client,
+        url,
+        Duration::from_secs(up.timeout),
+        auth,
+        &state.circuit_breaker,
+        BreakerScope::upstream(registry, url),
+        MAX_RECORD_BYTES,
+    )
+    .await
+    .map_err(fail)
 }
 
 async fn asset(
@@ -349,7 +371,6 @@ async fn asset(
     }
     let name = format!("{owner}/{repo}");
     let engine = &state.curation().curation_engine;
-
     // An internal name is never fetched from an upstream (dependency confusion).
     if let Some(response) =
         crate::curation::check_namespace_isolation(engine, RegistryType::Github, &name)
@@ -357,39 +378,108 @@ async fn asset(
         return response;
     }
 
+    let cfg = &state.config.github;
+    let up = github_upstream(&state);
     // The release record is required even for a cached asset: it is the release date.
-    let release = match load_release(&state, &owner, &repo, &tag).await {
+    let key = format!("github/meta/{owner}/{repo}/{}.json", tag_key(&tag));
+    let release: Release = match load_record(&state, "github", &key, cfg.metadata_ttl, || async {
+        let url = join_segments(
+            &cfg.api_url,
+            &["repos", &owner, &repo, "releases", "tags", &tag],
+        )
+        .ok_or_else(|| (cfg.api_url.clone(), ProxyError::Upstream(502)))?;
+        let body = fetch_record(
+            &state,
+            &up,
+            RegistryType::Github,
+            &url,
+            cfg.token.as_deref().map(UpstreamAuth::Bearer),
+        )
+        .await?;
+        Release::from_api(&body).map_err(|e| {
+            tracing::warn!(url = %url, error = %e, "github: release record unreadable");
+            (url.clone(), ProxyError::Upstream(502))
+        })
+    })
+    .await
+    {
         Ok(release) => release,
         Err(response) => return response,
     };
     let Some(expected) = release.assets.get(&file).cloned() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let published = release
-        .published_at
-        .as_deref()
-        .and_then(crate::curation::parse_iso8601_to_unix);
-    let publish_date = published.filter(|_| state.config.server.trust_upstream_dates);
+    let Some(url) = join_segments(
+        &cfg.download_url,
+        &[&owner, &repo, "releases", "download", &tag, &file],
+    ) else {
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+    serve_asset(
+        &state,
+        &headers,
+        Asset {
+            registry: RegistryType::Github,
+            name: &name,
+            version: &tag,
+            published: release
+                .published_at
+                .as_deref()
+                .and_then(crate::curation::parse_iso8601_to_unix),
+            expected,
+            key: format!("github/releases/{owner}/{repo}/{}/{file}", tag_key(&tag)),
+            label: format!("{name}@{tag}/{file}"),
+            url,
+            upstream: &up,
+            breaker_base: &cfg.download_url,
+            quarantine: quarantine(&state, &state.config.curation.github),
+        },
+    )
+    .await
+}
 
+/// One release asset to serve: its curation identity, date, digest and source.
+pub(crate) struct Asset<'a> {
+    pub registry: RegistryType,
+    /// Curation package name and version.
+    pub name: &'a str,
+    pub version: &'a str,
+    /// Release date (unix seconds) from the upstream's own record.
+    pub published: Option<i64>,
+    /// Hex sha256 the upstream publishes for the file, when it has one.
+    pub expected: Option<String>,
+    pub key: String,
+    pub label: String,
+    pub url: String,
+    pub upstream: &'a Upstream,
+    pub breaker_base: &'a str,
+    pub quarantine: (QuarantineMode, i64),
+}
+
+/// Serve `a`: release age, a cached copy (integrity-checked) or a fetch checked against
+/// the published digest, then the digest quarantine.
+pub(crate) async fn serve_asset(state: &AppState, headers: &HeaderMap, a: Asset<'_>) -> Response {
+    let reg = a.registry.as_str();
+    let engine = &state.curation().curation_engine;
+    let publish_date = a
+        .published
+        .filter(|_| state.config.server.trust_upstream_dates);
     if let Some(response) = crate::curation::check_download(
         engine,
         state.bypass_token().as_deref(),
-        &headers,
-        RegistryType::Github,
-        &name,
-        crate::curation::RequestVersion::Known(tag.clone()),
-        published,
+        headers,
+        a.registry,
+        a.name,
+        crate::curation::RequestVersion::Known(a.version.to_string()),
+        a.published,
     ) {
         return response;
     }
-
-    let (q_mode, q_secs) = quarantine(&state);
-    let key = format!("github/releases/{owner}/{repo}/{}/{file}", tag_key(&tag));
-    let label = format!("{name}@{tag}/{file}");
+    let (q_mode, q_secs) = a.quarantine;
 
     // Integrity-gated: a copy failing its pin is dropped and refetched, a storage
     // fault answers 503.
-    let cached = match crate::registry::read_cached_artifact(&state, "github", &key, false).await {
+    let cached = match crate::registry::read_cached_artifact(state, reg, &a.key, false).await {
         Ok(cached) => cached,
         Err(response) => return response,
     };
@@ -397,27 +487,27 @@ async fn asset(
         let digest = cached.digest();
         if let Some(response) = crate::curation::verify_integrity_by_hash(
             engine,
-            RegistryType::Github,
-            &name,
-            Some(&tag),
+            a.registry,
+            a.name,
+            Some(a.version),
             &digest,
         ) {
             return response;
         }
-        state.metrics.record_download("github");
-        state.metrics.record_cache_hit("github");
+        state.metrics.record_download(reg);
+        state.metrics.record_cache_hit(reg);
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
-            label,
-            RegistryType::Github,
+            a.label,
+            a.registry,
             "CACHE",
         ));
         state
             .audit
-            .log(AuditEntry::new("cache_hit", "proxy", "", "github", ""));
+            .log(AuditEntry::new("cache_hit", "proxy", "", reg, ""));
         if let Some(resp) = crate::digest_quarantine::proxy_gate_digest(
             &state.digest_store,
-            "github",
+            reg,
             &digest,
             &q_mode,
             q_secs,
@@ -427,92 +517,85 @@ async fn asset(
             return resp;
         }
         let len = cached.len();
-        return asset_response(len, cached.into_body(&state, "github", &key, false));
+        return asset_response(len, cached.into_body(state, reg, &a.key, false));
     }
 
-    let cfg = &state.config.github;
-    let Some(url) = join_segments(
-        &cfg.download_url,
-        &[&owner, &repo, "releases", "download", &tag, &file],
-    ) else {
-        return StatusCode::BAD_GATEWAY.into_response();
-    };
-    let client = match client_for(&state, &url) {
+    let client = match client_for(state, a.upstream, &a.url) {
         Ok(client) => client,
         Err(status) => return status.into_response(),
     };
     let (data, fetched) = match crate::registry::proxy_fetch_artifact_with(
-        &state,
+        state,
         &client,
-        &key,
-        "github",
-        &url,
-        cfg.proxy_timeout,
+        &a.key,
+        reg,
+        &a.url,
+        a.upstream.timeout,
         None,
-        BreakerScope::upstream(RegistryType::Github, &cfg.download_url),
+        BreakerScope::upstream(a.registry, a.breaker_base),
     )
     .await
     {
         Ok(fetched) => fetched,
-        Err(e) => return proxy_error_response("github", &url, &e),
+        Err(e) => return proxy_error_response(reg, &a.url, &e),
     };
-    // GitHub publishes the asset's digest: a body that does not match it (truncated,
-    // swapped) is neither served nor cached.
+    // The upstream publishes the file's digest: a body that does not match it
+    // (truncated, swapped) is neither served nor cached.
     let sha256 = data.sha256();
-    if let Some(expected) = expected.as_deref() {
+    if let Some(expected) = a.expected.as_deref() {
         if !sha256.eq_ignore_ascii_case(expected) {
-            tracing::warn!(url = %url, %expected, actual = %sha256, "GitHub asset does not match its release digest, refusing it");
+            tracing::warn!(registry = reg, url = %a.url, %expected, actual = %sha256, "release asset does not match its published digest, refusing it");
             return StatusCode::BAD_GATEWAY.into_response();
         }
     }
     let digest = format!("sha256:{sha256}");
     if let Some(response) = crate::curation::verify_integrity_by_hash(
         engine,
-        RegistryType::Github,
-        &name,
-        Some(&tag),
+        a.registry,
+        a.name,
+        Some(a.version),
         &digest,
     ) {
         return response;
     }
-    state.metrics.record_download("github");
-    state.metrics.record_cache_miss("github");
+    state.metrics.record_download(reg);
+    state.metrics.record_cache_miss(reg);
     state.activity.push(ActivityEntry::new(
         ActionType::ProxyFetch,
-        label,
-        RegistryType::Github,
+        a.label,
+        a.registry,
         "PROXY",
     ));
     state
         .audit
-        .log(AuditEntry::new("proxy_fetch", "proxy", "", "github", ""));
+        .log(AuditEntry::new("proxy_fetch", "proxy", "", reg, ""));
     // Only the caller whose fetch ran caches; coalesced followers share its body.
     if fetched {
-        let (cache_state, cache_key, body) = (state.clone(), key.clone(), data.clone());
+        let (cache_state, cache_key, body) = (state.clone(), a.key.clone(), data.clone());
         tokio::spawn(async move {
             match body.cache(&cache_state, &cache_key, true).await {
-                Ok(true) => cache_state.repo_index.invalidate("github"),
+                Ok(true) => cache_state.repo_index.invalidate(reg),
                 Ok(false) => {}
-                Err(e) => crate::record_cache_write_error("github", &cache_key, &e),
+                Err(e) => crate::record_cache_write_error(reg, &cache_key, &e),
             }
         });
     }
     if let Some(resp) = crate::digest_quarantine::proxy_gate_digest(
         &state.digest_store,
-        "github",
+        reg,
         &digest,
         &q_mode,
         q_secs,
-        &url,
+        &a.url,
         publish_date,
     ) {
         return resp;
     }
     let len = data.len();
-    match data.into_body(&key).await {
+    match data.into_body(&a.key).await {
         Ok(body) => asset_response(len, body),
         Err(e) => {
-            tracing::warn!(key = %key, error = %e, "github: spooled asset unreadable");
+            tracing::warn!(key = %a.key, error = %e, "release proxy: spooled asset unreadable");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

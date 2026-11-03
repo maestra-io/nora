@@ -149,6 +149,8 @@ pub struct CurationConfig {
     #[serde(default)]
     pub apk: RegistryCurationOverride,
     pub github: RegistryCurationOverride,
+    #[serde(default)]
+    pub hashicorp: RegistryCurationOverride,
 }
 
 /// Per-registry curation override (used within `[curation.{registry}]`).
@@ -207,6 +209,7 @@ impl Default for CurationConfig {
             helm: RegistryCurationOverride::default(),
             apk: RegistryCurationOverride::default(),
             github: RegistryCurationOverride::default(),
+            hashicorp: RegistryCurationOverride::default(),
         }
     }
 }
@@ -240,6 +243,7 @@ impl CurationConfig {
             RegistryType::Helm => Some(&self.helm),
             RegistryType::Apk => Some(&self.apk),
             RegistryType::Github => Some(&self.github),
+            RegistryType::Hashicorp => Some(&self.hashicorp),
             RegistryType::HuggingFace => None,
         }
     }
@@ -424,6 +428,7 @@ impl CurationConfig {
             ("HELM", &mut self.helm),
             ("APK", &mut self.apk),
             ("GITHUB", &mut self.github),
+            ("HASHICORP", &mut self.hashicorp),
         ] {
             if let Ok(val) = env::var(format!("NORA_CURATION_{}_MIN_RELEASE_AGE", env_suffix)) {
                 field.min_release_age = if val.is_empty() { None } else { Some(val) };

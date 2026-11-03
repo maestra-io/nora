@@ -326,6 +326,7 @@ pub async fn run_gc(
         "helm/",
         "apk/",
         "github/",
+        "hashicorp/",
     ] {
         let keys = storage.list(prefix).await.unwrap_or_else(|e| {
             tracing::error!("GC: storage.list({}) failed: {}", prefix, e);
@@ -1235,7 +1236,8 @@ async fn evict_pypi_companions(storage: &Storage, key: &str) {
 /// - every chart under `helm/charts/`: the Helm format is pull-through only; its
 ///   cached upstream indexes live under `helm/index/` and are not evicted.
 /// - every asset under `github/releases/`: GitHub Releases are pull-through only;
-///   release records under `github/meta/` are not evicted.
+///   release records under `github/meta/` are not evicted. The same for
+///   `hashicorp/releases/` and `hashicorp/meta/`.
 ///
 /// A package in `curation.internal_namespaces` is never fetched upstream, so a
 /// copy of one is the only copy: it is never evicted.
@@ -1265,6 +1267,7 @@ async fn evict_proxy_cache(
         "helm/charts/",
         "apk/pkgs/",
         "github/releases/",
+        "hashicorp/releases/",
     ] {
         let entries = match storage.list_with_meta(prefix).await {
             Ok(e) => e,
@@ -1293,6 +1296,7 @@ async fn evict_proxy_cache(
                 || prefix == "helm/charts/"
                 || prefix == "apk/pkgs/"
                 || prefix == "github/releases/"
+                || prefix == "hashicorp/releases/"
             {
                 proxy_files.push((key.clone(), meta.size, meta.modified));
                 continue;

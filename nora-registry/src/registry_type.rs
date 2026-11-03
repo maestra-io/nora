@@ -69,6 +69,7 @@ registry_types! {
     Helm      => "helm",      "/helm/",      "Helm";
     Apk       => "apk",       "/apk/",       "Alpine (apk)";
     Github    => "github",    "/github/",    "GitHub Releases";
+    Hashicorp => "hashicorp", "/hashicorp/", "HashiCorp Releases";
     HuggingFace => "hf",      "/hf/",        "Hugging Face";
 }
 
@@ -117,6 +118,7 @@ impl RegistryType {
             "helm" => Some(Self::Helm),
             "apk" | "alpine" => Some(Self::Apk),
             "github" | "gh" => Some(Self::Github),
+            "hashicorp" => Some(Self::Hashicorp),
             "hf" | "huggingface" => Some(Self::HuggingFace),
             _ => None,
         }
