@@ -295,7 +295,8 @@ pub static STORAGE_OPERATION_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock
         "nora_storage_operation_duration_seconds",
         "Storage backend call wall-clock by operation (get/put: whole body; get_reader/get_range: open only; list: whole walk)",
         &["operation"],
-        vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]
+        // 1.5: the NoraStorageSlow threshold, so its p99 is not interpolated across 1-2.5 s.
+        vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 1.5, 2.5, 5.0, 10.0, 30.0, 60.0]
     )
     .expect("failed to create STORAGE_OPERATION_DURATION_SECONDS metric at startup")
 });

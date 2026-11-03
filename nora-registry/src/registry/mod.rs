@@ -2221,10 +2221,21 @@ pub(crate) async fn proxy_fetch_conditional(
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<Revalidation, ProxyError> {
     let auth_header = upstream_auth_header(auth)?;
-    let cb_key = scope.into().key();
+    let scope = scope.into();
+    let registry_str = scope.registry().as_str();
+    let cb_key = scope.key();
     let probe = cb.check(&cb_key)?;
+    // Observed like proxy_fetch_core. Without it every NuGet metadata upstream call
+    // (all of them come through here) was missing from
+    // nora_upstream_request_duration_seconds (NoraHighLatency 03.11.2026).
+    let observe = |status: &str, started: std::time::Instant| {
+        UPSTREAM_REQUEST_DURATION
+            .with_label_values(&[registry_str, status])
+            .observe(started.elapsed().as_secs_f64());
+    };
 
     for attempt in 0..2 {
+        let started = std::time::Instant::now();
         let mut request = client.get(url).timeout(timeout);
         if let Some(value) = &auth_header {
             request = request.header(header::AUTHORIZATION, value.clone());
@@ -2240,10 +2251,12 @@ pub(crate) async fn proxy_fetch_conditional(
             Ok(response) => {
                 let status = response.status();
                 if status == reqwest::StatusCode::NOT_MODIFIED {
+                    observe("304", started);
                     cb.record_success(&cb_key, probe);
                     return Ok(Revalidation::NotModified);
                 }
                 if status.is_success() {
+                    observe("2xx", started);
                     let new_validators = Validators {
                         etag: header_string(&response, header::ETAG),
                         last_modified: header_string(&response, header::LAST_MODIFIED),
@@ -2268,6 +2281,7 @@ pub(crate) async fn proxy_fetch_conditional(
                 }
                 let code = status.as_u16();
                 if (400..500).contains(&code) {
+                    observe("4xx", started);
                     // 4xx — upstream alive; recover the breaker without clearing a
                     // real failure tally, consistent with proxy_fetch_core (#606).
                     let err = upstream_4xx(code, response.headers());
@@ -2281,12 +2295,23 @@ pub(crate) async fn proxy_fetch_conditional(
                 if status.is_redirection() {
                     // A redirect the client did not follow (off the upstream's origin): the
                     // upstream answered, as in proxy_fetch_core.
+                    observe("3xx", started);
                     cb.record_alive(&cb_key, probe);
                     return Err(ProxyError::Upstream(code));
                 }
+                observe("5xx", started);
                 ProxyError::Upstream(code)
             }
-            Err(e) => transport_error(e),
+            Err(e) => {
+                let e = transport_error(e);
+                let label = if matches!(e, ProxyError::Timeout(_)) {
+                    "timeout"
+                } else {
+                    "error"
+                };
+                observe(label, started);
+                e
+            }
         };
         if attempt == 0 {
             tracing::debug!(url, error = ?err, "conditional upstream fetch failed, retrying in 1s");
