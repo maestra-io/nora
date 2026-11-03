@@ -16,6 +16,7 @@ history: frequencies unknown.
 | Alert | Expression | `for` | Meaning |
 |---|---|---|---|
 | `NoraHighLatency` | `histogram_quantile(0.99, sum by (le) (rate(nora_http_request_duration_seconds_bucket[5m]))) > 5 and on() sum(rate(nora_http_request_duration_seconds_count[5m])) > 5` | 10m | p99 of all nora HTTP requests (every registry together) above 5s, only while nora serves more than 5 rps |
+| `NoraStorageSlow` | `histogram_quantile(0.99, sum by (le) (rate(nora_storage_operation_duration_seconds_bucket{operation="stat"}[10m]))) > 1.5 and on() sum(rate(nora_storage_operation_duration_seconds_count{operation="stat"}[10m])) > 0.5` | 15m | the object store (R2) answers a `stat` (HEAD) slowly: the store, not nora (Step 1c). Same runbook; usually precedes `NoraHighLatency` |
 
 Defined in `deploy/prometheus-rules.yml`, copied byte-for-byte to
 `maestra/charts/nora/files/prometheus-rules.yml` (CI `cmp`s them). The cluster gets
@@ -105,10 +106,49 @@ Reading it:
 - Compare each slow path with its own quiet-hour cost (third query): `/npm/typescript`
   is 15.8 MB and takes 1.3–3 s normally; 64–194 s on 02.11 was a stall, not size.
 
-Store latency itself: `nora_storage_operation_duration_seconds{operation}` (since
-`1.4.1-maestra.15`, nora#113) — `histogram_quantile(0.99, sum by (le, operation)
-(rate(nora_storage_operation_duration_seconds_bucket[5m])))`. Before it only the call
-counts existed, which is why 23.10 and 02.11 closed without a cause.
+## Step 1c — The store itself
+
+`nora_storage_operation_duration_seconds{operation}` (since `1.4.1-maestra.15`,
+nora#113; before it only call counts existed, which is why 23.10 and 02.11 closed
+without a cause). `stat` is a HEAD with no body: its time is store round-trips with
+no transfer. One `stat` can be more than one round-trip: a key with `@` gets a second
+HEAD when the first misses, and a Cloudflare edge error (`409`, `error code: 1001`) is
+retried up to four times with 200–800 ms pauses. So a slow `stat` p99 alone is "the
+store or its edge", and the shape below (every operation shifted together) is what
+points at the store:
+
+```bash
+q 'histogram_quantile(0.5, sum by (le, operation) (rate(nora_storage_operation_duration_seconds_bucket[10m])))'
+q 'histogram_quantile(0.99, sum by (le, operation) (rate(nora_storage_operation_duration_seconds_bucket[10m])))'
+q 'sum by (operation, status) (rate(nora_storage_operations_total[10m]))'
+kubectl --context "$CTX" -n nora logs "$(pod_of | awk '{print $1}')" --since=1h | grep -ci 'retry'   # object_store logs its retries at info
+```
+
+| | `stat` p50 | `stat` p99 | `get` p50 | `get` p99 | `put` p99 |
+|---|---|---|---|---|---|
+| normal (02.11 day) | 0.09 s | 0.25–0.45 s | 0.10 s | 0.9 s | 1 s |
+| store slow (02–03.11 night, from 23:41 UTC) | 0.16 s | 1.5–4.7 s | 0.20 s | 3.5 s | 4.5 s |
+
+Reading it:
+
+- **Every operation shifted at once, `stat` included, with 0 errors, 0 retries and
+  nora/node CPU idle (Step 2)** → the store or the path to it is slow. A failed `stat`
+  is counted as `status="miss"`, not `error` (the backend cannot tell "absent" from
+  "call failed"), so 0 `stat` errors proves nothing: judge failures by `get`/`put`
+  errors, a `miss` rate above its usual level, and the retry lines in the log. Nothing in nora
+  to fix; check the Cloudflare status page for R2 / the `wnam` hint, note the window
+  and move to Step 4e. `NoraStorageSlow` fires on this shape.
+- `get`/`put` slow while `stat` is normal → bodies are slow, not round-trips: the link
+  (Step 2b) or large objects.
+- Errors or retries rising → `NoraStorageUnreachable` territory.
+
+Why a slow store becomes a slow *request*: a NuGet metadata revalidation (every
+`metadata_ttl`, 300 s by default, per `flatcontainer/*/index.json` and registration
+document) was up to seven serial store calls plus the upstream round-trip on the
+client's critical path, so a ×5 store made each one 3–8 s. Since `1.4.1-maestra.19`
+the stale document is served at once and refreshed behind the response
+(stale-while-revalidate, `serve_stale = true`), and the NuGet upstream calls are in
+`nora_upstream_request_duration_seconds` (they were not before: a blind spot).
 
 ## Step 2 — CPU contention: profile the process on the node
 
@@ -190,6 +230,7 @@ kubectl --context "$CTX" -n nora logs "$(pod_of | awk '{print $1}')" --since=30m
 | `last=OOMKilled`, restarts > 0 | memory limit hit under load (12.10: OOMKilled at 2Gi every 1–6 min, 5 restarts, CPU spiking to ~25 cores) | raise `resources` in the fluxcd HelmRelease (requests == limits); then Step 2, OOMs and CPU contention came together |
 | `reason="jwks"` rejections rising right after a start (12.10: 970 in 1h, 596 in 3 min) | every request refetches JWKS on a cold cache; GitHub CI logins fail | wait for it to drain; fix is single-flight JWKS fetch, maestra-io/nora#54 |
 | upstream p99 ≈ HTTP p99 for one registry | upstream slow | nothing to fix in nora; confirm on the upstream's status page |
+| store `stat` p99 ×3 or more, all operations shifted, errors and CPU flat | store slow (Step 1c) | nothing to fix in nora; `NoraStorageSlow` names it; note the window for the thread |
 | `get`/`get_reader` errors well above baseline | R2 problem | see `NoraStorageUnreachable` / `NoraReadinessFlapping` |
 | `Index rebuilt` `elapsed_ms` in tens of seconds | cold start | transient; only matters if restarts repeat |
 
@@ -279,7 +320,7 @@ After the pod is Ready (`pod_of`), at least 10 minutes of traffic:
 
 | Date (UTC) | Object | Cause | Category | What helped | Thread |
 |---|---|---|---|---|---|
-| 03.11.2026 02:56–05:30, 4 firings | nora `1.4.1-maestra.16`, iota node 03 | night CI NuGet restores from in-cluster ARC runners at 5–11 rps: small `flatcontainer/*/index.json` (0.4–50 KB) took 7–21 s in shared stalls (04:14–04:31: 254 of 275 slow requests were NuGet, 251 in-cluster); CPU 0.005 core-s/req, `eno5` ≤ 108 Mbit/s, no restart, upstream p99 ≤ 0.5 s; store `get` p50 0.18 s, p99 2–3.5 s, only 39 of 14 153 `get` > 5 s, so the per-request time is several sequential store calls (hypothesis) | alert noise on short stalls | each cleared in 5–10 min; `for` 5m → 10m (backtest 27.10–03.11: 26 episodes ≥ 5 min, 2 ≥ 10 min) | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1793683501235679> |
+| 03.11.2026 02:56–05:30, 4 firings | nora `1.4.1-maestra.16`, iota node 03 | R2 (`nora-packages-iota`, wnam) slow from 23:41 UTC 02.11 to ~06:00: `stat` p50 0.09 → 0.16 s, p99 0.45 → 1.5–4.7 s, `get`/`put` p99 ×5, 0 errors, 0 object_store retries, nora CPU 0.01–0.08 cores, nodes ≤ 20 % CPU, `eno5` ≤ 137 Mbit/s, upstreams fast, no Cloudflare R2 incident (SJC maintenance was 09–13 UTC). Night CI NuGet restores at 5–11 rps then paid the serial revalidation chain (Step 1c) per `flatcontainer/*/index.json`: 696 of 737 requests > 5 s were that path (1835 in 3–8 s, only 11 at the 15 s upstream timeout); the same chain gives a 1–3 s tail by day (3484 in 3.5 h). NuGet upstream calls were not in `nora_upstream_request_duration_seconds` | store slow × serial revalidation on the request path | `for` 5m → 10m (nora#116). `1.4.1-maestra.19`: NuGet metadata stale-while-revalidate, NuGet upstream metric, `NoraStorageSlow`, this Step 1c | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1793683501235679> |
 | 02.11.2026 13:15–13:26 | nora `1.4.1-maestra.13`, iota node 03 | p99 7.6 s at 15 rps (npm GET ≥ 10 s at 1.9 rps, nuget 5.2 s at 12 rps), p90 1.1 s, p50 0.6 s; CPU 0.11 cores (0.0076 core-s/req), `eno5` rx 47 Mbit/s, no restart, upstream 0.4 req/min, breaker 0, node 03 retransmits < 0.4 %, conntrack 10 %, CoreDNS p99 10 ms, no Cilium drops, R2 edge 40–190 ms from the node. Traefik: 182 of 15 992 requests > 5 s, all `OriginDuration == Duration`: `/npm/typescript` (15.8 MB) 194/71/64 s vs 1.3–3 s normally, nuget `flatcontainer/*/index.json` (2–50 KB) 8–55 s, npm tarballs (2–30 KB) 8–17 s; stalls shared across clients in the same second (13:11, 13:40). No object_store retry lines in the pod log (it logs them at `info`). Second bump 13:40–13:42 stayed `pending` | shared stall, store or process-wide; cause not measurable (no per-operation store latency) | resolved on its own. nora#113: `nora_storage_operation_duration_seconds`; runbook Step 1b (Traefik access log) and 4e | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1793625380880529> |
 | 23.10.2026 01:02–01:08 | nora `1.4.1-maestra.9`, iota node 03 | every R2 operation stalled for ~3 min (00:57–01:00: `get ok` 335 → 19/min, then 32 `get` errors at 01:01) while nora served only 2.1 rps; 7 of 421 npm requests > 10s made the global p99. CPU 0.025 cores, `eno5` rx ≤ 31 Mbit/s, no restart, no Cloudflare R2 incident; stall cause not established | low-traffic false positive | resolved on its own; rule now fires only above 5 rps | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1792717381201449> |
 | 21.10.2026 10:20–10:25 | nora `1.3.6-maestra.3`, iota node 02 | Renovate wave over ~15 frontend repos (09:51–10:19, ~70 `pr` runs of `mcf-build.yml`): `node_modules` was cached under the exact lockfile hash and `~/.npm` not at all, so every bump ran a full `npm ci` (2534 packages, 6 min). npm 176 rps, 99k tarballs and 66 GB from R2 in 10 min, all nora `cache_hit`; `eno5` rx 908 Mbit/s, npm p99 5.1s; CPU 0.007 core-s/request | network link saturated (client-side cache miss) | ended with the wave. github-actions#184: on a `node_modules` miss `mcf-build` and `npm-package-publish` restore `~/.npm/_cacache` by key prefix (RunsOn magic cache), so a new lockfile fetches only changed packages | <https://maestraio.slack.com/archives/C0BN1L82W8M/p1792578041939979> |

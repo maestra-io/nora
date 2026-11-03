@@ -114,6 +114,23 @@ groups:
         annotations:
           summary: "NORA storage backend unreachable (readiness failing)"
 
+      - alert: NoraStorageSlow
+        # The object store itself (R2): p99 of `stat` (a tiny HEAD, nothing to pace)
+        # is 0.25-0.45 s in a normal hour. On 02-03.11.2026 it sat at 1.5-4.7 s from
+        # 23:41 UTC while nora and its nodes were idle; NoraHighLatency fired on it at
+        # 02:56 (runbook Step 1c). The rate guard: at 0.6 stat/min (quiet night) the
+        # p99 is a handful of calls. Metric since 1.4.1-maestra.15; in the 23 h of
+        # data before this rule it holds 15 min only in that night (01:36-02:21).
+        expr: >-
+          histogram_quantile(0.99, sum by (le) (rate(nora_storage_operation_duration_seconds_bucket{operation="stat"}[10m]))) > 1.5
+          and on() sum(rate(nora_storage_operation_duration_seconds_count{operation="stat"}[10m])) > 0.5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NORA object store slow: stat p99 above 1.5s"
+          runbook_url: "https://github.com/maestra-io/nora/blob/maestra/main/maestra/runbooks/NoraHighLatency.md#step-1c--the-store-itself"
+
   - name: nora-integrity
     rules:
       - alert: NoraIntegrityFailure
