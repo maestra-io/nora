@@ -898,6 +898,17 @@ fn docker_manifest_urls(body: &[u8]) -> Option<Vec<u8>> {
     let obj = doc.as_object()?;
     let mut out = Vec::new();
     let mut push_urls = |d: &serde_json::Value| {
+        // A foreign / non-distributable layer (Windows base layers) is fetched from its
+        // `urls` by spec, never from the registry, and a manifest is content-addressed,
+        // so nora cannot rewrite them: every docker-hub golang:windowsservercore
+        // manifest points at mcr.microsoft.com this way (NoraUpstreamUrlLeak, 03.11.2026).
+        // A bypass by design, not a rewriter gap.
+        if d.get("mediaType")
+            .and_then(|m| m.as_str())
+            .is_some_and(|m| m.contains(".foreign.") || m.contains(".nondistributable."))
+        {
+            return;
+        }
         for u in d
             .get("urls")
             .and_then(|u| u.as_array())
@@ -1120,6 +1131,17 @@ mod tests {
             "layers":[{"digest":"sha256:bb","size":1,"urls":["https://gcr.io/v2/foo/blobs/sha256:bb"]}]}"#;
         let urls = docker_manifest_urls(foreign_layer).unwrap();
         assert_eq!(finders.scan(&urls), Some(("docker", "gcr.io")));
+
+        // Windows base layers: fetched from `urls` by spec, unrewritable (03.11.2026).
+        let windows_base = br#"{"schemaVersion":2,"config":{"digest":"sha256:cc","size":1},
+            "layers":[{"mediaType":"application/vnd.docker.image.rootfs.foreign.diff.tar.gzip","digest":"sha256:bb","size":1,"urls":["https://gcr.io/v2/windows/servercore/blobs/sha256:bb"]},
+                      {"mediaType":"application/vnd.oci.image.layer.nondistributable.v1.tar+gzip","digest":"sha256:dd","size":1,"urls":["https://gcr.io/v2/windows/servercore/blobs/sha256:dd"]},
+                      {"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:ee","size":1}]}"#;
+        let urls = docker_manifest_urls(windows_base).unwrap();
+        assert!(
+            finders.scan(&urls).is_none(),
+            "a foreign layer's urls are a bypass by design"
+        );
 
         assert!(docker_manifest_urls(b"not json").is_none());
         assert!(docker_manifest_urls(b"[1,2]").is_none());
