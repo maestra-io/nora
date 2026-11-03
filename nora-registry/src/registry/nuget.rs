@@ -2510,7 +2510,9 @@ mod imported {
             let mut listed: Vec<String> = names
                 .into_iter()
                 .filter_map(|name| name.strip_suffix(".json"))
-                .filter(|v| !v.is_empty() && !v.contains('/'))
+                // Only versions: a stray `latest.json` is no record, and NuGet order against
+                // byte order for a non-version is no total order, which `sort_by` may panic on.
+                .filter(|v| !v.contains('/') && crate::curation::nuget_version_key(v).is_some())
                 .map(str::to_string)
                 .collect();
             listed.sort_by(|a, b| super::nuget_version_order(a, b).unwrap_or_else(|| a.cmp(b)));
@@ -3027,7 +3029,7 @@ mod tests {
     fn a_hosted_package_serves_only_the_versions_it_records() {
         use super::imported::{Version, Versions};
         // listing, hosted, served versions, version asked, what it is
-        let rows: [(&[&str], bool, &[&str], &str, Version); 12] = [
+        let rows: [(&[&str], bool, &[&str], &str, Version); 14] = [
             (&[], false, &[], "1.0.0", Version::Proxied),
             (&["1.0.0.json"], true, &["1.0.0"], "1.0.0", Version::Own),
             (&["1.0.0.json"], true, &["1.0.0"], "2.0.0", Version::Foreign),
@@ -3076,6 +3078,16 @@ mod tests {
                 "1.0.0.json",
                 Version::Foreign,
             ),
+            // A stray `.json` key that names no version is no record: not listed, and alone it
+            // makes nothing hosted.
+            (
+                &["10.0.0.json", "latest.json", "2.0.0.json", "1x.json"],
+                true,
+                &["2.0.0", "10.0.0"],
+                "latest",
+                Version::Foreign,
+            ),
+            (&["latest.json"], false, &[], "latest", Version::Proxied),
         ];
         for (names, hosted, listed, version, want) in rows {
             let versions = Versions::from_listing(names.iter().copied());
@@ -3085,6 +3097,22 @@ mod tests {
         }
         assert!(!Versions::none().hosted());
         assert_eq!(Versions::none().version("1.0.0"), Version::Proxied);
+    }
+
+    /// Stray `.json` keys among many versions: NuGet order between versions and byte order
+    /// against a non-version is no total order (`2.0.0` < `10.0.0` < `1x` < `2.0.0`), which
+    /// `sort_by` may answer with a panic. Only versions are listed, in NuGet's order.
+    #[test]
+    fn stray_records_among_many_versions_neither_panic_nor_list() {
+        let mut names: Vec<String> = Vec::new();
+        for major in (1..=40).rev() {
+            names.push(format!("{major}.0.0.json"));
+            names.push(format!("{major}x.json"));
+        }
+        names.push("latest.json".to_string());
+        let versions = super::imported::Versions::from_listing(names.iter().map(String::as_str));
+        let want: Vec<String> = (1..=40).map(|major| format!("{major}.0.0")).collect();
+        assert_eq!(versions.listed(), want.as_slice());
     }
 
     /// #385: a slash-escaped upstream registration URL must not survive the
