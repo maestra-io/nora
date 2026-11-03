@@ -374,8 +374,8 @@ fn pypi_key(path: &str) -> Result<String, Mapping> {
 /// The flat-container key of a .nupkg at source path `path`, from its file name
 /// `<id>.<version>.nupkg`. An id may end in a number, so the directory the file is in decides
 /// where the id ends when it names it (Artifactory `<id>/<id>.<version>.nupkg`); otherwise the
-/// version is the shortest tail of dot-separated fields that is a NuGet version. The transfer
-/// checks the package's .nuspec names the same id and version. Anything but a .nupkg is skipped.
+/// id is the shortest dot-separated head whose tail is a NuGet version (`Lib.2.1.0.0.nupkg` is
+/// `lib` 2.1.0.0). The transfer checks the package's .nuspec names the same id and version. Anything but a .nupkg is skipped.
 fn nuget_key(path: &str) -> Result<String, Mapping> {
     let (dirs, file) = path.rsplit_once('/').unwrap_or(("", path));
     let Some(stem) = file
