@@ -268,6 +268,7 @@ fn build_context_full(
         cpan: crate::config::CpanConfig::default(),
         hf: crate::config::HfConfig::default(),
         helm: crate::config::HelmConfig::default(),
+        apk: crate::config::ApkConfig::default(),
         auth: AuthConfig {
             enabled: auth_enabled,
             anonymous_read,

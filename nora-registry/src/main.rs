@@ -3380,6 +3380,10 @@ mod rate_limited_routes_tests {
             (RegistryType::Cpan, "/cpan/modules/03modlist.data.gz"),
             (RegistryType::HuggingFace, "/hf/api/models/x/y"),
             (RegistryType::Helm, "/helm/x/index.yaml"),
+            (
+                RegistryType::Apk,
+                "/apk/x/v3.22/main/x86_64/APKINDEX.tar.gz",
+            ),
         ];
         let covered: std::collections::HashSet<_> = routes.iter().map(|(rt, _)| *rt).collect();
         assert_eq!(
@@ -5582,6 +5586,7 @@ fn registry_routes(enabled: &HashSet<RegistryType>) -> Router<AppState> {
             RegistryType::Rpm | RegistryType::Deb => {}
             RegistryType::Cpan => registry_routes = registry_routes.merge(registry::cpan_routes()),
             RegistryType::Helm => registry_routes = registry_routes.merge(registry::helm_routes()),
+            RegistryType::Apk => registry_routes = registry_routes.merge(registry::apk_routes()),
             RegistryType::HuggingFace => {
                 tracing::info!(
                     "Hugging Face proxy enabled: public models only (datasets answer 501), \

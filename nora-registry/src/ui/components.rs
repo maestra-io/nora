@@ -806,6 +806,8 @@ pub mod icons {
     /// A plain isometric cube: a neutral mark for model repositories, not a brand logo.
     pub const HF: &str = r#"<path fill="currentColor" d="M12 2 3 7v10l9 5 9-5V7zm0 2.3L18.7 8 12 11.7 5.3 8zM5 9.7l6 3.3v6.7l-6-3.3zm8 10V13l6-3.3v6.7z"/>"#;
     /// A plain ship's wheel: a neutral mark for chart repositories, not a brand logo.
+    /// A plain parcel: a neutral mark for Alpine package repositories, not a brand logo.
+    pub const APK: &str = r#"<path fill="currentColor" d="M12 2 3 6.5v11L12 22l9-4.5v-11zm0 2.2 6.6 3.3L12 10.8 5.4 7.5zM5 9.1l6 3v7.6l-6-3zm8 10.6v-7.6l6-3v7.6z"/>"#;
     pub const HELM: &str = r#"<path fill="currentColor" d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 2a8 8 0 1 1 0 16 8 8 0 0 1 0-16zm-1 2v4.17A2 2 0 0 0 10.17 11H6v2h4.17a2 2 0 0 0 .83.83V18h2v-4.17a2 2 0 0 0 .83-.83H18v-2h-4.17a2 2 0 0 0-.83-.83V6z"/>"#;
 }
 

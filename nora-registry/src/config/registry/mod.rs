@@ -138,6 +138,7 @@ mod repo_proxy_tests {
 }
 
 mod ansible;
+mod apk;
 mod cargo;
 mod conan;
 mod cpan;
@@ -162,6 +163,7 @@ pub use self::conan::ConanConfig;
 pub use self::cpan::CpanConfig;
 pub use self::deb::DebConfig;
 // Re-export all Docker types including extract_docker_namespace (public API surface)
+pub use self::apk::ApkConfig;
 pub(in crate::config) use self::docker::RESERVED_DOCKER_SEGMENTS;
 #[allow(unused_imports)]
 pub use self::docker::{

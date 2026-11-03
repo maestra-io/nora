@@ -680,7 +680,8 @@ fn curation_name(rt: crate::registry_type::RegistryType, art: &ArtifactRef, key:
         | crate::registry_type::RegistryType::Deb
         | crate::registry_type::RegistryType::Cpan
         | crate::registry_type::RegistryType::HuggingFace
-        | crate::registry_type::RegistryType::Helm => art.path.clone(),
+        | crate::registry_type::RegistryType::Helm
+        | crate::registry_type::RegistryType::Apk => art.path.clone(),
     }
 }
 

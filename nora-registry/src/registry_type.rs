@@ -67,6 +67,7 @@ registry_types! {
     Deb       => "deb",       "/deb/",       "Debian";
     Cpan      => "cpan",      "/cpan/",      "CPAN";
     Helm      => "helm",      "/helm/",      "Helm";
+    Apk       => "apk",       "/apk/",       "Alpine (apk)";
     HuggingFace => "hf",      "/hf/",        "Hugging Face";
 }
 
@@ -113,6 +114,7 @@ impl RegistryType {
             "deb" | "apt" | "debian" => Some(Self::Deb),
             "cpan" => Some(Self::Cpan),
             "helm" => Some(Self::Helm),
+            "apk" | "alpine" => Some(Self::Apk),
             "hf" | "huggingface" => Some(Self::HuggingFace),
             _ => None,
         }

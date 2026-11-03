@@ -56,6 +56,7 @@ pub struct RegistryStats {
     pub cpan: usize,
     pub hf: usize,
     pub helm: usize,
+    pub apk: usize,
 }
 
 #[derive(Serialize)]
@@ -203,6 +204,7 @@ pub async fn api_stats(State(state): State<AppState>) -> Json<RegistryStats> {
         cpan: get(RegistryType::Cpan),
         hf: get(RegistryType::HuggingFace),
         helm: get(RegistryType::Helm),
+        apk: get(RegistryType::Apk),
     })
 }
 
@@ -302,6 +304,13 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
                 RegistryType::Helm => state
                     .config
                     .helm
+                    .proxies
+                    .values()
+                    .map(|p| p.url().to_string())
+                    .collect(),
+                RegistryType::Apk => state
+                    .config
+                    .apk
                     .proxies
                     .values()
                     .map(|p| p.url().to_string())
