@@ -514,6 +514,15 @@ async fn registration_index(
         id_lower
     );
 
+    if state.config.nuget.serve_stale {
+        if let Some(ref data) = cached_data {
+            refresh_in_background(&state, &storage_key, &url, Some(id_lower.clone()));
+            let text = String::from_utf8_lossy(data);
+            return with_json_stale(
+                rewrite_registration_urls(&text, &upstream, &base_url).into_bytes(),
+            );
+        }
+    }
     let rewrite = Some((upstream.as_str(), base_url.as_str()));
     match refresh_metadata(&state, &storage_key, &url, Some(id_lower.clone())).await {
         Ok(raw) => {
@@ -617,6 +626,15 @@ async fn registration_page(
 
     // Single-flight (C48) and conditional revalidation (C56), as the index.
     let activity = Some(format!("{}/page/{}/{}", id_lower, lower, upper));
+    if state.config.nuget.serve_stale {
+        if let Some(ref data) = cached_data {
+            refresh_in_background(&state, &storage_key, &url, activity);
+            let text = String::from_utf8_lossy(data);
+            return with_json_stale(
+                rewrite_registration_urls(&text, &upstream, &base_url).into_bytes(),
+            );
+        }
+    }
     match refresh_metadata(&state, &storage_key, &url, activity).await {
         Ok(raw) => {
             let text = String::from_utf8_lossy(&raw);
@@ -714,6 +732,12 @@ async fn version_list(state: AppState, id: &str) -> Response {
     );
 
     let activity = Some(format!("{}/versions", id_lower));
+    if state.config.nuget.serve_stale {
+        if let Some(ref data) = cached_data {
+            refresh_in_background(&state, &storage_key, &url, activity);
+            return with_json_stale(data.to_vec());
+        }
+    }
     match refresh_metadata(&state, &storage_key, &url, activity).await {
         Ok(raw) => with_json(raw.to_vec()),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -721,6 +745,43 @@ async fn version_list(state: AppState, id: &str) -> Response {
             tracing::debug!(error = ?e, "NuGet version list error");
             serve_stale_or_error(&state, cached_data, "version_list", None, &e)
         }
+    }
+}
+
+/// Serve the stale cached document now and refresh it behind the response
+/// (stale-while-revalidate). One revalidation is up to seven serial storage
+/// round-trips plus the upstream request, all on the client's critical path; on a
+/// slow store that chain put 3–8 s on every `flatcontainer/*/index.json` of a CI
+/// wave (NoraHighLatency 03.11.2026). Concurrent refreshes of one key coalesce in
+/// `refresh_metadata`, so a wave starts one flight. The callers gate it on
+/// `serve_stale`: an operator who turned that off wants nothing past its TTL served.
+fn refresh_in_background(state: &AppState, storage_key: &str, url: &str, activity: Option<String>) {
+    let state = state.clone();
+    let storage_key = storage_key.to_string();
+    let url = url.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = refresh_metadata(&state, &storage_key, &url, activity).await {
+            tracing::debug!(key = %storage_key, error = ?e, "background NuGet metadata refresh failed");
+        }
+    });
+}
+
+/// Poll the validator sidecar of `key` until a background revalidation stamps it.
+#[cfg(test)]
+async fn wait_for_stamp(storage: &crate::Storage, key: &str) -> String {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Ok(d) = storage.get(&crate::registry::validators_key(key)).await {
+            let s = String::from_utf8_lossy(&d).into_owned();
+            if s.contains("validated_at") {
+                return s;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{key} never revalidated"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
@@ -3898,7 +3959,7 @@ mod integration_tests {
     /// request, and on 304 only the sidecar is written.
     #[tokio::test]
     async fn test_registration_page_revalidates_with_304() {
-        use crate::registry::{validators_key, write_validators, Validators};
+        use crate::registry::{write_validators, Validators};
         use crate::test_helpers::{
             create_test_context_with_storage_and_config, op_counting_storage,
         };
@@ -3936,9 +3997,11 @@ mod integration_tests {
         )
         .await;
         assert_eq!(json_body(resp).await["count"], 1);
+        // The revalidation runs behind the response (stale-while-revalidate).
+        assert!(super::wait_for_stamp(st, key)
+            .await
+            .contains("validated_at"));
         assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
-        let sidecar = st.get(&validators_key(key)).await.unwrap();
-        assert!(String::from_utf8_lossy(&sidecar).contains("validated_at"));
         assert_eq!(ops.snapshot().get("put"), Some(&1), "{:?}", ops.snapshot());
     }
 
@@ -5212,6 +5275,9 @@ mod spec_conformance_tests {
         let before = crate::metrics::PROXY_UPSTREAM_304_TOTAL
             .with_label_values(&["nuget"])
             .get();
+        let observed_before = crate::metrics::UPSTREAM_REQUEST_DURATION
+            .with_label_values(&["nuget", "304"])
+            .get_sample_count();
 
         let resp = send(
             &ctx.app,
@@ -5231,6 +5297,72 @@ mod spec_conformance_tests {
             .with_label_values(&["nuget"])
             .get();
         assert!(after > before, "a 304 revalidation must be recorded");
+        assert!(
+            crate::metrics::UPSTREAM_REQUEST_DURATION
+                .with_label_values(&["nuget", "304"])
+                .get_sample_count()
+                > observed_before,
+            "the conditional upstream call is observed in nora_upstream_request_duration_seconds"
+        );
+    }
+
+    /// A stale version list is served from the cache at once and refreshed behind the
+    /// response: neither the upstream nor the storage round-trips of the revalidation
+    /// sit on the client's critical path (NoraHighLatency 03.11.2026). The body proves
+    /// it: a response that had waited for upstream would carry the new version.
+    #[tokio::test]
+    async fn test_nuget_stale_version_list_served_now_refreshed_behind() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"versions":["1.0.0","2.0.0","3.0.0"]}"#)
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(upstream.uri());
+            cfg.nuget.metadata_ttl = 0; // always stale
+        });
+        let key = "nuget/flatcontainer/swr-pkg/index.json";
+        ctx.state
+            .storage
+            .put(key, br#"{"versions":["1.0.0","2.0.0"]}"#)
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/flatcontainer/swr-pkg/index.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["x-nora-stale"], "true");
+        let body = body_bytes(resp).await;
+        assert!(
+            !String::from_utf8_lossy(&body).contains("3.0.0"),
+            "the cached list is served as is, not the upstream's"
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let data = ctx.state.storage.get(key).await.unwrap();
+            if String::from_utf8_lossy(&data).contains("3.0.0") {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "never refreshed");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     }
 }
 
