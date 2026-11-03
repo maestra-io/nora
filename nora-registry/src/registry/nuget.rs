@@ -6393,7 +6393,10 @@ mod spec_conformance_tests {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let upstream = MockServer::start().await;
+        // Unpooled: a pooled server may be one an earlier test dropped while its background
+        // request (nuget_release_dates' repro.pkg) was still in flight, and the count below
+        // would see it.
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -6441,7 +6444,14 @@ mod spec_conformance_tests {
             assert!(tokio::time::Instant::now() < deadline, "never refreshed");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+        let asked: Vec<String> = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert_eq!(asked.len(), 1, "upstream asked: {asked:?}");
     }
 }
 
