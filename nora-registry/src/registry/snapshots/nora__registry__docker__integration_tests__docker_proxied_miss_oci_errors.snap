@@ -89,7 +89,7 @@ expression: pinned
         {
           "code": "UNAVAILABLE",
           "detail": "its circuit breaker is open; retry after the Retry-After interval",
-          "message": "upstream docker:<upstream> temporarily unavailable"
+          "message": "upstream docker temporarily unavailable"
         }
       ]
     },
