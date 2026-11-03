@@ -5352,7 +5352,10 @@ mod spec_conformance_tests {
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let data = ctx.state.storage.get(key).await.unwrap();
+            // A read that lands inside the background write can fail on the local
+            // backend (body renamed in, pin recorded after it); the S3 backend writes
+            // the pin with the object. Only the refreshed body ends the wait.
+            let data = ctx.state.storage.get(key).await.unwrap_or_default();
             if String::from_utf8_lossy(&data).contains("3.0.0") {
                 break;
             }
