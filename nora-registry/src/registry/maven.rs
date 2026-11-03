@@ -466,8 +466,80 @@ async fn download(
         }
     }
 
-    // Read the cached artifact eagerly — kept for the freshness check and the stale-on-error fallback.
-    let (cached, read_failure) = crate::registry::cached_read(state.storage.get(&key).await);
+    // An immutable artifact (release .jar/.pom/...) is always fresh when cached: read it
+    // integrity-gated with bounded memory — whole and verified up to
+    // `server.stream_threshold_mb`, streamed above it with its pin checked as it streams.
+    // Read whole, a 125 MB jar pulled by ~75 CI shards at once OOM-killed the pod at its
+    // 4Gi limit three times (ContainerOOMKillLoop 03.11.2026).
+    if !is_mutable_maven_path(&path) {
+        let artifact =
+            match crate::registry::read_cached_artifact(&state, "maven", &key, internal).await {
+                Ok(artifact) => artifact,
+                Err(resp) => return resp,
+            };
+        if let Some(artifact) = artifact {
+            let engine = &state.curation().curation_engine;
+            let quarantine_on = !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off);
+            // Hashed only when a gate reads it: a streamed copy carries its verified pin,
+            // a buffered one is hashed here.
+            let digest = curation_coords
+                .as_ref()
+                .filter(|_| engine.is_active() || quarantine_on)
+                .map(|_| artifact.digest());
+            // Curation integrity verification (issue #189)
+            if let (Some((maven_name, maven_version)), Some(digest)) = (&curation_coords, &digest) {
+                if let Some(response) = crate::curation::verify_integrity_by_hash(
+                    engine,
+                    crate::curation::RegistryType::Maven,
+                    maven_name,
+                    Some(maven_version),
+                    digest,
+                ) {
+                    return response;
+                }
+            }
+            state.metrics.record_download("maven");
+            state.metrics.record_cache_hit("maven");
+            state.activity.push(ActivityEntry::new(
+                ActionType::CacheHit,
+                artifact_name.clone(),
+                crate::registry_type::RegistryType::Maven,
+                "CACHE",
+            ));
+            state
+                .audit
+                .log(AuditEntry::new("cache_hit", "proxy", "", "maven", ""));
+            // Quarantine only real version artifacts (.jar/.pom/.sha1, immutable per version).
+            if let Some(digest) = digest.as_deref().filter(|_| quarantine_on) {
+                if let Some(resp) = crate::digest_quarantine::proxy_gate_digest(
+                    &state.digest_store,
+                    "maven",
+                    digest,
+                    &q_mode,
+                    q_secs,
+                    "cache",
+                    publish_date,
+                ) {
+                    return resp;
+                }
+            }
+            let len = artifact.len();
+            let body = artifact.into_body(&state, "maven", &key, internal);
+            let mut response = with_content_type(&path, body).into_response();
+            let h = response.headers_mut();
+            h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+            h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            return response;
+        }
+    }
+
+    // A mutable path (maven-metadata.xml, SNAPSHOT files; small) is read whole: kept for the
+    // freshness check and the stale-on-error fallback. An immutable one was served above.
+    let (cached, read_failure) = if is_mutable_maven_path(&path) {
+        crate::registry::cached_read(state.storage.get(&key).await)
+    } else {
+        (None, None)
+    };
 
     // maven-metadata.xml and SNAPSHOT artifacts are MUTABLE (rewritten as versions deploy); a
     // proxied mutable path must be revalidated against upstream unless within a positive
@@ -1384,10 +1456,10 @@ fn maven_content_type(path: &str) -> &'static str {
     }
 }
 
-fn with_content_type(
+fn with_content_type<B>(
     path: &str,
-    data: Bytes,
-) -> (StatusCode, [(header::HeaderName, &'static str); 2], Bytes) {
+    data: B,
+) -> (StatusCode, [(header::HeaderName, &'static str); 2], B) {
     let content_type = maven_content_type(path);
 
     // maven-metadata.xml is mutable; release artifacts are immutable
@@ -1839,6 +1911,30 @@ mod integration_tests {
         assert_eq!(get.status(), StatusCode::OK);
         let body = body_bytes(get).await;
         assert_eq!(&body[..], jar_data);
+    }
+
+    /// A cached artifact above `server.stream_threshold_mb` is streamed from storage,
+    /// not read whole into memory: a wave of CI clients pulling one 125 MB jar
+    /// OOM-killed the pod at 4Gi (03.11).
+    #[tokio::test]
+    async fn test_maven_large_cached_artifact_streams_whole() {
+        let ctx = create_test_context_with_config(|cfg| cfg.server.stream_threshold_mb = 1);
+        let jar: Vec<u8> = (0..2 * 1024 * 1024 + 17).map(|i| (i % 251) as u8).collect();
+        let uri = "/maven2/com/example/big/1.0/big-1.0.jar";
+        let put = send(&ctx.app, Method::PUT, uri, Body::from(jar.clone())).await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        let get = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(
+            get.headers()[header::CONTENT_LENGTH],
+            jar.len().to_string().as_str()
+        );
+        assert_eq!(
+            get.headers()[header::CONTENT_TYPE],
+            "application/java-archive"
+        );
+        assert_eq!(body_bytes(get).await, jar);
     }
 
     #[tokio::test]
