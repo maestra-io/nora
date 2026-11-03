@@ -113,6 +113,9 @@ async fn collection_list(State(state): State<AppState>, RawQuery(raw_query): Raw
     // proxy_json answers from storage alone when the upstream is switched off.
     let proxy_url = upstream_url(&state).unwrap_or_default();
     let base = format!("{}{}/", proxy_url.trim_end_matches('/'), API_PREFIX);
+    // `fields`/`exclude_fields` never go upstream: the cache key ignores them, and a
+    // projected body without `created_at` would slip young versions past the Q04 filter.
+    let raw_query = without_projection(raw_query.as_deref());
     let url = append_query(&base, raw_query.as_deref());
 
     let cache_key = match extract_page_param(raw_query.as_deref()) {
@@ -769,6 +772,15 @@ fn append_query(base_url: &str, raw_query: Option<&str>) -> String {
     }
 }
 
+/// Drop the Galaxy NG projection parameters (`fields`, `exclude_fields`) from a query string.
+fn without_projection(raw_query: Option<&str>) -> Option<String> {
+    let kept: Vec<&str> = raw_query?
+        .split('&')
+        .filter(|p| !p.starts_with("fields=") && !p.starts_with("exclude_fields="))
+        .collect();
+    (!kept.is_empty()).then(|| kept.join("&"))
+}
+
 /// Extract `page` or `offset` parameter from a query string for cache key differentiation.
 fn extract_page_param(raw_query: Option<&str>) -> Option<String> {
     let q = raw_query?;
@@ -858,6 +870,16 @@ fn is_safe_filename(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn without_projection_drops_fields_params() {
+        assert_eq!(without_projection(None), None);
+        assert_eq!(without_projection(Some("exclude_fields=created_at")), None);
+        assert_eq!(
+            without_projection(Some("limit=100&fields=version&offset=100&exclude_fields=x")),
+            Some("limit=100&offset=100".to_string())
+        );
+    }
+
     use super::*;
 
     /// #385: a slash-escaped upstream URL (`https:\/\/host` — valid JSON many
