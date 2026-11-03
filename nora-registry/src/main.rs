@@ -3384,6 +3384,8 @@ mod rate_limited_routes_tests {
                 RegistryType::Apk,
                 "/apk/x/v3.22/main/x86_64/APKINDEX.tar.gz",
             ),
+            // An invalid owner: answered without reaching GitHub.
+            (RegistryType::Github, "/github/_/r/releases/download/v1/a"),
         ];
         let covered: std::collections::HashSet<_> = routes.iter().map(|(rt, _)| *rt).collect();
         assert_eq!(
@@ -5587,6 +5589,9 @@ fn registry_routes(enabled: &HashSet<RegistryType>) -> Router<AppState> {
             RegistryType::Cpan => registry_routes = registry_routes.merge(registry::cpan_routes()),
             RegistryType::Helm => registry_routes = registry_routes.merge(registry::helm_routes()),
             RegistryType::Apk => registry_routes = registry_routes.merge(registry::apk_routes()),
+            RegistryType::Github => {
+                registry_routes = registry_routes.merge(registry::github_routes())
+            }
             RegistryType::HuggingFace => {
                 tracing::info!(
                     "Hugging Face proxy enabled: public models only (datasets answer 501), \

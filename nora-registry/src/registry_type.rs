@@ -68,6 +68,7 @@ registry_types! {
     Cpan      => "cpan",      "/cpan/",      "CPAN";
     Helm      => "helm",      "/helm/",      "Helm";
     Apk       => "apk",       "/apk/",       "Alpine (apk)";
+    Github    => "github",    "/github/",    "GitHub Releases";
     HuggingFace => "hf",      "/hf/",        "Hugging Face";
 }
 
@@ -115,6 +116,7 @@ impl RegistryType {
             "cpan" => Some(Self::Cpan),
             "helm" => Some(Self::Helm),
             "apk" | "alpine" => Some(Self::Apk),
+            "github" | "gh" => Some(Self::Github),
             "hf" | "huggingface" => Some(Self::HuggingFace),
             _ => None,
         }

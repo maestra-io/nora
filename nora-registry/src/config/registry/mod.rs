@@ -145,6 +145,7 @@ mod cpan;
 mod deb;
 mod docker;
 mod gems;
+mod github;
 mod go;
 mod helm;
 mod hf;
@@ -171,6 +172,7 @@ pub use self::docker::{
     DockerUpstream,
 };
 pub use self::gems::GemsConfig;
+pub use self::github::GithubConfig;
 pub use self::go::GoConfig;
 pub use self::helm::HelmConfig;
 pub use self::hf::HfConfig;
