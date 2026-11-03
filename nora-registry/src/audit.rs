@@ -575,10 +575,14 @@ mod tests {
     #[tokio::test]
     async fn test_audit_log_rotates_by_size_and_keeps_n() {
         let tmp = TempDir::new().unwrap();
-        let line_len = serde_json::to_string(&AuditEntry::new("push", "u", "a0", "raw", ""))
-            .unwrap()
-            .len() as u64
-            + 1;
+        // One timestamp for every entry: chrono writes 0, 3, 6 or 9 fractional digits, so
+        // entries stamped `now` differ in length and "two per file" would hold only by luck.
+        let ts = Utc::now();
+        let entry = |artifact: &str| AuditEntry {
+            ts,
+            ..AuditEntry::new("push", "u", artifact, "raw", "")
+        };
+        let line_len = serde_json::to_string(&entry("a0")).unwrap().len() as u64 + 1;
         // Two entries per file.
         let rotation = Rotation {
             max_bytes: line_len * 2,
@@ -586,7 +590,7 @@ mod tests {
         };
         let log = AuditLog::with_rotation(tmp.path().to_str().unwrap(), AuditMode::File, rotation);
         for i in 0..7 {
-            log.log(AuditEntry::new("push", "u", &format!("a{i}"), "raw", ""));
+            log.log(entry(&format!("a{i}")));
         }
         let path = log.path().clone();
         log.shutdown().await;
