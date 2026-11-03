@@ -17,7 +17,7 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::config::UpstreamAuth;
 use crate::registry::{
-    fresh_within_ttl, mark_revalidated, nora_base_url, proxy_error_response, proxy_fetch_artifact,
+    mark_revalidated, nora_base_url, proxy_error_response, proxy_fetch_artifact,
     proxy_fetch_conditional, proxy_fetch_shared, proxy_fetch_text, read_cached_artifact,
     read_validators, spawn_cache_body, write_validators, CachedArtifact, ProxyError, Revalidation,
     Validators,
@@ -473,21 +473,23 @@ async fn registration_index(
     let base_url = nora_base_url(&state);
     let upstream = rewrite_host(&state);
 
-    // Read cache eagerly so stale data is available on upstream failure.
-    let (cached_data, read_failure) =
-        crate::registry::cached_read(state.storage.get(&storage_key).await);
+    // Read cache eagerly so stale data is available on upstream failure; the
+    // freshness check rides the same store round trip.
+    let ttl = state.config.nuget.metadata_ttl;
+    let (read, fresh) = tokio::join!(
+        state.storage.get(&storage_key),
+        crate::registry::stored_fresh(&state.storage, &storage_key, ttl)
+    );
+    let (cached_data, read_failure) = crate::registry::cached_read(read);
 
     // TTL cache — rewrite URLs on read (cache may contain pre-fix entries)
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
-            let ttl = state.config.nuget.metadata_ttl;
-            if fresh_within_ttl(&state.storage, &storage_key, meta.modified, ttl).await {
-                state.metrics.record_download("nuget");
-                state.metrics.record_cache_hit("nuget");
-                let text = String::from_utf8_lossy(data);
-                let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
-                return with_json_gzip(rewritten.into_bytes());
-            }
+        if fresh {
+            state.metrics.record_download("nuget");
+            state.metrics.record_cache_hit("nuget");
+            let text = String::from_utf8_lossy(data);
+            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
+            return with_json_gzip(rewritten.into_bytes());
         }
     }
 
@@ -589,21 +591,23 @@ async fn registration_page(
         id_lower, lower, upper
     );
 
-    // Read cache eagerly so stale data is available on upstream failure.
-    let (cached_data, read_failure) =
-        crate::registry::cached_read(state.storage.get(&storage_key).await);
+    // Read cache eagerly so stale data is available on upstream failure; the
+    // freshness check rides the same store round trip.
+    let ttl = state.config.nuget.metadata_ttl;
+    let (read, fresh) = tokio::join!(
+        state.storage.get(&storage_key),
+        crate::registry::stored_fresh(&state.storage, &storage_key, ttl)
+    );
+    let (cached_data, read_failure) = crate::registry::cached_read(read);
 
     // TTL cache (a 304 revalidation keeps a page fresh without re-uploading it, C56)
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
-            let ttl = state.config.nuget.metadata_ttl;
-            if fresh_within_ttl(&state.storage, &storage_key, meta.modified, ttl).await {
-                state.metrics.record_download("nuget");
-                state.metrics.record_cache_hit("nuget");
-                let text = String::from_utf8_lossy(data);
-                let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
-                return with_json_gzip(rewritten.into_bytes());
-            }
+        if fresh {
+            state.metrics.record_download("nuget");
+            state.metrics.record_cache_hit("nuget");
+            let text = String::from_utf8_lossy(data);
+            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
+            return with_json_gzip(rewritten.into_bytes());
         }
     }
 
@@ -726,19 +730,21 @@ async fn version_list(state: AppState, id: &str) -> Response {
         None => return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower)),
     }
 
-    // Read cache eagerly so stale data is available on upstream failure.
-    let (cached_data, read_failure) =
-        crate::registry::cached_read(state.storage.get(&storage_key).await);
+    // Read cache eagerly so stale data is available on upstream failure; the
+    // freshness check rides the same store round trip.
+    let ttl = state.config.nuget.metadata_ttl;
+    let (read, fresh) = tokio::join!(
+        state.storage.get(&storage_key),
+        crate::registry::stored_fresh(&state.storage, &storage_key, ttl)
+    );
+    let (cached_data, read_failure) = crate::registry::cached_read(read);
 
     // TTL cache
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
-            let ttl = state.config.nuget.metadata_ttl;
-            if fresh_within_ttl(&state.storage, &storage_key, meta.modified, ttl).await {
-                state.metrics.record_download("nuget");
-                state.metrics.record_cache_hit("nuget");
-                return with_json(data.to_vec());
-            }
+        if fresh {
+            state.metrics.record_download("nuget");
+            state.metrics.record_cache_hit("nuget");
+            return with_json(data.to_vec());
         }
     }
 
@@ -1784,15 +1790,17 @@ async fn compute_hidden_versions(
     let index_key = registration_key(id);
     let index_path = format!("{id}/index.json");
     let ttl = state.config.nuget.metadata_ttl;
-    let fresh = match state.storage.stat(&index_key).await {
-        Some(m) if fresh_within_ttl(&state.storage, &index_key, m.modified, ttl).await => {
-            read_json(&state.storage, &index_key).await
-        }
-        _ => None,
+    let (stored, is_fresh) = tokio::join!(
+        read_json(&state.storage, &index_key),
+        crate::registry::stored_fresh(&state.storage, &index_key, ttl)
+    );
+    let (fresh, stale) = if is_fresh {
+        (stored, None)
+    } else {
+        (None, stored)
     };
     if fresh.is_none() && state.config.nuget.serve_stale {
-        if let (Some(listed), Some(stored)) = (listed, read_json(&state.storage, &index_key).await)
-        {
+        if let (Some(listed), Some(stored)) = (listed, stale) {
             let leaves = registration_leaves(state, id, &stored, last_page_only).await;
             let known: HashSet<String> = leaves
                 .iter()
