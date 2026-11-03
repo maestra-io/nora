@@ -123,6 +123,7 @@ mod tests {
             auth_env: None,
             namespace: Some(ns.into()),
             prefix: None,
+            namespaces: Vec::new(),
         }
     }
 

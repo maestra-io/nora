@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -51,8 +52,48 @@ struct CachedToken {
 
 const TOKEN_PREFIX: &str = "nra_";
 
-/// Longest token lifetime any mint path may request (10 years).
+/// The longest lifetime a token is minted with, whatever a route asks for:
+/// ten years. Applied by the store, so every route that mints is held to it.
 pub const MAX_TOKEN_TTL_DAYS: u64 = 3650;
+
+pub const SECS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// The lifetime a mint grants, in seconds. Built only by
+/// [`MintLifetime::days`] and taken by [`TokenStore::mint_token`], so every
+/// route that mints, whatever it is asked, goes through the one rule there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MintLifetime(u64);
+
+impl MintLifetime {
+    /// The lifetime of a token asked for `requested_days` days by a caller
+    /// whose own credential allows it `ceiling_secs` seconds more (`None` when
+    /// it imposes no ceiling: Basic and opaque callers). First the cap of
+    /// [`MAX_TOKEN_TTL_DAYS`] days, a lifetime too long to count in seconds
+    /// being longer than the cap, then the ceiling, kept to the second: 0 once
+    /// nothing is left of the credential, and the route mints nothing.
+    pub fn days(requested_days: u64, ceiling_secs: Option<u64>) -> Self {
+        let max_secs = MAX_TOKEN_TTL_DAYS * SECS_PER_DAY;
+        let capped = requested_days
+            .checked_mul(SECS_PER_DAY)
+            .map_or(max_secs, |secs| secs.min(max_secs));
+        Self(ceiling_secs.map_or(capped, |ceiling| capped.min(ceiling)))
+    }
+
+    /// The lifetime in seconds.
+    pub fn secs(self) -> u64 {
+        self.0
+    }
+}
+
+/// A token just minted, with what it was granted: what a route answers and
+/// audits, the lifetime possibly less than it asked for.
+#[derive(Debug)]
+pub struct MintedToken {
+    pub token: String,
+    pub owner: String,
+    pub role: Role,
+    pub ttl_secs: u64,
+}
 
 /// Access role for API tokens
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -126,6 +167,15 @@ pub struct TokenStore {
     cache_ttl: Duration,
     /// Pending last_used updates: file_id_prefix -> timestamp (flushed periodically)
     pending_last_used: Arc<RwLock<HashMap<String, u64>>>,
+    /// Held by a revoke from its delete to its count, and by the legacy-hash
+    /// migration for its rewrite, so a migration that read a record before a
+    /// revoke cannot put it back after the revoke deleted it.
+    record_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Bumped by every revoke before it purges the cache. A verify reads it
+    /// before it reads the record and caches its result (or rewrites the
+    /// record) only if no revoke came in between, so a verify racing a revoke
+    /// cannot cache, or put back, the revoked token.
+    revocations: Arc<AtomicU64>,
 }
 
 impl TokenStore {
@@ -143,11 +193,13 @@ impl TokenStore {
             cache: Arc::new(RwLock::new(HashMap::new())),
             cache_ttl,
             pending_last_used: Arc::new(RwLock::new(HashMap::new())),
+            record_lock: Arc::new(tokio::sync::Mutex::new(())),
+            revocations: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Generate a new API token for a user. `ttl_days` is clamped to
-    /// `1..=MAX_TOKEN_TTL_DAYS` for every caller (an unbounded value overflows).
+    /// Generate a new API token for a user, living `ttl_days` days, clamped to
+    /// `1..=MAX_TOKEN_TTL_DAYS` (0 is one day).
     pub async fn create_token(
         &self,
         user: &str,
@@ -155,6 +207,23 @@ impl TokenStore {
         description: Option<String>,
         role: Role,
     ) -> Result<String, TokenError> {
+        let lifetime = MintLifetime::days(ttl_days.max(1), None);
+        self.mint_token(user, lifetime, description, role)
+            .await
+            .map(|minted| minted.token)
+    }
+
+    /// Generate a new API token living `lifetime` and report the lifetime
+    /// granted.
+    pub async fn mint_token(
+        &self,
+        user: &str,
+        lifetime: MintLifetime,
+        description: Option<String>,
+        role: Role,
+    ) -> Result<MintedToken, TokenError> {
+        let granted_role = role.clone();
+        let ttl_secs = lifetime.secs();
         // Generate random token
         let raw_token = format!(
             "{}{}",
@@ -170,8 +239,7 @@ impl TokenStore {
             .unwrap_or_default()
             .as_secs();
 
-        let ttl_days = ttl_days.clamp(1, MAX_TOKEN_TTL_DAYS);
-        let expires_at = now + (ttl_days * 24 * 60 * 60);
+        let expires_at = now.saturating_add(ttl_secs);
 
         let info = TokenInfo {
             token_hash,
@@ -191,7 +259,12 @@ impl TokenStore {
             .put_if_absent(&record_key(&file_id[..16]), Bytes::from(json))
             .await
         {
-            Ok(true) => Ok(raw_token),
+            Ok(true) => Ok(MintedToken {
+                token: raw_token,
+                owner: user.to_string(),
+                role: granted_role,
+                ttl_secs,
+            }),
             Ok(false) => Err(TokenError::Storage("token id collision".into())),
             Err(e) => Err(TokenError::Storage(e.to_string())),
         }
@@ -232,7 +305,9 @@ impl TokenStore {
         // Slow path: one storage read and Argon2. Misses are not cached (no negative
         // cache): an unknown token costs a read each time, and brute force is bounded
         // by the auth rate limiter, not here.
+        // A revoke after the read keeps the result out of the cache (see `revocations`).
         let key = record_key(&cache_key[..16]);
+        let seen = self.revocations.load(Ordering::SeqCst);
         let content = match self.storage.get(&key).await {
             Ok(c) => c,
             Err(StorageError::NotFound) => return Err(TokenError::NotFound),
@@ -249,11 +324,12 @@ impl TokenStore {
             // Legacy SHA256 hash (no salt) — verify and migrate
             let legacy_hash = sha256_hex(token);
             if info.token_hash == legacy_hash {
-                // Migrate to Argon2id
+                // Migrate to Argon2id. Best effort: skipped while a revoke runs, and
+                // when one came in since the read; a later verify retries.
                 if let Ok(new_hash) = hash_token_argon2(token) {
                     info.token_hash = new_hash;
                     if let Ok(json) = serde_json::to_vec_pretty(&info) {
-                        let _ = self.storage.put(&key, &json).await;
+                        self.rewrite_unless_revoked(seen, &key, &json).await;
                     }
                 }
                 true
@@ -276,8 +352,10 @@ impl TokenStore {
             return Err(TokenError::Expired);
         }
 
-        // Populate cache (key must match the fast-path lookup: full 64-char SHA-256 hex)
-        self.cache.write().insert(
+        // Populate cache (key must match the fast-path lookup: full 64-char
+        // SHA-256 hex), unless a revoke came in since the record was read.
+        self.cache_unless_revoked(
+            seen,
             cache_key.clone(),
             CachedToken {
                 user: info.user.clone(),
@@ -401,6 +479,29 @@ impl TokenStore {
         }
     }
 
+    /// Cache a verified token, unless a revoke came in since the verify read its
+    /// record (`seen`, the revocation count before the read). The count is checked
+    /// while the cache is held for the entry.
+    fn cache_unless_revoked(&self, seen: u64, cache_key: String, verified: CachedToken) {
+        let mut cache = self.cache.write();
+        if self.revocations.load(Ordering::SeqCst) == seen {
+            cache.insert(cache_key, verified);
+        }
+    }
+
+    /// Rewrite the record at `key` (the legacy-hash migration), unless a revoke runs
+    /// or came in since it was read (`seen`): a record a revoke deleted stays deleted.
+    /// Answers whether it was written.
+    async fn rewrite_unless_revoked(&self, seen: u64, key: &str, json: &[u8]) -> bool {
+        let Ok(_held) = self.record_lock.try_lock() else {
+            return false;
+        };
+        if self.revocations.load(Ordering::SeqCst) != seen {
+            return false;
+        }
+        self.storage.put(key, json).await.is_ok()
+    }
+
     /// Remove a token from the in-memory cache (called on revoke).
     /// Cache keys are full 64-char SHA-256 hex; revoke only knows the 16-char prefix,
     /// so we must scan for matching entries.
@@ -421,6 +522,9 @@ impl TokenStore {
             return Err(TokenError::NotFound);
         }
         let key = record_key(hash_prefix);
+        // From the delete to the count: a migration rewrite waits, so it cannot put
+        // the record back.
+        let _held = self.record_lock.lock().await;
         // An object-store delete of a missing key succeeds, so ask first.
         match self.storage.stat(&key).await {
             Some(_) => {}
@@ -428,6 +532,9 @@ impl TokenStore {
         }
         match self.storage.delete(&key).await {
             Ok(()) => {
+                // Count the revoke before purging the cache, so a verify that read
+                // the record before the delete keeps its result out of the cache.
+                self.revocations.fetch_add(1, Ordering::SeqCst);
                 self.invalidate_cache(hash_prefix);
                 Ok(())
             }
@@ -1293,5 +1400,173 @@ mod tests {
         assert!(matches!(result, Err(TokenError::NotFound)));
         let result = store.revoke_token("").await;
         assert!(matches!(result, Err(TokenError::NotFound)));
+    }
+
+    /// Every mint gets at most MAX_TOKEN_TTL_DAYS days, however long it asks
+    /// for: a lifetime that overflows when counted in seconds included, which
+    /// used to wrap around to a token of a few hours.
+    #[tokio::test]
+    async fn create_token_caps_the_lifetime_centrally() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(local(&temp_dir));
+        let ten_years = 3650 * 86_400;
+        for (asked, want) in [
+            (30, 30 * 86_400),
+            (3650, ten_years),
+            (3651, ten_years),
+            (1_000_000_000, ten_years),
+            (213_503_982_334_602, ten_years),
+            (u64::MAX, ten_years),
+        ] {
+            let token = store
+                .create_token("u", asked, None, Role::Read)
+                .await
+                .unwrap();
+            let prefix = &sha256_hex(&token)[..16];
+            let entry = store
+                .list_all_tokens()
+                .await
+                .into_iter()
+                .find(|t| t.file_id == prefix)
+                .unwrap();
+            assert_eq!(
+                entry.expires_at - entry.created_at,
+                want,
+                "ttl_days={asked}"
+            );
+        }
+    }
+
+    /// The lifetime of a mint, as a table: at most ten years whatever the days
+    /// asked, days too many to count in seconds included, then at most the
+    /// caller's ceiling, to the second.
+    #[test]
+    fn a_mint_lifetime_is_capped_then_held_to_the_ceiling() {
+        const DAY: u64 = 86_400;
+        const TEN_YEARS: u64 = 3650 * DAY;
+        let last_whole = u64::MAX / DAY;
+        for (days, ceiling, secs) in [
+            (30, None, 30 * DAY),
+            (0, None, 0),
+            (1, None, DAY),
+            (3650, None, TEN_YEARS),
+            (3651, None, TEN_YEARS),
+            (1_000_000_000, None, TEN_YEARS),
+            (last_whole, None, TEN_YEARS),
+            (last_whole + 1, None, TEN_YEARS),
+            (u64::MAX, None, TEN_YEARS),
+            (3650, Some(7 * DAY), 7 * DAY),
+            (3, Some(7 * DAY), 3 * DAY),
+            (3650, Some(DAY), DAY),
+            (3650, Some(900), 900),
+            (3650, Some(0), 0),
+            (last_whole + 1, Some(900), 900),
+            (u64::MAX, Some(900), 900),
+            (last_whole + 1, Some(20 * 365 * DAY), TEN_YEARS),
+            (u64::MAX, Some(u64::MAX), TEN_YEARS),
+        ] {
+            assert_eq!(
+                MintLifetime::days(days, ceiling).secs(),
+                secs,
+                "{days} days, ceiling {ceiling:?}"
+            );
+        }
+    }
+
+    /// The store reports the lifetime it granted, not the one asked for: a
+    /// route answers and audits what the token really lives.
+    #[tokio::test]
+    async fn mint_token_reports_the_lifetime_granted() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(local(&temp_dir));
+        for (asked, granted) in [
+            (MintLifetime::days(1, Some(900)), 900),
+            (MintLifetime::days(u64::MAX, None), 3650 * 86_400),
+        ] {
+            let minted = store
+                .mint_token("u", asked, None, Role::Write)
+                .await
+                .unwrap();
+            assert_eq!(minted.ttl_secs, granted, "asked {asked:?}");
+            assert_eq!((minted.owner.as_str(), minted.role), ("u", Role::Write));
+            let entry = store
+                .list_all_tokens()
+                .await
+                .into_iter()
+                .find(|t| t.file_id == sha256_hex(&minted.token)[..16])
+                .unwrap();
+            assert_eq!(entry.expires_at - entry.created_at, granted);
+        }
+    }
+
+    /// A verify that read a record before a revoke deleted it does not cache it
+    /// afterwards: the next verify reads storage and refuses the token.
+    #[tokio::test]
+    async fn a_verify_racing_a_revoke_leaves_the_token_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(local(&temp_dir));
+        let token = store.create_token("u", 30, None, Role::Read).await.unwrap();
+        let cache_key = sha256_hex(&token);
+        // The verify read the count (and the record) ...
+        let seen = store.revocations.load(Ordering::SeqCst);
+        // ... a revoke runs ...
+        store.revoke_token(&cache_key[..16]).await.unwrap();
+        // ... and the verify tries to cache what it read.
+        store.cache_unless_revoked(
+            seen,
+            cache_key.clone(),
+            CachedToken {
+                user: "u".into(),
+                role: Role::Read,
+                expires_at: u64::MAX,
+                cached_at: Instant::now(),
+            },
+        );
+        assert!(store.cache.read().is_empty());
+        assert!(matches!(
+            store.verify_token(&token).await,
+            Err(TokenError::NotFound)
+        ));
+        // Without a revoke in between, the entry is cached.
+        let seen = store.revocations.load(Ordering::SeqCst);
+        store.cache_unless_revoked(
+            seen,
+            cache_key,
+            CachedToken {
+                user: "u".into(),
+                role: Role::Read,
+                expires_at: u64::MAX,
+                cached_at: Instant::now(),
+            },
+        );
+        assert_eq!(store.cache.read().len(), 1);
+    }
+
+    /// A legacy-hash migration that read a record before a revoke deleted it does
+    /// not put it back, and none runs while a revoke holds the record lock.
+    #[tokio::test]
+    async fn a_migration_racing_a_revoke_leaves_the_token_revoked() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = local(&temp_dir);
+        let store = TokenStore::new(storage.clone());
+        let token = store.create_token("u", 30, None, Role::Read).await.unwrap();
+        let id = sha256_hex(&token)[..16].to_string();
+        let key = record_key(&id);
+        let json = storage.get(&key).await.unwrap();
+
+        let seen = store.revocations.load(Ordering::SeqCst);
+        store.revoke_token(&id).await.unwrap();
+        assert!(!store.rewrite_unless_revoked(seen, &key, &json).await);
+        assert!(matches!(
+            storage.get(&key).await,
+            Err(StorageError::NotFound)
+        ));
+
+        let seen = store.revocations.load(Ordering::SeqCst);
+        let held = store.record_lock.lock().await;
+        assert!(!store.rewrite_unless_revoked(seen, &key, &json).await);
+        drop(held);
+        assert!(store.rewrite_unless_revoked(seen, &key, &json).await);
+        assert!(storage.get(&key).await.is_ok());
     }
 }

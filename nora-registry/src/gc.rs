@@ -1221,8 +1221,9 @@ async fn evict_pypi_companions(storage: &Storage, key: &str) {
 /// - files under `rpm/` or `deb/` that have NO corresponding `.nora-meta/`
 ///   sidecar (hosted packages have one), are NOT themselves under `.nora-meta/`
 ///   and are NOT index files (repodata/, Packages, Release, etc.);
-/// - NuGet `.nupkg`/`.nuspec` files under `nuget/flatcontainer/` (hosted
-///   packages live under `nuget/hosted/`, never here);
+/// - NuGet `.nupkg`/`.nuspec` files under `nuget/flatcontainer/` of ids that are not
+///   hosted: pushed packages live under `nuget/hosted/<id>/<ver>/`, and an imported one,
+///   stored in the flat container, has its marker or records at `nuget/hosted/<id>/`;
 /// - npm tarballs with a cache provenance sidecar (#1055): only an upstream
 ///   fetch writes one, a publish does not;
 /// - PyPI files with a provenance marker (C22), likewise written only by an
@@ -1297,24 +1298,47 @@ async fn evict_proxy_cache(
         }
     }
 
-    match storage.list_with_meta("nuget/flatcontainer/").await {
-        Ok(entries) => {
-            for (key, meta) in entries {
-                let Some(id) = key
-                    .strip_prefix("nuget/flatcontainer/")
-                    .and_then(|rest| rest.split('/').next())
-                else {
-                    continue;
-                };
-                // index.json and sidecars are metadata, refreshed on their own.
-                let package = key.ends_with(".nupkg") || key.ends_with(".nuspec");
-                if package && !is_internal_namespace(curation, RegistryType::Nuget, id) {
-                    proxy_files.push((key, meta.size, meta.modified));
+    // Imported ids: the import marker `nuget/hosted/<id>/imported` or a record
+    // `nuget/hosted/<id>/<ver>.json` (two segments; the pushed feed's files have three).
+    // Their flat-container copy is the only one, so an unreadable listing skips NuGet.
+    let imported: Option<HashSet<String>> = match storage.list("nuget/hosted/").await {
+        Ok(keys) => Some(
+            keys.iter()
+                .filter_map(|key| key.strip_prefix("nuget/hosted/")?.split_once('/'))
+                .filter(|(_, rest)| {
+                    *rest == "imported" || (rest.ends_with(".json") && !rest.contains('/'))
+                })
+                .map(|(id, _)| id.to_string())
+                .collect(),
+        ),
+        Err(e) => {
+            tracing::error!("GC proxy-cache: list(nuget/hosted/) failed, NuGet skipped: {e}");
+            None
+        }
+    };
+    if let Some(imported) = imported {
+        match storage.list_with_meta("nuget/flatcontainer/").await {
+            Ok(entries) => {
+                for (key, meta) in entries {
+                    let Some(id) = key
+                        .strip_prefix("nuget/flatcontainer/")
+                        .and_then(|rest| rest.split('/').next())
+                    else {
+                        continue;
+                    };
+                    // index.json and sidecars are metadata, refreshed on their own.
+                    let package = key.ends_with(".nupkg") || key.ends_with(".nuspec");
+                    if package
+                        && !imported.contains(id)
+                        && !is_internal_namespace(curation, RegistryType::Nuget, id)
+                    {
+                        proxy_files.push((key, meta.size, meta.modified));
+                    }
                 }
             }
-        }
-        Err(e) => {
-            tracing::error!("GC proxy-cache: list_with_meta(nuget/flatcontainer/) failed: {e}")
+            Err(e) => {
+                tracing::error!("GC proxy-cache: list_with_meta(nuget/flatcontainer/) failed: {e}")
+            }
         }
     }
 
@@ -4007,8 +4031,9 @@ mod tests {
     }
 
     /// C22: the NuGet proxy cache is size-bounded like rpm/deb. Only proxied
-    /// `.nupkg`/`.nuspec` count: hosted packages (`nuget/hosted/`), `index.json`
-    /// and internal-namespace IDs (never refetchable) are never evicted.
+    /// `.nupkg`/`.nuspec` count: hosted packages (`nuget/hosted/`), imported ones (their
+    /// flat-container copy is the only one), `index.json` and internal-namespace IDs
+    /// (never refetchable) are never evicted.
     #[tokio::test]
     async fn test_evict_proxy_cache_nuget_flatcontainer() {
         let dir = tempfile::tempdir().unwrap();
@@ -4019,6 +4044,12 @@ mod tests {
             "nuget/hosted/maestra.lib/1.0.0/maestra.lib.1.0.0.nupkg",
             "nuget/hosted-meta/maestra.lib.json",
             "nuget/flatcontainer/maestra.seeded/1.0.0/maestra.seeded.1.0.0.nupkg",
+            // `nora import`: marker, record and the flat-container copy, older than any.
+            "nuget/hosted/corp.imported/imported",
+            "nuget/hosted/corp.imported/1.0.0.json",
+            "nuget/flatcontainer/corp.imported/1.0.0/corp.imported.1.0.0.nupkg",
+            "nuget/hosted/corp.marked/imported",
+            "nuget/flatcontainer/corp.marked/1.0.0/corp.marked.1.0.0.nupkg",
         ];
         for key in kept {
             put_aged(&storage, &data, key, 100, 0).await;

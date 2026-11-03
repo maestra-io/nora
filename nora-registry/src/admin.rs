@@ -20,9 +20,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditEntry;
-use crate::auth::{AuthenticatedUser, NamespaceAuthority};
+use crate::auth::{AuthenticatedUser, MintLifetimeCeiling, NamespaceAuthority};
 use crate::registry_type::RegistryType;
-use crate::tokens::{Role, MAX_TOKEN_TTL_DAYS};
+use crate::tokens::{MintLifetime, Role};
 use crate::AppState;
 
 /// Minimum seconds between two accepted reindex calls. A reindex flips dirty
@@ -179,12 +179,6 @@ fn default_admin_token_role() -> String {
     "read".to_string()
 }
 
-#[derive(Serialize)]
-struct AdminCreateTokenResponse {
-    token: String,
-    expires_in_days: u64,
-}
-
 /// Mint an API token of any role — including `admin` — WITHOUT the
 /// `auth.admin_users` self-service check.
 ///
@@ -203,7 +197,7 @@ async fn admin_create_token(
     State(state): State<AppState>,
     Extension(caller): Extension<AuthenticatedUser>,
     Extension(caller_authority): Extension<NamespaceAuthority>,
-    caller_mint_ceiling: Option<Extension<crate::auth::MintLifetimeCeiling>>,
+    caller_mint_ceiling: Option<Extension<MintLifetimeCeiling>>,
     Json(req): Json<AdminCreateTokenRequest>,
 ) -> Response {
     // Role is proven by the gate, but role is not authority: a minted opaque
@@ -234,13 +228,6 @@ async fn admin_create_token(
     if req.ttl_days == 0 {
         return (StatusCode::BAD_REQUEST, "ttl_days must be > 0").into_response();
     }
-    // The store clamps too; clamp here so the response and audit report the real TTL.
-    // An OIDC caller's provider ceiling (#1094) applies here as on the UI mint:
-    // a 15-minute credential must not mint a token that lasts years.
-    let ttl_days = crate::ui::cap_ttl_days(
-        req.ttl_days.min(MAX_TOKEN_TTL_DAYS),
-        caller_mint_ceiling.map(|Extension(c)| c.0),
-    );
 
     let Some(token_store) = &state.tokens else {
         return (
@@ -250,26 +237,33 @@ async fn admin_create_token(
             .into_response();
     };
 
-    let role_label = role.to_string();
+    // An OIDC admin is held to its credential as on the UI: the token lives no
+    // longer than the provider ceiling and what is left of the JWT, and a JWT
+    // with nothing left mints nothing.
+    let lifetime = MintLifetime::days(
+        req.ttl_days,
+        caller_mint_ceiling.map(|Extension(MintLifetimeCeiling(secs))| secs),
+    );
+    if lifetime.secs() == 0 {
+        return (
+            StatusCode::FORBIDDEN,
+            "The credential has expired; a token minted from it would outlive it",
+        )
+            .into_response();
+    }
     match token_store
-        .create_token(&req.username, ttl_days, req.description, role)
+        .mint_token(&req.username, lifetime, req.description, role)
         .await
     {
-        Ok(token) => {
-            // Audit the mint with actor + target + role + ttl (never the token itself).
-            let detail = format!("role={} ttl_days={}", role_label, ttl_days);
-            state.audit.log(AuditEntry::new(
-                "admin_token_mint",
+        Ok(minted) => {
+            state.audit.log(AuditEntry::token_mint(
                 &caller.0,
-                &req.username,
                 "admin",
-                &detail,
+                &minted.owner,
+                &minted.role,
+                minted.ttl_secs,
             ));
-            Json(AdminCreateTokenResponse {
-                token,
-                expires_in_days: ttl_days,
-            })
-            .into_response()
+            Json(crate::auth::MintedTokenResponse::from(minted)).into_response()
         }
         Err(e) => {
             tracing::error!(user = %req.username, error = %e, "admin token mint failed: cannot store the token record");

@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.4.1"
+version = "1.4.3"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -45,8 +45,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 debug = false
 strip = true
 codegen-units = 4
-# Unwind (the default), not abort: the catch_unwind guards on background tasks and
-# CatchPanicLayer only work with unwinding, so one panic is a 500, not a dead process.
+# Unwind, so a panic ends the request or task it happened in, not the process: the
+# `catch_unwind` guards and the panic layer only work under unwind.
+panic = "unwind"
 lto = "thin"
 
 # Maximum optimization for GitHub Releases and published binaries

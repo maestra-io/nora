@@ -13,6 +13,17 @@ struct CachedToken {
     expires_at: Instant,
 }
 
+/// Why a 401 challenge got no token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenError {
+    /// The upstream will not let NORA in with what it has (#1196): its challenge is not one
+    /// that a token answers (`Basic`, another scheme, none at all), or its token server refused
+    /// the credentials with 401 or 403. A configuration fault, not an outage.
+    Refused,
+    /// The token server could not be reached, or its challenge or answer was unusable.
+    Unavailable,
+}
+
 /// Docker registry authentication handler
 /// Manages Bearer token acquisition and caching for upstream registries
 #[derive(Clone)]
@@ -44,7 +55,7 @@ impl DockerAuth {
         name: &str,
         www_authenticate: Option<&str>,
         basic_auth: Option<&str>,
-    ) -> Option<String> {
+    ) -> Result<String, TokenError> {
         let cache_key = format!("{}:{}", registry_url, name);
 
         // Check cache first
@@ -52,13 +63,13 @@ impl DockerAuth {
             let tokens = self.tokens.read();
             if let Some(cached) = tokens.get(&cache_key) {
                 if cached.expires_at > Instant::now() {
-                    return Some(cached.token.clone());
+                    return Ok(cached.token.clone());
                 }
             }
         }
 
-        // Need to fetch a new token
-        let www_auth = www_authenticate?;
+        // Need to fetch a new token. A 401 without a challenge names no way in.
+        let www_auth = www_authenticate.ok_or(TokenError::Refused)?;
         let (token, lifetime) = self.fetch_token(www_auth, name, basic_auth).await?;
 
         // Cache the token for the lifetime the token server gave it, less a margin
@@ -74,7 +85,7 @@ impl DockerAuth {
             );
         }
 
-        Some(token)
+        Ok(token)
     }
 
     /// Parse Www-Authenticate header and fetch token from auth server
@@ -86,15 +97,17 @@ impl DockerAuth {
         www_authenticate: &str,
         name: &str,
         basic_auth: Option<&str>,
-    ) -> Option<(String, Duration)> {
-        let params = parse_www_authenticate(www_authenticate)?;
+    ) -> Result<(String, Duration), TokenError> {
+        // Not a Bearer challenge (Harbor answers `Basic realm="harbor"` to a robot account
+        // without access): no token can answer it.
+        let params = parse_www_authenticate(www_authenticate).ok_or(TokenError::Refused)?;
 
-        let realm = params.get("realm")?;
+        let realm = params.get("realm").ok_or(TokenError::Unavailable)?;
 
         // Validate realm URL scheme — only HTTP(S) allowed
         if !realm.starts_with("https://") && !realm.starts_with("http://") {
             tracing::warn!(realm = %realm, "Rejecting auth realm with non-HTTP(S) scheme");
-            return None;
+            return Err(TokenError::Unavailable);
         }
 
         let service = params.get("service").map(|s| s.as_str()).unwrap_or("");
@@ -111,22 +124,30 @@ impl DockerAuth {
             tracing::debug!("Using basic auth for token request");
         }
 
-        let response = request.send().await.ok()?;
+        let response = request.send().await.map_err(|_| TokenError::Unavailable)?;
 
-        if !response.status().is_success() {
-            tracing::warn!(status = %response.status(), "Token request failed");
-            return None;
+        let status = response.status();
+        if !status.is_success() {
+            tracing::warn!(status = %status, "Token request failed");
+            // Docker Hub answers wrong credentials with 401 "incorrect username or password".
+            return Err(match status {
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                    TokenError::Refused
+                }
+                _ => TokenError::Unavailable,
+            });
         }
 
-        let json: serde_json::Value = response.json().await.ok()?;
+        let json: serde_json::Value = response.json().await.map_err(|_| TokenError::Unavailable)?;
 
         // Docker Hub returns "token", some registries return "access_token"
         let token = json
             .get("token")
             .or_else(|| json.get("access_token"))
             .and_then(|v| v.as_str())
-            .map(String::from)?;
-        Some((token, token_lifetime(&json, chrono::Utc::now())))
+            .map(String::from)
+            .ok_or(TokenError::Unavailable)?;
+        Ok((token, token_lifetime(&json, chrono::Utc::now())))
     }
 }
 
@@ -278,7 +299,7 @@ mod tests {
             let token = auth
                 .get_token("https://r.example", "lib/x", Some(&header), None)
                 .await;
-            assert_eq!(token.as_deref(), Some("tok"));
+            assert_eq!(token.as_deref().ok(), Some("tok"));
             let tokens = auth.tokens.read();
             match tokens.get("https://r.example:lib/x") {
                 Some(t) => {
@@ -309,7 +330,7 @@ mod tests {
         let result = auth
             .get_token("https://registry.example.com", "library/test", None, None)
             .await;
-        assert!(result.is_none());
+        assert_eq!(result, Err(TokenError::Refused));
     }
 
     #[tokio::test]
@@ -329,7 +350,7 @@ mod tests {
         let result = auth
             .get_token("https://registry.example.com", "library/test", None, None)
             .await;
-        assert_eq!(result, Some("cached-token-123".to_string()));
+        assert_eq!(result, Ok("cached-token-123".to_string()));
     }
 
     #[tokio::test]
@@ -345,11 +366,11 @@ mod tests {
                 },
             );
         }
-        // Without www_authenticate, returns None (can't fetch new token)
+        // Without www_authenticate, no new token can be fetched
         let result = auth
             .get_token("https://registry.example.com", "library/test", None, None)
             .await;
-        assert!(result.is_none());
+        assert_eq!(result, Err(TokenError::Refused));
     }
 
     #[test]
@@ -401,7 +422,98 @@ mod tests {
                 None,
             )
             .await;
-        assert!(result.is_none());
+        assert_eq!(result, Err(TokenError::Unavailable));
+    }
+
+    /// #1196: how a challenge that yields no token is told apart. A refusal is the upstream
+    /// keeping NORA out (a challenge no token answers, the token server's 401 or 403); anything
+    /// else that yields no token is the token server failing.
+    #[tokio::test]
+    async fn a_refused_token_is_told_from_an_unavailable_one() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (challenge, token_answer, want) in [
+            ("Basic realm=\"harbor\"", None, Err(TokenError::Refused)),
+            ("Negotiate", None, Err(TokenError::Refused)),
+            ("", None, Err(TokenError::Refused)),
+            (
+                "Bearer",
+                Some(ResponseTemplate::new(401)),
+                Err(TokenError::Refused),
+            ),
+            (
+                "Bearer",
+                Some(ResponseTemplate::new(403)),
+                Err(TokenError::Refused),
+            ),
+            (
+                "Bearer",
+                Some(ResponseTemplate::new(500)),
+                Err(TokenError::Unavailable),
+            ),
+            (
+                "Bearer",
+                Some(ResponseTemplate::new(429)),
+                Err(TokenError::Unavailable),
+            ),
+            (
+                "Bearer",
+                Some(ResponseTemplate::new(404)),
+                Err(TokenError::Unavailable),
+            ),
+            (
+                "Bearer",
+                Some(ResponseTemplate::new(200).set_body_string("not json")),
+                Err(TokenError::Unavailable),
+            ),
+            (
+                "Bearer",
+                Some(ResponseTemplate::new(200).set_body_json(serde_json::json!({}))),
+                Err(TokenError::Unavailable),
+            ),
+            (
+                "Bearer",
+                Some(ResponseTemplate::new(200).set_body_json(serde_json::json!({"token": "t"}))),
+                Ok("t".to_string()),
+            ),
+            (
+                "Bearer",
+                Some(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"access_token": "a"})),
+                ),
+                Ok("a".to_string()),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            let challenge = if challenge == "Bearer" {
+                format!("Bearer realm=\"{}/token\",service=\"s\"", server.uri())
+            } else {
+                challenge.to_string()
+            };
+            let asked_token_server = token_answer.is_some();
+            if let Some(answer) = token_answer {
+                Mock::given(wiremock::matchers::any())
+                    .respond_with(answer)
+                    .mount(&server)
+                    .await;
+            }
+            let auth = DockerAuth::new(reqwest::Client::new(), 5);
+            let got = auth
+                .get_token(
+                    "https://registry.example.com",
+                    "project1/service1",
+                    Some(&challenge),
+                    Some("robot:secret"),
+                )
+                .await;
+            assert_eq!(got, want, "{challenge:?}");
+            assert_eq!(
+                !server.received_requests().await.unwrap().is_empty(),
+                asked_token_server,
+                "{challenge:?}: token server asked"
+            );
+        }
     }
 
     #[tokio::test]
@@ -415,6 +527,6 @@ mod tests {
                 None,
             )
             .await;
-        assert!(result.is_none());
+        assert_eq!(result, Err(TokenError::Unavailable));
     }
 }
