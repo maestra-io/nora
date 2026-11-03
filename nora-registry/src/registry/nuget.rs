@@ -766,25 +766,6 @@ fn refresh_in_background(state: &AppState, storage_key: &str, url: &str, activit
     });
 }
 
-/// Poll the validator sidecar of `key` until a background revalidation stamps it.
-#[cfg(test)]
-async fn wait_for_stamp(storage: &crate::Storage, key: &str) -> String {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if let Ok(d) = storage.get(&crate::registry::validators_key(key)).await {
-            let s = String::from_utf8_lossy(&d).into_owned();
-            if s.contains("validated_at") {
-                return s;
-            }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{key} never revalidated"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-}
-
 /// Refresh the cached metadata document at `storage_key` (registration index or
 /// page, version list) from `url`, returning its raw (not yet rewritten) body.
 ///
@@ -2543,6 +2524,24 @@ mod integration_tests {
     use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
     use axum::http::{Method, StatusCode};
 
+    /// Poll the validator sidecar of `key` until a background revalidation stamps it.
+    async fn wait_for_stamp(storage: &crate::Storage, key: &str) -> String {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(d) = storage.get(&crate::registry::validators_key(key)).await {
+                let s = String::from_utf8_lossy(&d).into_owned();
+                if s.contains("validated_at") {
+                    return s;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{key} never revalidated"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// A body of `len` bytes that is not one repeated byte (so a splice shows).
     fn big_body(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
@@ -3998,9 +3997,7 @@ mod integration_tests {
         .await;
         assert_eq!(json_body(resp).await["count"], 1);
         // The revalidation runs behind the response (stale-while-revalidate).
-        assert!(super::wait_for_stamp(st, key)
-            .await
-            .contains("validated_at"));
+        assert!(wait_for_stamp(st, key).await.contains("validated_at"));
         assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
         assert_eq!(ops.snapshot().get("put"), Some(&1), "{:?}", ops.snapshot());
     }
