@@ -456,9 +456,10 @@ impl UpstreamMiss {
             tracing::warn!(
                 registry,
                 path,
+                breaker = %key,
                 "no upstream answered and one was skipped for its open circuit breaker, returning 503"
             );
-            return circuit_open_response(key);
+            return circuit_open_response(registry);
         }
         if self.credentials_refused() {
             tracing::warn!(
@@ -565,7 +566,10 @@ pub(crate) fn local_copy_unreadable(
 }
 
 /// 503 response for circuit breaker open state with Retry-After header.
-pub(crate) fn circuit_open_response(registry: &str) -> Response {
+pub(crate) fn circuit_open_response(key: &str) -> Response {
+    // A per-upstream breaker key is `<registry>:<url>` (upstream_key): its host, path and
+    // query are the operator's, never the client's. Only the registry is named.
+    let registry = key.split_once(':').map_or(key, |(registry, _)| registry);
     (
         StatusCode::SERVICE_UNAVAILABLE,
         [("retry-after", "30")],
@@ -2599,6 +2603,7 @@ mod tests {
             }
             assert_eq!(miss.status(), *status, "{upstreams:?}");
             assert!(!miss.credentials_refused(), "{upstreams:?}");
+            assert_eq!(miss.open_key(), *key, "{upstreams:?}");
             let response = miss.response("docker", "x");
             assert_eq!(response.status(), *status, "{upstreams:?}");
             if let Some(key) = key {
@@ -2610,12 +2615,34 @@ mod tests {
                 let body = axum::body::to_bytes(response.into_body(), 1 << 16)
                     .await
                     .unwrap();
+                // The key (an upstream URL) is logged, never answered.
                 assert_eq!(
                     body.as_ref(),
-                    format!("upstream {key} temporarily unavailable").as_bytes(),
-                    "{upstreams:?}"
+                    b"upstream docker temporarily unavailable".as_slice(),
+                    "{upstreams:?} ({key})"
                 );
             }
+        }
+    }
+
+    /// Every caller hands `circuit_open_response` what `CircuitBreakerRegistry::check` put in
+    /// `CircuitOpen`: for a per-upstream breaker, the upstream's URL. The 503 names only the
+    /// registry, so an internal mirror's host, path or a token in its query never reaches a client.
+    #[tokio::test]
+    async fn the_circuit_open_503_names_only_the_registry() {
+        for (key, expected) in [
+            ("npm", "upstream npm temporarily unavailable"),
+            (
+                "maven:https://mirror.internal:8443/repo?token=s3cr3t",
+                "upstream maven temporarily unavailable",
+            ),
+        ] {
+            let response = circuit_open_response(key);
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            assert_eq!(body.as_ref(), expected.as_bytes(), "{key}");
         }
     }
 

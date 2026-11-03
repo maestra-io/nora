@@ -825,10 +825,11 @@ fn docker_miss_response(miss: &UpstreamMiss, missed: Missed<'_>) -> Response {
             Missed::Manifest { name, reference } => manifest_unknown_response(name, reference),
             Missed::Blob { digest, .. } => blob_unknown_response(digest),
         };
-    } else if let Some(key) = miss.open_key() {
+    } else if miss.open_key().is_some() {
+        // miss.response logged the breaker key; the body never names the upstream's URL.
         (
             "UNAVAILABLE",
-            format!("upstream {key} temporarily unavailable"),
+            "upstream docker temporarily unavailable".to_string(),
             json!("its circuit breaker is open; retry after the Retry-After interval"),
         )
     } else {
@@ -10006,7 +10007,15 @@ mod integration_tests {
             Some("30")
         );
         let body = body_bytes(response).await;
-        assert!(String::from_utf8_lossy(&body).contains("temporarily unavailable"));
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("upstream docker temporarily unavailable"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("127.0.0.1"),
+            "the upstream's URL is logged, not answered: {body}"
+        );
     }
 
     // ── OCI Distribution Spec conformance ──
