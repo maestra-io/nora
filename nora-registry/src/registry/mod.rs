@@ -1906,6 +1906,23 @@ pub(crate) async fn fresh_within_ttl(
     if crate::cache_ttl::is_within_ttl(modified, ttl_secs) {
         return true;
     }
+    validated_within_ttl(storage, key, ttl_secs).await
+}
+
+/// Whether the stored `key` exists and is fresh within `ttl_secs`: [`fresh_within_ttl`]
+/// with its stat and validators read in one store round trip instead of two (the
+/// validators read is wasted when the stat alone is fresh). On a slow store each
+/// serial round trip is a p99 of seconds (NoraHighLatency 03.11.2026).
+pub(crate) async fn stored_fresh(storage: &crate::Storage, key: &str, ttl_secs: i64) -> bool {
+    let (meta, validated) = tokio::join!(
+        storage.stat(key),
+        validated_within_ttl(storage, key, ttl_secs)
+    );
+    meta.is_some_and(|m| crate::cache_ttl::is_within_ttl(m.modified, ttl_secs) || validated)
+}
+
+/// Whether `key`'s validators record a revalidation within `ttl_secs`.
+async fn validated_within_ttl(storage: &crate::Storage, key: &str, ttl_secs: i64) -> bool {
     if ttl_secs <= 0 {
         return false;
     }
