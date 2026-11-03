@@ -73,7 +73,7 @@ runs and is not Ready while `/health` passes points to R2 — see `NoraStorageUn
 | Signal (Steps 1–2) | Cause | Act |
 |---|---|---|
 | new ReplicaSet from a version bump, container killed by the startup probe, log stops before the listener | new release starts slower than 150 s or hangs | roll back the image/chart tag in fluxcd to the last good version, or raise `startupProbe.failureThreshold` if the log shows progress (e.g. an index rebuild) |
-| `OOMKilled` | memory limit | raise `resources.limits.memory` in fluxcd; check `container_memory_rss` against the limit first |
+| `OOMKilled` | a registry holding whole bodies in memory, or the memory limit | first look for a wave of large downloads in the ingress logs for the minutes before the kill: `RequestHost:packages.maestra.io \| stats by (RequestPath) count() n, max(DownstreamContentSize) sz \| sort by (n desc)`. Many concurrent GETs of one artifact above `server.stream_threshold_mb` (16 MB) mean that registry's handler buffers it, which is a nora bug: fix it to serve through `read_cached_artifact` (ContainerOOMKillLoop 03.11.2026: 439 GETs of a 125 MB Maven jar from 150 CI runners, fixed in nora#124). Raise `resources.limits.memory` in fluxcd only when `container_memory_rss` grows without such a wave |
 | running, `/health` ok, `/ready` failing | R2 unreachable or slow | `NoraStorageUnreachable` path: R2 status, egress, credentials in `/r2-creds` |
 | `Pending` / `FailedScheduling`, node `SchedulingDisabled` | node drain or lack of capacity | check `#maintenance-notifications` and the node; the drain owner decides |
 | `ErrImagePull` / `ImagePullBackOff` | tag/digest missing in ECR or pull secret | fix the tag/digest in fluxcd (`image-pull` secret) |
