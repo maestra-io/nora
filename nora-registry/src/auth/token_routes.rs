@@ -180,7 +180,8 @@ async fn create_token(
     match token_store
         .mint_token(
             &req.username,
-            MintLifetime::days(req.ttl_days, None),
+            // 0 is one day, as create_token and the UI route have it.
+            MintLifetime::days(req.ttl_days.max(1), None),
             req.description,
             role,
         )
@@ -445,6 +446,23 @@ mod mint_tests {
             let (status, _) = post_json(&ctx, "/api/tokens/list", None, bob).await;
             assert_eq!(status, StatusCode::OK, "{route}");
         }
+    }
+
+    /// `ttl_days: 0` on the API route mints a one-day token, as `create_token` did before
+    /// the route minted directly: not one that is expired by the time it is answered.
+    #[tokio::test]
+    async fn api_mint_with_zero_days_lives_one_day() {
+        let ctx = audited(&[("alice", "alicepw")]);
+        let (status, json) = post_json(
+            &ctx,
+            "/api/tokens",
+            None,
+            r#"{"username":"alice","password":"alicepw","ttl_days":0}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["expires_in_secs"], 86_400, "{json}");
+        assert_eq!(lifetime_of(&ctx, "alice").await, 86_400);
     }
 
     /// Every route that mints holds a lifetime too long to count in seconds to
