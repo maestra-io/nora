@@ -1621,13 +1621,29 @@ struct HiddenEntry {
     at: std::time::Instant,
     curation: usize,
     hidden: Arc<HashSet<String>>,
+    /// Every version the set was judged over: an expired entry still answers for a
+    /// version list inside it.
+    known: Arc<HashSet<String>>,
+    /// When a background recompute of this expired entry started.
+    refreshing: Option<std::time::Instant>,
 }
+
+/// A background recompute older than this is taken as lost and started again.
+const HIDDEN_REFRESH_STALL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Memo entries kept before expired ones are dropped.
 // ponytail: whole-map prune at the cap, an LRU if the restored-ID set gets that big.
 const HIDDEN_MEMO_MAX: usize = 4096;
 
 /// [`compute_hidden_versions`], memoized in [`HiddenMemo`].
+///
+/// An expired entry under the same curation config still answers a caller whose
+/// `listed` versions it judged all of: it is served and recomputed behind the
+/// response (one recompute per entry), like the stale index in
+/// [`compute_hidden_versions`]. A low-traffic ID otherwise paid the index and page
+/// reads on every restore more than `metadata_ttl` apart (NoraHighLatency
+/// 03.11.2026). A listed version the entry does not know may be new and young, so
+/// it waits for the recompute.
 async fn hidden_versions(
     state: &AppState,
     id: &str,
@@ -1638,27 +1654,67 @@ async fn hidden_versions(
     let curation = Arc::as_ptr(&*state.curation()) as usize;
     let memo = &state.nuget_hosted.hidden.0;
     let key = (id.to_string(), last_page_only);
-    if let Some(e) = memo.lock().get(&key) {
-        if e.curation == curation && e.at.elapsed() < ttl {
-            return e.hidden.clone();
-        }
-    }
-    let hidden = Arc::new(compute_hidden_versions(state, id, last_page_only, listed).await);
-    if !ttl.is_zero() {
-        let mut memo = memo.lock();
-        if memo.len() >= HIDDEN_MEMO_MAX {
-            memo.retain(|_, e| e.at.elapsed() < ttl);
-            if memo.len() >= HIDDEN_MEMO_MAX {
-                memo.clear();
+    let mut refresh_behind = false;
+    if let Some(e) = memo.lock().get_mut(&key) {
+        if e.curation == curation {
+            if e.at.elapsed() < ttl {
+                return e.hidden.clone();
+            }
+            let covered = state.config.nuget.serve_stale
+                && listed.is_some_and(|listed| listed.is_subset(&e.known));
+            if covered {
+                if e.refreshing
+                    .is_none_or(|t| t.elapsed() > HIDDEN_REFRESH_STALL)
+                {
+                    e.refreshing = Some(std::time::Instant::now());
+                    refresh_behind = true;
+                }
+                let hidden = e.hidden.clone();
+                if refresh_behind {
+                    let (state, id) = (state.clone(), id.to_string());
+                    tokio::spawn(async move {
+                        let (hidden, known) =
+                            compute_hidden_versions(&state, &id, last_page_only, None).await;
+                        remember_hidden(&state, (id, last_page_only), curation, hidden, known);
+                    });
+                }
+                return hidden;
             }
         }
-        let entry = HiddenEntry {
-            at: std::time::Instant::now(),
-            curation,
-            hidden: hidden.clone(),
-        };
-        memo.insert(key, entry);
     }
+    let (hidden, known) = compute_hidden_versions(state, id, last_page_only, listed).await;
+    remember_hidden(state, key, curation, hidden, known)
+}
+
+/// Store a computed hidden set in [`HiddenMemo`] (not at all with a zero
+/// `metadata_ttl`) and return it.
+fn remember_hidden(
+    state: &AppState,
+    key: (String, bool),
+    curation: usize,
+    hidden: HashSet<String>,
+    known: HashSet<String>,
+) -> Arc<HashSet<String>> {
+    let hidden = Arc::new(hidden);
+    let ttl = std::time::Duration::from_secs(state.config.nuget.metadata_ttl.max(0) as u64);
+    if ttl.is_zero() {
+        return hidden;
+    }
+    let mut memo = state.nuget_hosted.hidden.0.lock();
+    if memo.len() >= HIDDEN_MEMO_MAX {
+        memo.retain(|_, e| e.at.elapsed() < ttl);
+        if memo.len() >= HIDDEN_MEMO_MAX {
+            memo.clear();
+        }
+    }
+    let entry = HiddenEntry {
+        at: std::time::Instant::now(),
+        curation,
+        hidden: hidden.clone(),
+        known: Arc::new(known),
+        refreshing: None,
+    };
+    memo.insert(key, entry);
     hidden
 }
 
@@ -1679,7 +1735,7 @@ async fn compute_hidden_versions(
     id: &str,
     last_page_only: bool,
     listed: Option<&HashSet<String>>,
-) -> HashSet<String> {
+) -> (HashSet<String>, HashSet<String>) {
     let index_key = registration_key(id);
     let index_path = format!("{id}/index.json");
     let ttl = state.config.nuget.metadata_ttl;
@@ -1695,14 +1751,11 @@ async fn compute_hidden_versions(
     if fresh.is_none() && state.config.nuget.serve_stale {
         if let (Some(listed), Some(stored)) = (listed, stale) {
             let leaves = registration_leaves(state, id, &stored, last_page_only).await;
-            let known: HashSet<String> = leaves
-                .iter()
-                .filter_map(|l| entry_version(l.get("catalogEntry")?))
-                .collect();
+            let known = leaf_versions(&leaves);
             if listed.is_subset(&known) {
                 let (bg, key, path) = (state.clone(), index_key.clone(), index_path.clone());
                 tokio::spawn(async move { fetch_registration_doc(&bg, &key, &path).await });
-                return hidden_leaves(state, id, &leaves).await;
+                return (hidden_leaves(state, id, &leaves).await, known);
             }
         }
     }
@@ -1714,10 +1767,21 @@ async fn compute_hidden_versions(
         },
     };
     let Some(index) = index else {
-        return HashSet::new();
+        return (HashSet::new(), HashSet::new());
     };
     let leaves = registration_leaves(state, id, &index, last_page_only).await;
-    hidden_leaves(state, id, &leaves).await
+    (
+        hidden_leaves(state, id, &leaves).await,
+        leaf_versions(&leaves),
+    )
+}
+
+/// The (lowercase) versions of registration `leaves`.
+fn leaf_versions(leaves: &[serde_json::Value]) -> HashSet<String> {
+    leaves
+        .iter()
+        .filter_map(|l| entry_version(l.get("catalogEntry")?))
+        .collect()
 }
 
 /// The leaves of a registration `index`: its inlined pages, else the page documents
@@ -4131,6 +4195,87 @@ mod integration_tests {
             "waited {:?} on the registration refresh",
             started.elapsed()
         );
+    }
+
+    /// An expired hidden-versions memo entry that judged every listed version answers
+    /// at once and is recomputed behind the response: the registration index is gone
+    /// from the store and its upstream is slow, yet the flat list is served in time,
+    /// still without the young 1.1.0. The recompute reaches upstream afterwards.
+    #[tokio::test]
+    async fn test_q04_expired_hidden_memo_is_served_and_recomputed_behind() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let upstream = wiremock::MockServer::start().await;
+        let reg = "/v3/registration5-gz-semver2/memo.pkg/index.json";
+        let index = serde_json::json!({ "items": [{ "items": [
+            leaf("1.0.0", &iso_ago(30 * 86400)), leaf("1.1.0", &iso_ago(600))
+        ] }] });
+        Mock::given(method("GET"))
+            .and(path(reg))
+            .respond_with(ResponseTemplate::new(200).set_body_json(index.clone()))
+            .up_to_n_times(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(reg))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(index)
+                    .set_delay(std::time::Duration::from_secs(5)),
+            )
+            .mount(&upstream)
+            .await;
+        mount_json(
+            &upstream,
+            "/v3-flatcontainer/memo.pkg/index.json",
+            serde_json::json!({ "versions": ["1.0.0", "1.1.0"] }),
+        )
+        .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.nuget.metadata_ttl = 1;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+        });
+        assert_eq!(
+            flat_versions(&ctx, "memo.pkg").await,
+            serde_json::json!(["1.0.0"])
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let _ = ctx
+            .state
+            .storage
+            .delete(&super::registration_key("memo.pkg"))
+            .await;
+        let started = std::time::Instant::now();
+        assert_eq!(
+            flat_versions(&ctx, "memo.pkg").await,
+            serde_json::json!(["1.0.0"])
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "waited {:?} on the hidden-versions recompute",
+            started.elapsed()
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let hits = upstream
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path() == reg)
+                .count();
+            if hits >= 2 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "no recompute behind");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     /// An upstream 404 in a background refresh drops the stale copy and its validators:
