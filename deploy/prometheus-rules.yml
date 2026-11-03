@@ -25,10 +25,13 @@ groups:
         # Only above 5 rps: at night traffic is ~2 rps, so the p99 is a handful of
         # requests and one short storage stall fires it (23.10.2026, 7 slow npm
         # requests at 2.1 rps). Every real incident ran at 7-413 rps.
+        # for: 10m: night CI NuGet restores at 5-11 rps cross 5s for 5-9 min and
+        # clear on their own; a 7-day backtest (27.10-03.11.2026) kept 2 of 26
+        # 5-minute episodes, the two sustained stalls (12 and 14 min).
         expr: >-
           histogram_quantile(0.99, sum by (le) (rate(nora_http_request_duration_seconds_bucket[5m]))) > 5
           and on() sum(rate(nora_http_request_duration_seconds_count[5m])) > 5
-        for: 5m
+        for: 10m
         labels:
           severity: warning
         annotations:
