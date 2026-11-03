@@ -628,6 +628,30 @@ mod tests {
         assert_eq!(galaxy_versions(&ctx).await, ["13.5.0", "12.0.0"]);
     }
 
+    /// A projection never reaches the upstream: a page without `created_at` would be
+    /// cached under the plain key and let young versions through.
+    #[tokio::test]
+    async fn ansible_versions_projection_is_not_forwarded() {
+        let (up, ctx) = galaxy_ctx(CurationMode::Enforce).await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/ansible/v3/collections/community/general/versions/?exclude_fields=created_at&limit=100",
+            "",
+        )
+        .await;
+        let versions: Vec<String> = json_of(resp).await["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["version"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(versions, ["13.5.0", "12.0.0"]);
+        let sent = up.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].url.query(), Some("limit=100"));
+    }
+
     #[tokio::test]
     async fn ansible_versions_audit_mode_keeps_young_collections() {
         let (_up, ctx) = galaxy_ctx(CurationMode::Audit).await;

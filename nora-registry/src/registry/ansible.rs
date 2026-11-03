@@ -177,6 +177,9 @@ async fn version_list(
         ns,
         name
     );
+    // Same as the collection list: the cache key ignores a projection, and a page
+    // without `created_at` would slip young versions past the Q04 filter below.
+    let raw_query = without_projection(raw_query.as_deref());
     let url = append_query(&base, raw_query.as_deref());
 
     let cache_key = match extract_page_param(raw_query.as_deref()) {
