@@ -705,21 +705,6 @@ async fn store(
     Ok(Stored::Created(format!("{}@{}", pkg.id, version)))
 }
 
-/// `nora import`: store a package offline, as a push would. There is no server index
-/// to update here: a running server picks the document up on `POST
-/// /api/v1/admin/reindex` or its periodic retention pass, a stopped one on its first
-/// index load.
-pub(crate) async fn import_package(
-    storage: &Storage,
-    locks: &crate::PublishLocks,
-    parsed: Parsed,
-    src: &std::path::Path,
-    sha256: &str,
-    size: u64,
-) -> Result<Stored, (StatusCode, String)> {
-    store(storage, locks, None, parsed, src, sha256, size).await
-}
-
 /// OIDC `namespace_scope` for NuGet: IDs are case-insensitive, so the lowercase ID is
 /// matched against lowercased patterns (`Maestra.*` and `maestra.*` are the same scope).
 fn scope_allows(authority: &NamespaceAuthority, id_lower: &str) -> bool {
@@ -3235,6 +3220,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
                     issuer,
                     jwks_uri: None,
                     audience: "packages.maestra.io".into(),
+                    any_audience: false,
                     algorithms: vec!["RS256".into()],
                     max_token_lifetime_secs: 900,
                     namespace_scope: vec!["Maestra.*".into(), "Mindbox.*".into()],

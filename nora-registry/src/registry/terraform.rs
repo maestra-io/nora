@@ -276,7 +276,8 @@ async fn provider_versions(
     let storage_key = format!("terraform/providers/{}/{}/versions.json", ns, ptype);
 
     // Read cache eagerly — preserve for serve-stale fallback (#532)
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
 
     // TTL cache — serve fresh if within TTL
     if let Some(ref data) = cached_data {
@@ -297,6 +298,9 @@ async fn provider_versions(
             state.metrics.record_download("terraform");
             state.metrics.record_cache_hit("terraform");
             return with_json(data.to_vec());
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("terraform", &storage_key, e);
         }
         return tf_isolation_refusal(&state, &provider);
     }
@@ -391,12 +395,9 @@ async fn provider_download_meta(
 
     // Read cache eagerly — preserve for serve-stale fallback (#532).
     // Strip internal fields now so stale response is client-safe.
-    let cached_data = state
-        .storage
-        .get(&storage_key)
-        .await
-        .ok()
-        .map(|d| Bytes::from(strip_nora_internal_fields(&d)));
+    let (cached_raw, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
+    let cached_data = cached_raw.map(|d| Bytes::from(strip_nora_internal_fields(&d)));
 
     // TTL cache — serve fresh if within TTL
     if let Some(ref data) = cached_data {
@@ -415,6 +416,9 @@ async fn provider_download_meta(
             state.metrics.record_download("terraform");
             state.metrics.record_cache_hit("terraform");
             return with_json(data.to_vec());
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("terraform", &storage_key, e);
         }
         return tf_isolation_refusal(&state, &provider);
     }
@@ -511,7 +515,9 @@ async fn provider_download_binary(
 
     // Immutable: if cached, serve directly. get_verified discharges the integrity
     // witness at serve (compile-time guarantee — see crate::verified).
-    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -566,6 +572,9 @@ async fn provider_download_binary(
     // #733: an internal provider's file that is not cached is refused, whatever URL metadata
     // cached before the namespace became internal names.
     if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("terraform", &storage_key, e);
+        }
         return tf_isolation_refusal(&state, &provider);
     }
 
@@ -662,7 +671,8 @@ async fn module_versions(
     );
 
     // Read cache eagerly — preserve for serve-stale fallback (#532)
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
 
     // TTL cache — serve fresh if within TTL
     if let Some(ref data) = cached_data {
@@ -683,6 +693,9 @@ async fn module_versions(
             state.metrics.record_download("terraform");
             state.metrics.record_cache_hit("terraform");
             return with_json(data.to_vec());
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("terraform", &storage_key, e);
         }
         return tf_isolation_refusal(&state, &module);
     }
@@ -768,20 +781,28 @@ async fn module_download(
         "terraform/modules/{}/{}/{}/{}/_source_url",
         ns, name, provider, ver
     );
-    if let Ok(data) = state.storage.get(&source_url_key).await {
-        let original_url = String::from_utf8_lossy(&data);
-        let rewritten =
-            rewrite_module_source_url(&original_url, &base_url, &ns, &name, &provider, &ver);
-        state.metrics.record_download("terraform");
-        state.metrics.record_cache_hit("terraform");
-        return (
-            StatusCode::NO_CONTENT,
-            [("x-terraform-get", rewritten.as_str())],
-        )
-            .into_response();
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get(&source_url_key).await);
+    // Only an archive source is stored. One an older release stored for a git source (the
+    // repository address, prefix stripped) names no archive: the upstream is asked again (#1209).
+    if let Some(data) = cached {
+        let stored = String::from_utf8_lossy(&data);
+        let rewritten = rewrite_module_source_url(&stored, &base_url, &ns, &name, &provider, &ver);
+        if rewritten != stored {
+            state.metrics.record_download("terraform");
+            state.metrics.record_cache_hit("terraform");
+            return (
+                StatusCode::NO_CONTENT,
+                [("x-terraform-get", rewritten.as_str())],
+            )
+                .into_response();
+        }
     }
 
     if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("terraform", &source_url_key, e);
+        }
         return tf_isolation_refusal(&state, &module);
     }
 
@@ -798,63 +819,59 @@ async fn module_download(
         ver
     );
 
-    // Module download returns 204 with X-Terraform-Get header pointing to source
-    let client = &state.http_client;
-    let timeout = state.config.terraform.proxy_timeout;
+    // Module download returns 204 with X-Terraform-Get header pointing to source. Asked through
+    // the `terraform` breaker like every other path (#1202): an open breaker is 503, a failure
+    // counts toward opening it.
+    let fetched = super::proxy_fetch_core(
+        &state.http_client,
+        &url,
+        Duration::from_secs(state.config.terraform.proxy_timeout),
+        false,
+        expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
+        None,
+        |response| async move {
+            Ok(response
+                .headers()
+                .get("x-terraform-get")
+                .map(|v| v.to_str().unwrap_or("").to_string()))
+        },
+        &state.circuit_breaker,
+        RegistryType::Terraform,
+    )
+    .await;
 
-    let mut request = client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(timeout));
-    if let Some(auth) = expose_opt(&state.config.terraform.proxy_auth) {
-        request = request.header("Authorization", crate::config::basic_auth_header(auth));
-    }
+    match fetched {
+        Ok(Some(original_url)) => {
+            state.metrics.record_download("terraform");
+            state.activity.push(ActivityEntry::new(
+                ActionType::ProxyFetch,
+                format!("{}/{}/{} v{}", ns, name, provider, ver),
+                crate::registry_type::RegistryType::Terraform,
+                "PROXY",
+            ));
 
-    match request.send().await {
-        Ok(response) => {
-            if let Some(tf_get) = response.headers().get("x-terraform-get") {
-                let original_url = tf_get.to_str().unwrap_or("").to_string();
-
-                state.metrics.record_download("terraform");
-                state.activity.push(ActivityEntry::new(
-                    ActionType::ProxyFetch,
-                    format!("{}/{}/{} v{}", ns, name, provider, ver),
-                    crate::registry_type::RegistryType::Terraform,
-                    "PROXY",
-                ));
-
-                // Rewrite X-Terraform-Get to point through NORA (air-gap safe)
-                let rewritten = rewrite_module_source_url(
-                    &original_url,
-                    &base_url,
-                    &ns,
-                    &name,
-                    &provider,
-                    &ver,
-                );
-
-                // Cache the inner URL (stripping VCS prefix like git::) for module_source_download
-                let (_, inner_url) = strip_vcs_prefix(&original_url);
-                state.spawn_cache(
-                    "terraform",
-                    source_url_key,
-                    Bytes::from(inner_url.to_string()),
-                );
-
-                return (
-                    StatusCode::NO_CONTENT,
-                    [("x-terraform-get", rewritten.as_str())],
-                )
-                    .into_response();
+            // An archive source goes through NORA (air-gap safe); anything else is the
+            // client's to fetch, and nothing is stored for it (#1209).
+            let rewritten =
+                rewrite_module_source_url(&original_url, &base_url, &ns, &name, &provider, &ver);
+            if rewritten != original_url {
+                state.spawn_cache("terraform", source_url_key, Bytes::from(original_url));
             }
-            // No source header: a 4xx says the module is not there; a 5xx, or a reply that
-            // breaks the protocol by leaving the header out, is a failed upstream.
-            let status = response.status().as_u16();
-            UpstreamMiss::of(&ProxyError::Upstream(status))
-                .response("terraform", &format!("{ns}/{name}/{provider}/{ver}"))
+
+            (
+                StatusCode::NO_CONTENT,
+                [("x-terraform-get", rewritten.as_str())],
+            )
+                .into_response()
         }
+        // A 2xx without the source header breaks the protocol: a failed upstream.
+        Ok(None) => UpstreamMiss::of(&ProxyError::Upstream(502))
+            .response("terraform", &format!("{ns}/{name}/{provider}/{ver}")),
+        // A 4xx says the module is not there; a 5xx, network error or timeout is a failed
+        // upstream; an open breaker is the 503 it is everywhere.
         Err(e) => {
             tracing::debug!(error = ?e, "Terraform module download error");
-            StatusCode::BAD_GATEWAY.into_response()
+            UpstreamMiss::of(&e).response("terraform", &format!("{ns}/{name}/{provider}/{ver}"))
         }
     }
 }
@@ -889,7 +906,9 @@ async fn module_source_download(
 
     // Immutable: if cached, serve directly. get_verified discharges the integrity
     // witness at serve (compile-time guarantee — see crate::verified).
-    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -931,6 +950,9 @@ async fn module_source_download(
     }
 
     if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("terraform", &storage_key, e);
+        }
         return tf_isolation_refusal(&state, &module);
     }
     // With the upstream switched off, a source URL stored while it was on is not followed: the
@@ -945,7 +967,8 @@ async fn module_source_download(
         ns, name, provider, ver
     );
     let upstream_url = match state.storage.get(&source_url_key).await {
-        Ok(data) => String::from_utf8_lossy(&data).to_string(),
+        // The stored address may carry a `//subdir`: that is the client's, not part of the URL.
+        Ok(data) => split_subdir(&String::from_utf8_lossy(&data)).0,
         Err(_) => {
             return StatusCode::NOT_FOUND.into_response();
         }
@@ -967,6 +990,16 @@ async fn module_source_download(
     )
     .await
     {
+        // A web page (a repository's) is no module: not served, not cached as one (#1209).
+        Ok(bytes) if !looks_like_archive(&bytes) => {
+            tracing::warn!(
+                module = %format!("{ns}/{name}/{provider}"),
+                version = %ver,
+                url = %upstream_url,
+                "module source is not an archive, not served or cached"
+            );
+            StatusCode::BAD_GATEWAY.into_response()
+        }
         Ok(bytes) => {
             state.metrics.record_download("terraform");
             state.metrics.record_cache_miss("terraform");
@@ -1135,6 +1168,7 @@ async fn mirror_provider_version(
 
     let mut archives = serde_json::Map::new();
     let mut incomplete = false;
+    let mut unreadable: Option<Box<Response>> = None;
     for (os, arch, res) in results {
         match res {
             // Fail-closed (SEC #1): only serve an archive that carries an integrity
@@ -1149,8 +1183,14 @@ async fn mirror_provider_version(
             // A platform the upstream failed to describe (not one it answered 4xx for):
             // the list would be incomplete, and a client on that platform would read
             // "not supported" from an outage.
-            Err(e) => incomplete |= UpstreamMiss::of(&e).status() == StatusCode::BAD_GATEWAY,
+            Err(ArchiveMiss::Upstream(e)) => {
+                incomplete |= UpstreamMiss::of(&e).status().is_server_error()
+            }
+            Err(ArchiveMiss::Unreadable(response)) => unreadable = Some(response),
         }
+    }
+    if let Some(response) = unreadable {
+        return *response;
     }
     if incomplete {
         tracing::warn!(registry = "terraform", %ns, %ptype, %ver, "upstream failed for a platform, returning 502");
@@ -1175,7 +1215,8 @@ async fn mirror_fetch_versions(
     internal: bool,
 ) -> Result<serde_json::Value, Box<Response>> {
     let storage_key = format!("terraform/providers/{}/{}/versions.json", ns, ptype);
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
 
     // TTL cache — serve fresh if within TTL.
     if let Some(ref data) = cached_data {
@@ -1193,6 +1234,13 @@ async fn mirror_fetch_versions(
         if let Some(ref data) = cached_data {
             state.metrics.record_cache_hit("terraform");
             return parse_json(data);
+        }
+        if let Some(e) = &read_failure {
+            return Err(Box::new(crate::registry::local_copy_unreadable(
+                "terraform",
+                &storage_key,
+                e,
+            )));
         }
         return Err(Box::new(tf_isolation_refusal(
             state,
@@ -1259,7 +1307,7 @@ async fn mirror_fetch_archive(
     ver: &str,
     (os, arch): (&str, &str),
     internal: bool,
-) -> Result<Option<(String, Option<String>)>, ProxyError> {
+) -> Result<Option<(String, Option<String>)>, ArchiveMiss> {
     if !is_valid_name(os) || !is_valid_name(arch) {
         return Ok(None);
     }
@@ -1270,9 +1318,20 @@ async fn mirror_fetch_archive(
 
     // Cached metadata already carries the NORA-rewritten download_url; reuse it. An internal
     // provider's platform without it is not listed: its metadata is never fetched (#68/#733).
-    let meta_text = match state.storage.get(&storage_key).await.ok() {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
+    let meta_text = match cached {
         Some(data) => String::from_utf8_lossy(&data).to_string(),
-        None if internal => return Ok(None),
+        // An internal provider's platform whose metadata the store could not read is unavailable:
+        // dropped from the list, it would read as "not supported on this platform".
+        None if internal => {
+            return match read_failure {
+                Some(e) => Err(ArchiveMiss::Unreadable(Box::new(
+                    crate::registry::local_copy_unreadable("terraform", &storage_key, &e),
+                ))),
+                None => Ok(None),
+            }
+        }
         None => {
             // No upstream when the operator switched it off: the archive is not listed.
             let Some(proxy_url) = upstream_url(state) else {
@@ -1296,7 +1355,8 @@ async fn mirror_fetch_archive(
                 &state.circuit_breaker,
                 RegistryType::Terraform,
             )
-            .await?;
+            .await
+            .map_err(ArchiveMiss::Upstream)?;
             let rewritten = rewrite_download_url(&text, base_url, ns, ptype, ver);
             state.spawn_cache("terraform", storage_key, Bytes::from(rewritten.clone()));
             rewritten
@@ -1314,6 +1374,14 @@ async fn mirror_fetch_archive(
         .and_then(|v| v.as_str())
         .map(String::from);
     Ok(Some((url.to_string(), shasum)))
+}
+
+/// Why a platform's archive could not be listed by the network mirror.
+enum ArchiveMiss {
+    /// The upstream failed, or answered no.
+    Upstream(ProxyError),
+    /// The store could not read an internal provider's cached metadata: the answer to give.
+    Unreadable(Box<Response>),
 }
 
 /// Reshape Registry-Protocol `{"versions":[{"version":"X",..}]}` into the network
@@ -1834,12 +1902,11 @@ fn rewrite_download_url(
     }
 }
 
-/// Rewrite X-Terraform-Get URL to point through NORA.
-///
-/// HTTP/HTTPS URLs are rewritten to NORA's module source proxy endpoint.
-/// VCS-prefixed URLs like `git::https://...` have their inner URL extracted
-/// and rewritten (the VCS prefix is dropped since NORA proxies via HTTP).
-/// Non-HTTP URLs (s3::, ssh://, relative paths) are returned as-is.
+/// The `X-Terraform-Get` NORA answers for the source the upstream named (#1209). An HTTP source
+/// that names an archive goes through NORA's module source endpoint, with `archive=<kind>` so
+/// go-getter unpacks it and its `//subdir` kept. Anything else — a VCS source (`git::`, `hg::`),
+/// a non-HTTP one (`s3::`, `ssh://`, a relative path), or an HTTP address nothing marks as an
+/// archive — is answered unchanged, for the client to fetch itself.
 fn rewrite_module_source_url(
     original_url: &str,
     base_url: &str,
@@ -1848,29 +1915,30 @@ fn rewrite_module_source_url(
     provider: &str,
     ver: &str,
 ) -> String {
+    // A VCS source (git::, hg::) or any non-HTTP one is the client's to fetch: NORA cannot
+    // serve a repository as an archive (#1209: it served the repository's web page).
     let (vcs_prefix, inner_url) = strip_vcs_prefix(original_url);
-
-    if inner_url.starts_with("http://") || inner_url.starts_with("https://") {
-        if !vcs_prefix.is_empty() {
-            tracing::warn!(
-                module = %format!("{}/{}/{}", ns, name, provider),
-                version = %ver,
-                vcs = vcs_prefix.trim_end_matches("::"),
-                "Module uses VCS prefix — source download via HTTP proxy may not work"
-            );
-        }
-        format!(
-            "{}/terraform/v1/modules/download/{}/{}/{}/{}/source",
-            base_url.trim_end_matches('/'),
-            ns,
-            name,
-            provider,
-            ver
-        )
-    } else {
-        // s3::, ssh://, relative paths — pass through as-is
-        original_url.to_string()
+    if !vcs_prefix.is_empty()
+        || !(inner_url.starts_with("http://") || inner_url.starts_with("https://"))
+    {
+        return original_url.to_string();
     }
+    let (source, subdir) = split_subdir(inner_url);
+    // An HTTP address nothing marks as an archive may be anything (go-getter asks it for an
+    // X-Terraform-Get of its own): the client follows it itself.
+    let Some(kind) = archive_kind(&source) else {
+        return original_url.to_string();
+    };
+    format!(
+        "{}/terraform/v1/modules/download/{}/{}/{}/{}/source{}?archive={}",
+        base_url.trim_end_matches('/'),
+        ns,
+        name,
+        provider,
+        ver,
+        subdir.map(|sub| format!("//{sub}")).unwrap_or_default(),
+        kind
+    )
 }
 
 /// Strip internal `_nora_*` fields from cached metadata before sending to clients,
@@ -1901,6 +1969,69 @@ fn strip_nora_internal_fields(data: &[u8]) -> Vec<u8> {
 /// Extract VCS prefix (`git::`, `hg::`) from a Terraform module source URL.
 ///
 /// Returns `(prefix, inner_url)`. If no VCS prefix is present, prefix is empty.
+/// Whether `bytes` open as an archive go-getter unpacks: gzip, zip, bzip2, xz or tar, by their
+/// magic bytes. A module's source is served and cached only when they do (#1209): an HTTP
+/// source can answer a web page (a git repository's), which is no module.
+fn looks_like_archive(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x1f, 0x8b])
+        || bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"BZh")
+        || bytes.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00])
+        || bytes.get(257..262) == Some(b"ustar".as_slice())
+}
+
+/// Archive kinds go-getter recognizes by extension, longest first.
+const ARCHIVE_EXTENSIONS: [&str; 8] = [
+    "tar.gz", "tar.bz2", "tar.xz", "tgz", "tbz2", "txz", "zip", "tar",
+];
+
+/// The kind of archive an HTTP source `address` names, as go-getter would read it: its
+/// `archive=` query value, else the extension its path ends in, else GitHub's codeload form
+/// (`/tar.gz/<ref>`, `/zip/<ref>`). `None` when nothing marks it as an archive.
+fn archive_kind(address: &str) -> Option<String> {
+    let (path, query) = address.split_once('?').unwrap_or((address, ""));
+    if let Some(kind) = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("archive="))
+        .filter(|k| !k.is_empty())
+    {
+        return Some(kind.to_string());
+    }
+    if let Some(ext) = ARCHIVE_EXTENSIONS
+        .iter()
+        .find(|ext| path.ends_with(&format!(".{ext}")))
+    {
+        return Some((*ext).to_string());
+    }
+    let after_host = path.splitn(4, '/').nth(3).unwrap_or("");
+    if path.contains("://codeload.github.com/") {
+        for kind in ["tar.gz", "zip"] {
+            if after_host.contains(&format!("/{kind}/")) {
+                return Some(kind.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// A go-getter address split into the source and its `//subdir`, the query kept on the source.
+fn split_subdir(address: &str) -> (String, Option<&str>) {
+    let scheme_end = address.find("://").map_or(0, |i| i + 3);
+    let (path, query) = address.split_once('?').unwrap_or((address, ""));
+    let Some(i) = path[scheme_end..].find("//") else {
+        return (address.to_string(), None);
+    };
+    let at = scheme_end + i;
+    let subdir = Some(&path[at + 2..]).filter(|sub| !sub.is_empty());
+    let source = if query.is_empty() {
+        path[..at].to_string()
+    } else {
+        format!("{}?{query}", &path[..at])
+    };
+    (source, subdir)
+}
+
 fn strip_vcs_prefix(url: &str) -> (&str, &str) {
     for prefix in &["git::", "hg::"] {
         if let Some(inner) = url.strip_prefix(prefix) {
@@ -2031,7 +2162,7 @@ mod tests {
         );
         assert_eq!(
             result,
-            "http://nora:4000/terraform/v1/modules/download/hashicorp/consul/aws/0.1.0/source"
+            "http://nora:4000/terraform/v1/modules/download/hashicorp/consul/aws/0.1.0/source?archive=tar.gz"
         );
         assert!(!result.contains("github.com"), "upstream URL must not leak");
     }
@@ -2047,16 +2178,9 @@ mod tests {
             "aws",
             "0.1.0",
         );
-        assert_eq!(
-            result,
-            "http://nora:4000/terraform/v1/modules/download/hashicorp/consul/aws/0.1.0/source",
-            "git::https:// URLs must be rewritten through NORA (air-gap)"
-        );
-        assert!(
-            !result.contains("example.com"),
-            "upstream URL must not leak"
-        );
-        assert!(!result.contains("git::"), "VCS prefix must be stripped");
+        // #1209: NORA cannot serve a repository as an archive (it served the repository's web
+        // page); the client clones the source itself.
+        assert_eq!(result, git_url, "git:: sources pass through unchanged");
     }
 
     #[test]
@@ -2071,9 +2195,8 @@ mod tests {
             "0.1.0",
         );
         assert_eq!(
-            result,
-            "http://nora:4000/terraform/v1/modules/download/hashicorp/consul/aws/0.1.0/source",
-            "hg::https:// URLs must be rewritten through NORA"
+            result, hg_url,
+            "hg:: sources pass through unchanged (#1209)"
         );
     }
 
@@ -2291,8 +2414,74 @@ mod tests {
         );
         assert_eq!(
             result,
-            "http://nora:4000/terraform/v1/modules/download/hashicorp/consul/aws/0.1.0/source"
+            "http://nora:4000/terraform/v1/modules/download/hashicorp/consul/aws/0.1.0/source?archive=tar.gz"
         );
+    }
+
+    /// #1209: what NORA answers in `X-Terraform-Get` for each kind of source the upstream names.
+    /// An archive is proxied with what tells the getter it is one (`archive=`) and its
+    /// subdirectory kept; a VCS source, or an HTTP address nothing marks as an archive, passes
+    /// through unchanged for the client to fetch itself.
+    #[test]
+    fn module_source_answer_decision_table() {
+        let nora = "http://nora:4000/terraform/v1/modules/download/acme/vpc/aws/1.0.0/source";
+        #[rustfmt::skip]
+        let rows: [(&str, Option<&str>); 14] = [
+            ("https://example.com/m.tar.gz",                 Some("?archive=tar.gz")),
+            ("https://example.com/m.tgz",                    Some("?archive=tgz")),
+            ("https://example.com/m.zip",                    Some("?archive=zip")),
+            ("https://example.com/m.tar.bz2",                Some("?archive=tar.bz2")),
+            ("https://example.com/m.tar.xz",                 Some("?archive=tar.xz")),
+            ("https://example.com/m.tar",                    Some("?archive=tar")),
+            ("https://gitlab.example/api/v4/m/file?archive=tgz", Some("?archive=tgz")),
+            ("https://codeload.github.com/a/b/zip/v1",       Some("?archive=zip")),
+            ("https://example.com/m.tar.gz//modules/vpc",    Some("//modules/vpc?archive=tar.gz")),
+            ("git::https://github.com/a/b?ref=v1",           None),
+            ("git::https://example.com/m.tar.gz",            None),
+            ("hg::https://example.com/m",                    None),
+            ("https://github.com/a/b",                       None),
+            ("https://example.com/m.tar.gz.sig",             None),
+        ];
+        for (source, answer) in rows {
+            let got = rewrite_module_source_url(
+                source,
+                "http://nora:4000",
+                "acme",
+                "vpc",
+                "aws",
+                "1.0.0",
+            );
+            match answer {
+                Some(suffix) => assert_eq!(got, format!("{nora}{suffix}"), "{source}"),
+                None => assert_eq!(got, source, "{source}"),
+            }
+        }
+    }
+
+    /// #1209: only bytes that open as an archive are served or cached as a module's source.
+    #[test]
+    fn a_module_source_is_an_archive_by_its_bytes() {
+        let mut tar = vec![0u8; 512];
+        tar[257..262].copy_from_slice(b"ustar");
+        #[rustfmt::skip]
+        let rows: [(&[u8], bool); 8] = [
+            (&[0x1f, 0x8b, 0x08, 0x00],                    true),
+            (b"PK\x03\x04rest",                           true),
+            (b"PK\x05\x06",                               true),
+            (b"BZh91AY",                                   true),
+            (&[0xfd, b'7', b'z', b'X', b'Z', 0x00, 0x00], true),
+            (&tar,                                         true),
+            (b"<!DOCTYPE html><html>",                     false),
+            (b"",                                          false),
+        ];
+        for (bytes, archive) in rows {
+            assert_eq!(
+                looks_like_archive(bytes),
+                archive,
+                "{:?}",
+                &bytes[..bytes.len().min(8)]
+            );
+        }
     }
 
     #[test]
@@ -2506,6 +2695,180 @@ mod integration_tests {
             "X-Terraform-Get must not leak upstream URL, got: {}",
             tf_get
         );
+    }
+
+    /// An upstream answering the module download with `X-Terraform-Get: <value>` at
+    /// `/v1/modules/acme/vpc/aws/1.0.0/download`, serving `archive` at `/m.tar.gz`.
+    async fn module_upstream(
+        source: impl Fn(&str) -> String,
+        archive: Vec<u8>,
+    ) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/modules/acme/vpc/aws/1.0.0/download"))
+            .respond_with(
+                ResponseTemplate::new(204)
+                    .insert_header("x-terraform-get", source(&server.uri()).as_str()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/m.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(archive))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    const MODULE_DL: &str = "/terraform/v1/modules/acme/vpc/aws/1.0.0/download";
+    const SOURCE_KEY: &str = "terraform/modules/acme/vpc/aws/1.0.0/source.tar.gz";
+
+    fn tf_ctx(url: String) -> crate::test_helpers::TestContext {
+        create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(url);
+            cfg.terraform.proxy_timeout = 2;
+        })
+    }
+
+    /// #1209: a git source is answered as the upstream named it; NORA stores no source URL for it.
+    #[tokio::test]
+    async fn a_git_module_source_is_passed_through() {
+        let git = "git::https://github.com/acme/terraform-aws-vpc?ref=v1.0.0";
+        let server = module_upstream(|_| git.to_string(), Vec::new()).await;
+        let ctx = tf_ctx(server.uri());
+        let resp = send(&ctx.app, Method::GET, MODULE_DL, "").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.headers().get("x-terraform-get").unwrap(), git);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(ctx
+            .state
+            .storage
+            .get("terraform/modules/acme/vpc/aws/1.0.0/_source_url")
+            .await
+            .is_err());
+    }
+
+    /// #1209: an archive source is proxied with `archive=` so the getter unpacks it, and its
+    /// bytes are served as the upstream sent them.
+    #[tokio::test]
+    async fn an_archive_module_source_is_proxied_as_an_archive() {
+        let archive = vec![0x1f, 0x8b, 0x08, 0x00, 1, 2, 3];
+        let server = module_upstream(|uri| format!("{uri}/m.tar.gz"), archive.clone()).await;
+        let ctx = tf_ctx(server.uri());
+        let resp = send(&ctx.app, Method::GET, MODULE_DL, "").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let get = resp
+            .headers()
+            .get("x-terraform-get")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            get.ends_with(
+                "/terraform/v1/modules/download/acme/vpc/aws/1.0.0/source?archive=tar.gz"
+            ),
+            "{get}"
+        );
+        let path = &get[get.find("/terraform/").unwrap()..];
+        let mut resp = send(&ctx.app, Method::GET, path, "").await;
+        for _ in 0..20 {
+            if resp.status() == StatusCode::OK {
+                break;
+            }
+            // the source URL is stored in the background
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            resp = send(&ctx.app, Method::GET, path, "").await;
+        }
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.as_ref(), archive.as_slice());
+    }
+
+    /// #1209: an archive source with a `//subdir`: the client is told the subdirectory, and NORA
+    /// fetches the archive itself, without it.
+    #[tokio::test]
+    async fn an_archive_source_with_a_subdirectory_is_fetched_without_it() {
+        let archive = vec![0x1f, 0x8b, 0x08, 0x00, 9];
+        let server = module_upstream(
+            |uri| format!("{uri}/m.tar.gz//modules/vpc"),
+            archive.clone(),
+        )
+        .await;
+        let ctx = tf_ctx(server.uri());
+        let resp = send(&ctx.app, Method::GET, MODULE_DL, "").await;
+        let get = resp
+            .headers()
+            .get("x-terraform-get")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            get.ends_with("/source//modules/vpc?archive=tar.gz"),
+            "{get}"
+        );
+        // go-getter asks for the source without the subdirectory
+        let path = "/terraform/v1/modules/download/acme/vpc/aws/1.0.0/source?archive=tar.gz";
+        let mut resp = send(&ctx.app, Method::GET, path, "").await;
+        for _ in 0..20 {
+            if resp.status() == StatusCode::OK {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            resp = send(&ctx.app, Method::GET, path, "").await;
+        }
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.as_ref(), archive.as_slice());
+    }
+
+    /// #1209: what the source URL answers is served and cached only when it is an archive: a web
+    /// page (a repository's) is a 502 and is not cached as the module.
+    #[tokio::test]
+    async fn a_source_that_is_not_an_archive_is_not_served_or_cached() {
+        let server = module_upstream(
+            |uri| format!("{uri}/m.tar.gz"),
+            b"<!DOCTYPE html><html>".to_vec(),
+        )
+        .await;
+        let ctx = tf_ctx(server.uri());
+        let resp = send(&ctx.app, Method::GET, MODULE_DL, "").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/download/acme/vpc/aws/1.0.0/source",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(ctx.state.storage.get(SOURCE_KEY).await.is_err());
+    }
+
+    /// #1209: a source URL an older release stored for a git source (the repository address,
+    /// prefix stripped) names no archive: the module download asks the upstream again instead
+    /// of pointing the client at it.
+    #[tokio::test]
+    async fn a_stored_source_url_that_names_no_archive_is_asked_again() {
+        let git = "git::https://github.com/acme/terraform-aws-vpc?ref=v1.0.0";
+        let server = module_upstream(|_| git.to_string(), Vec::new()).await;
+        let ctx = tf_ctx(server.uri());
+        ctx.state
+            .storage
+            .put(
+                "terraform/modules/acme/vpc/aws/1.0.0/_source_url",
+                b"https://github.com/acme/terraform-aws-vpc?ref=v1.0.0",
+            )
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::GET, MODULE_DL, "").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.headers().get("x-terraform-get").unwrap(), git);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -3069,6 +3432,61 @@ mod upstream_failure_edge_cases {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
+    /// #1202: the module download reports to the `terraform` breaker like every other path. An
+    /// open breaker answers 503 with Retry-After without asking the upstream.
+    #[tokio::test]
+    async fn module_download_behind_an_open_breaker_is_503_and_not_asked() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(204)
+                    .insert_header("x-terraform-get", "https://example.invalid/m.tar.gz"),
+            )
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let url = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy_timeout = 1;
+            cfg.terraform.proxy = Some(url);
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.reset_timeout = 3600;
+        });
+        ctx.state.circuit_breaker.open_for_test("terraform");
+        let resp = send(&ctx.app, Method::GET, MODULE, "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get("retry-after").map(|v| v.as_bytes()),
+            Some(b"30".as_slice())
+        );
+    }
+
+    /// #1202: a failed module download counts toward the breaker, so a dead upstream found by
+    /// module downloads alone opens it for the other Terraform paths too.
+    #[tokio::test]
+    async fn a_failed_module_download_opens_the_breaker() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy_timeout = 1;
+            cfg.terraform.proxy = Some("http://127.0.0.1:9".into());
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 1;
+            cfg.circuit_breaker.reset_timeout = 3600;
+        });
+        let resp = send(&ctx.app, Method::GET, MODULE, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(ctx.state.circuit_breaker.check("terraform").is_err());
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/providers/hashicorp/null/versions",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     /// A module upstream answering 400 said "not here" — 404.
     #[tokio::test]
     async fn module_400_is_404() {
@@ -3134,6 +3552,30 @@ mod upstream_failure_edge_cases {
             )
             .await
             .unwrap();
+        let resp = send(&ctx.app, Method::GET, MIRROR, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// `versions.json` is cached and the breaker is open: the platform was not described, which
+    /// is 502, not a list that leaves it out.
+    #[tokio::test]
+    async fn mirror_platform_behind_an_open_breaker_is_502() {
+        let versions = r#"{"versions":[{"version":"3.2.3","protocols":["5.0"],"platforms":[{"os":"linux","arch":"amd64"}]}]}"#;
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some("http://127.0.0.1:9".into());
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.reset_timeout = 3600;
+        });
+        ctx.state
+            .storage
+            .put(
+                "terraform/providers/hashicorp/null/versions.json",
+                versions.as_bytes(),
+            )
+            .await
+            .unwrap();
+        ctx.state.circuit_breaker.open_for_test("terraform");
         let resp = send(&ctx.app, Method::GET, MIRROR, "").await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }

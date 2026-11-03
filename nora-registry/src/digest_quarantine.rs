@@ -15,6 +15,7 @@
 //! `{storage.path}/quarantine.jsonl` is imported at every boot.
 //! Fail-open: unreadable entries or a failed listing → those digests unknown.
 
+use crate::log_redact::RecordedUrl;
 use axum::body::Bytes;
 use chrono::Utc;
 use futures::StreamExt;
@@ -104,8 +105,9 @@ pub struct DigestEntry {
     pub digest: String,
     /// Unix timestamp (seconds) when first seen by NORA.
     pub first_seen: i64,
-    /// Upstream that provided the content (e.g. "registry-1.docker.io").
-    pub upstream: String,
+    /// Upstream that provided the content (e.g. "registry-1.docker.io"), any userinfo in its
+    /// URL masked as in the log, by its type.
+    pub upstream: RecordedUrl,
 }
 
 // ============================================================================
@@ -153,6 +155,10 @@ struct Snapshot {
     /// Unix time the snapshot was written.
     as_of: i64,
     entries: Vec<DigestEntry>,
+    /// Every entry object was rewritten with its upstream masked ([`RecordedUrl`]);
+    /// absent in a snapshot of 1.4.1-maestra and older, whose objects may hold userinfo.
+    #[serde(default)]
+    masked: bool,
 }
 
 fn map_key(registry: &str, digest: &str) -> String {
@@ -268,7 +274,7 @@ impl DigestStore {
             registry: registry.to_string(),
             digest: digest.to_string(),
             first_seen: first_seen.unwrap_or_else(|| Utc::now().timestamp()),
-            upstream: upstream.to_string(),
+            upstream: RecordedUrl::new(upstream),
         };
 
         entries.insert(key, entry.clone());
@@ -400,6 +406,14 @@ pub fn proxy_gate(
         upstream,
         None,
     )
+}
+
+/// The first-seen a proxy handler gives [`proxy_gate_dated`]: its release date, only when upstream
+/// dates are trusted (#750). Without trust a handler's date is NORA's cache-age of a metadata file —
+/// when NORA last wrote a listing, not when it first fetched these bytes — and taken as first-seen
+/// it would let a file fetched now pass as mature, so the quarantine keeps its own clock.
+pub fn first_seen_seed(trust_upstream_dates: bool, release_date: Option<i64>) -> Option<i64> {
+    release_date.filter(|_| trust_upstream_dates)
 }
 
 /// Like [`proxy_gate`], but seeds the first-seen clock from a trusted upstream
@@ -571,27 +585,68 @@ async fn list_entries(storage: &Storage) -> Option<HashSet<String>> {
     }
 }
 
-/// The snapshot's entries by object key; empty when missing or unreadable.
-async fn read_snapshot(storage: &Storage) -> HashMap<String, DigestEntry> {
+/// The snapshot's entries by object key, and whether its objects are known masked;
+/// empty and not masked when missing or unreadable.
+async fn read_snapshot(storage: &Storage) -> (HashMap<String, DigestEntry>, bool) {
     let snapshot = match storage.get(SNAPSHOT_KEY).await {
         Ok(bytes) => match serde_json::from_slice::<Snapshot>(&bytes) {
             Ok(s) => s,
             Err(e) => {
                 warn!(error = %e, "Unparsable quarantine snapshot, reading every entry");
-                return HashMap::new();
+                return (HashMap::new(), false);
             }
         },
-        Err(StorageError::NotFound) => return HashMap::new(),
+        Err(StorageError::NotFound) => return (HashMap::new(), false),
         Err(e) => {
             warn!(error = %e, "Unreadable quarantine snapshot, reading every entry");
-            return HashMap::new();
+            return (HashMap::new(), false);
         }
     };
-    snapshot
+    let masked = snapshot.masked;
+    let entries = snapshot
         .entries
         .into_iter()
         .map(|e| (entry_key(&e), e))
-        .collect()
+        .collect();
+    (entries, masked)
+}
+
+/// The legacy ledger with each line's upstream masked, as [`RecordedUrl`] reads it; a line
+/// that does not parse is kept as it is. `None` when nothing changes.
+fn masked_jsonl(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len());
+    for line in data.split(|b| *b == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        match serde_json::from_slice::<DigestEntry>(line)
+            .ok()
+            .and_then(|entry| serde_json::to_vec(&entry).ok())
+        {
+            Some(masked) => out.extend_from_slice(&masked),
+            None => out.extend_from_slice(line),
+        }
+        out.push(b'\n');
+    }
+    (out != data).then_some(out)
+}
+
+/// Rewrite the legacy ledger masked (1.4.3: an older ledger loses its credential on the
+/// first start), through a temp file renamed over it.
+async fn mask_legacy(legacy: &Path, data: &[u8]) {
+    let Some(masked) = masked_jsonl(data) else {
+        return;
+    };
+    let tmp = legacy.with_extension("jsonl.tmp");
+    let written = async {
+        tokio::fs::write(&tmp, &masked).await?;
+        tokio::fs::rename(&tmp, legacy).await
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        error!(path = %legacy.display(), error = %e, "Failed to rewrite the legacy quarantine ledger masked");
+    }
 }
 
 /// Write every ledger line of `jsonl` (the legacy file format) to its per-entry
@@ -663,13 +718,14 @@ async fn load_entries(storage: &Storage, legacy: &Path) -> HashMap<String, Diges
         return HashMap::new();
     };
     // Snapshot entries by object key, plus what the import below writes.
-    let mut known = read_snapshot(storage).await;
+    let (mut known, masked) = read_snapshot(storage).await;
 
     // Maestra: the ledger was a file on the volume. Imported at every boot while it is
     // there; only lines with no object yet cost a request.
     match tokio::fs::read(legacy).await {
         Ok(data) => {
             let (written, present, failed) = import_jsonl(storage, &data, &listed, false).await;
+            mask_legacy(legacy, &data).await;
             info!(
                 failed = failed,
                 "imported {} quarantine entries from {}, {} already present",
@@ -734,9 +790,40 @@ async fn load_entries(storage: &Storage, legacy: &Path) -> HashMap<String, Diges
         .collect::<Vec<()>>()
         .await;
 
+    // An object an older release wrote may hold the upstream's userinfo: rewrite every one
+    // masked once, then the snapshot says so. ponytail: one put per entry on that start only.
+    let mut all_masked = true;
+    if !masked {
+        let mut failed = 0usize;
+        let mut writes = Vec::new();
+        for entry in entries.values() {
+            match entry_body(entry) {
+                Some(body) => writes.push((entry_key(entry), entry.digest.clone(), body)),
+                None => failed += 1,
+            }
+        }
+        failed += futures::stream::iter(writes)
+            .map(|(key, digest, body)| async move {
+                match storage.put_bytes(&key, body).await {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        warn!(digest = %digest, error = %e, "Failed to rewrite quarantine entry masked");
+                        1
+                    }
+                }
+            })
+            .buffer_unordered(LOAD_CONCURRENCY)
+            .collect::<Vec<usize>>()
+            .await
+            .into_iter()
+            .sum::<usize>();
+        all_masked = failed == 0;
+    }
+
     let snapshot = Snapshot {
         as_of: Utc::now().timestamp(),
         entries: entries.values().cloned().collect(),
+        masked: all_masked,
     };
     match serde_json::to_vec(&snapshot) {
         Ok(body) => {
@@ -921,6 +1008,86 @@ mod tests {
         assert_eq!(entry1.first_seen, entry2.first_seen);
         assert_eq!(entry1.upstream, entry2.upstream);
         assert_eq!(store.len(), 1);
+    }
+
+    /// An upstream configured with a credential is written down without it, in memory and in
+    /// the ledger file; the rest of its URL is kept.
+    #[tokio::test]
+    async fn the_ledger_names_an_upstream_without_its_credential() {
+        let tmp = TempDir::new().unwrap();
+        let st = storage(&tmp);
+        let store = DigestStore::empty(st.clone());
+        let entry = store.record(
+            "npm",
+            "sha256:abc",
+            "https://ci-user:s3cret@npm.example/pkg/-/pkg-1.0.0.tgz?x=1",
+            None,
+        );
+        let named = "https://***@npm.example/pkg/-/pkg-1.0.0.tgz?x=1";
+        assert_eq!(entry.upstream.as_str(), named);
+        // Maestra: the ledger is the entry object, then the snapshot a start writes.
+        let key = entry_key(&entry);
+        wait_for(&st, &key).await;
+        let written = String::from_utf8(st.get(&key).await.unwrap().to_vec()).unwrap();
+        assert!(written.contains(named), "{written}");
+        assert!(
+            !written.contains("s3cret") && !written.contains("ci-user"),
+            "{written}"
+        );
+        let reloaded = DigestStore::load(st.clone(), tmp.path().to_str().unwrap()).await;
+        assert_eq!(reloaded.len(), 1);
+        let snapshot = String::from_utf8(st.get(SNAPSHOT_KEY).await.unwrap().to_vec()).unwrap();
+        assert!(snapshot.contains(named), "{snapshot}");
+        assert!(!snapshot.contains("s3cret"), "{snapshot}");
+    }
+
+    /// A ledger written before the credential was masked loses it on the next start: loading
+    /// rewrites the file. Maestra: also the entry objects and the snapshot an older release
+    /// wrote (no `masked` in its snapshot), and the rewrite is not repeated after it.
+    #[tokio::test]
+    async fn a_credential_already_in_the_ledger_is_masked_on_load() {
+        let tmp = TempDir::new().unwrap();
+        let st = storage(&tmp);
+        let ledger = tmp.path().join("quarantine.jsonl");
+        let line = serde_json::json!({
+            "registry": "npm", "digest": "sha256:abc", "first_seen": Utc::now().timestamp(),
+            "upstream": "https://ci-user:s3cret@npm.example/pkg/-/pkg-1.0.0.tgz",
+        });
+        std::fs::write(&ledger, format!("{line}\n")).unwrap();
+        let object = serde_json::json!({
+            "registry": "docker", "digest": "sha256:def", "first_seen": Utc::now().timestamp(),
+            "upstream": "https://ci-user:s3cret@registry.example/v2/app/manifests/1",
+        });
+        let object_key = ".nora-quarantine/docker/sha256:def";
+        st.put(object_key, object.to_string().as_bytes())
+            .await
+            .unwrap();
+        let old_snapshot = serde_json::json!({ "as_of": 0, "entries": [object] });
+        st.put(SNAPSHOT_KEY, old_snapshot.to_string().as_bytes())
+            .await
+            .unwrap();
+
+        let store = DigestStore::load(st.clone(), tmp.path().to_str().unwrap()).await;
+        assert_eq!(store.len(), 2);
+        let written = std::fs::read_to_string(&ledger).unwrap();
+        assert!(
+            written.contains("https://***@npm.example/pkg/-/pkg-1.0.0.tgz"),
+            "{written}"
+        );
+        assert!(
+            !written.contains("s3cret") && !written.contains("ci-user"),
+            "{written}"
+        );
+        for key in [object_key, ".nora-quarantine/npm/sha256:abc", SNAPSHOT_KEY] {
+            let stored = String::from_utf8(st.get(key).await.unwrap().to_vec()).unwrap();
+            assert!(
+                !stored.contains("s3cret") && !stored.contains("ci-user"),
+                "{key}: {stored}"
+            );
+        }
+        let snapshot: Snapshot =
+            serde_json::from_slice(&st.get(SNAPSHOT_KEY).await.unwrap()).unwrap();
+        assert!(snapshot.masked);
     }
 
     #[tokio::test]
@@ -1258,7 +1425,7 @@ mod tests {
             registry: "docker".to_string(),
             digest: "sha256:abc".to_string(),
             first_seen: 1700000000,
-            upstream: "registry-1.docker.io".to_string(),
+            upstream: "registry-1.docker.io".into(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"registry\":\"docker\""));
@@ -1266,5 +1433,112 @@ mod tests {
 
         let parsed: DigestEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.digest, "sha256:abc");
+    }
+
+    /// Every line of an old ledger loses its credential on load, not only the first: the
+    /// rewrite keeps none of the users or passwords any line carried.
+    #[tokio::test]
+    async fn every_credential_already_in_the_ledger_is_masked_on_load() {
+        let tmp = TempDir::new().unwrap();
+        let ledger = tmp.path().join("quarantine.jsonl");
+        let now = Utc::now().timestamp();
+        let mut text = String::new();
+        for (digest, user) in [("sha256:aaa", "first-user"), ("sha256:bbb", "second-user")] {
+            let line = serde_json::json!({
+                "registry": "npm", "digest": digest, "first_seen": now,
+                "upstream": format!("https://{user}:s3cret@npm.example/pkg/-/pkg-1.0.0.tgz"),
+            });
+            text.push_str(&format!("{line}\n"));
+        }
+        std::fs::write(&ledger, text).unwrap();
+        let st = storage(&tmp);
+        let store = DigestStore::load(st.clone(), tmp.path().to_str().unwrap()).await;
+        assert_eq!(store.len(), 2);
+        let written = std::fs::read_to_string(&ledger).unwrap();
+        assert!(!written.contains("s3cret"), "{written}");
+        assert!(!written.contains("-user"), "{written}");
+        for key in st.list_internal(ENTRY_PREFIX).await.unwrap() {
+            let stored = String::from_utf8(st.get(&key).await.unwrap().to_vec()).unwrap();
+            assert!(
+                !stored.contains("s3cret") && !stored.contains("-user"),
+                "{key}: {stored}"
+            );
+        }
+    }
+    /// Each line of a ledger is loaded as the log has its URL, whatever the lines around it
+    /// hold: userinfo masked up to its last `@`, a URL without userinfo kept as it is; the
+    /// rewritten file and a new record alike.
+    #[tokio::test]
+    async fn every_ledger_line_is_loaded_with_its_upstream_masked() {
+        let rows = [
+            (
+                "sha256:a1",
+                "https://ci-user:s3cret@npm.example/pkg/-/pkg-1.0.0.tgz",
+                "https://***@npm.example/pkg/-/pkg-1.0.0.tgz",
+            ),
+            (
+                "sha256:a2",
+                "https://npm.example/pkg/-/pkg-2.0.0.tgz",
+                "https://npm.example/pkg/-/pkg-2.0.0.tgz",
+            ),
+            (
+                "sha256:a3",
+                "https://ci-user:p@ss@w0rd@npm.example/pkg",
+                "https://***@npm.example/pkg",
+            ),
+            ("sha256:a4", "registry-1.docker.io", "registry-1.docker.io"),
+            (
+                "sha256:a5",
+                "http://only-user@127.0.0.1:4873/pkg",
+                "http://***@127.0.0.1:4873/pkg",
+            ),
+            (
+                "sha256:a6",
+                "https://second:s3cret@npm.example/x?q=a@b",
+                "https://***@npm.example/x?q=a@b",
+            ),
+        ];
+        let secrets = ["s3cret", "ci-user", "p@ss", "w0rd", "only-user", "second"];
+        let now = Utc::now().timestamp();
+        for reversed in [false, true] {
+            let mut lines: Vec<_> = rows.iter().collect();
+            if reversed {
+                lines.reverse();
+            }
+            let tmp = TempDir::new().unwrap();
+            let ledger = tmp.path().join("quarantine.jsonl");
+            let text: String = lines
+                .iter()
+                .map(|(digest, upstream, _)| {
+                    let line = serde_json::json!({
+                        "registry": "npm", "digest": digest, "first_seen": now,
+                        "upstream": upstream,
+                    });
+                    format!("{line}\n")
+                })
+                .collect();
+            std::fs::write(&ledger, text).unwrap();
+            let store = DigestStore::load(storage(&tmp), tmp.path().to_str().unwrap()).await;
+            assert_eq!(store.len(), rows.len());
+            for (digest, upstream, recorded) in rows {
+                // A digest already recorded answers its entry as loaded.
+                let entry = store.record("npm", digest, "unused", None);
+                assert_eq!(
+                    entry.upstream.as_str(),
+                    recorded,
+                    "{upstream}, reversed: {reversed}"
+                );
+            }
+            let written = std::fs::read_to_string(&ledger).unwrap();
+            for secret in secrets {
+                assert!(!written.contains(secret), "{secret} in {written}");
+            }
+            for (_, upstream, _) in rows {
+                let entry = store.record("npm", &format!("new:{upstream}"), upstream, None);
+                for secret in secrets {
+                    assert!(!entry.upstream.as_str().contains(secret), "{entry:?}");
+                }
+            }
+        }
     }
 }

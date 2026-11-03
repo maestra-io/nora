@@ -33,6 +33,8 @@ COPY fuzz/ fuzz/
 # A production binary must carry mimalloc: the static musl build otherwise serialises
 # every allocation on one lock (perf: native_queued_spin_lock_slowpath, 12.10 and
 # 16-19.10.2026). The grep below fails the build when the feature got dropped.
+# The binary shipped carries no fault injection route (`/__fi/`, src/fault_injection.rs),
+# whatever features or build inputs this build was given: grep refuses it.
 ARG CARGO_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -40,7 +42,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked -p nora-registry $CARGO_FEATURES && \
     cp target/release/nora /nora && \
     strip /nora && \
-    (grep -a -q mimalloc /nora || { echo 'nora built without mimalloc (add --features mimalloc)' >&2; exit 1; })
+    (grep -a -q mimalloc /nora || { echo 'nora built without mimalloc (add --features mimalloc)' >&2; exit 1; }) && \
+    ! grep -qF '/__fi/' /nora
 
 # ── Binary export (for CI release artifacts) ───────────────────────────────
 FROM scratch AS binary
@@ -65,6 +68,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY nora-registry/ nora-registry/
 COPY fuzz/ fuzz/
 
+# As for amd64: no fault injection route in the binary shipped.
 ARG CARGO_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -72,7 +76,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked --target aarch64-unknown-linux-musl -p nora-registry $CARGO_FEATURES && \
     cp target/aarch64-unknown-linux-musl/release/nora /nora && \
     aarch64-linux-musl-strip /nora && \
-    (grep -a -q mimalloc /nora || { echo 'nora built without mimalloc (add --features mimalloc)' >&2; exit 1; })
+    (grep -a -q mimalloc /nora || { echo 'nora built without mimalloc (add --features mimalloc)' >&2; exit 1; }) && \
+    ! grep -qF '/__fi/' /nora
 
 FROM scratch AS binary-arm64
 COPY --from=cross-arm64 /nora /nora

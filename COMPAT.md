@@ -85,6 +85,8 @@ Which formats NORA proxies and hosts, the upstream each proxies by default, and 
 | Scoped packages `@scope/name` | Full | URL-encoded path |
 | Tarball download | Full | SHA256 verified |
 | Tarball URL rewriting | Full | Points to NORA, not upstream. Stored packuments hold no host: every serve uses the current `server.public_url`, for hosted and cached packages alike |
+| Tarball on another host (redirect) | Full | A tarball is fetched only for a version the upstream's packument lists (else 404, no tarball request). Redirects are followed to any http(s) host, at most 10 for the whole chain, the response headers of the chain within one `npm.proxy_timeout` (a body above `server.stream_threshold_mb` is spooled to disk); the upstream's credentials go only to its own origin, never past a hop that left it. An 11th redirect answers 502. Works with registries that serve tarballs from a storage host (GitHub Packages). |
+| Scoped upstream (`npm.proxies` with a scope) | Full | Metadata is read from the upstream's own origin only: a packument redirect to another origin answers 502. |
 | Publish (`npm publish`) | Full | Immutable versions and tarballs: one attachment per version, named `<name>-<version>.tgz` (400 otherwise), never replacing a different tarball published here (409; a proxied cached copy is replaced); a failed publish is rolled back, so it can be retried. Hosted packuments carry `time` (per version, `created`, `modified`); versions published here are not held by `min_release_age`, and a tarball of a version not published here is never fetched upstream |
 | Unpublish (`npm unpublish`) | Full | Packages published here: `<pkg>@<ver>` removes that version's document, tarball and the dist-tags pointing at it (`latest` moves to the highest remaining version); `<pkg> --force` removes them all. As on npmjs, a version string is never published again. Proxied packages: refused, never sent upstream |
 | Dist-tags (`latest`, `next`) | Full | Set at publish; `npm dist-tag ls/add/rm` on packages published here (never proxied); `latest` cannot be removed |
@@ -316,7 +318,7 @@ upstream's signatures) is served verbatim within `rpm.metadata_ttl` seconds
 | Package publish (`PUT {repo}/{name}.rpm`) | Full | Header parsed and validated; invalid RPMs rejected |
 | Package delete (`DELETE {repo}/{name}.rpm`) | Full | Repodata regenerated |
 | Package download | Full | Byte-identical, sha256 pkgid in repodata |
-| GPG-signed repodata (`repomd.xml.asc`) | Full | Signed on every regeneration; verify with `repo_gpgcheck=1`. Object-store backends (S3/GCS) require `signing.key_path` — without it signing is disabled with a startup warning |
+| GPG-signed repodata (`repomd.xml.asc`) | Full | Signed on every regeneration; verify with `repo_gpgcheck=1`. Object-store backends (S3/GCS) require `signing.key_path` — without it signing is disabled with a startup warning. A provisioned key must be Ed25519 (since 1.4.2); any other algorithm is a fatal startup error |
 | Public key (`repodata/repomd.xml.key`) | Full | Armored, for `gpgkey=`; key auto-generated at first boot |
 | Package signatures (`gpgcheck=1`) | — | Packages are stored as uploaded; NORA signs metadata, not packages |
 | Reconcile (`POST {repo}/-/reindex`) | Full | Heals out-of-band storage changes: drops orphan metadata, adopts added packages, rebuilds + re-signs repodata |
