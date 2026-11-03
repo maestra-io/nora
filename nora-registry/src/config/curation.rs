@@ -293,6 +293,8 @@ impl CurationConfig {
             cpan: _,
             helm: _,
             apk: _,
+            github: _,
+            hashicorp: _,
         } = self;
         let mut settings = vec![
             ("curation.quarantine".to_string(), format!("{quarantine:?}")),
@@ -350,6 +352,8 @@ impl CurationConfig {
             RegistryType::Cpan => Some(&mut self.cpan),
             RegistryType::Helm => Some(&mut self.helm),
             RegistryType::Apk => Some(&mut self.apk),
+            RegistryType::Github => Some(&mut self.github),
+            RegistryType::Hashicorp => Some(&mut self.hashicorp),
             RegistryType::HuggingFace => None,
         }
     }

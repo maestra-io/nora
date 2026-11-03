@@ -58,7 +58,9 @@ pub fn imported_since(rt: RegistryType) -> u32 {
         | RegistryType::Cpan
         | RegistryType::HuggingFace
         | RegistryType::Helm
-        | RegistryType::Apk => 1,
+        | RegistryType::Apk
+        | RegistryType::Github
+        | RegistryType::Hashicorp => 1,
     }
 }
 
@@ -89,7 +91,9 @@ pub fn compat(rt: RegistryType) -> Compat {
         | RegistryType::Cpan
         | RegistryType::HuggingFace
         | RegistryType::Helm
-        | RegistryType::Apk => Compat::Unsupported,
+        | RegistryType::Apk
+        | RegistryType::Github
+        | RegistryType::Hashicorp => Compat::Unsupported,
     }
 }
 
@@ -115,7 +119,9 @@ pub fn note(rt: RegistryType) -> &'static str {
         | RegistryType::Cpan
         | RegistryType::HuggingFace
         | RegistryType::Helm
-        | RegistryType::Apk => "no NORA import layout — will be skipped",
+        | RegistryType::Apk
+        | RegistryType::Github
+        | RegistryType::Hashicorp => "no NORA import layout — will be skipped",
     }
 }
 
@@ -191,7 +197,9 @@ pub(super) fn action(rt: RegistryType, under: UnderKey) -> Action {
         | RegistryType::Cpan
         | RegistryType::HuggingFace
         | RegistryType::Helm
-        | RegistryType::Apk => Transfer,
+        | RegistryType::Apk
+        | RegistryType::Github
+        | RegistryType::Hashicorp => Transfer,
     }
 }
 
@@ -232,7 +240,9 @@ pub(super) fn own_by(rt: RegistryType, key: &str) -> Own {
         | RegistryType::Cpan
         | RegistryType::HuggingFace
         | RegistryType::Helm
-        | RegistryType::Apk => Own::Unknown,
+        | RegistryType::Apk
+        | RegistryType::Github
+        | RegistryType::Hashicorp => Own::Unknown,
     }
 }
 
@@ -300,7 +310,9 @@ pub fn map_artifact(rt: RegistryType, art: &ArtifactRef) -> Mapping {
         | RegistryType::Cpan
         | RegistryType::HuggingFace
         | RegistryType::Helm
-        | RegistryType::Apk => return Mapping::Skip("format not hosted by NORA import"),
+        | RegistryType::Apk
+        | RegistryType::Github
+        | RegistryType::Hashicorp => return Mapping::Skip("format not hosted by NORA import"),
     };
 
     match validate_storage_key(&key) {
@@ -466,6 +478,8 @@ mod tests {
             (R::Cpan, [Transfer, Transfer, Transfer, Transfer]),
             (R::Helm, [Transfer, Transfer, Transfer, Transfer]),
             (R::Apk, [Transfer, Transfer, Transfer, Transfer]),
+            (R::Github, [Transfer, Transfer, Transfer, Transfer]),
+            (R::Hashicorp, [Transfer, Transfer, Transfer, Transfer]),
             (R::HuggingFace, [Transfer, Transfer, Transfer, Transfer]),
         ];
         let states = [
@@ -565,6 +579,8 @@ mod tests {
             (R::Cpan, Unsupported, 1, false),
             (R::Helm, Unsupported, 1, false),
             (R::Apk, Unsupported, 1, false),
+            (R::Github, Unsupported, 1, false),
+            (R::Hashicorp, Unsupported, 1, false),
             (R::HuggingFace, Unsupported, 1, false),
         ];
         let rows: Vec<RegistryType> = table.iter().map(|row| row.0).collect();
