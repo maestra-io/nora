@@ -23,6 +23,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -47,7 +48,7 @@ const LOAD_CONCURRENCY: usize = 32;
 const LOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Stale entry TTL: entries older than 90 days are pruned on startup.
-const PRUNE_TTL_SECS: i64 = 90 * 24 * 3600;
+pub(crate) const PRUNE_TTL_SECS: i64 = 90 * 24 * 3600;
 
 // ============================================================================
 // Quarantine Mode
@@ -147,6 +148,8 @@ impl QuarantineStatus {
 pub struct DigestStore {
     entries: Arc<RwLock<HashMap<String, DigestEntry>>>,
     storage: Storage,
+    /// The ledger is in `entries`. Until then "no record" says nothing about a digest.
+    loaded: Arc<AtomicBool>,
 }
 
 /// The [`SNAPSHOT_KEY`] document.
@@ -181,6 +184,7 @@ impl DigestStore {
         Self {
             entries: Arc::new(RwLock::new(entries)),
             storage,
+            loaded: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -194,8 +198,10 @@ impl DigestStore {
     /// killed the pod in a loop.
     pub fn load_in_background(storage: Storage, storage_path: &str) -> Self {
         let store = Self::empty(storage.clone());
+        store.set_loaded(false);
         let legacy = Path::new(storage_path).join(LEDGER_FILE);
         let entries = Arc::clone(&store.entries);
+        let loaded_flag = Arc::clone(&store.loaded);
         tokio::spawn(async move {
             let started = std::time::Instant::now();
             match tokio::time::timeout(LOAD_DEADLINE, load_entries(&storage, &legacy)).await {
@@ -214,6 +220,7 @@ impl DigestStore {
                     // A record() that adopted a stale object the walk then pruned
                     // would read as Mature until restart: apply the same cutoff here.
                     map.retain(|_, entry| entry.first_seen >= cutoff);
+                    loaded_flag.store(true, Ordering::Release);
                     info!(
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         entries = map.len(),
@@ -234,7 +241,17 @@ impl DigestStore {
         Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
             storage,
+            loaded: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// Whether the ledger is in memory, so that a digest with no record really has none.
+    pub fn loaded(&self) -> bool {
+        self.loaded.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_loaded(&self, loaded: bool) {
+        self.loaded.store(loaded, Ordering::Release);
     }
 
     /// Record a proxy-fetched digest. Returns the entry (existing or new).
