@@ -369,6 +369,7 @@ pub struct Config {
     pub helm: HelmConfig,
     #[serde(default)]
     pub apk: ApkConfig,
+    #[serde(default)]
     pub github: GithubConfig,
     #[serde(default)]
     pub hashicorp: HashicorpConfig,

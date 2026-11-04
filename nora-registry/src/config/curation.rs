@@ -148,6 +148,7 @@ pub struct CurationConfig {
     pub helm: RegistryCurationOverride,
     #[serde(default)]
     pub apk: RegistryCurationOverride,
+    #[serde(default)]
     pub github: RegistryCurationOverride,
     #[serde(default)]
     pub hashicorp: RegistryCurationOverride,
