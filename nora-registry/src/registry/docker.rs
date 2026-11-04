@@ -2371,7 +2371,7 @@ async fn try_fetch_and_cache(
                             tag = %reference,
                             held = %digest,
                             outcome,
-                            "Quarantine: tag moved to a held digest"
+                            "Quarantine: tag resolves to a held digest"
                         );
                     }
                     // In enforce mode, still cache by digest, but the client gets the tag's
