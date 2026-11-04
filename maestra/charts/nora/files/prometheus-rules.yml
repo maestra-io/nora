@@ -121,10 +121,15 @@ groups:
         # 02:56 (runbook Step 1c). The rate guard: at 0.6 stat/min (quiet night) the
         # p99 is a handful of calls. Metric since 1.4.1-maestra.15; in the 23 h of
         # data before this rule it holds 15 min only in that night (01:36-02:21).
+        # keep_firing_for: one slow-store episode is one alert. On 03-04.11 the p99
+        # stayed above 1.5 s from 23:00 to 00:44, but the rate guard dipped to
+        # 0.39 stat/s at 23:46 and the alert fired twice (23:24, 00:02). It goes
+        # OFF 15 min after the p99 or the rate falls below its bound.
         expr: >-
           histogram_quantile(0.99, sum by (le) (rate(nora_storage_operation_duration_seconds_bucket{operation="stat"}[10m]))) > 1.5
           and on() sum(rate(nora_storage_operation_duration_seconds_count{operation="stat"}[10m])) > 0.5
         for: 15m
+        keep_firing_for: 15m
         labels:
           severity: warning
         annotations:
