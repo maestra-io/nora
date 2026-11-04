@@ -366,6 +366,8 @@ pub struct Config {
     #[serde(default)]
     pub helm: HelmConfig,
     #[serde(default)]
+    pub apk: ApkConfig,
+    #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -402,6 +404,15 @@ pub(crate) enum ReleaseDateCheck {
 }
 
 /// The environment variable of `rt`'s own `enabled` flag.
+/// One path segment: letters, digits, '-', '_', '.', not starting with '.'.
+fn is_plain_segment(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 pub(crate) fn legacy_enable_var(rt: RegistryType) -> &'static str {
     match rt {
         RegistryType::Docker => "NORA_DOCKER_ENABLED",
@@ -422,6 +433,7 @@ pub(crate) fn legacy_enable_var(rt: RegistryType) -> &'static str {
         RegistryType::Cpan => "NORA_CPAN_ENABLED",
         RegistryType::HuggingFace => "NORA_HF_ENABLED",
         RegistryType::Helm => "NORA_HELM_ENABLED",
+        RegistryType::Apk => "NORA_APK_ENABLED",
     }
 }
 
@@ -444,7 +456,8 @@ pub(crate) fn release_date_check(rt: RegistryType) -> ReleaseDateCheck {
         | RegistryType::Nuget
         | RegistryType::PubDart
         | RegistryType::Conan
-        | RegistryType::Helm => ReleaseDateCheck::Dated,
+        | RegistryType::Helm
+        | RegistryType::Apk => ReleaseDateCheck::Dated,
     }
 }
 
@@ -628,6 +641,7 @@ impl Config {
                 RegistryType::Cpan => self.cpan.enabled = on,
                 RegistryType::HuggingFace => self.hf.enabled = on,
                 RegistryType::Helm => self.helm.enabled = on,
+                RegistryType::Apk => self.apk.enabled = on,
             }
         }
     }
@@ -689,6 +703,9 @@ impl Config {
         if self.helm.enabled {
             set.insert(RegistryType::Helm);
         }
+        if self.apk.enabled {
+            set.insert(RegistryType::Apk);
+        }
         if set.is_empty() {
             tracing::warn!("No registries enabled! All registries are disabled.");
         }
@@ -745,6 +762,7 @@ impl Config {
             RegistryType::Cpan => self.cpan.enabled && self.cpan.proxy.is_some(),
             RegistryType::HuggingFace => self.hf.enabled && self.hf.proxy.is_some(),
             RegistryType::Helm => self.helm.enabled && !self.helm.proxies.is_empty(),
+            RegistryType::Apk => self.apk.enabled && !self.apk.proxies.is_empty(),
         }
     }
 
@@ -790,6 +808,7 @@ impl Config {
             // control as Raw.
             RegistryType::HuggingFace => return QuarantineMode::Off,
             RegistryType::Helm => self.curation.helm.quarantine.as_ref(),
+            RegistryType::Apk => self.curation.apk.quarantine.as_ref(),
         };
         per.or(global).cloned().unwrap_or(QuarantineMode::Off)
     }
@@ -1528,6 +1547,26 @@ impl Config {
                 ));
             }
         }
+        // An apk mirror is served at `/apk/<name>/`, its public key at `/apk/keys/<key_name>`;
+        // every served index is signed, so an enabled proxy without loadable keys is an error.
+        for name in self.apk.proxies.keys() {
+            if !is_plain_segment(name) || name == "keys" {
+                errors.push(format!(
+                    "apk.proxies name {name:?} is not a plain path segment (letters, digits, '-', '_', '.'; not \"keys\")"
+                ));
+            }
+        }
+        if self.apk.enabled && !self.apk.proxies.is_empty() {
+            if !is_plain_segment(&self.apk.key_name) {
+                errors.push(format!(
+                    "apk.key_name {:?} is not a plain file name",
+                    self.apk.key_name
+                ));
+            }
+            if let Err(e) = crate::registry::apk::check_keys(&self.apk) {
+                errors.push(e);
+            }
+        }
         for u in &self.docker.upstreams {
             if u.trust_upstream_dates && u.date_source().is_none() {
                 let msg = format!(
@@ -1825,6 +1864,7 @@ impl Config {
         self.cpan.apply_env_overrides();
         self.hf.apply_env_overrides();
         self.helm.apply_env_overrides();
+        self.apk.apply_env_overrides();
 
         // Rate limit, GC, retention
         self.rate_limit.apply_env_overrides();
@@ -3235,6 +3275,7 @@ proxies = [
         assert_eq!(
             maps,
             [
+                "apk.proxies",
                 "circuit_breaker.overrides",
                 "deb.proxies",
                 "helm.proxies",
@@ -4973,6 +5014,7 @@ proxies = [
             &mut config.curation.deb,
             &mut config.curation.cpan,
             &mut config.curation.helm,
+            &mut config.curation.apk,
         ] {
             o.quarantine = Some(QuarantineMode::Off);
         }
@@ -5190,6 +5232,7 @@ proxies = [
             (RegistryType::Cpan, NoDate),
             (RegistryType::HuggingFace, NoDate),
             (RegistryType::Helm, Dated),
+            (RegistryType::Apk, Dated),
         ];
         assert_eq!(expected.len(), RegistryType::all().len());
         for (rt, check) in expected {
@@ -5220,6 +5263,7 @@ proxies = [
             (RegistryType::Deb, "[deb]\nenabled = true\n[deb.proxies]\ndebian = \"https://deb.debian.org/debian\"\n", none),
             (RegistryType::Cpan, "[cpan]\nenabled = true\nproxy = \"https://www.cpan.org\"\n", none),
             (RegistryType::Helm, "[helm]\nenabled = true\n[helm.proxies]\njetstack = \"https://charts.jetstack.io\"\n", none),
+            (RegistryType::Apk, "[apk]\nenabled = true\n[apk.proxies]\nalpine = \"https://dl-cdn.alpinelinux.org/alpine\"\n", none),
         ]
     }
 
@@ -5246,6 +5290,7 @@ proxies = [
             RegistryType::Raw => c.raw.enabled = true,
             RegistryType::HuggingFace => (c.hf.enabled, c.hf.proxy) = (true, None),
             RegistryType::Helm => (c.helm.enabled, c.helm.proxies) = (true, Default::default()),
+            RegistryType::Apk => (c.apk.enabled, c.apk.proxies) = (true, Default::default()),
         }
     }
 
@@ -5270,6 +5315,7 @@ proxies = [
             RegistryType::Raw => c.raw.enabled = false,
             RegistryType::HuggingFace => c.hf.enabled = false,
             RegistryType::Helm => c.helm.enabled = false,
+            RegistryType::Apk => c.apk.enabled = false,
         }
     }
 
@@ -5686,6 +5732,7 @@ proxies = [
             RegistryType::Cpan => Some("CPAN"),
             RegistryType::HuggingFace => None,
             RegistryType::Helm => Some("HELM"),
+            RegistryType::Apk => Some("APK"),
         }
     }
 

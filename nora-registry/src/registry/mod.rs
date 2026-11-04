@@ -4,6 +4,7 @@
 #![cfg_attr(not(test), deny(clippy::disallowed_types))]
 
 pub(crate) mod ansible;
+pub(crate) mod apk;
 mod cargo_registry;
 mod conan;
 pub(crate) mod cpan;
@@ -32,6 +33,7 @@ pub(crate) mod terraform;
 mod ns_isolation_metadata_tests;
 
 pub use ansible::routes as ansible_routes;
+pub use apk::routes as apk_routes;
 pub(crate) use cargo_registry::canonical_crate_name;
 pub use cargo_registry::rebuild_crate_name_records as rebuild_cargo_name_records;
 pub use cargo_registry::routes as cargo_routes;
@@ -1598,7 +1600,10 @@ impl CachedArtifact {
 /// and only while that digest is still the object's pin.
 pub(crate) async fn is_proxied_copy(storage: &crate::Storage, key: &str) -> bool {
     // Pull-through only: nothing is published under these.
-    if key.starts_with("nuget/flatcontainer/") || key.starts_with("helm/charts/") {
+    if key.starts_with("nuget/flatcontainer/")
+        || key.starts_with("helm/charts/")
+        || key.starts_with("apk/pkgs/")
+    {
         return true;
     }
     let Ok(record) = storage.get(&npm::origin_key(key)).await else {
@@ -5554,6 +5559,7 @@ mod curation_label_whitelist {
         ("docker.rs", RegistryType::Docker, include_str!("docker.rs")),
         ("gems.rs", RegistryType::Gems, include_str!("gems.rs")),
         ("go.rs", RegistryType::Go, include_str!("go.rs")),
+        ("apk.rs", RegistryType::Apk, include_str!("apk.rs")),
         ("helm.rs", RegistryType::Helm, include_str!("helm.rs")),
         ("hf.rs", RegistryType::HuggingFace, include_str!("hf.rs")),
         ("maven.rs", RegistryType::Maven, include_str!("maven.rs")),

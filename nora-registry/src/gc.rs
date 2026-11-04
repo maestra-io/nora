@@ -324,6 +324,7 @@ pub async fn run_gc(
         "deb/",
         "cpan/",
         "helm/",
+        "apk/",
     ] {
         let keys = storage.list(prefix).await.unwrap_or_else(|e| {
             tracing::error!("GC: storage.list({}) failed: {}", prefix, e);
@@ -1254,7 +1255,7 @@ async fn evict_proxy_cache(
     let mut proxy_files: Vec<(String, u64, u64)> = Vec::new(); // (key, size, mtime)
     let mut sidecar_covered: HashSet<String> = HashSet::new();
 
-    for prefix in ["rpm/", "deb/", "hf/", "helm/charts/"] {
+    for prefix in ["rpm/", "deb/", "hf/", "helm/charts/", "apk/pkgs/"] {
         let entries = match storage.list_with_meta(prefix).await {
             Ok(e) => e,
             Err(e) => {
@@ -1278,7 +1279,7 @@ async fn evict_proxy_cache(
 
         // Second pass: identify proxy-only files
         for (key, meta) in &entries {
-            if prefix == "hf/" || prefix == "helm/charts/" {
+            if prefix == "hf/" || prefix == "helm/charts/" || prefix == "apk/pkgs/" {
                 proxy_files.push((key.clone(), meta.size, meta.modified));
                 continue;
             }

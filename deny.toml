@@ -9,7 +9,10 @@ ignore = [
     # jsonwebtoken uses rsa for JWK decoding; NORA only verifies signatures.
     # Also transitive via pgp (rpgp): index signing is Ed25519-only — an RSA
     # key at signing.key_path is refused at load (signing.rs:signs_with_ed25519),
-    # so no rsa private-key operation is ever performed there either.
+    # so no rsa private-key operation is ever performed there either. The apk
+    # proxy signs its APKINDEX with RSA (apk verifies nothing else): blinded
+    # (sign_with_rng), over upstream content no client chooses, at most once
+    # a minute per index, so no timing oracle is exposed.
     "RUSTSEC-2023-0071",
     # quick-xml <0.41 DoS (quadratic-attr + NsReader memory-exhaustion).
     # Transitive via object_store (S3 XML parsing); no upstream fix yet

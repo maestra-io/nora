@@ -243,6 +243,8 @@ jobs:
           # RUSTSEC-2023-0071: Marvin Attack (RSA timing side-channel) — not applicable:
           #   NORA uses rsa crate only for JWT signature *verification* via jsonwebtoken.
           #   Marvin Attack targets RSA PKCS#1 v1.5 *decryption*, a different code path.
+          #   The apk proxy (maestra) signs APKINDEX with RSA, blinded (sign_with_rng),
+          #   over upstream content, once a minute per index at most: no timing oracle.
           #   No upstream patch exists. Index signing (pgp) refuses RSA keys at load. See: SECURITY.md
           # RUSTSEC-2026-0194 / -0195: quick-xml <0.41 quadratic-attribute + NsReader
           #   memory-exhaustion DoS. Transitive via object_store (S3 XML response parsing).

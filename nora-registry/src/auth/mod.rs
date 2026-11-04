@@ -245,6 +245,14 @@ fn is_public_path(path: &str) -> bool {
         path,
         "/" | "/health" | "/ready" | "/api/tokens" | "/api/tokens/list" | "/api/tokens/revoke"
     ) || is_static_asset(path)
+        || is_apk_public_key(path)
+}
+
+/// The apk proxy's public key (`/apk/keys/<name>`): what Dockerfiles `ADD` before they
+/// hold a token, and public by nature.
+fn is_apk_public_key(path: &str) -> bool {
+    path.strip_prefix("/apk/keys/")
+        .is_some_and(|name| !name.is_empty() && !name.contains('/'))
 }
 
 /// The UI's embedded assets and the favicon: no data, served to any caller, also
@@ -1466,6 +1474,12 @@ mod tests {
     #[test]
     fn test_is_not_public_path_registry() {
         assert!(!is_public_path("/v2/library/alpine/manifests/latest"));
+        assert!(is_public_path("/apk/keys/nora.rsa.pub"));
+        assert!(!is_public_path("/apk/keys/"));
+        assert!(!is_public_path("/apk/keys/x/y"));
+        assert!(!is_public_path(
+            "/apk/alpine/v3.22/main/x86_64/APKINDEX.tar.gz"
+        ));
         assert!(!is_public_path("/npm/lodash"));
         assert!(!is_public_path("/maven/com/example"));
         assert!(!is_public_path("/pypi/simple/flask"));

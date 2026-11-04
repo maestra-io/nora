@@ -57,7 +57,8 @@ pub fn imported_since(rt: RegistryType) -> u32 {
         | RegistryType::Deb
         | RegistryType::Cpan
         | RegistryType::HuggingFace
-        | RegistryType::Helm => 1,
+        | RegistryType::Helm
+        | RegistryType::Apk => 1,
     }
 }
 
@@ -87,7 +88,8 @@ pub fn compat(rt: RegistryType) -> Compat {
         | RegistryType::Deb
         | RegistryType::Cpan
         | RegistryType::HuggingFace
-        | RegistryType::Helm => Compat::Unsupported,
+        | RegistryType::Helm
+        | RegistryType::Apk => Compat::Unsupported,
     }
 }
 
@@ -112,7 +114,8 @@ pub fn note(rt: RegistryType) -> &'static str {
         | RegistryType::Deb
         | RegistryType::Cpan
         | RegistryType::HuggingFace
-        | RegistryType::Helm => "no NORA import layout — will be skipped",
+        | RegistryType::Helm
+        | RegistryType::Apk => "no NORA import layout — will be skipped",
     }
 }
 
@@ -187,7 +190,8 @@ pub(super) fn action(rt: RegistryType, under: UnderKey) -> Action {
         | RegistryType::Deb
         | RegistryType::Cpan
         | RegistryType::HuggingFace
-        | RegistryType::Helm => Transfer,
+        | RegistryType::Helm
+        | RegistryType::Apk => Transfer,
     }
 }
 
@@ -227,7 +231,8 @@ pub(super) fn own_by(rt: RegistryType, key: &str) -> Own {
         | RegistryType::Deb
         | RegistryType::Cpan
         | RegistryType::HuggingFace
-        | RegistryType::Helm => Own::Unknown,
+        | RegistryType::Helm
+        | RegistryType::Apk => Own::Unknown,
     }
 }
 
@@ -294,7 +299,8 @@ pub fn map_artifact(rt: RegistryType, art: &ArtifactRef) -> Mapping {
         | RegistryType::Deb
         | RegistryType::Cpan
         | RegistryType::HuggingFace
-        | RegistryType::Helm => return Mapping::Skip("format not hosted by NORA import"),
+        | RegistryType::Helm
+        | RegistryType::Apk => return Mapping::Skip("format not hosted by NORA import"),
     };
 
     match validate_storage_key(&key) {
@@ -459,6 +465,7 @@ mod tests {
             (R::Deb, [Transfer, Transfer, Transfer, Transfer]),
             (R::Cpan, [Transfer, Transfer, Transfer, Transfer]),
             (R::Helm, [Transfer, Transfer, Transfer, Transfer]),
+            (R::Apk, [Transfer, Transfer, Transfer, Transfer]),
             (R::HuggingFace, [Transfer, Transfer, Transfer, Transfer]),
         ];
         let states = [
@@ -557,6 +564,7 @@ mod tests {
             (R::Deb, Unsupported, 1, false),
             (R::Cpan, Unsupported, 1, false),
             (R::Helm, Unsupported, 1, false),
+            (R::Apk, Unsupported, 1, false),
             (R::HuggingFace, Unsupported, 1, false),
         ];
         let rows: Vec<RegistryType> = table.iter().map(|row| row.0).collect();
