@@ -40,6 +40,32 @@ fn streaming_client_options() -> object_store::ClientOptions {
 const METADATA_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Whole in-memory body transfers (`put`, the body of `get`, a reader read whole).
 pub(super) const BODY_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// The body of a `get` must make progress within this, or the GET is sent again (up
+/// to GET_BODY_ATTEMPTS times): R2 sometimes stalls a body mid-transfer, and a client
+/// gives up (cargo: 30 s without a byte) long before BODY_OP_TIMEOUT.
+const GET_BODY_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+const GET_BODY_ATTEMPTS: usize = 3;
+
+/// Runs `attempt` (one GET plus its whole body) until it succeeds, up to
+/// GET_BODY_ATTEMPTS times. NotFound is an answer, never retried.
+async fn retry_stalled_body<T, F, Fut>(mut attempt: F) -> object_store::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = object_store::Result<T>>,
+{
+    let mut n = 1;
+    loop {
+        match attempt().await {
+            Err(e)
+                if n < GET_BODY_ATTEMPTS && !matches!(e, object_store::Error::NotFound { .. }) =>
+            {
+                tracing::warn!(error = %e, attempt = n, "object store get failed, retrying");
+                n += 1;
+            }
+            other => return other,
+        }
+    }
+}
 
 async fn bounded<T>(
     limit: std::time::Duration,
@@ -262,6 +288,32 @@ pub struct ObjectStorage {
 const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl ObjectStorage {
+    /// One GET of `path` (or, when absent, the legacy `_at_` key of pre-#534 data) with
+    /// its whole body, each chunk within GET_BODY_IDLE.
+    async fn get_whole(
+        &self,
+        path: &Path,
+        legacy_path: Option<&Path>,
+    ) -> object_store::Result<(Bytes, Option<String>)> {
+        let result = match bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get(path)).await {
+            Err(object_store::Error::NotFound { .. }) if legacy_path.is_some() => {
+                let legacy = legacy_path.expect("checked");
+                bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get(legacy)).await?
+            }
+            other => other?,
+        };
+        let pin = read_pin(&result.attributes);
+        let size = result.meta.size;
+        // One buffer of the object's size (no second copy), or the chunk itself when the
+        // body arrives in one.
+        let body = object_store::collect_bytes(
+            idle_bounded(result.into_stream(), GET_BODY_IDLE),
+            Some(size),
+        );
+        let body = bounded(BODY_OP_TIMEOUT, body).await?;
+        Ok((body, pin))
+    }
+
     /// Create new S3 storage with optional credentials.
     ///
     /// `virtual_hosted` selects the request addressing style: `false` (default) appends
@@ -582,23 +634,16 @@ impl StorageBackend for ObjectStorage {
     async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
-        let result = match bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get(&path)).await {
-            Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
-                // Fallback: try legacy _at_ encoding for pre-#534 data.
-                // Only needed when key contains @, since otherwise both schemes produce the same output.
-                let legacy_path = Path::from(encode_object_key_legacy(key));
-                bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get(&legacy_path))
-                    .await
-                    .map_err(map_err)?
-            }
-            Err(e) => return Err(map_err(e)),
-        };
-        let pin = read_pin(&result.attributes);
-        let bytes = bounded(BODY_OP_TIMEOUT, result.bytes())
-            .await
-            .map_err(map_err)?;
-        Ok((bytes, pin))
+        let legacy_path = key
+            .contains('@')
+            .then(|| Path::from(encode_object_key_legacy(key)));
+        // BODY_OP_TIMEOUT bounds every attempt and all of them together.
+        bounded(
+            BODY_OP_TIMEOUT,
+            retry_stalled_body(|| self.get_whole(&path, legacy_path.as_ref())),
+        )
+        .await
+        .map_err(map_err)
     }
 
     async fn pin(&self, key: &str) -> Option<String> {
@@ -1680,6 +1725,51 @@ mod tests {
         assert!(matches!(err, object_store::Error::AlreadyExists { .. }));
         assert!(!is_cf_edge_error(&err));
         assert_eq!(calls, 1);
+    }
+
+    /// A GET whose body stalls is sent again; NotFound and the last failure are answers.
+    #[tokio::test]
+    async fn retry_stalled_body_resends_a_failed_get() {
+        let stall = || object_store::Error::Generic {
+            store: "object_store",
+            source: "no progress for 10 s".into(),
+        };
+        let mut calls = 0;
+        let got = retry_stalled_body(|| {
+            calls += 1;
+            let r = if calls < GET_BODY_ATTEMPTS {
+                Err(stall())
+            } else {
+                Ok(7)
+            };
+            async move { r }
+        })
+        .await;
+        assert_eq!(got.unwrap(), 7);
+        assert_eq!(calls, GET_BODY_ATTEMPTS);
+
+        let mut calls = 0;
+        let got: object_store::Result<u8> = retry_stalled_body(|| {
+            calls += 1;
+            async { Err(stall()) }
+        })
+        .await;
+        assert!(got.is_err());
+        assert_eq!(calls, GET_BODY_ATTEMPTS, "gives up after the last attempt");
+
+        let mut calls = 0;
+        let got: object_store::Result<u8> = retry_stalled_body(|| {
+            calls += 1;
+            async {
+                Err(object_store::Error::NotFound {
+                    path: "k".into(),
+                    source: "absent".into(),
+                })
+            }
+        })
+        .await;
+        assert!(matches!(got, Err(object_store::Error::NotFound { .. })));
+        assert_eq!(calls, 1, "NotFound is never retried");
     }
 
     /// C15: a read body that stops arriving fails after `idle`, but a consumer that
