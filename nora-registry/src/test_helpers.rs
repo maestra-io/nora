@@ -463,6 +463,7 @@ fn build_context_full(
         leak_finders,
         cancel_token: tokio_util::sync::CancellationToken::new(),
         nuget_hosted: Default::default(),
+        deb_young: Default::default(),
         pull_stats: std::sync::Arc::new(crate::registry::docker::PullStatsAccumulator::default()),
         tasks,
         maintenance,

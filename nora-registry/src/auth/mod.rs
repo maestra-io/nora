@@ -4476,6 +4476,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             leak_finders: ctx.state.leak_finders.clone(),
             cancel_token: tokio_util::sync::CancellationToken::new(),
             nuget_hosted: Default::default(),
+            deb_young: Default::default(),
             pull_stats: std::sync::Arc::new(
                 crate::registry::docker::PullStatsAccumulator::default(),
             ),
