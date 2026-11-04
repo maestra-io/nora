@@ -322,6 +322,10 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
                     .map(|p| p.url().to_string())
                     .collect(),
             }
+            .iter()
+            // A configured URL may carry userinfo or a secret query parameter.
+            .map(|u| crate::import::http::redact_url(u))
+            .collect()
         } else {
             vec![]
         };

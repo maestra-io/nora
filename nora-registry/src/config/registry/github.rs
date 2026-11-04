@@ -25,7 +25,7 @@ pub struct GithubConfig {
     /// API token (`NORA_GITHUB_TOKEN` only, never in config.toml): lifts the API rate
     /// limit from 60 to 5000 requests per hour. Read-only access to public repos is enough.
     #[serde(skip)]
-    pub token: Option<String>,
+    pub token: Option<crate::secrets::ProtectedString>,
     /// Let downloads reach loopback, private and link-local addresses (tests, a lab
     /// GitHub Enterprise); off: refused on the first request and every redirect hop.
     #[serde(default)]
@@ -81,7 +81,8 @@ impl GithubConfig {
         }
         if let Ok(val) = env::var("NORA_GITHUB_TOKEN") {
             let val = val.trim();
-            self.token = (!val.is_empty()).then(|| val.to_string());
+            self.token =
+                (!val.is_empty()).then(|| crate::secrets::ProtectedString::new(val.to_string()));
         }
     }
 }

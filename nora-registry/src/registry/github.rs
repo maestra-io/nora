@@ -369,7 +369,10 @@ async fn asset(
     {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let name = format!("{owner}/{repo}");
+    // GitHub matches owner and repo names case-insensitively: curation rules and the
+    // cache see one lowercase identity, the upstream URLs keep the client's spelling.
+    let (owner_key, repo_key) = (owner.to_ascii_lowercase(), repo.to_ascii_lowercase());
+    let name = format!("{owner_key}/{repo_key}");
     let engine = &state.curation().curation_engine;
     // An internal name is never fetched from an upstream (dependency confusion).
     if let Some(response) =
@@ -381,7 +384,7 @@ async fn asset(
     let cfg = &state.config.github;
     let up = github_upstream(&state);
     // The release record is required even for a cached asset: it is the release date.
-    let key = format!("github/meta/{owner}/{repo}/{}.json", tag_key(&tag));
+    let key = format!("github/meta/{owner_key}/{repo_key}/{}.json", tag_key(&tag));
     let release: Release = match load_record(&state, "github", &key, cfg.metadata_ttl, || async {
         let url = join_segments(
             &cfg.api_url,
@@ -393,7 +396,7 @@ async fn asset(
             &up,
             RegistryType::Github,
             &url,
-            cfg.token.as_deref().map(UpstreamAuth::Bearer),
+            crate::secrets::expose_opt(&cfg.token).map(UpstreamAuth::Bearer),
         )
         .await?;
         Release::from_api(&body).map_err(|e| {
@@ -427,7 +430,10 @@ async fn asset(
                 .as_deref()
                 .and_then(crate::curation::parse_iso8601_to_unix),
             expected,
-            key: format!("github/releases/{owner}/{repo}/{}/{file}", tag_key(&tag)),
+            key: format!(
+                "github/releases/{owner_key}/{repo_key}/{}/{file}",
+                tag_key(&tag)
+            ),
             label: format!("{name}@{tag}/{file}"),
             url,
             upstream: &up,
@@ -812,6 +818,22 @@ mod integration_tests {
         }
     }
 
+    /// GitHub owner and repo names are case-insensitive: `O/R` is the same cached
+    /// release and asset as `o/r`, never a second copy.
+    #[tokio::test]
+    async fn owner_and_repo_case_shares_one_cache_entry() {
+        let server = github("v1.0.0", "v1.0.0", OLD, &[("t.tar.gz", b"t", true)]).await;
+        let ctx = create_test_context_with_config(|cfg| configure(cfg, &server));
+        let resp = get(&ctx, "/github/o/r/releases/download/v1.0.0/t.tar.gz").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(server);
+        let resp = get(&ctx, "/github/O/R/releases/download/v1.0.0/t.tar.gz").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Served with the upstream gone: the lowercase release record and asset.
+        assert_eq!(body_bytes(resp).await, b"t".as_slice());
+    }
+
     #[tokio::test]
     async fn a_tag_with_a_slash_is_one_percent_encoded_segment() {
         let server = github(
@@ -921,7 +943,7 @@ mod integration_tests {
             .await;
         let ctx = create_test_context_with_config(|cfg| {
             configure(cfg, &server);
-            cfg.github.token = Some("t0ken".into());
+            cfg.github.token = Some(crate::secrets::ProtectedString::new("t0ken".to_string()));
         });
         let resp = get(&ctx, "/github/o/r/releases/download/v1/a.bin").await;
         assert_eq!(resp.status(), StatusCode::OK);

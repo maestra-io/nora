@@ -91,7 +91,7 @@ impl RegistryType {
     /// format on. An opt-in format is enabled only by name: an operator who wrote `all`
     /// before it existed did not choose it.
     pub fn in_all(&self) -> bool {
-        !matches!(self, Self::HuggingFace)
+        !matches!(self, Self::HuggingFace | Self::Github | Self::Hashicorp)
     }
 
     /// Parse from string (case-insensitive), accepting common aliases. Kept hand-written
@@ -153,6 +153,18 @@ mod tests {
             let parsed = RegistryType::from_str_opt(s);
             assert_eq!(parsed, Some(*rt), "roundtrip failed for {}", s);
         }
+    }
+
+    #[test]
+    fn opt_in_formats_are_not_in_all() {
+        for rt in [
+            RegistryType::HuggingFace,
+            RegistryType::Github,
+            RegistryType::Hashicorp,
+        ] {
+            assert!(!rt.in_all(), "{rt}");
+        }
+        assert!(RegistryType::Docker.in_all());
     }
 
     #[test]
