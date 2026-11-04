@@ -131,7 +131,7 @@ The dashboard includes a `registry` template variable to filter by specific prot
 | `NoraHighLatency` | p99 of `nora_http_request_duration_seconds` above 5s for 10m, while traffic is above 5 rps | warning |
 | `NoraStorageSlow` | p99 of `nora_storage_operation_duration_seconds{operation="stat"}` above 1.5s for 15m, while the store sees more than 0.5 stat/s: the object store itself is slow. Keeps firing 15m after it clears, so a dip of the rate guard does not split one episode | warning |
 | `NoraCircuitBreakerOpen` | `nora_circuit_breaker_state == 1` for 1m | critical |
-| `NoraCacheLowHitRate` | hit share of `nora_cache_requests_total` below 50% for 15m | warning |
+| `NoraCacheLowHitRate` | hit share of `nora_cache_requests_total` below 50% for 15m, while cache lookups are above 0.5/s | warning |
 | `NoraUpstreamUrlLeak` | any `nora_response_upstream_url_leak_total` increase for 5m (NuGet catalog0 `@id`s are not counted) | critical |
 | `NoraCacheWriteErrors` | any `nora_cache_write_errors_total` increase in 15m | warning |
 | `NoraSpoolFailures` | any `nora_spool_failures_total` increase in 15m | warning |
