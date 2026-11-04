@@ -1003,8 +1003,9 @@ fn quarantine_record_referenced(
 /// old, so after a restart the manifest serves with no record while an uncached blob of it
 /// would read as new and start a fresh TTL. The date is past the prune line, so nothing is
 /// persisted, and `record` leaves a digest with its own record alone. Not for a local push
-/// (`ns` is `None`: a push never matures a proxy digest), a manifest still held, or while
-/// the ledger loads, when a held manifest has no record either.
+/// (`ns` is `None`: a push never matures a proxy digest), a manifest still held, or a
+/// ledger not read whole (loading, or failed in part), where a held manifest has no record
+/// either.
 fn quarantine_readmit_referenced(
     state: &AppState,
     manifest: &[u8],

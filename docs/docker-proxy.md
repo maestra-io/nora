@@ -56,8 +56,8 @@ is held for the TTL from its first pull.
 A ledger entry older than 90 days is pruned at boot, and a registry date that old is never
 written, so after a restart a cached manifest of an old image has no record. Serving such a
 proxied copy admits what it names, so an uncached blob of it does not start a new TTL. A
-manifest still held, a local push, and any manifest while the ledger is still loading admit
-nothing.
+manifest still held, a local push, and any manifest while the ledger is loading or could not
+be read whole (a failed listing, an unreadable entry) admit nothing.
 
 ### A floating tag under enforce
 
