@@ -295,7 +295,6 @@ impl ObjectStorage {
         path: &Path,
         legacy_path: Option<&Path>,
     ) -> object_store::Result<(Bytes, Option<String>)> {
-        use futures::TryStreamExt;
         let result = match bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get(path)).await {
             Err(object_store::Error::NotFound { .. }) if legacy_path.is_some() => {
                 let legacy = legacy_path.expect("checked");
@@ -304,9 +303,15 @@ impl ObjectStorage {
             other => other?,
         };
         let pin = read_pin(&result.attributes);
-        let chunks = idle_bounded(result.into_stream(), GET_BODY_IDLE).try_collect::<Vec<Bytes>>();
-        let chunks = bounded(BODY_OP_TIMEOUT, chunks).await?;
-        Ok((Bytes::from(chunks.concat()), pin))
+        let size = result.meta.size;
+        // One buffer of the object's size (no second copy), or the chunk itself when the
+        // body arrives in one.
+        let body = object_store::collect_bytes(
+            idle_bounded(result.into_stream(), GET_BODY_IDLE),
+            Some(size),
+        );
+        let body = bounded(BODY_OP_TIMEOUT, body).await?;
+        Ok((body, pin))
     }
 
     /// Create new S3 storage with optional credentials.
@@ -632,9 +637,13 @@ impl StorageBackend for ObjectStorage {
         let legacy_path = key
             .contains('@')
             .then(|| Path::from(encode_object_key_legacy(key)));
-        retry_stalled_body(|| self.get_whole(&path, legacy_path.as_ref()))
-            .await
-            .map_err(map_err)
+        // BODY_OP_TIMEOUT bounds every attempt and all of them together.
+        bounded(
+            BODY_OP_TIMEOUT,
+            retry_stalled_body(|| self.get_whole(&path, legacy_path.as_ref())),
+        )
+        .await
+        .map_err(map_err)
     }
 
     async fn pin(&self, key: &str) -> Option<String> {
