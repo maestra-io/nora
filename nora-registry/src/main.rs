@@ -434,6 +434,21 @@ pub struct ReloadableConfig {
     pub bypass_token: Option<ProtectedString>,
 }
 
+/// deb proxy held versions: young-file key → (loaded at, index → filename → (name,
+/// version, first_seen)).
+pub(crate) type DebYoungCache = HashMap<
+    String,
+    (
+        Instant,
+        Arc<
+            std::collections::BTreeMap<
+                String,
+                std::collections::BTreeMap<String, (String, String, i64)>,
+            >,
+        >,
+    ),
+>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Storage,
@@ -489,6 +504,10 @@ pub struct AppState {
     pub cancel_token: tokio_util::sync::CancellationToken,
     /// In-memory index of hosted NuGet packages (maestra fork).
     pub(crate) nuget_hosted: Arc<registry::NugetHostedIndex>,
+    /// deb proxy: versions held per repository, read on each package download
+    /// (registry/deb_proxy.rs). Per state, so two servers in one process never share it.
+    #[allow(dead_code)] // read only with the deb feature
+    pub(crate) deb_young: Arc<parking_lot::Mutex<DebYoungCache>>,
     /// Off-request-path docker pull-stats accumulator (#1114): a manifest GET
     /// bumps the per-key counter here; a background task flushes it in batches
     /// to a `.stats.json` sidecar, so `.meta.json` is never rewritten by a pull.
@@ -3802,6 +3821,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         leak_finders,
         cancel_token: cancel_token.clone(),
         nuget_hosted: Default::default(),
+        deb_young: Default::default(),
         pull_stats: Arc::new(registry::docker::PullStatsAccumulator::default()),
         tasks,
         maintenance,

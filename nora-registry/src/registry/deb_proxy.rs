@@ -904,11 +904,6 @@ fn release_text(
     out
 }
 
-fn young_cache() -> &'static Mutex<HashMap<String, (Instant, Arc<Young>)>> {
-    static C: OnceLock<Mutex<HashMap<String, (Instant, Arc<Young>)>>> = OnceLock::new();
-    C.get_or_init(Default::default)
-}
-
 async fn update_young(
     state: &AppState,
     repo: &str,
@@ -923,23 +918,26 @@ async fn update_young(
     young.retain(|k, _| !k.starts_with(&prefix));
     young.extend(held.into_iter().filter(|(_, v)| !v.is_empty()));
     put_json(state, &key, &young).await?;
-    if let Ok(mut c) = young_cache().lock() {
-        c.insert(key, (Instant::now(), Arc::new(young)));
-    }
+    state
+        .deb_young
+        .lock()
+        .insert(key, (Instant::now(), Arc::new(young)));
     Ok(())
 }
 
 async fn load_young(state: &AppState, repo: &str) -> Arc<Young> {
     let key = young_key(repo);
-    if let Some((at, y)) = young_cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
+    let cached = state.deb_young.lock().get(&key).cloned();
+    if let Some((at, y)) = cached {
         if at.elapsed() < YOUNG_TTL {
             return y;
         }
     }
     let y: Arc<Young> = Arc::new(get_json(state, &key).await.unwrap_or_default());
-    if let Ok(mut c) = young_cache().lock() {
-        c.insert(key, (Instant::now(), y.clone()));
-    }
+    state
+        .deb_young
+        .lock()
+        .insert(key, (Instant::now(), y.clone()));
     y
 }
 
@@ -1325,7 +1323,21 @@ mod integration_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // The download is cached in the background; the stand-in below needs it stored.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while ctx
+            .state
+            .storage
+            .stat("deb/debian/pool/main/a_1_amd64.deb")
+            .await
+            .is_none()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a 1 never reached the cache"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
 
         // The upstream replaces a 1 and b 1 with new versions and adds c.
         publish(&server, &key, &[("a", "2"), ("b", "2"), ("c", "1")]).await;
@@ -1335,6 +1347,22 @@ mod integration_tests {
             [("a".into(), "1".into())],
             "a falls back to the cached 1; b 1 was never cached; c is new"
         );
+        // Another server in the same process with a repository of the same name and
+        // nothing held: its held set must not replace this one's (it was a process-wide
+        // cache, and this test failed when the 0d test ran beside it).
+        let other_uri = server.uri();
+        let other_dir = keydir.path().to_str().unwrap().to_string();
+        let other = create_test_context_with_config(move |cfg| {
+            cfg.deb.enabled = true;
+            cfg.deb.metadata_ttl = 0;
+            cfg.deb.upstream_keyring_dir = other_dir;
+            cfg.deb
+                .proxies
+                .insert("debian".into(), RepoProxyEntry::Simple(other_uri));
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.deb.min_release_age = Some("0d".into());
+        });
+        served(&other).await;
         let resp = send(
             &ctx.app,
             Method::GET,
