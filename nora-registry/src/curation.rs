@@ -1313,7 +1313,8 @@ fn rule_version_matches(registry: RegistryType, rule: &str, version: &str) -> bo
 /// A package name in the form its registry looks it up: PyPI per PEP 503, NuGet and Terraform
 /// in lowercase (NuGet ids resolve without case; Terraform lowercases provider names and
 /// registry.terraform.io answers provider and module paths in any case), Hugging Face repo ids
-/// in lowercase (the Hub answers `Org/Model` with a redirect to `org/model`), cargo as crates.io's
+/// in lowercase (the Hub answers `Org/Model` with a redirect to `org/model`), GitHub `owner/repo`
+/// in lowercase (GitHub resolves both without case), cargo as crates.io's
 /// `canon_crate_name` (lowercase, `-` as `_`: `Evil-Crate` and `evil_crate` are one crate),
 /// every other registry as written. Requests,
 /// rules, allowlist entries and internal namespaces are compared in this form, so a rule written
@@ -1322,9 +1323,10 @@ fn rule_version_matches(registry: RegistryType, rule: &str, version: &str) -> bo
 pub fn curation_name(registry: RegistryType, name: &str) -> String {
     match registry {
         RegistryType::PyPI => pep503_normalize(name),
-        RegistryType::Nuget | RegistryType::Terraform | RegistryType::HuggingFace => {
-            name.to_lowercase()
-        }
+        RegistryType::Nuget
+        | RegistryType::Terraform
+        | RegistryType::HuggingFace
+        | RegistryType::Github => name.to_lowercase(),
         RegistryType::Cargo => name.to_lowercase().replace('-', "_"),
         _ => name.to_string(),
     }
@@ -6697,6 +6699,15 @@ mod curation_pattern_spec {
                 "{registry:?} {pattern} {name}"
             );
         }
+    }
+
+    /// A rule written `Owner/Repo` holds for the lowercase name the GitHub handler passes.
+    #[test]
+    fn a_github_name_counts_without_case() {
+        assert_eq!(
+            curation_name(RegistryType::Github, "Kubernetes-Sigs/Kustomize"),
+            "kubernetes-sigs/kustomize"
+        );
     }
 
     fn body() -> impl Strategy<Value = String> {
