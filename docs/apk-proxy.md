@@ -39,15 +39,17 @@ public half is derived from it.
 ```sh
 wget -O /etc/apk/keys/packages.example.com.rsa.pub \
   https://packages.example.com/apk/keys/packages.example.com.rsa.pub   # no auth
-echo "https://token:$TOKEN@packages.example.com/apk/alpine/v3.22/main" > /tmp/repos
-apk add --repositories-file /tmp/repos jq
+echo "https://packages.example.com/apk/alpine/v3.22/main" > /tmp/repos
+HTTP_AUTH="basic:*:token:$TOKEN" apk add --repositories-file /tmp/repos jq
 ```
 
 apk appends `/<arch>/APKINDEX.tar.gz` to each repository line; branches (`v3.22`,
 `edge`), repositories (`main`, `community`, `testing`) and architectures are passed
-through. apk 2.x and 3.x mask the password in their output; only apk 3.x reads a
-`.netrc`. Keep the token out of image layers: write the repositories file inside the
-`RUN` that uses it (BuildKit secret mount) and remove it there.
+through. apk's libfetch sends the `HTTP_AUTH` credentials after NORA's 401, on apk 2.x
+and 3.x alike. Do not put the token in the URL (`https://token:$TOKEN@…`): apk-tools
+2.14.6 and older (Alpine 3.21 and older) reject a URL password over about 1 KiB as
+"invalid URL", and a GitHub OIDC token is longer. Keep the token out of image layers:
+read it from a BuildKit secret mount inside the `RUN` that uses it.
 
 ## How a version is chosen
 
