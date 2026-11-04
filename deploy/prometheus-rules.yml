@@ -47,9 +47,12 @@ groups:
           summary: "NORA circuit breaker OPEN for {{ $labels.registry }}"
 
       - alert: NoraCacheLowHitRate
+        # Traffic guard: on 04.11 a few first-time image pulls at 0.05-0.12 rps
+        # made up the whole night traffic and pushed the hit share under 50%.
         expr: >-
           sum(rate(nora_cache_requests_total{result="hit"}[15m]))
           / sum(rate(nora_cache_requests_total[15m])) < 0.5
+          and on() sum(rate(nora_cache_requests_total[15m])) > 0.5
         for: 15m
         labels:
           severity: warning
