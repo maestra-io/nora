@@ -23,6 +23,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -47,7 +48,7 @@ const LOAD_CONCURRENCY: usize = 32;
 const LOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Stale entry TTL: entries older than 90 days are pruned on startup.
-const PRUNE_TTL_SECS: i64 = 90 * 24 * 3600;
+pub(crate) const PRUNE_TTL_SECS: i64 = 90 * 24 * 3600;
 
 // ============================================================================
 // Quarantine Mode
@@ -147,6 +148,9 @@ impl QuarantineStatus {
 pub struct DigestStore {
     entries: Arc<RwLock<HashMap<String, DigestEntry>>>,
     storage: Storage,
+    /// The whole ledger is in `entries`. Until then, or after a load that failed to list or
+    /// read part of it, "no record" says nothing about a digest.
+    loaded: Arc<AtomicBool>,
 }
 
 /// The [`SNAPSHOT_KEY`] document.
@@ -177,10 +181,11 @@ impl DigestStore {
     /// Fail-open: unreadable entries are skipped, a failed listing → empty store.
     pub async fn load(storage: Storage, storage_path: &str) -> Self {
         let legacy = Path::new(storage_path).join(LEDGER_FILE);
-        let entries = load_entries(&storage, &legacy).await;
+        let (entries, whole) = load_entries(&storage, &legacy).await;
         Self {
             entries: Arc::new(RwLock::new(entries)),
             storage,
+            loaded: Arc::new(AtomicBool::new(whole)),
         }
     }
 
@@ -194,12 +199,14 @@ impl DigestStore {
     /// killed the pod in a loop.
     pub fn load_in_background(storage: Storage, storage_path: &str) -> Self {
         let store = Self::empty(storage.clone());
+        store.set_loaded(false);
         let legacy = Path::new(storage_path).join(LEDGER_FILE);
         let entries = Arc::clone(&store.entries);
+        let loaded_flag = Arc::clone(&store.loaded);
         tokio::spawn(async move {
             let started = std::time::Instant::now();
             match tokio::time::timeout(LOAD_DEADLINE, load_entries(&storage, &legacy)).await {
-                Ok(loaded) => {
+                Ok((loaded, whole)) => {
                     let cutoff = Utc::now().timestamp() - PRUNE_TTL_SECS;
                     let mut map = entries.write();
                     for (key, entry) in loaded {
@@ -214,9 +221,11 @@ impl DigestStore {
                     // A record() that adopted a stale object the walk then pruned
                     // would read as Mature until restart: apply the same cutoff here.
                     map.retain(|_, entry| entry.first_seen >= cutoff);
+                    loaded_flag.store(whole, Ordering::Release);
                     info!(
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         entries = map.len(),
+                        whole,
                         "Quarantine store merged into the live map"
                     );
                 }
@@ -234,7 +243,17 @@ impl DigestStore {
         Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
             storage,
+            loaded: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// Whether the whole ledger is in memory, so that a digest with no record really has none.
+    pub fn loaded(&self) -> bool {
+        self.loaded.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_loaded(&self, loaded: bool) {
+        self.loaded.store(loaded, Ordering::Release);
     }
 
     /// Record a proxy-fetched digest. Returns the entry (existing or new).
@@ -712,10 +731,11 @@ pub(crate) async fn import_jsonl(
     (written, already, failed)
 }
 
-/// [`DigestStore::load`]: the map keyed `registry:digest`.
-async fn load_entries(storage: &Storage, legacy: &Path) -> HashMap<String, DigestEntry> {
+/// [`DigestStore::load`]: the map keyed `registry:digest`, and whether it is the whole
+/// ledger: false after a failed listing or a listed entry that could not be read.
+async fn load_entries(storage: &Storage, legacy: &Path) -> (HashMap<String, DigestEntry>, bool) {
     let Some(mut listed) = list_entries(storage).await else {
-        return HashMap::new();
+        return (HashMap::new(), false);
     };
     // Snapshot entries by object key, plus what the import below writes.
     let (mut known, masked) = read_snapshot(storage).await;
@@ -770,14 +790,21 @@ async fn load_entries(storage: &Storage, legacy: &Path) -> HashMap<String, Diges
     let cutoff = Utc::now().timestamp() - PRUNE_TTL_SECS;
     let mut entries = HashMap::new();
     let mut stale = Vec::new();
+    let mut unread = 0usize;
     for key in listed {
         match known.remove(&key) {
             Some(entry) if entry.first_seen < cutoff => stale.push(key),
             Some(entry) => {
                 entries.insert(map_key(&entry.registry, &entry.digest), entry);
             }
-            None => {}
+            None => unread += 1,
         }
+    }
+    if unread > 0 {
+        error!(
+            unread,
+            "Quarantine entries could not be read: the ledger is incomplete until a restart"
+        );
     }
     let pruned = stale.len();
     futures::stream::iter(stale)
@@ -840,7 +867,7 @@ async fn load_entries(storage: &Storage, legacy: &Path) -> HashMap<String, Diges
         pruned = pruned,
         "Quarantine store loaded"
     );
-    entries
+    (entries, unread == 0)
 }
 
 // ============================================================================
@@ -1187,6 +1214,45 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = DigestStore::load(storage(&tmp), tmp.path().to_str().unwrap()).await;
         assert_eq!(store.len(), 0);
+    }
+
+    /// "No record" means something only for a ledger read whole: a failed listing or an
+    /// unreadable entry leaves the store serving, and not loaded.
+    #[tokio::test]
+    async fn only_a_ledger_read_whole_is_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+        assert!(DigestStore::load(storage(&tmp), path).await.loaded());
+
+        let (failing, outage) = crate::test_helpers::outage_storage();
+        outage.fail_listings_of(ENTRY_PREFIX);
+        assert!(!DigestStore::load(failing, path).await.loaded());
+
+        storage(&tmp)
+            .put(".nora-quarantine/docker/sha256:bad", b"not json")
+            .await
+            .unwrap();
+        assert!(!DigestStore::load(storage(&tmp), path).await.loaded());
+    }
+
+    #[tokio::test]
+    async fn a_background_load_is_loaded_only_when_read_whole() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+        let whole = DigestStore::load_in_background(storage(&tmp), path);
+        for _ in 0..200 {
+            if whole.loaded() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(whole.loaded());
+
+        let (failing, outage) = crate::test_helpers::outage_storage();
+        outage.fail_listings_of(ENTRY_PREFIX);
+        let partial = DigestStore::load_in_background(failing, path);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!partial.loaded());
     }
 
     #[tokio::test]

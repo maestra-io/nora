@@ -998,6 +998,60 @@ fn quarantine_record_referenced(
     }
 }
 
+/// Admit what a cached proxied manifest names when the manifest itself is admitted. A
+/// ledger entry past 90 days is pruned at boot, or never written for a registry date that
+/// old, so after a restart the manifest serves with no record while an uncached blob of it
+/// would read as new and start a fresh TTL. The date is past the prune line, so nothing is
+/// persisted, and `record` leaves a digest with its own record alone. Not for a local push
+/// (`ns` is `None`: a push never matures a proxy digest), a manifest still held, or a
+/// ledger not read whole (loading, or failed in part), where a held manifest has no record
+/// either.
+fn quarantine_readmit_referenced(
+    state: &AppState,
+    manifest: &[u8],
+    digest: &str,
+    ns: Option<&str>,
+) {
+    let (q_mode, q_secs) = resolve_quarantine(state);
+    let Some(ns) = ns.filter(|_| state.digest_store.loaded()) else {
+        return;
+    };
+    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off)
+        || matches!(
+            state.digest_store.check("docker", digest, q_secs),
+            crate::digest_quarantine::QuarantineStatus::Pending { .. }
+        )
+    {
+        return;
+    }
+    let long_ago = chrono::Utc::now().timestamp() - crate::digest_quarantine::PRUNE_TTL_SECS - 1;
+    quarantine_record_referenced(state, manifest, ns, long_ago);
+}
+
+/// Whether `copy`, the cached answer for tag `reference`, may stand in for `held`, the
+/// digest the tag moved to: a different manifest that is not itself held. A digest with no
+/// ledger record reads as admitted, as on the cache-serve gate: its record was pruned past
+/// 90 days, or it was cached before the quarantine was on. A digest reference never falls
+/// back: it asks for those bytes and no others.
+fn admitted_copy(
+    state: &AppState,
+    reference: &str,
+    copy: &[u8],
+    held: &str,
+    quarantine_secs: i64,
+) -> bool {
+    use sha2::Digest;
+    if reference.starts_with("sha256:") {
+        return false;
+    }
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(copy)));
+    digest != held
+        && !matches!(
+            state.digest_store.check("docker", &digest, quarantine_secs),
+            crate::digest_quarantine::QuarantineStatus::Pending { .. }
+        )
+}
+
 /// Docker v2 routes.
 /// Uses a `{*rest}` wildcard to support image names with arbitrary path depth
 /// (e.g., `library/astra/ubi18-cpp122`), per OCI Distribution spec.
@@ -2149,6 +2203,8 @@ async fn upload_blob(
 /// `None` if all upstreams failed.
 /// `rate_limited` is set to the upstream `Retry-After` (if any) when an upstream
 /// answered 429, so the caller can report throttling rather than a missing manifest.
+/// `cached` is the copy held under `cache_key` and the namespace it is served from: a tag
+/// that moved to a held digest falls back to it ([`admitted_copy`]).
 #[allow(clippy::too_many_arguments)]
 async fn try_fetch_and_cache(
     state: &AppState,
@@ -2158,6 +2214,7 @@ async fn try_fetch_and_cache(
     name: &str,
     reference: &str,
     cache_key: &str,
+    cached: Option<(&Bytes, Option<&str>)>,
     rate_limited: &mut Option<Option<String>>,
 ) -> Option<Response> {
     for (upstream, miss) in upstreams.iter().zip(misses.iter_mut()) {
@@ -2209,6 +2266,7 @@ async fn try_fetch_and_cache(
 
                 // Quarantine: record digest, check status
                 let (q_mode, q_secs) = resolve_quarantine(state);
+                let mut keep_tag_copy = false;
                 if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
                     let first_sight = matches!(
                         state.digest_store.check("docker", &digest, q_secs),
@@ -2228,6 +2286,7 @@ async fn try_fetch_and_cache(
                             upstream_name,
                             reference,
                             &digest,
+                            &data,
                         )
                         .await
                         .map(|at| (at, source.label()));
@@ -2289,15 +2348,45 @@ async fn try_fetch_and_cache(
                             );
                         }
                     }
-                    // In enforce mode, still cache but block the client
-                    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce)
-                        && !matches!(q_status, crate::digest_quarantine::QuarantineStatus::Mature)
-                    {
+                    let enforce =
+                        matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce);
+                    let held =
+                        !matches!(q_status, crate::digest_quarantine::QuarantineStatus::Mature);
+                    let admitted = cached
+                        .filter(|_| held)
+                        .filter(|(copy, _)| admitted_copy(state, reference, copy, &digest, q_secs));
+                    keep_tag_copy = admitted.is_some();
+                    if held && !reference.starts_with("sha256:") {
+                        let outcome = match (enforce, admitted.is_some()) {
+                            (true, true) => "fallback",
+                            (true, false) => "blocked",
+                            (false, true) => "would_fallback",
+                            (false, false) => "would_block",
+                        };
+                        crate::metrics::DOCKER_QUARANTINE_TAG_HELD_TOTAL
+                            .with_label_values(&[upstream.resolved_namespace().as_str(), outcome])
+                            .inc();
+                        tracing::warn!(
+                            name = %upstream_name,
+                            tag = %reference,
+                            held = %digest,
+                            outcome,
+                            "Quarantine: tag moved to a held digest"
+                        );
+                    }
+                    // In enforce mode, still cache by digest, but the client gets the tag's
+                    // admitted copy or a refusal. The tag copy stays: it is the fallback.
+                    if enforce && held {
                         let storage = state.storage.clone();
-                        let key_clone = cache_key.to_string();
+                        let key_clone = manifest_key(
+                            Some(upstream.resolved_namespace().as_str()),
+                            name,
+                            &digest,
+                        );
                         let repo_index = Arc::clone(&state.repo_index);
+                        let held_data = data.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = storage.put(&key_clone, &data).await {
+                            if let Err(e) = storage.put(&key_clone, &held_data).await {
                                 tracing::warn!(key = %key_clone, error = %e, "cache write failed (quarantine pre-cache)");
                                 crate::metrics::CACHE_WRITE_ERRORS
                                     .with_label_values(&["docker", "manifest"])
@@ -2305,7 +2394,21 @@ async fn try_fetch_and_cache(
                             }
                             repo_index.invalidate("docker");
                         });
-                        return Some(quarantine_forbidden(&digest, &q_status, q_secs));
+                        let Some((copy, ns)) = admitted else {
+                            return Some(quarantine_forbidden(&digest, &q_status, q_secs));
+                        };
+                        let mut response = serve_cached_manifest(state, copy, name, reference, ns);
+                        let until = entry.first_seen + q_secs;
+                        if let Ok(value) = axum::http::HeaderValue::from_str(&digest) {
+                            response
+                                .headers_mut()
+                                .insert(HeaderName::from_static("x-nora-quarantine-held"), value);
+                        }
+                        response.headers_mut().insert(
+                            HeaderName::from_static("x-nora-quarantine-held-until"),
+                            axum::http::HeaderValue::from(until),
+                        );
+                        return Some(response);
                     }
                 }
 
@@ -2320,8 +2423,12 @@ async fn try_fetch_and_cache(
                 let repo_index = Arc::clone(&state.repo_index);
                 let state_clone = state.clone();
                 tokio::spawn(async move {
-                    // Store manifest by tag and digest (namespaced)
-                    if let Err(e) = storage.put(&key_clone, &data_clone).await {
+                    // Store manifest by tag and digest (namespaced). A held digest does not
+                    // replace the admitted tag copy under observe either, so a tag that
+                    // moved just before enforce still has one behind it.
+                    if keep_tag_copy {
+                        tracing::debug!(key = %key_clone, "tag copy kept: the new digest is held");
+                    } else if let Err(e) = storage.put(&key_clone, &data_clone).await {
                         tracing::warn!(key = %key_clone, error = %e, "cache write failed (manifest by tag)");
                         crate::metrics::CACHE_WRITE_ERRORS
                             .with_label_values(&["docker", "manifest"])
@@ -2690,6 +2797,7 @@ async fn get_manifest(
         .iter()
         .map(|_| UpstreamMiss::default())
         .collect();
+    let copy = cached.as_ref().map(|data| (data, served_ns));
     if let Some(response) = try_fetch_and_cache(
         &state,
         &upstreams_to_try,
@@ -2698,6 +2806,7 @@ async fn get_manifest(
         &name,
         &reference,
         &key,
+        copy,
         &mut rate_limited,
     )
     .await
@@ -2717,6 +2826,7 @@ async fn get_manifest(
             &name,
             &reference,
             &key,
+            copy,
             &mut rate_limited,
         )
         .await
@@ -2820,6 +2930,7 @@ fn serve_cached_manifest(
     if let Some(resp) = quarantine_cache_serve_gate(state, &digest) {
         return resp;
     }
+    quarantine_readmit_referenced(state, data, &digest, ns);
 
     // Detect manifest media type from content
     let content_type = detect_manifest_media_type(data);
@@ -11116,6 +11227,7 @@ mod integration_tests {
     /// short of a usable past date leaves NORA's first-seen. Driven through quay.io's
     /// tag API (`/api/v1/repository/<repo>/tag/`), which the upstream host serves itself.
     mod trust_upstream_dates {
+        use super::super::manifest_key;
         use super::*;
         use crate::config::DockerUpstream;
         use crate::digest_quarantine::QuarantineMode;
@@ -11251,6 +11363,155 @@ mod integration_tests {
             assert_eq!(
                 entry.first_seen, pushed,
                 "the clock starts at the registry's date"
+            );
+        }
+
+        /// A floating tag at `library/demo:v1` that answers `body`, replacing what the
+        /// upstream served before: the tag moved.
+        async fn tag_answers(server: &MockServer, body: &[u8]) {
+            server.reset().await;
+            for route in ["v1".to_string(), sha(body)] {
+                Mock::given(method("GET"))
+                    .and(path(format!("/v2/library/demo/manifests/{route}")))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header(
+                                "Content-Type",
+                                "application/vnd.oci.image.manifest.v1+json",
+                            )
+                            .set_body_bytes(body.to_vec()),
+                    )
+                    .mount(server)
+                    .await;
+            }
+        }
+
+        fn moved_manifest() -> Vec<u8> {
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":1},"layers":[]}"#.to_vec()
+        }
+
+        /// `v1` cached at `image`, a digest past the TTL. The cache write is off the request
+        /// path, so wait for it.
+        async fn mature_tag_cached(ctx: &TestContext, image: &[u8]) {
+            ctx.state
+                .digest_store
+                .record("docker", &sha(image), "x", Some(days_ago(30)));
+            assert_eq!(get(ctx, "manifests/v1").await, StatusCode::OK);
+            let key = manifest_key(Some("quay.io"), "library/demo", "v1");
+            for _ in 0..200 {
+                if ctx.state.storage.get(&key).await.is_ok() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("tag copy never cached");
+        }
+
+        async fn manifest(ctx: &TestContext, rest: &str) -> Response {
+            let uri = format!("/v2/library/demo/{rest}");
+            send(&ctx.app, Method::GET, &uri, Body::empty()).await
+        }
+
+        fn header<'a>(resp: &'a Response, name: &str) -> Option<&'a str> {
+            resp.headers().get(name).and_then(|v| v.to_str().ok())
+        }
+
+        /// Enforce on a floating tag: the tag keeps the digest that was admitted until the
+        /// new one matures, and says which digest it is holding back.
+        #[tokio::test]
+        async fn a_moved_tag_keeps_its_mature_digest_under_enforce() {
+            let (server, image, _) = upstream_with_image().await;
+            let ctx = context(&server, false, QuarantineMode::Enforce);
+            mature_tag_cached(&ctx, &image).await;
+            let moved = moved_manifest();
+            tag_answers(&server, &moved).await;
+
+            let resp = manifest(&ctx, "manifests/v1").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                header(&resp, "docker-content-digest"),
+                Some(sha(&image).as_str())
+            );
+            assert_eq!(header(&resp, "x-nora-quarantine"), Some("mature"));
+            assert_eq!(
+                header(&resp, "x-nora-quarantine-held"),
+                Some(sha(&moved).as_str())
+            );
+            assert!(header(&resp, "x-nora-quarantine-held-until").is_some());
+
+            // Asked for by digest, the held manifest stays refused, and asking again by
+            // tag still answers the mature one.
+            assert_eq!(
+                get(&ctx, &format!("manifests/{}", sha(&moved))).await,
+                StatusCode::FORBIDDEN
+            );
+            let again = manifest(&ctx, "manifests/v1").await;
+            assert_eq!(
+                header(&again, "docker-content-digest"),
+                Some(sha(&image).as_str())
+            );
+        }
+
+        /// A previous digest that is itself still held is no fallback.
+        #[tokio::test]
+        async fn a_moved_tag_with_only_a_held_digest_behind_it_is_refused() {
+            let (server, image, _) = upstream_with_image().await;
+            let ctx = context(&server, false, QuarantineMode::Enforce);
+            mature_tag_cached(&ctx, &image).await;
+            let key = manifest_key(Some("quay.io"), "library/demo", "v1");
+            let held = b"{\"schemaVersion\":2,\"layers\":[]}".to_vec();
+            ctx.state
+                .digest_store
+                .record("docker", &sha(&held), "x", Some(days_ago(1)));
+            ctx.state.storage.put(&key, &held).await.unwrap();
+            tag_answers(&server, &moved_manifest()).await;
+            assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::FORBIDDEN);
+        }
+
+        /// Once the new digest is past the TTL the tag moves to it.
+        #[tokio::test]
+        async fn a_moved_tag_follows_the_new_digest_when_it_matures() {
+            let (server, image, _) = upstream_with_image().await;
+            let ctx = context(&server, false, QuarantineMode::Enforce);
+            mature_tag_cached(&ctx, &image).await;
+            let moved = moved_manifest();
+            ctx.state
+                .digest_store
+                .record("docker", &sha(&moved), "x", Some(days_ago(4)));
+            tag_answers(&server, &moved).await;
+            let resp = manifest(&ctx, "manifests/v1").await;
+            assert_eq!(
+                header(&resp, "docker-content-digest"),
+                Some(sha(&moved).as_str())
+            );
+            assert_eq!(header(&resp, "x-nora-quarantine-held"), None);
+        }
+
+        /// Observe serves the new digest as before, but the tag copy stays the admitted
+        /// one: otherwise a tag that moved in the days before enforce has nothing behind it.
+        #[tokio::test]
+        async fn observe_serves_a_moved_tag_and_keeps_the_mature_copy() {
+            let (server, image, _) = upstream_with_image().await;
+            let ctx = context(&server, false, QuarantineMode::Observe);
+            mature_tag_cached(&ctx, &image).await;
+            let moved = moved_manifest();
+            tag_answers(&server, &moved).await;
+            let resp = manifest(&ctx, "manifests/v1").await;
+            assert_eq!(
+                header(&resp, "docker-content-digest"),
+                Some(sha(&moved).as_str())
+            );
+            let digest_key = manifest_key(Some("quay.io"), "library/demo", &sha(&moved));
+            for _ in 0..200 {
+                if ctx.state.storage.get(&digest_key).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            let key = manifest_key(Some("quay.io"), "library/demo", "v1");
+            assert_eq!(
+                ctx.state.storage.get(&key).await.unwrap().as_ref(),
+                &image[..]
             );
         }
 
@@ -11397,9 +11658,77 @@ mod integration_tests {
             }
         }
 
-        /// Off by default, and a digest reference has no tag to ask quay about.
+        /// A ledger entry older than 90 days is gone after a restart, while the manifest
+        /// stays cached. What an admitted copy names is admitted with it: an uncached blob
+        /// of an old image must not start a new TTL, through an index and its platform too.
         #[tokio::test]
-        async fn no_lookup_without_trust_or_without_a_tag() {
+        async fn a_cached_manifest_without_a_record_admits_what_it_names() {
+            let (server, image, layer) = upstream_with_image().await;
+            let index = format!(
+                r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{}","size":1}}]}}"#,
+                sha(&image)
+            )
+            .into_bytes();
+            let ctx = context(&server, false, QuarantineMode::Enforce);
+            for body in [&index, &image] {
+                let key = manifest_key(Some("quay.io"), "library/demo", &sha(body));
+                ctx.state.storage.put(&key, body).await.unwrap();
+            }
+            for rest in [
+                format!("manifests/{}", sha(&index)),
+                format!("manifests/{}", sha(&image)),
+                format!("blobs/{}", sha(&layer)),
+            ] {
+                assert_eq!(get(&ctx, &rest).await, StatusCode::OK, "{rest}");
+            }
+        }
+
+        /// A copy still held admits nothing, under observe too, where it is served.
+        #[tokio::test]
+        async fn a_held_cached_manifest_admits_nothing() {
+            let (server, image, layer) = upstream_with_image().await;
+            let ctx = context(&server, false, QuarantineMode::Observe);
+            let key = manifest_key(Some("quay.io"), "library/demo", &sha(&image));
+            ctx.state.storage.put(&key, &image).await.unwrap();
+            ctx.state
+                .digest_store
+                .record("docker", &sha(&image), "x", Some(days_ago(1)));
+            assert_eq!(
+                get(&ctx, &format!("manifests/{}", sha(&image))).await,
+                StatusCode::OK
+            );
+            assert!(matches!(
+                ctx.state
+                    .digest_store
+                    .check("docker", &sha(&layer), 3 * 86400),
+                crate::digest_quarantine::QuarantineStatus::New
+            ));
+        }
+
+        /// While the ledger loads a held manifest reads as unrecorded too: nothing is
+        /// admitted until it is known.
+        #[tokio::test]
+        async fn nothing_is_admitted_while_the_ledger_loads() {
+            let (server, image, layer) = upstream_with_image().await;
+            let ctx = context(&server, false, QuarantineMode::Enforce);
+            ctx.state.digest_store.set_loaded(false);
+            let key = manifest_key(Some("quay.io"), "library/demo", &sha(&image));
+            ctx.state.storage.put(&key, &image).await.unwrap();
+            assert_eq!(
+                get(&ctx, &format!("manifests/{}", sha(&image))).await,
+                StatusCode::OK
+            );
+            assert!(matches!(
+                ctx.state
+                    .digest_store
+                    .check("docker", &sha(&layer), 3 * 86400),
+                crate::digest_quarantine::QuarantineStatus::New
+            ));
+        }
+
+        /// Off by default.
+        #[tokio::test]
+        async fn no_lookup_without_trust() {
             let (server, image, _) = upstream_with_image().await;
             Mock::given(method("GET"))
                 .and(path(TAG_API))
@@ -11411,9 +11740,50 @@ mod integration_tests {
                 .await;
             let untrusted = context(&server, false, QuarantineMode::Enforce);
             assert_eq!(get(&untrusted, "manifests/v1").await, StatusCode::FORBIDDEN);
-            let by_digest = context(&server, true, QuarantineMode::Enforce);
             assert_eq!(
-                get(&by_digest, &format!("manifests/{}", sha(&image))).await,
+                get(&untrusted, &format!("manifests/{}", sha(&image))).await,
+                StatusCode::FORBIDDEN
+            );
+        }
+
+        /// A digest reference names no tag, so the repository's tags are searched for it.
+        #[tokio::test]
+        async fn a_digest_reference_is_dated_by_the_tag_that_names_it() {
+            let (server, image, layer) = upstream_with_image().await;
+            Mock::given(method("GET"))
+                .and(path(TAG_API))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(quay_tag(&sha(&image), days_ago(30))),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let ctx = context(&server, true, QuarantineMode::Enforce);
+            let by_digest = format!("manifests/{}", sha(&image));
+            assert_eq!(get(&ctx, &by_digest).await, StatusCode::OK);
+            assert_eq!(
+                get(&ctx, &format!("blobs/{}", sha(&layer))).await,
+                StatusCode::OK
+            );
+            assert_eq!(get(&ctx, &by_digest).await, StatusCode::OK, "asked once");
+        }
+
+        /// A digest no tag names stays first-seen, after a bounded search: untagged says
+        /// nothing about its age.
+        #[tokio::test]
+        async fn a_digest_no_tag_names_is_held_after_a_bounded_search() {
+            let (server, image, _) = upstream_with_image().await;
+            let mut page = quay_tag(&sha(b"another manifest"), days_ago(30));
+            page["has_additional"] = true.into();
+            Mock::given(method("GET"))
+                .and(path(TAG_API))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page))
+                .expect(3)
+                .mount(&server)
+                .await;
+            let ctx = context(&server, true, QuarantineMode::Enforce);
+            assert_eq!(
+                get(&ctx, &format!("manifests/{}", sha(&image))).await,
                 StatusCode::FORBIDDEN
             );
         }

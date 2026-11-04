@@ -168,6 +168,17 @@ pub static DOCKER_QUARANTINE_FIRST_SIGHT_TOTAL: LazyLock<IntCounterVec> = LazyLo
     .expect("failed to create DOCKER_QUARANTINE_FIRST_SIGHT_TOTAL metric at startup")
 });
 
+/// A tag that moved to a digest the quarantine holds. `fallback` served the admitted copy,
+/// `blocked` had none and refused; `would_fallback` and `would_block` are the same under observe.
+pub static DOCKER_QUARANTINE_TAG_HELD_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_docker_quarantine_tag_held_total",
+        "Docker tag requests that resolved to a held digest, by upstream and outcome",
+        &["upstream", "outcome"]
+    )
+    .expect("failed to create DOCKER_QUARANTINE_TAG_HELD_TOTAL metric at startup")
+});
+
 /// Conditional revalidations where upstream answered 304 Not Modified — the
 /// cached body was reused and no body bytes were downloaded (#596).
 pub static PROXY_UPSTREAM_304_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
