@@ -73,8 +73,10 @@ building on the day the upstream patches it.
 | digest of a held manifest | any | 403 |
 
 A held digest never replaces the admitted tag copy, under `observe` too, so a tag that moved
-in the days before switching to `enforce` still has a copy behind it. Each such request logs
-`Quarantine: tag moved to a held digest` and counts
+in the days before switching to `enforce` still has a copy behind it. A tag that moved before
+1.4.3-maestra.5 lost that copy, so it stays `would_block` until its digest matures. Every fetch
+of a tag that resolves to a held digest, moved or not, logs
+`Quarantine: tag resolves to a held digest` and counts
 `nora_docker_quarantine_tag_held_total{upstream, outcome}`: `fallback` and `blocked` under
 `enforce`, `would_fallback` and `would_block` under `observe`.
 
