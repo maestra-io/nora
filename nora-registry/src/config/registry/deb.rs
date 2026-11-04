@@ -15,6 +15,8 @@ pub struct DebConfig {
     /// Pull-through repos: local repo name → upstream apt repo URL. A repo
     /// listed here is read-only (no publish/delete/reindex); upstream metadata
     /// is served verbatim under `metadata_ttl`, packages are cached forever.
+    /// maestra: with `[curation.deb] min_release_age` set, NORA builds and signs the
+    /// indexes itself instead (registry/deb_proxy.rs, docs/deb-proxy.md).
     #[serde(default)]
     pub proxies: BTreeMap<String, RepoProxyEntry>,
     #[serde(default = "super::super::default_timeout")]
@@ -23,6 +25,18 @@ pub struct DebConfig {
     /// not a `.deb`/`.udeb`); a non-positive value revalidates every pull.
     #[serde(default = "super::super::default_metadata_ttl")]
     pub metadata_ttl: i64,
+    /// maestra: architectures whose binary indexes a filtered proxy (`[curation.deb]
+    /// min_release_age` set) builds; others are left out of its Release.
+    #[serde(default = "default_deb_architectures")]
+    pub architectures: Vec<String>,
+    /// maestra: directory of the upstream archive keys (`*.gpg`/`*.pgp` keyrings or
+    /// `*.asc`); a filtered proxy refuses an upstream `InRelease` none of them signed.
+    #[serde(default)]
+    pub upstream_keyring_dir: String,
+}
+
+fn default_deb_architectures() -> Vec<String> {
+    vec!["amd64".to_string(), "arm64".to_string()]
 }
 
 fn default_deb_max_file_size() -> u64 {
@@ -37,6 +51,8 @@ impl Default for DebConfig {
             proxies: BTreeMap::new(),
             proxy_timeout: 30,
             metadata_ttl: 300,
+            architectures: default_deb_architectures(),
+            upstream_keyring_dir: String::new(),
         }
     }
 }
@@ -57,6 +73,16 @@ impl DebConfig {
         }
         if let Ok(val) = env::var("NORA_DEB_METADATA_TTL") {
             super::super::parse_env_warn("NORA_DEB_METADATA_TTL", &val, &mut self.metadata_ttl);
+        }
+        if let Ok(val) = env::var("NORA_DEB_ARCHITECTURES") {
+            self.architectures = val
+                .split(',')
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+                .collect();
+        }
+        if let Ok(val) = env::var("NORA_DEB_UPSTREAM_KEYRING_DIR") {
+            self.upstream_keyring_dir = val;
         }
     }
 }
