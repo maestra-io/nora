@@ -18,6 +18,7 @@ proxy_timeout = 30
 
 [apk.proxies]
 alpine = "https://dl-cdn.alpinelinux.org/alpine"
+corretto = "https://apk.corretto.aws"   # flat: <arch>/APKINDEX.tar.gz at the root
 
 [curation.apk]
 min_release_age = "3d"   # held back by the build time `t:` in the signed index
@@ -45,7 +46,9 @@ HTTP_AUTH="basic:*:token:$TOKEN" apk add --repositories-file /tmp/repos jq
 
 apk appends `/<arch>/APKINDEX.tar.gz` to each repository line; branches (`v3.22`,
 `edge`), repositories (`main`, `community`, `testing`) and architectures are passed
-through. apk's libfetch sends the `HTTP_AUTH` credentials after NORA's 401, on apk 2.x
+through. A flat repository (`/apk/corretto` for `https://apk.corretto.aws`) has no
+branch or repository segment; its signing key (`amazoncorretto.rsa.pub`) goes in
+`upstream_keys_dir` next to Alpine's. apk's libfetch sends the `HTTP_AUTH` credentials after NORA's 401, on apk 2.x
 and 3.x alike. Do not put the token in the URL (`https://token:$TOKEN@…`): apk-tools
 2.14.6 and older (Alpine 3.21 and older) reject a URL password over about 1 KiB as
 "invalid URL", and a GitHub OIDC token is longer. Keep the token out of image layers:

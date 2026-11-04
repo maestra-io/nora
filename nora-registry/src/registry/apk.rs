@@ -7,6 +7,8 @@
 //!   GET /apk/keys/{key_name}                               — NORA's public key (no auth)
 //!   GET /apk/{name}/{branch}/{repo}/{arch}/APKINDEX.tar.gz — the upstream index, filtered
 //!   GET /apk/{name}/{branch}/{repo}/{arch}/{pkg}-{ver}.apk — a package
+//!   GET /apk/{name}/{arch}/...                             — the same for a flat repository
+//!                                                            (apk.corretto.aws)
 //!
 //! The upstream index is refused unless one of `upstream_keys_dir`'s keys verifies its
 //! signature. It is kept as JSON (`apk/index/...json`) with every entry the upstream has
@@ -24,8 +26,9 @@
 //! verifies), cached under `apk/pkgs/` and held by the digest quarantine like any proxy
 //! artifact, seeded from the signed build time with `server.trust_upstream_dates`.
 //!
-//! Client (`/etc/apk/repositories`):
-//!   https://token:<token>@nora.example.com/apk/alpine/v3.22/main
+//! Client: `https://nora.example.com/apk/alpine/v3.22/main` as the repository, the token
+//! in `HTTP_AUTH="basic:*:token:<token>"` (apk-tools <= 2.14.6 rejects a URL password over
+//! ~1 KiB, and a GitHub OIDC token is longer).
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
@@ -69,6 +72,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/apk/keys/{file}", get(public_key))
         .route("/apk/{name}/{branch}/{repo}/{arch}/{file}", get(file))
+        .route("/apk/{name}/{arch}/{file}", get(flat_file))
 }
 
 // ── Index model ───────────────────────────────────────────────────────────────
@@ -513,37 +517,35 @@ fn quarantine(state: &AppState) -> (crate::digest_quarantine::QuarantineMode, i6
     )
 }
 
-/// `/{branch}/{repo}/{arch}` of a request, validated.
+/// `/{branch}/{repo}/{arch}` of a request, validated; `/{arch}` alone for a flat
+/// repository (apk.corretto.aws keeps `<arch>/APKINDEX.tar.gz` at its root).
 struct RepoPath {
     name: String,
-    branch: String,
-    repo: String,
-    arch: String,
+    /// `branch/repo/arch`, or `arch`.
+    dir: String,
 }
 
 impl RepoPath {
+    fn new(name: String, segments: &[&str]) -> Option<Self> {
+        segments
+            .iter()
+            .all(|s| is_valid_segment(s))
+            .then(|| RepoPath {
+                name,
+                dir: segments.join("/"),
+            })
+    }
+
     fn index_key(&self) -> String {
-        format!(
-            "apk/index/{}/{}/{}/{}.json",
-            self.name, self.branch, self.repo, self.arch
-        )
+        format!("apk/index/{}/{}.json", self.name, self.dir)
     }
 
     fn package_key(&self, file: &str) -> String {
-        format!(
-            "apk/pkgs/{}/{}/{}/{}/{file}",
-            self.name, self.branch, self.repo, self.arch
-        )
+        format!("apk/pkgs/{}/{}/{file}", self.name, self.dir)
     }
 
     fn upstream_url(&self, up: &RepoProxyEntry, file: &str) -> String {
-        format!(
-            "{}/{}/{}/{}/{file}",
-            up.url().trim_end_matches('/'),
-            self.branch,
-            self.repo,
-            self.arch
-        )
+        format!("{}/{}/{file}", up.url().trim_end_matches('/'), self.dir)
     }
 }
 
@@ -698,22 +700,35 @@ async fn file(
     headers: HeaderMap,
     Path((name, branch, repo, arch, file)): Path<(String, String, String, String, String)>,
 ) -> Response {
-    let Some(up) = upstream(&state, &name) else {
+    let path = RepoPath::new(name, &[&branch, &repo, &arch]);
+    serve(&state, &headers, path, &file).await
+}
+
+async fn flat_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((name, arch, file)): Path<(String, String, String)>,
+) -> Response {
+    let path = RepoPath::new(name, &[&arch]);
+    serve(&state, &headers, path, &file).await
+}
+
+async fn serve(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: Option<RepoPath>,
+    file: &str,
+) -> Response {
+    let Some(path) = path else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if ![&branch, &repo, &arch].iter().all(|s| is_valid_segment(s)) {
+    let Some(up) = upstream(state, &path.name) else {
         return StatusCode::NOT_FOUND.into_response();
-    }
-    let path = RepoPath {
-        name,
-        branch,
-        repo,
-        arch,
     };
     if file == "APKINDEX.tar.gz" {
-        index(&state, &path, up).await
-    } else if file.ends_with(".apk") && is_valid_token(&file) {
-        package(&state, &headers, &path, up, &file).await
+        index(state, &path, up).await
+    } else if file.ends_with(".apk") && is_valid_token(file) {
+        package(state, headers, &path, up, file).await
     } else {
         StatusCode::NOT_FOUND.into_response()
     }
@@ -866,10 +881,7 @@ async fn package(
     let publish_date = Some(entry.built).filter(|_| state.config.server.trust_upstream_dates);
     let (q_mode, q_secs) = quarantine(state);
     let key = path.package_key(file);
-    let label = format!(
-        "{}/{}/{}/{}/{file}",
-        path.name, path.branch, path.repo, path.arch
-    );
+    let label = format!("{}/{}/{file}", path.name, path.dir);
 
     let cached_copy = match crate::registry::read_cached_artifact(state, "apk", &key, false).await {
         Ok(copy) => copy,
@@ -1405,6 +1417,67 @@ mod integration_tests {
             StatusCode::NOT_FOUND,
             "only files an index lists"
         );
+    }
+
+    #[tokio::test]
+    async fn serves_a_flat_repository() {
+        // apk.corretto.aws: `<arch>/APKINDEX.tar.gz` at the root, no branch or repo.
+        let up_keys = key_files("alpine-test.rsa.pub");
+        let own_keys = key_files("nora-test.rsa.pub");
+        let signer = upstream_signer(&up_keys, &own_keys);
+        let (jdk, jdk_id) = package("jdk", b"jdk");
+        let server = MockServer::start().await;
+        let entries = [super::tests::entry(
+            "jdk",
+            "17-r0",
+            now() - 30 * DAY,
+            &jdk_id,
+        )];
+        mount(
+            &server,
+            "/x86_64/APKINDEX.tar.gz",
+            upstream_index(&signer, &entries),
+        )
+        .await;
+        mount(&server, "/x86_64/jdk-17-r0.apk", jdk.clone()).await;
+
+        let mut cfg_apk = config(&up_keys, &own_keys);
+        cfg_apk
+            .proxies
+            .insert("corretto".into(), RepoProxyEntry::Simple(server.uri()));
+        let apk = cfg_apk.clone();
+        let ctx = create_test_context_with_config(|cfg| cfg.apk = apk);
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/apk/corretto/x86_64/APKINDEX.tar.gz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let own = super::keys(&cfg_apk).unwrap();
+        let mut trusted = std::collections::HashMap::new();
+        trusted.insert(cfg_apk.key_name.clone(), own.signer.to_public_key());
+        let (_, text) = super::open_upstream_index(&body_bytes(resp).await, &trusted).unwrap();
+        assert_eq!(super::parse_apkindex(&text)[0].name, "jdk");
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/apk/corretto/x86_64/jdk-17-r0.apk",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, jdk);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/apk/corretto/.x/APKINDEX.tar.gz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
