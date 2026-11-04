@@ -57,6 +57,8 @@ pub struct RegistryStats {
     pub hf: usize,
     pub helm: usize,
     pub apk: usize,
+    pub github: usize,
+    pub hashicorp: usize,
 }
 
 #[derive(Serialize)]
@@ -205,6 +207,8 @@ pub async fn api_stats(State(state): State<AppState>) -> Json<RegistryStats> {
         hf: get(RegistryType::HuggingFace),
         helm: get(RegistryType::Helm),
         apk: get(RegistryType::Apk),
+        github: get(RegistryType::Github),
+        hashicorp: get(RegistryType::Hashicorp),
     })
 }
 
@@ -301,6 +305,8 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
                 RegistryType::Deb => vec![],
                 RegistryType::Cpan => state.config.cpan.proxy.clone().into_iter().collect(),
                 RegistryType::HuggingFace => state.config.hf.proxy.clone().into_iter().collect(),
+                RegistryType::Github => vec![state.config.github.download_url.clone()],
+                RegistryType::Hashicorp => vec![state.config.hashicorp.download_url.clone()],
                 RegistryType::Helm => state
                     .config
                     .helm
@@ -316,6 +322,10 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
                     .map(|p| p.url().to_string())
                     .collect(),
             }
+            .iter()
+            // A configured URL may carry userinfo or a secret query parameter.
+            .map(|u| crate::import::http::redact_url(u))
+            .collect()
         } else {
             vec![]
         };

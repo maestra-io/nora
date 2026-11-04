@@ -16,7 +16,9 @@ pub mod docker;
 pub mod docker_auth;
 mod docker_dates;
 pub(crate) mod gems;
+pub(crate) mod github;
 mod go;
+pub(crate) mod hashicorp;
 pub(crate) mod helm;
 pub(crate) mod hf;
 mod maven;
@@ -46,7 +48,9 @@ pub use deb::routes as deb_routes;
 pub use docker::routes as docker_routes;
 pub use docker_auth::DockerAuth;
 pub use gems::routes as gems_routes;
+pub use github::routes as github_routes;
 pub use go::routes as go_routes;
+pub use hashicorp::routes as hashicorp_routes;
 pub use helm::routes as helm_routes;
 pub use hf::routes as hf_routes;
 pub use maven::routes as maven_routes;
@@ -1605,6 +1609,8 @@ pub(crate) async fn is_proxied_copy(storage: &crate::Storage, key: &str) -> bool
     if key.starts_with("nuget/flatcontainer/")
         || key.starts_with("helm/charts/")
         || key.starts_with("apk/pkgs/")
+        || key.starts_with("github/releases/")
+        || key.starts_with("hashicorp/releases/")
     {
         return true;
     }
@@ -5560,8 +5566,14 @@ mod curation_label_whitelist {
         ("deb.rs", RegistryType::Deb, include_str!("deb.rs")),
         ("docker.rs", RegistryType::Docker, include_str!("docker.rs")),
         ("gems.rs", RegistryType::Gems, include_str!("gems.rs")),
+        ("github.rs", RegistryType::Github, include_str!("github.rs")),
         ("go.rs", RegistryType::Go, include_str!("go.rs")),
         ("apk.rs", RegistryType::Apk, include_str!("apk.rs")),
+        (
+            "hashicorp.rs",
+            RegistryType::Hashicorp,
+            include_str!("hashicorp.rs"),
+        ),
         ("helm.rs", RegistryType::Helm, include_str!("helm.rs")),
         ("hf.rs", RegistryType::HuggingFace, include_str!("hf.rs")),
         ("maven.rs", RegistryType::Maven, include_str!("maven.rs")),

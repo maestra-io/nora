@@ -809,6 +809,8 @@ pub mod icons {
     /// A plain parcel: a neutral mark for Alpine package repositories, not a brand logo.
     pub const APK: &str = r#"<path fill="currentColor" d="M12 2 3 6.5v11L12 22l9-4.5v-11zm0 2.2 6.6 3.3L12 10.8 5.4 7.5zM5 9.1l6 3v7.6l-6-3zm8 10.6v-7.6l6-3v7.6z"/>"#;
     pub const HELM: &str = r#"<path fill="currentColor" d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 2a8 8 0 1 1 0 16 8 8 0 0 1 0-16zm-1 2v4.17A2 2 0 0 0 10.17 11H6v2h4.17a2 2 0 0 0 .83.83V18h2v-4.17a2 2 0 0 0 .83-.83H18v-2h-4.17a2 2 0 0 0-.83-.83V6z"/>"#;
+    /// A plain tag: a neutral mark for release assets, not a brand logo.
+    pub const GITHUB: &str = r#"<path fill="currentColor" d="M3 3h8l10 10-8 8L3 11zm4 2.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3z"/>"#;
 }
 
 /// Format file size in human-readable format

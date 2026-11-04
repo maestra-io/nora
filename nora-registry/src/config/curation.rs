@@ -148,6 +148,10 @@ pub struct CurationConfig {
     pub helm: RegistryCurationOverride,
     #[serde(default)]
     pub apk: RegistryCurationOverride,
+    #[serde(default)]
+    pub github: RegistryCurationOverride,
+    #[serde(default)]
+    pub hashicorp: RegistryCurationOverride,
 }
 
 /// Per-registry curation override (used within `[curation.{registry}]`).
@@ -205,6 +209,8 @@ impl Default for CurationConfig {
             cpan: RegistryCurationOverride::default(),
             helm: RegistryCurationOverride::default(),
             apk: RegistryCurationOverride::default(),
+            github: RegistryCurationOverride::default(),
+            hashicorp: RegistryCurationOverride::default(),
         }
     }
 }
@@ -237,6 +243,8 @@ impl CurationConfig {
             RegistryType::Cpan => Some(&self.cpan),
             RegistryType::Helm => Some(&self.helm),
             RegistryType::Apk => Some(&self.apk),
+            RegistryType::Github => Some(&self.github),
+            RegistryType::Hashicorp => Some(&self.hashicorp),
             RegistryType::HuggingFace => None,
         }
     }
@@ -286,6 +294,8 @@ impl CurationConfig {
             cpan: _,
             helm: _,
             apk: _,
+            github: _,
+            hashicorp: _,
         } = self;
         let mut settings = vec![
             ("curation.quarantine".to_string(), format!("{quarantine:?}")),
@@ -343,6 +353,8 @@ impl CurationConfig {
             RegistryType::Cpan => Some(&mut self.cpan),
             RegistryType::Helm => Some(&mut self.helm),
             RegistryType::Apk => Some(&mut self.apk),
+            RegistryType::Github => Some(&mut self.github),
+            RegistryType::Hashicorp => Some(&mut self.hashicorp),
             RegistryType::HuggingFace => None,
         }
     }
@@ -420,6 +432,8 @@ impl CurationConfig {
             ("CPAN", &mut self.cpan),
             ("HELM", &mut self.helm),
             ("APK", &mut self.apk),
+            ("GITHUB", &mut self.github),
+            ("HASHICORP", &mut self.hashicorp),
         ] {
             if let Ok(val) = env::var(format!("NORA_CURATION_{}_MIN_RELEASE_AGE", env_suffix)) {
                 field.min_release_age = if val.is_empty() { None } else { Some(val) };

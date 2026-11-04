@@ -32,7 +32,9 @@ pub use self::auth::{
 };
 #[allow(unused_imports)]
 pub use self::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerOverride};
-pub use self::curation::{CurationConfig, CurationMode, CurationOnFailure};
+pub use self::curation::{
+    CurationConfig, CurationMode, CurationOnFailure, RegistryCurationOverride,
+};
 pub use self::gc::GcConfig;
 pub use self::rate_limit::RateLimitConfig;
 pub use self::registries::{EnableSpec, RegistriesSection};
@@ -368,6 +370,10 @@ pub struct Config {
     #[serde(default)]
     pub apk: ApkConfig,
     #[serde(default)]
+    pub github: GithubConfig,
+    #[serde(default)]
+    pub hashicorp: HashicorpConfig,
+    #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -434,6 +440,8 @@ pub(crate) fn legacy_enable_var(rt: RegistryType) -> &'static str {
         RegistryType::HuggingFace => "NORA_HF_ENABLED",
         RegistryType::Helm => "NORA_HELM_ENABLED",
         RegistryType::Apk => "NORA_APK_ENABLED",
+        RegistryType::Github => "NORA_GITHUB_ENABLED",
+        RegistryType::Hashicorp => "NORA_HASHICORP_ENABLED",
     }
 }
 
@@ -460,7 +468,9 @@ pub(crate) fn release_date_check(rt: RegistryType) -> ReleaseDateCheck {
         | RegistryType::PubDart
         | RegistryType::Conan
         | RegistryType::Helm
-        | RegistryType::Apk => ReleaseDateCheck::Dated,
+        | RegistryType::Apk
+        | RegistryType::Github
+        | RegistryType::Hashicorp => ReleaseDateCheck::Dated,
     }
 }
 
@@ -645,6 +655,8 @@ impl Config {
                 RegistryType::HuggingFace => self.hf.enabled = on,
                 RegistryType::Helm => self.helm.enabled = on,
                 RegistryType::Apk => self.apk.enabled = on,
+                RegistryType::Github => self.github.enabled = on,
+                RegistryType::Hashicorp => self.hashicorp.enabled = on,
             }
         }
     }
@@ -709,6 +721,12 @@ impl Config {
         if self.apk.enabled {
             set.insert(RegistryType::Apk);
         }
+        if self.github.enabled {
+            set.insert(RegistryType::Github);
+        }
+        if self.hashicorp.enabled {
+            set.insert(RegistryType::Hashicorp);
+        }
         if set.is_empty() {
             tracing::warn!("No registries enabled! All registries are disabled.");
         }
@@ -766,6 +784,10 @@ impl Config {
             RegistryType::HuggingFace => self.hf.enabled && self.hf.proxy.is_some(),
             RegistryType::Helm => self.helm.enabled && !self.helm.proxies.is_empty(),
             RegistryType::Apk => self.apk.enabled && !self.apk.proxies.is_empty(),
+            RegistryType::Github => self.github.enabled && !self.github.download_url.is_empty(),
+            RegistryType::Hashicorp => {
+                self.hashicorp.enabled && !self.hashicorp.download_url.is_empty()
+            }
         }
     }
 
@@ -812,6 +834,8 @@ impl Config {
             RegistryType::HuggingFace => return QuarantineMode::Off,
             RegistryType::Helm => self.curation.helm.quarantine.as_ref(),
             RegistryType::Apk => self.curation.apk.quarantine.as_ref(),
+            RegistryType::Github => self.curation.github.quarantine.as_ref(),
+            RegistryType::Hashicorp => self.curation.hashicorp.quarantine.as_ref(),
         };
         per.or(global).cloned().unwrap_or(QuarantineMode::Off)
     }
@@ -1896,6 +1920,8 @@ impl Config {
         self.hf.apply_env_overrides();
         self.helm.apply_env_overrides();
         self.apk.apply_env_overrides();
+        self.github.apply_env_overrides();
+        self.hashicorp.apply_env_overrides();
 
         // Rate limit, GC, retention
         self.rate_limit.apply_env_overrides();
@@ -5046,6 +5072,8 @@ proxies = [
             &mut config.curation.cpan,
             &mut config.curation.helm,
             &mut config.curation.apk,
+            &mut config.curation.github,
+            &mut config.curation.hashicorp,
         ] {
             o.quarantine = Some(QuarantineMode::Off);
         }
@@ -5262,6 +5290,8 @@ proxies = [
             (RegistryType::HuggingFace, NoDate),
             (RegistryType::Helm, Dated),
             (RegistryType::Apk, Dated),
+            (RegistryType::Github, Dated),
+            (RegistryType::Hashicorp, Dated),
         ];
         assert_eq!(expected.len(), RegistryType::all().len());
         for (rt, check) in expected {
@@ -5293,6 +5323,8 @@ proxies = [
             (RegistryType::Cpan, "[cpan]\nenabled = true\nproxy = \"https://www.cpan.org\"\n", none),
             (RegistryType::Helm, "[helm]\nenabled = true\n[helm.proxies]\njetstack = \"https://charts.jetstack.io\"\n", none),
             (RegistryType::Apk, "[apk]\nenabled = true\n[apk.proxies]\nalpine = \"https://dl-cdn.alpinelinux.org/alpine\"\n", none),
+            (RegistryType::Github, "[github]\nenabled = true\n", none),
+            (RegistryType::Hashicorp, "[hashicorp]\nenabled = true\n", none),
         ]
     }
 
@@ -5320,6 +5352,12 @@ proxies = [
             RegistryType::HuggingFace => (c.hf.enabled, c.hf.proxy) = (true, None),
             RegistryType::Helm => (c.helm.enabled, c.helm.proxies) = (true, Default::default()),
             RegistryType::Apk => (c.apk.enabled, c.apk.proxies) = (true, Default::default()),
+            RegistryType::Github => {
+                (c.github.enabled, c.github.download_url) = (true, String::new())
+            }
+            RegistryType::Hashicorp => {
+                (c.hashicorp.enabled, c.hashicorp.download_url) = (true, String::new())
+            }
         }
     }
 
@@ -5345,6 +5383,8 @@ proxies = [
             RegistryType::HuggingFace => c.hf.enabled = false,
             RegistryType::Helm => c.helm.enabled = false,
             RegistryType::Apk => c.apk.enabled = false,
+            RegistryType::Github => c.github.enabled = false,
+            RegistryType::Hashicorp => c.hashicorp.enabled = false,
         }
     }
 
@@ -5760,6 +5800,8 @@ proxies = [
             RegistryType::HuggingFace => None,
             RegistryType::Helm => Some("HELM"),
             RegistryType::Apk => Some("APK"),
+            RegistryType::Github => Some("GITHUB"),
+            RegistryType::Hashicorp => Some("HASHICORP"),
         }
     }
 

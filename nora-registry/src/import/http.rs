@@ -252,12 +252,42 @@ pub fn build_import_client(
     read_timeout: std::time::Duration,
     allow_private: bool,
 ) -> Result<reqwest::Client> {
+    build_guarded_client(tls, connect_timeout, read_timeout, allow_private, None)
+}
+
+/// [`build_import_client`] that also refuses a redirect hop to any host outside
+/// `hosts` (exact, case-insensitive): an upstream with a known CDN cannot be bounced
+/// to an arbitrary public host either.
+pub fn build_host_pinned_client(
+    tls: &crate::config::TlsConfig,
+    connect_timeout: std::time::Duration,
+    read_timeout: std::time::Duration,
+    allow_private: bool,
+    hosts: Vec<String>,
+) -> Result<reqwest::Client> {
+    build_guarded_client(
+        tls,
+        connect_timeout,
+        read_timeout,
+        allow_private,
+        Some(Arc::from(hosts)),
+    )
+}
+
+fn build_guarded_client(
+    tls: &crate::config::TlsConfig,
+    connect_timeout: std::time::Duration,
+    read_timeout: std::time::Duration,
+    allow_private: bool,
+    hosts: Option<Arc<[String]>>,
+) -> Result<reqwest::Client> {
     let redirect_policy =
         reqwest::redirect::Policy::custom(move |attempt| {
             match redirect_verdict(
                 attempt.url().host_str(),
                 attempt.previous().len(),
                 allow_private,
+                hosts.as_deref(),
             ) {
                 RedirectVerdict::Follow => attempt.follow(),
                 RedirectVerdict::TooMany => attempt.error(SsrfRedirectError(format!(
@@ -266,6 +296,9 @@ pub fn build_import_client(
                 RedirectVerdict::Blocked(ip) => {
                     attempt.error(SsrfRedirectError(format!("redirect to blocked IP {ip}")))
                 }
+                RedirectVerdict::OffList(host) => attempt.error(SsrfRedirectError(format!(
+                    "redirect to {host}, which is not an allowed host"
+                ))),
             }
         });
 
@@ -308,14 +341,26 @@ enum RedirectVerdict {
     Follow,
     TooMany,
     Blocked(IpAddr),
+    OffList(String),
 }
 
 /// Per-hop verdict: cap the hop count, and (unless opted out) block a redirect to
 /// an IP-literal in a denied range. Hostname hops fall through to `Follow` — the
 /// DNS-pinning [`GuardedResolver`] re-checks them at connect time.
-fn redirect_verdict(host: Option<&str>, previous: usize, allow_private: bool) -> RedirectVerdict {
+fn redirect_verdict(
+    host: Option<&str>,
+    previous: usize,
+    allow_private: bool,
+    hosts: Option<&[String]>,
+) -> RedirectVerdict {
     if previous >= MAX_REDIRECTS {
         return RedirectVerdict::TooMany;
+    }
+    if let Some(hosts) = hosts {
+        let host = host.unwrap_or_default();
+        if !hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+            return RedirectVerdict::OffList(host.to_string());
+        }
     }
     if !allow_private {
         if let Some(ip) = host.and_then(host_as_ip) {
@@ -433,32 +478,58 @@ mod tests {
         // IP-literal hops to denied ranges are blocked (DNS resolver never sees
         // them — there is no name to resolve).
         assert_eq!(
-            redirect_verdict(Some("169.254.169.254"), 1, false),
+            redirect_verdict(Some("169.254.169.254"), 1, false, None),
             RedirectVerdict::Blocked("169.254.169.254".parse().unwrap())
         );
         assert_eq!(
-            redirect_verdict(Some("[::1]"), 1, false),
+            redirect_verdict(Some("[::1]"), 1, false, None),
             RedirectVerdict::Blocked("::1".parse().unwrap())
         );
         // Hostname hops fall through — the resolver re-checks them at connect.
         assert_eq!(
-            redirect_verdict(Some("evil.example.com"), 1, false),
+            redirect_verdict(Some("evil.example.com"), 1, false, None),
             RedirectVerdict::Follow
         );
         // Public literal is fine.
         assert_eq!(
-            redirect_verdict(Some("93.184.216.34"), 1, false),
+            redirect_verdict(Some("93.184.216.34"), 1, false, None),
             RedirectVerdict::Follow
         );
         // Hop cap.
         assert_eq!(
-            redirect_verdict(Some("example.com"), MAX_REDIRECTS, false),
+            redirect_verdict(Some("example.com"), MAX_REDIRECTS, false, None),
             RedirectVerdict::TooMany
         );
         // Opt-out disables the IP block.
         assert_eq!(
-            redirect_verdict(Some("10.0.0.1"), 1, true),
+            redirect_verdict(Some("10.0.0.1"), 1, true, None),
             RedirectVerdict::Follow
+        );
+    }
+
+    #[test]
+    fn redirect_verdict_keeps_a_pinned_client_on_its_hosts() {
+        let hosts = [
+            "github.com".to_string(),
+            "release-assets.githubusercontent.com".to_string(),
+        ];
+        assert_eq!(
+            redirect_verdict(
+                Some("Release-Assets.GitHubUserContent.com"),
+                1,
+                false,
+                Some(&hosts)
+            ),
+            RedirectVerdict::Follow
+        );
+        assert_eq!(
+            redirect_verdict(Some("evil.example.com"), 1, false, Some(&hosts)),
+            RedirectVerdict::OffList("evil.example.com".into())
+        );
+        // The allowlist holds even where private addresses are allowed.
+        assert_eq!(
+            redirect_verdict(Some("10.0.0.1"), 1, true, Some(&hosts)),
+            RedirectVerdict::OffList("10.0.0.1".into())
         );
     }
 

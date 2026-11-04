@@ -325,6 +325,8 @@ pub async fn run_gc(
         "cpan/",
         "helm/",
         "apk/",
+        "github/",
+        "hashicorp/",
     ] {
         let keys = storage.list(prefix).await.unwrap_or_else(|e| {
             tracing::error!("GC: storage.list({}) failed: {}", prefix, e);
@@ -1233,6 +1235,9 @@ async fn evict_pypi_companions(storage: &Storage, key: &str) {
 ///   hosted files, sidecars or indexes (#579), so a repo named `repodata` is no index.
 /// - every chart under `helm/charts/`: the Helm format is pull-through only; its
 ///   cached upstream indexes live under `helm/index/` and are not evicted.
+/// - every asset under `github/releases/`: GitHub Releases are pull-through only;
+///   release records under `github/meta/` are not evicted. The same for
+///   `hashicorp/releases/` and `hashicorp/meta/`.
 ///
 /// A package in `curation.internal_namespaces` is never fetched upstream, so a
 /// copy of one is the only copy: it is never evicted.
@@ -1255,7 +1260,15 @@ async fn evict_proxy_cache(
     let mut proxy_files: Vec<(String, u64, u64)> = Vec::new(); // (key, size, mtime)
     let mut sidecar_covered: HashSet<String> = HashSet::new();
 
-    for prefix in ["rpm/", "deb/", "hf/", "helm/charts/", "apk/pkgs/"] {
+    for prefix in [
+        "rpm/",
+        "deb/",
+        "hf/",
+        "helm/charts/",
+        "apk/pkgs/",
+        "github/releases/",
+        "hashicorp/releases/",
+    ] {
         let entries = match storage.list_with_meta(prefix).await {
             Ok(e) => e,
             Err(e) => {
@@ -1279,7 +1292,12 @@ async fn evict_proxy_cache(
 
         // Second pass: identify proxy-only files
         for (key, meta) in &entries {
-            if prefix == "hf/" || prefix == "helm/charts/" || prefix == "apk/pkgs/" {
+            if prefix == "hf/"
+                || prefix == "helm/charts/"
+                || prefix == "apk/pkgs/"
+                || prefix == "github/releases/"
+                || prefix == "hashicorp/releases/"
+            {
                 proxy_files.push((key.clone(), meta.size, meta.modified));
                 continue;
             }

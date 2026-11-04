@@ -145,7 +145,9 @@ mod cpan;
 mod deb;
 mod docker;
 mod gems;
+mod github;
 mod go;
+mod hashicorp;
 mod helm;
 mod hf;
 mod maven;
@@ -171,7 +173,9 @@ pub use self::docker::{
     DockerUpstream,
 };
 pub use self::gems::GemsConfig;
+pub use self::github::GithubConfig;
 pub use self::go::GoConfig;
+pub use self::hashicorp::HashicorpConfig;
 pub use self::helm::HelmConfig;
 pub use self::hf::HfConfig;
 #[allow(unused_imports)]

@@ -328,6 +328,14 @@ async fn build(reg_type: RegistryType, state: &AppState) -> Option<Vec<RepoInfo>
             let (p, s) = crate::registry::apk::INDEX_PATTERN;
             build_generic_index(storage, p, s).await
         }
+        RegistryType::Github => {
+            let (p, s) = crate::registry::github::INDEX_PATTERN;
+            build_index_by_segments(storage, p, s, 2).await
+        }
+        RegistryType::Hashicorp => {
+            let (p, s) = crate::registry::hashicorp::INDEX_PATTERN;
+            build_generic_index(storage, p, s).await
+        }
     }
 }
 
@@ -624,6 +632,17 @@ async fn build_generic_index(
     prefix: &str,
     suffix: &str,
 ) -> Option<Vec<RepoInfo>> {
+    build_index_by_segments(storage, prefix, suffix, 1).await
+}
+
+/// [`build_generic_index`] with a package named by the first `depth` path segments
+/// after `prefix` (GitHub: `owner/repo`).
+async fn build_index_by_segments(
+    storage: &Storage,
+    prefix: &str,
+    suffix: &str,
+    depth: usize,
+) -> Option<Vec<RepoInfo>> {
     let keys = list_keys(storage, prefix).await?;
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
@@ -632,7 +651,11 @@ async fn build_generic_index(
             continue;
         }
         if let Some(rest) = key.strip_prefix(prefix) {
-            let name = rest.split('/').next().unwrap_or(rest).to_string();
+            let name = rest
+                .splitn(depth + 1, '/')
+                .take(depth)
+                .collect::<Vec<_>>()
+                .join("/");
             if name.is_empty() {
                 continue;
             }
@@ -1072,6 +1095,32 @@ mod tests {
         assert_eq!(
             got,
             vec![("gpt2".to_string(), 1, 1), ("org/model".to_string(), 2, 8)]
+        );
+    }
+
+    /// GitHub release assets are indexed per `owner/repo`, not per owner.
+    #[tokio::test]
+    async fn github_index_groups_by_owner_and_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for (key, body) in [
+            ("github/releases/o/a/v1/x.tar.gz", &b"12"[..]),
+            ("github/releases/o/a/v2/x.tar.gz", b"3"),
+            ("github/releases/o/b/v1/y.zip", b"4"),
+        ] {
+            storage.put(key, body).await.unwrap();
+        }
+        let (p, s) = crate::registry::github::INDEX_PATTERN;
+        let mut got: Vec<(String, usize, u64)> = build_index_by_segments(&storage, p, s, 2)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.name.clone(), r.versions, r.size))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("o/a".to_string(), 2, 3), ("o/b".to_string(), 1, 1)]
         );
     }
 

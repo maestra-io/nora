@@ -269,6 +269,8 @@ fn build_context_full(
         hf: crate::config::HfConfig::default(),
         helm: crate::config::HelmConfig::default(),
         apk: crate::config::ApkConfig::default(),
+        github: crate::config::GithubConfig::default(),
+        hashicorp: crate::config::HashicorpConfig::default(),
         auth: AuthConfig {
             enabled: auth_enabled,
             anonymous_read,
