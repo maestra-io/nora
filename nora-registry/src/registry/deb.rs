@@ -759,6 +759,20 @@ async fn download(
         }
         let lower = path.to_ascii_lowercase();
         let immutable = lower.ends_with(".deb") || lower.ends_with(".udeb");
+        // maestra: filtered and re-signed indexes, held versions refused.
+        if super::deb_proxy::active(&state.config) {
+            if let Some(response) = super::deb_proxy::serve(&state, &repo, entry, &path).await {
+                return response;
+            }
+            if !immutable {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            if let Some(response) =
+                super::deb_proxy::package_gate(&state, &headers, &repo, &path).await
+            {
+                return response;
+            }
+        }
         let url = format!("{}/{}", entry.url().trim_end_matches('/'), path);
         return crate::registry::repo_proxy_download(
             &state,

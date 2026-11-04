@@ -10,6 +10,8 @@ mod conan;
 pub(crate) mod cpan;
 #[cfg(feature = "deb")]
 pub(crate) mod deb;
+#[cfg(feature = "deb")]
+pub(crate) mod deb_proxy;
 pub mod docker;
 pub mod docker_auth;
 mod docker_dates;
@@ -5466,8 +5468,8 @@ mod release_date_read {
 
     /// A release-age rule a reload brings in is read from then on: a global one by every
     /// registry, a registry's own by that registry alone. The server refuses a reload whose
-    /// own rule cannot apply — rpm and deb downloads are not checked by name or date, cpan's
-    /// carry none — and the running engine stays.
+    /// own rule cannot apply — rpm downloads are not checked by name or date, cpan's carry
+    /// none — and the running engine stays.
     #[tokio::test]
     async fn a_release_age_rule_a_reload_brings_in_is_read() {
         let start = || {
@@ -5486,7 +5488,7 @@ mod release_date_read {
                 "{rt}: global rule"
             );
         }
-        let refused = [RegistryType::Rpm, RegistryType::Deb, RegistryType::Cpan];
+        let refused = [RegistryType::Rpm, RegistryType::Cpan];
         for &target in RegistryType::all() {
             let ctx = start();
             if ctx

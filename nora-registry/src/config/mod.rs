@@ -440,7 +440,10 @@ pub(crate) fn legacy_enable_var(rt: RegistryType) -> &'static str {
 /// The release-date check of `rt`'s downloads, as each handler calls curation.
 pub(crate) fn release_date_check(rt: RegistryType) -> ReleaseDateCheck {
     match rt {
-        RegistryType::Rpm | RegistryType::Deb => ReleaseDateCheck::NoNameOrDate,
+        RegistryType::Rpm => ReleaseDateCheck::NoNameOrDate,
+        // maestra: a proxied apt version is dated by NORA's first sight of it in an
+        // upstream index (registry/deb_proxy.rs).
+        RegistryType::Deb => ReleaseDateCheck::Dated,
         // registry/cpan.rs passes no publish date; a Hub commit has none NORA reads.
         RegistryType::Cpan | RegistryType::HuggingFace => ReleaseDateCheck::NoDate,
         RegistryType::Docker
@@ -1565,6 +1568,34 @@ impl Config {
             }
             if let Err(e) = crate::registry::apk::check_keys(&self.apk) {
                 errors.push(e);
+            }
+        }
+        // maestra: a filtered apt proxy verifies the upstream InRelease with
+        // deb.upstream_keyring_dir and signs its own with the [signing] key.
+        #[cfg(feature = "deb")]
+        if self.deb.enabled
+            && !self.deb.proxies.is_empty()
+            && self.curation.deb.min_release_age.is_some()
+        {
+            if let Err(e) =
+                crate::registry::deb_proxy::check_keyring(&self.deb.upstream_keyring_dir)
+            {
+                errors.push(format!(
+                    "curation.deb.min_release_age filters the [deb.proxies] repositories, which needs the upstream archive keys: {e}"
+                ));
+            }
+            if !self.signing.enabled
+                || (self.signing.key_path.is_empty() && self.storage.mode != StorageMode::Local)
+            {
+                errors.push(
+                    "curation.deb.min_release_age filters the [deb.proxies] repositories, which NORA re-signs: enable [signing] and set signing.key_path (required off local storage)".to_string(),
+                );
+            }
+            if self.deb.architectures.is_empty() {
+                errors.push(
+                    "deb.architectures is empty: a filtered apt proxy would serve no index"
+                        .to_string(),
+                );
             }
         }
         for u in &self.docker.upstreams {
@@ -5127,18 +5158,16 @@ proxies = [
     }
 
     #[test]
-    fn a_min_release_age_for_rpm_or_deb_is_refused() {
+    fn a_min_release_age_for_rpm_is_refused() {
         let _lock = env_lock();
-        // rpm and deb downloads are not checked by name or release date: the value
-        // could never apply, so startup says so instead of accepting it (#1098).
-        for registry in ["rpm", "deb"] {
+        // rpm downloads are not checked by name or release date: the value could
+        // never apply, so startup says so instead of accepting it (#1098). (maestra:
+        // deb is dated by its filtered proxy, registry/deb_proxy.rs.)
+        {
+            let registry = "rpm";
             let mut config = npm_hosted_only();
             config.curation.quarantine = Some(QuarantineMode::Enforce);
-            let value = Some("3d".to_string());
-            match registry {
-                "rpm" => config.curation.rpm.min_release_age = value,
-                _ => config.curation.deb.min_release_age = value,
-            }
+            config.curation.rpm.min_release_age = Some("3d".to_string());
             let (_, errors) = config.validate_with_config_path(None);
             let key = format!("curation.{registry}.min_release_age");
             assert!(
@@ -5228,7 +5257,7 @@ proxies = [
             (RegistryType::PubDart, Dated),
             (RegistryType::Conan, Dated),
             (RegistryType::Rpm, NoNameOrDate),
-            (RegistryType::Deb, NoNameOrDate),
+            (RegistryType::Deb, Dated),
             (RegistryType::Cpan, NoDate),
             (RegistryType::HuggingFace, NoDate),
             (RegistryType::Helm, Dated),
@@ -5371,10 +5400,7 @@ proxies = [
         }
         let mut seen = std::collections::BTreeSet::new();
         for (rt, toml, fixup) in proxy_forms() {
-            let dated = !matches!(
-                rt,
-                RegistryType::Rpm | RegistryType::Deb | RegistryType::Cpan
-            );
+            let dated = !matches!(rt, RegistryType::Rpm | RegistryType::Cpan);
             let other = if rt == RegistryType::Docker {
                 "npm"
             } else {
@@ -5648,11 +5674,12 @@ proxies = [
     }
 
     #[test]
-    fn a_min_release_age_for_rpm_or_deb_is_refused_for_its_own_reason_without_a_quarantine() {
+    fn a_min_release_age_for_rpm_is_refused_for_its_own_reason_without_a_quarantine() {
         let _lock = env_lock();
-        // On an enabled rpm or deb proxy with no quarantine, the refusal still gives
-        // the reason the value can never apply, not the quarantine one.
-        for registry in ["rpm", "deb"] {
+        // On an enabled rpm proxy with no quarantine, the refusal still gives the
+        // reason the value can never apply, not the quarantine one.
+        {
+            let registry = "rpm";
             let content = format!(
                 "[{registry}]\nenabled = true\n[{registry}.proxies]\nupstream = \"https://repo.example.com/{registry}\"\n[curation.{registry}]\nmin_release_age = \"3d\"\n"
             );
@@ -5681,7 +5708,7 @@ proxies = [
     fn a_min_release_age_for_cpan_is_refused_its_downloads_carry_no_release_date() {
         let _lock = env_lock();
         // registry/cpan.rs asks curation with no publish date, so a cpan threshold is
-        // never compared: refused like rpm and deb, for its own reason, with or
+        // never compared: refused like rpm, for its own reason, with or
         // without a quarantine, enabled or not (#1098).
         for quarantine in ["", "quarantine = \"enforce\"\n"] {
             for enabled in [true, false] {
