@@ -57,7 +57,10 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     runs-on: runs-on=${{ github.run_id }}-test/pool=build
     steps:
-      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+      # Exports RUSTC_WRAPPER=sccache and the agent's WebDAV endpoint.
+      - uses: runs-on/action@13fbb6a39310a0dac9ab4716da2c4e74a3326dfc # v2.7.0
+        with:
+          remote_cache: sccache
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -65,6 +68,12 @@ jobs:
       - name: Install toolchain
         run: rustup toolchain install || rustup show
 
+      - name: Install sccache
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: sccache@0.18.0
+
+      # Also sets CARGO_INCREMENTAL=0, which sccache needs.
       - name: Cache cargo
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
@@ -86,6 +95,10 @@ jobs:
 
       - name: Run tests (release features)
         run: cargo test --package nora-registry --no-default-features --features mimalloc,deb --locked
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
   # Vendored Helm chart (maestra/charts/nora, see its MAESTRA-CHART.md).
   chart:
