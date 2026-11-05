@@ -212,6 +212,46 @@ pub fn pypi_index(
     Some(kept.concat().into_bytes())
 }
 
+/// The version field of a RubyGems compact index row (`/info/<name>`): `<version>` or
+/// `<version>-<platform>`, the row's first space-separated field.
+pub fn gems_info_row_key(row: &str) -> &str {
+    row.split(' ').next().unwrap_or(row)
+}
+
+/// A RubyGems compact index (`/info/<name>`): the header up to `---`, then one row per
+/// version and platform. Drop the rows of versions younger than `min_release_age`, so
+/// Bundler and `gem install` resolve a requirement to the newest mature version instead of
+/// the fresh one the `.gem` gate then refuses. `dates` is keyed by the row's first field
+/// (`1.2.0`, `1.2.0-java`), as [`gems_info_row_key`] reads it.
+pub fn gems_info(
+    engine: &CurationEngine,
+    name: &str,
+    body: &[u8],
+    dates: &std::collections::HashMap<String, i64>,
+) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(body).ok()?;
+    let mut in_rows = !text.lines().any(|l| l == "---");
+    let mut hidden = false;
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let row = line.trim_end_matches(['\n', '\r']);
+        if !in_rows || row.is_empty() {
+            in_rows |= row == "---";
+            out.push_str(line);
+            continue;
+        }
+        let key = gems_info_row_key(row);
+        // A RubyGems version never holds `-` (Gem::Version turns it into `.pre.`).
+        let version = key.split_once('-').map_or(key, |(v, _)| v);
+        if engine.hides_from_metadata(RegistryType::Gems, name, version, dates.get(key).copied()) {
+            hidden = true;
+        } else {
+            out.push_str(line);
+        }
+    }
+    hidden.then(|| out.into_bytes())
+}
+
 /// A Galaxy v3 versions page (`data[]` of `{version, created_at}`): drop the young
 /// entries, so `ansible-galaxy install` resolves a range like `>=8.0.0` to the newest
 /// mature version instead of the fresh one the tarball gate then refuses. `meta` and
@@ -656,5 +696,102 @@ mod tests {
     async fn ansible_versions_audit_mode_keeps_young_collections() {
         let (_up, ctx) = galaxy_ctx(CurationMode::Audit).await;
         assert_eq!(galaxy_versions(&ctx).await, ["14.0.0", "13.5.0", "12.0.0"]);
+    }
+
+    // ── RubyGems ──
+
+    const GEMS_INFO: &str = "---\n1.0.0 |checksum:aa\n1.1.0 |checksum:bb,ruby:>= 2.7\n1.1.0-java |checksum:cc\n2.0.0 |checksum:dd\n";
+
+    async fn gems_ctx(mode: CurationMode) -> (MockServer, crate::test_helpers::TestContext) {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/info/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GEMS_INFO))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "created_at: 2026-01-01T00:00:00Z\n---\npkg 1.0.0,1.1.0,1.1.0-java,2.0.0 abc\n",
+            ))
+            .mount(&upstream)
+            .await;
+        let v = |n: &str, platform: &str, secs: i64| json!({ "number": n, "platform": platform, "created_at": iso_ago(secs) });
+        Mock::given(method("GET"))
+            .and(path("/api/v1/versions/pkg.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                v("2.0.0", "ruby", YOUNG),
+                v("1.1.0", "java", YOUNG),
+                v("1.1.0", "ruby", OLD),
+                v("1.0.0", "ruby", OLD + 10),
+            ])))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(uri);
+            cooldown(cfg, mode);
+        });
+        (upstream, ctx)
+    }
+
+    async fn gems_info_served(ctx: &crate::test_helpers::TestContext) -> String {
+        let resp = send(&ctx.app, Method::GET, "/gems/info/pkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag = resp.headers()["etag"].to_str().unwrap().to_string();
+        let body = body_bytes(resp).await;
+        // Bundler 1.x takes the compact index only when the ETag is the body's quoted MD5.
+        use md5::Digest as _;
+        assert_eq!(
+            etag,
+            format!("\"{}\"", hex::encode(md5::Md5::digest(&body)))
+        );
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn gems_info_hides_young_versions_per_platform() {
+        let (up, ctx) = gems_ctx(CurationMode::Enforce).await;
+        let served = "---\n1.0.0 |checksum:aa\n1.1.0 |checksum:bb,ruby:>= 2.7\n";
+        assert_eq!(gems_info_served(&ctx).await, served);
+        // Served again from the cache with the kept dates: still filtered, no new API call.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(gems_info_served(&ctx).await, served);
+        let asked = up
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/api/v1/versions/pkg.json")
+            .count();
+        assert_eq!(asked, 1);
+    }
+
+    #[tokio::test]
+    async fn gems_info_audit_mode_keeps_young_versions() {
+        let (_up, ctx) = gems_ctx(CurationMode::Audit).await;
+        assert_eq!(gems_info_served(&ctx).await, GEMS_INFO);
+    }
+
+    /// Without `versions` Bundler and `gem install` fall back to the full Marshal index,
+    /// which lists the young versions the filter leaves out of `info/<name>`.
+    #[tokio::test]
+    async fn gems_versions_is_served_with_its_md5_etag() {
+        let (_up, ctx) = gems_ctx(CurationMode::Enforce).await;
+        let resp = send(&ctx.app, Method::GET, "/gems/versions", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()["content-type"].to_str().unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        let etag = resp.headers()["etag"].to_str().unwrap().to_string();
+        let body = body_bytes(resp).await;
+        use md5::Digest as _;
+        assert_eq!(
+            etag,
+            format!("\"{}\"", hex::encode(md5::Md5::digest(&body)))
+        );
+        assert!(body.ends_with(b"pkg 1.0.0,1.1.0,1.1.0-java,2.0.0 abc\n"));
     }
 }
