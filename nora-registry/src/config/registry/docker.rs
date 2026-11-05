@@ -83,6 +83,10 @@ pub struct DockerUpstream {
     /// held as new to this mirror. Off by default: NORA's own first-seen clock.
     #[serde(default)]
     pub trust_upstream_dates: bool,
+    /// File holding the bearer token the date API wants (ghcr.io: any GitHub token, an App
+    /// installation token included), re-read at each walk so a rotated Secret applies.
+    #[serde(default)]
+    pub date_token_file: Option<String>,
 }
 
 /// Where a registry publishes the date a manifest was pushed, read by the registry
@@ -93,8 +97,16 @@ pub enum DateSource {
     HubTagLastPushed,
     /// quay.io `/api/v1/repository/<repo>/tag/?specificTag=<tag>` `last_modified`.
     QuayLastModified,
-    /// registry.k8s.io / gcr.io `/v2/<repo>/tags/list` `manifest.<digest>.timeUploadedMs`.
+    /// registry.k8s.io / gcr.io / Artifact Registry `/v2/<repo>/tags/list`
+    /// `manifest.<digest>.timeUploadedMs`.
     GcrTimeUploaded,
+    /// ghcr.io: `api.github.com/users/<owner>/packages/container/<package>/versions`
+    /// `created_at` per digest (needs a token).
+    GhcrCreatedAt,
+    /// mcr.microsoft.com `/api/v1/catalog/<repo>/tags` `lastModifiedDate` per tag.
+    McrLastModified,
+    /// public.ecr.aws gallery `describeImageTags` `imagePushedAt` per tag.
+    EcrPublicPushedAt,
 }
 
 impl DateSource {
@@ -104,7 +116,25 @@ impl DateSource {
             Self::HubTagLastPushed => "hub_tag_last_pushed",
             Self::QuayLastModified => "quay_last_modified",
             Self::GcrTimeUploaded => "gcr_time_uploaded",
+            Self::GhcrCreatedAt => "ghcr_created_at",
+            Self::McrLastModified => "mcr_last_modified",
+            Self::EcrPublicPushedAt => "ecr_public_pushed_at",
         }
+    }
+
+    /// Whether the registry dates a digest whatever the request named, so a digest NORA
+    /// holds by its own clock can be asked about again (Hub and quay date a tag, and such a
+    /// digest was dated on its first sight already).
+    pub fn dates_digests(self) -> bool {
+        !matches!(self, Self::HubTagLastPushed | Self::QuayLastModified)
+    }
+
+    /// Whether the date of one digest comes from a listing of the whole repository.
+    pub fn walks_repository(self) -> bool {
+        matches!(
+            self,
+            Self::GhcrCreatedAt | Self::McrLastModified | Self::EcrPublicPushedAt
+        )
     }
 }
 
@@ -117,7 +147,7 @@ impl DockerUpstream {
     }
 
     /// The registry's date source, by the upstream's namespace (its host); `None` for a
-    /// registry that publishes no date NORA reads (ghcr.io, mcr, public.ecr.aws, ...).
+    /// registry that publishes no date NORA reads (cgr.dev, docker.dragonflydb.io, ...).
     pub fn date_source(&self) -> Option<DateSource> {
         match self.resolved_namespace().as_str() {
             "docker.io" | "index.docker.io" => Some(DateSource::HubTagLastPushed),
@@ -125,7 +155,12 @@ impl DockerUpstream {
             "registry.k8s.io" | "k8s.io" | "gcr.io" | "mirror.gcr.io" => {
                 Some(DateSource::GcrTimeUploaded)
             }
-            ns if ns.ends_with(".gcr.io") => Some(DateSource::GcrTimeUploaded),
+            ns if ns.ends_with(".gcr.io") || ns.ends_with("-docker.pkg.dev") => {
+                Some(DateSource::GcrTimeUploaded)
+            }
+            "ghcr.io" => Some(DateSource::GhcrCreatedAt),
+            "mcr.microsoft.com" => Some(DateSource::McrLastModified),
+            "public.ecr.aws" => Some(DateSource::EcrPublicPushedAt),
             _ => None,
         }
     }
@@ -262,6 +297,7 @@ fn default_docker_metadata_ttl() -> i64 {
 fn default_docker_upstreams() -> Vec<DockerUpstream> {
     vec![DockerUpstream {
         trust_upstream_dates: false,
+        date_token_file: None,
         url: "https://registry-1.docker.io".to_string(),
         auth: None,
         auth_env: None,
@@ -429,6 +465,7 @@ impl DockerConfig {
                         .unwrap_or_default();
                     DockerUpstream {
                         trust_upstream_dates: false,
+                        date_token_file: None,
                         url: parts[0].to_string(),
                         auth,
                         auth_env: None,

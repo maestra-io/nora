@@ -77,6 +77,9 @@ data:
     {{- if $u.trust_upstream_dates }}
     trust_upstream_dates = true
     {{- end }}
+    {{- with $u.date_token_file }}
+    date_token_file = {{ . | quote }}
+    {{- end }}
     {{- with include "nora.docker.authEnv" (list $i $u) }}
     auth_env = {{ . | quote }}
     {{- end }}
