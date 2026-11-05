@@ -217,6 +217,17 @@ tests:
       - matchRegex:
           path: data["config.toml"]
           pattern: 'url = "https://quay\.io"\n\s*namespace = "quay\.io"\n\s*trust_upstream_dates = true'
+  - it: renders date_token_file next to trust_upstream_dates
+    set:
+      config.docker.upstreams:
+        - url: https://ghcr.io
+          namespace: ghcr.io
+          trust_upstream_dates: true
+          date_token_file: /var/run/secrets/github/token
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'namespace = "ghcr\.io"\n\s*trust_upstream_dates = true\n\s*date_token_file = "/var/run/secrets/github/token"'
 
   - it: renders retention rules
     set:

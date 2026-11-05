@@ -5,17 +5,47 @@
 //! image (`created` is the builder's, 1970 for some). Best effort: any failure (429,
 //! 5xx, timeout, an answer about another digest) is `None`, and the quarantine falls
 //! back to NORA's first-seen; the pull itself never waits on more than one lookup.
+//!
+//! ghcr.io, mcr.microsoft.com and public.ecr.aws date a digest only in a listing of the
+//! whole repository, so that listing is walked once per repository ([`WALK_TTL`]) off the
+//! request path and shared by every first sight of the repository; a request waits
+//! [`TIMEOUT`] for it.
 
 use crate::circuit_breaker::BreakerScope;
-use crate::config::{DateSource, DockerUpstream};
+use crate::config::{DateSource, DockerUpstream, UpstreamAuth};
 use crate::registry_type::RegistryType;
 use crate::AppState;
-use std::time::Duration;
+use futures::future::{BoxFuture, FutureExt, Shared};
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-/// A gcr.io tags/list names every digest of the repository: megabytes for the largest.
-const MAX_BODY: u64 = 8 << 20;
+/// A gcr.io tags/list names every digest of the repository: megabytes for the largest;
+/// the mcr catalog of dotnet/aspnet was 6.9 MB on 05.11.2026.
+const MAX_BODY: u64 = 32 << 20;
 const TIMEOUT: Duration = Duration::from_secs(5);
 const HUB_API: &str = "https://hub.docker.com";
+const GITHUB_API: &str = "https://api.github.com";
+const ECR_PUBLIC_API: &str = "https://api.us-east-1.gallery.ecr.aws";
+/// A walked repository answers first sights this long; a digest pushed since reads as
+/// no date (first-seen, so never younger than it is).
+const WALK_TTL: Duration = Duration::from_secs(600);
+/// A walk that got nothing (401, 429, 5xx) is retried after this.
+const WALK_RETRY: Duration = Duration::from_secs(60);
+/// One walk, all its pages; it runs on its own task, so a request never waits on it longer
+/// than [`TIMEOUT`].
+const WALK_DEADLINE: Duration = Duration::from_secs(120);
+const WALK_PAGE_TIMEOUT: Duration = Duration::from_secs(20);
+/// ghcr lists versions newest first, 100 a page: the newest 1000 are dated.
+const GHCR_PAGES: u32 = 10;
+/// public.ecr.aws lists tags in no date order, 1000 a page (4 s each): gravitational's
+/// teleport-distroless was 17 pages on 05.11.2026, 16140 of them cosign `.sig` tags. 25
+/// pages fit in [`WALK_DEADLINE`].
+const ECR_PAGES: u32 = 25;
+const ECR_PER_PAGE: u32 = 1000;
+/// Walked repositories kept; past it the expired ones go, then all.
+const WALK_REPOS: usize = 256;
 /// A digest reference names no tag, so the newest tags are searched for it. Every hit on
 /// the held list of 04.11.2026 sat on the first page; a miss costs all of them, once per
 /// digest, inside the one [`TIMEOUT`].
@@ -34,6 +64,16 @@ pub(super) async fn published_at(
     digest: &str,
     manifest: &[u8],
 ) -> Option<i64> {
+    if source.walks_repository() {
+        let dates = tokio::time::timeout(TIMEOUT, walk(state, upstream, source, name))
+            .await
+            .ok()
+            .flatten()?;
+        return dates
+            .get(digest)
+            .copied()
+            .filter(|date| *date <= chrono::Utc::now().timestamp());
+    }
     let runnable = runnable_digests(manifest, digest);
     let date = if reference.contains(':') && source != DateSource::GcrTimeUploaded {
         tokio::time::timeout(
@@ -45,7 +85,7 @@ pub(super) async fn published_at(
         .flatten()
     } else {
         let url = lookup_url(upstream, source, name, reference)?;
-        let body = fetch(state, upstream, source, &url).await?;
+        let body = fetch(state, upstream, source, &url, None, TIMEOUT).await?;
         parse(source, &body, reference, digest, &runnable)
     };
     date.filter(|date| *date <= chrono::Utc::now().timestamp())
@@ -56,14 +96,16 @@ async fn fetch(
     upstream: &DockerUpstream,
     source: DateSource,
     url: &str,
+    auth: Option<UpstreamAuth<'_>>,
+    timeout: Duration,
 ) -> Option<axum::body::Bytes> {
     // Its own breaker: a throttled date API must not open the upstream's pull breaker.
     let scope = format!("{}#{}", upstream.url, source.label());
     super::proxy_fetch_capped(
         &state.http_client,
         url,
-        TIMEOUT,
-        None,
+        timeout,
+        auth,
         &state.circuit_breaker,
         BreakerScope::upstream(RegistryType::Docker, &scope),
         MAX_BODY,
@@ -88,13 +130,244 @@ async fn search_tags(
 ) -> Option<i64> {
     for page in 1..=TAG_PAGES {
         let url = tags_page_url(upstream, source, name, page);
-        let body = fetch(state, upstream, source, &url).await?;
+        let body = fetch(state, upstream, source, &url, None, TIMEOUT).await?;
         let (date, more) = search_page(source, &body, digest, runnable)?;
         if date.is_some() || !more {
             return date;
         }
     }
     None
+}
+
+/// Digest -> the registry's date for it, of one repository.
+type Dates = HashMap<String, i64>;
+type Walk = Shared<BoxFuture<'static, Option<Arc<Dates>>>>;
+
+/// Walks by repository (`AppState::docker_date_walks`): when each started, and the walk
+/// every first sight of the repository awaits.
+pub type Walks = Mutex<HashMap<String, (Instant, Walk)>>;
+
+/// The walk of `name` that answers now: the cached one while it is fresh, else a new one
+/// on its own task, so that a request giving up on it after [`TIMEOUT`] leaves it running
+/// for the next first sight.
+fn walk(state: &AppState, upstream: &DockerUpstream, source: DateSource, name: &str) -> Walk {
+    let key = format!("{}#{}/{name}", upstream.url, source.label());
+    let mut walks = state.docker_date_walks.lock();
+    if let Some((started, walk)) = walks.get(&key) {
+        let ttl = match walk.peek() {
+            Some(None) => WALK_RETRY,
+            _ => WALK_TTL,
+        };
+        if started.elapsed() < ttl {
+            return walk.clone();
+        }
+    }
+    if walks.len() >= WALK_REPOS {
+        walks.retain(|_, (started, _)| started.elapsed() < WALK_TTL);
+    }
+    if walks.len() >= WALK_REPOS {
+        // ponytail: drops every walk at once; an LRU when 256 repositories churn in 10 min.
+        walks.clear();
+    }
+    let task = tokio::spawn(tokio::time::timeout(
+        WALK_DEADLINE,
+        walk_repository(state.clone(), upstream.clone(), source, name.to_owned()),
+    ));
+    let walk = task
+        .map(|done| done.ok().and_then(Result::ok).flatten().map(Arc::new))
+        .boxed()
+        .shared();
+    walks.insert(key, (Instant::now(), walk.clone()));
+    walk
+}
+
+/// Every date the repository's listing gives, page by page within the source's bound. A
+/// page that fails ends the walk with what came before it (`None` when that is nothing):
+/// a digest it misses stays first-seen.
+async fn walk_repository(
+    state: AppState,
+    upstream: DockerUpstream,
+    source: DateSource,
+    name: String,
+) -> Option<Dates> {
+    let base = upstream.url.trim_end_matches('/');
+    let mut dates = Dates::new();
+    match source {
+        DateSource::GhcrCreatedAt => {
+            let token = date_token(&upstream)?;
+            let (owner, package) = name.split_once('/')?;
+            let api = if base.ends_with("ghcr.io") {
+                GITHUB_API
+            } else {
+                base
+            };
+            // `/users/` answers for an organisation too; a nested name is one package.
+            let package = package.replace('/', "%2F");
+            for page in 1..=GHCR_PAGES {
+                let url = format!(
+                    "{api}/users/{owner}/packages/container/{package}/versions?per_page=100&page={page}"
+                );
+                let auth = Some(UpstreamAuth::Bearer(&token));
+                let Some(body) =
+                    fetch(&state, &upstream, source, &url, auth, WALK_PAGE_TIMEOUT).await
+                else {
+                    break;
+                };
+                let Some(listed) = ghcr_page(&body, &mut dates) else {
+                    break;
+                };
+                if listed < 100 {
+                    break;
+                }
+            }
+        }
+        DateSource::McrLastModified => {
+            let url = format!("{base}/api/v1/catalog/{name}/tags?reg=mar");
+            let body = fetch(&state, &upstream, source, &url, None, WALK_PAGE_TIMEOUT).await?;
+            mcr_catalog(&body, &mut dates)?;
+        }
+        DateSource::EcrPublicPushedAt => {
+            let (alias, repository) = name.split_once('/')?;
+            let api = if base.ends_with("public.ecr.aws") {
+                ECR_PUBLIC_API
+            } else {
+                base
+            };
+            let url = format!("{api}/describeImageTags");
+            let mut next: Option<String> = None;
+            for _ in 0..ECR_PAGES {
+                let mut request = serde_json::json!({
+                    "registryAliasName": alias,
+                    "repositoryName": repository,
+                    "maxResults": ECR_PER_PAGE,
+                });
+                if let Some(token) = &next {
+                    request["nextToken"] = token.as_str().into();
+                }
+                let Some(body) = post_json(&state, &url, &request).await else {
+                    break;
+                };
+                let Some(more) = ecr_page(&body, &mut dates) else {
+                    break;
+                };
+                next = more;
+                if next.is_none() {
+                    break;
+                }
+            }
+        }
+        _ => return None,
+    }
+    tracing::info!(upstream = %upstream.url, name = %name, source = source.label(), digests = dates.len(), "docker publish dates walked");
+    (!dates.is_empty()).then_some(dates)
+}
+
+/// The upstream's `date_token_file`, read at each walk: a mounted Secret that rotates.
+fn date_token(upstream: &DockerUpstream) -> Option<String> {
+    let path = upstream.date_token_file.as_deref()?;
+    match std::fs::read_to_string(path) {
+        Ok(token) if !token.trim().is_empty() => Some(token.trim().to_owned()),
+        Ok(_) => {
+            tracing::info!(path, "docker date_token_file is empty: first-seen applies");
+            None
+        }
+        Err(e) => {
+            tracing::info!(path, error = %e, "docker date_token_file unreadable: first-seen applies");
+            None
+        }
+    }
+}
+
+/// The public.ecr.aws gallery API is a POST; it has no breaker of its own (a failed walk
+/// is retried after [`WALK_RETRY`] only).
+async fn post_json(
+    state: &AppState,
+    url: &str,
+    request: &serde_json::Value,
+) -> Option<axum::body::Bytes> {
+    let sent = state
+        .http_client
+        .post(url)
+        .json(request)
+        .timeout(WALK_PAGE_TIMEOUT)
+        .send()
+        .await;
+    let response = match sent {
+        Ok(response) if response.status().is_success() => response,
+        Ok(response) => {
+            tracing::info!(url, status = %response.status(), "docker publish date lookup failed: first-seen applies");
+            return None;
+        }
+        Err(e) => {
+            tracing::info!(url, error = %e, "docker publish date lookup failed: first-seen applies");
+            return None;
+        }
+    };
+    if response.content_length().is_some_and(|n| n > MAX_BODY) {
+        return None;
+    }
+    response.bytes().await.ok()
+}
+
+fn rfc3339(at: &serde_json::Value) -> Option<i64> {
+    Some(
+        chrono::DateTime::parse_from_rfc3339(at.as_str()?)
+            .ok()?
+            .timestamp(),
+    )
+}
+
+/// One page of ghcr package versions: each version is a digest (an index and each of its
+/// platform manifests apart) with the `created_at` GitHub set when it was pushed. How many
+/// versions the page listed, `None` for an answer that is not a page.
+fn ghcr_page(body: &[u8], dates: &mut Dates) -> Option<usize> {
+    let doc: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let versions = doc.as_array()?;
+    for v in versions {
+        if let (Some(digest), Some(at)) = (v["name"].as_str(), rfc3339(&v["created_at"])) {
+            dates.entry(digest.to_owned()).or_insert(at);
+        }
+    }
+    Some(versions.len())
+}
+
+/// The mcr catalog of a repository: every tag with the digest it names and when the tag
+/// last moved (`createdDate` is the tag's first push, not the digest's). A digest takes
+/// the earliest move of the tags naming it: no tag moved onto it before it was pushed.
+fn mcr_catalog(body: &[u8], dates: &mut Dates) -> Option<()> {
+    let doc: serde_json::Value = serde_json::from_slice(body).ok()?;
+    for tag in doc.as_array()? {
+        if let (Some(digest), Some(at)) =
+            (tag["digest"].as_str(), rfc3339(&tag["lastModifiedDate"]))
+        {
+            dates
+                .entry(digest.to_owned())
+                .and_modify(|d| *d = (*d).min(at))
+                .or_insert(at);
+        }
+    }
+    Some(())
+}
+
+/// One page of public.ecr.aws `describeImageTags`: the digest each tag names with its
+/// `imagePushedAt`. Cosign tags (`.sig`, `.att`, `.sbom`) name signatures, not images. The
+/// next page's token, `None` for an answer that is not a page.
+fn ecr_page(body: &[u8], dates: &mut Dates) -> Option<Option<String>> {
+    let doc: serde_json::Value = serde_json::from_slice(body).ok()?;
+    for tag in doc["imageTagDetails"].as_array()? {
+        let name = tag["imageTag"].as_str().unwrap_or_default();
+        if [".sig", ".att", ".sbom"].iter().any(|s| name.ends_with(s)) {
+            continue;
+        }
+        let image = &tag["imageDetail"];
+        if let (Some(digest), Some(at)) = (
+            image["imageDigest"].as_str(),
+            rfc3339(&image["imagePushedAt"]),
+        ) {
+            dates.entry(digest.to_owned()).or_insert(at);
+        }
+    }
+    Some(doc["nextToken"].as_str().map(str::to_owned))
 }
 
 /// The manifests a client can run from `manifest`: an index's platform manifests without
@@ -157,6 +430,7 @@ fn lookup_url(
             tag?
         )),
         DateSource::GcrTimeUploaded => Some(format!("{base}/v2/{name}/tags/list")),
+        _ => None,
     }
 }
 
@@ -238,6 +512,7 @@ fn parse(
                 .ok()?;
             (ms > 0).then_some(ms / 1000)
         }
+        _ => None,
     }
 }
 
@@ -250,6 +525,7 @@ mod tests {
     fn upstream(url: &str, ns: &str) -> DockerUpstream {
         DockerUpstream {
             trust_upstream_dates: true,
+            date_token_file: None,
             url: url.into(),
             auth: None,
             auth_env: None,
@@ -289,9 +565,67 @@ mod tests {
             lookup_url(&k8s, DateSource::GcrTimeUploaded, "pause", D).as_deref(),
             Some("https://registry.k8s.io/v2/pause/tags/list")
         );
-        for ns in ["ghcr.io", "mcr.microsoft.com", "public.ecr.aws", "cgr.dev"] {
+        let gar = upstream("https://x", "europe-west1-docker.pkg.dev");
+        assert_eq!(gar.date_source(), Some(DateSource::GcrTimeUploaded));
+        for (ns, source) in [
+            ("ghcr.io", DateSource::GhcrCreatedAt),
+            ("mcr.microsoft.com", DateSource::McrLastModified),
+            ("public.ecr.aws", DateSource::EcrPublicPushedAt),
+        ] {
+            assert_eq!(
+                upstream("https://x", ns).date_source(),
+                Some(source),
+                "{ns}"
+            );
+            assert!(source.walks_repository());
+        }
+        for ns in ["cgr.dev", "docker.dragonflydb.io", "xpkg.upbound.io"] {
             assert_eq!(upstream("https://x", ns).date_source(), None, "{ns}");
         }
+    }
+
+    /// Bodies trimmed from the live answers of 05.11.2026.
+    #[test]
+    fn walked_listings_date_each_digest_by_the_registry() {
+        // ghcr: actions/actions-runner 2.338.2, the index and a platform manifest apart.
+        let ghcr = br#"[{"name":"sha256:759a1d94a15b","created_at":"2026-10-26T14:50:37Z","metadata":{"container":{"tags":["2.338.2","latest"]}}},
+            {"name":"sha256:69add0c05ce2","created_at":"2026-10-26T14:50:46Z","metadata":{"container":{"tags":[]}}}]"#;
+        let mut dates = Dates::new();
+        assert_eq!(ghcr_page(ghcr, &mut dates), Some(2));
+        assert_eq!(dates["sha256:759a1d94a15b"], 1_793_026_237);
+        assert_eq!(dates.len(), 2);
+        assert_eq!(
+            ghcr_page(br#"{"message":"Bad credentials"}"#, &mut dates),
+            None
+        );
+
+        // mcr: dotnet/monitor `10`, `10.0` and `latest` name one digest and moved within two
+        // minutes of each other; `createdDate` (the tag's first push, 2025) is not used.
+        let mcr = br#"[{"name":"10","digest":"sha256:200dbc2060a2","lastModifiedDate":"2026-10-29T02:54:08.0000000+00:00","createdDate":"2025-11-11T14:19:49.0000000+00:00"},
+            {"name":"10.0.5","digest":"sha256:200dbc2060a2","lastModifiedDate":"2026-10-29T02:52:42.0000000+00:00","createdDate":"2026-10-29T02:52:42.0000000+00:00"},
+            {"name":"9","digest":"sha256:d9a6daf51bfa","lastModifiedDate":"2026-10-29T02:52:47.0000000+00:00","createdDate":"2024-11-12T00:00:00.0000000+00:00"}]"#;
+        let mut dates = Dates::new();
+        assert_eq!(mcr_catalog(mcr, &mut dates), Some(()));
+        assert_eq!(
+            dates["sha256:200dbc2060a2"], 1_793_242_362,
+            "the earliest move"
+        );
+        assert_eq!(dates.len(), 2);
+        assert_eq!(mcr_catalog(b"<html>", &mut dates), None);
+
+        // public.ecr.aws: gravitational/teleport-distroless, a cosign tag skipped.
+        let ecr = br#"{"imageTagDetails":[
+            {"imageTag":"sha256-97c78f0f46cf.sig","createdAt":"2026-06-09T16:37:55.974Z","imageDetail":{"imageDigest":"sha256:a87cd31fc783","imagePushedAt":"2026-06-09T16:37:55.815Z"}},
+            {"imageTag":"18.2.2","createdAt":"2025-09-24T10:00:00Z","imageDetail":{"imageDigest":"sha256:f8f3974301fd","imagePushedAt":"2025-09-24T10:00:00.000Z"}}],
+            "nextToken":"opaque"}"#;
+        let mut dates = Dates::new();
+        assert_eq!(ecr_page(ecr, &mut dates), Some(Some("opaque".to_owned())));
+        assert_eq!(dates.len(), 1);
+        assert_eq!(dates["sha256:f8f3974301fd"], 1_758_708_000);
+        assert_eq!(
+            ecr_page(br#"{"imageTagDetails":[]}"#, &mut dates),
+            Some(None)
+        );
     }
 
     /// Bodies trimmed from the live answers of 02.11.2026.

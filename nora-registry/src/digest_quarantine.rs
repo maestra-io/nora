@@ -307,6 +307,18 @@ impl DigestStore {
         entry
     }
 
+    /// Move an entry back to `first_seen` when that is earlier: a registry date found after
+    /// NORA's own clock started it, or a dated manifest naming it. Returns the entry.
+    ///
+    /// ponytail: memory only. The stored object keeps the first writer's date, so a restart
+    /// forgets this until the next fetch finds the date again; a hold ends at the TTL anyway.
+    pub fn backdate(&self, registry: &str, digest: &str, first_seen: i64) -> Option<DigestEntry> {
+        let mut entries = self.entries.write();
+        let entry = entries.get_mut(&map_key(registry, digest))?;
+        entry.first_seen = entry.first_seen.min(first_seen);
+        Some(entry.clone())
+    }
+
     /// Write a new entry off the request path. The object is created once: when it
     /// exists already (another replica, or a pod that started before it), the stored
     /// entry is the ledger's and replaces the one just recorded in memory.

@@ -4448,6 +4448,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             activity: Arc::new(crate::activity_log::ActivityLog::new(50)),
             audit: ctx.state.audit.clone(),
             docker_auth: Arc::new(crate::registry::DockerAuth::new(reqwest::Client::new(), 5)),
+            docker_date_walks: Default::default(),
             repo_index: Arc::new(crate::repo_index::RepoIndex::new()),
             http_client: reqwest::Client::new(),
             http_client_no_redirect: reqwest::Client::new(),

@@ -47,6 +47,7 @@ pub use cpan::routes as cpan_routes;
 pub use deb::routes as deb_routes;
 pub use docker::routes as docker_routes;
 pub use docker_auth::DockerAuth;
+pub use docker_dates::Walks as DockerDateWalks;
 pub use gems::routes as gems_routes;
 pub use github::routes as github_routes;
 pub use go::routes as go_routes;
@@ -3975,6 +3976,7 @@ mod first_download_integrity {
             |c, u| {
                 c.docker.upstreams = vec![crate::config::DockerUpstream {
                     trust_upstream_dates: false,
+                    date_token_file: None,
                     url: u,
                     auth: None,
                     auth_env: None,
@@ -4072,6 +4074,7 @@ mod first_download_integrity {
             |c, u| {
                 c.docker.upstreams = vec![crate::config::DockerUpstream {
                     trust_upstream_dates: false,
+                    date_token_file: None,
                     url: u,
                     auth: None,
                     auth_env: None,
@@ -5205,6 +5208,7 @@ mod upstream_failure_matrix {
             .into_iter()
             .map(|url| DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url,
                 auth: None,
                 auth_env: None,

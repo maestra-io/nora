@@ -1623,12 +1623,22 @@ impl Config {
             }
         }
         for u in &self.docker.upstreams {
-            if u.trust_upstream_dates && u.date_source().is_none() {
-                let msg = format!(
-                    "docker.upstreams {:?} sets trust_upstream_dates, but {} publishes no date NORA reads (Docker Hub, quay.io, registry.k8s.io and gcr.io do): first-seen applies",
-                    u.url,
-                    u.resolved_namespace()
-                );
+            let undated = u.date_source().is_none();
+            let tokenless =
+                u.date_source() == Some(DateSource::GhcrCreatedAt) && u.date_token_file.is_none();
+            if u.trust_upstream_dates && (undated || tokenless) {
+                let msg = if undated {
+                    format!(
+                        "docker.upstreams {:?} sets trust_upstream_dates, but {} publishes no date NORA reads (Docker Hub, quay.io, registry.k8s.io, gcr.io, Artifact Registry, ghcr.io, mcr.microsoft.com and public.ecr.aws do): first-seen applies",
+                        u.url,
+                        u.resolved_namespace()
+                    )
+                } else {
+                    format!(
+                        "docker.upstreams {:?} sets trust_upstream_dates without date_token_file: the GitHub packages API answers only with a token, so first-seen applies",
+                        u.url
+                    )
+                };
                 if config_strict_from_env() {
                     errors.push(msg);
                 } else {
@@ -1961,12 +1971,12 @@ mod tests {
         let toml = |url: &str| {
             format!("[[docker.upstreams]]\nurl = \"{url}\"\ntrust_upstream_dates = true\n")
         };
-        let (ghcr, _) = parse_config(&toml("https://ghcr.io")).unwrap();
+        let (ghcr, _) = parse_config(&toml("https://cgr.dev")).unwrap();
         let (warnings, _) = ghcr.validate();
         assert!(
             warnings
                 .iter()
-                .any(|w| w.contains("ghcr.io publishes no date")),
+                .any(|w| w.contains("cgr.dev publishes no date")),
             "{warnings:?}"
         );
         std::env::set_var("NORA_CONFIG_STRICT", "true");
@@ -1975,8 +1985,27 @@ mod tests {
         assert!(
             strict
                 .iter()
-                .any(|e| e.contains("ghcr.io publishes no date")),
+                .any(|e| e.contains("cgr.dev publishes no date")),
             "strict refuses: {strict:?}"
+        );
+        // ghcr.io dates only with a token for the GitHub packages API.
+        let (ghcr, _) = parse_config(&toml("https://ghcr.io")).unwrap();
+        let (warnings, _) = ghcr.validate();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("without date_token_file")),
+            "{warnings:?}"
+        );
+        let (ghcr, _) = parse_config(&format!(
+            "{}date_token_file = \"/run/gh/token\"\n",
+            toml("https://ghcr.io")
+        ))
+        .unwrap();
+        let (warnings, _) = ghcr.validate();
+        assert!(
+            !warnings.iter().any(|w| w.contains("trust_upstream_dates")),
+            "{warnings:?}"
         );
         let (quay, _) = parse_config(&toml("https://quay.io")).unwrap();
         assert!(quay.docker.upstreams[0].trust_upstream_dates);
@@ -4230,6 +4259,7 @@ proxies = [
             .enumerate()
             .map(|(i, (prefix, masks))| DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: format!("https://r{i}.example"),
                 auth: None,
                 auth_env: None,

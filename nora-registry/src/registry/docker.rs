@@ -972,7 +972,7 @@ fn quarantine_record_verified(state: &AppState, digest: &str, upstream: &str) {
 /// three TTLs for a multi-arch image. The names come from bytes hashed to the manifest
 /// digest, and the date is the manifest's own first-seen: NORA's first sight of it, or
 /// the registry's publish date under `trust_upstream_dates`, so no child is older than
-/// what names it. Idempotent: a digest already recorded keeps its own first-seen.
+/// what names it. Idempotent: a digest recorded later moves back to this date, never forward.
 fn quarantine_record_referenced(
     state: &AppState,
     manifest: &[u8],
@@ -994,6 +994,9 @@ fn quarantine_record_referenced(
             state
                 .digest_store
                 .record("docker", d, upstream, Some(first_seen));
+            // A digest with its own later record (a platform manifest pulled first, a layer
+            // shared with a newer image) has existed since the manifest naming it.
+            state.digest_store.backdate("docker", d, first_seen);
         }
     }
 }
@@ -2268,17 +2271,22 @@ async fn try_fetch_and_cache(
                 let (q_mode, q_secs) = resolve_quarantine(state);
                 let mut keep_tag_copy = false;
                 if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
-                    let first_sight = matches!(
-                        state.digest_store.check("docker", &digest, q_secs),
-                        crate::digest_quarantine::QuarantineStatus::New
+                    let seen = state.digest_store.check("docker", &digest, q_secs);
+                    let first_sight =
+                        matches!(seen, crate::digest_quarantine::QuarantineStatus::New);
+                    let still_held = matches!(
+                        seen,
+                        crate::digest_quarantine::QuarantineStatus::Pending { .. }
                     );
                     // First sight under `trust_upstream_dates`: the registry's own publish
                     // date starts the clock, so an image older than the TTL is not new here.
+                    // A digest held by NORA's clock is asked about again: it may have been
+                    // recorded before its registry had a date source, or in a failed lookup.
                     let mut dated = None;
-                    if let Some(source) = upstream
-                        .date_source()
-                        .filter(|_| first_sight && upstream.trust_upstream_dates)
-                    {
+                    if let Some(source) = upstream.date_source().filter(|source| {
+                        upstream.trust_upstream_dates
+                            && (first_sight || (still_held && source.dates_digests()))
+                    }) {
                         dated = super::docker_dates::published_at(
                             state,
                             upstream,
@@ -2291,12 +2299,18 @@ async fn try_fetch_and_cache(
                         .await
                         .map(|at| (at, source.label()));
                     }
-                    let entry = state.digest_store.record(
+                    let mut entry = state.digest_store.record(
                         "docker",
                         &digest,
                         &upstream.url,
                         dated.map(|(at, _)| at),
                     );
+                    if let Some((at, source)) = dated.filter(|(at, _)| *at < entry.first_seen) {
+                        if let Some(moved) = state.digest_store.backdate("docker", &digest, at) {
+                            tracing::info!(digest = %digest, name = %upstream_name, source, was = entry.first_seen, first_seen = at, "Quarantine: held manifest dated by its registry");
+                            entry = moved;
+                        }
+                    }
                     quarantine_record_referenced(state, &data, &upstream.url, entry.first_seen);
                     let q_status = state.digest_store.check("docker", &digest, q_secs);
                     if first_sight {
@@ -5683,6 +5697,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: upstream.uri(),
                 auth: None,
                 auth_env: None,
@@ -5774,6 +5789,7 @@ mod integration_tests {
                     .into_iter()
                     .map(|url| DockerUpstream {
                         trust_upstream_dates: false,
+                        date_token_file: None,
                         url,
                         auth: None,
                         auth_env: None,
@@ -5859,6 +5875,7 @@ mod integration_tests {
                     namespaces: vec!["team-*".to_string()],
                     auth_env: None,
                     trust_upstream_dates: false,
+                    date_token_file: None,
                 };
                 let hub = DockerUpstream {
                     url: squatter.uri(),
@@ -5868,6 +5885,7 @@ mod integration_tests {
                     namespaces: Vec::new(),
                     auth_env: None,
                     trust_upstream_dates: false,
+                    date_token_file: None,
                 };
                 let upstreams = if harbor_first {
                     vec![bound, hub]
@@ -5942,6 +5960,7 @@ mod integration_tests {
                     namespaces: Vec::new(),
                     auth_env: None,
                     trust_upstream_dates: false,
+                    date_token_file: None,
                 },
                 DockerUpstream {
                     url: harbor_url,
@@ -5951,6 +5970,7 @@ mod integration_tests {
                     namespaces: vec!["team-*".to_string()],
                     auth_env: None,
                     trust_upstream_dates: false,
+                    date_token_file: None,
                 },
             ];
         });
@@ -6033,6 +6053,7 @@ mod integration_tests {
                     namespaces: Vec::new(),
                     auth_env: None,
                     trust_upstream_dates: false,
+                    date_token_file: None,
                 },
                 DockerUpstream {
                     url: harbor_url,
@@ -6042,6 +6063,7 @@ mod integration_tests {
                     namespaces: vec!["team-*".to_string()],
                     auth_env: None,
                     trust_upstream_dates: false,
+                    date_token_file: None,
                 },
             ];
         });
@@ -6119,6 +6141,7 @@ mod integration_tests {
                 namespaces: vec!["team-*".to_string()],
                 auth_env: None,
                 trust_upstream_dates: false,
+                date_token_file: None,
             }];
         });
         let manifest = serde_json::to_vec(&serde_json::json!({
@@ -6217,6 +6240,7 @@ mod integration_tests {
                 namespaces: Vec::new(),
                 auth_env: None,
                 trust_upstream_dates: false,
+                date_token_file: None,
             }];
         });
 
@@ -6376,6 +6400,7 @@ mod integration_tests {
                     namespaces: Vec::new(),
                     auth_env: None,
                     trust_upstream_dates: false,
+                    date_token_file: None,
                 }];
             });
             let case = format!("{challenge:?} token={token:?} credential={credential}");
@@ -6449,6 +6474,7 @@ mod integration_tests {
                         namespaces: Vec::new(),
                         auth_env: None,
                         trust_upstream_dates: false,
+                        date_token_file: None,
                     })
                     .collect();
             });
@@ -6469,6 +6495,7 @@ mod integration_tests {
                 namespaces,
                 auth_env: None,
                 trust_upstream_dates: false,
+                date_token_file: None,
             })
             .collect()
     }
@@ -6734,6 +6761,7 @@ mod integration_tests {
                     namespaces: Vec::new(),
                     auth_env: None,
                     trust_upstream_dates: false,
+                    date_token_file: None,
                 }];
             });
             if open {
@@ -6783,6 +6811,7 @@ mod integration_tests {
             cfg.docker.serve_stale = false;
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -6920,6 +6949,7 @@ mod integration_tests {
         };
         let upstream = |url: String, prefix: Option<&str>| DockerUpstream {
             trust_upstream_dates: false,
+            date_token_file: None,
             url,
             auth: None,
             auth_env: None,
@@ -7050,6 +7080,7 @@ mod integration_tests {
             .await;
         let upstream = DockerUpstream {
             trust_upstream_dates: false,
+            date_token_file: None,
             url: server.uri(),
             auth: None,
             auth_env: None,
@@ -7169,6 +7200,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: uri,
                 auth: None,
                 auth_env: None,
@@ -7262,6 +7294,7 @@ mod integration_tests {
             .await;
         let upstream = DockerUpstream {
             trust_upstream_dates: false,
+            date_token_file: None,
             url: server.uri(),
             auth: None,
             auth_env: None,
@@ -7340,6 +7373,7 @@ mod integration_tests {
         let (storage, ops) = crate::test_helpers::op_counting_storage();
         let upstream = DockerUpstream {
             trust_upstream_dates: false,
+            date_token_file: None,
             url: "http://127.0.0.1:9".to_string(),
             auth: None,
             auth_env: None,
@@ -7377,6 +7411,7 @@ mod integration_tests {
         let (storage, ops) = crate::test_helpers::op_counting_storage();
         let upstream = DockerUpstream {
             trust_upstream_dates: false,
+            date_token_file: None,
             url: "http://127.0.0.1:9".to_string(),
             auth: None,
             auth_env: None,
@@ -7652,6 +7687,7 @@ mod integration_tests {
                 .await;
             let upstream = DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: server.uri(),
                 auth: None,
                 auth_env: None,
@@ -7736,6 +7772,7 @@ mod integration_tests {
             use crate::config::DockerUpstream;
             let upstream = DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: "http://127.0.0.1:9".to_string(),
                 auth: None,
                 auth_env: None,
@@ -8193,6 +8230,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -8667,6 +8705,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -8750,6 +8789,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -10083,6 +10123,7 @@ mod integration_tests {
             // Unreachable upstream
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -10345,6 +10386,7 @@ mod integration_tests {
             cfg.docker.upstreams = vec![
                 DockerUpstream {
                     trust_upstream_dates: false,
+                    date_token_file: None,
                     url: "http://127.0.0.1:1".into(), // upstream A (will be tripped)
                     auth: None,
                     auth_env: None,
@@ -10354,6 +10396,7 @@ mod integration_tests {
                 },
                 DockerUpstream {
                     trust_upstream_dates: false,
+                    date_token_file: None,
                     url: "http://127.0.0.1:2".into(), // upstream B (stays closed)
                     auth: None,
                     auth_env: None,
@@ -10497,6 +10540,7 @@ mod integration_tests {
     fn test_canonicalize_prefix_routing() {
         let upstreams = vec![crate::config::DockerUpstream {
             trust_upstream_dates: false,
+            date_token_file: None,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             auth_env: None,
@@ -10517,6 +10561,7 @@ mod integration_tests {
     fn test_canonicalize_hostname_detection() {
         let upstreams = vec![crate::config::DockerUpstream {
             trust_upstream_dates: false,
+            date_token_file: None,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             auth_env: None,
@@ -10545,6 +10590,7 @@ mod integration_tests {
     fn test_canonicalize_fallback() {
         let upstreams = vec![crate::config::DockerUpstream {
             trust_upstream_dates: false,
+            date_token_file: None,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             auth_env: None,
@@ -10618,6 +10664,7 @@ mod integration_tests {
         let upstreams = vec![
             crate::config::DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: "https://registry-1.docker.io".to_string(),
                 auth: None,
                 auth_env: None,
@@ -10627,6 +10674,7 @@ mod integration_tests {
             },
             crate::config::DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: "https://ghcr.io".to_string(),
                 auth: None,
                 auth_env: None,
@@ -10658,6 +10706,7 @@ mod integration_tests {
         let upstreams = vec![
             crate::config::DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: "https://registry-1.docker.io".to_string(),
                 auth: None,
                 auth_env: None,
@@ -10667,6 +10716,7 @@ mod integration_tests {
             },
             crate::config::DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: "https://ghcr.io".to_string(),
                 auth: None,
                 auth_env: None,
@@ -10700,6 +10750,7 @@ mod integration_tests {
     fn test_canonicalize_deny_mode_allows_known_hostname() {
         let upstreams = vec![crate::config::DockerUpstream {
             trust_upstream_dates: false,
+            date_token_file: None,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             auth_env: None,
@@ -10728,6 +10779,7 @@ mod integration_tests {
                 namespaces: masks.iter().map(|m| m.to_string()).collect(),
                 auth_env: None,
                 trust_upstream_dates: false,
+                date_token_file: None,
             }
         };
         vec![
@@ -10835,6 +10887,7 @@ mod integration_tests {
             namespaces: masks.iter().map(|m| m.to_string()).collect(),
             auth_env: None,
             trust_upstream_dates: false,
+            date_token_file: None,
         };
         let with_hub = vec![
             entry("https://registry.gitlab.com", None, &[]),
@@ -10927,6 +10980,7 @@ mod integration_tests {
     fn test_denied_response_format() {
         let upstreams = vec![crate::config::DockerUpstream {
             trust_upstream_dates: false,
+            date_token_file: None,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             auth_env: None,
@@ -10981,6 +11035,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: upstream.uri(),
                 auth: None,
                 auth_env: None,
@@ -11068,6 +11123,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: upstream.uri(),
                 auth: None,
                 auth_env: None,
@@ -11167,6 +11223,7 @@ mod integration_tests {
             create_test_context_with_config(|cfg| {
                 cfg.docker.upstreams = vec![DockerUpstream {
                     trust_upstream_dates: false,
+                    date_token_file: None,
                     url: upstream.uri(),
                     auth: None,
                     auth_env: None,
@@ -11294,6 +11351,7 @@ mod integration_tests {
             create_test_context_with_config(move |cfg| {
                 cfg.docker.upstreams = vec![DockerUpstream {
                     trust_upstream_dates: trust,
+                    date_token_file: None,
                     url: url.clone(),
                     auth: None,
                     auth_env: None,
@@ -11304,6 +11362,207 @@ mod integration_tests {
                 cfg.curation.quarantine = Some(mode);
                 cfg.curation.quarantine_ttl = Some("3d".to_string());
             })
+        }
+
+        /// The upstream as `namespace` (a registry that dates by walking the repository),
+        /// with `token` in its `date_token_file`.
+        fn walked(server: &MockServer, namespace: &str, token: Option<&str>) -> TestContext {
+            let url = server.uri();
+            let namespace = namespace.to_string();
+            let file = token.map(|t| {
+                let dir = tempfile::tempdir().unwrap().keep();
+                let file = dir.join("token");
+                std::fs::write(&file, format!("{t}\n")).unwrap();
+                file.to_string_lossy().into_owned()
+            });
+            create_test_context_with_config(move |cfg| {
+                cfg.docker.upstreams = vec![DockerUpstream {
+                    trust_upstream_dates: true,
+                    date_token_file: file.clone(),
+                    url: url.clone(),
+                    auth: None,
+                    auth_env: None,
+                    namespace: Some(namespace.clone()),
+                    prefix: None,
+                    namespaces: Vec::new(),
+                }];
+                cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+                cfg.curation.quarantine_ttl = Some("3d".to_string());
+            })
+        }
+
+        fn rfc3339(at: i64) -> String {
+            chrono::DateTime::from_timestamp(at, 0)
+                .unwrap()
+                .to_rfc3339()
+        }
+
+        const GHCR_API: &str = "/users/library/packages/container/demo/versions";
+
+        /// ghcr.io: the image's digest is a package version created `at`, listed on the
+        /// second page; the API wants the token.
+        async fn ghcr_versions(server: &MockServer, image: &[u8], at: i64) {
+            let filler: Vec<_> = (0..100)
+                .map(|i| serde_json::json!({"name": format!("sha256:{i:064x}"), "created_at": rfc3339(at)}))
+                .collect();
+            Mock::given(method("GET"))
+                .and(path(GHCR_API))
+                .and(wiremock::matchers::query_param("page", "1"))
+                .and(wiremock::matchers::header(
+                    "authorization",
+                    "Bearer ghs_test",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(filler))
+                .expect(1)
+                .mount(server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(GHCR_API))
+                .and(wiremock::matchers::query_param("page", "2"))
+                .and(wiremock::matchers::header(
+                    "authorization",
+                    "Bearer ghs_test",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"name": sha(image), "created_at": rfc3339(at)}
+                ])))
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn ghcr_dates_a_digest_request_by_its_package_version() {
+            let (server, image, layer) = upstream_with_image().await;
+            ghcr_versions(&server, &image, days_ago(30)).await;
+            let ctx = walked(&server, "ghcr.io", Some("ghs_test"));
+            assert_eq!(
+                get(&ctx, &format!("manifests/{}", sha(&image))).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                get(&ctx, &format!("blobs/{}", sha(&layer))).await,
+                StatusCode::OK
+            );
+            // Each page once (`expect(1)`): the ledger keeps the date for the tag request.
+            assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn a_fresh_ghcr_version_is_held_from_its_created_at() {
+            let (server, image, _) = upstream_with_image().await;
+            let pushed = days_ago(1);
+            ghcr_versions(&server, &image, pushed).await;
+            let ctx = walked(&server, "ghcr.io", Some("ghs_test"));
+            assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::FORBIDDEN);
+            let entry = ctx
+                .state
+                .digest_store
+                .record("docker", &sha(&image), "x", None);
+            assert_eq!(entry.first_seen, pushed);
+        }
+
+        /// No token, a refusing API, a digest no version names: first-seen, never a pass.
+        #[tokio::test]
+        async fn an_undated_ghcr_digest_stays_first_seen() {
+            let (server, image, _) = upstream_with_image().await;
+            let ctx = walked(&server, "ghcr.io", None);
+            assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::FORBIDDEN);
+
+            let (server, _, _) = upstream_with_image().await;
+            Mock::given(method("GET"))
+                .and(path(GHCR_API))
+                .respond_with(ResponseTemplate::new(429))
+                .mount(&server)
+                .await;
+            let ctx = walked(&server, "ghcr.io", Some("ghs_test"));
+            assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::FORBIDDEN);
+
+            let (server, _, _) = upstream_with_image().await;
+            Mock::given(method("GET"))
+                .and(path(GHCR_API))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"name": "sha256:other", "created_at": rfc3339(days_ago(30))}
+                ])))
+                .mount(&server)
+                .await;
+            let ctx = walked(&server, "ghcr.io", Some("ghs_test"));
+            assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::FORBIDDEN);
+            let entry = ctx
+                .state
+                .digest_store
+                .record("docker", &sha(&image), "x", None);
+            assert!(entry.first_seen > days_ago(1), "first-seen: {entry:?}");
+        }
+
+        /// A digest NORA held by its own clock before its registry had a date source: the
+        /// next fetch dates it, and what it names matures with it.
+        #[tokio::test]
+        async fn a_held_digest_is_dated_by_a_later_fetch() {
+            let (server, image, layer) = upstream_with_image().await;
+            ghcr_versions(&server, &image, days_ago(30)).await;
+            let ctx = walked(&server, "ghcr.io", Some("ghs_test"));
+            for digest in [sha(&image), sha(&layer)] {
+                ctx.state.digest_store.record("docker", &digest, "x", None);
+            }
+            assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::OK);
+            assert_eq!(
+                get(&ctx, &format!("blobs/{}", sha(&layer))).await,
+                StatusCode::OK
+            );
+            let entry = ctx
+                .state
+                .digest_store
+                .record("docker", &sha(&image), "x", None);
+            assert!(entry.first_seen <= days_ago(29), "{entry:?}");
+        }
+
+        /// The date only ever moves a hold back: a registry date later than NORA's clock (a
+        /// digest moved between repositories) leaves the entry.
+        #[tokio::test]
+        async fn a_later_registry_date_leaves_a_held_digest_alone() {
+            let (server, image, _) = upstream_with_image().await;
+            ghcr_versions(&server, &image, days_ago(1)).await;
+            let ctx = walked(&server, "ghcr.io", Some("ghs_test"));
+            let seen = days_ago(2);
+            ctx.state
+                .digest_store
+                .record("docker", &sha(&image), "x", Some(seen));
+            assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::FORBIDDEN);
+            let entry = ctx
+                .state
+                .digest_store
+                .record("docker", &sha(&image), "x", None);
+            assert_eq!(entry.first_seen, seen);
+        }
+
+        /// public.ecr.aws: the gallery's `describeImageTags`, paged by `nextToken`, cosign
+        /// tags skipped.
+        #[tokio::test]
+        async fn ecr_public_dates_a_digest_across_pages() {
+            let (server, image, _) = upstream_with_image().await;
+            let tag = |name: &str, digest: &str, at: i64| serde_json::json!({"imageTag": name, "imageDetail": {"imageDigest": digest, "imagePushedAt": rfc3339(at)}});
+            Mock::given(method("POST"))
+                .and(path("/describeImageTags"))
+                .and(wiremock::matchers::body_partial_json(serde_json::json!({"registryAliasName": "library", "repositoryName": "demo", "nextToken": "p2"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "imageTagDetails": [tag("v1", &sha(&image), days_ago(30))]
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/describeImageTags"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "imageTagDetails": [tag(&format!("sha256-{}.sig", &sha(&image)[7..]), &sha(&image), days_ago(1))],
+                    "nextToken": "p2"
+                })))
+                .mount(&server)
+                .await;
+            let ctx = walked(&server, "public.ecr.aws", None);
+            assert_eq!(
+                get(&ctx, &format!("manifests/{}", sha(&image))).await,
+                StatusCode::OK
+            );
         }
 
         async fn get(ctx: &TestContext, rest: &str) -> StatusCode {
@@ -11812,6 +12071,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: upstream.uri(),
                 auth: None,
                 auth_env: None,
@@ -11935,6 +12195,7 @@ mod integration_tests {
     fn unreachable_upstream() -> crate::config::DockerUpstream {
         crate::config::DockerUpstream {
             trust_upstream_dates: false,
+            date_token_file: None,
             // Reserved port on localhost — connect fails fast, no real network.
             url: "http://127.0.0.1:9".to_string(),
             auth: None,
@@ -12155,6 +12416,7 @@ mod stream_spool_tests {
         create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: upstream,
                 auth: None,
                 auth_env: None,
@@ -12552,6 +12814,7 @@ mod stream_spool_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: upstream,
                 auth: None,
                 auth_env: None,
@@ -12801,6 +13064,7 @@ mod upstream_resume_tests {
             cfg.docker.proxy_timeout = proxy_timeout;
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url,
                 auth: None,
                 auth_env: None,
@@ -13090,6 +13354,7 @@ mod upstream_resume_tests {
             cfg.docker.proxy_timeout = 5;
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: upstream_url,
                 auth: None,
                 auth_env: None,
@@ -13412,6 +13677,7 @@ mod blob_single_flight_tests {
             cfg.curation.bypass_token = Some(ProtectedString::from("let-me-in"));
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url,
                 auth: None,
                 auth_env: None,
@@ -13802,6 +14068,7 @@ mod upstream_failure_cases {
             let ctx = create_test_context_with_config(move |cfg| {
                 cfg.docker.upstreams = vec![DockerUpstream {
                     trust_upstream_dates: false,
+                    date_token_file: None,
                     url,
                     auth: None,
                     auth_env: None,
@@ -13848,6 +14115,7 @@ mod upstream_failure_edge_cases {
             let ctx = create_test_context_with_config(move |cfg| {
                 cfg.docker.upstreams = vec![DockerUpstream {
                     trust_upstream_dates: false,
+                    date_token_file: None,
                     url,
                     auth: None,
                     auth_env: None,
@@ -13950,6 +14218,7 @@ mod hosted_pull_stats_and_re_push {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -14069,6 +14338,7 @@ mod hosted_pull_stats_and_re_push {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -14260,6 +14530,7 @@ mod hosted_pull_stats_every_writer_takes_the_lock {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -14534,6 +14805,7 @@ mod hosted_pull_stats_after_a_delete {
         crate::test_helpers::create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
+                date_token_file: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 auth_env: None,
@@ -14731,6 +15003,7 @@ mod manifest_before_metadata_one_lock_order {
             cfg.docker.upstreams = if upstream_ns {
                 vec![DockerUpstream {
                     trust_upstream_dates: false,
+                    date_token_file: None,
                     url: "http://127.0.0.1:1".into(),
                     auth: None,
                     auth_env: None,

@@ -441,6 +441,7 @@ fn build_context_full(
         activity: Arc::new(ActivityLog::new(50)),
         audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
         docker_auth: Arc::new(docker_auth),
+        docker_date_walks: Default::default(),
         repo_index: Arc::new(RepoIndex::new()),
         http_client,
         http_client_no_redirect,
