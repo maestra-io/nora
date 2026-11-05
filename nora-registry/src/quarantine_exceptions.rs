@@ -96,6 +96,10 @@ pub fn parse(text: &str, now: i64) -> Result<HashMap<String, Exception>, String>
     Ok(list)
 }
 
+/// Held by a test while it reloads or reads the process-global gauges.
+#[cfg(test)]
+pub static GAUGES: Mutex<()> = Mutex::new(());
+
 /// The live list, swapped whole on a good read.
 #[derive(Default)]
 pub struct QuarantineExceptions {
@@ -245,6 +249,7 @@ mod tests {
 
     #[test]
     fn a_bad_file_keeps_the_last_good_list_and_names_follow_their_entry() {
+        let _gauges = GAUGES.lock();
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("exceptions.toml");
         let path = path.to_str().unwrap();

@@ -11440,7 +11440,10 @@ mod integration_tests {
             ),
         )
         .unwrap();
-        ctx.state.quarantine_exceptions.reload(file);
+        {
+            let _gauges = crate::quarantine_exceptions::GAUGES.lock();
+            ctx.state.quarantine_exceptions.reload(file);
+        }
         let before = used();
         let r = send(
             &ctx.app,
@@ -11467,7 +11470,10 @@ mod integration_tests {
         assert!(used() >= before + 4, "{} uses", used() - before);
 
         std::fs::write(file, "").unwrap();
-        ctx.state.quarantine_exceptions.reload(file);
+        {
+            let _gauges = crate::quarantine_exceptions::GAUGES.lock();
+            ctx.state.quarantine_exceptions.reload(file);
+        }
         assert_eq!(
             status(&ctx, "manifests/latest".into()).await,
             StatusCode::FORBIDDEN,
