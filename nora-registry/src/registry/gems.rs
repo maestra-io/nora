@@ -7,6 +7,7 @@
 //!   GET /gems/specs.4.8.gz             — full gem index (binary, mutable, TTL cache)
 //!   GET /gems/latest_specs.4.8.gz      — latest gem index (binary, mutable, TTL cache)
 //!   GET /gems/prerelease_specs.4.8.gz  — prerelease index (binary, mutable, TTL cache)
+//!   GET /gems/versions                 — compact index list of gems (text, mutable, TTL cache)
 //!   GET /gems/info/{name}              — compact index (text, mutable, TTL cache)
 //!   GET /gems/gems/{name}-{version}.gem — gem download (binary, immutable cache)
 //!   GET /gems/quick/Marshal.4.8/{name}-{version}.gemspec.rz — gemspec (binary, immutable cache)
@@ -40,8 +41,10 @@ pub fn routes() -> Router<AppState> {
         .route("/gems/specs.4.8.gz", get(specs_index))
         .route("/gems/latest_specs.4.8.gz", get(latest_specs_index))
         .route("/gems/prerelease_specs.4.8.gz", get(prerelease_specs_index))
-        // Compact index (mutable)
-        .route("/gems/info/{name}", get(compact_index))
+        // Compact index (mutable). Bundler and `gem install` use it only when `versions`
+        // answers; without it they read the full Marshal index, which no age filter holds.
+        .route("/gems/versions", get(versions_index))
+        .route("/gems/info/{name}", get(compact_index_filtered))
         // Gem download (immutable) — wildcard because axum forbids two params per segment
         .route("/gems/gems/{filename}", get(download_gem))
         // Gemspec (immutable)
@@ -53,18 +56,36 @@ use crate::cache_ttl::is_within_ttl;
 // ── Index endpoints (mutable, TTL cached) ─────────────────────────────
 
 async fn specs_index(State(state): State<AppState>) -> Response {
-    fetch_index(&state, "specs.4.8.gz").await
+    fetch_index(&state, "specs.4.8.gz", GZIP).await
 }
 
 async fn latest_specs_index(State(state): State<AppState>) -> Response {
-    fetch_index(&state, "latest_specs.4.8.gz").await
+    fetch_index(&state, "latest_specs.4.8.gz", GZIP).await
 }
 
 async fn prerelease_specs_index(State(state): State<AppState>) -> Response {
-    fetch_index(&state, "prerelease_specs.4.8.gz").await
+    fetch_index(&state, "prerelease_specs.4.8.gz", GZIP).await
 }
 
-async fn fetch_index(state: &AppState, filename: &str) -> Response {
+/// The compact index's list of every gem, its versions and the checksum of its `info` file.
+/// Served as upstream wrote it: the young versions it names are left out of `info/<name>`,
+/// which is all a resolver reads, and a checksum that differs from the filtered `info` only
+/// makes Bundler fetch that file again.
+async fn versions_index(State(state): State<AppState>) -> Response {
+    fetch_index(&state, "versions", TEXT).await
+}
+
+const GZIP: &str = "application/gzip";
+const TEXT: &str = "text/plain; charset=utf-8";
+
+async fn fetch_index(state: &AppState, filename: &str, content_type: &'static str) -> Response {
+    let respond = |data: Vec<u8>| {
+        if content_type == TEXT {
+            with_text(data)
+        } else {
+            with_binary(data, content_type)
+        }
+    };
     let storage_key = format!("gems/{}", filename);
 
     // Eager cache read — preserve data for serve-stale fallback
@@ -80,7 +101,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
                     crate::registry_type::RegistryType::Gems,
                     "CACHE",
                 ));
-                return with_binary(data.to_vec(), "application/gzip");
+                return respond(data.to_vec());
             }
         }
     }
@@ -88,7 +109,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
     // Fetch from upstream — none when the operator switched it off: what is stored is all there is.
     let Some(proxy_url) = upstream_url(state) else {
         return match cached_data {
-            Some(data) => with_binary(data.to_vec(), "application/gzip"),
+            Some(data) => respond(data.to_vec()),
             None => StatusCode::NOT_FOUND.into_response(),
         };
     };
@@ -119,7 +140,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
 
             // Cache in background (overwrite — mutable content)
             state.spawn_cache("gems", storage_key, Bytes::from(bytes.clone()));
-            with_binary(bytes, "application/gzip")
+            respond(bytes)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -132,25 +153,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
                         error = ?e,
                         "RubyGems upstream error, serving stale index"
                     );
-                    return (
-                        StatusCode::OK,
-                        [
-                            (
-                                header::CONTENT_TYPE,
-                                HeaderValue::from_static("application/gzip"),
-                            ),
-                            (
-                                header::CACHE_CONTROL,
-                                HeaderValue::from_static("public, max-age=0, must-revalidate"),
-                            ),
-                            (
-                                axum::http::header::HeaderName::from_static("x-nora-stale"),
-                                HeaderValue::from_static("true"),
-                            ),
-                        ],
-                        data.to_vec(),
-                    )
-                        .into_response();
+                    return stale_index(data.to_vec(), content_type);
                 }
             }
             tracing::debug!(filename, error = ?e, "RubyGems upstream error");
@@ -331,31 +334,149 @@ async fn compact_index(
                         error = ?e,
                         "RubyGems upstream error, serving stale compact index"
                     );
-                    return (
-                        StatusCode::OK,
-                        [
-                            (
-                                header::CONTENT_TYPE,
-                                HeaderValue::from_static("text/plain; charset=utf-8"),
-                            ),
-                            (
-                                header::CACHE_CONTROL,
-                                HeaderValue::from_static("public, max-age=0, must-revalidate"),
-                            ),
-                            (
-                                axum::http::header::HeaderName::from_static("x-nora-stale"),
-                                HeaderValue::from_static("true"),
-                            ),
-                        ],
-                        data.to_vec(),
-                    )
-                        .into_response();
+                    return stale_index(data.to_vec(), TEXT);
                 }
             }
             tracing::debug!(error = ?e, "RubyGems compact index error");
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
+}
+
+/// Q04: the compact index of a proxied gem is served without the versions younger than
+/// `min_release_age` (see `crate::metadata_filter::gems_info`), dated by [`gem_dates`]. The
+/// cache keeps the upstream original, so a version shows up as soon as it ages in.
+async fn compact_index_filtered(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    let resp = compact_index(State(state.clone()), headers, Path(name.clone())).await;
+    let curation = state.curation();
+    let engine = &curation.curation_engine;
+    if resp.status() != StatusCode::OK
+        || !engine.metadata_filter_active()
+        || upstream_url(&state).is_none()
+        || crate::curation::is_internal_namespace(
+            engine,
+            crate::curation::RegistryType::Gems,
+            &name,
+        )
+    {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    // The body is a document NORA already holds in memory.
+    let Ok(body) = axum::body::to_bytes(body, usize::MAX).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let text = String::from_utf8_lossy(&body);
+    let mut rows = text.lines().skip_while(|l| *l != "---").skip(1);
+    let keys: Vec<&str> = rows
+        .by_ref()
+        .filter(|l| !l.is_empty())
+        .map(crate::metadata_filter::gems_info_row_key)
+        .collect();
+    let dates = gem_dates(&state, &name, &keys).await;
+    match crate::metadata_filter::gems_info(engine, &name, &body, &dates) {
+        Some(filtered) => {
+            parts.headers.remove(header::CONTENT_LENGTH);
+            parts
+                .headers
+                .insert(header::ETAG, compact_index_etag(&filtered));
+            Response::from_parts(parts, axum::body::Body::from(filtered))
+        }
+        None => Response::from_parts(parts, axum::body::Body::from(body)),
+    }
+}
+
+/// Release dates of a gem's versions, keyed as its compact index rows are (`1.2.0`,
+/// `1.2.0-java`), from the RubyGems API (`/api/v1/versions/<name>.json`, `created_at`) and
+/// kept at `gems/dates/<name>.json`. Asked again only when a key in `wanted` is missing and
+/// the kept copy is older than `gems.metadata_ttl`, so a new release is dated on its first
+/// listing and a row the API never dates costs one request per TTL. Any failure: what is kept
+/// (an undated row is not hidden; the `.gem` gate still applies).
+async fn gem_dates(
+    state: &AppState,
+    name: &str,
+    wanted: &[&str],
+) -> std::collections::HashMap<String, i64> {
+    let key = format!("gems/dates/{name}.json");
+    let kept: Option<std::collections::HashMap<String, i64>> = state
+        .storage
+        .get(&key)
+        .await
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    if let Some(kept) = &kept {
+        if wanted.iter().all(|w| kept.contains_key(*w)) {
+            return kept.clone();
+        }
+        if let Some(meta) = state.storage.stat(&key).await {
+            if is_within_ttl(meta.modified, state.config.gems.metadata_ttl) {
+                return kept.clone();
+            }
+        }
+    }
+    let fetched = match upstream_url(state) {
+        Some(proxy) => {
+            fetch_gem_dates(
+                &state.http_client,
+                &proxy,
+                name,
+                state.config.gems.proxy_timeout,
+            )
+            .await
+        }
+        None => None,
+    };
+    match fetched {
+        Some(dates) => {
+            if let Ok(json) = serde_json::to_vec(&dates) {
+                state.spawn_cache("gems", key, Bytes::from(json));
+            }
+            dates
+        }
+        None => kept.unwrap_or_default(),
+    }
+}
+
+/// Every version's `created_at` from the RubyGems API, keyed `<number>` for a pure-Ruby gem
+/// and `<number>-<platform>` otherwise, as the compact index writes its rows.
+async fn fetch_gem_dates(
+    client: &reqwest::Client,
+    proxy: &str,
+    name: &str,
+    timeout_secs: u64,
+) -> Option<std::collections::HashMap<String, i64>> {
+    let url = format!(
+        "{}/api/v1/versions/{}.json",
+        proxy.trim_end_matches('/'),
+        name
+    );
+    let resp = client
+        .get(&url)
+        .timeout(Duration::from_secs(timeout_secs))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let arr: Vec<serde_json::Value> = resp.json().await.ok()?;
+    Some(
+        arr.iter()
+            .filter_map(|v| {
+                let number = v.get("number")?.as_str()?;
+                let date = crate::curation::parse_iso8601_to_unix(v.get("created_at")?.as_str()?)?;
+                let key = match v.get("platform").and_then(|p| p.as_str()) {
+                    None | Some("ruby") => number.to_string(),
+                    Some(platform) => format!("{number}-{platform}"),
+                };
+                Some((key, date))
+            })
+            .collect(),
+    )
 }
 
 /// Best-effort per-version `created_at` from the RubyGems API (the compact index
@@ -793,10 +914,40 @@ fn with_text(data: Vec<u8>) -> Response {
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=60, must-revalidate"),
             ),
+            (header::ETAG, compact_index_etag(&data)),
         ],
         data,
     )
         .into_response()
+}
+
+/// A cached index served after an upstream error: revalidated on every use, marked stale.
+fn stale_index(data: Vec<u8>, content_type: &'static str) -> Response {
+    let mut response = if content_type == TEXT {
+        with_text(data)
+    } else {
+        with_binary(data, content_type)
+    };
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=0, must-revalidate"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("x-nora-stale"),
+        HeaderValue::from_static("true"),
+    );
+    response
+}
+
+/// The ETag of a compact index file as RubyGems writes it, the quoted MD5 of the body
+/// served: Bundler 1.x checks `versions` and `info/<name>` against it and refuses the compact
+/// index (falling back to the full Marshal index, which no age filter holds) when it is
+/// missing or differs, as it would after filtering.
+fn compact_index_etag(body: &[u8]) -> HeaderValue {
+    use md5::Digest as _;
+    HeaderValue::from_str(&format!("\"{}\"", hex::encode(md5::Md5::digest(body))))
+        .unwrap_or_else(|_| HeaderValue::from_static("\"\""))
 }
 
 /// One reading of a gem file name. RubyGems names a gem file `name-version[-suffix].gem`
@@ -1417,7 +1568,25 @@ async fn upstream_gem_release_dates(
         .as_deref()
         .filter(|_| lookup && state.config.server.trust_upstream_dates);
     for identity in identities {
+        // The dates the compact index was filtered by, when they hold this file: no request.
+        let row = match &identity.platform {
+            Some(platform) => format!("{}-{}", identity.version, platform),
+            None => identity.version.clone(),
+        };
+        let kept = match proxy {
+            Some(_) => state
+                .storage
+                .get(&format!("gems/dates/{}.json", identity.name))
+                .await
+                .ok()
+                .and_then(|b| {
+                    serde_json::from_slice::<std::collections::HashMap<String, i64>>(&b).ok()
+                })
+                .and_then(|dates| dates.get(&row).copied()),
+            None => None,
+        };
         let date = match proxy {
+            Some(_) if kept.is_some() => kept,
             Some(proxy) => {
                 fetch_gems_date(
                     &state.http_client,
