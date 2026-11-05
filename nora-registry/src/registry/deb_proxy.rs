@@ -50,6 +50,9 @@ const MAX_PACKAGES_TEXT: u64 = 1024 * 1024 * 1024;
 const RETAIN_AGE_SECS: i64 = 7 * 86_400;
 /// How long a loaded young-version map is reused for package downloads.
 const YOUNG_TTL: Duration = Duration::from_secs(30);
+/// How long a client waits for a suite refresh before it gets the previous build
+/// (apt times a request out after 30 s).
+const STALE_AFTER: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
 
 /// Whether proxied deb repositories are served filtered: `[curation.deb]
 /// min_release_age` is set. "0d" filters nothing but keeps the ledger and signing on.
@@ -539,6 +542,12 @@ fn dists_url(up: &RepoProxyEntry, suite: &str, path: &str) -> String {
 
 /// Refresh `suite` of `repo` when its state is older than `metadata_ttl`, a held
 /// version has matured, or there is none. Errors only when nothing can be served.
+///
+/// The refresh runs in its own task. Request handlers are dropped when the client
+/// disconnects, and apt gives up on a request after 30 s, so a build slower than that
+/// used to restart from scratch on every retry and never finished: trixie-security
+/// (61 s) answered 499 to 44% of InRelease requests on 04-05.11.2026. With a previous
+/// build the client waits at most `STALE_AFTER`, then gets that build.
 async fn ensure_suite(
     state: &AppState,
     repo: &str,
@@ -546,30 +555,67 @@ async fn ensure_suite(
     suite: &str,
 ) -> Result<(), Response> {
     let state_key = suite_key(repo, suite, "state.json");
-    let fresh = |m: Option<crate::storage::FileMeta>| {
-        m.is_some_and(|m| {
-            crate::cache_ttl::is_within_ttl(m.modified, state.config.deb.metadata_ttl)
-        })
-    };
-    let now = crate::cache_ttl::now_unix() as i64;
-    let matured = |s: &Option<SuiteState>| {
-        s.as_ref()
-            .and_then(|s| s.matures_at)
-            .is_some_and(|t| now >= t)
-    };
     let current: Option<SuiteState> = get_json(state, &state_key).await;
-    if current.is_some() && !matured(&current) && fresh(state.storage.stat(&state_key).await) {
+    if current.is_some() && !needs_refresh(state, &state_key, &current).await {
         return Ok(());
     }
+    let task = {
+        let (state, repo, up, suite) = (
+            state.clone(),
+            repo.to_string(),
+            up.clone(),
+            suite.to_string(),
+        );
+        let has_build = current.is_some();
+        tokio::spawn(async move { refresh_suite(&state, &repo, &up, &suite, has_build).await })
+    };
+    let joined = if current.is_none() {
+        task.await
+    } else {
+        match tokio::time::timeout(STALE_AFTER, task).await {
+            Ok(r) => r,
+            // Still building: serve the previous build, the task finishes on its own.
+            Err(_) => return Ok(()),
+        }
+    };
+    match joined {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "deb proxy: suite refresh task failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
+async fn needs_refresh(state: &AppState, state_key: &str, current: &Option<SuiteState>) -> bool {
+    let now = crate::cache_ttl::now_unix() as i64;
+    let matured = current
+        .as_ref()
+        .and_then(|s| s.matures_at)
+        .is_some_and(|t| now >= t);
+    let fresh = state.storage.stat(state_key).await.is_some_and(|m| {
+        crate::cache_ttl::is_within_ttl(m.modified, state.config.deb.metadata_ttl)
+    });
+    current.is_none() || matured || !fresh
+}
+
+async fn refresh_suite(
+    state: &AppState,
+    repo: &str,
+    up: &RepoProxyEntry,
+    suite: &str,
+    has_build: bool,
+) -> Result<(), Response> {
+    let state_key = suite_key(repo, suite, "state.json");
     let lock = state.publish_lock(&state_key);
     let _guard = match lock.try_lock() {
         Ok(g) => g,
-        // Another request is refreshing: serve what is there, or wait for it.
-        Err(_) if current.is_some() => return Ok(()),
+        // Another task is refreshing: serve what is there, or wait for it.
+        Err(_) if has_build => return Ok(()),
         Err(_) => lock.lock().await,
     };
     let current: Option<SuiteState> = get_json(state, &state_key).await;
-    if current.is_some() && !matured(&current) && fresh(state.storage.stat(&state_key).await) {
+    if !needs_refresh(state, &state_key, &current).await {
         return Ok(());
     }
     match build_suite(state, repo, up, suite, current.as_ref()).await {
@@ -1216,6 +1262,16 @@ mod integration_tests {
 
     /// Mount a signed suite listing `stanzas` and their package files.
     async fn publish(server: &MockServer, key: &SignedSecretKey, stanzas: &[(&str, &str)]) {
+        publish_slow(server, key, stanzas, std::time::Duration::ZERO).await;
+    }
+
+    /// `publish` with an upstream InRelease that answers after `delay`.
+    async fn publish_slow(
+        server: &MockServer,
+        key: &SignedSecretKey,
+        stanzas: &[(&str, &str)],
+        delay: std::time::Duration,
+    ) {
         server.reset().await;
         let text: String = stanzas.iter().map(|(n, v)| stanza(n, v) + "\n").collect();
         let packages = gz(text.as_bytes());
@@ -1237,7 +1293,15 @@ mod integration_tests {
                 .mount(server)
                 .await;
         };
-        mount("/dists/bookworm/InRelease".into(), signed.into_bytes()).await;
+        Mock::given(method("GET"))
+            .and(path("/dists/bookworm/InRelease"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(signed.into_bytes())
+                    .set_delay(delay),
+            )
+            .mount(server)
+            .await;
         mount(
             "/dists/bookworm/main/binary-amd64/Packages.gz".into(),
             packages,
@@ -1435,6 +1499,50 @@ mod integration_tests {
 
         // Signed by a key outside the keyring: the last good build stays served.
         publish(&server, &other, &[("a", "3")]).await;
+        let (_, pkgs) = served(&ctx).await;
+        assert_eq!(pkgs, [("a".into(), "2".into())]);
+    }
+    #[tokio::test]
+    async fn a_slow_refresh_serves_the_last_build_and_finishes_without_the_client() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        publish(&server, &key, &[("a", "1")]).await;
+        let uri = server.uri();
+        let dir = keydir.path().to_str().unwrap().to_string();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.deb.enabled = true;
+            cfg.deb.metadata_ttl = 0;
+            cfg.deb.upstream_keyring_dir = dir;
+            cfg.deb
+                .proxies
+                .insert("debian".into(), RepoProxyEntry::Simple(uri));
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.deb.min_release_age = Some("0d".into());
+            cfg.curation.deb.quarantine = Some(QuarantineMode::Observe);
+        });
+        served(&ctx).await;
+
+        // The upstream takes longer than a client waits: the previous build is served
+        // after STALE_AFTER (apt would have given up at 30 s and cancelled the build).
+        let delay = std::time::Duration::from_secs(3);
+        publish_slow(&server, &key, &[("a", "2")], delay).await;
+        let t = std::time::Instant::now();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/deb/debian/dists/bookworm/InRelease",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            t.elapsed() < delay,
+            "waited {:?} for a slow upstream",
+            t.elapsed()
+        );
+
+        // The refresh outlived that request and finished on its own.
+        tokio::time::sleep(delay + std::time::Duration::from_secs(1)).await;
         let (_, pkgs) = served(&ctx).await;
         assert_eq!(pkgs, [("a".into(), "2".into())]);
     }
