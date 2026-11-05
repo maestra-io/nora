@@ -179,6 +179,35 @@ pub static DOCKER_QUARANTINE_TAG_HELD_TOTAL: LazyLock<IntCounterVec> = LazyLock:
     .expect("failed to create DOCKER_QUARANTINE_TAG_HELD_TOTAL metric at startup")
 });
 
+/// Docker requests a break-glass quarantine exception admitted (Maestra, issues-maestra#1649),
+/// by the listed digest: the manifest itself, or a manifest or blob it names.
+pub static DOCKER_QUARANTINE_EXCEPTION_USED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_docker_quarantine_exception_used_total",
+        "Docker requests a break-glass quarantine exception admitted, by listed digest",
+        &["digest"]
+    )
+    .expect("failed to create DOCKER_QUARANTINE_EXCEPTION_USED_TOTAL metric at startup")
+});
+
+/// Unexpired entries in the quarantine exceptions file, as of its last read.
+pub static DOCKER_QUARANTINE_EXCEPTIONS_ACTIVE: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "nora_docker_quarantine_exceptions_active",
+        "Unexpired entries in the docker quarantine exceptions file"
+    )
+    .expect("failed to create DOCKER_QUARANTINE_EXCEPTIONS_ACTIVE metric at startup")
+});
+
+/// 1 while the quarantine exceptions file on disk is refused and the last good list serves.
+pub static DOCKER_QUARANTINE_EXCEPTIONS_INVALID: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "nora_docker_quarantine_exceptions_invalid",
+        "1 while the docker quarantine exceptions file is refused (last good list kept)"
+    )
+    .expect("failed to create DOCKER_QUARANTINE_EXCEPTIONS_INVALID metric at startup")
+});
+
 /// Conditional revalidations where upstream answered 304 Not Modified — the
 /// cached body was reused and no body bytes were downloaded (#596).
 pub static PROXY_UPSTREAM_304_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {

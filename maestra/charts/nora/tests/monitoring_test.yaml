@@ -74,7 +74,7 @@ tests:
           value: nora
       - lengthEqual:
           path: spec.groups[0].rules
-          count: 10
+          count: 12
       - equal:
           path: spec.groups[1].rules[0].alert
           value: NoraIntegrityFailure

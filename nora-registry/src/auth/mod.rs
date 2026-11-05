@@ -4473,6 +4473,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             spool: ctx.state.spool.clone(),
             blob_flights: crate::proxy_coalesce::InflightMap::new(),
             digest_store: ctx.state.digest_store.clone(),
+            quarantine_exceptions: ctx.state.quarantine_exceptions.clone(),
             signer: ctx.state.signer.clone(),
             leak_finders: ctx.state.leak_finders.clone(),
             cancel_token: tokio_util::sync::CancellationToken::new(),

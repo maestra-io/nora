@@ -96,8 +96,18 @@ with `registry=~"pypi(:.*)?"`, not `registry="pypi"`.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `nora_task_panics_total` | counter | task | Panics of a long-lived background task: `maintenance` (session expiry, storage reachability), `token_flush` (token `last_used` to disk), `storage_size` (the store's size and the per-registry gauges), `pull_stats`, `cleanup` (GC and retention), `sighup` (curation reload), `audit` (audit writer). Each one is logged as `background task panicked` with the task's name. A task is restarted after a backoff; one that keeps panicking, or a maintenance loop that has not finished a tick for `server.maintenance_stall_secs`, makes `/health` answer 503 with `failing_task`. `token_flush` and `storage_size` are started by the maintenance loop, one run at a time; a panic ends only that run, and the next tick starts another. A panic of `audit` ends the process (exit 70): NORA does not serve without its audit trail. Any increase is a bug |
+| `nora_task_panics_total` | counter | task | Panics of a long-lived background task: `maintenance` (session expiry, storage reachability), `token_flush` (token `last_used` to disk), `storage_size` (the store's size and the per-registry gauges), `pull_stats`, `cleanup` (GC and retention), `sighup` (curation reload), `quarantine_exceptions` (re-read of the break-glass list), `audit` (audit writer). Each one is logged as `background task panicked` with the task's name. A task is restarted after a backoff; one that keeps panicking, or a maintenance loop that has not finished a tick for `server.maintenance_stall_secs`, makes `/health` answer 503 with `failing_task`. `token_flush` and `storage_size` are started by the maintenance loop, one run at a time; a panic ends only that run, and the next tick starts another. A panic of `audit` ends the process (exit 70): NORA does not serve without its audit trail. Any increase is a bug |
 | `nora_maintenance_timeouts_total` | counter | — | Maintenance ticks cut at their deadline, a third of what `server.maintenance_stall_secs` leaves after one 30 s tick (90 s by default), because the storage did not answer its reachability request (the first page of a listing on an object store, a write probe on the local disk) in time; each one is logged as `maintenance tick cut at its deadline`. The loop goes on, so this does not fail `/health`: whether the storage answers is `/ready`'s business, and a restart would not fix it. The size of the store is counted apart from the tick, so a large bucket does not cut ticks |
+
+### Docker quarantine exceptions
+
+Break-glass entries from `[docker] quarantine_exceptions` ([procedure](docs/docker-proxy.md)).
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `nora_docker_quarantine_exception_used_total` | counter | digest | Held digests admitted past the quarantine, per listed digest, children counted against the entry that named them. The series appears at 0 when the entry loads |
+| `nora_docker_quarantine_exceptions_active` | gauge | — | Listed entries that have not expired, refreshed on every re-read |
+| `nora_docker_quarantine_exceptions_invalid` | gauge | — | 1 while the last read of the file was refused and the last good list is in force, else 0 |
 
 ### Health probes
 
@@ -139,6 +149,8 @@ The dashboard includes a `registry` template variable to filter by specific prot
 | `NoraStorageUnreachable` | `nora_storage_reachable == 0` for 2m (readiness failing) | critical |
 | `NoraIntegrityFailure` | any `get` with `status=~"integrity_fail\|verify_error"` | critical |
 | `NoraTaskPanic` | any `nora_task_panics_total` increase in 15m (a background task panicked and was restarted) | warning |
+| `NoraQuarantineExceptionUsed` | any `nora_docker_quarantine_exception_used_total` increase in 15m, by listed `digest`: a break-glass entry of `[docker] quarantine_exceptions` admitted a held image (Maestra fork) | warning |
+| `NoraQuarantineExceptionsInvalid` | `nora_docker_quarantine_exceptions_invalid == 1` for 5m: the exceptions file is refused, the last good list stays (Maestra fork) | warning |
 
 ## Integrity recovery
 

@@ -49,6 +49,10 @@ pub struct DockerConfig {
     pub default_action: DefaultAction,
     #[serde(default = "default_docker_upstreams")]
     pub upstreams: Vec<DockerUpstream>,
+    /// Maestra: a TOML file of break-glass exceptions to the digest quarantine, re-read
+    /// every 30 s (quarantine_exceptions.rs, docs/docker-proxy.md).
+    #[serde(default)]
+    pub quarantine_exceptions: Option<String>,
 }
 
 /// One Docker upstream.
@@ -317,6 +321,7 @@ impl Default for DockerConfig {
             serve_stale: true,
             default_action: DefaultAction::default(),
             upstreams: default_docker_upstreams(),
+            quarantine_exceptions: None,
         }
     }
 }

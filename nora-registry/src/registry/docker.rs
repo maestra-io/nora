@@ -735,7 +735,8 @@ fn quarantine_forbidden(
 /// `x-nora-quarantine: pending` plus `x-nora-quarantine-until` (unix seconds) while the
 /// digest is still within the TTL, `mature` once admitted: past the TTL, dated past it by
 /// the registry (`trust_upstream_dates`), quarantine off, or served without a proxy record
-/// (a local push). A 403 keeps the headers [`quarantine_forbidden`] set.
+/// (a local push), `exception` while held but admitted by a break-glass exception
+/// ([`quarantine_excepted`]). A 403 keeps the headers [`quarantine_forbidden`] set.
 fn with_quarantine_verdict(state: &AppState, mut resp: Response) -> Response {
     if resp.status() != StatusCode::OK {
         return resp;
@@ -758,8 +759,15 @@ fn with_quarantine_verdict(state: &AppState, mut resp: Response) -> Response {
             _ => None,
         },
     };
+    // Held, but admitted by a break-glass exception: served, and said so.
+    let excepted = held.is_some() && state.quarantine_exceptions.covering(&digest).is_some();
+    let held = held.filter(|_| !excepted);
     let headers = resp.headers_mut();
-    let verdict = if held.is_some() { "pending" } else { "mature" };
+    let verdict = match (excepted, held) {
+        (true, _) => "exception",
+        (false, Some(_)) => "pending",
+        (false, None) => "mature",
+    };
     headers.insert(
         HeaderName::from_static("x-nora-quarantine"),
         axum::http::HeaderValue::from_static(verdict),
@@ -876,13 +884,20 @@ fn blob_unknown_response(digest: &str) -> Response {
 /// can therefore neither hold nor mature a digest on the proxy path. Returns
 /// `Some(403)` to block, `None` to proceed.
 #[must_use = "the returned response blocks a quarantined artifact; dropping it serves it"]
-fn quarantine_cache_serve_gate(state: &AppState, digest: &str) -> Option<Response> {
+fn quarantine_cache_serve_gate(
+    state: &AppState,
+    digest: &str,
+    manifest: Option<&[u8]>,
+) -> Option<Response> {
     let (q_mode, q_secs) = resolve_quarantine(state);
     if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
         return None;
     }
     let status = state.digest_store.check("docker", digest, q_secs);
     if let crate::digest_quarantine::QuarantineStatus::Pending { .. } = status {
+        if quarantine_excepted(state, digest, manifest) {
+            return None;
+        }
         let outcome = if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce) {
             "blocked"
         } else {
@@ -903,6 +918,30 @@ fn quarantine_cache_serve_gate(state: &AppState, digest: &str) -> Option<Respons
         }
     }
     None
+}
+
+/// Whether a break-glass exception (`[docker] quarantine_exceptions`, quarantine_exceptions.rs)
+/// admits `digest`, which the quarantine holds. `manifest` is its bytes when it is a manifest:
+/// what it names is admitted with it, so a pull of the listed image gets its platform
+/// manifests and blobs. Each use is logged and counted.
+fn quarantine_excepted(state: &AppState, digest: &str, manifest: Option<&[u8]>) -> bool {
+    let Some((listed, entry)) = state.quarantine_exceptions.covering(digest) else {
+        return false;
+    };
+    if let Some(m) = manifest {
+        state.quarantine_exceptions.admit_named(&listed, m);
+    }
+    crate::metrics::DOCKER_QUARANTINE_EXCEPTION_USED_TOTAL
+        .with_label_values(&[listed.as_str()])
+        .inc();
+    tracing::warn!(
+        digest = %digest,
+        listed = %listed,
+        reason = %entry.reason,
+        expires = entry.expires,
+        "Quarantine: held digest admitted by a break-glass exception"
+    );
+    true
 }
 
 /// Post-proxy-fetch quarantine gate for a blob with a known content digest.
@@ -930,7 +969,9 @@ fn quarantine_proxy_fetch_gate(state: &AppState, digest: &str, upstream: &str) -
         }
         status => status,
     };
-    if !matches!(status, crate::digest_quarantine::QuarantineStatus::Mature) {
+    if !matches!(status, crate::digest_quarantine::QuarantineStatus::Mature)
+        && !quarantine_excepted(state, digest, None)
+    {
         let outcome = if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce) {
             "blocked"
         } else {
@@ -979,26 +1020,31 @@ fn quarantine_record_referenced(
     upstream: &str,
     first_seen: i64,
 ) {
+    for d in named_digests(manifest) {
+        state
+            .digest_store
+            .record("docker", &d, upstream, Some(first_seen));
+        // A digest with its own later record (a platform manifest pulled first, a layer
+        // shared with a newer image) has existed since the manifest naming it.
+        state.digest_store.backdate("docker", &d, first_seen);
+    }
+}
+
+/// The digests a manifest names: an index's manifests, an image's config and layers.
+pub(crate) fn named_digests(manifest: &[u8]) -> Vec<String> {
     let Ok(doc) = serde_json::from_slice::<serde_json::Value>(manifest) else {
-        return;
+        return Vec::new();
     };
     let listed = ["manifests", "layers"]
         .iter()
         .filter_map(|k| doc[*k].as_array())
         .flatten();
-    for named in listed.chain(std::iter::once(&doc["config"])) {
-        if let Some(d) = named["digest"]
-            .as_str()
-            .filter(|d| validate_digest(d).is_ok())
-        {
-            state
-                .digest_store
-                .record("docker", d, upstream, Some(first_seen));
-            // A digest with its own later record (a platform manifest pulled first, a layer
-            // shared with a newer image) has existed since the manifest naming it.
-            state.digest_store.backdate("docker", d, first_seen);
-        }
-    }
+    listed
+        .chain(std::iter::once(&doc["config"]))
+        .filter_map(|named| named["digest"].as_str())
+        .filter(|d| validate_digest(d).is_ok())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Admit what a cached proxied manifest names when the manifest itself is admitted. A
@@ -1355,7 +1401,7 @@ async fn check_blob(
             // Mirror download_blob / HEAD-manifest: a proxy-cached blob still within its
             // cooldown is reported as held (403), not available — so HEAD and GET agree.
             // A local/internal blob has no proxy record (`New`) and acks normally.
-            if let Some(resp) = quarantine_cache_serve_gate(&state, &digest) {
+            if let Some(resp) = quarantine_cache_serve_gate(&state, &digest, None) {
                 return resp;
             }
             (
@@ -1398,7 +1444,7 @@ async fn serve_local_blob(
     // A blob with no proxy record (a local push, or an entry pruned past 90d)
     // reads as `New` and is served; only `Pending` blocks (enforce). Covers both
     // the 206 range serve and the 200 full serve below.
-    if let Some(resp) = quarantine_cache_serve_gate(state, digest) {
+    if let Some(resp) = quarantine_cache_serve_gate(state, digest, None) {
         return Some(resp);
     }
 
@@ -1680,7 +1726,7 @@ async fn mount_blob(state: State<AppState>, raw_name: &str, from: &str, digest: 
 
     // A digest still inside its proxy cooldown must not be laundered into a
     // local repository by a mount.
-    if quarantine_cache_serve_gate(&state, digest).is_some() {
+    if quarantine_cache_serve_gate(&state, digest, None).is_some() {
         return start_upload(state, Path(raw_name.to_string())).await;
     }
 
@@ -2338,6 +2384,15 @@ async fn try_fetch_and_cache(
                             "Quarantine: first sight of a proxied manifest"
                         );
                     }
+                    // A break-glass exception admits the digest, and what it names.
+                    let q_status =
+                        if !matches!(q_status, crate::digest_quarantine::QuarantineStatus::Mature)
+                            && quarantine_excepted(state, &digest, Some(&data[..]))
+                        {
+                            crate::digest_quarantine::QuarantineStatus::Mature
+                        } else {
+                            q_status
+                        };
                     match &q_status {
                         crate::digest_quarantine::QuarantineStatus::Mature => {}
                         _ => {
@@ -2941,7 +2996,7 @@ fn serve_cached_manifest(
     // with no proxy record (a local push, or a pruned entry) reads as `New` and serves —
     // only `Pending` blocks, so a local push is never held and never matures a proxy
     // digest. (A just-proxied manifest is recorded + checked on the fetch path above.)
-    if let Some(resp) = quarantine_cache_serve_gate(state, &digest) {
+    if let Some(resp) = quarantine_cache_serve_gate(state, &digest, Some(data)) {
         return resp;
     }
     quarantine_readmit_referenced(state, data, &digest, ns);
@@ -11277,6 +11332,158 @@ mod integration_tests {
                 "a blob the platform manifest named"
             );
         }
+    }
+
+    /// A break-glass exception (`[docker] quarantine_exceptions`) admits a held index under
+    /// enforce, with the platform manifest and blobs a pull of it needs, says `exception` on
+    /// the manifest answer, and counts each use; removed from the file, it admits nothing.
+    #[tokio::test]
+    async fn a_quarantine_exception_admits_the_image_and_what_it_names() {
+        use crate::config::DockerUpstream;
+        use crate::digest_quarantine::QuarantineMode;
+        use crate::test_helpers::{create_test_context_with_config, TestContext};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let sha = |b: &[u8]| format!("sha256:{}", hex::encode(sha2::Sha256::digest(b)));
+        let config = br#"{"architecture":"amd64","os":"linux"}"#.to_vec();
+        let layer = b"layer bytes".to_vec();
+        let image = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{}","size":{}}}]}}"#,
+            sha(&config),
+            config.len(),
+            sha(&layer),
+            layer.len()
+        )
+        .into_bytes();
+        let index = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{}","size":{},"platform":{{"architecture":"amd64","os":"linux"}}}}]}}"#,
+            sha(&image),
+            image.len()
+        )
+        .into_bytes();
+
+        let upstream = MockServer::start().await;
+        let index_ct = "application/vnd.oci.image.index.v1+json";
+        for (route, body, ct) in [
+            ("manifests/latest".to_string(), index.clone(), index_ct),
+            (
+                format!("manifests/{}", sha(&image)),
+                image.clone(),
+                "application/vnd.oci.image.manifest.v1+json",
+            ),
+            (
+                format!("blobs/{}", sha(&config)),
+                config.clone(),
+                "application/octet-stream",
+            ),
+            (
+                format!("blobs/{}", sha(&layer)),
+                layer.clone(),
+                "application/octet-stream",
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/library/demo/{route}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Type", ct)
+                        .set_body_bytes(body),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        let enforcing = || {
+            create_test_context_with_config(|cfg| {
+                cfg.docker.upstreams = vec![DockerUpstream {
+                    trust_upstream_dates: false,
+                    date_token_file: None,
+                    url: upstream.uri(),
+                    auth: None,
+                    auth_env: None,
+                    namespace: None,
+                    prefix: None,
+                    namespaces: Vec::new(),
+                }];
+                cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+                cfg.curation.quarantine_ttl = Some("1h".to_string());
+            })
+        };
+        async fn status(ctx: &TestContext, rest: String) -> StatusCode {
+            let uri = format!("/v2/library/demo/{rest}");
+            send(&ctx.app, Method::GET, &uri, Body::empty())
+                .await
+                .status()
+        }
+
+        let ctx = enforcing();
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("exceptions.toml");
+        let file = file.to_str().unwrap();
+        let used = || {
+            crate::metrics::DOCKER_QUARANTINE_EXCEPTION_USED_TOTAL
+                .with_label_values(&[sha(&index).as_str()])
+                .get()
+        };
+        assert_eq!(
+            status(&ctx, "manifests/latest".into()).await,
+            StatusCode::FORBIDDEN,
+            "held, no exception"
+        );
+
+        let expires = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        std::fs::write(
+            file,
+            format!(
+                "[[exception]]\ndigest = {:?}\nreason = \"hotfix\"\nexpires = {expires:?}\n",
+                sha(&index)
+            ),
+        )
+        .unwrap();
+        {
+            let _gauges = crate::quarantine_exceptions::GAUGES.lock();
+            ctx.state.quarantine_exceptions.reload(file);
+        }
+        let before = used();
+        let r = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/demo/manifests/latest",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK, "the listed index");
+        assert_eq!(r.headers().get("x-nora-quarantine").unwrap(), "exception");
+        assert!(r.headers().get("x-nora-quarantine-until").is_none());
+        assert_eq!(
+            status(&ctx, format!("manifests/{}", sha(&image))).await,
+            StatusCode::OK,
+            "the platform manifest the index names"
+        );
+        for blob in [&config, &layer] {
+            assert_eq!(
+                status(&ctx, format!("blobs/{}", sha(blob))).await,
+                StatusCode::OK,
+                "a blob the platform manifest names"
+            );
+        }
+        assert!(used() >= before + 4, "{} uses", used() - before);
+
+        std::fs::write(file, "").unwrap();
+        {
+            let _gauges = crate::quarantine_exceptions::GAUGES.lock();
+            ctx.state.quarantine_exceptions.reload(file);
+        }
+        assert_eq!(
+            status(&ctx, "manifests/latest".into()).await,
+            StatusCode::FORBIDDEN,
+            "the entry is gone"
+        );
+        assert_eq!(
+            status(&ctx, format!("blobs/{}", sha(&layer))).await,
+            StatusCode::FORBIDDEN,
+            "and with it what the index named"
+        );
     }
 
     /// `trust_upstream_dates` (issues-maestra#1649): the registry's own publish date
