@@ -139,6 +139,36 @@ groups:
           summary: "NORA object store slow: stat p99 above 1.5s"
           runbook_url: "https://github.com/maestra-io/nora/blob/maestra/main/maestra/runbooks/NoraHighLatency.md#step-1c--the-store-itself"
 
+      - alert: NoraQuarantineExceptionUsed
+        # Maestra (issues-maestra#1649): a break-glass entry of [docker]
+        # quarantine_exceptions admitted a digest the quarantine holds (the listed
+        # manifest or something it names). OFF 15 min after its last use; nora
+        # creates each listed digest's series at 0 when it loads the file, so the
+        # first use is counted.
+        expr: sum by (digest) (increase(nora_docker_quarantine_exception_used_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NORA admitted held image {{ $labels.digest }} by a quarantine exception"
+          description: >-
+            The reason and expiry are in the `Quarantine: held digest admitted by a
+            break-glass exception` log line. Remove the entry once the digest is past
+            quarantine_ttl (docs/docker-proxy.md, break-glass).
+
+      - alert: NoraQuarantineExceptionsInvalid
+        # The exceptions file is refused (a rule broken, unparsable, unreadable): nora
+        # keeps serving the last good list. OFF once a good file is read (30 s).
+        expr: max(nora_docker_quarantine_exceptions_invalid) == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NORA refuses its quarantine exceptions file, the last good list stays"
+          description: >-
+            Find `Quarantine exceptions file refused` in the error log for the broken
+            rule, and fix the file.
+
   - name: nora-integrity
     rules:
       - alert: NoraIntegrityFailure

@@ -58,6 +58,7 @@ mod mirror;
 mod openapi;
 mod proxy_coalesce;
 mod pypi_files;
+mod quarantine_exceptions;
 mod rate_limit;
 mod registry;
 mod registry_type;
@@ -497,6 +498,8 @@ pub struct AppState {
     /// Docker blob fills in flight, shared by every request for the blob (#1003).
     pub(crate) blob_flights: proxy_coalesce::InflightMap<registry::docker::SpoolShare>,
     pub digest_store: Arc<digest_quarantine::DigestStore>,
+    /// Break-glass exceptions to the docker quarantine, re-read from `[docker] quarantine_exceptions`.
+    pub quarantine_exceptions: Arc<quarantine_exceptions::QuarantineExceptions>,
     /// Repository index signer (rpm/deb). `None` = indexes are unsigned.
     pub signer: Option<Arc<signing::RepoSigner>>,
     /// Pre-compiled upstream hostname searchers for leak detection (#386)
@@ -3823,6 +3826,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         artifact_flights: proxy_coalesce::InflightMap::new(),
         blob_flights: proxy_coalesce::InflightMap::new(),
         digest_store,
+        quarantine_exceptions: Default::default(),
         signer,
         leak_finders,
         cancel_token: cancel_token.clone(),
@@ -4119,6 +4123,24 @@ async fn run_server(mut config: Config, storage: Storage) {
             }
         }
     });
+
+    // Maestra: break-glass quarantine exceptions, re-read from their own file (a ConfigMap
+    // mounted as a directory), so a change needs neither a restart nor a SIGHUP.
+    if let Some(path) = state.config.docker.quarantine_exceptions.clone() {
+        state.quarantine_exceptions.reload(&path);
+        let exceptions = state.quarantine_exceptions.clone();
+        state.tasks.spawn("quarantine_exceptions", move || {
+            let (exceptions, path) = (exceptions.clone(), path.clone());
+            async move {
+                let mut tick = tokio::time::interval(quarantine_exceptions::RELOAD_EVERY);
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    exceptions.reload(&path);
+                }
+            }
+        });
+    }
 
     // SIGHUP handler: hot-reload curation policy
     #[cfg(unix)]
@@ -4442,11 +4464,12 @@ mod background_task_tests {
     const SOURCE: &str = include_str!("main.rs");
 
     /// The tasks the server runs, by the name they are supervised under.
-    const SUPERVISED: [&str; 6] = [
+    const SUPERVISED: [&str; 7] = [
         "cleanup",
         "internal_listener",
         "maintenance",
         "pull_stats",
+        "quarantine_exceptions",
         "repo_index",
         "sighup",
     ];

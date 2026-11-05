@@ -139,6 +139,8 @@ The dashboard includes a `registry` template variable to filter by specific prot
 | `NoraStorageUnreachable` | `nora_storage_reachable == 0` for 2m (readiness failing) | critical |
 | `NoraIntegrityFailure` | any `get` with `status=~"integrity_fail\|verify_error"` | critical |
 | `NoraTaskPanic` | any `nora_task_panics_total` increase in 15m (a background task panicked and was restarted) | warning |
+| `NoraQuarantineExceptionUsed` | any `nora_docker_quarantine_exception_used_total` increase in 15m, by listed `digest`: a break-glass entry of `[docker] quarantine_exceptions` admitted a held image (Maestra fork) | warning |
+| `NoraQuarantineExceptionsInvalid` | `nora_docker_quarantine_exceptions_invalid == 1` for 5m: the exceptions file is refused, the last good list stays (Maestra fork) | warning |
 
 ## Integrity recovery
 

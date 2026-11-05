@@ -245,6 +245,7 @@ fn build_context_full(
             serve_stale: true,
             default_action: crate::config::DefaultAction::Allow,
             upstreams: vec![],
+            quarantine_exceptions: None,
         },
         raw: RawConfig {
             enabled: true,
@@ -462,6 +463,7 @@ fn build_context_full(
         digest_store: Arc::new(crate::digest_quarantine::DigestStore::empty(
             storage.clone(),
         )),
+        quarantine_exceptions: Default::default(),
         signer,
         leak_finders,
         cancel_token: tokio_util::sync::CancellationToken::new(),

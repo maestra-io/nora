@@ -130,3 +130,52 @@ under `observe`, where nothing is refused (fluxcd `scripts/nora-image-check.py`)
 | 200, digest still inside the TTL | `pending` | unix seconds the hold ends |
 | 200, admitted (past the TTL, dated past it by the registry, quarantine off, or a local push with no proxy record) | `mature` | absent |
 | 403 under `enforce` | `pending` or `new`, as before | unix seconds the hold ends |
+
+## Break-glass: admit a held image before the TTL (`quarantine_exceptions`)
+
+When to use: an urgent fix (a CVE, an outage) needs an image digest that the quarantine holds,
+and waiting `quarantine_ttl` is worse than the supply-chain risk of a fresh upstream push.
+For anything else, wait or pin an older digest.
+
+```toml
+[docker]
+quarantine_exceptions = "/etc/nora/quarantine-exceptions/exceptions.toml"
+```
+
+The file is re-read every 30 s. Mount it from its own ConfigMap as a directory: a `subPath`
+mount never sees an update, and the main ConfigMap is in the pod's `checksum/config`, so an
+edit there restarts nora. Annotate that ConfigMap `reloader.stakater.com/ignore: "true"`.
+
+```toml
+[[exception]]
+digest = "sha256:<64 hex>"   # the manifest digest the pod pins: the index of a multi-arch image
+reason = "CVE-2026-1234 fix, issues-maestra#NNNN"
+expires = "2026-11-08T12:00:00Z"
+```
+
+- An unexpired entry admits that digest under `observe` and `enforce`. It also admits every
+  digest an admitted manifest names, so the platform manifests, config and layers a pull
+  needs are served too. The manifest answer then carries `x-nora-quarantine: exception`.
+- Every use logs `Quarantine: held digest admitted by a break-glass exception` (with `listed`,
+  `reason`, `expires`) and counts `nora_docker_quarantine_exception_used_total{digest}`. The
+  `NoraQuarantineExceptionUsed` alert (warning) shows a used entry.
+- Rules: a non-empty `reason`, `digest` as `sha256:` plus 64 lowercase hex, listed once, and
+  `expires` as RFC 3339 with an offset, at most 7 days after the read. A file that breaks a rule
+  is refused whole: nora keeps the last good list, logs `Quarantine exceptions file refused`,
+  sets `nora_docker_quarantine_exceptions_invalid` to 1 and raises
+  `NoraQuarantineExceptionsInvalid`. At start there is no last good list, so a bad file means
+  no exceptions. `nora_docker_quarantine_exceptions_active` counts the unexpired entries.
+- Expired entries admit nothing. Removing an entry withdraws it, and what it admitted, at the
+  next read.
+- What a manifest names is learned when nora serves that manifest, and is kept in memory. After
+  a nora restart, a client that already holds the index and platform manifest and asks only for
+  a missing layer gets 403 under `enforce`. A fresh pull is not affected. If that happens, list
+  the platform manifest digest as well.
+
+Procedure (packages.maestra.io): in one fluxcd PR, add the entry to
+`iota/us-iota-lw-kube-infra/nora/quarantine-exceptions.yaml` and add the image. The PR's
+`scripts/nora-image-check.py` reads the entry from the PR tree: the held digest passes with a
+notice, and an entry that breaks a rule fails the job. Once merged, nora admits the digest
+within about 1–2 minutes (ConfigMap propagation plus one read). Remove the entry in a follow-up
+PR once the digest is past `quarantine_ttl` (the `x-nora-quarantine-until` it had), or at the
+latest when it expires.
