@@ -55,6 +55,11 @@ const TAGS_PER_PAGE: u32 = 100;
 /// When `upstream` published `digest`, which NORA fetched as `name:reference` with the
 /// body `manifest`, by the registry's own record. `None` when the registry has no date for
 /// it or the lookup failed; a date in the future is `None` too.
+///
+/// A walk that outlasts the request's [`TIMEOUT`] still dates the digest: the ledger moves
+/// it, and what it names, back to the registry's date when the walk lands
+/// ([`super::docker::quarantine_dated`]). Before that a tag, the first request of a
+/// repository, read as first-seen while the digest request a second later had the date.
 pub(super) async fn published_at(
     state: &AppState,
     upstream: &DockerUpstream,
@@ -65,14 +70,26 @@ pub(super) async fn published_at(
     manifest: &[u8],
 ) -> Option<i64> {
     if source.walks_repository() {
-        let dates = tokio::time::timeout(TIMEOUT, walk(state, upstream, source, name))
-            .await
-            .ok()
-            .flatten()?;
-        return dates
-            .get(digest)
-            .copied()
-            .filter(|date| *date <= chrono::Utc::now().timestamp());
+        let walk = walk(state, upstream, source, name);
+        let Ok(dates) = tokio::time::timeout(TIMEOUT, walk.clone()).await else {
+            let (state, url, name) = (state.clone(), upstream.url.clone(), name.to_owned());
+            let (digest, manifest) = (digest.to_owned(), manifest.to_vec());
+            tokio::spawn(async move {
+                if let Some(at) = walk.await.and_then(|dates| date_of(&dates, &digest)) {
+                    super::docker::quarantine_dated(
+                        &state,
+                        &url,
+                        &name,
+                        &digest,
+                        &manifest,
+                        at,
+                        source.label(),
+                    );
+                }
+            });
+            return None;
+        };
+        return dates.and_then(|dates| date_of(&dates, digest));
     }
     let runnable = runnable_digests(manifest, digest);
     let date = if reference.contains(':') && source != DateSource::GcrTimeUploaded {
@@ -89,6 +106,14 @@ pub(super) async fn published_at(
         parse(source, &body, reference, digest, &runnable)
     };
     date.filter(|date| *date <= chrono::Utc::now().timestamp())
+}
+
+/// The walk's date for `digest`, unless it is in the future.
+fn date_of(dates: &Dates, digest: &str) -> Option<i64> {
+    dates
+        .get(digest)
+        .copied()
+        .filter(|date| *date <= chrono::Utc::now().timestamp())
 }
 
 async fn fetch(
@@ -203,21 +228,24 @@ async fn walk_repository(
             };
             // `/users/` answers for an organisation too; a nested name is one package.
             let package = package.replace('/', "%2F");
-            for page in 1..=GHCR_PAGES {
+            let page = |page: u32| {
                 let url = format!(
                     "{api}/users/{owner}/packages/container/{package}/versions?per_page=100&page={page}"
                 );
                 let auth = Some(UpstreamAuth::Bearer(&token));
-                let Some(body) =
-                    fetch(&state, &upstream, source, &url, auth, WALK_PAGE_TIMEOUT).await
-                else {
-                    break;
-                };
-                let Some(listed) = ghcr_page(&body, &mut dates) else {
-                    break;
-                };
-                if listed < 100 {
-                    break;
+                let (state, upstream) = (&state, &upstream);
+                async move { fetch(state, upstream, source, &url, auth, WALK_PAGE_TIMEOUT).await }
+            };
+            // A full first page asks for the rest at once, read in order up to the first
+            // failed or short one: ten pages one after another took 5.9 s, past a request's
+            // wait (gha-runner-scale-set-controller, 05.11.2026).
+            let first = page(1).await.and_then(|body| ghcr_page(&body, &mut dates));
+            if first == Some(100) {
+                for body in futures::future::join_all((2..=GHCR_PAGES).map(page)).await {
+                    match body.and_then(|body| ghcr_page(&body, &mut dates)) {
+                        Some(100) => {}
+                        _ => break,
+                    }
                 }
             }
         }

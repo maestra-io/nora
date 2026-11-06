@@ -35,19 +35,27 @@ ghcr.io, mcr and public.ecr.aws date a digest only in a listing of the whole rep
 NORA walks that listing once per repository on a task of its own (pages bounded as in the
 table, 120 s in all) and keeps the result for 10 min (a walk that got nothing: 1 min), so
 every first sight in the repository, a platform manifest or another tag, reads the same
-walk. A request waits at most the lookup's 5 s for it: a walk still running, a failed one
-(401, 429, 5xx), or a digest the listing does not name leaves first-seen and never fails
-the pull. A digest pushed after the walk is first-seen as well, which is never younger
-than it is. public.ecr.aws lists tags in no date order, 1000 per 4 s page, so a repository
-with thousands of signature tags (gravitational/teleport-distroless: 17 pages) is dated
-only from the second first sight on.
+walk. A request waits at most the lookup's 5 s for it; a walk still running then starts
+the digest at first-seen and, when it lands, moves it and everything it names back to the
+registry's date. A tag is usually the first request of a repository, so before this it
+stayed first-seen while the digest request a second later had the date. ghcr pages after a
+full first one are asked at once (10 one after another took 5.9 s). A failed walk (401,
+429, 5xx) or a digest the listing does not name leaves first-seen and never fails the
+pull. A digest pushed after the walk is first-seen as well, which is never younger than it
+is. public.ecr.aws lists tags in no date order, 1000 per 4 s page, so a repository with
+thousands of signature tags (gravitational/teleport-distroless: 17 pages, about 50 s) is
+dated when its walk lands, not on the first request: under enforce that request is a 403.
+public.ecr.aws lists no platform manifest of an index (they carry no tag): they take the
+index's date.
 
 A digest already held by NORA's own clock, recorded before its registry had a date source
 or in a failed lookup, is asked about again each time a tag pull revalidates it, and moves
 back to the registry's date, with everything it names. Only Docker Hub and quay.io are not
 asked again: they date a tag, and the first sight used that. A pull by digest of a cached
-manifest never reaches upstream, so it stays held until the TTL. The move lives in memory
-(the stored entry is immutable): after a restart the next tag pull finds the date again.
+held manifest asks the walked registries (ghcr.io, mcr, public.ecr.aws) too, which costs no
+request of its own; for registry.k8s.io and Artifact Registry it stays held until a tag pull
+or the TTL. A move is written beside the ledger entry (`<entry>.dated`), and every start
+takes the earliest of the two, so it outlives a restart.
 
 tags/list is read anonymously: a private Artifact Registry repository answers 401, and its
 images stay first-seen.

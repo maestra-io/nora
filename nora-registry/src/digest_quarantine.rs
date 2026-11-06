@@ -11,7 +11,9 @@
 //! Persistence: one object per entry under [`ENTRY_PREFIX`] in the storage
 //! backend, written with `put_if_absent` (first writer wins, also across
 //! replicas), plus a boot-time snapshot of the whole map so a start reads one
-//! object and a listing instead of one GET per entry. A legacy
+//! object and a listing instead of one GET per entry. A date moved back later
+//! (a registry's publish date) is a `.dated` object beside the entry, read at
+//! every boot; the earliest date wins. A legacy
 //! `{storage.path}/quarantine.jsonl` is imported at every boot.
 //! Fail-open: unreadable entries or a failed listing → those digests unknown.
 
@@ -173,6 +175,12 @@ fn entry_key(entry: &DigestEntry) -> String {
     format!("{ENTRY_PREFIX}{}/{}", entry.registry, entry.digest)
 }
 
+/// An entry moved back by [`DigestStore::backdate`]: `<entry key>.dated`, the moved entry.
+/// Never in the snapshot, so every boot reads it.
+fn dated_key(entry: &DigestEntry) -> String {
+    format!("{}.dated", entry_key(entry))
+}
+
 impl DigestStore {
     /// Load the ledger from `storage`: import a legacy `{storage_path}/quarantine.jsonl`,
     /// read the snapshot plus every entry recorded since it, prune stale (>90d)
@@ -310,13 +318,39 @@ impl DigestStore {
     /// Move an entry back to `first_seen` when that is earlier: a registry date found after
     /// NORA's own clock started it, or a dated manifest naming it. Returns the entry.
     ///
-    /// ponytail: memory only. The stored object keeps the first writer's date, so a restart
-    /// forgets this until the next fetch finds the date again; a hold ends at the TTL anyway.
-    pub fn backdate(&self, registry: &str, digest: &str, first_seen: i64) -> Option<DigestEntry> {
+    /// `persist` writes a move to [`dated_key`]: the entry object stays the first writer's,
+    /// and a boot reads it from the snapshot, so a restart would forget the date otherwise.
+    /// The load takes the earliest of the two. Not for an admitted manifest's children
+    /// ([`DigestStore::record`] does not write a date past the prune line either).
+    pub fn backdate(
+        &self,
+        registry: &str,
+        digest: &str,
+        first_seen: i64,
+        persist: bool,
+    ) -> Option<DigestEntry> {
         let mut entries = self.entries.write();
         let entry = entries.get_mut(&map_key(registry, digest))?;
+        let moved = first_seen < entry.first_seen;
         entry.first_seen = entry.first_seen.min(first_seen);
-        Some(entry.clone())
+        let entry = entry.clone();
+        drop(entries);
+        if moved && persist {
+            let storage = self.storage.clone();
+            let dated = entry.clone();
+            // ponytail: two moves of one digest race their puts; the later write may hold the
+            // later date until the next move. A move is rare and only ever goes back.
+            tokio::spawn(async move {
+                let key = dated_key(&dated);
+                let Some(body) = entry_body(&dated) else {
+                    return;
+                };
+                if let Err(e) = storage.put_bytes(&key, body).await {
+                    error!(key = %key, error = %e, "Failed to persist a quarantine date (fail-open)");
+                }
+            });
+        }
+        Some(entry)
     }
 
     /// Write a new entry off the request path. The object is created once: when it
@@ -334,9 +368,14 @@ impl DigestStore {
                 Ok(true) => {}
                 Ok(false) => {
                     if let Some(stored) = read_entry(&storage, &key).await {
+                        // A date moved back meanwhile stays: the earlier one wins.
                         entries
                             .write()
-                            .insert(map_key(&stored.registry, &stored.digest), stored);
+                            .entry(map_key(&stored.registry, &stored.digest))
+                            .and_modify(|live| {
+                                live.first_seen = live.first_seen.min(stored.first_seen)
+                            })
+                            .or_insert(stored);
                     }
                 }
                 Err(e) => error!(
@@ -799,17 +838,32 @@ async fn load_entries(storage: &Storage, legacy: &Path) -> (HashMap<String, Dige
         }
     }
 
+    // A digest's entry object and its `.dated` move: the earliest date is the entry, and
+    // both go once that is past the prune line.
     let cutoff = Utc::now().timestamp() - PRUNE_TTL_SECS;
-    let mut entries = HashMap::new();
-    let mut stale = Vec::new();
+    let mut by_digest: HashMap<String, (Vec<String>, DigestEntry)> = HashMap::new();
     let mut unread = 0usize;
     for key in listed {
         match known.remove(&key) {
-            Some(entry) if entry.first_seen < cutoff => stale.push(key),
             Some(entry) => {
-                entries.insert(map_key(&entry.registry, &entry.digest), entry);
+                let (keys, earliest) = by_digest
+                    .entry(map_key(&entry.registry, &entry.digest))
+                    .or_insert_with(|| (Vec::new(), entry.clone()));
+                keys.push(key);
+                if entry.first_seen < earliest.first_seen {
+                    *earliest = entry;
+                }
             }
             None => unread += 1,
+        }
+    }
+    let mut entries = HashMap::new();
+    let mut stale = Vec::new();
+    for (digest, (keys, entry)) in by_digest {
+        if entry.first_seen < cutoff {
+            stale.extend(keys);
+        } else {
+            entries.insert(digest, entry);
         }
     }
     if unread > 0 {
@@ -1389,6 +1443,71 @@ mod tests {
             third.record("npm", "sha256:aa", "other", None).first_seen,
             first_seen
         );
+    }
+
+    /// A registry date found after NORA's own clock started a digest outlives the process,
+    /// also once a boot snapshot holds the clock's date (#1649); one past the prune line
+    /// leaves no record, as a digest recorded with it has none.
+    #[tokio::test]
+    async fn a_backdate_survives_a_restart() {
+        let tmp = TempDir::new().unwrap();
+        let now = Utc::now().timestamp();
+        let store = DigestStore::empty(storage(&tmp));
+        for digest in ["sha256:aa", "sha256:bb"] {
+            store.record("docker", digest, "up", None);
+            wait_for(&storage(&tmp), &format!(".nora-quarantine/docker/{digest}")).await;
+        }
+        let booted = DigestStore::load(storage(&tmp), "/nonexistent").await;
+        assert!(storage(&tmp).stat(SNAPSHOT_KEY).await.is_some());
+        drop(booted);
+
+        let dated = now - 30 * 86400;
+        let moved = store.backdate("docker", "sha256:aa", dated, true).unwrap();
+        assert_eq!(moved.first_seen, dated);
+        let long_ago = now - PRUNE_TTL_SECS - 86400;
+        store.backdate("docker", "sha256:bb", long_ago, true);
+        for digest in ["sha256:aa", "sha256:bb"] {
+            wait_for(
+                &storage(&tmp),
+                &format!(".nora-quarantine/docker/{digest}.dated"),
+            )
+            .await;
+        }
+
+        let reloaded = DigestStore::load(storage(&tmp), "/nonexistent").await;
+        assert_eq!(
+            reloaded.check("docker", "sha256:aa", 3 * 86400),
+            QuarantineStatus::Mature
+        );
+        assert_eq!(
+            reloaded.check("docker", "sha256:bb", 3 * 86400),
+            QuarantineStatus::New
+        );
+        assert!(storage(&tmp)
+            .stat(".nora-quarantine/docker/sha256:bb")
+            .await
+            .is_none());
+        // The next start reads the date from its snapshot and the object again.
+        let third = DigestStore::load(storage(&tmp), "/nonexistent").await;
+        assert_eq!(
+            third.record("docker", "sha256:aa", "up", None).first_seen,
+            dated
+        );
+    }
+
+    /// A move that is not persisted (an admitted manifest's children) stays in memory.
+    #[tokio::test]
+    async fn a_memory_backdate_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let store = DigestStore::empty(storage(&tmp));
+        store.record("docker", "sha256:aa", "up", None);
+        wait_for(&storage(&tmp), ".nora-quarantine/docker/sha256:aa").await;
+        store.backdate("docker", "sha256:aa", 1, false);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(storage(&tmp)
+            .stat(".nora-quarantine/docker/sha256:aa.dated")
+            .await
+            .is_none());
     }
 
     /// Two replicas record the same digest: the first object wins, and the
