@@ -1014,11 +1014,15 @@ fn quarantine_record_verified(state: &AppState, digest: &str, upstream: &str) {
 /// digest, and the date is the manifest's own first-seen: NORA's first sight of it, or
 /// the registry's publish date under `trust_upstream_dates`, so no child is older than
 /// what names it. Idempotent: a digest recorded later moves back to this date, never forward.
+/// `persist` keeps a move across a restart ([`DigestStore::backdate`]).
+///
+/// [`DigestStore::backdate`]: crate::digest_quarantine::DigestStore::backdate
 fn quarantine_record_referenced(
     state: &AppState,
     manifest: &[u8],
     upstream: &str,
     first_seen: i64,
+    persist: bool,
 ) {
     for d in named_digests(manifest) {
         state
@@ -1026,7 +1030,86 @@ fn quarantine_record_referenced(
             .record("docker", &d, upstream, Some(first_seen));
         // A digest with its own later record (a platform manifest pulled first, a layer
         // shared with a newer image) has existed since the manifest naming it.
-        state.digest_store.backdate("docker", &d, first_seen);
+        state
+            .digest_store
+            .backdate("docker", &d, first_seen, persist);
+    }
+}
+
+/// Date `digest`, a manifest `upstream` served, at `at`, its registry's publish date, and
+/// what it names with it (an index's platform manifests, which public.ecr.aws lists under no
+/// tag), when that is earlier than the ledger has: on its first sight, a later fetch, a
+/// cached serve or a walk that answered after the request stopped waiting. Persisted, so a
+/// restart keeps it. Returns the entry.
+pub(super) fn quarantine_dated(
+    state: &AppState,
+    upstream: &str,
+    name: &str,
+    digest: &str,
+    manifest: &[u8],
+    at: i64,
+    source: &str,
+) -> crate::digest_quarantine::DigestEntry {
+    let mut entry = state
+        .digest_store
+        .record("docker", digest, upstream, Some(at));
+    if at < entry.first_seen {
+        if let Some(moved) = state.digest_store.backdate("docker", digest, at, true) {
+            tracing::info!(digest = %digest, name = %name, source, was = entry.first_seen, first_seen = at, "Quarantine: held manifest dated by its registry");
+            entry = moved;
+        }
+    }
+    quarantine_record_referenced(state, manifest, upstream, entry.first_seen, true);
+    entry
+}
+
+/// A cached manifest NORA's own clock still holds is asked about again before it is served:
+/// a digest pull never reaches the upstream, so a digest whose first lookup missed (a walk
+/// slower than the request's wait, a ledger entry from before its registry had a date
+/// source) would stay held to the TTL. Only a registry dated by a walk of the repository,
+/// which every request of the repository shares: a held digest costs no request of its own.
+async fn quarantine_redate_cached(
+    state: &AppState,
+    upstreams: &[&crate::config::DockerUpstream],
+    name: &str,
+    reference: &str,
+    manifest: &[u8],
+) {
+    let (q_mode, q_secs) = resolve_quarantine(state);
+    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+        return;
+    }
+    use sha2::Digest;
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(manifest)));
+    if !matches!(
+        state.digest_store.check("docker", &digest, q_secs),
+        crate::digest_quarantine::QuarantineStatus::Pending { .. }
+    ) {
+        return;
+    }
+    for upstream in upstreams {
+        let Some(source) = upstream
+            .date_source()
+            .filter(|source| upstream.trust_upstream_dates && source.walks_repository())
+        else {
+            continue;
+        };
+        if let Some(at) = super::docker_dates::published_at(
+            state, upstream, source, name, reference, &digest, manifest,
+        )
+        .await
+        {
+            quarantine_dated(
+                state,
+                &upstream.url,
+                name,
+                &digest,
+                manifest,
+                at,
+                source.label(),
+            );
+            return;
+        }
     }
 }
 
@@ -1074,7 +1157,7 @@ fn quarantine_readmit_referenced(
         return;
     }
     let long_ago = chrono::Utc::now().timestamp() - crate::digest_quarantine::PRUNE_TTL_SECS - 1;
-    quarantine_record_referenced(state, manifest, ns, long_ago);
+    quarantine_record_referenced(state, manifest, ns, long_ago, false);
 }
 
 /// Whether `copy`, the cached answer for tag `reference`, may stand in for `held`, the
@@ -2345,19 +2428,31 @@ async fn try_fetch_and_cache(
                         .await
                         .map(|at| (at, source.label()));
                     }
-                    let mut entry = state.digest_store.record(
-                        "docker",
-                        &digest,
-                        &upstream.url,
-                        dated.map(|(at, _)| at),
-                    );
-                    if let Some((at, source)) = dated.filter(|(at, _)| *at < entry.first_seen) {
-                        if let Some(moved) = state.digest_store.backdate("docker", &digest, at) {
-                            tracing::info!(digest = %digest, name = %upstream_name, source, was = entry.first_seen, first_seen = at, "Quarantine: held manifest dated by its registry");
-                            entry = moved;
+                    let entry = match dated {
+                        Some((at, source)) => quarantine_dated(
+                            state,
+                            &upstream.url,
+                            upstream_name,
+                            &digest,
+                            &data,
+                            at,
+                            source,
+                        ),
+                        None => {
+                            let entry =
+                                state
+                                    .digest_store
+                                    .record("docker", &digest, &upstream.url, None);
+                            quarantine_record_referenced(
+                                state,
+                                &data,
+                                &upstream.url,
+                                entry.first_seen,
+                                true,
+                            );
+                            entry
                         }
-                    }
-                    quarantine_record_referenced(state, &data, &upstream.url, entry.first_seen);
+                    };
                     let q_status = state.digest_store.check("docker", &digest, q_secs);
                     if first_sight {
                         let source = dated.map_or("first_seen", |(_, source)| source);
@@ -2837,6 +2932,10 @@ async fn get_manifest(
     // Serve fresh cache immediately
     if let Some(ref data) = cached {
         if cache_fresh {
+            // An internal-namespace name is never sent upstream, not even to a date API.
+            if !hosted && !internal {
+                quarantine_redate_cached(&state, &upstreams_to_try, &name, &reference, data).await;
+            }
             return serve_cached_manifest(&state, data, &name, &reference, served_ns);
         }
     }
@@ -11715,6 +11814,127 @@ mod integration_tests {
             assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::OK);
             assert_eq!(
                 get(&ctx, &format!("blobs/{}", sha(&layer))).await,
+                StatusCode::OK
+            );
+            let entry = ctx
+                .state
+                .digest_store
+                .record("docker", &sha(&image), "x", None);
+            assert!(entry.first_seen <= days_ago(29), "{entry:?}");
+        }
+
+        /// A tag is the first request of a repository, so it starts the walk; a walk slower
+        /// than the request's wait still dates the digest, and what it names, when it lands,
+        /// and the date outlives the process (#1649: gha-runner-scale-set-controller 0.15.1
+        /// read as first-seen by tag and as ghcr_created_at by digest a second later).
+        #[tokio::test]
+        async fn a_tag_whose_walk_outlasts_the_request_is_dated_when_it_lands() {
+            let (server, image, layer) = upstream_with_image().await;
+            let pushed = days_ago(30);
+            let filler: Vec<_> = (0..100)
+                .map(|i| serde_json::json!({"name": format!("sha256:{i:064x}"), "created_at": rfc3339(pushed)}))
+                .collect();
+            Mock::given(method("GET"))
+                .and(path(GHCR_API))
+                .and(wiremock::matchers::query_param("page", "1"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(filler)
+                        .set_delay(std::time::Duration::from_secs(6)),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(GHCR_API))
+                .and(wiremock::matchers::query_param("page", "2"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"name": sha(&image), "created_at": rfc3339(pushed)}
+                ])))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let ctx = walked(&server, "ghcr.io", Some("ghs_test"));
+            assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::FORBIDDEN);
+            for _ in 0..500 {
+                if ctx.state.digest_store.check("docker", &sha(&image), 3600)
+                    == crate::digest_quarantine::QuarantineStatus::Mature
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            for digest in [sha(&image), sha(&layer)] {
+                let entry = ctx.state.digest_store.record("docker", &digest, "x", None);
+                assert_eq!(entry.first_seen, pushed, "{entry:?}");
+                let dated = format!(".nora-quarantine/docker/{digest}.dated");
+                let mut stored = false;
+                for _ in 0..500 {
+                    if ctx.state.storage.stat(&dated).await.is_some() {
+                        stored = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert!(stored, "{dated} was never written");
+            }
+            assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::OK);
+            assert_eq!(
+                get(&ctx, &format!("blobs/{}", sha(&layer))).await,
+                StatusCode::OK
+            );
+        }
+
+        /// ghcr pages past the first are asked at once: three pages of 2 s date a tag within
+        /// the request's 5 s wait, where one after another they took 6.
+        #[tokio::test]
+        async fn ghcr_pages_after_the_first_are_asked_at_once() {
+            let (server, image, _) = upstream_with_image().await;
+            let pushed = days_ago(30);
+            for page in 1..=3 {
+                let versions: Vec<_> = if page < 3 {
+                    (0..100)
+                        .map(|i| serde_json::json!({"name": format!("sha256:{page}{i:063x}"), "created_at": rfc3339(pushed)}))
+                        .collect()
+                } else {
+                    vec![serde_json::json!({"name": sha(&image), "created_at": rfc3339(pushed)})]
+                };
+                Mock::given(method("GET"))
+                    .and(path(GHCR_API))
+                    .and(wiremock::matchers::query_param("page", page.to_string()))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(versions)
+                            .set_delay(std::time::Duration::from_secs(2)),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            let ctx = walked(&server, "ghcr.io", Some("ghs_test"));
+            assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::OK);
+        }
+
+        /// A digest pull of a cached manifest never reaches the upstream: one held by NORA's
+        /// clock in the ledger (a lookup that missed before) is dated before it is served.
+        #[tokio::test]
+        async fn a_cached_held_digest_is_dated_on_a_digest_pull() {
+            let (server, image, _) = upstream_with_image().await;
+            ghcr_versions(&server, &image, days_ago(30)).await;
+            let ctx = walked(&server, "ghcr.io", Some("ghs_test"));
+            ctx.state
+                .storage
+                .put(
+                    &manifest_key(Some("ghcr.io"), "library/demo", &sha(&image)),
+                    &image,
+                )
+                .await
+                .unwrap();
+            ctx.state
+                .digest_store
+                .record("docker", &sha(&image), &server.uri(), None);
+            assert_eq!(
+                get(&ctx, &format!("manifests/{}", sha(&image))).await,
                 StatusCode::OK
             );
             let entry = ctx
