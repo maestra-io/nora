@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
+  "extends": ["config:recommended", "github>maestra-io/renovate-config:externalImages"],
   "minimumReleaseAge": "5 days",
   "cargo": { "enabled": true },
   "github-actions": { "enabled": true },
@@ -9,8 +9,9 @@
   "labels": ["dependencies"],
   "packageRules": [
     {
-      "description": "Auto-merge patch and digest updates that pass CI",
-      "matchUpdateTypes": ["patch", "digest"],
+      "description": "Auto-merge patch updates that pass CI and are 5 days old. Digest moves are new content and wait for a human (issues-maestra#1649)",
+      "matchUpdateTypes": ["patch"],
+      "minimumReleaseAge": "5 days",
       "automerge": true,
       "automergeType": "pr",
       "automergeStrategy": "squash"
