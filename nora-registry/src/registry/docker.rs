@@ -2932,7 +2932,8 @@ async fn get_manifest(
     // Serve fresh cache immediately
     if let Some(ref data) = cached {
         if cache_fresh {
-            if !hosted {
+            // An internal-namespace name is never sent upstream, not even to a date API.
+            if !hosted && !internal {
                 quarantine_redate_cached(&state, &upstreams_to_try, &name, &reference, data).await;
             }
             return serve_cached_manifest(&state, data, &name, &reference, served_ns);
