@@ -1629,7 +1629,7 @@ impl Config {
             if u.trust_upstream_dates && (undated || tokenless) {
                 let msg = if undated {
                     format!(
-                        "docker.upstreams {:?} sets trust_upstream_dates, but {} publishes no date NORA reads (Docker Hub, quay.io, registry.k8s.io, gcr.io, Artifact Registry, ghcr.io, mcr.microsoft.com and public.ecr.aws do): first-seen applies",
+                        "docker.upstreams {:?} sets trust_upstream_dates, but {} publishes no date NORA reads (Docker Hub, quay.io, registry.k8s.io, gcr.io, Artifact Registry, ghcr.io, mcr.microsoft.com, public.ecr.aws and cgr.dev do): first-seen applies",
                         u.url,
                         u.resolved_namespace()
                     )
@@ -1971,12 +1971,12 @@ mod tests {
         let toml = |url: &str| {
             format!("[[docker.upstreams]]\nurl = \"{url}\"\ntrust_upstream_dates = true\n")
         };
-        let (ghcr, _) = parse_config(&toml("https://cgr.dev")).unwrap();
+        let (ghcr, _) = parse_config(&toml("https://docker.dragonflydb.io")).unwrap();
         let (warnings, _) = ghcr.validate();
         assert!(
             warnings
                 .iter()
-                .any(|w| w.contains("cgr.dev publishes no date")),
+                .any(|w| w.contains("docker.dragonflydb.io publishes no date")),
             "{warnings:?}"
         );
         std::env::set_var("NORA_CONFIG_STRICT", "true");
@@ -1985,8 +1985,15 @@ mod tests {
         assert!(
             strict
                 .iter()
-                .any(|e| e.contains("cgr.dev publishes no date")),
+                .any(|e| e.contains("docker.dragonflydb.io publishes no date")),
             "strict refuses: {strict:?}"
+        );
+        // cgr.dev dates by its tag history, with no token of ours.
+        let (cgr, _) = parse_config(&toml("https://cgr.dev")).unwrap();
+        let (warnings, _) = cgr.validate();
+        assert!(
+            !warnings.iter().any(|w| w.contains("trust_upstream_dates")),
+            "{warnings:?}"
         );
         // ghcr.io dates only with a token for the GitHub packages API.
         let (ghcr, _) = parse_config(&toml("https://ghcr.io")).unwrap();

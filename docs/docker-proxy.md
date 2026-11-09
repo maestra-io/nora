@@ -29,9 +29,11 @@ are used, never the image's own `created` (the builder writes it: 1970 for exter
 | ghcr.io | `api.github.com/users/<owner>/packages/container/<package>/versions` `created_at` (a nested name is one package, `a%2Fb`); needs `date_token_file` | tag and digest requests, when one of the newest 1000 versions is the digest |
 | mcr.microsoft.com | `/api/v1/catalog/<repo>/tags?reg=mar`: the earliest `lastModifiedDate` of the tags naming the digest (`createdDate` is the tag's first push, not the digest's) | tag and digest requests, when a tag names the digest |
 | public.ecr.aws | gallery `describeImageTags` `imagePushedAt` per tag (cosign `.sig`/`.att`/`.sbom` tags skipped) | tag and digest requests, when one of the first 25000 tags names the digest |
-| cgr.dev, docker.dragonflydb.io, others | none | first-seen; `trust_upstream_dates` there is a config warning (an error under `NORA_CONFIG_STRICT`) |
+| cgr.dev | `/v2/<repo>/_chainguard/history/<tag>` `updateTimestamp`: when the tag moved onto the digest (the earliest record of it), with an anonymous token from `/token?scope=repository:<repo>:pull` | a tag request by that tag's history; a digest request by the history of the repository's first 10 tags on tags/list (cosign `sha256-*` tags skipped; a public `chainguard/*` repository has `latest` and `latest-dev`), 5 pages of 1000 records per tag |
+| docker.dragonflydb.io, others | none | first-seen; `trust_upstream_dates` there is a config warning (an error under `NORA_CONFIG_STRICT`) |
 
-ghcr.io, mcr and public.ecr.aws date a digest only in a listing of the whole repository.
+ghcr.io, mcr, public.ecr.aws and cgr.dev date a digest only in a listing of the whole
+repository (cgr.dev: of a tag, a tag request walks that tag alone).
 NORA walks that listing once per repository on a task of its own (pages bounded as in the
 table, 120 s in all) and keeps the result for 10 min (a walk that got nothing: 1 min), so
 every first sight in the repository, a platform manifest or another tag, reads the same
@@ -45,20 +47,29 @@ pull. A digest pushed after the walk is first-seen as well, which is never young
 is. public.ecr.aws lists tags in no date order, 1000 per 4 s page, so a repository with
 thousands of signature tags (gravitational/teleport-distroless: 17 pages, about 50 s) is
 dated when its walk lands, not on the first request: under enforce that request is a 403.
-public.ecr.aws lists no platform manifest of an index (they carry no tag): they take the
-index's date.
+public.ecr.aws and the cgr.dev history list no platform manifest of an index (they carry
+no tag): they take the index's date.
 
 A digest already held by NORA's own clock, recorded before its registry had a date source
 or in a failed lookup, is asked about again each time a tag pull revalidates it, and moves
 back to the registry's date, with everything it names. Only Docker Hub and quay.io are not
 asked again: they date a tag, and the first sight used that. A pull by digest of a cached
-held manifest asks the walked registries (ghcr.io, mcr, public.ecr.aws) too, which costs no
+held manifest asks the walked registries (ghcr.io, mcr, public.ecr.aws, cgr.dev) too, which costs no
 request of its own; for registry.k8s.io and Artifact Registry it stays held until a tag pull
 or the TTL. A move is written beside the ledger entry (`<entry>.dated`), and every start
 takes the earliest of the two, so it outlives a restart.
 
 tags/list is read anonymously: a private Artifact Registry repository answers 401, and its
-images stay first-seen.
+images stay first-seen. So is cgr.dev: Chainguard documents an anonymous token for the
+free `latest`/`latest-dev` images; a private repository needs a Chainguard token, which
+NORA does not send, so its images stay first-seen.
+
+cgr.dev rebuilds its images about daily and moves `latest` each time, so a pin such as
+`cgr.dev/chainguard/nginx:latest@sha256:…` is pulled by digest, usually first by a kubelet.
+Its history answers the date the tag moved onto the digest: `0352063c` of chainguard/nginx,
+first fetched by NORA on 08.11.2026 12:49Z, was published 07.11.2026 19:55Z. The history
+answers 1000 records a request, oldest first; a full page asks for the next from its last
+record (`?start=`).
 
 The GitHub packages API answers only with a token. `date_token_file` names a file holding
 one, re-read at each walk, so a mounted Secret that rotates applies without a restart.

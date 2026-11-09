@@ -6,8 +6,8 @@
 //! 5xx, timeout, an answer about another digest) is `None`, and the quarantine falls
 //! back to NORA's first-seen; the pull itself never waits on more than one lookup.
 //!
-//! ghcr.io, mcr.microsoft.com and public.ecr.aws date a digest only in a listing of the
-//! whole repository, so that listing is walked once per repository ([`WALK_TTL`]) off the
+//! ghcr.io, mcr.microsoft.com, public.ecr.aws and cgr.dev date a digest only in a listing
+//! of the whole repository (cgr.dev: the history of its tags), so that listing is walked once per repository ([`WALK_TTL`]) off the
 //! request path and shared by every first sight of the repository; a request waits
 //! [`TIMEOUT`] for it.
 
@@ -51,6 +51,14 @@ const WALK_REPOS: usize = 256;
 /// digest, inside the one [`TIMEOUT`].
 const TAG_PAGES: u32 = 3;
 const TAGS_PER_PAGE: u32 = 100;
+/// cgr.dev tags read for a digest request. tags/list names every cosign `sha256-*` tag
+/// too (1000 a page for chainguard/nginx on 09.11.2026), and a public repository carries
+/// two others, `latest` and `latest-dev`.
+const CGR_TAGS: usize = 10;
+/// A tag's history answers at most 1000 records, oldest first; pages after a full one start
+/// at its last record. chainguard/nginx:latest-dev had 659 on 09.11.2026.
+const CGR_HISTORY_PAGES: u32 = 5;
+const CGR_HISTORY_PER_PAGE: usize = 1000;
 
 /// When `upstream` published `digest`, which NORA fetched as `name:reference` with the
 /// body `manifest`, by the registry's own record. `None` when the registry has no date for
@@ -70,7 +78,10 @@ pub(super) async fn published_at(
     manifest: &[u8],
 ) -> Option<i64> {
     if source.walks_repository() {
-        let walk = walk(state, upstream, source, name);
+        // cgr.dev dates a tag request by that tag's history alone, a walk of its own.
+        let tag =
+            (source == DateSource::CgrTagHistory && !reference.contains(':')).then_some(reference);
+        let walk = walk(state, upstream, source, name, tag);
         let Ok(dates) = tokio::time::timeout(TIMEOUT, walk.clone()).await else {
             let (state, url, name) = (state.clone(), upstream.url.clone(), name.to_owned());
             let (digest, manifest) = (digest.to_owned(), manifest.to_vec());
@@ -172,11 +183,20 @@ type Walk = Shared<BoxFuture<'static, Option<Arc<Dates>>>>;
 /// every first sight of the repository awaits.
 pub type Walks = Mutex<HashMap<String, (Instant, Walk)>>;
 
-/// The walk of `name` that answers now: the cached one while it is fresh, else a new one
-/// on its own task, so that a request giving up on it after [`TIMEOUT`] leaves it running
-/// for the next first sight.
-fn walk(state: &AppState, upstream: &DockerUpstream, source: DateSource, name: &str) -> Walk {
-    let key = format!("{}#{}/{name}", upstream.url, source.label());
+/// The walk of `name` (of its `tag` alone, for cgr.dev) that answers now: the cached one
+/// while it is fresh, else a new one on its own task, so that a request giving up on it
+/// after [`TIMEOUT`] leaves it running for the next first sight.
+fn walk(
+    state: &AppState,
+    upstream: &DockerUpstream,
+    source: DateSource,
+    name: &str,
+    tag: Option<&str>,
+) -> Walk {
+    let key = match tag {
+        Some(tag) => format!("{}#{}/{name}:{tag}", upstream.url, source.label()),
+        None => format!("{}#{}/{name}", upstream.url, source.label()),
+    };
     let mut walks = state.docker_date_walks.lock();
     if let Some((started, walk)) = walks.get(&key) {
         let ttl = match walk.peek() {
@@ -196,7 +216,13 @@ fn walk(state: &AppState, upstream: &DockerUpstream, source: DateSource, name: &
     }
     let task = tokio::spawn(tokio::time::timeout(
         WALK_DEADLINE,
-        walk_repository(state.clone(), upstream.clone(), source, name.to_owned()),
+        walk_repository(
+            state.clone(),
+            upstream.clone(),
+            source,
+            name.to_owned(),
+            tag.map(str::to_owned),
+        ),
     ));
     let walk = task
         .map(|done| done.ok().and_then(Result::ok).flatten().map(Arc::new))
@@ -214,6 +240,7 @@ async fn walk_repository(
     upstream: DockerUpstream,
     source: DateSource,
     name: String,
+    tag: Option<String>,
 ) -> Option<Dates> {
     let base = upstream.url.trim_end_matches('/');
     let mut dates = Dates::new();
@@ -281,6 +308,57 @@ async fn walk_repository(
                 next = more;
                 if next.is_none() {
                     break;
+                }
+            }
+        }
+        DateSource::CgrTagHistory => {
+            // An anonymous token reads a public repository (cgr.dev/chainguard/*); a private
+            // one is refused and stays first-seen.
+            let url = format!("{base}/token?scope=repository:{name}:pull");
+            let body = fetch(&state, &upstream, source, &url, None, WALK_PAGE_TIMEOUT).await?;
+            let token = serde_json::from_slice::<serde_json::Value>(&body).ok()?["token"]
+                .as_str()?
+                .to_owned();
+            let auth = Some(UpstreamAuth::Bearer(&token));
+            let tags = match tag {
+                Some(tag) => vec![tag],
+                None => {
+                    let url = format!("{base}/v2/{name}/tags/list");
+                    let body =
+                        fetch(&state, &upstream, source, &url, auth, WALK_PAGE_TIMEOUT).await?;
+                    cgr_tags(&body)?
+                }
+            };
+            let history = |tag: String| {
+                let (state, upstream, name, token) = (&state, &upstream, &name, &token);
+                async move {
+                    let mut dates = Dates::new();
+                    let mut start = String::new();
+                    for _ in 0..CGR_HISTORY_PAGES {
+                        let mut url = format!("{base}/v2/{name}/_chainguard/history/{tag}");
+                        if !start.is_empty() {
+                            url = format!("{url}?start={start}");
+                        }
+                        let auth = Some(UpstreamAuth::Bearer(token));
+                        let Some(body) =
+                            fetch(state, upstream, source, &url, auth, WALK_PAGE_TIMEOUT).await
+                        else {
+                            break;
+                        };
+                        match cgr_history(&body, &mut dates) {
+                            Some((CGR_HISTORY_PER_PAGE, Some(last))) => start = last,
+                            _ => break,
+                        }
+                    }
+                    dates
+                }
+            };
+            for listed in futures::future::join_all(tags.into_iter().map(history)).await {
+                for (digest, at) in listed {
+                    dates
+                        .entry(digest)
+                        .and_modify(|d| *d = (*d).min(at))
+                        .or_insert(at);
                 }
             }
         }
@@ -396,6 +474,51 @@ fn ecr_page(body: &[u8], dates: &mut Dates) -> Option<Option<String>> {
         }
     }
     Some(doc["nextToken"].as_str().map(str::to_owned))
+}
+
+/// The tags of a cgr.dev tags/list page that name images, at most [`CGR_TAGS`]: cosign's
+/// `sha256-<digest>.sig`/`.att`/`.sbom` name signatures. `None` for an answer that is not a
+/// tag list.
+fn cgr_tags(body: &[u8]) -> Option<Vec<String>> {
+    let doc: serde_json::Value = serde_json::from_slice(body).ok()?;
+    Some(
+        doc["tags"]
+            .as_array()?
+            .iter()
+            .filter_map(|t| t.as_str())
+            .filter(|t| !t.starts_with("sha256-"))
+            .take(CGR_TAGS)
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// One page of a cgr.dev tag history: each digest the tag named, from `updateTimestamp`,
+/// when the tag moved onto it. A digest takes its earliest record. How many records the page
+/// held and the last one's timestamp (the next page starts there, inclusive); `None` for an
+/// answer that is not a history (`"history": null` past its end is an empty one).
+fn cgr_history(body: &[u8], dates: &mut Dates) -> Option<(usize, Option<String>)> {
+    let doc: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let history = match &doc["history"] {
+        serde_json::Value::Null if doc.get("history").is_some() => return Some((0, None)),
+        history => history.as_array()?,
+    };
+    for record in history {
+        if let (Some(digest), Some(at)) = (
+            record["digest"].as_str(),
+            rfc3339(&record["updateTimestamp"]),
+        ) {
+            dates
+                .entry(digest.to_owned())
+                .and_modify(|d| *d = (*d).min(at))
+                .or_insert(at);
+        }
+    }
+    let last = history
+        .last()
+        .and_then(|r| r["updateTimestamp"].as_str())
+        .map(str::to_owned);
+    Some((history.len(), last))
 }
 
 /// The manifests a client can run from `manifest`: an index's platform manifests without
@@ -599,6 +722,7 @@ mod tests {
             ("ghcr.io", DateSource::GhcrCreatedAt),
             ("mcr.microsoft.com", DateSource::McrLastModified),
             ("public.ecr.aws", DateSource::EcrPublicPushedAt),
+            ("cgr.dev", DateSource::CgrTagHistory),
         ] {
             assert_eq!(
                 upstream("https://x", ns).date_source(),
@@ -607,7 +731,7 @@ mod tests {
             );
             assert!(source.walks_repository());
         }
-        for ns in ["cgr.dev", "docker.dragonflydb.io", "xpkg.upbound.io"] {
+        for ns in ["docker.dragonflydb.io", "xpkg.upbound.io"] {
             assert_eq!(upstream("https://x", ns).date_source(), None, "{ns}");
         }
     }
@@ -654,6 +778,53 @@ mod tests {
             ecr_page(br#"{"imageTagDetails":[]}"#, &mut dates),
             Some(None)
         );
+    }
+
+    /// cgr.dev chainguard/nginx on 09.11.2026, trimmed: tags/list with its cosign tags, and
+    /// the history of `latest`, oldest first.
+    #[test]
+    fn cgr_dates_each_digest_by_its_tag_history() {
+        let tags = br#"{"name":"chainguard/nginx","tags":["latest","latest-dev",
+            "sha256-000e710230b9ef839e55a3e2563a9e3ae669cd6d2abac4cea2fc1f9074a44d20.att",
+            "sha256-000e710230b9ef839e55a3e2563a9e3ae669cd6d2abac4cea2fc1f9074a44d20.sig",
+            "sha256-002710a0de8e2c60f8d80094685e0852440ee543b364f17cae50c83e02573104.sbom"]}"#;
+        assert_eq!(cgr_tags(tags).unwrap(), ["latest", "latest-dev"]);
+        assert_eq!(cgr_tags(br#"{"errors":[{"code":"UNAUTHORIZED"}]}"#), None);
+
+        let history = br#"{"history":[
+            {"updateTimestamp":"2023-05-12T13:42:12.726Z","digest":"sha256:33f9533aab6ba0f99b8ddd274e7384c0ec6aff3e2d78a460bf148cf960cf2b76"},
+            {"updateTimestamp":"2026-11-06T11:10:08.506Z","digest":"sha256:56827eefb441357ccbbbf2c38074bb942109a0ec433aba9c457be490eef5bdc2"},
+            {"updateTimestamp":"2026-11-07T19:55:29.291Z","digest":"sha256:0352063c168740414d8caf7cbcc2b386506dba82ba3955cfaee2b8582a1a93a8"}]}"#;
+        let mut dates = Dates::new();
+        assert_eq!(
+            cgr_history(history, &mut dates),
+            Some((3, Some("2026-11-07T19:55:29.291Z".to_owned())))
+        );
+        assert_eq!(
+            dates["sha256:0352063c168740414d8caf7cbcc2b386506dba82ba3955cfaee2b8582a1a93a8"],
+            1_794_081_329
+        );
+        assert_eq!(
+            dates["sha256:56827eefb441357ccbbbf2c38074bb942109a0ec433aba9c457be490eef5bdc2"],
+            1_793_963_408
+        );
+        // A tag moved back onto a digest: the digest keeps its first record.
+        let back = br#"{"history":[{"updateTimestamp":"2026-11-08T00:00:00Z","digest":"sha256:56827eefb441357ccbbbf2c38074bb942109a0ec433aba9c457be490eef5bdc2"}]}"#;
+        assert_eq!(cgr_history(back, &mut dates).map(|(n, _)| n), Some(1));
+        assert_eq!(
+            dates["sha256:56827eefb441357ccbbbf2c38074bb942109a0ec433aba9c457be490eef5bdc2"],
+            1_793_963_408
+        );
+        // Past its end the API answers `null`; an error is no history.
+        assert_eq!(
+            cgr_history(br#"{"history":null}"#, &mut dates),
+            Some((0, None))
+        );
+        assert_eq!(
+            cgr_history(br#"{"errors":[{"code":"MANIFEST_UNKNOWN"}]}"#, &mut dates),
+            None
+        );
+        assert_eq!(dates.len(), 3);
     }
 
     /// Bodies trimmed from the live answers of 02.11.2026.
