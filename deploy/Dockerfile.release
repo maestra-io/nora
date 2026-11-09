@@ -9,11 +9,15 @@
 #
 # Expects nora-linux-amd64 and nora-linux-arm64 in the build context.
 
-FROM alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
+FROM packages.maestra.io/docker-hub/library/alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
 ARG TARGETARCH
 
-RUN apk upgrade --no-cache \
-    && apk add --no-cache ca-certificates \
+# apk through nora (packages.maestra.io, 3-day hold, issues-maestra#1649): BuildKit secret
+# PRIVATE_PACKAGES_TOKEN (CI: a fresh OIDC token; local: an nra_ token,
+# docker build --secret id=PRIVATE_PACKAGES_TOKEN,env=PRIVATE_PACKAGES_TOKEN .).
+RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true --mount=type=bind,from=public.ecr.aws/g5f9s8a4/nora-apk:1.0.0@sha256:55df38687c301e6fefa230dc1c71a8841618214cc549ade71be740b25822a00e,target=/nora-apk \
+    /nora-apk/nora-apk upgrade --no-cache \
+    && /nora-apk/nora-apk add --no-cache ca-certificates \
     && addgroup -S nora && adduser -S -G nora nora \
     && mkdir -p /data && chown nora:nora /data
 

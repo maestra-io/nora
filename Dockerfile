@@ -5,16 +5,18 @@
 #
 # Usage:
 #   docker build .                                             # Alpine (default)
-#   docker build --target redos .                              # RED OS
-#   docker build --target astra .                              # Astra Linux SE
 #   docker buildx build --target binary --output type=local,dest=out .      # amd64 binary
 #   docker buildx build --target binary-arm64 --output type=local,dest=out .  # arm64 binary (cross-compiled)
 #
 
 # ── Build ──────────────────────────────────────────────────────────────────
-FROM rust:1-alpine3.23@sha256:42c2519fdf75d9e34cc61a1aaf34b1a684da9bfd65fe5daefef98d92a801b001 AS builder
+FROM packages.maestra.io/docker-hub/library/rust:1-alpine3.23@sha256:42c2519fdf75d9e34cc61a1aaf34b1a684da9bfd65fe5daefef98d92a801b001 AS builder
 
-RUN apk add --no-cache musl-dev
+# apk through nora (packages.maestra.io, 3-day hold, issues-maestra#1649): BuildKit secret
+# PRIVATE_PACKAGES_TOKEN (CI: a fresh OIDC token; local: an nra_ token,
+# docker build --secret id=PRIVATE_PACKAGES_TOKEN,env=PRIVATE_PACKAGES_TOKEN .).
+RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true --mount=type=bind,from=public.ecr.aws/g5f9s8a4/nora-apk:1.0.0@sha256:55df38687c301e6fefa230dc1c71a8841618214cc549ade71be740b25822a00e,target=/nora-apk \
+    /nora-apk/nora-apk add --no-cache musl-dev
 
 WORKDIR /build
 
@@ -50,9 +52,10 @@ FROM scratch AS binary
 COPY --from=builder /nora /nora
 
 # ── Cross-compile arm64 (runs natively on x86, no QEMU) ──────────────────
-FROM rust:1-alpine3.23@sha256:42c2519fdf75d9e34cc61a1aaf34b1a684da9bfd65fe5daefef98d92a801b001 AS cross-arm64
+FROM packages.maestra.io/docker-hub/library/rust:1-alpine3.23@sha256:42c2519fdf75d9e34cc61a1aaf34b1a684da9bfd65fe5daefef98d92a801b001 AS cross-arm64
 
-RUN apk add --no-cache musl-dev \
+RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true --mount=type=bind,from=public.ecr.aws/g5f9s8a4/nora-apk:1.0.0@sha256:55df38687c301e6fefa230dc1c71a8841618214cc549ade71be740b25822a00e,target=/nora-apk \
+    /nora-apk/nora-apk add --no-cache musl-dev \
     && wget -qO- https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /opt
 
 ENV PATH="/opt/aarch64-linux-musl-cross/bin:$PATH" \
@@ -82,72 +85,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM scratch AS binary-arm64
 COPY --from=cross-arm64 /nora /nora
 
-# ── RED OS (FSTEC-certified, RPM-based) ───────────────────────────────────
-FROM registry.red-soft.ru/ubi8/ubi-minimal AS redos
-
-RUN microdnf install -y ca-certificates shadow-utils curl \
-    && microdnf clean all \
-    && groupadd -r nora && useradd -r -g nora -d /data -s /sbin/nologin nora \
-    && mkdir -p /data && chown nora:nora /data
-
-COPY --from=builder --chown=nora:nora /nora /usr/local/bin/nora
-
-ENV RUST_LOG=info \
-    NORA_HOST=:: \
-    NORA_CONFIG_PATH=/etc/nora/config.toml
-
-# Config *values* ship as a FILE, not ENV: env has the highest precedence in
-# Config::load and would silently override a user-provided config.toml (#719).
-# Only NORA_HOST stays in ENV — binding must survive a bind-mounted (possibly
-# partial) config.toml so the container stays reachable (-e NORA_HOST to change).
-COPY --chown=nora:nora deploy/config.docker.toml /etc/nora/config.toml
-
-EXPOSE 4000
-VOLUME ["/data"]
-USER nora
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD ["/usr/local/bin/nora", "healthcheck"]
-
-ENTRYPOINT ["/usr/local/bin/nora"]
-CMD ["serve"]
-
-# ── Astra Linux SE (FSTEC-certified, Debian-based) ────────────────────────
-FROM registry.astralinux.ru/library/astra/ubi17:latest AS astra
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd -r nora && useradd -r -g nora -d /data -s /usr/sbin/nologin nora \
-    && mkdir -p /data && chown nora:nora /data
-
-COPY --from=builder --chown=nora:nora /nora /usr/local/bin/nora
-
-ENV RUST_LOG=info \
-    NORA_HOST=:: \
-    NORA_CONFIG_PATH=/etc/nora/config.toml
-
-# Config *values* ship as a FILE, not ENV: env has the highest precedence in
-# Config::load and would silently override a user-provided config.toml (#719).
-# Only NORA_HOST stays in ENV — binding must survive a bind-mounted (possibly
-# partial) config.toml so the container stays reachable (-e NORA_HOST to change).
-COPY --chown=nora:nora deploy/config.docker.toml /etc/nora/config.toml
-
-EXPOSE 4000
-VOLUME ["/data"]
-USER nora
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD ["/usr/local/bin/nora", "healthcheck"]
-
-ENTRYPOINT ["/usr/local/bin/nora"]
-CMD ["serve"]
-
 # ── Alpine (default — must be last) ───────────────────────────────────────
-FROM alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
+FROM packages.maestra.io/docker-hub/library/alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
 
-RUN apk upgrade --no-cache \
-    && apk add --no-cache ca-certificates \
+# apk through nora (packages.maestra.io, 3-day hold, issues-maestra#1649): BuildKit secret
+# PRIVATE_PACKAGES_TOKEN (CI: a fresh OIDC token; local: an nra_ token,
+# docker build --secret id=PRIVATE_PACKAGES_TOKEN,env=PRIVATE_PACKAGES_TOKEN .).
+RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true --mount=type=bind,from=public.ecr.aws/g5f9s8a4/nora-apk:1.0.0@sha256:55df38687c301e6fefa230dc1c71a8841618214cc549ade71be740b25822a00e,target=/nora-apk \
+    /nora-apk/nora-apk upgrade --no-cache \
+    && /nora-apk/nora-apk add --no-cache ca-certificates \
     && addgroup -S nora && adduser -S -G nora nora \
     && mkdir -p /data && chown nora:nora /data
 

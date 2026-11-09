@@ -56,6 +56,40 @@ jobs:
           fi
           echo "value=${tag}" >> "$GITHUB_OUTPUT"
 
+      # BuildKit pulls the base images through nora (packages.maestra.io, issues-maestra#1649)
+      # with ~/.docker/config.json. nora takes the GitHub OIDC token, which lives minutes: a
+      # credential helper mints a fresh one per pull. Same step as dotnet-service-build.yml in
+      # maestra-io/github-actions.
+      - name: nora docker credentials
+        env:
+          AUDIENCE: packages.maestra.io
+          PACKAGES_URL: https://packages.maestra.io
+        run: |
+          # >>> nora-cred-helper (copy of maestra-io/github-actions dotnet-service-build.yml)
+          bin="$RUNNER_TEMP/nora-bin"; mkdir -p "$bin"
+          # The helper runs in the caller's environment, which tox and other test runners
+          # scrub: the job's OIDC request URL and token go to a 0600 file next to it.
+          ( umask 077; printf 'url=%q\ntoken=%q\naud=%q\n' "$ACTIONS_ID_TOKEN_REQUEST_URL" \
+            "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$AUDIENCE" > "$bin/oidc.env" )
+          cat > "$bin/docker-credential-nora" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [ "${1:-}" = get ] || exit 0
+          server=$(cat) # docker sends it without a newline
+          . "${BASH_SOURCE[0]%/*}/oidc.env"
+          t=$(curl -sSf --retry 3 --connect-timeout 10 --max-time 30 -H "Authorization: bearer $token" \
+            "$url&audience=$aud" | jq -r '.value // empty')
+          [ -n "$t" ]
+          jq -cn --arg s "$server" --arg t "$t" '{ServerURL: $s, Username: "token", Secret: $t}'
+          EOF
+          chmod 755 "$bin/docker-credential-nora"
+          echo "$bin" >> "$GITHUB_PATH"
+          host="${PACKAGES_URL#*://}"; host="${host%%/*}"
+          cfg="${DOCKER_CONFIG:-$HOME/.docker}/config.json"; mkdir -p "$(dirname "$cfg")"
+          [ -s "$cfg" ] || echo '{}' > "$cfg"
+          jq --arg h "$host" '.credHelpers[$h] = "nora"' "$cfg" > "$cfg.t" && mv "$cfg.t" "$cfg"
+          # <<< nora-cred-helper
+
       # --no-default-features: packages.maestra.io serves no rpm, so its parser
       # stays out of the image. `deb` comes back: the apt proxy with the 3-day hold
       # (docs/deb-proxy.md, issues-maestra#1649) needs its parsers and the rpgp signer.
@@ -77,6 +111,17 @@ jobs:
           targetTag: ${{ steps.tag.outputs.value }}
           push: false
 
+      # apk inside the build goes through nora (issues-maestra#1649): a fresh OIDC token
+      # (minutes-lived) for the BuildKit secret, minted right before the build.
+      - name: nora token for the image build
+        id: nora
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const t = await core.getIDToken('packages.maestra.io');
+            core.setSecret(t);
+            core.setOutput('token', t);
+
       - name: Build and push image
         id: push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
@@ -87,6 +132,7 @@ jobs:
             CARGO_FEATURES=--no-default-features --features mimalloc,deb
           provenance: false
           push: true
+          secrets: PRIVATE_PACKAGES_TOKEN=${{ steps.nora.outputs.token }}
           tags: ${{ steps.ecr.outputs.registry }}/nora:${{ steps.tag.outputs.value }}
 
       # Keyless cosign signature + CycloneDX SBOM attestation (issues-maestra#1648).
