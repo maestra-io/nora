@@ -251,7 +251,9 @@ pub(crate) enum ProxyError {
     /// Upstream answered 429; carries its `Retry-After` value, if any.
     RateLimited(Option<String>),
     /// Upstream answered 401/403: a credential or policy refusal, not a missing artifact.
-    Denied(u16),
+    /// With the reason its body gives, when it is a JSON error with a `message`
+    /// (GitHub's API: `message` and `documentation_url`).
+    Denied(u16, Option<String>),
     /// The body could not be spooled locally: nora's own disk or budget, not upstream.
     Spool(SpoolError),
     /// The upstream answered and would not let NORA in: it refused the credential configured
@@ -278,9 +280,28 @@ pub(crate) fn upstream_4xx(status: u16, headers: &reqwest::header::HeaderMap) ->
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_owned),
         ),
-        401 | 403 => ProxyError::Denied(status),
+        401 | 403 => ProxyError::Denied(status, None),
         _ => ProxyError::NotFound,
     }
+}
+
+/// The reason a 401/403 body gives, read up to 4 KiB: a JSON error's `message`, with its
+/// `documentation_url` (GitHub: an organisation's IP allow list, SSO, a token's reach).
+/// `None` for any other body. The body is the upstream's; it never holds our credential.
+async fn denied_reason(mut response: reqwest::Response) -> Option<String> {
+    let mut body = Vec::new();
+    while body.len() < 4096 {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    let doc: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    let message: String = doc["message"].as_str()?.chars().take(300).collect();
+    Some(match doc["documentation_url"].as_str() {
+        Some(url) => format!("{message} ({url})"),
+        None => message,
+    })
 }
 
 /// Client response for an upstream fetch that failed with nothing cached to fall
@@ -310,7 +331,7 @@ pub(crate) fn proxy_error_response(registry: &str, url: &str, err: &ProxyError) 
                 .into_response();
         }
         ProxyError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
-        ProxyError::Denied(_)
+        ProxyError::Denied(..)
         | ProxyError::CredentialsRefused
         | ProxyError::Upstream(_)
         | ProxyError::Network(_) => StatusCode::BAD_GATEWAY,
@@ -406,7 +427,7 @@ impl UpstreamMiss {
             | ProxyError::Network(_)
             | ProxyError::Timeout(_)
             | ProxyError::RateLimited(_)
-            | ProxyError::Denied(_)
+            | ProxyError::Denied(..)
             | ProxyError::Spool(_) => self.failed = true,
             ProxyError::CredentialsRefused => self.refused = true,
             ProxyError::CircuitOpen(key) => {
@@ -749,11 +770,16 @@ where
                     // from HalfOpen (so it recovers instead of slow-probing) but
                     // is a no-op in Closed, so a 4xx never clears a real failure
                     // tally (#606). A 429 is the exception: back off.
-                    let err = upstream_4xx(status, response.headers());
+                    let mut err = upstream_4xx(status, response.headers());
                     if matches!(err, ProxyError::RateLimited(_)) {
                         cb.record_failure(&cb_key, probe);
                     } else {
                         cb.record_alive(&cb_key, probe);
+                    }
+                    if let ProxyError::Denied(_, reason) = &mut err {
+                        if !headers_only {
+                            *reason = denied_reason(response).await;
+                        }
                     }
                     return Err(err);
                 }
@@ -3596,7 +3622,14 @@ mod tests {
                 ResponseTemplate::new(429).insert_header("retry-after", "7"),
             ),
             ("/denied", ResponseTemplate::new(401)),
-            ("/forbidden", ResponseTemplate::new(403)),
+            (
+                "/forbidden",
+                ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "message": "Although you appear to have the correct authorization credentials, the `aquasecurity` organization has an IP allow list enabled, and your IP address is not permitted to access this resource.",
+                    "documentation_url": "https://docs.github.com/rest/packages/packages",
+                    "status": "403"
+                })),
+            ),
             (
                 "/slow",
                 ResponseTemplate::new(200).set_delay(Duration::from_secs(3)),
@@ -3634,12 +3667,16 @@ mod tests {
         ));
         assert!(matches!(
             fetch("/denied").await,
-            Err(ProxyError::Denied(401))
+            Err(ProxyError::Denied(401, None))
         ));
-        assert!(matches!(
-            fetch("/forbidden").await,
-            Err(ProxyError::Denied(403))
-        ));
+        // A JSON refusal carries its reason (GitHub's message and documentation_url).
+        match fetch("/forbidden").await {
+            Err(ProxyError::Denied(403, Some(reason))) => assert_eq!(
+                reason,
+                "Although you appear to have the correct authorization credentials, the `aquasecurity` organization has an IP allow list enabled, and your IP address is not permitted to access this resource. (https://docs.github.com/rest/packages/packages)"
+            ),
+            other => panic!("{other:?}"),
+        }
         assert!(matches!(fetch("/slow").await, Err(ProxyError::Timeout(_))));
 
         let resp = proxy_error_response("npm", "u", &ProxyError::RateLimited(Some("7".into())));
@@ -3649,7 +3686,7 @@ mod tests {
             (ProxyError::NotFound, StatusCode::NOT_FOUND),
             (ProxyError::Upstream(500), StatusCode::BAD_GATEWAY),
             (ProxyError::Network("x".into()), StatusCode::BAD_GATEWAY),
-            (ProxyError::Denied(403), StatusCode::BAD_GATEWAY),
+            (ProxyError::Denied(403, None), StatusCode::BAD_GATEWAY),
             (ProxyError::Timeout("x".into()), StatusCode::GATEWAY_TIMEOUT),
         ] {
             assert_eq!(proxy_error_response("npm", "u", &err).status(), want);

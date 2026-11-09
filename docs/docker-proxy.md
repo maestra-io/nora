@@ -74,7 +74,10 @@ record (`?start=`).
 The GitHub packages API answers only with a token. `date_token_file` names a file holding
 one, re-read at each walk, so a mounted Secret that rotates applies without a restart.
 GitHub documents that a GitHub App installation token reads public packages with no
-permission of its own; a classic PAT needs `read:packages`.
+permission of its own; a classic PAT needs `read:packages`. A refusal (401/403) logs
+GitHub's own reason in `docker publish date lookup failed` (`Denied(403, Some("<message>
+(<documentation_url>)"))`): an organisation's IP allow list, SSO enforcement or the
+token's reach.
 
 ```toml
 [[docker.upstreams]]
