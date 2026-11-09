@@ -111,6 +111,9 @@ pub enum DateSource {
     McrLastModified,
     /// public.ecr.aws gallery `describeImageTags` `imagePushedAt` per tag.
     EcrPublicPushedAt,
+    /// cgr.dev `/v2/<repo>/_chainguard/history/<tag>` `updateTimestamp` per digest the tag
+    /// named (an anonymous token).
+    CgrTagHistory,
 }
 
 impl DateSource {
@@ -123,6 +126,7 @@ impl DateSource {
             Self::GhcrCreatedAt => "ghcr_created_at",
             Self::McrLastModified => "mcr_last_modified",
             Self::EcrPublicPushedAt => "ecr_public_pushed_at",
+            Self::CgrTagHistory => "cgr_tag_history",
         }
     }
 
@@ -137,7 +141,10 @@ impl DateSource {
     pub fn walks_repository(self) -> bool {
         matches!(
             self,
-            Self::GhcrCreatedAt | Self::McrLastModified | Self::EcrPublicPushedAt
+            Self::GhcrCreatedAt
+                | Self::McrLastModified
+                | Self::EcrPublicPushedAt
+                | Self::CgrTagHistory
         )
     }
 }
@@ -151,7 +158,7 @@ impl DockerUpstream {
     }
 
     /// The registry's date source, by the upstream's namespace (its host); `None` for a
-    /// registry that publishes no date NORA reads (cgr.dev, docker.dragonflydb.io, ...).
+    /// registry that publishes no date NORA reads (docker.dragonflydb.io, ...).
     pub fn date_source(&self) -> Option<DateSource> {
         match self.resolved_namespace().as_str() {
             "docker.io" | "index.docker.io" => Some(DateSource::HubTagLastPushed),
@@ -165,6 +172,7 @@ impl DockerUpstream {
             "ghcr.io" => Some(DateSource::GhcrCreatedAt),
             "mcr.microsoft.com" => Some(DateSource::McrLastModified),
             "public.ecr.aws" => Some(DateSource::EcrPublicPushedAt),
+            "cgr.dev" => Some(DateSource::CgrTagHistory),
             _ => None,
         }
     }

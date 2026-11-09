@@ -11992,6 +11992,189 @@ mod integration_tests {
             );
         }
 
+        /// cgr.dev time as its history writes it: milliseconds, `Z`.
+        fn cgr_time(at: i64) -> String {
+            chrono::DateTime::from_timestamp(at, 0)
+                .unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        }
+
+        /// cgr.dev's anonymous token for library/demo, and `tags` on its tags/list.
+        async fn cgr_repository(server: &MockServer, tags: &[&str], listed: u64) {
+            Mock::given(method("GET"))
+                .and(path("/token"))
+                .and(wiremock::matchers::query_param(
+                    "scope",
+                    "repository:library/demo:pull",
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"token": "cgr_anon", "expires_in": 3600}),
+                    ),
+                )
+                .mount(server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v2/library/demo/tags/list"))
+                .and(wiremock::matchers::header(
+                    "authorization",
+                    "Bearer cgr_anon",
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"name": "library/demo", "tags": tags})),
+                )
+                .expect(listed)
+                .mount(server)
+                .await;
+        }
+
+        /// The history of tag `v1`: `records` (digest, time), oldest first.
+        fn cgr_history(records: &[(String, i64)]) -> ResponseTemplate {
+            let history: Vec<_> = records
+                .iter()
+                .map(|(d, at)| serde_json::json!({"updateTimestamp": cgr_time(*at), "digest": d}))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"history": history}))
+        }
+
+        const CGR_HISTORY: &str = "/v2/library/demo/_chainguard/history/v1";
+
+        /// A digest request (a kubelet pull, `:latest@sha256`) names no tag: the history of
+        /// the repository's tags dates it, cosign tags skipped, a full page of 1000 followed
+        /// from its last record.
+        #[tokio::test]
+        async fn cgr_dates_a_digest_request_by_the_history_of_its_tags() {
+            let (server, image, layer) = upstream_with_image().await;
+            let old = days_ago(400);
+            let filler: Vec<_> = (0..1000)
+                .map(|i| (format!("sha256:{i:064x}"), old + i))
+                .collect();
+            let last = cgr_time(old + 999);
+            cgr_repository(&server, &["v1", "sha256-0000.sig"], 1).await;
+            Mock::given(method("GET"))
+                .and(path(CGR_HISTORY))
+                .and(wiremock::matchers::query_param_is_missing("start"))
+                .and(wiremock::matchers::header(
+                    "authorization",
+                    "Bearer cgr_anon",
+                ))
+                .respond_with(cgr_history(&filler))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(CGR_HISTORY))
+                .and(wiremock::matchers::query_param("start", last.as_str()))
+                .respond_with(cgr_history(&[
+                    (format!("sha256:{:064x}", 999), old + 999),
+                    (sha(&image), days_ago(30)),
+                ]))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let ctx = walked(&server, "cgr.dev", None);
+            assert_eq!(
+                get(&ctx, &format!("manifests/{}", sha(&image))).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                get(&ctx, &format!("blobs/{}", sha(&layer))).await,
+                StatusCode::OK
+            );
+        }
+
+        /// A tag request reads that tag's history alone.
+        #[tokio::test]
+        async fn cgr_dates_a_tag_request_by_its_own_history() {
+            let (server, image, _) = upstream_with_image().await;
+            cgr_repository(&server, &["v1"], 0).await;
+            Mock::given(method("GET"))
+                .and(path(CGR_HISTORY))
+                .respond_with(cgr_history(&[(sha(&image), days_ago(30))]))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let ctx = walked(&server, "cgr.dev", None);
+            assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::OK);
+        }
+
+        /// chainguard/nginx@0352063c on 09.11.2026: cached and held from NORA's first fetch
+        /// by digest, a day after cgr.dev published it. A digest pull moves it back to the
+        /// history's date; still younger than the TTL, it stays held.
+        #[tokio::test]
+        async fn a_cached_cgr_digest_held_by_first_seen_takes_the_history_date() {
+            let (server, image, _) = upstream_with_image().await;
+            let pushed = days_ago(2);
+            cgr_repository(&server, &["v1"], 1).await;
+            Mock::given(method("GET"))
+                .and(path(CGR_HISTORY))
+                .respond_with(cgr_history(&[(sha(&image), pushed)]))
+                .mount(&server)
+                .await;
+            let ctx = walked(&server, "cgr.dev", None);
+            ctx.state
+                .storage
+                .put(
+                    &manifest_key(Some("cgr.dev"), "library/demo", &sha(&image)),
+                    &image,
+                )
+                .await
+                .unwrap();
+            ctx.state
+                .digest_store
+                .record("docker", &sha(&image), &server.uri(), Some(days_ago(1)));
+            assert_eq!(
+                get(&ctx, &format!("manifests/{}", sha(&image))).await,
+                StatusCode::FORBIDDEN
+            );
+            let entry = ctx
+                .state
+                .digest_store
+                .record("docker", &sha(&image), "x", None);
+            assert_eq!(entry.first_seen, pushed);
+        }
+
+        /// A refused token, a failing history, a digest no history names: first-seen, never
+        /// a pass and never a failed pull.
+        #[tokio::test]
+        async fn an_undated_cgr_digest_stays_first_seen() {
+            let (server, image, _) = upstream_with_image().await;
+            Mock::given(method("GET"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(&server)
+                .await;
+            let ctx = walked(&server, "cgr.dev", None);
+            assert_eq!(
+                get(&ctx, &format!("manifests/{}", sha(&image))).await,
+                StatusCode::FORBIDDEN
+            );
+
+            for history in [
+                ResponseTemplate::new(429),
+                cgr_history(&[("sha256:other".to_owned(), days_ago(30))]),
+            ] {
+                let (server, image, _) = upstream_with_image().await;
+                cgr_repository(&server, &["v1"], 1).await;
+                Mock::given(method("GET"))
+                    .and(path(CGR_HISTORY))
+                    .respond_with(history)
+                    .mount(&server)
+                    .await;
+                let ctx = walked(&server, "cgr.dev", None);
+                assert_eq!(
+                    get(&ctx, &format!("manifests/{}", sha(&image))).await,
+                    StatusCode::FORBIDDEN
+                );
+                let entry = ctx
+                    .state
+                    .digest_store
+                    .record("docker", &sha(&image), "x", None);
+                assert!(entry.first_seen > days_ago(1), "first-seen: {entry:?}");
+            }
+        }
+
         async fn get(ctx: &TestContext, rest: &str) -> StatusCode {
             let uri = format!("/v2/library/demo/{rest}");
             send(&ctx.app, Method::GET, &uri, Body::empty())
