@@ -3223,6 +3223,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
                     any_audience: false,
                     algorithms: vec!["RS256".into()],
                     max_token_lifetime_secs: 900,
+                    session_lifetime_secs: 0,
                     namespace_scope: vec!["Maestra.*".into(), "Mindbox.*".into()],
                     namespace_scope_enforcement: ScopeEnforcement::Enforce,
                     enabled: true,

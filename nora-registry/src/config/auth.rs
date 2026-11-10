@@ -599,6 +599,11 @@ pub struct OidcProvider {
     /// First match wins. No match = deny.
     #[serde(default)]
     pub role_rules: Vec<OidcRoleRule>,
+    /// Maestra: lifetime of a session token (`nrs_`) a valid JWT of this provider
+    /// is exchanged for at `POST /api/oidc/session`, in seconds. 0 (default) = no
+    /// sessions. At most 21600; the session keeps the JWT's role rules and scope.
+    #[serde(default)]
+    pub session_lifetime_secs: u64,
 }
 
 /// How a provider checks the `aud` claim of a token, read from `audience` and

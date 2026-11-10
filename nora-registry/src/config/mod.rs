@@ -1374,6 +1374,16 @@ impl Config {
                     )),
                     AudienceCheck::Expect(_) => {}
                 }
+                if provider.session_lifetime_secs
+                    > crate::auth::oidc_session::MAX_SESSION_LIFETIME_SECS
+                {
+                    errors.push(format!(
+                        "auth.oidc provider \"{}\" has session_lifetime_secs = {}, more than {}",
+                        provider.name,
+                        provider.session_lifetime_secs,
+                        crate::auth::oidc_session::MAX_SESSION_LIFETIME_SECS
+                    ));
+                }
             }
         }
 

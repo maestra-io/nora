@@ -11,6 +11,7 @@
 mod htpasswd;
 mod namespace;
 pub mod oidc;
+pub mod oidc_session;
 pub mod teleport;
 mod token_routes;
 
@@ -244,7 +245,8 @@ fn is_public_path(path: &str) -> bool {
     matches!(
         path,
         "/" | "/health" | "/ready" | "/api/tokens" | "/api/tokens/list" | "/api/tokens/revoke"
-    ) || is_static_asset(path)
+    ) || path == oidc_session::SESSION_ROUTE
+        || is_static_asset(path)
         || is_apk_public_key(path)
 }
 
@@ -402,7 +404,7 @@ async fn anonymous_read_passthrough(mut request: Request<Body>, next: Next) -> R
 #[derive(Clone)]
 struct AuthRejection {
     /// Bounded: wrong_password, token_invalid, malformed, basic_not_configured,
-    /// no_oidc, locked_out, or an OIDC class from `oidc::classify_rejection`.
+    /// no_oidc, locked_out, session_invalid, or an OIDC class from `oidc::classify_rejection`.
     reason: &'static str,
     /// Counted in `nora_auth_oidc_rejected_total` already.
     oidc: bool,
@@ -448,6 +450,8 @@ fn presented_credential(request: &Request<Body>) -> Option<(&'static str, Option
     if let Some(token) = auth.strip_prefix("Bearer ") {
         let kind = if token.trim().starts_with("nra_") {
             "bearer_nra"
+        } else if token.trim().starts_with("nrs_") {
+            "bearer_nrs"
         } else {
             "bearer_jwt"
         };
@@ -466,6 +470,8 @@ fn presented_credential(request: &Request<Body>) -> Option<(&'static str, Option
     };
     let kind = if password.starts_with("nra_") {
         "basic_nra"
+    } else if password.starts_with("nrs_") {
+        "basic_nrs"
     } else if password.starts_with("eyJ") && password.split('.').count() == 3 {
         "basic_jwt"
     } else {
@@ -831,6 +837,36 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
 
     // Try Bearer token first (opaque nra_ tokens, then OIDC JWT)
     if let Some(token) = auth_header.strip_prefix("Bearer ") {
+        // 0. Maestra: an OIDC session token (nrs_), never a JWT or an nra_ token.
+        if token.starts_with(oidc_session::SESSION_TOKEN_PREFIX) {
+            let verdict = match state.oidc.as_deref() {
+                Some(oidc) => oidc.verify_session(&state.storage, token).await,
+                None => Err(oidc_session::SessionError::Invalid),
+            };
+            return match verdict {
+                Ok(identity) => {
+                    admit_workload(
+                        identity,
+                        request,
+                        next,
+                        is_token_management,
+                        is_npm_audit,
+                        is_admin,
+                    )
+                    .await
+                }
+                Err(oidc_session::SessionError::Storage(e)) => {
+                    tracing::error!(error = %e, "session store read failed during Bearer auth");
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Token verification unavailable",
+                    )
+                        .into_response()
+                }
+                Err(oidc_session::SessionError::Invalid) => AuthRejection::new("session_invalid")
+                    .on(unauthorized_response("Invalid or expired token", realm)),
+            };
+        }
         // 1. Try opaque token (nra_ prefix)
         if let Some(ref token_store) = state.tokens {
             match token_store.verify_token(token).await {
@@ -886,58 +922,15 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
                             role = ?identity.role,
                             "OIDC authentication successful"
                         );
-                        // Maestra (R2-01): a workload identity (short-lived, namespace-
-                        // scoped CI JWT) must not exchange itself for a long-lived,
-                        // unscoped nra_ token; token management is for people only.
-                        if is_token_management {
-                            return (
-                                StatusCode::FORBIDDEN,
-                                "Workload identities cannot manage API tokens",
-                            )
-                                .into_response();
-                        }
-                        if is_write_method(request.method())
-                            && !is_npm_audit
-                            && !identity.role.can_write()
-                        {
-                            return (StatusCode::FORBIDDEN, "Read-only OIDC identity")
-                                .into_response();
-                        }
-                        if is_admin && !identity.role.can_admin() {
-                            return (StatusCode::FORBIDDEN, "Admin role required").into_response();
-                        }
-                        // Carry the namespace scopes into the request so write
-                        // handlers can enforce them on the artifact coordinate
-                        // (#583). Provider scope and rule scope are a conjunction:
-                        // the provider scope is a ceiling a rule cannot widen.
-                        let authority = NamespaceAuthority::from_oidc_scopes(
-                            &identity.provider,
-                            std::iter::once(identity.namespace_scope.as_slice())
-                                .chain(identity.rule_namespace_scope.as_deref()),
-                            identity.namespace_scope_enforcement,
-                        );
-                        request.extensions_mut().insert(authority);
-                        // Carry the provider's lifetime ceiling so a token minted
-                        // by this identity cannot outlive it (#1094). Taken from
-                        // the identity — i.e. the provider that actually validated
-                        // this JWT — never re-looked-up by name, since provider
-                        // names are not unique (#1094 N2).
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        request.extensions_mut().insert(MintLifetimeCeiling(
-                            identity
-                                .max_token_lifetime_secs
-                                .min(identity.expires_at.saturating_sub(now)),
-                        ));
-                        request
-                            .extensions_mut()
-                            .insert(AuthenticatedUser(identity.subject.clone()));
-                        request
-                            .extensions_mut()
-                            .insert(AuthenticatedRole(identity.role));
-                        return next.run(request).await;
+                        return admit_workload(
+                            identity,
+                            request,
+                            next,
+                            is_token_management,
+                            is_npm_audit,
+                            is_admin,
+                        )
+                        .await;
                     }
                     Err(reason) => {
                         // #994 — surface *why* OIDC rejected the token: a bounded
@@ -1299,6 +1292,66 @@ pub(crate) fn too_many_failed_attempts(retry_after: u64) -> Response {
         .into_response()
 }
 
+/// Admit a workload identity, an OIDC JWT or a session exchanged for one
+/// (auth/oidc_session.rs), with its role, namespace scope and lifetime ceiling.
+async fn admit_workload(
+    identity: oidc::OidcIdentity,
+    mut request: Request<Body>,
+    next: Next,
+    is_token_management: bool,
+    is_npm_audit: bool,
+    is_admin: bool,
+) -> Response {
+    // Maestra (R2-01): a workload identity (short-lived, namespace-
+    // scoped CI JWT) must not exchange itself for a long-lived,
+    // unscoped nra_ token; token management is for people only.
+    if is_token_management {
+        return (
+            StatusCode::FORBIDDEN,
+            "Workload identities cannot manage API tokens",
+        )
+            .into_response();
+    }
+    if is_write_method(request.method()) && !is_npm_audit && !identity.role.can_write() {
+        return (StatusCode::FORBIDDEN, "Read-only OIDC identity").into_response();
+    }
+    if is_admin && !identity.role.can_admin() {
+        return (StatusCode::FORBIDDEN, "Admin role required").into_response();
+    }
+    // Carry the namespace scopes into the request so write
+    // handlers can enforce them on the artifact coordinate
+    // (#583). Provider scope and rule scope are a conjunction:
+    // the provider scope is a ceiling a rule cannot widen.
+    let authority = NamespaceAuthority::from_oidc_scopes(
+        &identity.provider,
+        std::iter::once(identity.namespace_scope.as_slice())
+            .chain(identity.rule_namespace_scope.as_deref()),
+        identity.namespace_scope_enforcement,
+    );
+    request.extensions_mut().insert(authority);
+    // Carry the provider's lifetime ceiling so a token minted
+    // by this identity cannot outlive it (#1094). Taken from
+    // the identity — i.e. the provider that actually validated
+    // this JWT — never re-looked-up by name, since provider
+    // names are not unique (#1094 N2).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    request.extensions_mut().insert(MintLifetimeCeiling(
+        identity
+            .max_token_lifetime_secs
+            .min(identity.expires_at.saturating_sub(now)),
+    ));
+    request
+        .extensions_mut()
+        .insert(AuthenticatedUser(identity.subject.clone()));
+    request
+        .extensions_mut()
+        .insert(AuthenticatedRole(identity.role));
+    next.run(request).await
+}
+
 /// The methods a read-only identity may not use: exactly PUT, POST, DELETE and
 /// PATCH. Every other method is a read — HEAD included, which is how
 /// `docker pull` starts.
@@ -1306,7 +1359,8 @@ fn is_write_method(method: &Method) -> bool {
     [Method::PUT, Method::POST, Method::DELETE, Method::PATCH].contains(method)
 }
 
-/// `Authorization: Basic` whose password is an `nra_` API token or a JWT (three
+/// `Authorization: Basic` whose password is an `nra_` API token, an `nrs_` OIDC
+/// session or a JWT (three
 /// dot-separated segments, JSON header), rewritten as `Bearer <password>`. Any other
 /// Basic credential (an htpasswd password) is left alone.
 fn basic_token_as_bearer(headers: &HeaderMap, nra: bool) -> Option<axum::http::HeaderValue> {
@@ -1318,7 +1372,8 @@ fn basic_token_as_bearer(headers: &HeaderMap, nra: bool) -> Option<axum::http::H
     let decoded = String::from_utf8(STANDARD.decode(encoded.trim()).ok()?).ok()?;
     let (_, password) = decoded.split_once(':')?;
     let is_jwt = password.starts_with("eyJ") && password.split('.').count() == 3;
-    if !((nra && password.starts_with("nra_")) || is_jwt) {
+    let opaque = password.starts_with("nra_") || password.starts_with("nrs_");
+    if !((nra && opaque) || is_jwt) {
         return None;
     }
     axum::http::HeaderValue::from_str(&format!("Bearer {password}")).ok()
@@ -4386,6 +4441,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
                     any_audience: false,
                     algorithms: vec!["RS256".to_string()],
                     max_token_lifetime_secs: 900,
+                    session_lifetime_secs: 0,
                     namespace_scope: provider_scope.clone(),
                     namespace_scope_enforcement: crate::config::ScopeEnforcement::Enforce,
                     enabled: true,
@@ -4500,6 +4556,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         let public_routes = Router::new().merge(crate::health::routes());
         let app_routes = Router::new()
             .merge(crate::auth::token_routes())
+            .merge(crate::auth::oidc_session::routes())
             .merge(crate::ui::routes())
             .merge(crate::admin::routes())
             .merge(registry_routes);
@@ -5696,6 +5753,236 @@ Jd74nq6dNCjpWG4drIsyhqX+
 
     /// R2-01: a workload identity (CI OIDC JWT, 15-min, namespace-scoped) must not
     /// exchange itself for a long-lived, unscoped nra_ token, nor list/revoke tokens.
+    async fn jwks_server() -> MockServer {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+        mock_server
+    }
+
+    fn basic_with(secret: &str) -> String {
+        format!(
+            "Basic {}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                format!("x:{secret}")
+            )
+        )
+    }
+
+    /// POST the OIDC session exchange with `auth`: the status and the JSON answer.
+    async fn exchange(ctx: &TestContext, auth: &str) -> (StatusCode, serde_json::Value) {
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            crate::auth::oidc_session::SESSION_ROUTE,
+            vec![("authorization", auth)],
+            "",
+        )
+        .await;
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// A session for `subject` from a JWT that has 30 s left.
+    async fn session_for(ctx: &TestContext, issuer: &str, subject: &str) -> String {
+        let now = now_secs();
+        let jwt = make_jwt(issuer, subject, "nora", now - 270, now + 30);
+        let (status, body) = exchange(ctx, &format!("Bearer {jwt}")).await;
+        assert_eq!(status, StatusCode::OK, "exchange for {subject}: {body}");
+        let expires_in = body["expires_in"].as_u64().unwrap();
+        assert!(
+            (3590..=3600).contains(&expires_in),
+            "expires_in={expires_in}"
+        );
+        body["token"].as_str().unwrap().to_string()
+    }
+
+    fn session_context(issuer: &str) -> TestContext {
+        create_oidc_test_context_tweaked(issuer, |p| p.session_lifetime_secs = 3600)
+    }
+
+    /// #1649: a session lives the provider's session lifetime, not the JWT's, and
+    /// carries the JWT's grant: role, rule scope, read-only, over Bearer and Basic.
+    #[tokio::test]
+    async fn an_oidc_session_outlives_its_jwt_with_the_jwt_grant() {
+        let mock_server = jwks_server().await;
+        let issuer = mock_server.uri();
+        let ctx = session_context(&issuer);
+
+        let main = session_for(&ctx, &issuer, "repo:myorg/app:ref:refs/heads/main").await;
+        assert!(main.starts_with("nrs_"));
+        for auth in [format!("Bearer {main}"), basic_with(&main)] {
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::PUT,
+                "/raw/session/a.txt",
+                vec![("authorization", &auth)],
+                b"from a session".to_vec(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "write via {auth:.6}");
+        }
+
+        let pr = session_for(&ctx, &issuer, "repo:myorg/app:pull_request").await;
+        let bearer = format!("Bearer {pr}");
+        for (uri, want) in [
+            ("/raw/ci-transport/run-1/a.txt", StatusCode::OK),
+            ("/raw/prod/a.txt", StatusCode::FORBIDDEN),
+        ] {
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::PUT,
+                uri,
+                vec![("authorization", &bearer)],
+                b"x".to_vec(),
+            )
+            .await;
+            assert_eq!(resp.status(), want, "pull_request session PUT {uri}");
+        }
+
+        // A read-only identity exchanges too, and its session only reads.
+        let dev = session_for(&ctx, &issuer, "repo:myorg/app:ref:refs/heads/dev").await;
+        let bearer = format!("Bearer {dev}");
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/session/b.txt",
+            vec![("authorization", &bearer)],
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/session/a.txt",
+            vec![("authorization", &bearer)],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A session never buys another session or an API token, and a forged or
+    /// expired one is a 401.
+    #[tokio::test]
+    async fn a_session_mints_nothing_and_a_forged_one_is_refused() {
+        let mock_server = jwks_server().await;
+        let issuer = mock_server.uri();
+        let ctx = session_context(&issuer);
+        let session = session_for(&ctx, &issuer, "repo:myorg/app:ref:refs/heads/main").await;
+
+        for auth in [format!("Bearer {session}"), basic_with(&session)] {
+            let (status, _) = exchange(&ctx, &auth).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "re-exchange via {auth:.6}");
+            let resp = super::integration_tests::ui_create_token(&ctx, &auth, "write").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "mint via {auth:.6}");
+        }
+
+        let secret = "0".repeat(64);
+        let far = now_secs() + 3000;
+        let (expires_at, _) = session
+            .strip_prefix("nrs_")
+            .unwrap()
+            .split_once('_')
+            .unwrap();
+        let moved = session.replacen(expires_at, &far.to_string(), 1);
+        for forged in [
+            format!("nrs_{far}_{secret}"),
+            format!("nrs_1_{secret}"),
+            moved,
+        ] {
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/raw/session/a.txt",
+                vec![("authorization", &format!("Bearer {forged}"))],
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{forged:.20}");
+        }
+    }
+
+    /// No `session_lifetime_secs`: the provider grants no session, and a session
+    /// minted while it did stops working once its config no longer grants one.
+    #[tokio::test]
+    async fn a_provider_without_a_session_lifetime_grants_none() {
+        let mock_server = jwks_server().await;
+        let issuer = mock_server.uri();
+        let ctx = create_oidc_test_context(&issuer);
+        let now = now_secs();
+        let jwt = make_jwt(
+            &issuer,
+            "repo:myorg/app:ref:refs/heads/main",
+            "nora",
+            now,
+            now + 300,
+        );
+        let (status, _) = exchange(&ctx, &format!("Bearer {jwt}")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // A session minted while the provider granted sessions is refused once its
+        // config grants none: the grant is read from the config at every request.
+        let granting = session_context(&issuer);
+        let granting = granting.state.oidc.clone().unwrap();
+        let identity = granting.validate_token(&jwt).await.unwrap();
+        let (session, _) = granting
+            .mint_session(&ctx.state.storage, &identity)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(granting
+            .verify_session(&ctx.state.storage, &session)
+            .await
+            .is_ok());
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/anything.txt",
+            vec![("authorization", &format!("Bearer {session}"))],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The sweep deletes expired session records and leaves live ones.
+    #[tokio::test]
+    async fn the_sweep_deletes_only_expired_sessions() {
+        let mock_server = jwks_server().await;
+        let issuer = mock_server.uri();
+        let ctx = session_context(&issuer);
+        let session = session_for(&ctx, &issuer, "repo:myorg/app:ref:refs/heads/main").await;
+        let expired = ".nora-oidc-sessions/1-00.json";
+        ctx.state.storage.put(expired, b"{}").await.unwrap();
+
+        let oidc = ctx.state.oidc.clone().unwrap();
+        assert_eq!(oidc.sweep_sessions(&ctx.state.storage).await, 1);
+        assert!(ctx.state.storage.get(expired).await.is_err());
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/session/c.txt",
+            vec![("authorization", &format!("Bearer {session}"))],
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn test_oidc_identity_cannot_manage_api_tokens() {
         let mock_server = MockServer::start().await;
