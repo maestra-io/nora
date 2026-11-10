@@ -85,6 +85,11 @@ fn token_expiry(token: &str) -> Option<u64> {
         .flatten()
 }
 
+/// Whether `token` has a session token's shape (`nrs_<expires_at>_<64 hex>`).
+pub fn is_session_token(token: &str) -> bool {
+    token_expiry(token).is_some()
+}
+
 fn digest(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }

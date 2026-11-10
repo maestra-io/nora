@@ -1372,8 +1372,10 @@ fn basic_token_as_bearer(headers: &HeaderMap, nra: bool) -> Option<axum::http::H
     let decoded = String::from_utf8(STANDARD.decode(encoded.trim()).ok()?).ok()?;
     let (_, password) = decoded.split_once(':')?;
     let is_jwt = password.starts_with("eyJ") && password.split('.').count() == 3;
-    let opaque = password.starts_with("nra_") || password.starts_with("nrs_");
-    if !((nra && opaque) || is_jwt) {
+    // A session token has a fixed shape no htpasswd password takes by chance, so it
+    // is a token on every peer, like a JWT (an `nra_` one only with the shortcut).
+    let is_session = oidc_session::is_session_token(password);
+    if !((nra && password.starts_with("nra_")) || is_session || is_jwt) {
         return None;
     }
     axum::http::HeaderValue::from_str(&format!("Bearer {password}")).ok()
@@ -1409,6 +1411,23 @@ fn unauthorized_response(message: &str, realm: &str) -> Response {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A Basic `nrs_` session password is a Bearer credential on every peer, an
+    /// htpasswd one included; an `nra_` one only with the shortcut.
+    #[test]
+    fn a_basic_session_password_is_always_a_bearer() {
+        let basic = |password: &str| {
+            let mut headers = HeaderMap::new();
+            let value = format!("Basic {}", STANDARD.encode(format!("ci:{password}")));
+            headers.insert(header::AUTHORIZATION, value.parse().unwrap());
+            headers
+        };
+        let session = format!("nrs_1700000000_{}", "a".repeat(64));
+        let bearer = basic_token_as_bearer(&basic(&session), false).unwrap();
+        assert_eq!(bearer.to_str().unwrap(), format!("Bearer {session}"));
+        assert!(basic_token_as_bearer(&basic("nra_x"), false).is_none());
+        assert!(basic_token_as_bearer(&basic("nrs_password"), false).is_none());
+    }
 
     /// #1094: an OIDC caller's lifetime ceiling caps the minted token; a
     /// caller with no ceiling (Basic/opaque) is unchanged.
