@@ -114,7 +114,7 @@ struct OidcDiscoveryDoc {
 
 /// OIDC validator — thread-safe, holds cached JWKS per issuer.
 pub struct OidcValidator {
-    config: OidcConfig,
+    pub(super) config: OidcConfig,
     http_client: Client,
     /// issuer URL → cached JWKS
     jwks_cache: RwLock<HashMap<String, CachedJwks>>,
@@ -127,6 +127,8 @@ pub struct OidcValidator {
     /// unreachable issuer never blocks refreshes for a healthy one. Bounded by the number of
     /// configured issuers; each wait is bounded by the discovery + fetch timeouts.
     issuer_refresh_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Maestra: verified OIDC session records (auth/oidc_session.rs).
+    pub(super) sessions: super::oidc_session::SessionCache,
 }
 
 /// Per-request timeout for OIDC HTTP calls (discovery + JWKS fetch).
@@ -201,6 +203,7 @@ impl OidcValidator {
             discovered_jwks_uri: RwLock::new(HashMap::new()),
             jwks_failed_at: RwLock::new(HashMap::new()),
             issuer_refresh_locks: RwLock::new(HashMap::new()),
+            sessions: Default::default(),
         }
     }
 
@@ -525,7 +528,7 @@ impl OidcValidator {
 
     /// Match subject against provider's role_rules. First match wins.
     /// Returns the role plus the rule's namespace-scope override, if any.
-    fn match_role(
+    pub(super) fn match_role(
         &self,
         provider: &OidcProvider,
         subject: &str,
@@ -752,6 +755,7 @@ mod tests {
             any_audience: false,
             algorithms: vec!["RS256".to_string()],
             max_token_lifetime_secs: 900,
+            session_lifetime_secs: 0,
             namespace_scope: vec!["*".to_string()],
             namespace_scope_enforcement: crate::config::ScopeEnforcement::Enforce,
             enabled: true,
@@ -834,6 +838,7 @@ mod tests {
                 any_audience: false,
                 algorithms: vec!["RS256".to_string()],
                 max_token_lifetime_secs: 900,
+                session_lifetime_secs: 0,
                 namespace_scope: vec!["*".to_string()],
                 namespace_scope_enforcement: crate::config::ScopeEnforcement::Enforce,
                 enabled: true,
@@ -905,6 +910,7 @@ mod tests {
                 any_audience: false,
                 algorithms: vec!["RS256".to_string()],
                 max_token_lifetime_secs: 900,
+                session_lifetime_secs: 0,
                 namespace_scope: vec!["*".to_string()],
                 namespace_scope_enforcement: crate::config::ScopeEnforcement::Enforce,
                 enabled: true,
@@ -955,6 +961,7 @@ mod tests {
             any_audience: false,
             algorithms: vec!["RS256".to_string()],
             max_token_lifetime_secs: 99_999_999,
+            session_lifetime_secs: 0,
             namespace_scope: vec!["*".to_string()],
             namespace_scope_enforcement: crate::config::ScopeEnforcement::Enforce,
             enabled: false,

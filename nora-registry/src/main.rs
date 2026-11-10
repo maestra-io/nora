@@ -3692,7 +3692,9 @@ async fn run_server(mut config: Config, storage: Storage) {
     ui::components::set_enabled_registries(enabled_registries.clone());
 
     // Registry routes — only merge enabled registries
-    let registry_routes = registry_routes(&enabled_registries);
+    // Maestra: the OIDC session exchange rides the registry tier (the upload limiter on
+    // POST), not the 1 rps auth tier: every CI job behind one egress address calls it.
+    let registry_routes = registry_routes(&enabled_registries).merge(auth::oidc_session::routes());
 
     // Routes WITHOUT rate limiting (health, metrics, UI)
     let public_routes = Router::new()
@@ -4290,6 +4292,8 @@ fn spawn_maintenance(
 struct MaintenanceWork {
     /// Token `last_used` to disk; its file rewrites must not be cut halfway.
     token_flush: supervise::Detached,
+    /// Maestra: expired OIDC session records deleted (auth/oidc_session.rs).
+    session_sweep: supervise::Detached,
     /// The store's size and the per-registry gauges: a whole listing, as long as it takes.
     storage_size: supervise::Detached,
     /// Keyed rate-limiter state, pruned of idle clients every tick (Maestra fork).
@@ -4303,6 +4307,7 @@ impl MaintenanceWork {
     fn new(tasks: &supervise::Supervisor, limiters: Vec<rate_limit::RateLimiterState>) -> Self {
         Self {
             token_flush: tasks.detached("token_flush"),
+            session_sweep: tasks.detached("oidc_session_sweep"),
             storage_size: tasks.detached("storage_size"),
             limiters,
             size_due: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -4434,6 +4439,12 @@ async fn maintenance_tick(state: &AppState, tick_count: u64, work: &MaintenanceW
     // Every 5 minutes (tick_count % 10 == 0): evict unused publish locks
     // + clean up stale proxy and upload temp files (#580)
     if tick_count.is_multiple_of(10) {
+        if let Some(oidc) = state.oidc.clone() {
+            let storage = state.storage.clone();
+            work.session_sweep.start(async move {
+                oidc.sweep_sessions(&storage).await;
+            });
+        }
         let mut locks = state.publish_locks.lock();
         locks.retain(|_, arc| Arc::strong_count(arc) > 1);
         let storage_path = state.config.storage.path.clone();
