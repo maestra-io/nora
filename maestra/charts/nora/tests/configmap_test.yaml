@@ -278,6 +278,27 @@ tests:
           path: data["config.toml"]
           pattern: 'jwks_uri = "https://auth\.internal\.corp/keys/jwks\.json"'
 
+  - it: renders an OIDC provider's session lifetime only when set
+    set:
+      config.auth.enabled: true
+      config.auth.oidc.enabled: true
+      config.auth.oidc.providers:
+        - name: github-actions
+          issuer: https://token.actions.githubusercontent.com
+          session_lifetime_secs: 3600
+        - name: other
+          issuer: https://auth.internal.corp
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'name = "github-actions"\n(.*\n)*?session_lifetime_secs = 3600\n'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'session_lifetime_secs = 3600\n'
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'name = "other"\n(.*\n)*?session_lifetime_secs'
+
   - it: renders custom htpasswd secret mount path
     set:
       config.auth.enabled: true

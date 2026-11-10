@@ -156,6 +156,9 @@ data:
     {{- if hasKey . "max_token_lifetime_secs" }}
     max_token_lifetime_secs = {{ .max_token_lifetime_secs }}
     {{- end }}
+    {{- if hasKey . "session_lifetime_secs" }}
+    session_lifetime_secs = {{ .session_lifetime_secs }}
+    {{- end }}
     {{- /* `default true` would turn an explicit false into true */}}
     enabled = {{ ternary .enabled true (hasKey . "enabled") }}
     {{- with .jwks_uri }}

@@ -201,7 +201,7 @@ config:
 | `config.auth.oidc.jwks_cache_secs` | JWKS cache TTL (seconds) | `300` |
 | `config.auth.oidc.providers` | OIDC provider list | `[]` |
 
-Per provider: `name`, `issuer`, `audience`, `algorithms`, `max_token_lifetime_secs`, `enabled`, optional `jwks_uri`, `namespace_scope`, `namespace_scope_enforcement` (`enforce` | `audit`), and `role_rules` (`pattern`, `role`, optional `namespace_scope` that narrows the provider scope).
+Per provider: `name`, `issuer`, `audience`, `algorithms`, `max_token_lifetime_secs`, `session_lifetime_secs` (lifetime of the `nrs_` token `POST /api/oidc/session` trades a JWT for; 0 or unset = no sessions, max 21600), `enabled`, optional `jwks_uri`, `namespace_scope`, `namespace_scope_enforcement` (`enforce` | `audit`), and `role_rules` (`pattern`, `role`, optional `namespace_scope` that narrows the provider scope).
 
 Without `namespace_scope` (nora's default `["*"]`) every identity a `write` rule matches can publish any package:
 
