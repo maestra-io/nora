@@ -292,7 +292,10 @@ async fn denied_reason(mut response: reqwest::Response) -> Option<String> {
     let mut body = Vec::new();
     while body.len() < 4096 {
         match response.chunk().await {
-            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(Some(chunk)) => {
+                let room = 4096 - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
             _ => break,
         }
     }
@@ -2345,11 +2348,14 @@ pub(crate) async fn proxy_fetch_conditional(
                     observe("4xx", started);
                     // 4xx — upstream alive; recover the breaker without clearing a
                     // real failure tally, consistent with proxy_fetch_core (#606).
-                    let err = upstream_4xx(code, response.headers());
+                    let mut err = upstream_4xx(code, response.headers());
                     if matches!(err, ProxyError::RateLimited(_)) {
                         cb.record_failure(&cb_key, probe);
                     } else {
                         cb.record_alive(&cb_key, probe);
+                    }
+                    if let ProxyError::Denied(_, reason) = &mut err {
+                        *reason = denied_reason(response).await;
                     }
                     return Err(err);
                 }
@@ -3184,6 +3190,54 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(body, ProxyBody::Mem(ref b) if &b[..] == b"small"));
+    }
+
+    /// A refused revalidation carries the upstream's reason like a plain fetch, and a
+    /// refusal body is read only up to 4 KiB, however large its chunks.
+    #[tokio::test]
+    async fn conditional_denied_carries_its_reason() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(path("/forbidden"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(
+                serde_json::json!({"message": "IP not allowed", "documentation_url": "https://d"}),
+            ))
+            .mount(&upstream)
+            .await;
+        let huge = format!("{{\"message\": \"{}\"}}", "x".repeat(1 << 20));
+        Mock::given(path("/huge"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(huge))
+            .mount(&upstream)
+            .await;
+        let cb = noop_cb();
+        let fetch = |p: &'static str| {
+            let url = format!("{}{p}", upstream.uri());
+            let cb = &cb;
+            async move {
+                proxy_fetch_conditional(
+                    &reqwest::Client::new(),
+                    &url,
+                    Duration::from_secs(5),
+                    None,
+                    &Validators::default(),
+                    cb,
+                    RegistryType::Npm,
+                )
+                .await
+            }
+        };
+        match fetch("/forbidden").await {
+            Err(ProxyError::Denied(403, Some(r))) => assert_eq!(r, "IP not allowed (https://d)"),
+            Err(other) => panic!("{other:?}"),
+            Ok(_) => panic!("a 403 revalidated"),
+        }
+        // Cut at 4 KiB the JSON no longer parses: no reason, and no 1 MiB buffer.
+        assert!(matches!(
+            fetch("/huge").await,
+            Err(ProxyError::Denied(403, None))
+        ));
     }
 
     /// With no stored validators, the conditional fetch sends no `If-None-Match`,
