@@ -128,6 +128,8 @@ where
 /// fails the walk instead of holding it for STREAM_ATTEMPT_TIMEOUT. A read body is
 /// bounded the same way: the clock runs only while the consumer waits for the next
 /// chunk, so a slow download client (backpressure) never trips it, a stalled store does.
+/// Fused: `object_store::collect_bytes` polls twice, and an empty S3 object's body ends
+/// at the first poll; a bare `unfold` panics when it is polled again (a 500 on go).
 fn idle_bounded<T: Send + 'static>(
     stream: futures::stream::BoxStream<'static, object_store::Result<T>>,
     idle: std::time::Duration,
@@ -147,6 +149,7 @@ fn idle_bounded<T: Send + 'static>(
             )),
         }
     })
+    .fuse()
     .boxed()
 }
 
@@ -1798,6 +1801,20 @@ mod tests {
         assert_eq!(start.elapsed(), idle);
         assert!(matches!(map_err(err), StorageError::Network(_)));
         assert!(stalled.next().await.is_none(), "a cut-off body ends");
+    }
+
+    /// An empty object's body (S3/R2 send no chunk at all) read the way `get` reads it:
+    /// `collect_bytes` polls the ended stream a second time. Unfused, that panicked
+    /// (`Unfold must not be polled after it returned Poll::Ready(None)`), a 500 on every
+    /// cached empty file, e.g. a go `@v/list` with no versions.
+    #[tokio::test]
+    async fn an_empty_body_reads_as_empty() {
+        use futures::StreamExt;
+        let empty = futures::stream::empty::<object_store::Result<Bytes>>().boxed();
+        let body = object_store::collect_bytes(idle_bounded(empty, GET_BODY_IDLE), Some(0))
+            .await
+            .unwrap();
+        assert!(body.is_empty());
     }
 }
 
