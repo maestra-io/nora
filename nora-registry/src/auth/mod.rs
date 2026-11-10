@@ -5916,6 +5916,24 @@ Jd74nq6dNCjpWG4drIsyhqX+
         }
     }
 
+    /// A JWT past its exp but inside the validation leeway buys no session.
+    #[tokio::test]
+    async fn an_expired_jwt_buys_no_session() {
+        let mock_server = jwks_server().await;
+        let issuer = mock_server.uri();
+        let ctx = session_context(&issuer);
+        let now = now_secs();
+        let jwt = make_jwt(
+            &issuer,
+            "repo:myorg/app:ref:refs/heads/main",
+            "nora",
+            now - 300,
+            now - 10,
+        );
+        let (status, _) = exchange(&ctx, &format!("Bearer {jwt}")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
     /// No `session_lifetime_secs`: the provider grants no session, and a session
     /// minted while it did stops working once its config no longer grants one.
     #[tokio::test]

@@ -9,9 +9,9 @@
 //! `nrs_` token that lives the provider's `session_lifetime_secs`.
 //!
 //! A session keeps the JWT's identity, not a copy of its grant: every request
-//! re-resolves the provider and its role rules from the current config, so a
-//! disabled provider or a removed rule ends its sessions at once, and the
-//! namespace scope is the JWT's. A session cannot mint a session, and token
+//! re-resolves the provider and its role rules from the running config, so the
+//! namespace scope is the JWT's, and a disabled provider or a removed rule ends
+//! its sessions when nora restarts with it (OIDC config is not reloaded on SIGHUP). A session cannot mint a session, and token
 //! management stays refused, as for the JWT (R2-01).
 //!
 //! Records are immutable and written with `put_if_absent`, so replicas share
@@ -250,6 +250,11 @@ async fn exchange(State(state): State<AppState>, headers: HeaderMap) -> Response
             return (StatusCode::UNAUTHORIZED, "Invalid or expired token").into_response();
         }
     };
+    // `validate_token` admits a JWT up to `leeway_secs` past its exp; one that has
+    // expired buys no session, as it mints no token (#1094).
+    if identity.expires_at <= now() {
+        return (StatusCode::FORBIDDEN, "The OIDC token has already expired").into_response();
+    }
     match oidc.mint_session(&state.storage, &identity).await {
         Ok(Some((token, expires_at))) => {
             let expires_in = expires_at.saturating_sub(now());
