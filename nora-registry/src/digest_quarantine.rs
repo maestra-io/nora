@@ -456,8 +456,10 @@ pub fn resolve_global(mode: Option<&QuarantineMode>, ttl: Option<&str>) -> (Quar
 /// Records the artifact's content digest as first-seen, then checks maturity.
 /// Returns `Some(403)` to BLOCK (enforce mode, not yet mature), `None` to serve.
 /// In observe mode it logs but never blocks. Idempotent: `record` preserves the
-/// earliest `first_seen`, so calling this on every request (proxy fetch or cache
-/// hit) is safe and the quarantine clock does not reset.
+/// earliest `first_seen`, so calling this on every request is safe while the record
+/// lives. A record is pruned 90 days after its first sight ([`PRUNE_TTL_SECS`]): a cache
+/// hit goes through [`cache_gate_digest`], which does not restart the clock of a copy
+/// cached for longer than that.
 #[must_use = "the returned response blocks a quarantined artifact; dropping it serves the artifact"]
 pub fn proxy_gate(
     store: &DigestStore,
@@ -567,6 +569,62 @@ pub fn proxy_gate_digest(
     } else {
         None
     }
+}
+
+/// [`proxy_gate_digest`] for a cache hit on the object at `key`: the same gate, except
+/// that a digest with no record whose copy NORA wrote more than [`PRUNE_TTL_SECS`] ago is
+/// first seen then, not now ([`cached_first_seen`]). The ledger forgets a digest 90 days
+/// after its first sight, and without this every package cached for longer was held for a
+/// new TTL after each restart (R4-C05).
+#[must_use = "the returned response blocks a quarantined artifact; dropping it serves the artifact"]
+#[allow(clippy::too_many_arguments)]
+pub async fn cache_gate_digest(
+    store: &DigestStore,
+    storage: &Storage,
+    key: &str,
+    registry: &str,
+    digest: &str,
+    mode: &QuarantineMode,
+    quarantine_secs: i64,
+    trusted_first_seen: Option<i64>,
+) -> Option<Response> {
+    if matches!(mode, QuarantineMode::Off) {
+        return None;
+    }
+    let first_seen = match trusted_first_seen {
+        Some(date) => Some(date),
+        None => cached_first_seen(store, storage, key, registry, digest).await,
+    };
+    proxy_gate_digest(
+        store,
+        registry,
+        digest,
+        mode,
+        quarantine_secs,
+        "cache",
+        first_seen,
+    )
+}
+
+/// The first-seen of a cached digest whose record the ledger no longer holds: when NORA
+/// wrote the object at `key`, if that is past the prune line. `None` when the digest has a
+/// record (it keeps its date), the object cannot be stat'ed, or it was written within
+/// [`PRUNE_TTL_SECS`]: inside the ledger's memory a missing record means the quarantine
+/// never saw these bytes, and they count from now. The write time is NORA's own clock on
+/// the artifact itself (not a listing's age, not an upstream date), and a copy that old
+/// did not arrive fresh from the upstream.
+pub async fn cached_first_seen(
+    store: &DigestStore,
+    storage: &Storage,
+    key: &str,
+    registry: &str,
+    digest: &str,
+) -> Option<i64> {
+    if !matches!(store.check(registry, digest, 0), QuarantineStatus::New) {
+        return None;
+    }
+    let written = i64::try_from(storage.stat(key).await?.modified).ok()?;
+    (written < Utc::now().timestamp() - PRUNE_TTL_SECS).then_some(written)
 }
 
 /// Build a generic 403 for a quarantined proxy artifact (non-Docker shape).
@@ -1369,6 +1427,101 @@ mod tests {
             store.check("docker", "sha256:old", 86400),
             QuarantineStatus::New
         );
+    }
+
+    /// Write `key` and move its write time `days` back.
+    async fn cached_days_ago(tmp: &TempDir, key: &str, days: u64) {
+        storage(tmp).put(key, b"artifact").await.unwrap();
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86400);
+        std::fs::File::options()
+            .write(true)
+            .open(tmp.path().join(key))
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+    }
+
+    async fn cache_gate(store: &DigestStore, tmp: &TempDir, key: &str, digest: &str) -> bool {
+        let mode = QuarantineMode::Enforce;
+        cache_gate_digest(
+            store,
+            &storage(tmp),
+            key,
+            "nuget",
+            digest,
+            &mode,
+            14 * 86400,
+            None,
+        )
+        .await
+        .is_some()
+    }
+
+    /// R4-C05: the ledger forgets a digest 90 days after its first sight. A copy cached for
+    /// longer is not first seen again at the next cache hit: its clock is the day NORA
+    /// wrote it, so it is served, on this start and after the next one.
+    #[tokio::test]
+    async fn a_copy_cached_past_the_prune_line_is_not_held_again() {
+        let tmp = TempDir::new().unwrap();
+        cached_days_ago(&tmp, "nuget/old.nupkg", 100).await;
+        for _restart in 0..2 {
+            let store = DigestStore::load(storage(&tmp), "/nonexistent").await;
+            assert_eq!(
+                store.check("nuget", "sha256:old", 14 * 86400),
+                QuarantineStatus::New
+            );
+            assert!(!cache_gate(&store, &tmp, "nuget/old.nupkg", "sha256:old").await);
+            assert_eq!(
+                store.check("nuget", "sha256:old", 14 * 86400),
+                QuarantineStatus::Mature
+            );
+        }
+        // A date past the prune line is never written: nothing for the next start to prune.
+        assert!(storage(&tmp)
+            .stat(".nora-quarantine/nuget/sha256:old")
+            .await
+            .is_none());
+    }
+
+    /// The other direction: what the quarantine holds stays held on a cache hit. Bytes that
+    /// arrived from the upstream now are recorded now, whatever the age of the object the
+    /// cache hit names; and a copy with no record inside the ledger's memory (cached before
+    /// the quarantine saw it) counts from now, not from its write time.
+    #[tokio::test]
+    async fn a_cache_hit_does_not_mature_what_the_quarantine_holds() {
+        let tmp = TempDir::new().unwrap();
+        let store = DigestStore::empty(storage(&tmp));
+        let mode = QuarantineMode::Enforce;
+
+        cached_days_ago(&tmp, "nuget/fresh.nupkg", 100).await;
+        let fetched = proxy_gate_digest(
+            &store,
+            "nuget",
+            "sha256:fresh",
+            &mode,
+            14 * 86400,
+            "https://upstream.example",
+            None,
+        );
+        assert!(fetched.is_some(), "first fetched now: held");
+        assert!(
+            cache_gate(&store, &tmp, "nuget/fresh.nupkg", "sha256:fresh").await,
+            "its record keeps its date: the object's age does not replace it"
+        );
+
+        cached_days_ago(&tmp, "nuget/unseen.nupkg", 30).await;
+        assert!(
+            cache_gate(&store, &tmp, "nuget/unseen.nupkg", "sha256:unseen").await,
+            "no record within the ledger's 90 days: counted from now"
+        );
+        assert!(
+            cache_gate(&store, &tmp, "nuget/missing.nupkg", "sha256:missing").await,
+            "no object to date it by: counted from now"
+        );
+        assert!(matches!(
+            store.check("nuget", "sha256:unseen", 14 * 86400),
+            QuarantineStatus::Pending { .. }
+        ));
     }
 
     #[test]

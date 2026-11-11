@@ -947,18 +947,25 @@ async fn handle_request(
         state
             .audit
             .log(AuditEntry::new("cache_hit", "proxy", "", "npm", ""));
-        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+        // A digest with no record counts from when its copy was cached (R4-C05).
+        if let Some(resp) = crate::digest_quarantine::cache_gate_digest(
             &state.digest_store,
+            &state.storage,
+            &key,
             "npm",
-            &data,
+            &format!(
+                "sha256:{}",
+                hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&data))
+            ),
             &q_mode,
             q_secs,
-            "cache",
             crate::digest_quarantine::first_seen_seed(
                 state.config.server.trust_upstream_dates,
                 publish_date,
             ),
-        ) {
+        )
+        .await
+        {
             return resp;
         }
         let mut response = with_content_type(true, data).into_response();
@@ -1618,6 +1625,24 @@ async fn serve_streamed_tarball(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Integrity check failed").into_response();
         }
     }
+    // A digest with no record counts from when its copy was cached (R4-C05).
+    let cached_at = match gates.q_mode {
+        crate::digest_quarantine::QuarantineMode::Off => None,
+        _ => {
+            crate::digest_quarantine::cached_first_seen(
+                &state.digest_store,
+                &state.storage,
+                key,
+                "npm",
+                &digest,
+            )
+            .await
+        }
+    };
+    let gates = TarballGates {
+        publish_date: gates.publish_date.or(cached_at),
+        ..gates
+    };
     if let Some(response) = gates.check(state, &digest, "cache") {
         return response;
     }

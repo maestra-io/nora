@@ -1116,15 +1116,19 @@ async fn flatcontainer_download(
         ));
 
         if quarantine_on {
-            if let Some(resp) = crate::digest_quarantine::proxy_gate_digest(
+            // A digest with no record counts from when its copy was cached (R4-C05).
+            if let Some(resp) = crate::digest_quarantine::cache_gate_digest(
                 &state.digest_store,
+                &state.storage,
+                &storage_key,
                 "nuget",
                 &cached.digest(),
                 &q_mode,
                 q_secs,
-                "cache",
                 first_seen,
-            ) {
+            )
+            .await
+            {
                 return resp;
             }
         }
@@ -7055,6 +7059,29 @@ mod nuget_release_dates {
         )
         .await;
         assert_eq!(download(&ctx, "1.2.4").await, StatusCode::FORBIDDEN);
+        assert!(
+            upstream_paths(&up).await.is_empty(),
+            "served from the cache"
+        );
+    }
+
+    /// R4-C05: the ledger forgets a digest 90 days after its first sight. A package cached for
+    /// longer than that is not held for a new TTL by the first cache hit after a restart: its
+    /// clock is the day NORA wrote the copy.
+    #[tokio::test]
+    async fn a_package_cached_past_the_ledgers_memory_is_not_held_again() {
+        let up = upstream().await;
+        let ctx = context(&up, false, quarantine_7d);
+        put_written_days_ago(
+            &ctx,
+            &format!("nuget/flatcontainer/{ID}/1.2.4/{ID}.1.2.4.nupkg"),
+            b"stored",
+            100,
+        )
+        .await;
+        for _ in 0..2 {
+            assert_eq!(download(&ctx, "1.2.4").await, StatusCode::OK);
+        }
         assert!(
             upstream_paths(&up).await.is_empty(),
             "served from the cache"
