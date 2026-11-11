@@ -79,8 +79,10 @@ build asking for a new suite, never hides a whole distribution. A version that a
 upstream while nobody asked NORA for that suite is dated by NORA's next look: it is held
 longer, never shorter. One pool file listed by several suites (Ubuntu's `jammy-updates`
 and `jammy-security` share a kernel `.deb`, often days apart) is as old as its first
-sighting in any of them: a suite dates its young files from the other suites' ledgers of
-the same component and architecture.
+sighting in any of them: a build dates its young files from every other ledger of the
+repository (other suites, components and architectures: an `_all.deb` is in every arch
+index), and checks its holds again, under the lock of the held-version map, against the
+ledgers written while it ran.
 
 1. `dists/<suite>/InRelease` is fetched under `metadata_ttl` and refused unless a key of
    `upstream_keyring_dir` signed it. Each `<component>/binary-<arch>/Packages` it lists
