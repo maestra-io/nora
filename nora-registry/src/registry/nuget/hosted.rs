@@ -2955,6 +2955,137 @@ mod integration_tests {
         );
     }
 
+    /// A context with three hosted IDs in front of `upstream` as proxy and search service.
+    async fn ctx_before_upstream(
+        upstream: &wiremock::MockServer,
+    ) -> crate::test_helpers::TestContext {
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.search_service = format!("{uri}/query");
+            cfg.nuget.proxy = Some(uri);
+        });
+        for i in 0..3 {
+            let id = format!("Maestra.H{i}");
+            assert_eq!(
+                push(&ctx.app, &nupkg(&id, "1.0.0", ""), &[]).await,
+                StatusCode::CREATED
+            );
+        }
+        ctx
+    }
+
+    /// R4-T08: paging over hosted ++ a live upstream. Three hosted IDs and five upstream
+    /// rows read two at a time: every row once, in order, none skipped where the window
+    /// crosses from hosted to upstream, `totalHits` the sum on every page, and the upstream
+    /// asked for exactly the remainder of each window.
+    #[tokio::test]
+    async fn search_pages_through_hosted_then_upstream() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("GET"))
+            .and(path("/query"))
+            .respond_with(|req: &wiremock::Request| {
+                let arg = |name: &str| -> usize {
+                    req.url
+                        .query_pairs()
+                        .find(|(k, _)| k == name)
+                        .and_then(|(_, v)| v.parse().ok())
+                        .unwrap()
+                };
+                let rows: Vec<Value> = (0..5usize)
+                    .skip(arg("skip"))
+                    .take(arg("take"))
+                    .map(|i| serde_json::json!({"id": format!("Upstream.Maestra{i}"), "version": "1.0.0"}))
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"totalHits": 5, "data": rows}))
+            })
+            .mount(&upstream)
+            .await;
+        let ctx = ctx_before_upstream(&upstream).await;
+
+        let mut seen = Vec::new();
+        for skip in [0, 2, 4, 6, 8] {
+            let (status, page) = get_json(
+                &ctx.app,
+                &format!("/nuget/v3/query?q=maestra&skip={skip}&take=2"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(page["totalHits"], 8, "skip={skip}");
+            for e in page["data"].as_array().unwrap() {
+                seen.push(e["id"].as_str().unwrap().to_string());
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                "Maestra.H0",
+                "Maestra.H1",
+                "Maestra.H2",
+                "Upstream.Maestra0",
+                "Upstream.Maestra1",
+                "Upstream.Maestra2",
+                "Upstream.Maestra3",
+                "Upstream.Maestra4",
+            ]
+        );
+        let asked: Vec<String> = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.query().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                "q=maestra&skip=0&take=1", // a window of hosted rows only: one row, dropped
+                "q=maestra&skip=0&take=1",
+                "q=maestra&skip=1&take=2",
+                "q=maestra&skip=3&take=2",
+                "q=maestra&skip=5&take=2",
+            ]
+        );
+    }
+
+    /// R4-T08: an upstream that fails does not take the hosted results with it, with the
+    /// stale fallback of the upstream handler on or off.
+    #[tokio::test]
+    async fn search_answers_hosted_hits_when_the_upstream_fails() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for serve_stale in [true, false] {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(any())
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&upstream)
+                .await;
+            let mut ctx = ctx_before_upstream(&upstream).await;
+            if !serve_stale {
+                let mut config = (*ctx.state.config).clone();
+                config.nuget.serve_stale = false;
+                ctx.state.config = std::sync::Arc::new(config);
+                ctx.app = crate::registry::nuget::routes().with_state(ctx.state.clone());
+            }
+            let (status, page) = get_json(&ctx.app, "/nuget/v3/query?q=maestra&take=5").await;
+            assert_eq!(status, StatusCode::OK, "serve_stale={serve_stale}");
+            let ids: Vec<&str> = page["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                ids,
+                ["Maestra.H0", "Maestra.H1", "Maestra.H2"],
+                "serve_stale={serve_stale}"
+            );
+            assert_eq!(page["totalHits"], 3, "serve_stale={serve_stale}");
+        }
+    }
+
     #[tokio::test]
     async fn search_exact_id_and_package_type() {
         let ctx = local_ctx();
@@ -4165,5 +4296,227 @@ Jd74nq6dNCjpWG4drIsyhqX+
         let (s, idx) = get_json(&ctx.app, uri).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(idx["versions"], serde_json::json!(["1.0.0"]));
+    }
+}
+
+/// R4-T07: a pushed package is read by [`parse_nupkg`] (the `zip` crate), an imported one by
+/// the parent module's `root_nuspec` (its own central-directory reader) and `parse_nuspec`.
+/// Neither reader may panic on any bytes, and on a well-formed package both read the same
+/// manifest.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod nupkg_reader_proptests {
+    use super::super::{parse_nuspec as imported_nuspec, root_nuspec};
+    use super::{parse_nupkg, parse_nuspec};
+    use proptest::prelude::*;
+    use std::io::{Cursor, Write};
+
+    /// A zip of `entries`, each stored or deflated.
+    fn zip(entries: &[(String, Vec<u8>, bool)]) -> Vec<u8> {
+        let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, body, deflate) in entries {
+            let method = if *deflate {
+                zip::CompressionMethod::Deflated
+            } else {
+                zip::CompressionMethod::Stored
+            };
+            let opts = zip::write::SimpleFileOptions::default().compression_method(method);
+            w.start_file(name.as_str(), opts).unwrap();
+            w.write_all(body).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    fn escape(text: &str) -> String {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    }
+
+    type Dep = (String, Option<String>);
+
+    fn dependency() -> impl Strategy<Value = Dep> {
+        (
+            "[A-Za-z][A-Za-z0-9.]{0,12}",
+            proptest::option::of(r"[\[(]?[0-9]{1,2}\.[0-9]{1,2}(, ?[0-9]{1,2}\.[0-9])?[\])]?"),
+        )
+    }
+
+    /// `<dependencies>` and what it says: groups of (target framework, dependencies).
+    fn dependencies() -> impl Strategy<Value = (String, Vec<(String, Vec<Dep>)>)> {
+        let deps = |list: &[Dep]| -> String {
+            list.iter()
+                .map(|(id, range)| match range {
+                    Some(range) => {
+                        format!(r#"<dependency id="{id}" version="{}" />"#, escape(range))
+                    }
+                    None => format!(r#"<dependency id="{id}" />"#),
+                })
+                .collect()
+        };
+        prop_oneof![
+            Just((String::new(), Vec::new())),
+            // A flat list is one group for every framework.
+            proptest::collection::vec(dependency(), 1..4).prop_map(move |list| {
+                (
+                    format!("<dependencies>{}</dependencies>", deps(&list)),
+                    vec![(String::new(), list)],
+                )
+            }),
+            proptest::collection::vec(
+                (
+                    proptest::option::of("[a-z][a-z0-9.]{0,12}"),
+                    proptest::collection::vec(dependency(), 0..4)
+                ),
+                1..4
+            )
+            .prop_map(move |groups| {
+                let xml: String = groups
+                    .iter()
+                    .map(|(framework, list)| match framework {
+                        Some(f) => {
+                            format!(r#"<group targetFramework="{f}">{}</group>"#, deps(list))
+                        }
+                        None => format!("<group>{}</group>", deps(list)),
+                    })
+                    .collect();
+                let said = groups
+                    .into_iter()
+                    .map(|(framework, list)| (framework.unwrap_or_default(), list))
+                    .collect();
+                (format!("<dependencies>{xml}</dependencies>"), said)
+            }),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Any bytes: an error or a manifest, never a panic, from either reader.
+        #[test]
+        fn readers_never_panic_on_arbitrary_bytes(data in proptest::collection::vec(any::<u8>(), 0..2048)) {
+            let _ = root_nuspec(Cursor::new(&data));
+            let _ = parse_nupkg(Cursor::new(&data));
+            let _ = imported_nuspec(&data);
+            let _ = parse_nuspec(&String::from_utf8_lossy(&data));
+        }
+
+        /// A real archive cut short or with bytes overwritten (its central directory and end
+        /// record among them: they are its last bytes) is an error or a manifest within the
+        /// size limit, never a panic or an unbounded read.
+        #[test]
+        fn readers_survive_a_damaged_archive(
+            nuspec in proptest::collection::vec(any::<u8>(), 0..512),
+            deflate in any::<bool>(),
+            damage in proptest::collection::vec((any::<proptest::sample::Index>(), any::<u8>()), 0..8),
+            from_end in proptest::collection::vec((0usize..96, any::<u8>()), 0..8),
+            cut in proptest::option::of(any::<proptest::sample::Index>()),
+        ) {
+            let mut data = zip(&[
+                ("lib/net8.0/a.dll".to_string(), b"dll".to_vec(), true),
+                ("Pkg.nuspec".to_string(), nuspec, deflate),
+            ]);
+            for (at, byte) in damage {
+                let at = at.index(data.len());
+                data[at] = byte;
+            }
+            for (back, byte) in from_end {
+                let at = data.len() - 1 - back.min(data.len() - 1);
+                data[at] = byte;
+            }
+            if let Some(cut) = cut {
+                data.truncate(cut.index(data.len() + 1));
+            }
+            if let Ok(nuspec) = root_nuspec(Cursor::new(&data)) {
+                prop_assert!(nuspec.len() <= 1 << 20);
+            }
+            let _ = parse_nupkg(Cursor::new(&data));
+        }
+
+        /// The .nuspec at the root comes back byte for byte, stored or deflated, among
+        /// entries that are not it.
+        #[test]
+        fn the_root_nuspec_is_read_back_whole(
+            nuspec in proptest::collection::vec(any::<u8>(), 0..4096),
+            deflate in any::<bool>(),
+            others in proptest::collection::vec(
+                ("[a-z]{1,8}/[a-z]{1,8}\\.(dll|nuspec|xml)", proptest::collection::vec(any::<u8>(), 0..64), any::<bool>()),
+                0..4,
+            ),
+            first in any::<bool>(),
+        ) {
+            let mut entries = others;
+            // Entry names in one archive are distinct.
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries.dedup_by(|a, b| a.0 == b.0);
+            let at = if first { 0 } else { entries.len() };
+            entries.insert(at, ("Some.Package.NUSPEC".to_string(), nuspec.clone(), deflate));
+            prop_assert_eq!(root_nuspec(Cursor::new(zip(&entries))).unwrap(), nuspec);
+        }
+
+        /// A well-formed package reads the same through both paths: id, version, authors,
+        /// description and dependency groups.
+        #[test]
+        fn both_readers_agree_on_a_well_formed_package(
+            id in "[A-Za-z][A-Za-z0-9]{0,8}(\\.[A-Za-z][A-Za-z0-9]{0,8}){0,2}",
+            (major, minor, patch) in (0u32..100, 0u32..100, 0u32..100),
+            label in proptest::option::of("[a-zA-Z][a-zA-Z0-9]{0,6}"),
+            authors in "[A-Za-z0-9 &<>\",.-]{0,24}",
+            description in "[A-Za-z0-9 &<>\",.-]{0,24}",
+            (dependencies, said) in dependencies(),
+            deflate in any::<bool>(),
+        ) {
+            let version = match &label {
+                Some(label) => format!("{major}.{minor}.{patch}-{label}"),
+                None => format!("{major}.{minor}.{patch}"),
+            };
+            let nuspec = format!(
+                r#"<?xml version="1.0" encoding="utf-8"?><package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd"><metadata><id>{id}</id><version>{version}</version><authors>{}</authors><description>{}</description>{dependencies}</metadata></package>"#,
+                escape(&authors),
+                escape(&description),
+            );
+            let nupkg = zip(&[
+                (format!("{id}.nuspec"), nuspec.clone().into_bytes(), deflate),
+                ("lib/net8.0/a.dll".to_string(), b"dll".to_vec(), true),
+            ]);
+
+            let pushed = parse_nupkg(Cursor::new(&nupkg)).unwrap();
+            let raw = root_nuspec(Cursor::new(&nupkg)).unwrap();
+            prop_assert_eq!(&raw, nuspec.as_bytes());
+            prop_assert_eq!(&pushed.raw, &nuspec);
+            let imported = imported_nuspec(&raw).unwrap();
+
+            prop_assert_eq!(&pushed.id, &id);
+            prop_assert_eq!(&imported.id, &id);
+            prop_assert_eq!(&pushed.version, &version);
+            prop_assert_eq!(&imported.version, &version);
+            prop_assert_eq!(&pushed.authors, authors.trim());
+            prop_assert_eq!(&imported.authors, authors.trim());
+            prop_assert_eq!(&pushed.description, description.trim());
+            prop_assert_eq!(&imported.description, description.trim());
+
+            let pushed_groups: Vec<(String, Vec<Dep>)> = pushed
+                .dependency_groups
+                .iter()
+                .map(|g| {
+                    let deps = g.dependencies.iter().map(|d| (d.id.clone(), d.range.clone()));
+                    (g.target_framework.clone().unwrap_or_default(), deps.collect())
+                })
+                .collect();
+            let imported_groups: Vec<(String, Vec<Dep>)> = imported
+                .dependency_groups
+                .iter()
+                .map(|g| {
+                    let deps = g
+                        .dependencies
+                        .iter()
+                        .map(|d| (d.id.clone(), Some(d.range.clone()).filter(|r| !r.is_empty())));
+                    (g.target_framework.clone(), deps.collect())
+                })
+                .collect();
+            prop_assert_eq!(&pushed_groups, &said);
+            prop_assert_eq!(&imported_groups, &said);
+        }
     }
 }

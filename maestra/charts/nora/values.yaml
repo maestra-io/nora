@@ -311,8 +311,10 @@ config:
   # to the response headers per attempt and per body stall, not for the whole
   # download), metadata_proxy_timeout (registration index / version list,
   # per attempt, one retry; nora default 10 s), metadata_ttl, serve_stale,
-  # revalidate, proxy, search_service, autocomplete. Enable NuGet itself via
-  # registries.enable.
+  # max_stale (seconds a copy past metadata_ttl is still answered at once and
+  # refreshed behind the response; older is revalidated first; nora default
+  # 3600, 0 = always first, -1 = no bound), revalidate, proxy, search_service,
+  # autocomplete. Enable NuGet itself via registries.enable.
   nuget:
     proxy_timeout: 30
     metadata_proxy_timeout: 15

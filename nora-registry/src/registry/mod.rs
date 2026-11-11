@@ -2286,22 +2286,35 @@ pub(crate) async fn stored_fresh(storage: &crate::Storage, key: &str, ttl_secs: 
     meta.is_some_and(|m| crate::cache_ttl::is_within_ttl(m.modified, ttl_secs) || validated)
 }
 
+/// When the stored `key` was last known to match its upstream: written, or revalidated
+/// (a 304, see [`mark_revalidated`]), whichever is later. `None` when it is not stored.
+/// One store round trip, as [`stored_fresh`]; a caller with two windows (a TTL and a
+/// stale-while-revalidate bound) checks both against it.
+pub(crate) async fn stored_validated_at(storage: &crate::Storage, key: &str) -> Option<u64> {
+    let (meta, validated) = tokio::join!(storage.stat(key), validated_at(storage, key));
+    meta.map(|m| m.modified.max(validated.unwrap_or(0)))
+}
+
 /// Whether `key`'s validators record a revalidation within `ttl_secs`.
 async fn validated_within_ttl(storage: &crate::Storage, key: &str, ttl_secs: i64) -> bool {
     if ttl_secs <= 0 {
         return false;
     }
+    validated_at(storage, key)
+        .await
+        .is_some_and(|t| crate::cache_ttl::is_within_ttl(t, ttl_secs))
+}
+
+/// When `key`'s validators last recorded a revalidation.
+async fn validated_at(storage: &crate::Storage, key: &str) -> Option<u64> {
     #[derive(serde::Deserialize)]
     struct Freshness {
         validated_at: Option<u64>,
     }
-    let Ok(data) = storage.get(&validators_key(key)).await else {
-        return false;
-    };
+    let data = storage.get(&validators_key(key)).await.ok()?;
     serde_json::from_slice::<Freshness>(&data)
         .ok()
         .and_then(|f| f.validated_at)
-        .is_some_and(|t| crate::cache_ttl::is_within_ttl(t, ttl_secs))
 }
 
 fn header_string(resp: &reqwest::Response, name: reqwest::header::HeaderName) -> Option<String> {
