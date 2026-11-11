@@ -1,75 +1,18 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
-//! Secrets management for NORA
-//!
-//! Provides a trait-based architecture for secrets providers:
-//! - `env` - Environment variables (default, 12-Factor App)
-//!
-//! Additional providers (AWS Secrets Manager, HashiCorp Vault, Kubernetes
-//! Secrets) may be added in future releases.
-//!
-//! # Example
-//!
-//! ```rust,ignore
-//! use nora::secrets::{create_secrets_provider, SecretsConfig};
-//!
-//! let config = SecretsConfig::default(); // Uses ENV provider
-//! let provider = create_secrets_provider(&config)?;
-//!
-//! let api_key = provider.get_secret("API_KEY").await?;
-//! println!("Got secret (redacted): {:?}", api_key);
-//! ```
+//! Secrets in memory: [`ProtectedString`] zeroizes a credential on drop and keeps it out of
+//! `Debug` output. Credentials come from the config file and `NORA_*` environment variables;
+//! there is no secrets provider (Vault, AWS Secrets Manager, Kubernetes).
 
-mod env;
 pub mod protected;
 
-pub use env::EnvProvider;
-#[allow(unused_imports)] // S3Credentials: scaffolding for future secrets integration
-pub use protected::{expose_opt, ProtectedString, S3Credentials};
+pub use protected::{expose_opt, ProtectedString};
 
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
-#[allow(dead_code)] // Variants used by provider impls
-/// Secrets provider error
-#[derive(Debug, Error)]
-pub enum SecretsError {
-    #[error("Secret not found: {0}")]
-    NotFound(String),
-
-    #[error("Provider error: {0}")]
-    Provider(String),
-
-    #[error("Configuration error: {0}")]
-    Config(String),
-
-    #[error("Unsupported provider: {0}")]
-    UnsupportedProvider(String),
-}
-
-/// Secrets provider trait
-///
-/// Implement this trait to add new secrets backends.
-#[async_trait]
-pub trait SecretsProvider: Send + Sync {
-    /// Get a secret by key (required)
-    #[allow(dead_code)]
-    async fn get_secret(&self, key: &str) -> Result<ProtectedString, SecretsError>;
-
-    /// Get a secret by key (optional, returns None if not found)
-    #[allow(dead_code)]
-    async fn get_secret_optional(&self, key: &str) -> Option<ProtectedString> {
-        self.get_secret(key).await.ok()
-    }
-
-    /// Get provider name for logging
-    #[allow(dead_code)]
-    fn provider_name(&self) -> &'static str;
-}
-
-/// Secrets configuration
+/// The `[secrets]` config section. Parsed so that configs written for upstream NORA load
+/// without an unknown-key report; nothing reads its fields.
 ///
 /// # Example config.toml
 ///
@@ -102,26 +45,6 @@ impl Default for SecretsConfig {
     }
 }
 
-#[allow(dead_code)] // Scaffolding for future secrets integration (Vault, AWS SM, K8s)
-/// Create a secrets provider based on configuration
-///
-/// Currently supports:
-/// - `env` - Environment variables (default)
-pub fn create_secrets_provider(
-    config: &SecretsConfig,
-) -> Result<Box<dyn SecretsProvider>, SecretsError> {
-    match config.provider.as_str() {
-        "env" => {
-            let mut provider = EnvProvider::new();
-            if config.clear_env {
-                provider = provider.with_clear_after_read();
-            }
-            Ok(Box::new(provider))
-        }
-        other => Err(SecretsError::UnsupportedProvider(other.to_string())),
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -132,23 +55,6 @@ mod tests {
         let config = SecretsConfig::default();
         assert_eq!(config.provider, "env");
         assert!(!config.clear_env);
-    }
-
-    #[test]
-    fn test_create_env_provider() {
-        let config = SecretsConfig::default();
-        let provider = create_secrets_provider(&config).unwrap();
-        assert_eq!(provider.provider_name(), "env");
-    }
-
-    #[test]
-    fn test_create_unsupported_provider() {
-        let config = SecretsConfig {
-            provider: "unknown".to_string(),
-            clear_env: false,
-        };
-        let result = create_secrets_provider(&config);
-        assert!(matches!(result, Err(SecretsError::UnsupportedProvider(_))));
     }
 
     #[test]

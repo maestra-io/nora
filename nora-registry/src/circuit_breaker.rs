@@ -639,8 +639,17 @@ mod tests {
     #[test]
     fn test_init_gauges_noop_when_disabled() {
         let cb = CircuitBreakerRegistry::new(disabled_config());
-        // Should not panic or set anything
         cb.init_gauges(&["init_disabled_a"]);
+        // Disabled: the state gauge exports no series for the registry.
+        let exported = prometheus::core::Collector::collect(&*CIRCUIT_BREAKER_STATE)
+            .iter()
+            .flat_map(|family| family.get_metric())
+            .flat_map(|metric| metric.get_label())
+            .any(|label| label.value() == "init_disabled_a");
+        assert!(
+            !exported,
+            "a disabled breaker must not export a state gauge"
+        );
     }
 
     #[test]
@@ -841,7 +850,11 @@ mod tests {
             h.join().unwrap();
         }
 
-        // No panics = success
+        // Every thread ended on a success and 100 failures in a row never happened:
+        // each breaker is closed.
+        for registry in ["reg0", "reg1", "reg2"] {
+            assert!(cb.check(registry).is_ok(), "{registry} must be closed");
+        }
     }
 
     #[test]

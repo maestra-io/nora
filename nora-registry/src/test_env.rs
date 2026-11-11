@@ -108,7 +108,7 @@ fn every_env_touching_test_holds_the_env_lock() {
     }
 
     // A scan that sees nothing passes everything: pin files known to hold env tests.
-    for known in ["config/mod.rs", "config/storage.rs", "secrets/env.rs"] {
+    for known in ["config/mod.rs", "config/storage.rs", "config/auth.rs"] {
         assert!(
             env_test_files.iter().any(|f| f == known),
             "the scan no longer sees the env-touching tests of {known}; seen: {env_test_files:?}"

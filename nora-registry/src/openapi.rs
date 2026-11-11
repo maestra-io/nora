@@ -147,6 +147,7 @@ use crate::AppState;
         crate::openapi::revoke_token,
         // Admin
         crate::openapi::admin_reindex,
+        crate::openapi::admin_create_token,
     ),
     components(
         schemas(
@@ -162,6 +163,7 @@ use crate::AppState;
             DockerCatalog,
             DockerTags,
             TokenRequest,
+            AdminTokenRequest,
             MintedTokenResponse,
             TokenListResponse,
             TokenListItem,
@@ -245,6 +247,20 @@ pub struct TokenRequest {
 
 fn default_ttl() -> u32 {
     30
+}
+
+/// The body of `POST /api/v1/admin/tokens` (admin.rs `AdminCreateTokenRequest`).
+#[derive(Deserialize, ToSchema)]
+pub struct AdminTokenRequest {
+    /// Subject the token is minted for; no password is checked
+    pub username: String,
+    /// Token TTL in days (default: 30), greater than 0
+    #[serde(default = "default_ttl")]
+    pub ttl_days: u32,
+    /// Optional description
+    pub description: Option<String>,
+    /// `read` (default), `write` or `admin`
+    pub role: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -1432,6 +1448,25 @@ pub async fn revoke_token() {}
 )]
 pub async fn admin_reindex() {}
 
+/// Mint an API token of any role for any subject (admin only)
+///
+/// Requires an `Admin`-role token that is not namespace-scoped; the minted token is
+/// namespace-unrestricted.
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/tokens",
+    tag = "admin",
+    request_body = AdminTokenRequest,
+    responses(
+        (status = 200, description = "Token created", body = MintedTokenResponse),
+        (status = 400, description = "Invalid role or ttl_days"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin role required; or the caller is namespace-scoped; or its credential has expired"),
+        (status = 503, description = "Token storage not configured")
+    )
+)]
+pub async fn admin_create_token() {}
+
 // ============ Routes ============
 
 /// Swagger UI 5.17.14: the page at `/api-docs` and the files it loads, from
@@ -1523,6 +1558,145 @@ pub fn routes() -> Router<AppState> {
 mod tests {
     use super::{ApiDoc, MintedTokenResponse};
     use utoipa::OpenApi;
+
+    /// R4-T23: the document describes the server. Every documented operation reaches a route
+    /// of the real router: the router's own "no such route" and any 405 are a stale or
+    /// mistyped stub. A handler's own 404 (no such artifact) is an answer, so a fallback
+    /// marks the router's.
+    #[tokio::test]
+    async fn every_documented_operation_is_routed() {
+        use crate::config::{EnableSpec, RegistriesSection};
+        use crate::test_helpers::create_test_context_with_config;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        // Every registry this build compiles, mounted.
+        let ctx = create_test_context_with_config(|config| {
+            config.registries = Some(RegistriesSection {
+                enable: Some(EnableSpec::List(
+                    crate::registry_type::RegistryType::all()
+                        .iter()
+                        .map(|registry| registry.as_str().to_string())
+                        .collect(),
+                )),
+            });
+        });
+        let app = ctx
+            .app
+            .clone()
+            .fallback(|| async { (StatusCode::NOT_FOUND, [("x-no-route", "1")]) });
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let mut checked = 0;
+        let mut unrouted = Vec::new();
+        for (path, item) in spec["paths"].as_object().unwrap() {
+            // A registry compiled out of this build is documented and not mounted.
+            if (path.starts_with("/rpm/") && !cfg!(feature = "rpm"))
+                || (path.starts_with("/deb/") && !cfg!(feature = "deb"))
+            {
+                continue;
+            }
+            // Each `{parameter}` filled with one path segment.
+            let mut uri = String::new();
+            for (i, part) in path.split(['{', '}']).enumerate() {
+                uri.push_str(if i % 2 == 0 { part } else { "x" });
+            }
+            for method in item.as_object().unwrap().keys() {
+                let request = Request::builder()
+                    .method(method.to_uppercase().as_str())
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                checked += 1;
+                if response.headers().contains_key("x-no-route")
+                    || response.status() == StatusCode::METHOD_NOT_ALLOWED
+                {
+                    unrouted.push(format!("{method} {path} -> {}", response.status()));
+                }
+            }
+        }
+        assert!(unrouted.is_empty(), "documented, not routed: {unrouted:#?}");
+        assert!(
+            checked >= 50,
+            "operations read from the document: {checked}"
+        );
+    }
+
+    /// R4-T23, the other direction for the API: every `/api/` route the server mounts is in
+    /// the document, or is one of the UI's own endpoints (HTMX fragments and the JSON its
+    /// pages read, behind the UI session), listed here. A new `/api/` route fails this test
+    /// until it is documented or listed.
+    #[test]
+    fn every_api_route_is_documented() {
+        const UI_OWN: &[&str] = &[
+            "/api/ui/stats",
+            "/api/ui/tokens/create",
+            "/api/ui/tokens/list",
+            "/api/ui/tokens/{file_id}/revoke",
+            "/api/ui/{registry_type}/list",
+            "/api/ui/{registry_type}/search",
+            "/api/ui/{registry_type}/{name}",
+        ];
+
+        /// The first argument of each `.route("/api/…", …)` outside `#[cfg(test)]`.
+        #[derive(Default)]
+        struct ApiRoutes(Vec<String>);
+        impl<'ast> syn::visit::Visit<'ast> for ApiRoutes {
+            fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+                let under_test = m.attrs.iter().any(|a| {
+                    a.path().is_ident("cfg")
+                        && matches!(&a.meta, syn::Meta::List(l) if l.tokens.to_string() == "test")
+                });
+                if !under_test {
+                    syn::visit::visit_item_mod(self, m);
+                }
+            }
+            fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+                if call.method == "route" {
+                    if let Some(syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(path),
+                        ..
+                    })) = call.args.first()
+                    {
+                        if path.value().starts_with("/api/") {
+                            self.0.push(path.value());
+                        }
+                    }
+                }
+                syn::visit::visit_expr_method_call(self, call);
+            }
+        }
+
+        fn read(dir: &std::path::Path, routes: &mut ApiRoutes) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    read(&path, routes);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let file = syn::parse_file(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                    syn::visit::Visit::visit_file(routes, &file);
+                }
+            }
+        }
+        let mut routes = ApiRoutes::default();
+        read(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut routes,
+        );
+        assert!(routes.0.len() >= 13, "routes read: {:?}", routes.0);
+
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let documented = spec["paths"].as_object().unwrap();
+        let mut undocumented: Vec<&str> = routes
+            .0
+            .iter()
+            .map(String::as_str)
+            .filter(|route| !documented.contains_key(*route))
+            .collect();
+        undocumented.sort_unstable();
+        undocumented.dedup();
+        assert_eq!(undocumented, UI_OWN, "routed under /api/, not documented");
+    }
 
     /// Swagger UI comes from the files in `ui/static/swagger-ui/`, embedded in the binary,
     /// as `utoipa-swagger-ui` served them before: `/api-docs` redirects to the page, each

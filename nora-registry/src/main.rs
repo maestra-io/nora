@@ -57,7 +57,6 @@ mod migrate;
 mod mirror;
 mod openapi;
 mod proxy_coalesce;
-mod pypi_files;
 mod quarantine_exceptions;
 mod rate_limit;
 mod registry;

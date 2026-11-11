@@ -83,3 +83,120 @@ fn without_python_tag(version: &str) -> &str {
         version
     }
 }
+
+/// One file of a project's index page, as upstream lists it and as NORA caches it.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct FileEntry {
+    pub filename: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// PEP 503 `data-requires-python`, unescaped (e.g. `>=3.8`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_python: Option<String>,
+    /// PEP 592 `data-yanked`: `Some("")` is yanked without a reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yanked: Option<String>,
+    /// PEP 658/714 `data-core-metadata` value: `true` or `sha256=<hex>`. Set only where
+    /// nora can serve `<file>.metadata`: a stored copy, or the upstream's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_metadata: Option<String>,
+    /// Upstream entries only: the file's absolute URL (no fragment) and the configured
+    /// upstream that lists it, so a download or `.metadata` request is resolved from the
+    /// cached index instead of refetching the project page (R2-27).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+}
+
+/// Extract filename from PyPI download URL.
+pub fn extract_filename(url: &str) -> Option<&str> {
+    let url = url.split('#').next()?;
+    let filename = url.rsplit('/').next()?;
+
+    served_extension(filename).map(|_| filename)
+}
+
+/// Parse upstream PyPI simple index HTML into file entries.
+///
+/// Extracts filenames, optional `#sha256=` fragments and the PEP 503/592
+/// `data-requires-python` / `data-yanked` attributes from `<a href="...">` links.
+/// Filenames are percent-decoded (`%2B` -> `+`), the form the download route sees; each
+/// `url` is the href without its fragment, still encoded, resolved against `page_url`
+/// (relative hrefs of some mirrors: Tsinghua, USTC, Aliyun, #877).
+pub fn parse_upstream_files(html: &str, page_url: &str) -> Vec<FileEntry> {
+    let base = reqwest::Url::parse(page_url).ok();
+    let mut files = Vec::new();
+    let mut offset = 0;
+
+    while let Some(href_start) = html[offset..].find("href=\"") {
+        let value_start = offset + href_start + 6;
+        let Some(href_len) = html[value_start..].find('"') else {
+            break;
+        };
+        let url = &html[value_start..value_start + href_len];
+        offset = value_start + href_len;
+        if let Some(filename) = extract_filename(url) {
+            // The anchor's attributes: from its `<a` to the first `>` outside quotes
+            // (some mirrors leave `data-requires-python=">=3.8"` unescaped).
+            let tag_start = html[..value_start].rfind("<a").unwrap_or(0);
+            let mut quoted = false;
+            let tag_end = html[offset + 1..]
+                .char_indices()
+                .find(|&(_, c)| {
+                    quoted ^= c == '"';
+                    c == '>' && !quoted
+                })
+                .map_or(html.len(), |(e, _)| offset + 1 + e);
+            let tag = &html[tag_start..tag_end];
+            let raw = url.split('#').next().unwrap_or(url);
+            let resolved = if raw.starts_with("http://") || raw.starts_with("https://") {
+                raw.to_string()
+            } else {
+                base.as_ref()
+                    .and_then(|base| base.join(raw).ok())
+                    .map_or_else(|| raw.to_string(), |u| u.to_string())
+            };
+            files.push(FileEntry {
+                filename: percent_encoding::percent_decode_str(filename)
+                    .decode_utf8_lossy()
+                    .into_owned(),
+                sha256: url.find("#sha256=").map(|pos| url[pos + 8..].to_string()),
+                requires_python: html_attr(tag, "data-requires-python").map(html_unescape),
+                yanked: html_attr(tag, "data-yanked").map(html_unescape),
+                core_metadata: html_attr(tag, "data-core-metadata")
+                    .or_else(|| html_attr(tag, "data-dist-info-metadata"))
+                    .map(html_unescape),
+                url: Some(resolved),
+                upstream: None,
+            });
+        }
+    }
+    files
+}
+
+/// Value of a double-quoted attribute `name="..."` inside an HTML tag, raw (still escaped).
+fn html_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("{name}=\"");
+    let mut from = 0;
+    while let Some(pos) = tag[from..].find(&needle) {
+        let start = from + pos;
+        from = start + needle.len();
+        // Whole attribute name only: `data-yanked` must not match `xdata-yanked`.
+        if tag[..start].ends_with(|c: char| c.is_ascii_whitespace()) {
+            let end = tag[from..].find('"')?;
+            return Some(&tag[from..from + end]);
+        }
+    }
+    None
+}
+
+/// Reverse the entity escaping index pages apply to attribute values.
+fn html_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&amp;", "&")
+}

@@ -6,8 +6,11 @@ use nora_registry::validation::{
 };
 
 fuzz_target!(|data: &str| {
-    // Extended validation fuzzing: covers edge cases not in fuzz_validation
-    // Focus on interaction between validators and helpers
+    // Despite the name this target parses no TOML: `Config` is compiled into the binary only
+    // (it reads auth, curation and registry modules), so the library the fuzz targets link
+    // cannot reach it. Config parsing is covered by the unit tests of config/mod.rs.
+    // What runs here: extended validation fuzzing, edge cases not in fuzz_validation,
+    // the interaction between validators and helpers.
 
     // ends_with_ci with arbitrary suffix — must never panic
     let _ = ends_with_ci(data, ".tar.gz");

@@ -21,7 +21,8 @@ clippy:
 	$(CARGO) clippy --all-targets -- -D warnings
 
 # The library, the binary and every test under nora-registry/tests/ (which runs the built
-# binary), as CI's `cargo test --package nora-registry` does; doctests and benches stay out.
+# binary). `--tests` leaves the doctests out: CI's `cargo test --package nora-registry --locked`
+# runs them too.
 test:
 	$(CARGO) test --package nora-registry --tests
 

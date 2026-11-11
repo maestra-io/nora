@@ -117,14 +117,15 @@ engine errors, the request is blocked (fail-closed).
 
 ## Code Map
 
-The tree below tracks the module declarations in `main.rs` (the binary) and
-`lib.rs` (the library surface used by tests and fuzz targets).
+The tree below is an orientation map of the main modules, not a full listing: the
+`mod` declarations in `main.rs` (the binary) and `lib.rs` (the library surface used by
+tests and fuzz targets) are the complete list.
 
 ```
 nora/
 ├── nora-registry/src/
 │   ├── main.rs              # CLI (clap), server startup, route + middleware assembly
-│   ├── lib.rs              # Library surface: re-exports validation + verified for tests/fuzz
+│   ├── lib.rs              # Library surface: the modules the binary shares with tests and fuzz targets
 │   ├── registry_type.rs     # RegistryType enum shared across all modules
 │   │
 │   ├── config/             # Configuration (split by concern, not one file)
@@ -430,7 +431,7 @@ from the Conan (v0.7.0) and RPM handlers:
 
 | # | File | What to add |
 |---|------|-------------|
-| 1 | `registry/<format>.rs` | **New file.** Routes, handlers, proxy/publish logic, curation calls, tests. 400-1200 lines. |
+| 1 | `registry/<format>.rs` | **New file.** Routes, handlers, proxy/publish logic, curation calls, tests. From about 300 lines (`hashicorp.rs`) to 16,000 (`docker.rs`), tests included. |
 | 2 | `registry/mod.rs` | `mod <format>;` and `pub use <format>::routes as <format>_routes;` |
 | 3 | `registry_type.rs` | Enum variant + match arms in `as_str()`, `mount_point()`, `display_name()`, `all()`, `from_str_opt()` |
 | 4 | `config/registry/<format>.rs` | **New file.** `<Format>Config` struct + Default + `NORA_<FORMAT>_*` env overrides; `mod`/`pub use` in `config/registry/mod.rs` |

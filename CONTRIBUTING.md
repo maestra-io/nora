@@ -48,7 +48,7 @@ The GitHub organization [getnora-io](https://github.com/getnora-io) has multiple
 
 ### Prerequisites
 
-- **Rust** stable (1.85+) — install via [rustup](https://rustup.rs/)
+- **Rust** — the toolchain pinned in `rust-toolchain.toml`; [rustup](https://rustup.rs/) installs it on first use
 - **Docker** (optional) — for integration tests (docker push/pull)
 - **Node.js** 18+ (optional) — for npm integration tests
 
@@ -58,15 +58,20 @@ The GitHub organization [getnora-io](https://github.com/getnora-io) has multiple
 # Build
 cargo build --package nora-registry
 
-# Run unit tests (important: use --lib --bin to skip fuzz targets)
-cargo test --lib --bin nora
+# The checks CI runs on a pull request (.github/workflows/maestra-ci.yml), same commands:
+cargo fmt --all -- --check
+cargo clippy -p nora-registry --all-targets --locked -- -D warnings
+cargo test --package nora-registry --locked
 
-# Run clippy (must pass with zero warnings)
-cargo clippy --package nora-registry -- -D warnings
-
-# Format check
-cargo fmt --check
+# CI repeats clippy and the tests without the rpm registry:
+cargo clippy -p nora-registry --all-targets --no-default-features --features mimalloc,deb --locked -- -D warnings
+cargo test --package nora-registry --no-default-features --features mimalloc,deb --locked
 ```
+
+`cargo test --package nora-registry` runs the unit tests of the library and the binary, the
+integration tests under `nora-registry/tests/` (they run the built binary) and the doctests;
+the fuzz targets are a separate package and stay out. `make check` runs the format, clippy and
+test steps plus the repository's own scripts (version, coherence, lock audit, changelog).
 
 ### Run Locally
 
@@ -87,7 +92,7 @@ curl http://localhost:4000/health
 # Build release binary first
 cargo build --release
 
-# Run full smoke suite (starts NORA, tests all 15 protocols, stops)
+# Run the smoke suite (starts NORA, drives npm, Docker, Go and other clients against it, stops)
 bash tests/smoke.sh
 ```
 
