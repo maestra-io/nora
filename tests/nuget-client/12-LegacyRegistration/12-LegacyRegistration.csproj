@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RollForward>Major</RollForward>
+    <!-- The pinned old client is the subject of the test, not a dependency to keep current. -->
+    <NuGetAudit>false</NuGetAudit>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The NuGet.Protocol that Microsoft.CodeAnalysis.Testing 1.1.3 pulls: it looks up
+         RegistrationsBaseUrl only as /Versioned, /3.4.0 and /3.0.0-beta. -->
+    <PackageReference Include="NuGet.Protocol" Version="6.3.4" />
+  </ItemGroup>
+</Project>
