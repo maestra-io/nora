@@ -56,6 +56,22 @@ pub static RETENTION_LAST_RUN: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("retention_last_run metric")
 });
 
+pub static RETENTION_SKIPPED_UNKNOWN: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "nora_retention_skipped_unknown_total",
+        "Listings retention could not read plus versions whose age it could not read; all of them were kept. Nonzero means retention is not enforcing its rules there; alert on it"
+    )
+    .expect("retention_skipped_unknown metric")
+});
+
+pub static RETENTION_DELETE_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "nora_retention_delete_failures_total",
+        "Versions retention planned with at least one delete the store refused: the version stays whole when its artifact could not be deleted, else a sidecar is left behind; the log names the keys"
+    )
+    .expect("retention_delete_failures metric")
+});
+
 // ============================================================================
 // Retention planner (pure function)
 // ============================================================================
@@ -270,16 +286,13 @@ fn glob_match_inner(p: &[char], t: &[char]) -> bool {
 
 /// Collect Maven versions for a given group/artifact.
 async fn collect_maven_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
-    let all_keys = storage.list("maven/").await.unwrap_or_else(|e| {
-        tracing::error!("Failed to list maven/ keys: {}", e);
-        Vec::new()
-    });
+    let listed = list_meta(storage, "maven/").await;
     let mut artifacts: std::collections::HashMap<
         String,
         std::collections::HashMap<String, Vec<String>>,
     > = std::collections::HashMap::new();
 
-    for key in &all_keys {
+    for key in listed.keys() {
         let parts: Vec<&str> = key
             .strip_prefix("maven/")
             .unwrap_or("")
@@ -308,7 +321,9 @@ async fn collect_maven_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
     for (artifact, versions) in &artifacts {
         let mut entries = Vec::new();
         for (version, keys) in versions {
-            let (modified, size) = aggregate_meta(storage, keys).await;
+            let Some((modified, size)) = aggregate_meta(&listed, keys) else {
+                continue;
+            };
             entries.push(VersionEntry {
                 name: version.clone(),
                 version: None,
@@ -397,17 +412,11 @@ async fn collect_sidecar_versions(
     registry: &str,
     parse: impl Fn(&serde_json::Value) -> SidecarVersion,
 ) -> Vec<(String, Vec<VersionEntry>)> {
-    let all_keys = storage
-        .list(&format!("{registry}/"))
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!("Failed to list {registry}/ keys: {}", e);
-            Vec::new()
-        });
+    let listed = list_meta(storage, &format!("{registry}/")).await;
 
     let mut groups: std::collections::HashMap<String, Vec<VersionEntry>> =
         std::collections::HashMap::new();
-    for key in &all_keys {
+    for (key, meta) in &listed {
         // {registry}/{repo}/.nora-meta/{path}.json
         let Some(rest) = key.strip_prefix(&format!("{registry}/")) else {
             continue;
@@ -434,10 +443,7 @@ async fn collect_sidecar_versions(
             continue;
         }
         let package_key = format!("{registry}/{repo}/{pkg_path}");
-        let modified = match sv.modified {
-            Some(m) => m,
-            None => storage.stat(key).await.map(|m| m.modified).unwrap_or(0),
-        };
+        let modified = sv.modified.unwrap_or(meta.modified);
         let group = match &sv.placement {
             Some(placement) => {
                 format!("{registry}:{repo}/{placement}/{}/{}", sv.arch, sv.package)
@@ -465,6 +471,7 @@ async fn collect_raw_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
         Ok(k) => k,
         Err(e) => {
             tracing::error!("Failed to list raw/ keys: {}", e);
+            RETENTION_SKIPPED_UNKNOWN.inc();
             return Vec::new();
         }
     };
@@ -522,6 +529,7 @@ async fn collect_hf_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry
         Ok(k) => k,
         Err(e) => {
             tracing::error!("Failed to list hf/models/ keys: {}", e);
+            RETENTION_SKIPPED_UNKNOWN.inc();
             return Vec::new();
         }
     };
@@ -553,14 +561,11 @@ async fn collect_hf_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry
 
 /// Collect Docker tags for each repository.
 async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
-    let all_keys = storage.list("docker/").await.unwrap_or_else(|e| {
-        tracing::error!("Failed to list docker/ keys: {}", e);
-        Vec::new()
-    });
+    let listed = list_meta(storage, "docker/").await;
     let mut repos: std::collections::HashMap<String, Vec<(String, String)>> =
         std::collections::HashMap::new();
 
-    for key in &all_keys {
+    for key in listed.keys() {
         // docker/{repo}/manifests/{tag}.json
         if let Some(rest) = key.strip_prefix("docker/") {
             if let Some(idx) = rest.find("/manifests/") {
@@ -578,21 +583,22 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
         }
     }
 
-    let key_set: std::collections::HashSet<&String> = all_keys.iter().collect();
     let mut result = Vec::new();
     for (repo, tags) in &repos {
         let mut entries = Vec::new();
         for (tag, manifest_key) in tags {
-            let meta = storage.stat(manifest_key).await;
-            let modified = meta.as_ref().map(|m| m.modified).unwrap_or(0);
-            let size = meta.as_ref().map(|m| m.size).unwrap_or(0);
+            let Some((modified, size)) =
+                aggregate_meta(&listed, std::slice::from_ref(manifest_key))
+            else {
+                continue;
+            };
             // The tag's sidecars go with it: .meta.json and the .stats.json pull
             // stats (#1114), which nothing else would ever reap. Blob keys are not
             // included because blobs may be shared across tags; GC handles orphans.
             let stem = manifest_key.strip_suffix(".json").unwrap_or(manifest_key);
             let mut keys = vec![manifest_key.clone()];
             for sidecar in [format!("{stem}.meta.json"), format!("{stem}.stats.json")] {
-                if key_set.contains(&sidecar) {
+                if listed.contains_key(&sidecar) {
                     keys.push(sidecar);
                 }
             }
@@ -611,14 +617,25 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
 
 /// Collect npm package versions.
 async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
-    let all_keys = storage.list("npm/").await.unwrap_or_else(|e| {
-        tracing::error!("Failed to list npm/ keys: {}", e);
-        Vec::new()
-    });
+    let listed = list_meta(storage, "npm/").await;
+    // Provenance sidecars live under an internal prefix that the listing above hides. Without
+    // this listing a retired tarball would leave its sidecar behind, where no later retention
+    // pass finds it: npm is left alone for this pass.
+    let origins: std::collections::HashSet<String> = match storage
+        .list_internal(&crate::registry::npm::origin_key("npm/"))
+        .await
+    {
+        Ok(keys) => keys.into_iter().collect(),
+        Err(e) => {
+            tracing::error!("Failed to list npm provenance sidecars, retention keeps npm/: {e}");
+            RETENTION_SKIPPED_UNKNOWN.inc();
+            return Vec::new();
+        }
+    };
     let mut packages: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
 
-    for key in &all_keys {
+    for key in listed.keys() {
         // npm/{package}/tarballs/{file} — each tarball is a "version"
         // Skip metadata.json and checksum files — they are indexes, not versions.
         if let Some(rest) = key.strip_prefix("npm/") {
@@ -642,26 +659,28 @@ async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
         let mut entries = Vec::new();
         for key in tarball_keys {
             let filename = key.rsplit('/').next().unwrap_or("");
-            let (modified, size) = aggregate_meta(storage, std::slice::from_ref(key)).await;
+            let Some((modified, size)) = aggregate_meta(&listed, std::slice::from_ref(key)) else {
+                continue;
+            };
             // A version is its whole key set, not just the payload: the
             // `.sha256` sidecar and the per-version document describe the same
             // artifact, and leaving either behind makes the registry advertise
             // a version it can no longer serve (#961).
             let mut keys = vec![key.clone()];
             let hash_key = format!("{}.sha256", key);
-            if storage.stat(&hash_key).await.is_some() {
+            if listed.contains_key(&hash_key) {
                 keys.push(hash_key);
             }
             // Provenance sidecar of a proxied tarball (#1055, under an internal prefix
             // that list() hides): part of the version too.
             let origin_key = crate::registry::npm::origin_key(key);
-            if storage.stat(&origin_key).await.is_some() {
+            if origins.contains(&origin_key) {
                 keys.push(origin_key);
             }
             let version = crate::curation::parse_npm_tarball_version(pkg, filename);
             if let Some(version) = &version {
                 let version_key = format!("npm/{}/versions/{}.json", pkg, version);
-                if storage.stat(&version_key).await.is_some() {
+                if listed.contains_key(&version_key) {
                     keys.push(version_key);
                 }
             }
@@ -681,18 +700,14 @@ async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
 /// Collect PyPI releases: every distribution file of one version (sdist and wheels)
 /// forms one entry, so `keep_last` keeps or retires whole releases.
 async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
-    let all_keys = storage.list("pypi/").await.unwrap_or_else(|e| {
-        tracing::error!("Failed to list pypi/ keys: {}", e);
-        Vec::new()
-    });
-    let listed: std::collections::HashSet<&str> = all_keys.iter().map(String::as_str).collect();
+    let listed = list_meta(storage, "pypi/").await;
     // package -> release version -> distribution file keys. Checksums, `<file>.metadata`
     // and the project's bookkeeping JSON (dates, upstream index) are not releases.
     let mut packages: std::collections::HashMap<
         &str,
         std::collections::HashMap<String, Vec<&str>>,
     > = std::collections::HashMap::new();
-    for key in &all_keys {
+    for key in listed.keys() {
         let Some((pkg, filename)) = key.strip_prefix("pypi/").and_then(|r| r.split_once('/'))
         else {
             continue;
@@ -713,10 +728,20 @@ async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEnt
     // Hash markers live outside `pypi/`, one directory per file:
     // `pypi-sha256/<project>/<filename>/<sha256>`. A retired file takes them with it.
     let marker_root = crate::registry::PYPI_HASH_MARKER_PREFIX;
-    let marker_keys = storage.list(marker_root).await.unwrap_or_else(|e| {
-        tracing::error!("Failed to list {} keys: {}", marker_root, e);
-        Vec::new()
-    });
+    // A file retired without its markers or its own-record leaves them describing a file that
+    // is gone, and a file stored later under the same name inherits them: when either listing
+    // fails, PyPI is left alone for this pass.
+    let (marker_keys, own_records) = match (
+        storage.list(marker_root).await,
+        storage.list(crate::registry::PYPI_OWN_PREFIX).await,
+    ) {
+        (Ok(markers), Ok(own)) => (markers, own),
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::error!("Failed to list PyPI markers, retention keeps pypi/: {e}");
+            RETENTION_SKIPPED_UNKNOWN.inc();
+            return Vec::new();
+        }
+    };
     let mut markers: std::collections::HashMap<&str, Vec<String>> =
         std::collections::HashMap::new();
     for marker in &marker_keys {
@@ -731,16 +756,7 @@ async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEnt
     // Records that a file is NORA's own live outside `pypi/` too:
     // `pypi-own/<project>/files/<filename>`. A retired file takes its record with it, so a
     // file stored later under the same name is not taken for the project's own.
-    let own_root = crate::registry::PYPI_OWN_PREFIX;
-    let own_records: std::collections::HashSet<String> = storage
-        .list(own_root)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!("Failed to list {} keys: {}", own_root, e);
-            Vec::new()
-        })
-        .into_iter()
-        .collect();
+    let own_records: std::collections::HashSet<String> = own_records.into_iter().collect();
 
     let mut result = Vec::new();
     for (pkg, releases) in &packages {
@@ -751,7 +767,7 @@ async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEnt
                 let filename = file.rsplit('/').next().unwrap_or("");
                 keys.push(file.to_string());
                 for sidecar in [format!("{file}.sha256"), format!("{file}.metadata")] {
-                    if listed.contains(sidecar.as_str()) {
+                    if listed.contains_key(&sidecar) {
                         keys.push(sidecar);
                     }
                 }
@@ -768,7 +784,9 @@ async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEnt
             // Age and size of the release's files; a marker or sidecar written later
             // (backfill) must not make an old release look new.
             let file_keys: Vec<String> = files.iter().map(|f| f.to_string()).collect();
-            let (modified, size) = aggregate_meta(storage, &file_keys).await;
+            let Some((modified, size)) = aggregate_meta(&listed, &file_keys) else {
+                continue;
+            };
             entries.push(VersionEntry {
                 name: release.clone(),
                 version: None,
@@ -784,16 +802,13 @@ async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEnt
 
 /// Collect Cargo crate versions.
 async fn collect_cargo_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
-    let all_keys = storage.list("cargo/").await.unwrap_or_else(|e| {
-        tracing::error!("Failed to list cargo/ keys: {}", e);
-        Vec::new()
-    });
+    let listed = list_meta(storage, "cargo/").await;
     let mut crates: std::collections::HashMap<
         String,
         std::collections::HashMap<String, Vec<String>>,
     > = std::collections::HashMap::new();
 
-    for key in &all_keys {
+    for key in listed.keys() {
         // A version is exactly cargo/{crate}/{version}/{crate}-{version}.crate. Every other cargo
         // key — the sparse index, its per-version entries and the records beside it, metadata.json —
         // is not a version of a crate, whatever its path looks like.
@@ -815,7 +830,9 @@ async fn collect_cargo_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
     for (crate_name, versions) in &crates {
         let mut entries = Vec::new();
         for (version, keys) in versions {
-            let (modified, size) = aggregate_meta(storage, keys).await;
+            let Some((modified, size)) = aggregate_meta(&listed, keys) else {
+                continue;
+            };
             entries.push(VersionEntry {
                 name: version.clone(),
                 version: None,
@@ -830,16 +847,13 @@ async fn collect_cargo_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
 }
 
 async fn collect_go_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
-    let all_keys = storage.list("go/").await.unwrap_or_else(|e| {
-        tracing::error!("Failed to list go/ keys: {}", e);
-        Vec::new()
-    });
+    let listed = list_meta(storage, "go/").await;
     let mut modules: std::collections::HashMap<
         String,
         std::collections::HashMap<String, Vec<String>>,
     > = std::collections::HashMap::new();
 
-    for key in &all_keys {
+    for key in listed.keys() {
         // go/{module}/@v/{version}.{info|mod|zip}
         if let Some(at_v_pos) = key.find("/@v/") {
             let module = &key["go/".len()..at_v_pos];
@@ -864,7 +878,9 @@ async fn collect_go_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry
     for (module, versions) in &modules {
         let mut entries = Vec::new();
         for (version, keys) in versions {
-            let (modified, size) = aggregate_meta(storage, keys).await;
+            let Some((modified, size)) = aggregate_meta(&listed, keys) else {
+                continue;
+            };
             entries.push(VersionEntry {
                 name: version.clone(),
                 version: None,
@@ -878,17 +894,38 @@ async fn collect_go_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry
     result
 }
 
-/// Get max modified time and total size across keys.
-async fn aggregate_meta(storage: &Storage, keys: &[String]) -> (u64, u64) {
+/// Keys under `prefix` with the size and time the listing itself carries: the one source of a
+/// version's age. A `stat` per key cannot tell "absent" from "the call failed", and a failed
+/// one read as time 0 made a version pushed minutes ago "older than any threshold". A listing
+/// that fails is empty, so nothing under `prefix` is planned (fail-closed), and is counted.
+async fn list_meta(storage: &Storage, prefix: &str) -> Listed {
+    match storage.list_with_meta(prefix).await {
+        Ok(entries) => entries.into_iter().collect(),
+        Err(e) => {
+            tracing::error!("Failed to list {prefix} keys, retention keeps them: {e}");
+            RETENTION_SKIPPED_UNKNOWN.inc();
+            Listed::new()
+        }
+    }
+}
+
+type Listed = std::collections::BTreeMap<String, crate::storage::FileMeta>;
+
+/// Max modified time and total size across `keys`, or `None` when the listing does not hold
+/// one of them: its age is unknown, and the caller keeps the version.
+fn aggregate_meta(listed: &Listed, keys: &[String]) -> Option<(u64, u64)> {
     let mut max_modified = 0u64;
     let mut total_size = 0u64;
     for key in keys {
-        if let Some(meta) = storage.stat(key).await {
-            max_modified = max_modified.max(meta.modified);
-            total_size += meta.size;
-        }
+        let Some(meta) = listed.get(key) else {
+            tracing::warn!(key = %key, "retention: age unknown, version skipped (kept)");
+            RETENTION_SKIPPED_UNKNOWN.inc();
+            return None;
+        };
+        max_modified = max_modified.max(meta.modified);
+        total_size += meta.size;
     }
-    (max_modified, total_size)
+    Some((max_modified, total_size))
 }
 
 // ============================================================================
@@ -899,6 +936,10 @@ async fn aggregate_meta(storage: &Storage, keys: &[String]) -> (u64, u64) {
 pub struct RetentionResult {
     pub planned: usize,
     pub deleted_keys: usize,
+    /// Planned versions with at least one delete the store refused (not a dry run). The version
+    /// stays whole, and is planned again, when its artifact could not be deleted; otherwise a
+    /// sidecar is left behind and the log names it.
+    pub delete_failures: usize,
     pub bytes_freed: u64,
     pub duration_secs: f64,
     pub plans: Vec<(String, Vec<DeletionPlan>)>,
@@ -939,19 +980,32 @@ pub async fn run_retention(
     all_groups.extend(collect_raw_versions(storage).await);
     all_groups.extend(collect_hf_versions(storage).await);
 
+    // One repository's groups side by side (names sharing a prefix sort together), so its
+    // index is rebuilt as soon as its last group is done, not at the end of the whole pass.
+    all_groups.sort_by(|a, b| a.0.cmp(&b.0));
+
     let mut all_plans: Vec<(String, Vec<DeletionPlan>)> = Vec::new();
     let mut total_planned = 0usize;
     let mut total_deleted_keys = 0usize;
     let mut total_bytes = 0u64;
-    // rpm/deb repos whose packages were deleted — their indexes must be
-    // rebuilt (and re-signed) afterwards or they keep advertising ghosts.
-    // npm packages retention touched, with the versions it removed from each.
-    let mut npm_regen: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
-        std::collections::BTreeMap::new();
-    let mut regen: std::collections::BTreeSet<(&'static str, String)> =
-        std::collections::BTreeSet::new();
+    let mut deleted_versions = 0u64;
+    let mut delete_failures = 0usize;
+    // The rpm/deb repo whose packages were just deleted: its indexes are rebuilt (and
+    // re-signed) before the pass moves to another repo, or they keep advertising ghosts.
+    let mut regen: Option<(&'static str, String)> = None;
 
     for (group_name, versions) in all_groups {
+        let repo = group_name
+            .strip_prefix("rpm:")
+            .map(|n| ("rpm", n))
+            .or_else(|| group_name.strip_prefix("deb:").map(|n| ("deb", n)))
+            .and_then(|(fmt, n)| n.split('/').next().map(|r| (fmt, r.to_string())));
+        if regen.is_some() && regen != repo {
+            if let Some((fmt, repo)) = regen.take() {
+                regenerate_repo_indexes(storage, publish_locks, signer, fmt, &repo).await;
+            }
+        }
+
         // Find matching rule for this group
         let registry = group_name.split(':').next().unwrap_or("");
         let rule = match find_matching_rule(rules, registry, &group_name) {
@@ -967,46 +1021,39 @@ pub async fn run_retention(
         total_planned += plans.len();
 
         if !dry_run {
-            if let Some(package) = group_name.strip_prefix("npm:") {
-                npm_regen
-                    .entry(package.to_string())
-                    .or_default()
-                    .extend(plans.iter().filter_map(|plan| {
-                        crate::curation::parse_npm_tarball_version(package, &plan.version_name)
-                    }));
-            }
-            if let Some(repo) = group_name
-                .strip_prefix("rpm:")
-                .map(|n| ("rpm", n))
-                .or_else(|| group_name.strip_prefix("deb:").map(|n| ("deb", n)))
-                .and_then(|(fmt, n)| n.split('/').next().map(|r| (fmt, r.to_string())))
-            {
-                regen.insert((
-                    if group_name.starts_with("rpm:") {
-                        "rpm"
-                    } else {
-                        "deb"
-                    },
-                    repo.1,
-                ));
-            }
+            let npm_package = group_name.strip_prefix("npm:");
+            let mut npm_retired = std::collections::BTreeSet::new();
             for plan in &plans {
-                for key in &plan.keys {
-                    // Serialize with concurrent publish to prevent deleting
-                    // an artifact that is being referenced by a new publish.
-                    let lock = crate::acquire_publish_lock(publish_locks, key);
-                    let _guard = lock.lock().await;
-                    if storage.delete(key).await.is_ok() {
-                        total_deleted_keys += 1;
-                    }
+                let deleted = delete_plan(storage, publish_locks, plan).await;
+                total_deleted_keys += deleted;
+                if deleted < plan.keys.len() {
+                    delete_failures += 1;
                 }
+                // `keys` opens with the artifact itself: once it is gone the version is, and
+                // the index derived from it has to follow.
+                if deleted == 0 {
+                    continue;
+                }
+                deleted_versions += 1;
                 total_bytes += plan.size;
+                if let Some(package) = npm_package {
+                    npm_retired.extend(crate::curation::parse_npm_tarball_version(
+                        package,
+                        &plan.version_name,
+                    ));
+                }
+                if repo.is_some() {
+                    regen = repo.clone();
+                }
                 info!(
                     group = %group_name,
                     version = %plan.version_name,
                     reason = %plan.reason,
                     "Retention: deleted"
                 );
+            }
+            if let Some(package) = npm_package.filter(|_| !npm_retired.is_empty()) {
+                reconcile_npm_package(storage, publish_locks, package, &npm_retired).await;
             }
         } else {
             for plan in &plans {
@@ -1023,80 +1070,15 @@ pub async fn run_retention(
 
         all_plans.push((group_name, plans));
     }
-
-    // Reconcile the packument of every npm package retention touched, for the
-    // same reason the rpm/deb rebuild below exists: the index is derived, and
-    // leaving it describing deleted artifacts makes the registry promise
-    // versions it can no longer serve (#961). A published package is regenerated
-    // from `versions/`; a dangling dist-tag pointer is dropped first, so the
-    // regenerated `latest` is derived from what survives rather than pointing at
-    // a retired version. A proxied package has no `versions/` keys: the retired
-    // versions are removed from its cached upstream packument instead.
-    //
-    // Fail-open per package: a failed regeneration logs and the next publish or
-    // read heals it (a read rebuilds a *missing* packument, #956); the
-    // deletions themselves are already durable.
-    for (package, retired) in &npm_regen {
-        let lock_key = crate::registry::npm::package_lock_key(package);
-        let lock = crate::acquire_publish_lock(publish_locks, &lock_key);
-        let _guard = lock.lock().await;
-
-        let dist_tags_prefix = format!("npm/{package}/dist-tags/");
-        for tag_key in storage.list(&dist_tags_prefix).await.unwrap_or_default() {
-            let Ok(data) = storage.get(&tag_key).await else {
-                continue;
-            };
-            let Ok(version) = String::from_utf8(data.to_vec()) else {
-                continue;
-            };
-            let version_key = format!("npm/{package}/versions/{}.json", version.trim());
-            if storage.stat(&version_key).await.is_none() && storage.delete(&tag_key).await.is_ok()
-            {
-                info!(package = %package, tag = %tag_key, version = %version.trim(),
-                    "retention: dropped dist-tag pointing at a retired version");
-            }
-        }
-
-        match crate::registry::npm::reconcile_packument_after_retention(storage, package, retired)
-            .await
-        {
-            Ok(()) => {
-                info!(registry = "npm", package = %package, "retention: packument reconciled")
-            }
-            Err(e) => tracing::error!(registry = "npm", package = %package, error = %e,
-                "retention: packument reconciliation failed — the next publish or read heals it"),
-        }
+    if let Some((fmt, repo)) = regen.take() {
+        regenerate_repo_indexes(storage, publish_locks, signer, fmt, &repo).await;
     }
-
-    // Rebuild + re-sign the indexes of every rpm/deb repo retention touched,
-    // under the same per-repo publish lock the handlers use. Fail-open per
-    // repo: a failed rebuild logs loudly and the next publish/reindex heals
-    // it; the deletions themselves are already durable.
-    for (fmt, repo) in &regen {
-        let is_rpm = matches!(
-            crate::registry_type::RegistryType::from_str_opt(fmt),
-            Some(crate::registry_type::RegistryType::Rpm)
+    if delete_failures > 0 {
+        tracing::warn!(
+            versions = delete_failures,
+            "Retention: the store refused deletes; the keys are in the warnings above"
         );
-        let lock_key = if is_rpm {
-            format!("rpm/{repo}/repodata/repomd.xml")
-        } else {
-            format!("deb/{repo}/Release")
-        };
-        let lock = crate::acquire_publish_lock(publish_locks, &lock_key);
-        let _guard = lock.lock().await;
-        let result: Result<(), String> = match *fmt {
-            #[cfg(feature = "rpm")]
-            "rpm" => crate::registry::rpm::regenerate_repodata(storage, signer, repo).await,
-            #[cfg(feature = "deb")]
-            "deb" => crate::registry::deb::regenerate_indexes(storage, signer, repo).await,
-            // Unreachable in practice: a compiled-out format is never collected above.
-            _ => Err(format!("{fmt} support is not compiled into this build")),
-        };
-        if let Err(e) = result {
-            tracing::error!(registry = %fmt, repo = %repo, error = %e, "retention: index regeneration failed — run -/reindex to heal");
-        } else {
-            info!(registry = %fmt, repo = %repo, "retention: indexes regenerated");
-        }
+        RETENTION_DELETE_FAILURES.inc_by(delete_failures as u64);
     }
 
     let duration = start.elapsed().as_secs_f64();
@@ -1109,7 +1091,7 @@ pub async fn run_retention(
     );
 
     if !dry_run {
-        RETENTION_VERSIONS_DELETED.inc_by(total_planned as u64);
+        RETENTION_VERSIONS_DELETED.inc_by(deleted_versions);
         RETENTION_BYTES_FREED.inc_by(total_bytes);
         if total_planned > 0 {
             info!(
@@ -1124,9 +1106,134 @@ pub async fn run_retention(
     RetentionResult {
         planned: total_planned,
         deleted_keys: total_deleted_keys,
+        delete_failures,
         bytes_freed: total_bytes,
         duration_secs: duration,
         plans: all_plans,
+    }
+}
+
+/// Delete the keys of one planned version, in order, each under its publish lock (so a
+/// publish of the same key is not deleted under). `keys` opens with the artifact. When the
+/// store refuses that delete nothing else of the version is touched: a sidecar deleted while
+/// its artifact stayed would leave a file retention can no longer see. Once the artifact is
+/// gone every other key is attempted, refused or not: what is left then describes nothing, and
+/// a version document left behind would be put back into the index. A key already gone is not
+/// a refusal. Returns how many keys are gone.
+async fn delete_plan(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    plan: &DeletionPlan,
+) -> usize {
+    let mut deleted = 0;
+    for key in &plan.keys {
+        let lock = crate::acquire_publish_lock(publish_locks, key);
+        let _guard = lock.lock().await;
+        match storage.delete(key).await {
+            Ok(()) | Err(crate::storage::StorageError::NotFound) => deleted += 1,
+            Err(e) => {
+                tracing::warn!(key = %key, version = %plan.version_name, error = %e,
+                    "Retention: delete failed");
+                if deleted == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    deleted
+}
+
+/// Reconcile the packument of an npm package retention just removed `retired` from, for the
+/// same reason the rpm/deb rebuild exists: the index is derived, and
+/// leaving it describing deleted artifacts makes the registry promise
+/// versions it can no longer serve (#961). A published package is regenerated
+/// from `versions/`; a dangling dist-tag pointer is dropped first, so the
+/// regenerated `latest` is derived from what survives rather than pointing at
+/// a retired version. A proxied package has no `versions/` keys: the retired
+/// versions are removed from its cached upstream packument instead.
+///
+/// Fail-open: a failed regeneration logs and the next publish or
+/// read heals it (a read rebuilds a *missing* packument, #956); the
+/// deletions themselves are already durable.
+async fn reconcile_npm_package(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    package: &str,
+    retired: &std::collections::BTreeSet<String>,
+) {
+    let lock_key = crate::registry::npm::package_lock_key(package);
+    let lock = crate::acquire_publish_lock(publish_locks, &lock_key);
+    let _guard = lock.lock().await;
+
+    let dist_tags_prefix = format!("npm/{package}/dist-tags/");
+    // Which versions survive is read off one listing: a `stat` that failed would read as
+    // "retired" and drop a live tag. No listing, no tag dropped.
+    let versions: Option<std::collections::HashSet<String>> = storage
+        .list(&format!("npm/{package}/versions/"))
+        .await
+        .ok()
+        .map(|keys| keys.into_iter().collect());
+    for tag_key in storage.list(&dist_tags_prefix).await.unwrap_or_default() {
+        let Ok(data) = storage.get(&tag_key).await else {
+            continue;
+        };
+        let Ok(version) = String::from_utf8(data.to_vec()) else {
+            continue;
+        };
+        let version_key = format!("npm/{package}/versions/{}.json", version.trim());
+        if versions.as_ref().is_some_and(|v| !v.contains(&version_key))
+            && storage.delete(&tag_key).await.is_ok()
+        {
+            info!(package = %package, tag = %tag_key, version = %version.trim(),
+                "retention: dropped dist-tag pointing at a retired version");
+        }
+    }
+
+    match crate::registry::npm::reconcile_packument_after_retention(storage, package, retired).await
+    {
+        Ok(()) => {
+            info!(registry = "npm", package = %package, "retention: packument reconciled")
+        }
+        Err(e) => tracing::error!(registry = "npm", package = %package, error = %e,
+            "retention: packument reconciliation failed — the next publish or read heals it"),
+    }
+}
+
+/// Rebuild + re-sign the indexes of an rpm/deb repo retention touched,
+/// under the same per-repo publish lock the handlers use. Fail-open: a failed rebuild logs
+/// loudly and the next publish/reindex heals it; the deletions themselves are already durable.
+async fn regenerate_repo_indexes(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    #[cfg_attr(not(any(feature = "rpm", feature = "deb")), allow(unused_variables))] signer: Option<
+        &crate::signing::RepoSigner,
+    >,
+    fmt: &'static str,
+    repo: &str,
+) {
+    let is_rpm = matches!(
+        crate::registry_type::RegistryType::from_str_opt(fmt),
+        Some(crate::registry_type::RegistryType::Rpm)
+    );
+    let lock_key = if is_rpm {
+        format!("rpm/{repo}/repodata/repomd.xml")
+    } else {
+        format!("deb/{repo}/Release")
+    };
+    let lock = crate::acquire_publish_lock(publish_locks, &lock_key);
+    let _guard = lock.lock().await;
+    let result: Result<(), String> = match fmt {
+        #[cfg(feature = "rpm")]
+        "rpm" => crate::registry::rpm::regenerate_repodata(storage, signer, repo).await,
+        #[cfg(feature = "deb")]
+        "deb" => crate::registry::deb::regenerate_indexes(storage, signer, repo).await,
+        // Unreachable in practice: a compiled-out format is never collected above.
+        _ => Err(format!("{fmt} support is not compiled into this build")),
+    };
+    if let Err(e) = result {
+        tracing::error!(registry = %fmt, repo = %repo, error = %e, "retention: index regeneration failed — run -/reindex to heal");
+    } else {
+        info!(registry = %fmt, repo = %repo, "retention: indexes regenerated");
     }
 }
 
@@ -1165,6 +1272,17 @@ mod tests {
     use super::*;
     use sha2::Digest as _;
     use std::sync::Arc;
+
+    /// R4-T04: the local directory and the in-process object store (the S3 code path).
+    pub(super) fn both_backends() -> [(Option<tempfile::TempDir>, Storage); 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let local = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        [(Some(dir), local), (None, object_store())]
+    }
+
+    pub(super) fn object_store() -> Storage {
+        Storage::from_backend(Arc::new(crate::storage::ObjectStorage::in_memory()))
+    }
 
     fn test_publish_locks() -> PublishLocks {
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
@@ -1958,9 +2076,12 @@ mod tests {
     /// (only ceil(3/2) = 2 tags survived).
     #[tokio::test]
     async fn test_docker_keep_last_correct_with_digests() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        for (_dir, storage) in both_backends() {
+            test_docker_keep_last_correct_with_digests_on(storage).await;
+        }
+    }
 
+    async fn test_docker_keep_last_correct_with_digests_on(storage: Storage) {
         for (i, tag) in ["v1", "v2", "v3", "v4"].iter().enumerate() {
             let manifest = serde_json::json!({"tag": tag, "i": i});
             let body = serde_json::to_vec(&manifest).unwrap();
@@ -2058,9 +2179,12 @@ mod tests {
     /// must still count 4 tags and delete 1, not be confused by the shared digest.
     #[tokio::test]
     async fn test_docker_tag_aliasing_keep_last() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        for (_dir, storage) in both_backends() {
+            test_docker_tag_aliasing_keep_last_on(storage).await;
+        }
+    }
 
+    async fn test_docker_tag_aliasing_keep_last_on(storage: Storage) {
         let body = b"{\"shared\": true}";
         let digest = format!(
             "sha256:{}",
@@ -2103,9 +2227,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_retention_maven_keep_last() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        for (_dir, storage) in both_backends() {
+            test_retention_maven_keep_last_on(storage).await;
+        }
+    }
 
+    async fn test_retention_maven_keep_last_on(storage: Storage) {
         // Create 3 Maven versions (same mtime is fine — tiebreaker is name desc)
         storage
             .put("maven/com/example/lib/1.0/lib-1.0.jar", b"v1")
@@ -2272,9 +2399,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_retention_go_keep_last() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        for (_dir, storage) in both_backends() {
+            test_retention_go_keep_last_on(storage).await;
+        }
+    }
 
+    async fn test_retention_go_keep_last_on(storage: Storage) {
         // 3 Go module versions with .info, .mod, .zip each
         for ver in &["v1.0.0", "v2.0.0", "v3.0.0"] {
             storage
@@ -2326,8 +2456,291 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod format_retention_tests {
     use super::*;
-    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use crate::test_helpers::{
+        body_bytes, create_test_context, create_test_context_with_storage, op_counting_storage,
+        outage_storage, send,
+    };
     use axum::http::{Method, StatusCode};
+
+    /// R4-T04: a registry over the local directory, and one over the in-process object store.
+    fn both_contexts() -> [crate::test_helpers::TestContext; 2] {
+        [
+            create_test_context(),
+            create_test_context_with_storage(super::tests::object_store()),
+        ]
+    }
+
+    const DAY: u64 = 86_400;
+
+    fn locks() -> PublishLocks {
+        std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    async fn put_all(storage: &Storage, keys: &[&str]) {
+        for key in keys {
+            storage.put(key, b"0123456789").await.unwrap();
+        }
+    }
+
+    async fn keys_under(storage: &Storage, prefix: &str) -> Vec<String> {
+        let mut keys = storage.list(prefix).await.unwrap();
+        keys.sort();
+        keys
+    }
+
+    /// One fresh version in each registry whose age used to come from a `stat` per key.
+    const FRESH: [&str; 7] = [
+        "cargo/serde/1.0.0/serde-1.0.0.crate",
+        "docker/app/manifests/v1.json",
+        "go/example.com/mod/@v/v1.0.0.info",
+        "go/example.com/mod/@v/v1.0.0.zip",
+        "maven/g/a/1.0/a-1.0.jar",
+        "npm/@corp/foo/tarballs/foo-1.0.0.tgz",
+        "pypi/p/p-1.0.tar.gz",
+    ];
+
+    /// R4-C02: a `stat` that fails (a HEAD that timed out) is not "modified at time 0". A
+    /// version stored a moment ago is not older than 30 days, whatever `stat` answers.
+    #[tokio::test]
+    async fn a_failed_stat_does_not_make_a_fresh_version_old() {
+        let (storage, outage) = outage_storage();
+        put_all(&storage, &FRESH).await;
+        outage.fail_stats_of("");
+
+        for rules in [
+            vec![rule("*", None, None, Some(30))],
+            vec![rule("*", None, Some(0), Some(30))],
+        ] {
+            let result = run_retention(&storage, &locks(), None, &rules, false).await;
+            assert_eq!(result.planned, 0, "{:?}", result.plans);
+        }
+        assert_eq!(keys_under(&storage, "").await, FRESH);
+    }
+
+    /// R4-T04: the age rule on the object store, from the times its listing reports: 40 days
+    /// old is past a 30-day rule and inside a 60-day one.
+    #[tokio::test]
+    async fn the_age_rule_reads_the_object_store_listing() {
+        let (storage, outage) = outage_storage();
+        put_all(&storage, &FRESH).await;
+        outage.age_all(40 * DAY);
+
+        let kept = [rule("*", None, None, Some(60))];
+        let result = run_retention(&storage, &locks(), None, &kept, false).await;
+        assert_eq!(result.planned, 0);
+
+        let due = [rule("*", None, None, Some(30))];
+        let result = run_retention(&storage, &locks(), None, &due, false).await;
+        assert_eq!((result.planned, result.delete_failures), (6, 0));
+        assert_eq!(result.deleted_keys, FRESH.len());
+        assert_eq!(keys_under(&storage, "").await, Vec::<String>::new());
+    }
+
+    /// R4-T04: a registry whose listing fails is left alone and counted; the others are
+    /// still pruned.
+    #[tokio::test]
+    async fn a_failed_listing_keeps_its_registry() {
+        let (storage, outage) = outage_storage();
+        let docker = [
+            "docker/app/manifests/v1.json",
+            "docker/app/manifests/v2.json",
+        ];
+        put_all(&storage, &docker).await;
+        put_all(
+            &storage,
+            &["maven/g/a/1.0/a-1.0.jar", "maven/g/a/2.0/a-2.0.jar"],
+        )
+        .await;
+        outage.fail_listings_of("docker/");
+        let before = RETENTION_SKIPPED_UNKNOWN.get();
+
+        let rules = [rule("*", None, Some(1), None)];
+        let result = run_retention(&storage, &locks(), None, &rules, false).await;
+
+        assert_eq!(result.planned, 1);
+        assert!(RETENTION_SKIPPED_UNKNOWN.get() > before);
+        outage.end();
+        assert_eq!(keys_under(&storage, "docker/").await, docker);
+        assert_eq!(
+            keys_under(&storage, "maven/").await,
+            ["maven/g/a/2.0/a-2.0.jar"]
+        );
+    }
+
+    /// R4-C14: a delete the store refuses keeps the rest of that version (its sidecars would
+    /// otherwise go while the artifact stays), is reported and metered, is not counted as
+    /// deleted, and does not stop the versions after it.
+    #[tokio::test]
+    async fn a_refused_delete_keeps_the_rest_of_the_version() {
+        let (storage, outage) = outage_storage();
+        let v1 = [
+            "npm/foo/tarballs/foo-1.0.0.tgz",
+            "npm/foo/tarballs/foo-1.0.0.tgz.sha256",
+        ];
+        put_all(&storage, &v1).await;
+        put_all(
+            &storage,
+            &[
+                "npm/foo/tarballs/foo-2.0.0.tgz",
+                "npm/foo/tarballs/foo-2.0.0.tgz.sha256",
+                "npm/foo/tarballs/foo-3.0.0.tgz",
+            ],
+        )
+        .await;
+        outage.fail_deletes_of("foo-1.0.0.tgz");
+        let before = RETENTION_DELETE_FAILURES.get();
+
+        let rules = [rule("npm", None, Some(1), None)];
+        let result = run_retention(&storage, &locks(), None, &rules, false).await;
+
+        assert_eq!((result.planned, result.delete_failures), (2, 1));
+        assert_eq!(result.deleted_keys, 2, "2.0.0 and its checksum");
+        assert_eq!(result.bytes_freed, 10, "only the version that went");
+        assert!(RETENTION_DELETE_FAILURES.get() > before);
+        assert_eq!(
+            keys_under(&storage, "npm/foo/tarballs/").await,
+            [v1[0], v1[1], "npm/foo/tarballs/foo-3.0.0.tgz"]
+        );
+    }
+
+    /// R4-C14: once the artifact is gone the rest of the version is attempted even when one
+    /// delete in the middle is refused, so the version document does not outlive the tarball
+    /// (the packument is rebuilt from the documents).
+    #[tokio::test]
+    async fn a_refused_sidecar_delete_does_not_keep_the_version_document() {
+        let (storage, outage) = outage_storage();
+        put_all(
+            &storage,
+            &[
+                "npm/foo/tarballs/foo-1.0.0.tgz",
+                "npm/foo/tarballs/foo-1.0.0.tgz.sha256",
+                "npm/foo/versions/1.0.0.json",
+                "npm/foo/tarballs/foo-2.0.0.tgz",
+                "npm/foo/versions/2.0.0.json",
+            ],
+        )
+        .await;
+        outage.fail_deletes_of(".sha256");
+
+        let rules = [rule("npm", None, Some(1), None)];
+        let result = run_retention(&storage, &locks(), None, &rules, false).await;
+
+        assert_eq!((result.planned, result.delete_failures), (1, 1));
+        assert_eq!(
+            result.deleted_keys, 2,
+            "the tarball and its version document"
+        );
+        assert_eq!(
+            keys_under(&storage, "npm/foo/versions/").await,
+            ["npm/foo/versions/2.0.0.json"]
+        );
+    }
+
+    /// R4-C02: without the listing of the provenance sidecars a retired tarball would leave
+    /// its sidecar where no later pass finds it, so npm is left alone and the skip is counted.
+    #[tokio::test]
+    async fn npm_is_left_alone_when_its_provenance_sidecars_cannot_be_listed() {
+        let (storage, outage) = outage_storage();
+        let tarballs = [
+            "npm/foo/tarballs/foo-1.0.0.tgz",
+            "npm/foo/tarballs/foo-2.0.0.tgz",
+        ];
+        put_all(&storage, &tarballs).await;
+        outage.fail_listings_of(&crate::registry::npm::origin_key("npm/"));
+        let before = RETENTION_SKIPPED_UNKNOWN.get();
+
+        let rules = [rule("npm", None, Some(1), None)];
+        let result = run_retention(&storage, &locks(), None, &rules, false).await;
+
+        assert_eq!(result.planned, 0);
+        assert!(RETENTION_SKIPPED_UNKNOWN.get() > before);
+        assert_eq!(keys_under(&storage, "npm/").await, tarballs);
+    }
+
+    /// R4-C14: a key that is already gone is not a refusal: the rest of the version (here a
+    /// sidecar left by a pass that was interrupted) is still deleted.
+    #[cfg(feature = "rpm")]
+    #[tokio::test]
+    async fn a_sidecar_whose_package_is_already_gone_is_deleted() {
+        for ctx in both_contexts() {
+            let storage = &ctx.state.storage;
+            for v in ["1.0", "2.0"] {
+                let put = format!("/rpm/prod/pkg-{v}.rpm");
+                let r = send(&ctx.app, Method::PUT, &put, build_rpm("pkg", v)).await;
+                assert_eq!(r.status(), StatusCode::CREATED);
+            }
+            let old: Vec<String> = keys_under(storage, "rpm/prod/")
+                .await
+                .into_iter()
+                .filter(|key| key.contains("pkg-1.0") && key.ends_with(".rpm"))
+                .collect();
+            assert_eq!(old.len(), 1, "{old:?}");
+            storage.delete(&old[0]).await.unwrap();
+
+            let rules = [rule("rpm", None, Some(1), None)];
+            let result =
+                run_retention(storage, &ctx.state.publish_locks, None, &rules, false).await;
+
+            assert_eq!((result.planned, result.delete_failures), (1, 0));
+            let left = keys_under(storage, "rpm/prod/").await;
+            assert!(!left.iter().any(|key| key.contains("pkg-1.0")), "{left:?}");
+        }
+    }
+
+    /// R4-C14: the index of what retention pruned is brought in line right after its group,
+    /// before the pass deletes anything of the next package or repository. A pass cut short
+    /// (SIGTERM gives it 10 s) then leaves at most one index behind, not all of them.
+    #[tokio::test]
+    async fn an_index_is_reconciled_before_the_next_group_is_pruned() {
+        let (storage, counts) = op_counting_storage();
+        let ctx = create_test_context_with_storage(storage.clone());
+        for package in ["aaa", "zzz"] {
+            for version in ["1.0.0", "2.0.0"] {
+                publish_npm(&ctx, package, version).await;
+            }
+        }
+        #[cfg(feature = "rpm")]
+        for repo in ["first", "second"] {
+            for v in ["1.0", "2.0"] {
+                let put = format!("/rpm/{repo}/pkg-{v}.rpm");
+                let r = send(&ctx.app, Method::PUT, &put, build_rpm("pkg", v)).await;
+                assert_eq!(r.status(), StatusCode::CREATED);
+            }
+        }
+        let rpm_old: Vec<String> = keys_under(&storage, "rpm/second/")
+            .await
+            .into_iter()
+            .filter(|key| key.contains("pkg-1.0") && key.ends_with(".rpm"))
+            .collect();
+        counts.reset();
+
+        let rules = [rule("*", None, Some(1), None)];
+        let result = run_retention(
+            &storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            false,
+        )
+        .await;
+        assert_eq!(result.delete_failures, 0);
+
+        let at = |method: &str, key: &str| {
+            counts
+                .position(method, key)
+                .unwrap_or_else(|| panic!("no {method} of {key}: {:?}", counts.snapshot()))
+        };
+        assert!(
+            at("put", "npm/aaa/metadata.json") < at("delete", "npm/zzz/tarballs/zzz-1.0.0.tgz"),
+            "the packument of aaa is rewritten before zzz is pruned"
+        );
+        #[cfg(feature = "rpm")]
+        assert!(
+            at("put", "rpm/first/repodata/repomd.xml") < at("delete", &rpm_old[0]),
+            "the repodata of the first repo is rebuilt before the second is pruned"
+        );
+        let _ = rpm_old;
+    }
 
     fn rule(
         registry: &str,
@@ -2390,7 +2803,13 @@ mod format_retention_tests {
     /// no ghosts advertised.
     #[tokio::test]
     async fn test_rpm_retention_deletes_and_regenerates() {
-        let ctx = create_test_context();
+        for ctx in both_contexts() {
+            test_rpm_retention_deletes_and_regenerates_on(ctx).await;
+        }
+    }
+
+    #[cfg(feature = "rpm")]
+    async fn test_rpm_retention_deletes_and_regenerates_on(ctx: crate::test_helpers::TestContext) {
         for v in ["1.0", "2.0", "3.0"] {
             let r = send(
                 &ctx.app,
@@ -2515,7 +2934,13 @@ mod format_retention_tests {
     /// signatures follow the deletion.
     #[tokio::test]
     async fn test_deb_retention_deletes_and_regenerates() {
-        let ctx = create_test_context();
+        for ctx in both_contexts() {
+            test_deb_retention_deletes_and_regenerates_on(ctx).await;
+        }
+    }
+
+    #[cfg(feature = "deb")]
+    async fn test_deb_retention_deletes_and_regenerates_on(ctx: crate::test_helpers::TestContext) {
         for v in ["1.0", "2.0"] {
             let deb = crate::registry::deb::test_fixtures::build_deb("pkg", v);
             let r = send(
@@ -2608,7 +3033,12 @@ mod format_retention_tests {
     /// their sidecars) are kept or retired together; project bookkeeping is never a release.
     #[tokio::test]
     async fn test_pypi_retention_keeps_whole_releases() {
-        let ctx = crate::test_helpers::create_test_context();
+        for ctx in both_contexts() {
+            test_pypi_retention_keeps_whole_releases_on(ctx).await;
+        }
+    }
+
+    async fn test_pypi_retention_keeps_whole_releases_on(ctx: crate::test_helpers::TestContext) {
         let storage = &ctx.state.storage;
         let marker_root = crate::registry::PYPI_HASH_MARKER_PREFIX;
         let release = |v: &str| {
@@ -2673,9 +3103,16 @@ mod format_retention_tests {
     /// A retired PyPI file takes its hash markers with it; a surviving file keeps its own.
     #[tokio::test]
     async fn test_pypi_retention_deletes_hash_markers_with_files() {
+        for ctx in both_contexts() {
+            test_pypi_retention_deletes_hash_markers_with_files_on(ctx).await;
+        }
+    }
+
+    async fn test_pypi_retention_deletes_hash_markers_with_files_on(
+        ctx: crate::test_helpers::TestContext,
+    ) {
         use sha2::Digest as _;
 
-        let ctx = crate::test_helpers::create_test_context();
         let storage = &ctx.state.storage;
         let marker_root = crate::registry::PYPI_HASH_MARKER_PREFIX;
         let files: Vec<String> = (1..=4)
@@ -2791,7 +3228,14 @@ mod format_retention_tests {
 
     #[tokio::test]
     async fn test_npm_retention_packument_matches_storage() {
-        let ctx = create_test_context();
+        for ctx in both_contexts() {
+            test_npm_retention_packument_matches_storage_on(ctx).await;
+        }
+    }
+
+    async fn test_npm_retention_packument_matches_storage_on(
+        ctx: crate::test_helpers::TestContext,
+    ) {
         for version in ["1.0.1", "1.0.2", "1.0.3", "1.0.4"] {
             publish_npm(&ctx, "rettest", version).await;
         }
@@ -2847,7 +3291,12 @@ mod format_retention_tests {
     /// A dist-tag must never point at a version that retention removed.
     #[tokio::test]
     async fn test_npm_retention_drops_dangling_dist_tag() {
-        let ctx = create_test_context();
+        for ctx in both_contexts() {
+            test_npm_retention_drops_dangling_dist_tag_on(ctx).await;
+        }
+    }
+
+    async fn test_npm_retention_drops_dangling_dist_tag_on(ctx: crate::test_helpers::TestContext) {
         for version in ["1.0.1", "1.0.2", "1.0.3"] {
             publish_npm(&ctx, "tagtest", version).await;
         }

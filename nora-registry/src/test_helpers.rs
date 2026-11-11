@@ -609,6 +609,13 @@ impl OpCounts {
             .count()
     }
 
+    /// Where in the order of counted calls the first `method` on exactly `key` is, to assert
+    /// that one storage call came before another.
+    pub fn position(&self, method: &str, key: &str) -> Option<usize> {
+        let log = self.log.lock().unwrap();
+        log.iter().position(|(m, k)| *m == method && k == key)
+    }
+
     /// Make every put to a key ending with `suffix` fail (`None`: none), to drive a
     /// handler's storage-failure branch.
     pub fn fail_puts_ending(&self, suffix: Option<&str>) {
@@ -846,6 +853,12 @@ struct Faults {
     reads: Vec<(String, ReadFault)>,
     /// Prefixes whose listings fail.
     listings: Vec<String>,
+    /// Key suffixes whose `stat` finds nothing, as a HEAD that timed out does.
+    stats: Vec<String>,
+    /// Key suffixes whose delete fails.
+    deletes: Vec<String>,
+    /// Seconds every object's reported modification time lies in the past.
+    age_secs: u64,
 }
 
 /// How the read of a key fails.
@@ -907,6 +920,42 @@ impl StorageOutage {
     /// read answer.
     pub fn fail_listings_of(&self, prefix: &str) {
         self.faults().listings.push(prefix.to_string());
+    }
+
+    /// Make `stat` find nothing for the keys ending with `suffix` (every key for `""`); listings
+    /// and reads answer.
+    pub fn fail_stats_of(&self, suffix: &str) {
+        self.faults().stats.push(suffix.to_string());
+    }
+
+    /// Fail the deletes of the keys ending with `suffix` with a network error.
+    pub fn fail_deletes_of(&self, suffix: &str) {
+        self.faults().deletes.push(suffix.to_string());
+    }
+
+    /// Report every object as last modified `secs` ago: an in-memory store stamps "now", and
+    /// age-based cleanup needs old objects.
+    pub fn age_all(&self, secs: u64) {
+        self.faults().age_secs = secs;
+    }
+
+    fn aged(&self, mut meta: crate::storage::FileMeta) -> crate::storage::FileMeta {
+        meta.modified = meta.modified.saturating_sub(self.faults().age_secs);
+        meta
+    }
+
+    fn stat_fails(&self, key: &str) -> bool {
+        self.faults()
+            .stats
+            .iter()
+            .any(|s| key.ends_with(s.as_str()))
+    }
+
+    fn delete_fails(&self, key: &str) -> bool {
+        self.faults()
+            .deletes
+            .iter()
+            .any(|s| key.ends_with(s.as_str()))
     }
 
     /// Bring the store back and clear every fault: operations waiting on a silent store go on,
@@ -1025,6 +1074,9 @@ impl crate::storage::StorageBackend for OutageBackend {
     async fn delete(&self, key: &str) -> crate::storage::Result<()> {
         self.outage.wait_answer().await;
         self.check()?;
+        if self.outage.delete_fails(key) {
+            return Err(network_error());
+        }
         self.inner.delete(key).await
     }
 
@@ -1039,7 +1091,10 @@ impl crate::storage::StorageBackend for OutageBackend {
     async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
         self.outage.wait_answer().await;
         self.check().ok()?;
-        self.inner.stat(key).await
+        if self.outage.stat_fails(key) {
+            return None;
+        }
+        self.inner.stat(key).await.map(|m| self.outage.aged(m))
     }
 
     async fn list_with_meta(
@@ -1050,7 +1105,11 @@ impl crate::storage::StorageBackend for OutageBackend {
         if self.outage.listing_fails(prefix) {
             return Err(network_error());
         }
-        self.inner.list_with_meta(prefix).await
+        let entries = self.inner.list_with_meta(prefix).await?;
+        Ok(entries
+            .into_iter()
+            .map(|(key, meta)| (key, self.outage.aged(meta)))
+            .collect())
     }
 
     async fn health_check(&self) -> bool {

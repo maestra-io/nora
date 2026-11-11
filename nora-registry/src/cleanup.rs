@@ -20,6 +20,10 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+/// What a pass with a zero interval waits between two runs. Config validation refuses an
+/// interval of 0 for an enabled pass; this floor holds for any caller.
+const ZERO_INTERVAL_FLOOR: Duration = Duration::from_secs(1);
+
 pub(crate) struct CleanupPass {
     pub name: &'static str,
     pub interval: Duration,
@@ -93,6 +97,12 @@ pub(crate) async fn run_cleanup_scheduler(
                         "cleanup pass panicked — continuing with remaining passes"
                     );
                 }
+                // A zero interval would make the pass due again the moment it ends, and the
+                // scheduler a busy loop under the lock: its floor counts from the end of the
+                // pass, however long the pass took.
+                if pass.interval.is_zero() {
+                    due[i] = Instant::now() + ZERO_INTERVAL_FLOOR;
+                }
             }
 
             drop(guard);
@@ -152,6 +162,41 @@ mod tests {
             assert!(Instant::now() < deadline, "only recorded {seen:?}");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// R4-C13: a pass with a zero interval is not due again the moment it ends. Without the
+    /// floor the scheduler spins and the pass cancels it after 100 runs within one instant.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_interval_is_not_a_busy_loop() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancel = CancellationToken::new();
+        let pass = {
+            let (runs, cancel) = (runs.clone(), cancel.clone());
+            CleanupPass {
+                name: "gc",
+                interval: Duration::ZERO,
+                run: Box::new(move || {
+                    if runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 100 {
+                        cancel.cancel();
+                    }
+                    // Longer than the floor: the wait counts from the end of the pass.
+                    tokio::time::sleep(Duration::from_secs(2)).boxed()
+                }),
+            }
+        };
+        let handle = spawn_cleanup_scheduler(
+            vec![pass],
+            Arc::new(tokio::sync::Mutex::new(())),
+            cancel.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(7500)).await;
+        cancel.cancel();
+        handle.await.unwrap();
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "at 0 s, 3 s and 6 s: two seconds of pass, then one second of floor"
+        );
     }
 
     /// The first cycle runs at boot and chains retention → GC in order.

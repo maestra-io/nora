@@ -81,6 +81,8 @@ with `registry=~"pypi(:.*)?"`, not `registry="pypi"`.
 | `nora_retention_bytes_freed_total` | counter | — | Bytes freed by retention |
 | `nora_retention_duration_seconds` | histogram | — | Retention sweep duration |
 | `nora_retention_last_run_timestamp` | gauge | — | Unix timestamp of last retention run |
+| `nora_retention_skipped_unknown_total` | counter | — | Listings retention could not read, plus versions whose age it could not read. All of them were kept; nonzero means the rules are not enforced there |
+| `nora_retention_delete_failures_total` | counter | — | Planned versions with at least one delete the store refused: the version stays whole when its artifact could not be deleted, else a sidecar is left behind; the log names the keys |
 
 ### Garbage Collection
 
@@ -91,6 +93,10 @@ with `registry=~"pypi(:.*)?"`, not `registry="pypi"`.
 | `nora_gc_duration_seconds` | histogram | — | GC sweep duration |
 | `nora_gc_last_run_timestamp` | gauge | — | Unix timestamp of last GC run |
 | `nora_gc_metadata_phantoms_total` | counter | — | Metadata entries without corresponding blobs |
+| `nora_gc_stat_failures_total` | counter | — | Orphans GC could not stat; kept, age unknown |
+| `nora_gc_docker_mark_failures_total` | counter | — | Docker sweeps skipped because the manifest graph could not be read |
+| `nora_gc_list_failures_total` | counter | — | Listings GC could not read; everything they cover was kept for the pass. Nonzero means that space is not reclaimed |
+| `nora_gc_delete_failures_total` | counter | — | Deletes GC or proxy-cache eviction attempted that the store refused; the object is still there |
 
 ### Background tasks
 
