@@ -670,7 +670,11 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
             || (path == "/metrics" && config.public_metrics);
         // Probes and metrics never validate credentials: a Basic header there
         // would buy any client an unlimited, unauthenticated bcrypt per request.
-        let is_probe = matches!(path, "/health" | "/ready" | "/metrics");
+        // Nor do the redirect at `/` and the static assets: their handlers use no
+        // identity and sit behind no rate limiter, so a token there would buy an
+        // unlimited storage read per request.
+        let no_identity =
+            matches!(path, "/health" | "/ready" | "/metrics" | "/") || is_static_asset(path);
         if open {
             // Opportunistic auth: if the caller provided credentials on an
             // open path, try to validate them so downstream handlers can
@@ -681,7 +685,7 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
                 .headers()
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|h| h.to_str().ok())
-                .filter(|_| !is_probe)
+                .filter(|_| !no_identity)
             {
                 if let Some(encoded) = auth_val.strip_prefix("Basic ") {
                     // No bcrypt here (an open path has no lockout and no limiter): an
@@ -792,9 +796,12 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
     let has_auth_header = request.headers().contains_key(header::AUTHORIZATION);
 
     // Anonymous read for non-Docker registries (Maven/raw/npm/…) if configured.
-    // Token management, whoami, admin, and all Docker `/v2` paths are excluded.
+    // Token management, whoami, admin, and all Docker `/v2` paths are excluded,
+    // and so is /metrics: here it is closed (`public_metrics = false`; an open one
+    // was served above), and `anonymous_read` opens registry reads, not metrics.
     if state.config.auth.anonymous_read
         && (is_read_method || is_npm_audit)
+        && path != "/metrics"
         && !is_docker
         && !is_token_management
         && !is_whoami
@@ -3357,6 +3364,152 @@ mod integration_tests {
             probe_took < one_check / 2,
             "the probe waited for bcrypt: {probe_took:?} (one check {one_check:?})"
         );
+    }
+
+    /// R4-C09: `public_metrics = false` closes /metrics to everything but real
+    /// credentials. `anonymous_read` opens registry reads, not metrics, whatever
+    /// Authorization header the request carries.
+    #[tokio::test]
+    async fn anonymous_read_does_not_open_closed_metrics() {
+        let ctx = create_test_context_with_auth_and_config(&[("admin", "secret")], |c| {
+            c.auth.anonymous_read = true;
+            c.auth.public_metrics = false;
+        });
+        let get = |authorization: Option<String>| {
+            let app = ctx.app.clone();
+            async move {
+                let headers: Vec<(&str, &str)> = authorization
+                    .as_deref()
+                    .map(|value| ("authorization", value))
+                    .into_iter()
+                    .collect();
+                send_with_headers(&app, Method::GET, "/metrics", headers, Vec::new())
+                    .await
+                    .status()
+            }
+        };
+        assert_eq!(get(None).await, StatusCode::UNAUTHORIZED);
+        for bogus in [
+            basic_header("x", "y"),
+            "Bearer nra_0123456789abcdef0123456789abcdef".to_owned(),
+            "Bearer not-a-token".to_owned(),
+            "Negotiate abc".to_owned(),
+        ] {
+            assert_eq!(
+                get(Some(bogus.clone())).await,
+                StatusCode::UNAUTHORIZED,
+                "{bogus}"
+            );
+        }
+        assert_eq!(
+            get(Some(basic_header("admin", "secret"))).await,
+            StatusCode::OK
+        );
+    }
+
+    /// R4-C18: `/` and the static assets sit behind no rate limiter and their handlers
+    /// use no identity, so a token sent there is not looked up in storage. A gated path
+    /// shows the counter counts.
+    #[tokio::test]
+    async fn a_token_on_the_unlimited_open_paths_costs_no_storage_read() {
+        use sha2::{Digest, Sha256};
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+        let (storage, counts) = op_counting_storage();
+        let mut state = ctx.state.clone();
+        state.tokens = Some(crate::tokens::TokenStore::new(storage));
+        let routes = axum::Router::new()
+            .route("/raw/x", axum::routing::get(|| async { "x" }))
+            .route(
+                "/ui/static/htmx.min.js",
+                axum::routing::get(|| async { "js" }),
+            )
+            .route("/", axum::routing::get(|| async { "root" }));
+        let app = crate::request_layers(routes, &state).with_state(state);
+
+        // A made-up token no store holds, spelled so that no secret scanner reads a key.
+        let token = &format!("nra_{}", "0123456789abcdef".repeat(2));
+        let id = hex::encode(Sha256::digest(token.as_bytes()));
+        let record = format!("{}{}.json", crate::tokens::STORAGE_PREFIX, &id[..16]);
+        for authorization in [format!("Bearer {token}"), basic_header("ci", token)] {
+            for path in ["/", "/ui/static/htmx.min.js"] {
+                let response = send_with_headers(
+                    &app,
+                    Method::GET,
+                    path,
+                    vec![("authorization", &authorization)],
+                    Vec::new(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                assert_eq!(
+                    counts.calls("get", &record),
+                    0,
+                    "{path} read the token store"
+                );
+            }
+        }
+        let authorization = format!("Bearer {token}");
+        let response = send_with_headers(
+            &app,
+            Method::GET,
+            "/raw/x",
+            vec![("authorization", &authorization)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(counts.calls("get", &record), 1, "the counter counts");
+    }
+
+    /// R4-C17: a revoke that cannot reach the store answers 503, never "Token not
+    /// found": the record is still there and the token still works.
+    #[tokio::test]
+    async fn revoke_answers_503_while_the_store_is_down() {
+        use axum::extract::ConnectInfo;
+        use sha2::{Digest, Sha256};
+        use tower::ServiceExt;
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+        let (storage, outage) = outage_storage();
+        let store = crate::tokens::TokenStore::new(storage);
+        let token = store
+            .create_token("alice", 30, None, crate::tokens::Role::Read)
+            .await
+            .unwrap();
+        let id = hex::encode(Sha256::digest(token.as_bytes()));
+        let mut state = ctx.state.clone();
+        state.tokens = Some(store.clone());
+        let app =
+            crate::request_layers(super::token_routes::token_routes(), &state).with_state(state);
+        let revoke = || {
+            let body = format!(
+                r#"{{"username":"alice","password":"alicepw","hash_prefix":"{}"}}"#,
+                &id[..16]
+            );
+            let mut request = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/api/tokens/revoke")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    4000,
+                ))));
+            app.clone().oneshot(request)
+        };
+
+        outage.begin();
+        assert_eq!(
+            revoke().await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        outage.end();
+        assert!(store.verify_token(&token).await.is_ok(), "still valid");
+        assert_eq!(revoke().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(revoke().await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert!(store.verify_token(&token).await.is_err());
     }
 
     /// A password sent for a locked-out username is refused unchecked, so it

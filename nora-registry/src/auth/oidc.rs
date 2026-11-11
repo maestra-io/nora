@@ -291,6 +291,8 @@ impl OidcValidator {
         let mut validation = Validation::new(header.alg);
         validation.set_issuer(&[&provider.issuer]);
         validation.leeway = self.config.leeway_secs;
+        // Off by default in jsonwebtoken: a token is not valid before its `nbf`.
+        validation.validate_nbf = true;
 
         match provider.audience_check() {
             AudienceCheck::Expect(audience) => validation.set_audience(&[audience]),
@@ -310,15 +312,22 @@ impl OidcValidator {
 
         let claims = token_data.claims;
 
-        // Enforce token lifetime ceiling
-        if let (Some(iat), Some(exp)) = (claims.iat, claims.exp) {
-            let lifetime = exp.saturating_sub(iat);
-            if lifetime > provider.max_token_lifetime_secs {
-                return Err(format!(
-                    "Token lifetime {} exceeds max {} for provider {}",
-                    lifetime, provider.max_token_lifetime_secs, provider.name
-                ));
-            }
+        // Enforce token lifetime ceiling. `iat` is optional in some issuers' tokens
+        // (a SPIFFE JWT-SVID requires only sub, aud, exp): without it the token is
+        // held to the ceiling by the lifetime it has left, so a far `exp` is refused
+        // all the same. `exp` is required by the validation above.
+        let iat = claims.iat.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        });
+        let lifetime = claims.exp.unwrap_or(0).saturating_sub(iat);
+        if lifetime > provider.max_token_lifetime_secs {
+            return Err(format!(
+                "Token lifetime {} exceeds max {} for provider {}",
+                lifetime, provider.max_token_lifetime_secs, provider.name
+            ));
         }
 
         // Map claims to role via role_rules
@@ -979,6 +988,63 @@ mod tests {
             identity.max_token_lifetime_secs, 900,
             "ceiling must come from the validating provider, not the disabled same-name decoy"
         );
+    }
+
+    /// R4-C16: a token is refused before its `nbf` (past the leeway), and one without
+    /// `iat` is held to the ceiling by the lifetime it has left. The shape
+    /// GitHub Actions sends (`nbf` some minutes before `iat`) passes.
+    #[tokio::test]
+    async fn test_nbf_is_enforced_and_the_ceiling_holds_without_iat() {
+        use crate::auth::oidc_integration_tests::{TEST_JWKS_JSON, TEST_RSA_PRIVATE_KEY};
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        use wiremock::{matchers::path, Mock, ResponseTemplate};
+
+        let (server, config, _) = mock_issuer(Some("/jwks"), 300).await;
+        Mock::given(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&server)
+            .await;
+        assert_eq!(config.leeway_secs, 60);
+        let v = OidcValidator::new(config, Client::new());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let validate = |extra: serde_json::Value| {
+            let mut claims = serde_json::json!({
+                "iss": server.uri(), "sub": "repo:myorg/app", "aud": "nora", "exp": now + 600,
+            });
+            for (k, val) in extra.as_object().unwrap() {
+                claims[k] = val.clone();
+            }
+            let mut header = Header::new(Algorithm::RS256);
+            header.kid = Some("test-key-1".to_string());
+            let key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
+            let token = encode(&header, &claims, &key).unwrap();
+            let v = &v;
+            async move { v.validate_token(&token).await }
+        };
+
+        let early = validate(serde_json::json!({ "iat": now, "nbf": now + 300 })).await;
+        let err = early.unwrap_err();
+        assert!(err.contains("ImmatureSignature"), "{err}");
+        assert_eq!(classify_rejection(&err), "jwt_invalid");
+        let within_leeway = validate(serde_json::json!({ "iat": now, "nbf": now + 30 })).await;
+        assert!(within_leeway.is_ok(), "{within_leeway:?}");
+        let github = validate(serde_json::json!({ "iat": now, "nbf": now - 600 })).await;
+        assert!(github.is_ok(), "{github:?}");
+
+        // No iat (a JWT-SVID): the lifetime left is held to the 900 s ceiling, so ten
+        // minutes pass and ten years do not.
+        let svid = validate(serde_json::json!({})).await;
+        assert!(svid.is_ok(), "{svid:?}");
+        let ten_years = now + 10 * 365 * 24 * 3600;
+        let err = validate(serde_json::json!({ "exp": ten_years }))
+            .await
+            .unwrap_err();
+        assert_eq!(classify_rejection(&err), "lifetime_exceeded", "{err}");
     }
 
     /// Cold start under load: concurrent requests share one JWKS fetch.

@@ -574,7 +574,8 @@ pub struct OidcProvider {
     /// Allowed JWT algorithms (default: RS256, ES256). Reject all others.
     #[serde(default = "default_oidc_algorithms")]
     pub algorithms: Vec<String>,
-    /// Maximum token lifetime in seconds. Tokens with longer exp-iat are rejected.
+    /// Maximum token lifetime in seconds. Tokens with longer exp-iat are rejected,
+    /// and a token without `iat` is held to it by the lifetime it has left.
     ///
     /// The default (900) fits GitHub Actions, whose tokens are short-lived. GitLab
     /// derives the lifetime from the job timeout — 60 minutes by default — so a
