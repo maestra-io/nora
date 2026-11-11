@@ -2746,6 +2746,7 @@ mod format_retention_tests {
         }
     }
 
+    #[cfg(feature = "rpm")]
     async fn test_rpm_retention_deletes_and_regenerates_on(ctx: crate::test_helpers::TestContext) {
         for v in ["1.0", "2.0", "3.0"] {
             let r = send(
@@ -2876,6 +2877,7 @@ mod format_retention_tests {
         }
     }
 
+    #[cfg(feature = "deb")]
     async fn test_deb_retention_deletes_and_regenerates_on(ctx: crate::test_helpers::TestContext) {
         for v in ["1.0", "2.0"] {
             let deb = crate::registry::deb::test_fixtures::build_deb("pkg", v);
