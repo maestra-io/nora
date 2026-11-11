@@ -114,6 +114,10 @@ syn = { version = "2", default-features = false, features = ["full", "parsing", 
 name = "parsing"
 harness = false
 
+[[bench]]
+name = "hotpath"
+harness = false
+
 [lints]
 workspace = true
 
