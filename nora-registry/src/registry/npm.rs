@@ -2473,18 +2473,78 @@ fn search_names_private(state: &AppState, query: &str) -> bool {
     })
 }
 
-/// [`packument_response`] for a cached upstream document, as [`served_copy`] has it; 404 for a
-/// version manifest whose tarball lies outside the upstream.
-fn served_packument(
+/// What a render of the proxied document at `path` depends on besides the document: the
+/// form asked for, whether `min_release_age` filters it, the base it is served under and
+/// the curation loaded (a reload swaps the snapshot, so its address names it; the render's
+/// minute of life bounds a reused address). The memo key is this and the document's digest.
+fn render_variant(state: &AppState, headers: &HeaderMap, path: &str, filtered: bool) -> String {
+    let curation = state.curation();
+    format!(
+        "{path}\n{}\n{}{}\n{:p}\n",
+        nora_base_url(state),
+        u8::from(wants_install_v1(headers)),
+        u8::from(filtered && curation.curation_engine.metadata_filter_active()),
+        Arc::as_ptr(&*curation),
+    )
+}
+
+/// What NORA serves of the proxied document `data` ([`served_copy`], then
+/// [`packument_body`]), rendered once per document and `variant` and shared by concurrent
+/// and repeated requests ([`crate::packument_memo`]), on the blocking pool: the parse of a
+/// large packument is not run on a runtime worker (R4-P02). `pin` is the document's storage
+/// pin when it was read from storage; without one the document is hashed here.
+async fn shared_render(
     state: &AppState,
     headers: &HeaderMap,
     path: &str,
-    data: Bytes,
     hide: HideYoung<'_>,
-) -> Response {
-    match served_copy(state, path, data) {
-        (Some(data), _) => packument_response(headers, data, &nora_base_url(state), hide),
-        (None, _) => StatusCode::NOT_FOUND.into_response(),
+    variant: &str,
+    data: Bytes,
+    pin: Option<String>,
+) -> crate::packument_memo::Rendered {
+    use crate::packument_memo::Rendered;
+    let digest = match pin {
+        Some(pin) => pin,
+        // ponytail: every follower of a shared refetch hashes its copy; share the digest
+        // with the fetch if a stampede on an expired packument shows up in CPU.
+        None => {
+            let data = data.clone();
+            on_blocking_pool(move || hex::encode(sha2::Sha256::digest(&data))).await
+        }
+    };
+    let name = hide.map(|(_, name)| name.to_string());
+    let (state_, headers, path) = (state.clone(), headers.clone(), path.to_string());
+    let render = move || {
+        let curation = state_.curation();
+        let hide = name
+            .as_deref()
+            .map(|name| (&curation.curation_engine, name));
+        let (served, past_nora) = served_copy(&state_, &path, data);
+        let base = nora_base_url(&state_);
+        Rendered {
+            body: served.map(|data| packument_body(&headers, data, &base, hide)),
+            past_nora,
+        }
+    };
+    state
+        .packument_memo
+        .render(&format!("{variant}{digest}"), || on_blocking_pool(render))
+        .await
+}
+
+/// `work` run on the blocking pool; its panic is this task's.
+async fn on_blocking_pool<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(done) => done,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
+}
+
+/// The response for a rendered proxied document; 404 for one NORA does not serve.
+fn rendered_response(rendered: crate::packument_memo::Rendered) -> Response {
+    match rendered.body {
+        Some(body) => packument_body_response(body),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -2501,18 +2561,30 @@ async fn upstream_metadata(
     cache_key: &str,
     packument: bool,
 ) -> Response {
-    let base = nora_base_url(state);
     let internal = is_internal(state, name);
     let curation = state.curation();
     let hide = (packument && !internal).then_some((&curation.curation_engine, name));
 
     let legacy_key = legacy_cache_key(path);
+    let variant = render_variant(state, headers, path, hide.is_some());
     let mut cached = None;
     for key in [cache_key, legacy_key.as_str()] {
         // #1055: in a scope owned by a private upstream, only what that owner delivered
         // may be served from cache.
         if !cached_copy_trusted(state, path, key, name, None).await {
             continue;
+        }
+        // R4-P02: a render kept for the copy with this pin is served without reading the
+        // copy (39 MB for `vite`), hashing or parsing it again. Not for an internal name:
+        // its copy is read, and fails closed, on every request.
+        let pin = state.storage.pin(key).await;
+        let kept = pin
+            .as_deref()
+            .filter(|_| !internal)
+            .and_then(|pin| state.packument_memo.lookup(&format!("{variant}{pin}")));
+        if let Some(kept) = kept {
+            cached = Some((Ok(kept), key.to_string()));
+            break;
         }
         // Single-flight: a CI fleet asking for one big packument at once reads it from
         // storage once, not once per client — 46 concurrent reads of a 39 MB `vite`
@@ -2544,14 +2616,14 @@ async fn upstream_metadata(
             None
         };
         if let Some(data) = shared {
-            cached = Some((data, key.to_string()));
+            cached = Some((Err((data, pin)), key.to_string()));
             break;
         }
         // A store fault is a retryable 503, never a 404 nor a guess sent upstream; for an
         // internal name a copy failing its pin is a 500 (`cache_read`).
         match cache_read(state.storage.get_verified(key).await, "npm", key, internal) {
             Ok(Some(outcome)) => {
-                cached = Some((verified_data(outcome), key.to_string()));
+                cached = Some((Err((verified_data(outcome), pin)), key.to_string()));
                 break;
             }
             Ok(None) => {}
@@ -2559,10 +2631,16 @@ async fn upstream_metadata(
         }
     }
 
-    if let Some((data, from_key)) = cached {
+    if let Some((copy, from_key)) = cached {
         // A copy holding a link past NORA (cached by a release that kept one) is served placed
         // again, and refetched in full whatever its age: a 304 would keep it as it is.
-        let (served, past_nora) = served_copy(state, path, data);
+        let rendered = match copy {
+            Ok(kept) => kept,
+            Err((data, pin)) => {
+                shared_render(state, headers, path, hide, &variant, data, pin).await
+            }
+        };
+        let past_nora = rendered.past_nora;
         let ttl = state.config.npm.metadata_ttl;
         let fresh = !past_nora
             && match state.storage.stat(&from_key).await {
@@ -2575,10 +2653,7 @@ async fn upstream_metadata(
         // #68 namespace isolation: an internal-namespace package is never revalidated
         // upstream (dependency confusion); it is owned locally.
         if fresh || internal {
-            return match served {
-                Some(data) => packument_response(headers, data, &base, hide),
-                None => StatusCode::NOT_FOUND.into_response(),
-            };
+            return rendered_response(rendered);
         }
         // Single-flight: a CI fleet stampeding one expired packument revalidates it once (#595).
         let refetch = || async {
@@ -2600,16 +2675,17 @@ async fn upstream_metadata(
         // Filtered on the fresh document, `time` included: the cached copy may predate
         // the version it brings (R2-16).
         if let Some(refreshed) = refreshed {
-            return served_packument(state, headers, path, refreshed, hide);
+            return rendered_response(
+                shared_render(state, headers, path, hide, &variant, refreshed, None).await,
+            );
         }
         if state.config.npm.serve_stale {
             tracing::warn!(registry = "npm", path = %path, "npm upstream unavailable, serving stale metadata");
-            let Some(data) = served else {
-                return StatusCode::NOT_FOUND.into_response();
-            };
             // Degraded, but still the representation that was asked for: body and
             // Content-Type must agree here too.
-            let (stale_body, stale_type) = packument_body(headers, data, &base, hide);
+            let Some((stale_body, stale_type)) = rendered.body else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
             return (
                 StatusCode::OK,
                 [
@@ -2624,7 +2700,7 @@ async fn upstream_metadata(
                         HeaderValue::from_static("true"),
                     ),
                 ],
-                stale_body.to_vec(),
+                stale_body,
             )
                 .into_response();
         }
@@ -2686,7 +2762,9 @@ async fn upstream_metadata(
             }
             // The copy cached keeps an upstream's link on its origin; the one served has it
             // on NORA.
-            served_packument(state, headers, path, rewritten, hide)
+            rendered_response(
+                shared_render(state, headers, path, hide, &variant, rewritten, None).await,
+            )
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         // The upstream answered "no such package": a real 404.
@@ -4688,8 +4766,10 @@ fn packument_response(
     nora_base: &str,
     hide: HideYoung<'_>,
 ) -> Response {
-    let (body, content_type) = packument_body(headers, data, nora_base, hide);
+    packument_body_response(packument_body(headers, data, nora_base, hide))
+}
 
+fn packument_body_response((body, content_type): (Bytes, &'static str)) -> Response {
     (
         StatusCode::OK,
         [
@@ -9179,7 +9259,8 @@ mod index_cost_tests {
         ops.reset();
         let resp = send_with_headers(&ctx.app, Method::GET, "/npm/pkg", corgi, "").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(ops.calls("get", meta), 1, "one read: {:?}", ops.snapshot());
+        // R4-P02: the render of the first request is kept, the document is not read again.
+        assert_eq!(ops.calls("get", meta), 0, "no read: {:?}", ops.snapshot());
 
         ops.reset();
         let resp = send(&ctx.app, Method::GET, "/npm/pkg/-/pkg-1.0.0.tgz", "").await;
@@ -15916,5 +15997,76 @@ mod tarball_integrity {
         let requests = up.received_requests().await.unwrap();
         let packuments = requests.iter().filter(|r| r.url.path() == "/pkg").count();
         assert_eq!(packuments, 1, "fetched again once");
+    }
+}
+
+/// R4-P02: a proxied packument is rendered once per stored document and form asked for, and the
+/// render is kept for a minute: a repeated request is answered without reading the document
+/// from storage, a changed document (another pin) is rendered again.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod shared_packument_render {
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_storage_and_config, outage_storage, send_with_headers,
+        StorageOutage, TestContext,
+    };
+    use axum::http::{Method, StatusCode};
+    use wiremock::MockServer;
+
+    const FORMS: [&str; 2] = ["application/json", super::NPM_INSTALL_V1];
+
+    async fn context() -> (MockServer, TestContext, StorageOutage) {
+        let up = MockServer::start().await;
+        super::mount_listing(&up, "pkg", &[("1.0.0", "pkg/-/pkg-1.0.0.tgz")]).await;
+        let uri = up.uri();
+        let (storage, outage) = outage_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, move |c| {
+            c.npm.proxy = Some(uri);
+        });
+        (up, ctx, outage)
+    }
+
+    async fn get(ctx: &TestContext, accept: &str) -> (StatusCode, String, axum::body::Bytes) {
+        let headers = vec![("accept", accept)];
+        let resp = send_with_headers(&ctx.app, Method::GET, "/npm/pkg", headers, "").await;
+        let form = resp.headers()["content-type"].to_str().unwrap().to_string();
+        (resp.status(), form, body_bytes(resp).await)
+    }
+
+    #[tokio::test]
+    async fn a_kept_render_is_served_without_reading_the_document() {
+        let (up, ctx, outage) = context().await;
+        let mut first = Vec::new();
+        for accept in FORMS {
+            let got = get(&ctx, accept).await;
+            assert_eq!((got.0, got.1.as_str()), (StatusCode::OK, accept));
+            first.push(got);
+        }
+        outage.fail_reads_of("upstream/packument.json");
+        for (accept, first) in FORMS.iter().zip(&first) {
+            assert_eq!(&get(&ctx, accept).await, first, "{accept}");
+        }
+        let requests = up.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "the upstream was asked once");
+    }
+
+    #[tokio::test]
+    async fn a_changed_document_is_rendered_again() {
+        let (_up, ctx, _outage) = context().await;
+        let (_, _, before) = get(&ctx, FORMS[0]).await;
+        let key = super::upstream_packument_key("pkg");
+        let stored = ctx.state.storage.get(&key).await.unwrap();
+        let mut doc: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(doc["versions"].as_object().unwrap().len(), 1);
+        doc["versions"]["2.0.0"] = doc["versions"]["1.0.0"].clone();
+        let changed = serde_json::to_vec(&doc).unwrap();
+        ctx.state.storage.put(&key, &changed).await.unwrap();
+        for accept in FORMS {
+            let (status, _, body) = get(&ctx, accept).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_ne!(body, before);
+            let served: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(served["versions"].as_object().unwrap().len(), 2, "{accept}");
+        }
     }
 }

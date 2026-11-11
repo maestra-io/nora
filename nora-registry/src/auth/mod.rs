@@ -4700,6 +4700,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             artifact_flights: crate::proxy_coalesce::InflightMap::new(),
             spool: ctx.state.spool.clone(),
             blob_flights: crate::proxy_coalesce::InflightMap::new(),
+            packument_memo: Arc::default(),
             digest_store: ctx.state.digest_store.clone(),
             quarantine_exceptions: ctx.state.quarantine_exceptions.clone(),
             signer: ctx.state.signer.clone(),

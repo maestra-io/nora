@@ -56,6 +56,7 @@ mod metrics;
 mod migrate;
 mod mirror;
 mod openapi;
+mod packument_memo;
 mod proxy_coalesce;
 mod quarantine_exceptions;
 mod rate_limit;
@@ -499,6 +500,8 @@ pub struct AppState {
     pub(crate) spool: Arc<registry::SpoolBudget>,
     /// Docker blob fills in flight, shared by every request for the blob (#1003).
     pub(crate) blob_flights: proxy_coalesce::InflightMap<registry::docker::SpoolShare>,
+    /// Renders of proxied npm packuments, shared by concurrent and repeated requests.
+    pub(crate) packument_memo: Arc<packument_memo::PackumentMemo>,
     pub digest_store: Arc<digest_quarantine::DigestStore>,
     /// Break-glass exceptions to the docker quarantine, re-read from `[docker] quarantine_exceptions`.
     pub quarantine_exceptions: Arc<quarantine_exceptions::QuarantineExceptions>,
@@ -3853,6 +3856,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         proxy_coalesce: proxy_coalesce::InflightMap::new(),
         artifact_flights: proxy_coalesce::InflightMap::new(),
         blob_flights: proxy_coalesce::InflightMap::new(),
+        packument_memo: Arc::default(),
         digest_store,
         quarantine_exceptions: Default::default(),
         signer,
