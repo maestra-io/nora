@@ -10,8 +10,9 @@ use crate::metrics::{METADATA_CORRUPT_TOTAL, PACKUMENT_REBUILT_TOTAL};
 use crate::registry::{
     cache_read, circuit_open_response, method_not_allowed, nora_base_url, proxy_error_response,
     proxy_fetch, proxy_fetch_artifact_hop, proxy_fetch_bytes, proxy_fetch_conditional,
-    proxy_fetch_shared, proxy_forward_post, read_cached_artifact, read_validators, validators_key,
-    write_validators, ArtifactHop, CachedArtifact, ProxyBody, ProxyError, Revalidation, Validators,
+    proxy_fetch_shared, proxy_forward_post, read_cached_artifact_pinned, read_validators,
+    validators_key, write_validators, ArtifactHop, CachedArtifact, ProxyBody, ProxyError,
+    Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::AppState;
@@ -732,16 +733,28 @@ async fn handle_request(
     // own publish, not a new upstream artifact: neither curation nor the quarantine
     // holds it (R2-18: its `time` is the local publish time, not an upstream release
     // date), as NuGet's hosted downloads.
-    let hosted = is_tarball
-        && (internal
-            || match tarball_version.as_deref() {
-                Some(v) => state
+    // R4-P07: read together with the first-seen ledger the curation check below dates the
+    // version from, one round trip instead of two before the tarball's own read.
+    let (published_here, first_seen) = match tarball_version.as_deref() {
+        Some(v) if !internal => tokio::join!(
+            async {
+                state
                     .storage
                     .stat(&format!("npm/{package_name}/versions/{v}.json"))
                     .await
-                    .is_some(),
-                None => false,
-            });
+                    .is_some()
+            },
+            async {
+                if first_seen_tracked(&state) {
+                    first_seen_date(&state.storage, &upstream_packument_key(&package_name), v).await
+                } else {
+                    None
+                }
+            },
+        ),
+        _ => (false, None),
+    };
+    let hosted = internal || published_here;
 
     // Upstream release date of the tarball's version, for curation and to seed the
     // digest quarantine's first_seen (#750). Packuments have no version: `None`
@@ -762,16 +775,7 @@ async fn handle_request(
         // quarantine reads neither: a version listed long ago says nothing about bytes
         // first fetched now, so without trusted dates it counts from the first fetch. A
         // version the ledger lacks keeps the mtime date.
-        let mut release_date = publish_date;
-        if let Some(ver) = tarball_version
-            .as_deref()
-            .filter(|_| first_seen_tracked(&state))
-        {
-            release_date =
-                first_seen_date(&state.storage, &upstream_packument_key(&package_name), ver)
-                    .await
-                    .or(publish_date);
-        }
+        let release_date = first_seen.or(publish_date);
         if let Some(response) = crate::curation::check_download(
             &state.curation().curation_engine,
             state.bypass_token().as_deref(),
@@ -857,14 +861,15 @@ async fn handle_request(
     // --- Cache hit path ---
     // get_verified discharges the integrity witness at the serve site (compile-time
     // guarantee — see crate::verified). Both the tarball serve (pinned, Verified arm)
-    // and the metadata serve (unpinned, Unpinned arm) flow the discharged bytes. The
-    // .sha256 sidecar check below stays: it is the integrity check on S3 (storage
-    // pins are local-only).
+    // and the metadata serve (unpinned, Unpinned arm) flow the discharged bytes. A copy
+    // without a pin (stored before pins) was checked against nothing by the read: for
+    // it the .sha256 sidecar check below is the integrity check. A pinned one is not
+    // read against the sidecar again (R4-P07).
     let cached = if cache_trusted {
         // A tarball above `server.stream_threshold_mb` streams from storage (C17).
-        match read_cached_artifact(&state, "npm", &key, internal).await {
-            Ok(Some(CachedArtifact::Buffered(data))) => Some(data),
-            Ok(Some(streamed)) => {
+        match read_cached_artifact_pinned(&state, "npm", &key, internal).await {
+            Ok(Some((CachedArtifact::Buffered(data), pinned))) => Some((data, pinned)),
+            Ok(Some((streamed, _))) => {
                 let gates = TarballGates {
                     package_name: &package_name,
                     version: tarball_version.as_deref(),
@@ -881,7 +886,8 @@ async fn handle_request(
         None
     };
     let cached = match cached {
-        Some(data) => {
+        Some((data, true)) => Some(data),
+        Some((data, false)) => {
             // Tarball: integrity check against the sidecar written with it.
             match crate::registry::check_sidecar(&state.storage, &key, &data).await {
                 crate::registry::Sidecar::Holds => Some(data),
@@ -1126,10 +1132,27 @@ async fn fetch_upstream_tarball(
         Some(rest) => format!("{}{rest}", nora_base.trim_end_matches('/')),
         None => link,
     };
-    let copy = trusted_copy(state, ask.package())
+    let listed = trusted_copy(state, ask.package())
         .await
-        .and_then(|copy| copy.listed_link(ask.version()))
-        .map(on_nora);
+        .and_then(|copy| copy.listed(ask.version()))
+        .unwrap_or_default();
+    let copy = listed.tarball.map(on_nora);
+    // What the packument says the tarball hashes to, and whether that packument was fetched
+    // for this download (the cached copy may be older than the file the upstream has now).
+    let mut expected = listed.digest;
+    let mut current = false;
+    let doc_key = upstream_packument_key(ask.package());
+    let refetch = || {
+        refetch_metadata(
+            state,
+            ask.package(),
+            ask.package(),
+            &doc_key,
+            &doc_key,
+            true,
+            false,
+        )
+    };
     let step = |refetched| {
         npm_links::tarball_step(
             ask,
@@ -1142,20 +1165,12 @@ async fn fetch_upstream_tarball(
     };
     let mut decided = step(None);
     if matches!(decided, TarballStep::Refetch) {
-        let doc_key = upstream_packument_key(ask.package());
-        let refetched = match refetch_metadata(
-            state,
-            ask.package(),
-            ask.package(),
-            &doc_key,
-            &doc_key,
-            true,
-            false,
-        )
-        .await
-        {
+        let refetched = match refetch().await {
             Ok(doc) => {
-                Refetched::Packument(npm_links::listed_link(&doc, ask.version()).map(on_nora))
+                let listed = npm_links::listed(&doc, ask.version()).unwrap_or_default();
+                expected = listed.digest;
+                current = true;
+                Refetched::Packument(listed.tarball.map(on_nora))
             }
             Err(ProxyError::NotFound) => Refetched::NoPackument,
             Err(e) => Refetched::Failed(e),
@@ -1176,7 +1191,41 @@ async fn fetch_upstream_tarball(
         }
     };
     let fetched = fetch_following(state, upstream, &asked, auth, &nora_npm_base, key).await;
+    // R4-R03: the body is the file the packument lists, or it is neither served nor cached. A
+    // body shared by a concurrent request is checked too: its leader's refusal is not ours.
+    if let (Ok((body, _)), Some(want)) = (&fetched, &expected) {
+        let mut holds = tarball_matches(body, want).await;
+        if !holds && !current {
+            // The cached packument may predate a file its upstream replaced: asked once more.
+            if let Ok(doc) = refetch().await {
+                holds = match npm_links::listed(&doc, ask.version()).and_then(|l| l.digest) {
+                    Some(want) => tarball_matches(body, &want).await,
+                    None => false,
+                };
+            }
+        }
+        if !holds {
+            tracing::warn!(
+                registry = "npm",
+                package = %ask.package(),
+                version = %ask.version(),
+                "upstream tarball does not match the integrity its packument gives, refusing it"
+            );
+            let refused = "tarball does not match the integrity its packument gives";
+            return (named, Err(ProxyError::Network(refused.to_string())));
+        }
+    }
     (named, fetched)
+}
+
+/// Whether `body` hashes to `want`. A body that cannot be read back does not.
+async fn tarball_matches(body: &ProxyBody, want: &npm_links::TarballDigest) -> bool {
+    use npm_links::TarballDigest;
+    let (got, want) = match want {
+        TarballDigest::Sha512(want) => (body.hash::<sha2::Sha512>().await, want),
+        TarballDigest::Sha1(want) => (body.hash::<sha1::Sha1>().await, want),
+    };
+    got.is_ok_and(|got| &got == want)
 }
 
 /// Download `asked` from `upstream` with its credential, following the redirects here, one at
@@ -1303,9 +1352,9 @@ mod trusted {
             }))
         }
 
-        /// The link this copy names for the tarball of `version`, if it lists that version.
-        pub(super) fn listed_link(&self, version: &str) -> Option<String> {
-            npm_links::listed_link(&self.0, version)
+        /// What this copy says of the tarball of `version`, if it lists that version.
+        pub(super) fn listed(&self, version: &str) -> Option<npm_links::Listed> {
+            npm_links::listed(&self.0, version)
         }
     }
 }
@@ -2998,6 +3047,27 @@ fn publish_tarballs(
     Ok(tarballs)
 }
 
+/// Whether `name` is a package name as npm writes one: `name` or `@scope/name`, of URL-safe
+/// characters, 214 at most, no part starting with `.` and an unscoped name not with `_`
+/// either. Upper case passes, as npm's rule for names published before it required lower case.
+fn is_package_name(name: &str) -> bool {
+    let part = |p: &str| {
+        !p.is_empty()
+            && !p.starts_with('.')
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+    };
+    if name.len() > 214 {
+        return false;
+    }
+    match name.strip_prefix('@') {
+        Some(scoped) => scoped
+            .split_once('/')
+            .is_some_and(|(scope, name)| part(scope) && part(name)),
+        None => part(name) && !name.starts_with('_'),
+    }
+}
+
 async fn handle_publish(
     State(state): State<AppState>,
     Path(path): Path<String>,
@@ -3024,6 +3094,11 @@ async fn handle_publish(
         return unpublish_put(&state, &authority, &user, name, &body).await;
     }
     let package_name = path;
+    // Every key of the package is built from this name: one that is not a package name
+    // (`foo/versions`) would write under another package's keys.
+    if !is_package_name(&package_name) {
+        return (StatusCode::BAD_REQUEST, "Invalid package name").into_response();
+    }
 
     // Enforce OIDC namespace_scope on the package coordinate (#583).
     if enforce_namespace_scope(&authority, &package_name).is_err() {
@@ -6788,6 +6863,83 @@ mod integration_tests {
         let resp = send(app, Method::GET, &format!("/npm/{name}"), "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         serde_json::from_slice(&body_bytes(resp).await).unwrap()
+    }
+
+    /// R4-R13: a publish under a path that is not a package name is refused before anything
+    /// is stored: `foo/versions` would write its keys among those of `foo`.
+    #[tokio::test]
+    async fn publish_refuses_a_path_that_is_not_a_package_name() {
+        let ctx = create_test_context();
+        for name in [
+            "foo/versions",
+            "foo/tarballs/x",
+            "@scope",
+            "@scope/a/b",
+            "@/a",
+            ".hidden",
+            "_private",
+            "@scope/.x",
+            &"a".repeat(215),
+        ] {
+            assert_eq!(
+                publish(&ctx.app, name, "1.0.0").await,
+                StatusCode::BAD_REQUEST,
+                "{name}"
+            );
+        }
+        assert!(ctx.state.storage.list("npm/").await.unwrap().is_empty());
+        for name in ["foo", "@scope/foo", "@scope/_x", "Legacy.Name-1~x", "-"] {
+            assert!(super::is_package_name(name), "{name}");
+        }
+        for name in ["with space", "caf\u{e9}", "a%2fb", "a\\b", ""] {
+            assert!(!super::is_package_name(name), "{name}");
+        }
+        assert_eq!(publish(&ctx.app, "foo", "1.0.0").await, StatusCode::CREATED);
+        assert_eq!(
+            publish(&ctx.app, "@scope/foo", "1.0.0").await,
+            StatusCode::CREATED
+        );
+    }
+
+    /// R4-T05: concurrent publishes of different versions serialize on the package's
+    /// publish lock: the packument lists every one of them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_publishes_keep_every_version() {
+        let ctx = create_test_context();
+        let publishes = (0..16).map(|i| {
+            let app = ctx.app.clone();
+            tokio::spawn(async move { publish(&app, "race", &format!("1.0.{i}")).await })
+        });
+        for p in futures::future::join_all(publishes).await {
+            assert_eq!(p.unwrap(), StatusCode::CREATED);
+        }
+        let doc = packument(&ctx.app, "race").await;
+        assert_eq!(doc["versions"].as_object().unwrap().len(), 16);
+    }
+
+    /// R4-T05: of concurrent publishes of one version exactly one is stored; the rest are
+    /// conflicts, and the version keeps the first one's tarball.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_publishes_of_one_version_store_it_once() {
+        let ctx = create_test_context();
+        let publishes = (0..8).map(|_| {
+            let app = ctx.app.clone();
+            tokio::spawn(async move { publish(&app, "race", "1.0.0").await })
+        });
+        let mut statuses = Vec::new();
+        for p in futures::future::join_all(publishes).await {
+            statuses.push(p.unwrap());
+        }
+        let created = statuses.iter().filter(|s| **s == StatusCode::CREATED);
+        assert_eq!(created.count(), 1, "{statuses:?}");
+        assert!(
+            statuses
+                .iter()
+                .all(|s| matches!(*s, StatusCode::CREATED | StatusCode::CONFLICT)),
+            "{statuses:?}"
+        );
+        let doc = packument(&ctx.app, "race").await;
+        assert_eq!(doc["versions"].as_object().unwrap().len(), 1);
     }
 
     /// A package published here, outside any internal namespace, is never
@@ -13268,7 +13420,9 @@ mod rewrite_both_schemes {
     }
 }
 
-/// A cached tarball whose `.sha256` sidecar the store cannot read is not served unchecked. NORA's
+/// A cached tarball without a storage pin (stored before pins) whose `.sha256` sidecar the store
+/// cannot read is not served unchecked; a pinned one was checked by its read and needs no
+/// sidecar (R4-P07). NORA's
 /// own copy (an internal or published package, or any package without an upstream) has nowhere
 /// else to come from: unavailable (503), its bytes not sent. A proxied copy is fetched again and
 /// checked as on its first download; an upstream that fails then answers as on a cache miss.
@@ -13305,9 +13459,18 @@ mod unreadable_sidecar {
         (ctx, outage)
     }
 
+    /// A copy as a release before storage pins cached it: no pin, checked by its sidecar alone.
     async fn cache(ctx: &TestContext, name: &str, bytes: &[u8]) {
         let key = format!("npm/{name}/tarballs/{name}-1.0.0.tgz");
-        ctx.state.storage.put(&key, bytes).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("copy");
+        std::fs::write(&src, bytes).unwrap();
+        ctx.state
+            .storage
+            .put_from_path(&key, &src, None)
+            .await
+            .unwrap();
+        assert_eq!(ctx.state.storage.pin(&key).await, None);
         let pin = hex::encode(sha2::Sha256::digest(bytes));
         let sidecar = format!("{key}.sha256");
         ctx.state
@@ -13317,11 +13480,11 @@ mod unreadable_sidecar {
             .unwrap();
     }
 
-    async fn publish(ctx: &TestContext, name: &str) {
+    async fn publish(ctx: &TestContext, name: &str, version: &str) {
         let payload = serde_json::json!({
             "name": name,
-            "versions": { "1.0.0": { "name": name, "version": "1.0.0", "dist": {} } },
-            "_attachments": { format!("{name}-1.0.0.tgz"): {
+            "versions": { version: { "name": name, "version": version, "dist": {} } },
+            "_attachments": { format!("{name}-{version}.tgz"): {
                 "data": base64::engine::general_purpose::STANDARD.encode(b"CACHED"),
             } },
         });
@@ -13353,15 +13516,14 @@ mod unreadable_sidecar {
         let mut wrong = Vec::new();
         for (case, name, upstream) in [
             ("internal", "internal-pkg", Some(&up)),
-            ("published", "pkg", Some(&up)),
+            ("published beside", "pkg", Some(&up)),
             ("no upstream", "pkg", None),
         ] {
             let (ctx, outage) = context(upstream);
-            if case == "published" {
-                publish(&ctx, name).await;
-            } else {
-                cache(&ctx, name, b"CACHED").await;
+            if case == "published beside" {
+                publish(&ctx, name, "2.0.0").await;
             }
+            cache(&ctx, name, b"CACHED").await;
             // The copy and its sidecar read: served.
             if get(&ctx, name).await != (StatusCode::OK, b"CACHED".to_vec()) {
                 wrong.push(format!("{case}: not served with the store up"));
@@ -13378,6 +13540,29 @@ mod unreadable_sidecar {
         }
         assert_eq!(asked(&up).await, 0, "an own package's upstream was asked");
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// R4-P07: a pinned copy, published or cached, was checked against its pin by the read
+    /// that fetched it: served without a read of the sidecar, readable or not.
+    #[tokio::test]
+    async fn a_pinned_copy_is_served_without_its_sidecar() {
+        let up = upstream(200).await;
+        let (ctx, outage) = context(Some(&up));
+        publish(&ctx, "pkg", "1.0.0").await;
+        let key = "npm/proxied/tarballs/proxied-1.0.0.tgz";
+        ctx.state.storage.put(key, b"CACHED").await.unwrap();
+        // A sidecar naming other bytes than the pinned ones is not what decides.
+        let sidecar = format!("{key}.sha256");
+        ctx.state.storage.put(&sidecar, b"stale").await.unwrap();
+        outage.fault_reads_of(".tgz.sha256", ReadFault::Network);
+        for name in ["pkg", "proxied"] {
+            assert_eq!(
+                get(&ctx, name).await,
+                (StatusCode::OK, b"CACHED".to_vec()),
+                "{name}"
+            );
+        }
+        assert_eq!(asked(&up).await, 0);
     }
 
     #[tokio::test]
@@ -15516,5 +15701,149 @@ mod upstream_dates_gate {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+}
+
+/// R4-R03: a proxied tarball is the file its upstream's packument lists (`dist.integrity`'s
+/// sha512, else `dist.shasum`), or it is neither served nor cached: 502, as an upstream that
+/// failed. A cached packument older than the file is fetched again once before the refusal.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tarball_integrity {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use base64::Engine;
+    use sha2::Digest;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const KEY: &str = "npm/pkg/tarballs/pkg-1.0.0.tgz";
+    const URI: &str = "/npm/pkg/-/pkg-1.0.0.tgz";
+
+    fn integrity(bytes: &[u8]) -> serde_json::Value {
+        let hash = base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(bytes));
+        serde_json::json!({ "integrity": format!("sha512-{hash}"), "shasum": "0".repeat(40) })
+    }
+
+    fn shasum(bytes: &[u8]) -> serde_json::Value {
+        serde_json::json!({ "shasum": hex::encode(sha1::Sha1::digest(bytes)) })
+    }
+
+    /// The upstream lists pkg 1.0.0 with `dist` and serves `body` as its tarball.
+    async fn serve(up: &MockServer, mut dist: serde_json::Value, body: &[u8]) {
+        dist["tarball"] = format!("{}/pkg/-/pkg-1.0.0.tgz", up.uri()).into();
+        let doc = serde_json::json!({ "name": "pkg", "versions": { "1.0.0": { "dist": dist } } });
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(doc))
+            .mount(up)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pkg/-/pkg-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(up)
+            .await;
+    }
+
+    fn context(up: &MockServer, threshold_mb: u64) -> TestContext {
+        let uri = up.uri();
+        create_test_context_with_config(move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.server.stream_threshold_mb = threshold_mb;
+        })
+    }
+
+    async fn get(ctx: &TestContext) -> (StatusCode, axum::body::Bytes) {
+        let resp = send(&ctx.app, Method::GET, URI, "").await;
+        (resp.status(), body_bytes(resp).await)
+    }
+
+    /// Wait for the cache writes a response left running: each holds the store until it ends.
+    async fn writes_done(ctx: &TestContext, holders: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while ctx.state.storage.holders() > holders {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cache writes still run"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn tarball_requests(up: &MockServer) -> usize {
+        let requests = up.received_requests().await.unwrap();
+        requests
+            .iter()
+            .filter(|r| r.url.path().ends_with(".tgz"))
+            .count()
+    }
+
+    /// In memory (64 MB threshold) and spooled to disk (1 MB), by integrity and by shasum.
+    #[tokio::test]
+    async fn a_tarball_its_packument_lists_is_served_and_cached() {
+        let body = vec![7u8; 2 * 1024 * 1024];
+        for threshold_mb in [64, 1] {
+            for dist in [integrity(&body), shasum(&body)] {
+                let up = MockServer::start().await;
+                serve(&up, dist.clone(), &body).await;
+                let ctx = context(&up, threshold_mb);
+                let holders = ctx.state.storage.holders();
+                let (status, got) = get(&ctx).await;
+                assert_eq!(status, StatusCode::OK, "{threshold_mb} {dist}");
+                assert!(got[..] == body[..], "{threshold_mb} {dist}");
+                writes_done(&ctx, holders).await;
+                assert!(ctx.state.storage.stat(KEY).await.is_some());
+                assert_eq!(get(&ctx).await.0, StatusCode::OK);
+                assert_eq!(tarball_requests(&up).await, 1, "the second is a cache hit");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tarball_that_is_not_the_listed_file_is_refused_and_not_cached() {
+        let listed = vec![7u8; 2 * 1024 * 1024];
+        // A body cut short, as a chunked response that broke off.
+        let sent = &listed[..listed.len() - 1];
+        for threshold_mb in [64, 1] {
+            for dist in [integrity(&listed), shasum(&listed)] {
+                let up = MockServer::start().await;
+                serve(&up, dist.clone(), sent).await;
+                let ctx = context(&up, threshold_mb);
+                let holders = ctx.state.storage.holders();
+                for asked in 1..=2 {
+                    let (status, got) = get(&ctx).await;
+                    assert_eq!(status, StatusCode::BAD_GATEWAY, "{threshold_mb} {dist}");
+                    assert!(got.len() < 1024, "the body is not sent");
+                    writes_done(&ctx, holders).await;
+                    for key in [
+                        KEY.to_string(),
+                        format!("{KEY}.sha256"),
+                        super::origin_key(KEY),
+                    ] {
+                        assert!(ctx.state.storage.stat(&key).await.is_none(), "{key}");
+                    }
+                    assert_eq!(tarball_requests(&up).await, asked);
+                }
+            }
+        }
+    }
+
+    /// The cached packument lists the version with the digest of a file its upstream has since
+    /// replaced: the packument is fetched again, and the file is the one it lists now.
+    #[tokio::test]
+    async fn a_packument_older_than_the_file_is_fetched_again_once() {
+        let up = MockServer::start().await;
+        serve(&up, integrity(b"OLD"), b"OLD").await;
+        let ctx = context(&up, 64);
+        let resp = send(&ctx.app, Method::GET, "/npm/pkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        up.reset().await;
+        serve(&up, integrity(b"NEW"), b"NEW").await;
+        let (status, got) = get(&ctx).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&got[..], b"NEW");
+        let requests = up.received_requests().await.unwrap();
+        let packuments = requests.iter().filter(|r| r.url.path() == "/pkg").count();
+        assert_eq!(packuments, 1, "fetched again once");
     }
 }
