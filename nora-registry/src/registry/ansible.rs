@@ -563,7 +563,15 @@ async fn proxy_json(
     let upstream = upstream_url(state).unwrap_or_else(|| UPSTREAM_DEFAULT.to_string());
 
     // Read cache eagerly so stale data is available on upstream failure.
-    let cached_data = state.storage.get(cache_key).await.ok();
+    let cached_data = match crate::registry::cache_read(
+        state.storage.get(cache_key).await,
+        "ansible",
+        cache_key,
+        false,
+    ) {
+        Ok(cached) => cached,
+        Err(response) => return response,
+    };
 
     // TTL check — serve fresh cache without hitting upstream.
     if let Some(ref data) = cached_data {
@@ -1212,6 +1220,32 @@ mod integration_tests {
         body_bytes, create_test_context_with_config, send, send_with_headers,
     };
     use axum::http::{Method, StatusCode};
+
+    /// R4-T13: a store that cannot be read is a retryable 503, not a cache miss answered by
+    /// the upstream.
+    #[tokio::test]
+    async fn an_unreadable_store_is_503_not_a_miss() {
+        use axum::http::{Method, StatusCode};
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        let ctx =
+            crate::test_helpers::create_test_context_with_storage_and_config(storage, move |cfg| {
+                cfg.ansible.enabled = true;
+                cfg.ansible.proxy = Some(uri);
+            });
+        outage.fail_reads();
+        for path in ["/ansible/v3/collections/community/general/"] {
+            let resp = crate::test_helpers::send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        }
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn test_ansible_disabled_returns_404() {

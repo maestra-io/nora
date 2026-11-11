@@ -2329,6 +2329,55 @@ mod proxy_tests {
         assert_eq!(&body_bytes(resp).await[..], b"debbytes");
     }
 
+    /// R4-R07: without a cached copy only an upstream 404 is a 404 (apt takes one as a
+    /// definitive miss); an upstream that is down is a 502 apt retries, and a store that
+    /// cannot be read a 503, never a miss.
+    #[tokio::test]
+    async fn test_deb_proxy_maps_only_an_upstream_404_to_404() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pool/main/a/down_1.0_amd64.deb"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pool/main/a/gone_1.0_amd64.deb"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pool/main/a/a_1.0_amd64.deb"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"debbytes".to_vec()))
+            .mount(&upstream)
+            .await;
+
+        let uri = upstream.uri();
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        let ctx =
+            crate::test_helpers::create_test_context_with_storage_and_config(storage, move |cfg| {
+                cfg.deb.enabled = true;
+                cfg.deb
+                    .proxies
+                    .insert("debian".to_string(), RepoProxyEntry::Simple(uri));
+            });
+        for (file, status) in [
+            ("down_1.0_amd64.deb", StatusCode::BAD_GATEWAY),
+            ("gone_1.0_amd64.deb", StatusCode::NOT_FOUND),
+        ] {
+            let uri = format!("/deb/debian/pool/main/a/{file}");
+            let resp = send(&ctx.app, Method::GET, &uri, "").await;
+            assert_eq!(resp.status(), status, "{file}");
+        }
+
+        outage.fail_reads();
+        let uri = "/deb/debian/pool/main/a/a_1.0_amd64.deb";
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        outage.end();
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn test_deb_proxy_strips_flat_prefix() {
         let upstream = MockServer::start().await;

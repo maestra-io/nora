@@ -1277,6 +1277,20 @@ impl Config {
             }
         }
 
+        // 3a. raw.cache_control is sent as a header on every raw GET and HEAD.
+        if axum::http::HeaderValue::from_str(&self.raw.cache_control).is_err() {
+            let msg = format!(
+                "raw.cache_control {:?} is not a valid header value (a control character or \
+                 a line break)",
+                self.raw.cache_control
+            );
+            if config_strict_from_env() {
+                errors.push(msg);
+            } else {
+                warnings.push(format!("{msg}: \"no-cache\" is sent instead"));
+            }
+        }
+
         // 4. Rate limit values must be > 0 when rate limiting is enabled
         if self.rate_limit.enabled {
             if self.rate_limit.auth_rps == 0 {
@@ -2704,6 +2718,31 @@ proxies = [
         config.apply_env_overrides().unwrap();
         assert!(config.storage.s3_virtual_hosted);
         std::env::remove_var("NORA_STORAGE_S3_VIRTUAL_HOSTED");
+    }
+
+    /// R4-T10: a `raw.cache_control` that cannot be a header value is a warning (an error
+    /// under NORA_CONFIG_STRICT), and the default is what a request sends.
+    #[test]
+    fn test_raw_cache_control_must_be_a_header_value() {
+        let _lock = env_lock();
+        std::env::remove_var("NORA_CONFIG_STRICT");
+        let mut config = Config::default();
+        assert_eq!(config.raw.cache_control(), "no-cache");
+        config.raw.cache_control = "public, max-age=60".into();
+        assert_eq!(config.raw.cache_control(), "public, max-age=60");
+        let hit = |list: &[String]| list.iter().any(|m| m.contains("raw.cache_control"));
+        let (warnings, errors) = config.validate_with_config_path(None);
+        assert!(!hit(&warnings) && !hit(&errors));
+
+        config.raw.cache_control = "public,\nmax-age=60\n".into();
+        assert_eq!(config.raw.cache_control(), "no-cache");
+        let (warnings, errors) = config.validate_with_config_path(None);
+        assert!(hit(&warnings) && !hit(&errors), "{warnings:?} {errors:?}");
+
+        std::env::set_var("NORA_CONFIG_STRICT", "1");
+        let (warnings, errors) = config.validate_with_config_path(None);
+        std::env::remove_var("NORA_CONFIG_STRICT");
+        assert!(!hit(&warnings) && hit(&errors), "{warnings:?} {errors:?}");
     }
 
     /// C71: s3 mode without usable credentials is a warning (an error under

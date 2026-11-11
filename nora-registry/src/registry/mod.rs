@@ -1836,7 +1836,11 @@ pub(crate) async fn repo_proxy_download(
         builder.body(Body::from(data)).expect("valid response")
     };
 
-    let cached = state.storage.get(&key).await.ok();
+    // A store that cannot be read is a retryable 503, not a miss answered by the upstream.
+    let cached = match cache_read(state.storage.get(&key).await, registry, &key, false) {
+        Ok(cached) => cached,
+        Err(response) => return response,
+    };
     let cache_fresh = match &cached {
         None => false,
         Some(_) if immutable => true,
@@ -1944,8 +1948,9 @@ pub(crate) async fn repo_proxy_download(
                 );
                 return response;
             }
-            tracing::debug!(registry, url = %url, error = ?e, "proxy fetch failed with no cached copy");
-            StatusCode::NOT_FOUND.into_response()
+            // Only an upstream 404 is a 404: apt and dnf take one as a definitive miss and do
+            // not retry, while they retry the 502/503/504 of an upstream that is down.
+            proxy_error_response(registry, &url, &e)
         }
     }
 }

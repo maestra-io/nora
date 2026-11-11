@@ -37,6 +37,17 @@ impl Default for RawConfig {
 }
 
 impl RawConfig {
+    /// `cache_control` as sent: the configured value, or the default when it cannot be a
+    /// header value (a newline from a YAML block). `validate` reports such a value at start;
+    /// a request must never panic on it.
+    pub fn cache_control(&self) -> &str {
+        if axum::http::HeaderValue::from_str(&self.cache_control).is_ok() {
+            &self.cache_control
+        } else {
+            "no-cache"
+        }
+    }
+
     pub(in crate::config) fn apply_env_overrides(&mut self) {
         if let Ok(val) = env::var("NORA_RAW_ENABLED") {
             self.enabled = val.to_lowercase() == "true" || val == "1";

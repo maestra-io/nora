@@ -89,7 +89,15 @@ async fn fetch_index(state: &AppState, filename: &str, content_type: &'static st
     let storage_key = format!("gems/{}", filename);
 
     // Eager cache read — preserve data for serve-stale fallback
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let cached_data = match crate::registry::cache_read(
+        state.storage.get(&storage_key).await,
+        "gems",
+        &storage_key,
+        false,
+    ) {
+        Ok(cached) => cached,
+        Err(response) => return response,
+    };
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.gems.metadata_ttl) {
@@ -197,7 +205,15 @@ async fn compact_index(
     let storage_key = format!("gems/info/{}", name);
 
     // Eager cache read — preserve data for serve-stale fallback
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let cached_data = match crate::registry::cache_read(
+        state.storage.get(&storage_key).await,
+        "gems",
+        &storage_key,
+        false,
+    ) {
+        Ok(cached) => cached,
+        Err(response) => return response,
+    };
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             let ttl = state.config.gems.metadata_ttl;
@@ -1748,6 +1764,32 @@ mod integration_tests {
         body_bytes, create_test_context_with_config, send, send_with_headers,
     };
     use axum::http::{header, Method, StatusCode};
+
+    /// R4-T13: a store that cannot be read is a retryable 503, not a cache miss answered by
+    /// the upstream.
+    #[tokio::test]
+    async fn an_unreadable_store_is_503_not_a_miss() {
+        use axum::http::{Method, StatusCode};
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        let ctx =
+            crate::test_helpers::create_test_context_with_storage_and_config(storage, move |cfg| {
+                cfg.gems.enabled = true;
+                cfg.gems.proxy = Some(uri);
+            });
+        outage.fail_reads();
+        for path in ["/gems/versions", "/gems/info/rails"] {
+            let resp = crate::test_helpers::send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        }
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn test_gems_disabled_returns_404() {
