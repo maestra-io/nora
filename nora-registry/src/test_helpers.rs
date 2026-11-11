@@ -197,6 +197,7 @@ fn build_context_full(
             enabled: true,
             proxies: vec![],
             proxy_timeout: 5,
+            date_lookup_timeout: 5,
             checksum_verify: true,
             immutable_releases: true,
             metadata_ttl: 300,

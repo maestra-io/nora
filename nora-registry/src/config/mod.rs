@@ -2454,6 +2454,12 @@ proxies = [
     fn test_maven_config_default() {
         let m = MavenConfig::default();
         assert_eq!(m.proxy_timeout, 30);
+        assert_eq!(m.date_lookup_timeout, 5);
+        let parsed: MavenConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            parsed.date_lookup_timeout, 5,
+            "serde default matches Default"
+        );
         assert_eq!(m.proxies.len(), 1);
         assert_eq!(m.proxies[0].url(), "https://repo1.maven.org/maven2");
         assert!(m.proxies[0].auth().is_none());
