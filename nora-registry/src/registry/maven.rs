@@ -647,15 +647,19 @@ async fn download(
                     })
                     .await;
                 }
-                if let Some(resp) = crate::digest_quarantine::proxy_gate_digest(
+                // A digest with no record counts from when its copy was cached (R4-C05).
+                if let Some(resp) = crate::digest_quarantine::cache_gate_digest(
                     &state.digest_store,
+                    &state.storage,
+                    &key,
                     "maven",
                     digest,
                     &q_mode,
                     q_secs,
-                    "cache",
                     publish_date,
-                ) {
+                )
+                .await
+                {
                     return resp;
                 }
             }
@@ -724,15 +728,19 @@ async fn download(
             // per version). maven-metadata.xml is mutable (curation_coords=None) —
             // never quarantine it or its digest would change forever.
             if curation_coords.is_some() {
-                if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+                // A digest with no record counts from when its copy was cached (R4-C05).
+                if let Some(resp) = crate::digest_quarantine::cache_gate_dated(
                     &state.digest_store,
+                    &state.storage,
+                    &key,
                     "maven",
                     data,
                     &q_mode,
                     q_secs,
-                    "cache",
                     publish_date,
-                ) {
+                )
+                .await
+                {
                     return resp;
                 }
             }
@@ -962,15 +970,19 @@ async fn download(
                     .as_deref()
                     .or(state.config.curation.quarantine_ttl.as_deref()),
             );
-            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+            // A digest with no record counts from when its copy was cached (R4-C05).
+            if let Some(resp) = crate::digest_quarantine::cache_gate_dated(
                 &state.digest_store,
+                &state.storage,
+                &key,
                 "maven",
                 data,
                 &q_mode,
                 q_secs,
-                "cache-stale",
                 publish_date,
-            ) {
+            )
+            .await
+            {
                 return resp;
             }
         }
@@ -2554,6 +2566,23 @@ mod integration_tests {
             &ctx.state.storage.get(&sidecar).await.unwrap()[..],
             sha1.as_bytes()
         );
+    }
+
+    /// R4-C05, a streamed cache hit gated by its digest: an artifact cached for longer than the
+    /// quarantine ledger remembers (90 days) is not held for a new TTL after a restart.
+    #[tokio::test]
+    async fn an_artifact_cached_past_the_ledgers_memory_is_not_held_again() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.curation.maven.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+            cfg.curation.maven.quarantine_ttl = Some("7d".to_string());
+        });
+        let key = "maven/com/example/aged/1.0/aged-1.0.jar";
+        crate::test_helpers::put_written_days_ago(&ctx, key, b"jar", 100).await;
+        for _ in 0..2 {
+            let path = "/maven2/com/example/aged/1.0/aged-1.0.jar";
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
     }
 
     /// R4-T13: an unreadable stored `maven-metadata.xml` is logged, and the upload still

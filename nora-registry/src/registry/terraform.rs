@@ -545,15 +545,19 @@ async fn provider_download_binary(
                 .as_deref()
                 .or(state.config.curation.quarantine_ttl.as_deref()),
         );
-        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+        // A digest with no record counts from when its copy was cached (R4-C05).
+        if let Some(resp) = crate::digest_quarantine::cache_gate_dated(
             &state.digest_store,
+            &state.storage,
+            &storage_key,
             "terraform",
             &data,
             &q_mode,
             q_secs,
-            "cache",
             publish_date,
-        ) {
+        )
+        .await
+        {
             return resp;
         }
 
@@ -930,14 +934,19 @@ async fn module_source_download(
                 .as_deref()
                 .or(state.config.curation.quarantine_ttl.as_deref()),
         );
-        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+        // A digest with no record counts from when its copy was cached (R4-C05).
+        if let Some(resp) = crate::digest_quarantine::cache_gate_dated(
             &state.digest_store,
+            &state.storage,
+            &storage_key,
             "terraform",
             &data,
             &q_mode,
             q_secs,
-            "cache",
-        ) {
+            None,
+        )
+        .await
+        {
             return resp;
         }
 
@@ -966,12 +975,17 @@ async fn module_source_download(
         "terraform/modules/{}/{}/{}/{}/_source_url",
         ns, name, provider, ver
     );
-    let upstream_url = match state.storage.get(&source_url_key).await {
+    // No stored address is a 404; a store that cannot be read is a retryable 503.
+    let upstream_url = match crate::registry::cache_read(
+        state.storage.get(&source_url_key).await,
+        "terraform",
+        &source_url_key,
+        false,
+    ) {
         // The stored address may carry a `//subdir`: that is the client's, not part of the URL.
-        Ok(data) => split_subdir(&String::from_utf8_lossy(&data)).0,
-        Err(_) => {
-            return StatusCode::NOT_FOUND.into_response();
-        }
+        Ok(Some(data)) => split_subdir(&String::from_utf8_lossy(&data)).0,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(response) => return response,
     };
 
     // Only proxy HTTP/HTTPS URLs (git:: or other schemes can't be proxied)
@@ -2869,6 +2883,33 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         assert_eq!(resp.headers().get("x-terraform-get").unwrap(), git);
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// A module with no stored source address is a 404; a store that cannot read the address
+    /// is a retryable 503, not "no such module".
+    #[tokio::test]
+    async fn an_unreadable_source_url_is_503_and_a_missing_one_404() {
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        let ctx =
+            crate::test_helpers::create_test_context_with_storage_and_config(storage, |cfg| {
+                cfg.terraform.enabled = true;
+                cfg.terraform.proxy = Some("http://127.0.0.1:1".to_string());
+            });
+        let path = "/terraform/v1/modules/download/acme/vpc/aws/1.0.0/source";
+        let missing = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        ctx.state
+            .storage
+            .put(
+                "terraform/modules/acme/vpc/aws/1.0.0/_source_url",
+                b"http://127.0.0.1:1/m.tar.gz",
+            )
+            .await
+            .unwrap();
+        outage.fail_reads_of("/_source_url");
+        let unreadable = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(unreadable.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

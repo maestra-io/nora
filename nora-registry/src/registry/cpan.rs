@@ -276,14 +276,19 @@ async fn distribution_proxy(
         state
             .audit
             .log(AuditEntry::new("cache_hit", "proxy", "", "cpan", ""));
-        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+        // A digest with no record counts from when its copy was cached (R4-C05).
+        if let Some(resp) = crate::digest_quarantine::cache_gate_dated(
             &state.digest_store,
+            &state.storage,
+            &storage_key,
             "cpan",
             &data,
             &q_mode,
             q_secs,
-            "cache",
-        ) {
+            None,
+        )
+        .await
+        {
             return resp;
         }
         return with_binary(data.to_vec(), "application/octet-stream");
@@ -731,6 +736,29 @@ mod integration_tests {
             assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
         }
         assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    /// R4-C05, a registry's own buffered cache hit: a distribution cached for longer than the
+    /// quarantine ledger remembers (90 days) is not held for a new TTL after a restart.
+    #[tokio::test]
+    async fn a_distribution_cached_past_the_ledgers_memory_is_not_held_again() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.cpan.enabled = true;
+            cfg.curation.cpan.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+            cfg.curation.cpan.quarantine_ttl = Some("7d".to_string());
+        });
+        let key = "cpan/authors/id/A/AU/AUTHOR/Old-1.0.tar.gz";
+        put_written_days_ago(&ctx, key, b"old dist", 100).await;
+        for _ in 0..2 {
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                "/cpan/authors/id/A/AU/AUTHOR/Old-1.0.tar.gz",
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
     }
 
     #[tokio::test]

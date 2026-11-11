@@ -606,6 +606,37 @@ pub async fn cache_gate_digest(
     )
 }
 
+/// [`cache_gate_digest`] for a cached body held whole: hashes `bytes`.
+#[must_use = "the returned response blocks a quarantined artifact; dropping it serves the artifact"]
+#[allow(clippy::too_many_arguments)]
+pub async fn cache_gate_dated(
+    store: &DigestStore,
+    storage: &Storage,
+    key: &str,
+    registry: &str,
+    bytes: &[u8],
+    mode: &QuarantineMode,
+    quarantine_secs: i64,
+    trusted_first_seen: Option<i64>,
+) -> Option<Response> {
+    if matches!(mode, QuarantineMode::Off) {
+        return None;
+    }
+    use sha2::Digest;
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
+    cache_gate_digest(
+        store,
+        storage,
+        key,
+        registry,
+        &digest,
+        mode,
+        quarantine_secs,
+        trusted_first_seen,
+    )
+    .await
+}
+
 /// The first-seen of a cached digest whose record the ledger no longer holds: when NORA
 /// wrote the object at `key`, if that is past the prune line. `None` when the digest has a
 /// record (it keeps its date), the object cannot be stat'ed, or it was written within
