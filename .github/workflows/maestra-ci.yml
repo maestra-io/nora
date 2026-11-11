@@ -456,7 +456,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: runs-on=${{ github.run_id }}-fuzz/pool=build
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       # libFuzzer needs nightly; pinned so a nightly regression cannot fail an unrelated PR.
       FUZZ_TOOLCHAIN: nightly-2026-11-01
@@ -478,6 +478,9 @@ jobs:
         run: |
           rustup toolchain install "${FUZZ_TOOLCHAIN}" --profile minimal
           cargo install --locked --version 0.13.1 cargo-fuzz
+
+      - name: Build every target
+        run: cargo "+${FUZZ_TOOLCHAIN}" fuzz build
 
       - name: Run every target for 60 s
         run: |
