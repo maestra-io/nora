@@ -7,6 +7,9 @@ name: Maestra release
 # maestra/charts/nora as oci://.../charts/nora, version and appVersion = that tag. Upstream's own Release workflow also
 # matches v* tags; it is disabled in this fork (see MAESTRA.md). Last, the
 # release job creates or updates the GitHub Release for the tag.
+#
+# Nothing is pushed before `verify` (the tag's commit is on maestra/main) and `ci`
+# (every Maestra CI job, run on that commit: a release reuses no earlier result).
 
 concurrency: release-nora
 
@@ -26,8 +29,45 @@ permissions:
   id-token: write  # GitHub OIDC -> Teleport image-push bot -> AWS STS
 
 jobs:
+  # A tag on a feature branch, or on a commit that never reached the default branch,
+  # is not a release.
+  verify:
+    name: Tag is on maestra/main
+    runs-on: runs-on=${{ github.run_id }}-verify/pool=small
+    env:
+      GIT_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: refs/tags/${{ env.GIT_TAG }}
+          fetch-depth: 0
+
+      - name: Tag commit is an ancestor of origin/maestra/main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin '+refs/heads/maestra/main:refs/remotes/origin/maestra/main'
+          sha=$(git rev-parse 'HEAD^{commit}')
+          if ! git merge-base --is-ancestor "${sha}" origin/maestra/main; then
+            echo "::error::${GIT_TAG} (${sha}) is not on maestra/main: merge it first, then tag the merged commit"
+            exit 1
+          fi
+          echo "${GIT_TAG} = ${sha}, on maestra/main"
+
+  ci:
+    name: CI
+    needs: verify
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/maestra-ci.yml
+    with:
+      ref: refs/tags/${{ inputs.tag || github.ref_name }}
+
   image:
     name: Build & push image to ECR
+    needs: [verify, ci]
     runs-on: runs-on=${{ github.run_id }}/pool=build
     env:
       GIT_TAG: ${{ inputs.tag || github.ref_name }}

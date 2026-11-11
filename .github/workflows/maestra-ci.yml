@@ -1,23 +1,36 @@
 name: Maestra CI
 
-# fmt, clippy, cargo test, RustSec advisories and the vendored chart on PRs into
-# our default branch, and on pushes to it so a red merge commit is visible. A PR
-# changing only *.md files skips the Rust jobs (see `changes`); the chart always runs.
+# Everything upstream's ci.yml and kani.yml run for `main`, for our default branch: PRs
+# into maestra/main and pushes to it (so a red merge commit is visible). fmt, clippy and
+# cargo test for the default, release and fault-injection/demo feature sets; coverage
+# floor and diff coverage; the repo's coherence scripts; cargo deny; the built binary
+# against real clients (docker, npm, dotnet, uv) and real S3 servers; the release panic
+# check; Kani proofs; a bounded fuzz run; the vendored chart. A PR changing only *.md
+# files skips the Rust jobs (see `changes`); chart and coherence always run.
 # Upstream's CI only targets main, which in this fork is the untouched upstream
-# mirror (see MAESTRA.md).
+# mirror, and is disabled here (see MAESTRA.md).
 
 on:
   pull_request:
     branches: [maestra/main]
   push:
     branches: [maestra/main]
+  # maestra-release.yml runs every job here on the tag's commit before it pushes anything.
+  workflow_call:
+    inputs:
+      ref:
+        description: "Ref to check out instead of the event's commit (the release tag)"
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 concurrency:
-  # Per commit on main (each merge gets its own result), per ref on PRs.
-  group: maestra-ci-${{ github.event_name == 'push' && github.sha || github.ref }}
+  # Per commit on main (each merge gets its own result), per ref on PRs. github.workflow
+  # is the caller's name under workflow_call: a release of a commit does not cancel that
+  # commit's own push run.
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -33,6 +46,7 @@ jobs:
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
 
       - name: Anything besides Markdown?
@@ -60,6 +74,8 @@ jobs:
       - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.ref }}
 
       # rustup reads rust-toolchain.toml and installs the pinned channel.
       - name: Install toolchain
@@ -87,6 +103,11 @@ jobs:
       - name: Run tests (release features)
         run: cargo test --package nora-registry --no-default-features --features mimalloc,deb --locked
 
+      # Off in every shipped build, so nothing else compiles them: `fault-injection` is
+      # what scripts/release-panic-check.sh builds, `demo` is the demo-site banner.
+      - name: Clippy (fault-injection, demo)
+        run: cargo clippy -p nora-registry --all-targets --features fault-injection,demo --locked -- -D warnings
+
   # Vendored Helm chart (maestra/charts/nora, see its MAESTRA-CHART.md).
   chart:
     name: helm chart
@@ -95,6 +116,8 @@ jobs:
       - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.ref }}
 
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
@@ -127,19 +150,337 @@ jobs:
           helm template nora . -f ci/maestra-values.yaml > /dev/null
           helm template nora . --set config.server.public_url=https://registry.example.com > /dev/null
 
-  advisories:
-    name: cargo deny advisories
+  deny:
+    name: cargo deny
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: runs-on=${{ github.run_id }}-advisories/pool=build
+    runs-on: runs-on=${{ github.run_id }}-deny/pool=build
     steps:
       - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.ref }}
 
-      # RustSec advisories against Cargo.lock; accepted ones live in deny.toml
-      # (the one ignore list, also read by upstream's `cargo deny check`).
-      - name: cargo deny check advisories
+      # RustSec advisories against Cargo.lock, licenses, banned crates and crate
+      # sources (crates.io only). Accepted advisories live in deny.toml, the only
+      # ignore list this fork's CI reads.
+      - name: cargo deny check
         uses: EmbarkStudios/cargo-deny-action@a4d2d701318fdc1c6ae17ba8cea8f329c5110eb2 # v2.0.17
         with:
-          command: check advisories
+          command: check
+          arguments: --all-features
+
+  # Upstream ci.yml `coherence`, plus the changelog fragments and the state of
+  # upstream's workflows in this repository.
+  coherence:
+    name: coherence
+    runs-on: runs-on=${{ github.run_id }}-coherence/pool=small
+    permissions:
+      contents: read
+      actions: read  # workflow states for check-upstream-workflows.sh
+    steps:
+      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Coherence check
+        run: ./scripts/coherence-check.sh
+
+      - name: Verify changelog claims
+        run: ./scripts/verify-changelog.sh
+
+      - name: Changelog fragments
+        run: |
+          bash scripts/test-changelog-fragments.sh
+          ./scripts/changelog-fragments.sh --check
+
+      # Self-tests first: each of these checks is a heuristic over text, and a broken
+      # one prints nothing, which reads like a clean tree.
+      - name: Script self-tests
+        run: |
+          bash scripts/test-reland-filechanges.sh
+          bash scripts/test-diff-coverage.sh
+          bash scripts/test-pre-commit-check.sh
+          bash scripts/test-lock-audit.sh
+          bash scripts/test-package-scriptlets.sh
+          bash maestra/scripts/test-check-upstream-workflows.sh
+
+      - name: Lock audit (publish_lock consistency)
+        run: bash scripts/lock-audit.sh
+
+      - name: Upstream workflows stay disabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash maestra/scripts/check-upstream-workflows.sh
+
+  # tarpaulin.toml holds the floor (`fail-under`); the diff gate fails a PR whose
+  # changed .rs lines are covered below 70% (scripts/diff-coverage.py).
+  coverage:
+    name: coverage
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: runs-on=${{ github.run_id }}-coverage/pool=build
+    timeout-minutes: 90
+    steps:
+      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Install toolchain
+        run: rustup toolchain install || rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      # Pinned as upstream pins it: 0.37.4 aborts with "Timed out waiting for test
+      # response" on an unchanged tree.
+      - name: Install tarpaulin
+        run: cargo install --locked --version 0.37.2 cargo-tarpaulin
+
+      # No pipe: tarpaulin's exit code (non-zero below fail-under) must reach the runner.
+      - name: Coverage floor
+        run: |
+          cargo tarpaulin --config tarpaulin.toml --locked
+          python3 -c "import json; print('coverage: %.1f%%' % json.load(open('coverage/tarpaulin-report.json'))['coverage'])" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Runs when the floor failed too: the report is written before tarpaulin exits.
+      - name: Diff coverage
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          LCOV=$(find coverage -type f \( -name "*.lcov" -o -name "lcov.info" \) | head -1)
+          if [ -z "$LCOV" ]; then echo "No lcov file found" >&2; exit 1; fi
+          python3 scripts/diff-coverage.py --lcov "$LCOV" --base "${BASE}"
+
+  # The binary with the shipped feature set against real clients: upstream ci.yml
+  # `integration` (docker push/pull, maven, npm, pypi, cargo endpoints), tests/smoke.sh,
+  # dotnet restore (tests/nuget-client) and uv (tests/pypi-client).
+  integration:
+    name: integration
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: runs-on=${{ github.run_id }}-integration/pool=build
+    timeout-minutes: 60
+    steps:
+      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install toolchain
+        run: rustup toolchain install || rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: 8.0.x
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Build NORA (release features)
+        run: cargo build --release --package nora-registry --no-default-features --features mimalloc,deb --locked
+
+      - name: Start NORA
+        run: |
+          NORA_STORAGE_PATH="${RUNNER_TEMP}/nora-data" ./target/release/nora &
+          for _ in $(seq 1 15); do
+            if curl -sf http://localhost:4000/health; then break; fi
+            sleep 2
+          done
+          curl -sf http://localhost:4000/health | jq .
+
+      # docker treats a registry on localhost as insecure: no daemon.json change.
+      - name: Docker push and pull
+        run: |
+          docker pull alpine:3.20
+          docker tag alpine:3.20 localhost:4000/test/alpine:integration
+          docker push localhost:4000/test/alpine:integration
+          docker rmi localhost:4000/test/alpine:integration
+          docker pull localhost:4000/test/alpine:integration
+          curl -sf http://localhost:4000/v2/_catalog | jq .
+          curl -sf http://localhost:4000/v2/test/alpine/tags/list | jq .
+
+      - name: npm, PyPI and Cargo endpoints
+        run: |
+          set -euo pipefail
+          status() { curl -s -o /dev/null -w '%{http_code}' "http://localhost:4000$1"; }
+          s=$(status /npm/lodash); echo "npm: $s"; [ "$s" != "000" ]
+          s=$(status /simple/); echo "pypi: $s"; [ "$s" = "200" ]
+          s=$(status /cargo/api/v1/crates/serde); echo "cargo: $s"; [ "$s" != "000" ]
+
+      - name: Maven deploy and download
+        run: |
+          set -euo pipefail
+          echo "test-artifact-content-$(date +%s)" > "${RUNNER_TEMP}/test-artifact.jar"
+          url=http://localhost:4000/maven2/com/example/test-lib/1.0.0/test-lib-1.0.0.jar
+          curl -sf -X PUT --data-binary @"${RUNNER_TEMP}/test-artifact.jar" "$url"
+          curl -sf -o "${RUNNER_TEMP}/downloaded.jar" "$url"
+          cmp "${RUNNER_TEMP}/test-artifact.jar" "${RUNNER_TEMP}/downloaded.jar"
+
+      - name: Health, ready, metrics
+        run: |
+          set -euo pipefail
+          curl -sf http://localhost:4000/health | jq .status
+          curl -sf http://localhost:4000/ready
+          curl -sf http://localhost:4000/metrics | head -5
+
+      - name: Maven immutable release rejects a re-deploy
+        run: |
+          set -euo pipefail
+          url=http://localhost:4000/maven2/com/example/immutable/1.0.0/immutable-1.0.0.jar
+          echo first-deploy | curl -sf -X PUT --data-binary @- "$url"
+          s=$(echo second-deploy | curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary @- "$url")
+          echo "re-deploy: $s"; [ "$s" = "409" ]
+
+      - name: A nonexistent tag is 404
+        run: |
+          s=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:4000/v2/nonexistent/repo/manifests/v999)
+          echo "nonexistent tag: $s"; [ "$s" = "404" ]
+
+      - name: Stop NORA
+        if: always()
+        run: pkill -x nora || true
+
+      - name: Smoke suite (tests/smoke.sh)
+        run: bash tests/smoke.sh
+
+      - name: NuGet client (dotnet restore)
+        run: DOTNET="$(command -v dotnet)" bash tests/nuget-client/run-tests.sh
+
+      - name: PyPI client (uv)
+        run: bash tests/pypi-client/run-uv-tests.sh
+
+  # The image the release ships, on three S3 servers (MinIO, SeaweedFS, Garage):
+  # unit tests only see object_store's in-memory backend and wiremock.
+  s3-backends:
+    name: s3 backends
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: runs-on=${{ github.run_id }}-s3/pool=build
+    timeout-minutes: 60
+    steps:
+      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      # The same build arguments as maestra-release.yml; compose reuses the tag.
+      - name: Build the image
+        run: docker build --build-arg "CARGO_FEATURES=--no-default-features --features mimalloc,deb" -t nora:local .
+
+      - name: Start the backends and three NORA instances
+        working-directory: tests/s3-backends
+        run: docker compose up -d --no-build
+
+      - name: S3 backends suite
+        working-directory: tests/s3-backends
+        run: bash test.sh
+
+      - name: Container logs
+        if: failure()
+        working-directory: tests/s3-backends
+        run: docker compose logs --no-color --tail 200
+
+  # What a panic does to a release binary: tests always build with unwind.
+  release-panic-check:
+    name: release panic check
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: runs-on=${{ github.run_id }}-panic/pool=build
+    timeout-minutes: 45
+    steps:
+      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install toolchain
+        run: rustup toolchain install || rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Release panic check
+        run: scripts/release-panic-check.sh
+
+  # Upstream kani.yml: the `#[kani::proof]` harnesses (Range arithmetic).
+  kani:
+    name: kani proofs
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: runs-on=${{ github.run_id }}-kani/pool=build
+    timeout-minutes: 45
+    steps:
+      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install toolchain
+        run: rustup toolchain install || rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      # Pinned version from crates.io; `cargo kani setup` fetches its toolchain and CBMC.
+      - name: Install Kani
+        run: |
+          cargo install --locked --version 0.67.0 kani-verifier
+          cargo kani setup
+
+      - name: Run Kani proofs
+        run: cargo kani --package nora-registry
+
+  # A smoke run, not a campaign: every target builds, replays its corpus and survives
+  # a minute of new inputs. A crash prints the input to reproduce it with.
+  fuzz:
+    name: fuzz smoke
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: runs-on=${{ github.run_id }}-fuzz/pool=build
+    timeout-minutes: 60
+    env:
+      # libFuzzer needs nightly; pinned so a nightly regression cannot fail an unrelated PR.
+      FUZZ_TOOLCHAIN: nightly-2026-11-01
+    steps:
+      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: |
+            . -> target
+            . -> fuzz/target
+
+      - name: Install toolchain and cargo-fuzz
+        run: |
+          rustup toolchain install "${FUZZ_TOOLCHAIN}" --profile minimal
+          cargo install --locked --version 0.13.1 cargo-fuzz
+
+      - name: Run every target for 60 s
+        run: |
+          set -euo pipefail
+          targets=$(cargo "+${FUZZ_TOOLCHAIN}" fuzz list)
+          [ -n "${targets}" ] || { echo "no fuzz targets found" >&2; exit 1; }
+          for target in ${targets}; do
+            echo "::group::${target}"
+            cargo "+${FUZZ_TOOLCHAIN}" fuzz run "${target}" -- -max_total_time=60
+            echo "::endgroup::"
+          done
