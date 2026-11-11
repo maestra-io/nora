@@ -236,6 +236,28 @@ where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, Option<E>>>,
     {
+        self.coalesced_try_leased(key, registry, budget, fetch)
+            .await
+            .map(|(value, _lease)| value)
+        // The leader's lease drops here: the slot is released with the fetch.
+    }
+
+    /// [`coalesced_try`](Self::coalesced_try) handing the leader of a successful fetch
+    /// a [`Lease`] on its slot: until it is dropped, a caller arriving later still gets
+    /// the leader's value instead of fetching again (R4-P03: a fill whose client went
+    /// away is kept for the retry). `None` for a follower, and for a caller that
+    /// fetched alone after its budget.
+    pub async fn coalesced_try_leased<F, Fut>(
+        &self,
+        key: &str,
+        registry: &'static str,
+        budget: Duration,
+        fetch: F,
+    ) -> Result<(T, Option<Lease<T, E>>), Option<E>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, Option<E>>>,
+    {
         // --- PRECONDITIONS ---
         debug_assert!(!key.is_empty(), "coalesce key must not be empty");
 
@@ -249,21 +271,28 @@ where
                     // including cancellation of `fetch().await` below.
                     // CANCEL-SAFETY: slot release happens in `FetchGuard::drop`,
                     // not after the await point.
-                    let _guard = FetchGuard {
+                    let guard = FetchGuard {
                         map: Arc::clone(&self.map),
                         key: key.to_string(),
                         slot: Arc::clone(&slot),
                         registry,
                     };
-                    let out = fetch().await;
                     // Publish BEFORE the guard drops so a follower woken by the
                     // guard's `notify_waiters()` always observes the final outcome.
-                    match &out {
-                        Ok(value) => slot.publish(value.clone()),
-                        Err(failure) => slot.publish_failure(failure.clone()),
-                    }
-                    return out;
-                    // `_guard` drops here: removes key (ptr_eq) + notify_waiters.
+                    return match fetch().await {
+                        Ok(value) => {
+                            slot.publish(value.clone());
+                            // The guard may outlive this call as a lease: wake the
+                            // waiters now, at publish.
+                            slot.ready.notify_waiters();
+                            Ok((value, Some(Lease { _guard: guard })))
+                        }
+                        Err(failure) => {
+                            slot.publish_failure(failure.clone());
+                            Err(failure)
+                            // `guard` drops here: removes key (ptr_eq) + notify_waiters.
+                        }
+                    };
                 }
                 Role::Follower(slot) => {
                     // Register interest BEFORE checking `result`: a `Notified`
@@ -274,14 +303,14 @@ where
                     tokio::pin!(notified);
 
                     if let Some(outcome) = slot.outcome() {
-                        return Self::record_follower(registry, outcome);
+                        return Self::record_follower(registry, outcome).map(|v| (v, None));
                     }
 
                     // CANCEL-SAFETY: a follower holds nothing but its `Arc<Slot>`.
                     match tokio::time::timeout(budget, &mut notified).await {
                         Ok(()) => {
                             if let Some(outcome) = slot.outcome() {
-                                return Self::record_follower(registry, outcome);
+                                return Self::record_follower(registry, outcome).map(|v| (v, None));
                             }
                             // The leader was cancelled (client disconnect) before it
                             // resolved and its slot is gone: elect again, so the
@@ -297,7 +326,7 @@ where
                             crate::metrics::PROXY_COALESCE_FALLTHROUGH_TOTAL
                                 .with_label_values(&[registry, "budget"])
                                 .inc();
-                            return fetch().await;
+                            return fetch().await.map(|v| (v, None));
                         }
                     }
                 }
@@ -704,7 +733,7 @@ mod tests {
     }
 
     /// Slots currently in the map (held by a fetch or a lease).
-    fn slots_held<T>(map: &InflightMap<T>) -> usize {
+    fn slots_held<T, E>(map: &InflightMap<T, E>) -> usize {
         map.map.lock().len()
     }
 
@@ -750,6 +779,42 @@ mod tests {
             "after release the next caller leads a fresh fetch"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// R4-P03: while the leader of a successful fetch keeps its lease, a caller that
+    /// arrives after the fetch ended still gets its value; a failed fetch gives no lease.
+    #[tokio::test]
+    async fn try_lease_keeps_a_fetched_value_for_late_callers() {
+        let map: InflightMap<u64, &'static str> = InflightMap::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch = |out: Result<u64, Option<&'static str>>| {
+            let calls = Arc::clone(&calls);
+            move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                out
+            }
+        };
+        let (value, lease) = map
+            .coalesced_try_leased("pkg", "test", budget(), fetch(Ok(7)))
+            .await
+            .unwrap();
+        assert_eq!(value, 7);
+        assert!(lease.is_some(), "the leader holds the slot");
+        let (late, none) = map
+            .coalesced_try_leased("pkg", "test", budget(), fetch(Ok(8)))
+            .await
+            .unwrap();
+        assert_eq!(late, 7, "a late caller follows the held value");
+        assert!(none.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(lease);
+        assert_eq!(slots_held(&map), 0);
+
+        let failed = map
+            .coalesced_try_leased("pkg", "test", budget(), fetch(Err(Some("down"))))
+            .await;
+        assert!(matches!(failed, Err(Some("down"))));
+        assert_eq!(slots_held(&map), 0, "a failure is not held");
     }
 
     /// Followers waiting on a leader are woken when it publishes, not when its lease ends.

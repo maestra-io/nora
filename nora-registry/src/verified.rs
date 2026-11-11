@@ -112,6 +112,9 @@ impl Integrity for Verified {
 #[derive(Debug)]
 pub struct Blob<S: Integrity, T = axum::body::Bytes> {
     payload: T,
+    /// Lowercase hex SHA-256 the payload was matched against: set by
+    /// [`Blob::<Verified>::verify`] only, empty in the other tiers.
+    sha256: String,
     _tier: PhantomData<S>,
 }
 
@@ -145,6 +148,7 @@ impl<T> Blob<Unverified, T> {
     pub fn raw(payload: T) -> Self {
         Self {
             payload,
+            sha256: String::new(),
             _tier: PhantomData,
         }
     }
@@ -161,8 +165,25 @@ impl<T> Blob<TamperEvident, T> {
     pub fn from_eof_verifier(payload: T) -> Self {
         Self {
             payload,
+            sha256: String::new(),
             _tier: PhantomData,
         }
+    }
+}
+
+impl<T> Blob<Verified, T> {
+    /// The lowercase hex SHA-256 these bytes were verified to have: the digest
+    /// [`verify`](Self::verify) computed, for callers that would otherwise hash the
+    /// same bytes again (R4-P05).
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// Consume the witness into the payload and its verified lowercase hex SHA-256.
+    #[must_use]
+    pub fn into_parts(self) -> (T, String) {
+        (self.payload, self.sha256)
     }
 }
 
@@ -188,6 +209,7 @@ impl<T: AsRef<[u8]>> Blob<Verified, T> {
         if actual == expected {
             Ok(Self {
                 payload,
+                sha256: actual,
                 _tier: PhantomData,
             })
         } else {

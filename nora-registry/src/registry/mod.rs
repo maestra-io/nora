@@ -406,6 +406,8 @@ pub(crate) struct UpstreamMiss {
     not_found: bool,
     failed: bool,
     refused: bool,
+    /// An upstream's body was over NORA's own size cap: answered, and too big to take.
+    too_large: bool,
     /// The breaker key of the first upstream skipped for its open breaker.
     open: Option<String>,
 }
@@ -425,6 +427,10 @@ impl UpstreamMiss {
         match e {
             ProxyError::NotFound => self.not_found = true,
             ProxyError::Upstream(code) if (400..500).contains(code) => self.not_found = true,
+            ProxyError::Spool(SpoolError::TooLarge(_)) => {
+                self.failed = true;
+                self.too_large = true;
+            }
             // Throttling, auth refusals, timeouts and nora's own spool are never "not found".
             ProxyError::Upstream(_)
             | ProxyError::Network(_)
@@ -444,6 +450,7 @@ impl UpstreamMiss {
     /// under none of them, since a 4xx for one name says nothing about the other.
     pub(crate) fn record_upstream(&mut self, asked: &UpstreamMiss) {
         if asked.failed || asked.refused || asked.open.is_some() {
+            self.too_large |= asked.too_large;
             self.failed |= asked.failed;
             self.refused |= asked.refused;
             if self.open.is_none() {
@@ -455,13 +462,16 @@ impl UpstreamMiss {
     }
 
     /// The status for the miss: 404 when an upstream said "not found" or none was asked;
-    /// otherwise 503 when one was skipped for its open breaker, 502 when every one failed or
-    /// refused NORA's credentials.
+    /// otherwise 503 when one was skipped for its open breaker, 507 when one answered with a
+    /// body over NORA's size cap (`server.proxy_max_buffered_mb`, `proxy_max_artifact_mb`),
+    /// 502 when every one failed or refused NORA's credentials.
     pub(crate) fn status(&self) -> StatusCode {
         if self.not_found {
             StatusCode::NOT_FOUND
         } else if self.open.is_some() {
             StatusCode::SERVICE_UNAVAILABLE
+        } else if self.too_large {
+            StatusCode::INSUFFICIENT_STORAGE
         } else if self.failed || self.refused {
             StatusCode::BAD_GATEWAY
         } else {
@@ -536,9 +546,19 @@ pub(crate) enum Sidecar {
 /// Check the cached copy `data` of `key` against the `.sha256` sidecar written beside it.
 pub(crate) async fn check_sidecar(storage: &crate::Storage, key: &str, data: &[u8]) -> Sidecar {
     use sha2::Digest;
+    check_sidecar_digest(storage, key, || hex::encode(sha2::Sha256::digest(data))).await
+}
+
+/// [`check_sidecar`] for a copy whose lowercase hex SHA-256 the caller can give
+/// (`computed` runs only when there is a sidecar to compare with).
+pub(crate) async fn check_sidecar_digest(
+    storage: &crate::Storage,
+    key: &str,
+    computed: impl FnOnce() -> String,
+) -> Sidecar {
     match storage.get(&format!("{key}.sha256")).await {
         Ok(stored) => {
-            let computed = hex::encode(sha2::Sha256::digest(data));
+            let computed = computed();
             let expected = String::from_utf8_lossy(&stored).into_owned();
             if computed == expected {
                 Sidecar::Holds
@@ -683,6 +703,39 @@ async fn proxy_fetch_core_with<T, F, Fut, R>(
     headers_only: bool,
     auth: Option<UpstreamAuth<'_>>,
     extra_headers: Option<(&str, &str)>,
+    reading: (F, R),
+    breaker: (&CircuitBreakerRegistry, BreakerScope<'_>),
+) -> Result<T, ProxyError>
+where
+    F: Fn(reqwest::Response) -> Fut + Copy,
+    Fut: std::future::Future<Output = Result<T, ProxyError>>,
+    R: Fn(&reqwest::Response) -> Option<T>,
+{
+    let auth_header = upstream_auth_header(auth)?;
+    proxy_fetch_prepared(
+        client,
+        url,
+        timeout,
+        headers_only,
+        auth_header,
+        extra_headers,
+        reading,
+        breaker,
+    )
+    .await
+}
+
+/// [`proxy_fetch_core_with`] with the `Authorization` value already built: what a fetch
+/// that outlives its request (a detached artifact fill) owns instead of the borrowed
+/// credential.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_fetch_prepared<T, F, Fut, R>(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    headers_only: bool,
+    auth_header: Option<reqwest::header::HeaderValue>,
+    extra_headers: Option<(&str, &str)>,
     (extract, redirected): (F, R),
     (cb, scope): (&CircuitBreakerRegistry, BreakerScope<'_>),
 ) -> Result<T, ProxyError>
@@ -691,7 +744,6 @@ where
     Fut: std::future::Future<Output = Result<T, ProxyError>>,
     R: Fn(&reqwest::Response) -> Option<T>,
 {
-    let auth_header = upstream_auth_header(auth)?;
     let registry_str = scope.registry().as_str();
     let cb_key = scope.key();
     let probe = cb.check(&cb_key)?;
@@ -824,6 +876,49 @@ where
     Err(ProxyError::Network("max retries exceeded".into()))
 }
 
+/// `server.proxy_max_buffered_mb` in bytes (`u64::MAX` = no cap): the largest upstream
+/// body the buffered fetchers below read into memory (R4-P14).
+// ponytail: process-wide, set once at startup, because the ~60 call sites of the
+// buffered fetchers take no `AppState`; pass it as an argument if it ever has to
+// differ per registry.
+static MAX_BUFFERED_BODY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(512 * MIB);
+
+/// Set the cap of [`read_buffered`] from the configuration (`None` = no cap).
+pub(crate) fn set_max_buffered_body(cap: Option<u64>) {
+    MAX_BUFFERED_BODY.store(
+        cap.unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// An upstream body read whole into memory, refused above
+/// `server.proxy_max_buffered_mb`: every metadata fetch comes through here.
+async fn read_buffered(response: reqwest::Response) -> Result<Vec<u8>, ProxyError> {
+    let cap = MAX_BUFFERED_BODY.load(std::sync::atomic::Ordering::Relaxed);
+    read_capped(response, cap).await
+}
+
+/// A body of at most `cap` bytes, refused on its `Content-Length` or as soon as the
+/// running count crosses the cap, instead of being buffered whole. The chunks land
+/// in one `Vec`: no second copy of the body is made.
+async fn read_capped(mut response: reqwest::Response, cap: u64) -> Result<Vec<u8>, ProxyError> {
+    let too_large = || ProxyError::Spool(SpoolError::TooLarge(cap));
+    let declared = response.content_length();
+    if declared.is_some_and(|n| n > cap) {
+        return Err(too_large());
+    }
+    // A declared length is a hint, not a promise: never reserve more than 64 MiB on it.
+    let mut body = Vec::with_capacity(declared.unwrap_or(0).min(64 * MIB) as usize);
+    while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+        if (body.len() + chunk.len()) as u64 > cap {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Fetch binary content from upstream proxy with timeout and 1 retry.
 pub(crate) async fn proxy_fetch(
     client: &reqwest::Client,
@@ -840,7 +935,7 @@ pub(crate) async fn proxy_fetch(
         false,
         auth,
         None,
-        |r| async { r.bytes().await.map(|b| b.to_vec()).map_err(transport_error) },
+        read_buffered,
         cb,
         scope,
     )
@@ -865,19 +960,10 @@ pub(crate) async fn proxy_fetch_capped(
         false,
         auth,
         None,
-        move |mut r| async move {
-            let too_large = || ProxyError::Spool(SpoolError::TooLarge(cap));
-            if r.content_length().is_some_and(|n| n > cap) {
-                return Err(too_large());
-            }
-            let mut body = Vec::new();
-            while let Some(chunk) = r.chunk().await.map_err(transport_error)? {
-                body.extend_from_slice(&chunk);
-                if body.len() as u64 > cap {
-                    return Err(too_large());
-                }
-            }
-            Ok(Bytes::from(body))
+        // The caller's cap, never above `server.proxy_max_buffered_mb`.
+        move |r| async move {
+            let cap = cap.min(MAX_BUFFERED_BODY.load(std::sync::atomic::Ordering::Relaxed));
+            read_capped(r, cap).await.map(Bytes::from)
         },
         cb,
         scope,
@@ -902,7 +988,7 @@ pub(crate) async fn proxy_fetch_bytes(
         false,
         auth,
         None,
-        |r| async { r.bytes().await.map_err(transport_error) },
+        |r| async { read_buffered(r).await.map(Bytes::from) },
         cb,
         scope,
     )
@@ -1218,6 +1304,17 @@ async fn next_chunk(
     }
 }
 
+/// The byte cap of a proxied artifact. With spooling off (`threshold == 0`) the whole
+/// artifact is held in memory: it is a buffered body, under `buffered`
+/// (`server.proxy_max_buffered_mb`) as well as under `cap`.
+fn artifact_cap(threshold: u64, cap: Option<u64>, buffered: u64) -> Option<u64> {
+    if threshold == 0 {
+        Some(cap.map_or(buffered, |cap| cap.min(buffered)))
+    } else {
+        cap
+    }
+}
+
 /// Read an upstream response body, each chunk under the `idle` timeout: whole into
 /// memory up to `threshold` bytes (0 = always), else to a spool file under `spool`'s
 /// budget with a running SHA-256, never holding more than one chunk of it. A body
@@ -1232,6 +1329,11 @@ async fn read_or_spool(
 ) -> Result<ProxyBody, ProxyError> {
     use sha2::Digest;
     use tokio::io::AsyncWriteExt;
+    let cap = artifact_cap(
+        threshold,
+        cap,
+        MAX_BUFFERED_BODY.load(std::sync::atomic::Ordering::Relaxed),
+    );
     let over_cap = |len: u64| cap.is_some_and(|cap| len > cap);
     let too_large = || ProxyError::Spool(SpoolError::TooLarge(cap.unwrap_or_default()));
     let in_memory = |len: u64| threshold == 0 || len <= threshold;
@@ -1330,6 +1432,386 @@ pub(crate) async fn proxy_fetch_artifact(
     .await
 }
 
+/// How long the fill of a request that went away is kept for its retry: the body
+/// stays in the flight, and the first request to ask for it gets it and caches it.
+const ORPHAN_FILL_HOLD: Duration = Duration::from_secs(120);
+
+/// In-memory bodies kept for a retry, all fills together: past it an orphaned fill is
+/// dropped instead of kept (a spooled one is under the spool budget already). Clients
+/// that start many small downloads and leave cannot pin more than this.
+const ORPHAN_MEM_MAX: u64 = 256 * MIB;
+static ORPHAN_MEM_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A share of [`ORPHAN_MEM_MAX`], given back on drop.
+struct OrphanMem(u64);
+
+impl OrphanMem {
+    /// Room for keeping `body`; `None` when the kept in-memory bodies are at their limit.
+    fn reserve(body: &ProxyBody) -> Option<Self> {
+        Self::reserve_len(match body {
+            ProxyBody::Mem(b) => b.len() as u64,
+            ProxyBody::File(_) => 0,
+        })
+    }
+
+    fn reserve_len(len: u64) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        ORPHAN_MEM_HELD
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                (held + len <= ORPHAN_MEM_MAX).then_some(held + len)
+            })
+            .ok()
+            .map(|_| OrphanMem(len))
+    }
+}
+
+impl Drop for OrphanMem {
+    fn drop(&mut self) {
+        ORPHAN_MEM_HELD.fetch_sub(self.0, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// How long a fill goes on after the request that started it went away. An attended
+/// download is bounded by progress alone (the idle timeout); one nobody asked to finish
+/// must not hold an upstream connection and a spool reservation for as long as the
+/// upstream keeps trickling bytes.
+const UNATTENDED_FILL_LIMIT: Duration = Duration::from_secs(30 * 60);
+
+/// Fills running with nobody waiting, all keys together. Each holds at most the
+/// in-memory head of a body (`server.stream_threshold_mb`; the rest is under the spool
+/// budget), so this bounds what requests that started a download and left can pin.
+const UNATTENDED_FILLS_MAX: usize = 16;
+static UNATTENDED_FILLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One of the [`UNATTENDED_FILLS_MAX`] places, given back on drop.
+struct UnattendedFill;
+
+impl UnattendedFill {
+    fn take() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        UNATTENDED_FILLS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < UNATTENDED_FILLS_MAX).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| UnattendedFill)
+    }
+}
+
+impl Drop for UnattendedFill {
+    fn drop(&mut self) {
+        UNATTENDED_FILLS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The requests waiting on one artifact flight right now, whatever their role in it.
+#[derive(Default)]
+struct Waiters {
+    count: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+/// Waiters of every running flight, by flight key.
+static FLIGHT_WAITERS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<Waiters>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// A hold on a flight's [`Waiters`]: a request's (`counted`, dropped with the request
+/// future, so a disconnect is seen at once) or its fill task's. The entry leaves the
+/// map with the last hold.
+struct Seat {
+    key: String,
+    waiters: std::sync::Arc<Waiters>,
+    counted: bool,
+}
+
+impl Seat {
+    /// The seat of a request that waits on flight `key`.
+    fn waiting(key: &str) -> Self {
+        let waiters =
+            std::sync::Arc::clone(FLIGHT_WAITERS.lock().entry(key.to_string()).or_default());
+        waiters
+            .count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        waiters.changed.notify_waiters();
+        Seat {
+            key: key.to_string(),
+            waiters,
+            counted: true,
+        }
+    }
+
+    /// The seat of the task that fetches for this request: it keeps the entry, and
+    /// does not count as a waiter.
+    fn of_task(&self) -> Self {
+        let mut map = FLIGHT_WAITERS.lock();
+        // Re-insert under the lock: the entry may have left with another seat.
+        let waiters = std::sync::Arc::clone(
+            map.entry(self.key.clone())
+                .or_insert_with(|| std::sync::Arc::clone(&self.waiters)),
+        );
+        Seat {
+            key: self.key.clone(),
+            waiters,
+            counted: false,
+        }
+    }
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let mut map = FLIGHT_WAITERS.lock();
+        if self.counted {
+            self.waiters.count.fetch_sub(1, Ordering::AcqRel);
+            self.waiters.changed.notify_waiters();
+        }
+        // The map's hold and this one: nobody else is on the flight.
+        if std::sync::Arc::strong_count(&self.waiters) <= 2
+            && map
+                .get(&self.key)
+                .is_some_and(|w| std::sync::Arc::ptr_eq(w, &self.waiters))
+        {
+            map.remove(&self.key);
+        }
+    }
+}
+
+/// `fetch`, given up once nobody has waited on its flight for [`UNATTENDED_FILL_LIMIT`]
+/// in a row, or at once when [`UNATTENDED_FILLS_MAX`] other fills already run unattended.
+/// A retry that joins the flight makes it attended again.
+async fn while_attended<T>(
+    fetch: impl std::future::Future<Output = Result<T, ProxyError>>,
+    waiters: &Waiters,
+) -> Result<T, ProxyError> {
+    let unattended = async {
+        loop {
+            let changed = waiters.changed.notified();
+            tokio::pin!(changed);
+            // Registered before the count is read: a change in between is not missed.
+            changed.as_mut().enable();
+            if waiters.count.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                changed.await;
+                continue;
+            }
+            let Some(_place) = UnattendedFill::take() else {
+                return "too many fills already run with nobody waiting";
+            };
+            tokio::select! {
+                () = tokio::time::sleep(UNATTENDED_FILL_LIMIT) => {
+                    return "nobody waited for it for 30 minutes";
+                }
+                () = &mut changed => {}
+            }
+        }
+    };
+    tokio::select! {
+        result = fetch => result,
+        why = unattended => Err(ProxyError::Timeout(format!("fill abandoned: {why}"))),
+    }
+}
+
+/// What a cold-miss artifact flight shares: the body, and whether it still has to be
+/// cached by whoever takes it (the request that led the fill went away).
+#[derive(Clone)]
+pub(crate) struct ArtifactFill {
+    body: ProxyBody,
+    orphaned: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// What one upstream request of an artifact fetch gave.
+enum Fetched {
+    Body(ProxyBody),
+    /// A redirect the no-redirect client handed back unfollowed.
+    Redirect(reqwest::Url),
+}
+
+/// What [`fill_detached`] gives its caller.
+enum Filled {
+    /// This caller's own fetch ran.
+    Own(Fetched),
+    /// Another request's fill; the flag is true when this caller must cache it.
+    Shared(ProxyBody, bool),
+}
+
+/// The upstream request of an artifact fetch as a future that owns everything it
+/// reads, so it can outlive the request that started it. `redirects`: hand an
+/// unfollowed redirect back as [`Fetched::Redirect`] instead of failing on it.
+fn owned_artifact_fetch(
+    state: &AppState,
+    client: &reqwest::Client,
+    url: &str,
+    timeout_secs: u64,
+    auth: Option<UpstreamAuth<'_>>,
+    scope: BreakerScope<'_>,
+    redirects: bool,
+) -> Result<
+    impl std::future::Future<Output = Result<Fetched, ProxyError>> + Send + 'static,
+    ProxyError,
+> {
+    let auth_header = upstream_auth_header(auth)?;
+    let (state, client, url) = (state.clone(), client.clone(), url.to_string());
+    let (registry_type, upstream) = (scope.registry(), scope.upstream_url().map(str::to_string));
+    Ok(async move {
+        let spool = state.spool.as_ref();
+        let threshold = state.config.server.stream_threshold();
+        let cap = state.config.server.proxy_max_artifact();
+        let timeout = Duration::from_secs(timeout_secs);
+        let scope = match &upstream {
+            Some(upstream) => BreakerScope::upstream(registry_type, upstream),
+            None => registry_type.into(),
+        };
+        proxy_fetch_prepared(
+            &client,
+            &url,
+            timeout,
+            true,
+            auth_header,
+            None,
+            (
+                move |r| async move {
+                    read_or_spool(r, spool, threshold, cap, timeout)
+                        .await
+                        .map(Fetched::Body)
+                },
+                move |r: &reqwest::Response| {
+                    redirects
+                        .then(|| unfollowed_redirect(r))
+                        .flatten()
+                        .map(Fetched::Redirect)
+                },
+            ),
+            (&state.circuit_breaker, scope),
+        )
+        .await
+    })
+}
+
+/// Run a cold-miss artifact `fetch` for storage `key` under single-flight, in a task of
+/// its own (R4-P03): a client that gives up mid-download (pip after 15 s without a
+/// byte, NuGet after 100 s) no longer cancels the fetch and discards the bytes already
+/// spooled. Its retry joins the same flight; when the fill ends with nobody waiting, the
+/// body is kept for [`ORPHAN_FILL_HOLD`] and the first request to ask for it takes it,
+/// runs its own gates, and caches it. `Err(None)`: the leader had nothing to share (a
+/// redirect), ask again.
+async fn fill_detached(
+    state: &AppState,
+    key: &str,
+    registry: &'static str,
+    budget: Duration,
+    fetch: impl std::future::Future<Output = Result<Fetched, ProxyError>> + Send + 'static,
+) -> Result<Filled, Option<ProxyError>> {
+    use futures::FutureExt as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let flights = state.artifact_flights.clone();
+    let flight_key = format!("fetch:{key}");
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // Dropped with this request's future: the flight sees a disconnect at once.
+    let seat = Seat::waiting(&flight_key);
+    let task_seat = seat.of_task();
+    let task = async move {
+        let orphaned = std::sync::Arc::new(AtomicBool::new(false));
+        // `fetch` runs at most once per caller: as the leader, or as a follower whose
+        // leader was cancelled or outlasted the budget. Its own result wins.
+        let mut own = None;
+        // Whether the body was offered to the flight's followers when it was published.
+        let mut offered = false;
+        let (own_slot, offered_slot, flag, waiting, waiters) = (
+            &mut own,
+            &mut offered,
+            std::sync::Arc::clone(&orphaned),
+            &tx,
+            task_seat.waiters.as_ref(),
+        );
+        let shared = flights
+            .coalesced_try_leased(&flight_key, registry, budget, move || async move {
+                // A request that left before its fetch started (a follower whose wait
+                // ran out, or whose leader was cancelled) starts none.
+                if waiting.is_closed() {
+                    return Err(None);
+                }
+                let result = while_attended(fetch, waiters).await;
+                let shared = match &result {
+                    Ok(Fetched::Body(body)) => {
+                        // Nobody is waiting for this answer any more: whoever takes
+                        // the body from the flight caches it.
+                        *offered_slot = waiting.is_closed();
+                        flag.store(*offered_slot, Ordering::Release);
+                        Ok(ArtifactFill {
+                            body: body.clone(),
+                            orphaned: flag,
+                        })
+                    }
+                    // A redirect is this caller's answer only: no detail to share.
+                    Ok(Fetched::Redirect(_)) => Err(None),
+                    Err(e) => Err(Some(e.clone())),
+                };
+                *own_slot = Some(result);
+                shared
+            })
+            .await;
+        // Room to keep the body this task fetched, should its request be gone.
+        let kept = match &own {
+            Some(Ok(Fetched::Body(body))) => OrphanMem::reserve(body),
+            _ => None,
+        };
+        let (answer, lease, took_over) = match (own, shared) {
+            (Some(result), shared) => (
+                result.map(Filled::Own).map_err(Some),
+                shared.ok().and_then(|(_, lease)| lease),
+                None,
+            ),
+            // A follower: the leader's body, or the leader's own failure (R4-P08).
+            (None, Ok((fill, _))) => {
+                let take = fill.orphaned.swap(false, Ordering::AcqRel);
+                (
+                    Ok(Filled::Shared(fill.body, take)),
+                    None,
+                    take.then_some(fill.orphaned),
+                )
+            }
+            (None, Err(e)) => (Err(e), None, None),
+        };
+        if !tx.is_closed() {
+            // The request gets its answer and caches the body; the flight ends with
+            // the fetch, as before.
+            drop(lease);
+            if tx.send(answer).is_err() {
+                // It left in this very moment: offer a body it had taken over again.
+                if let Some(flag) = took_over {
+                    flag.store(true, Ordering::Release);
+                }
+            }
+            return;
+        }
+        // The request went away. A body it was to cache is offered to the next one.
+        if let Some(flag) = took_over {
+            flag.store(true, Ordering::Release);
+        }
+        let Some((lease, _room)) = lease.zip(kept) else {
+            return; // Nothing fetched to keep, or no room to keep it in memory.
+        };
+        // Offered at publish already, and maybe taken since: never offered twice.
+        if !offered {
+            orphaned.store(true, Ordering::Release);
+        }
+        tokio::time::sleep(ORPHAN_FILL_HOLD).await;
+        drop(lease);
+    };
+    tokio::spawn(async move {
+        if let Err(panic) = std::panic::AssertUnwindSafe(task).catch_unwind().await {
+            crate::supervise::report_panic("artifact_fill", &panic);
+        }
+    });
+    let answer = rx.await.unwrap_or_else(|_| {
+        Err(Some(ProxyError::Network(
+            "artifact fill ended without an answer".into(),
+        )))
+    });
+    drop(seat);
+    answer
+}
+
 /// [`proxy_fetch_artifact`] over `client` instead of the shared one (helm: an
 /// SSRF-guarded client for a host the upstream's index names).
 #[allow(clippy::too_many_arguments)]
@@ -1343,50 +1825,22 @@ pub(crate) async fn proxy_fetch_artifact_with(
     auth: Option<UpstreamAuth<'_>>,
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<(ProxyBody, bool), ProxyError> {
-    let spool = state.spool.as_ref();
-    let threshold = state.config.server.stream_threshold();
-    let cap = state.config.server.proxy_max_artifact();
-    let timeout = Duration::from_secs(timeout_secs);
-    let fetch = proxy_fetch_core(
-        client,
-        url,
-        timeout,
-        true,
-        auth,
-        None,
-        |r| read_or_spool(r, spool, threshold, cap, timeout),
-        &state.circuit_breaker,
-        scope,
-    );
+    let fetch = owned_artifact_fetch(state, client, url, timeout_secs, auth, scope.into(), false)?;
+    let body_of = |fetched| match fetched {
+        Fetched::Body(body) => Ok((body, true)),
+        // Unreachable: without `redirects` a redirect is an `Upstream` error.
+        Fetched::Redirect(_) => Err(ProxyError::Network("unexpected redirect".into())),
+    };
     if !state.config.server.proxy_coalesce {
-        return fetch.await.map(|b| (b, true));
+        return fetch.await.and_then(body_of);
     }
-    // As `proxy_fetch_shared`: the caller's own result (error included) wins.
-    let mut own = None;
-    let own_slot = &mut own;
-    let shared = state
-        .artifact_flights
-        .coalesced_try(
-            &format!("fetch:{key}"),
-            registry,
-            crate::proxy_coalesce::follower_budget(timeout_secs).max(ARTIFACT_FOLLOWER_BUDGET),
-            move || async move {
-                let result = fetch.await;
-                let shared = match &result {
-                    Ok(value) => Ok(value.clone()),
-                    Err(e) => Err(Some(e.clone())),
-                };
-                *own_slot = Some(result);
-                shared
-            },
-        )
-        .await;
-    match own {
-        Some(result) => result.map(|b| (b, true)),
-        // A follower: the leader's body, or the leader's own failure (R4-P08).
-        None => shared.map(|b| (b, false)).map_err(|e| {
-            e.unwrap_or_else(|| ProxyError::Network("coalesced fetch returned nothing".into()))
-        }),
+    let budget = crate::proxy_coalesce::follower_budget(timeout_secs).max(ARTIFACT_FOLLOWER_BUDGET);
+    match fill_detached(state, key, registry, budget, fetch).await {
+        Ok(Filled::Own(fetched)) => body_of(fetched),
+        Ok(Filled::Shared(body, cache)) => Ok((body, cache)),
+        Err(e) => {
+            Err(e.unwrap_or_else(|| ProxyError::Network("coalesced fetch returned nothing".into())))
+        }
     }
 }
 
@@ -1413,70 +1867,22 @@ pub(crate) async fn proxy_fetch_artifact_hop(
     auth: Option<UpstreamAuth<'_>>,
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<ArtifactHop, ProxyError> {
-    enum Fetched {
-        Body(ProxyBody),
-        Redirect(reqwest::Url),
-    }
-    let spool = state.spool.as_ref();
-    let threshold = state.config.server.stream_threshold();
-    let cap = state.config.server.proxy_max_artifact();
-    let timeout = Duration::from_secs(timeout_secs);
     let scope = scope.into();
-    let fetch = || {
-        proxy_fetch_core_with(
-            client,
-            url,
-            timeout,
-            true,
-            auth,
-            None,
-            (
-                move |r| async move {
-                    read_or_spool(r, spool, threshold, cap, timeout)
-                        .await
-                        .map(Fetched::Body)
-                },
-                |r: &reqwest::Response| unfollowed_redirect(r).map(Fetched::Redirect),
-            ),
-            (&state.circuit_breaker, scope),
-        )
-    };
+    let fetch = || owned_artifact_fetch(state, client, url, timeout_secs, auth, scope, true);
     let hop = |fetched: Fetched, own: bool| match fetched {
         Fetched::Body(body) => ArtifactHop::Body(body, own),
         Fetched::Redirect(next) => ArtifactHop::Redirect(next),
     };
     if !state.config.server.proxy_coalesce {
-        return fetch().await.map(|f| hop(f, true));
+        return fetch()?.await.map(|f| hop(f, true));
     }
-    // As `proxy_fetch_artifact_with`: the caller's own result (error included) wins.
-    let mut own = None;
-    let own_slot = &mut own;
-    let first = fetch();
-    let shared = state
-        .artifact_flights
-        .coalesced_try(
-            &format!("fetch:{key}"),
-            registry,
-            crate::proxy_coalesce::follower_budget(timeout_secs).max(ARTIFACT_FOLLOWER_BUDGET),
-            move || async move {
-                let result = first.await;
-                let shared = match &result {
-                    Ok(Fetched::Body(body)) => Ok(body.clone()),
-                    // A redirect is this caller's answer only: no detail to share.
-                    Ok(Fetched::Redirect(_)) => Err(None),
-                    Err(e) => Err(Some(e.clone())),
-                };
-                *own_slot = Some(result);
-                shared
-            },
-        )
-        .await;
-    match (own, shared) {
-        (Some(result), _) => result.map(|f| hop(f, true)),
-        (None, Ok(body)) => Ok(ArtifactHop::Body(body, false)),
+    let budget = crate::proxy_coalesce::follower_budget(timeout_secs).max(ARTIFACT_FOLLOWER_BUDGET);
+    match fill_detached(state, key, registry, budget, fetch()?).await {
+        Ok(Filled::Own(fetched)) => Ok(hop(fetched, true)),
+        Ok(Filled::Shared(body, cache)) => Ok(ArtifactHop::Body(body, cache)),
         // The leader's failure is the flight's (R4-P08); its redirect is not ours.
-        (None, Err(Some(e))) => Err(e),
-        (None, Err(None)) => fetch().await.map(|f| hop(f, true)),
+        Err(Some(e)) => Err(e),
+        Err(None) => fetch()?.await.map(|f| hop(f, true)),
     }
 }
 
@@ -1611,7 +2017,9 @@ pub(crate) fn spawn_cache_body(
 /// A cached proxied artifact: read whole and gated, or (above
 /// `server.stream_threshold_mb`) an open reader to stream with its pin.
 pub(crate) enum CachedArtifact {
-    Buffered(Bytes),
+    /// `sha256`: lowercase hex, the pin the read verified, or for a copy without a
+    /// pin the digest taken once when it was read (R4-P05).
+    Buffered { data: Bytes, sha256: String },
     Streamed {
         len: u64,
         sha256: String,
@@ -1620,20 +2028,19 @@ pub(crate) enum CachedArtifact {
 }
 
 impl CachedArtifact {
-    /// `sha256:<hex>` of the artifact: the verified pin, or hashed now.
+    /// `sha256:<hex>` of the artifact: the pin its read verified (or, streamed, checks
+    /// as it goes), else the digest taken when it was read. Never hashes.
     pub(crate) fn digest(&self) -> String {
-        use sha2::Digest;
         match self {
-            CachedArtifact::Buffered(b) => {
-                format!("sha256:{}", hex::encode(sha2::Sha256::digest(b)))
+            CachedArtifact::Buffered { sha256, .. } | CachedArtifact::Streamed { sha256, .. } => {
+                format!("sha256:{sha256}")
             }
-            CachedArtifact::Streamed { sha256, .. } => format!("sha256:{sha256}"),
         }
     }
 
     pub(crate) fn len(&self) -> u64 {
         match self {
-            CachedArtifact::Buffered(b) => b.len() as u64,
+            CachedArtifact::Buffered { data, .. } => data.len() as u64,
             CachedArtifact::Streamed { len, .. } => *len,
         }
     }
@@ -1650,7 +2057,7 @@ impl CachedArtifact {
         internal: bool,
     ) -> Body {
         match self {
-            CachedArtifact::Buffered(b) => Body::from(b),
+            CachedArtifact::Buffered { data, .. } => Body::from(data),
             CachedArtifact::Streamed { sha256, reader, .. } => {
                 let state = state.clone();
                 let heal_key = key.to_string();
@@ -1760,29 +2167,45 @@ pub(crate) async fn read_cached_artifact_pinned(
     let fail_closed = internal
         || (matches!(read, Err(StorageError::IntegrityViolation))
             && !drop_proxied_copy(state, registry, key).await);
-    Ok(
-        cache_read(read, registry, key, fail_closed)?.map(|read| match read {
-            BoundedRead::Buffered(outcome) => {
-                use nora_registry::verified::{verified_body, GateOutcome};
-                match outcome {
-                    GateOutcome::Verified(blob) => {
-                        (CachedArtifact::Buffered(verified_body(blob)), true)
-                    }
-                    GateOutcome::Unpinned(blob) => {
-                        (CachedArtifact::Buffered(blob.into_inner()), false)
-                    }
+    let Some(read) = cache_read(read, registry, key, fail_closed)? else {
+        return Ok(None);
+    };
+    Ok(Some(match read {
+        BoundedRead::Buffered(outcome) => {
+            use nora_registry::verified::GateOutcome;
+            match outcome {
+                // The digest the read just verified: the gates use it as it is.
+                GateOutcome::Verified(blob) => {
+                    let (data, sha256) = blob.into_parts();
+                    (CachedArtifact::Buffered { data, sha256 }, true)
+                }
+                // No pin (stored before pins): hashed once here, off the workers,
+                // for every gate that needs the digest.
+                GateOutcome::Unpinned(blob) => {
+                    let data = blob.into_inner();
+                    let body = data.clone();
+                    let sha256 = tokio::task::spawn_blocking(move || {
+                        use sha2::Digest;
+                        hex::encode(sha2::Sha256::digest(&body))
+                    })
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(registry, key, error = %e, "hashing a cached copy failed");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    })?;
+                    (CachedArtifact::Buffered { data, sha256 }, false)
                 }
             }
-            BoundedRead::Streamed { len, pin, reader } => (
-                CachedArtifact::Streamed {
-                    len,
-                    sha256: pin,
-                    reader,
-                },
-                true,
-            ),
-        }),
-    )
+        }
+        BoundedRead::Streamed { len, pin, reader } => (
+            CachedArtifact::Streamed {
+                len,
+                sha256: pin,
+                reader,
+            },
+            true,
+        ),
+    }))
 }
 
 /// Fetch text content from upstream proxy with timeout and 1 retry.
@@ -1802,7 +2225,14 @@ pub(crate) async fn proxy_fetch_text(
         false,
         auth,
         extra_headers,
-        |r| async { r.text().await.map_err(transport_error) },
+        // As `Response::text` for a UTF-8 body (every registry's metadata), capped.
+        |r| async {
+            let body = read_buffered(r).await?;
+            Ok(match String::from_utf8(body) {
+                Ok(text) => text,
+                Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+            })
+        },
         cb,
         scope,
     )
@@ -2421,13 +2851,18 @@ pub(crate) async fn proxy_fetch_conditional(
                         etag: header_string(&response, header::ETAG),
                         last_modified: header_string(&response, header::LAST_MODIFIED),
                     };
-                    return match response.bytes().await {
+                    return match read_buffered(response).await {
                         Ok(body) => {
                             cb.record_success(&cb_key, probe);
                             Ok(Revalidation::Modified {
-                                body: body.to_vec(),
+                                body,
                                 validators: new_validators,
                             })
+                        }
+                        // Refused for its size: nora's limit, the upstream is alive.
+                        Err(e @ ProxyError::Spool(_)) => {
+                            cb.record_success(&cb_key, probe);
+                            Err(e)
                         }
                         Err(e) => {
                             // 2xx but the body could not be read (e.g. a mid-stream
@@ -2435,7 +2870,7 @@ pub(crate) async fn proxy_fetch_conditional(
                             // proxy_fetch_core; unreported, a half-open probe would
                             // hold its slot until the #585 stall recovery.
                             cb.record_failure(&cb_key, probe);
-                            Err(transport_error(e))
+                            Err(e)
                         }
                     };
                 }
@@ -2970,6 +3405,303 @@ mod tests {
         format!("http://{addr}/a")
     }
 
+    /// An upstream on a raw socket that answers 200 with a chunked body in two halves:
+    /// the first at once, the second when `release` is notified. Counts its connections.
+    async fn gated_upstream(
+        release: std::sync::Arc<tokio::sync::Notify>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (release, seen) = (
+                    std::sync::Arc::clone(&release),
+                    std::sync::Arc::clone(&seen),
+                );
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let head =
+                        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+                    if sock.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    release.notified().await;
+                    let _ = sock.write_all(b"5\r\nworld\r\n0\r\n\r\n").await;
+                });
+            }
+        });
+        (format!("http://{addr}/a"), hits)
+    }
+
+    fn mem(body: &ProxyBody) -> &[u8] {
+        match body {
+            ProxyBody::Mem(b) => b,
+            ProxyBody::File(_) => panic!("expected an in-memory body"),
+        }
+    }
+
+    /// R4-P05: a cached artifact carries the SHA-256 its read established (the pin the
+    /// storage gate verified, or for a copy stored before pins one hash taken at the
+    /// read), and `digest()` answers from it for every gate instead of hashing the
+    /// body again per gate.
+    #[tokio::test]
+    async fn cached_artifact_carries_the_digest_of_its_read() {
+        use sha2::Digest;
+        let ctx = crate::test_helpers::create_test_context();
+        let state = &ctx.state;
+        let hex_of = |b: &[u8]| hex::encode(sha2::Sha256::digest(b));
+
+        state
+            .storage
+            .put("npm/p/tarballs/p-1.0.0.tgz", b"pinned")
+            .await
+            .unwrap();
+        let (artifact, pinned) =
+            read_cached_artifact_pinned(state, "npm", "npm/p/tarballs/p-1.0.0.tgz", false)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(pinned);
+        assert!(
+            matches!(&artifact, CachedArtifact::Buffered { sha256, .. } if *sha256 == hex_of(b"pinned"))
+        );
+        assert_eq!(artifact.digest(), format!("sha256:{}", hex_of(b"pinned")));
+
+        let legacy = ctx._tempdir.path().join("npm/p/tarballs/p-0.9.0.tgz");
+        std::fs::write(&legacy, b"no pin").unwrap();
+        let (artifact, pinned) =
+            read_cached_artifact_pinned(state, "npm", "npm/p/tarballs/p-0.9.0.tgz", false)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(!pinned);
+        assert_eq!(artifact.digest(), format!("sha256:{}", hex_of(b"no pin")));
+    }
+
+    /// An artifact held whole in memory (spooling off) is capped as a buffered body; one
+    /// that spools keeps the artifact cap alone.
+    #[test]
+    fn artifact_in_memory_is_under_the_buffered_cap() {
+        assert_eq!(
+            artifact_cap(0, Some(2048 * MIB), 512 * MIB),
+            Some(512 * MIB)
+        );
+        assert_eq!(artifact_cap(0, Some(64 * MIB), 512 * MIB), Some(64 * MIB));
+        assert_eq!(artifact_cap(0, None, 512 * MIB), Some(512 * MIB));
+        assert_eq!(
+            artifact_cap(16 * MIB, Some(2048 * MIB), 512 * MIB),
+            Some(2048 * MIB)
+        );
+        assert_eq!(artifact_cap(16 * MIB, None, 512 * MIB), None);
+    }
+
+    /// In-memory bodies kept for a retry share one budget: a fill that does not fit is
+    /// not kept, and room comes back when a kept one is dropped.
+    #[test]
+    fn kept_orphan_bodies_share_a_budget() {
+        assert!(OrphanMem::reserve_len(ORPHAN_MEM_MAX + 1).is_none());
+        let before = ORPHAN_MEM_HELD.load(std::sync::atomic::Ordering::Acquire);
+        let room = OrphanMem::reserve_len(MIB).expect("a small body fits");
+        drop(room);
+        // Other tests may hold room at the same time: only this one's share is checked.
+        assert!(ORPHAN_MEM_HELD.load(std::sync::atomic::Ordering::Acquire) <= before + MIB);
+    }
+
+    /// A fill goes on for as long as a request waits on its flight, however long. With
+    /// nobody waiting it is given up after `UNATTENDED_FILL_LIMIT`, and a retry that
+    /// joins meanwhile starts that time over.
+    #[tokio::test(start_paused = true)]
+    async fn unattended_fill_is_given_up_after_its_limit() {
+        let never = || std::future::pending::<Result<(), ProxyError>>();
+        let request = Seat::waiting("fetch:test/attendance");
+        let task = request.of_task();
+        let attended = tokio::time::timeout(
+            UNATTENDED_FILL_LIMIT * 10,
+            while_attended(never(), &task.waiters),
+        )
+        .await;
+        assert!(
+            attended.is_err(),
+            "an attended fill has no deadline of its own"
+        );
+
+        // The request leaves; a retry joins before the limit and leaves again.
+        drop(request);
+        let fill = tokio::spawn({
+            let waiters = std::sync::Arc::clone(&task.waiters);
+            async move {
+                let started = tokio::time::Instant::now();
+                let out = while_attended(never(), &waiters).await;
+                (out, started.elapsed())
+            }
+        });
+        tokio::time::sleep(UNATTENDED_FILL_LIMIT - Duration::from_secs(1)).await;
+        let retry = Seat::waiting("fetch:test/attendance");
+        assert!(
+            std::sync::Arc::ptr_eq(&retry.waiters, &task.waiters),
+            "a retry joins the running flight's waiters"
+        );
+        tokio::time::sleep(UNATTENDED_FILL_LIMIT).await;
+        assert!(!fill.is_finished(), "attended again: not given up");
+        drop(retry);
+        let (abandoned, elapsed) = fill.await.unwrap();
+        assert!(
+            matches!(abandoned, Err(ProxyError::Timeout(_))),
+            "{abandoned:?}"
+        );
+        assert_eq!(
+            elapsed,
+            UNATTENDED_FILL_LIMIT * 3 - Duration::from_secs(1),
+            "the limit runs from the moment the last waiter left"
+        );
+
+        drop(task);
+        assert!(
+            !FLIGHT_WAITERS.lock().contains_key("fetch:test/attendance"),
+            "the entry leaves with the last seat"
+        );
+    }
+
+    /// Fills that run with nobody waiting are few: past `UNATTENDED_FILLS_MAX` one is
+    /// given up at once instead of holding its buffer for a client that left.
+    #[tokio::test(start_paused = true)]
+    async fn unattended_fills_are_bounded_in_number() {
+        let places: Vec<_> = std::iter::from_fn(UnattendedFill::take).collect();
+        assert!(places.len() <= UNATTENDED_FILLS_MAX);
+        let seat = Seat::waiting("fetch:test/bounded");
+        let task = seat.of_task();
+        drop(seat);
+        let started = tokio::time::Instant::now();
+        let out = while_attended(
+            std::future::pending::<Result<(), ProxyError>>(),
+            &task.waiters,
+        )
+        .await;
+        assert!(matches!(out, Err(ProxyError::Timeout(_))), "{out:?}");
+        assert_eq!(started.elapsed(), Duration::ZERO, "given up at once");
+    }
+
+    /// A miss whose upstream answered with a body over NORA's size cap is a 507, as
+    /// the single-upstream formats answer it, not a 502; "not found" from another
+    /// upstream still decides.
+    #[test]
+    fn miss_over_the_size_cap_is_a_507() {
+        let too_large = ProxyError::Spool(SpoolError::TooLarge(MIB));
+        assert_eq!(
+            UpstreamMiss::of(&too_large).status(),
+            StatusCode::INSUFFICIENT_STORAGE
+        );
+        let mut miss = UpstreamMiss::of(&too_large);
+        miss.record(&ProxyError::NotFound);
+        assert_eq!(miss.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            UpstreamMiss::of(&ProxyError::Spool(SpoolError::Busy)).status(),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    /// R4-P03: a client that disconnects while its cold miss is being downloaded does
+    /// not cancel the download. Its retry joins the same fill (one upstream request in
+    /// all), gets the body, and is the one that caches it. Before, the dropped request
+    /// dropped the fetch, and the retry started from zero.
+    #[tokio::test]
+    async fn client_disconnect_mid_fill_keeps_the_fill_and_a_retry_joins_it() {
+        use std::sync::atomic::Ordering;
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (url, hits) = gated_upstream(std::sync::Arc::clone(&release)).await;
+        let ctx = crate::test_helpers::create_test_context();
+        let state = ctx.state.clone();
+
+        let first = tokio::spawn({
+            let (state, url) = (state.clone(), url.clone());
+            async move { fetch_artifact(&state, "npm/x", &url, 5).await }
+        });
+        while hits.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // The client gives up mid-download.
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        // Its retry arrives while the fill is still running, then upstream finishes.
+        let retry = tokio::spawn({
+            let (state, url) = (state.clone(), url.clone());
+            async move { fetch_artifact(&state, "npm/x", &url, 5).await }
+        });
+        tokio::task::yield_now().await;
+        release.notify_waiters();
+        let (body, cache) = retry.await.unwrap().unwrap();
+        assert_eq!(mem(&body), b"helloworld");
+        assert!(cache, "the retry caches the fill its first attempt started");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "one upstream download in all"
+        );
+
+        // The fill is still held for late retries, but its caching duty is taken.
+        let (again, cache) = fetch_artifact(&state, "npm/x", &url, 5).await.unwrap();
+        assert_eq!(mem(&again), b"helloworld");
+        assert!(!cache, "only one request caches an orphaned fill");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// R4-P03: a fill whose client went away and that ended with nobody waiting is
+    /// kept for the retry that comes after it ended.
+    #[tokio::test]
+    async fn orphaned_fill_is_kept_for_a_retry_after_it_ended() {
+        use std::sync::atomic::Ordering;
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (url, hits) = gated_upstream(std::sync::Arc::clone(&release)).await;
+        let ctx = crate::test_helpers::create_test_context();
+        let state = ctx.state.clone();
+        let first = tokio::spawn({
+            let (state, url) = (state.clone(), url.clone());
+            async move { fetch_artifact(&state, "npm/y", &url, 5).await }
+        });
+        while hits.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        release.notify_waiters();
+        // Whether the retry lands before or after the fill ends, it is served by it.
+        let (body, cache) = fetch_artifact(&state, "npm/y", &url, 5).await.unwrap();
+        assert_eq!(mem(&body), b"helloworld");
+        assert!(cache);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A request that stays gets its own fetch and caches it, and the flight ends with
+    /// the fetch: the next cold miss asks upstream again (no negative or positive memo).
+    #[tokio::test]
+    async fn attended_fill_is_not_held() {
+        use std::sync::atomic::Ordering;
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (url, hits) = gated_upstream(std::sync::Arc::clone(&release)).await;
+        let ctx = crate::test_helpers::create_test_context();
+        let state = &ctx.state;
+        for n in 1..=2 {
+            let fetch = fetch_artifact(state, "npm/z", &url, 5);
+            tokio::pin!(fetch);
+            let (body, cache) = loop {
+                tokio::select! {
+                    out = &mut fetch => break out.unwrap(),
+                    _ = tokio::task::yield_now() => release.notify_waiters(),
+                }
+            };
+            assert_eq!(mem(&body), b"helloworld");
+            assert!(cache);
+            assert_eq!(hits.load(Ordering::SeqCst), n);
+        }
+    }
+
     async fn fetch_artifact(
         state: &AppState,
         key: &str,
@@ -3101,6 +3833,47 @@ mod tests {
         drop(held);
         let (body, _) = fetch_artifact(state, "npm/b", &b, 5).await.unwrap();
         assert_eq!(body.len(), 2 * MIB);
+    }
+
+    /// R4-P14: a body read whole into memory (metadata) is refused above its cap, on
+    /// the declared length before a byte is read and on the running count of a
+    /// chunked one, and a body under the cap comes back whole. Before, a multi-GB
+    /// "packument" was buffered until the pod was OOM-killed.
+    #[tokio::test]
+    async fn buffered_body_is_refused_over_the_cap() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1u8; 3 * MIB as usize]))
+            .mount(&upstream)
+            .await;
+        let client = reqwest::Client::new();
+        let declared = format!("{}/doc", upstream.uri());
+        let chunked = chunked_upstream(48, 64 * 1024, Duration::ZERO).await;
+        for url in [&declared, &chunked] {
+            let response = client.get(url).send().await.unwrap();
+            let err = read_capped(response, 2 * MIB).await.unwrap_err();
+            assert!(
+                matches!(err, ProxyError::Spool(SpoolError::TooLarge(n)) if n == 2 * MIB),
+                "{url}: {err:?}"
+            );
+            assert_eq!(
+                proxy_error_response("npm", url, &err).status(),
+                StatusCode::INSUFFICIENT_STORAGE
+            );
+            let response = client.get(url).send().await.unwrap();
+            let body = read_capped(response, 3 * MIB).await.unwrap();
+            assert_eq!(body.len() as u64, 3 * MIB, "{url}: at the cap is allowed");
+        }
+        // The fetchers every metadata request uses go through the cap (512 MiB by
+        // default, `server.proxy_max_buffered_mb`).
+        let cb = crate::circuit_breaker::CircuitBreakerRegistry::new(Default::default());
+        let rt = crate::registry_type::RegistryType::Npm;
+        let body = proxy_fetch(&client, &declared, Duration::from_secs(5), None, &cb, rt)
+            .await
+            .unwrap();
+        assert_eq!(body.len() as u64, 3 * MIB);
     }
 
     /// R2-05: `proxy_max_artifact_mb` refuses a body on its Content-Length before

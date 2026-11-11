@@ -1327,12 +1327,14 @@ async fn serve_artifact(
         let extra = [(header::CACHE_CONTROL, IMMUTABLE.to_string())];
         let ranged = match &cached {
             // C23: a 206 cut from the body already read, not a second read.
-            CachedArtifact::Buffered(data) => crate::registry::range::range_response_from_bytes(
-                data,
-                headers,
-                content_type,
-                &extra,
-            ),
+            CachedArtifact::Buffered { data, .. } => {
+                crate::registry::range::range_response_from_bytes(
+                    data,
+                    headers,
+                    content_type,
+                    &extra,
+                )
+            }
             CachedArtifact::Streamed { len, .. } => {
                 crate::registry::range::range_response(
                     &state.storage,

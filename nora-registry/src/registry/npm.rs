@@ -868,7 +868,9 @@ async fn handle_request(
     let cached = if cache_trusted {
         // A tarball above `server.stream_threshold_mb` streams from storage (C17).
         match read_cached_artifact_pinned(&state, "npm", &key, internal).await {
-            Ok(Some((CachedArtifact::Buffered(data), pinned))) => Some((data, pinned)),
+            Ok(Some((CachedArtifact::Buffered { data, sha256 }, pinned))) => {
+                Some((data, sha256, pinned))
+            }
             Ok(Some((streamed, _))) => {
                 let gates = TarballGates {
                     package_name: &package_name,
@@ -885,12 +887,16 @@ async fn handle_request(
     } else {
         None
     };
+    // `sha256` is the digest the read verified (pinned) or took once (unpinned): the
+    // sidecar, curation and quarantine checks below all use it, none hashes the body
+    // again (R4-P05).
     let cached = match cached {
-        Some((data, true)) => Some(data),
-        Some((data, false)) => {
+        Some((data, sha256, true)) => Some((data, sha256)),
+        Some((data, sha256, false)) => {
             // Tarball: integrity check against the sidecar written with it.
-            match crate::registry::check_sidecar(&state.storage, &key, &data).await {
-                crate::registry::Sidecar::Holds => Some(data),
+            let digest = sha256.clone();
+            match crate::registry::check_sidecar_digest(&state.storage, &key, || digest).await {
+                crate::registry::Sidecar::Holds => Some((data, sha256)),
                 crate::registry::Sidecar::Differs { expected, computed } => {
                     tracing::error!(
                         key = %key,
@@ -924,14 +930,15 @@ async fn handle_request(
         }
         None => None,
     };
-    if let Some(data) = cached {
+    if let Some((data, sha256)) = cached {
+        let digest = format!("sha256:{sha256}");
         // Curation integrity verification (issue #189)
-        if let Some(response) = crate::curation::verify_integrity(
+        if let Some(response) = crate::curation::verify_integrity_by_hash(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Npm,
             &package_name,
             tarball_version.as_deref(),
-            &data,
+            &digest,
         ) {
             return response;
         }
@@ -953,10 +960,7 @@ async fn handle_request(
             &state.storage,
             &key,
             "npm",
-            &format!(
-                "sha256:{}",
-                hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&data))
-            ),
+            &digest,
             &q_mode,
             q_secs,
             crate::digest_quarantine::first_seen_seed(
