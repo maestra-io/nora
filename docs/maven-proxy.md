@@ -40,3 +40,8 @@ that fails (timeout, throttled 403, no date) leaves the artifact on the first-se
 `nora_maven_date_lookup_total{source,outcome}`. Before 1.4.3-maestra.16 only the search was asked,
 on `proxy_timeout` (30 s), silently: a throttled search added 30 s to a cold miss and held a
 years-old artifact as new.
+
+A cache hit asks Central again (once per digest per hour) when the quarantine holds the artifact
+or has no entry for it, and a Central date moves the clock back. No entry is what a restart
+leaves for an artifact dated past the prune line on its miss: that entry is never persisted, so
+the first hit after a restart used to hold it as new.
