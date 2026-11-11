@@ -2573,6 +2573,10 @@ mod integration_tests {
     #[tokio::test]
     async fn an_artifact_cached_past_the_ledgers_memory_is_not_held_again() {
         let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            // With a proxy the copy is a cached one: hosted-only dates by the file time itself.
+            cfg.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(
+                "http://127.0.0.1:1".to_string(),
+            )];
             cfg.curation.maven.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
             cfg.curation.maven.quarantine_ttl = Some("7d".to_string());
         });
