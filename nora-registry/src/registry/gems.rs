@@ -642,15 +642,19 @@ async fn download_gem(
             crate::registry_type::RegistryType::Gems,
             "CACHE",
         ));
-        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+        // A digest with no record counts from when its copy was cached (R4-C05).
+        if let Some(resp) = crate::digest_quarantine::cache_gate_dated(
             &state.digest_store,
+            &state.storage,
+            &storage_key,
             "gems",
             &data,
             &q_mode,
             q_secs,
-            "cache",
             publish_date,
-        ) {
+        )
+        .await
+        {
             return resp;
         }
         let mut response = with_binary(data.to_vec(), "application/octet-stream");
@@ -796,15 +800,19 @@ async fn download_gemspec(
                 .as_deref()
                 .or(state.config.curation.quarantine_ttl.as_deref()),
         );
-        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+        // A digest with no record counts from when its copy was cached (R4-C05).
+        if let Some(resp) = crate::digest_quarantine::cache_gate_dated(
             &state.digest_store,
+            &state.storage,
+            &storage_key,
             "gems",
             &data,
             &q_mode,
             q_secs,
-            "cache",
             publish_date,
-        ) {
+        )
+        .await
+        {
             return resp;
         }
         return with_binary(data.to_vec(), "application/octet-stream");

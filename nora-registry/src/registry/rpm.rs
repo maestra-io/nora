@@ -2268,6 +2268,39 @@ mod proxy_tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// R4-C05, the shared rpm/deb proxy path: the ledger forgets a digest 90 days after its
+    /// first sight. A package cached for longer is not held for a new TTL by the first cache
+    /// hit after a restart: its clock is the day NORA wrote the copy.
+    #[tokio::test]
+    async fn a_package_cached_past_the_ledgers_memory_is_not_held_again() {
+        let upstream = MockServer::start().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.rpm.enabled = true;
+            cfg.rpm
+                .proxies
+                .insert("fedora".to_string(), RepoProxyEntry::Simple(uri));
+            cfg.curation.rpm.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+            cfg.curation.rpm.quarantine_ttl = Some("7d".to_string());
+        });
+        let key = "rpm/fedora/Packages/old-1.0-1.x86_64.rpm";
+        crate::test_helpers::put_written_days_ago(&ctx, key, b"oldrpm", 100).await;
+        for _ in 0..2 {
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                "/rpm/fedora/Packages/old-1.0-1.x86_64.rpm",
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "served from the cache"
+        );
+    }
+
     #[tokio::test]
     async fn test_rpm_proxied_repo_rejects_writes() {
         let ctx = create_test_context_with_config(|cfg| {

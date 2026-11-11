@@ -409,15 +409,19 @@ async fn download_tarball(
                 .as_deref()
                 .or(state.config.curation.quarantine_ttl.as_deref()),
         );
-        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+        // A digest with no record counts from when its copy was cached (R4-C05).
+        if let Some(resp) = crate::digest_quarantine::cache_gate_dated(
             &state.digest_store,
+            &state.storage,
+            &storage_key,
             "ansible",
             &data,
             &q_mode,
             q_secs,
-            "cache",
             publish_date,
-        ) {
+        )
+        .await
+        {
             return resp;
         }
 

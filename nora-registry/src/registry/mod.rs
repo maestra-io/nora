@@ -1889,15 +1889,19 @@ pub(crate) async fn repo_proxy_download(
             // Quarantine only immutable packages — metadata is rewritten
             // upstream on every sync and its digest would change forever.
             if immutable {
-                if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+                // A digest with no record counts from when its copy was cached (R4-C05).
+                if let Some(resp) = crate::digest_quarantine::cache_gate_dated(
                     &state.digest_store,
+                    &state.storage,
+                    &key,
                     registry,
                     data,
                     &q_mode,
                     q_secs,
-                    "cache",
                     None,
-                ) {
+                )
+                .await
+                {
                     return resp;
                 }
             }
@@ -1952,15 +1956,19 @@ pub(crate) async fn repo_proxy_download(
             if let Some(data) = cached {
                 tracing::warn!(registry, url = %url, error = ?e, "upstream failed, serving stale cached copy");
                 if immutable {
-                    if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+                    // A digest with no record counts from when its copy was cached (R4-C05).
+                    if let Some(resp) = crate::digest_quarantine::cache_gate_dated(
                         &state.digest_store,
+                        &state.storage,
+                        &key,
                         registry,
                         &data,
                         &q_mode,
                         q_secs,
-                        "cache-stale",
                         None,
-                    ) {
+                    )
+                    .await
+                    {
                         return resp;
                     }
                 }

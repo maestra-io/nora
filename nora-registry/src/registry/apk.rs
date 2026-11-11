@@ -909,15 +909,19 @@ async fn package(
         state
             .audit
             .log(AuditEntry::new("cache_hit", "proxy", "", "apk", ""));
-        if let Some(resp) = crate::digest_quarantine::proxy_gate_digest(
+        // A digest with no record counts from when its copy was cached (R4-C05).
+        if let Some(resp) = crate::digest_quarantine::cache_gate_digest(
             &state.digest_store,
+            &state.storage,
+            &key,
             "apk",
             &digest,
             &q_mode,
             q_secs,
-            "cache",
             publish_date,
-        ) {
+        )
+        .await
+        {
             return resp;
         }
         let len = copy.len();

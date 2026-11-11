@@ -608,18 +608,22 @@ async fn download_archive(
                 .as_deref()
                 .or(state.config.curation.quarantine_ttl.as_deref()),
         );
-        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+        // A digest with no record counts from when its copy was cached (R4-C05).
+        if let Some(resp) = crate::digest_quarantine::cache_gate_dated(
             &state.digest_store,
+            &state.storage,
+            &key,
             "pub",
             &data,
             &q_mode,
             q_secs,
-            "cache",
             crate::digest_quarantine::first_seen_seed(
                 state.config.server.trust_upstream_dates,
                 publish_date,
             ),
-        ) {
+        )
+        .await
+        {
             return resp;
         }
 
