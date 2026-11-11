@@ -170,21 +170,41 @@ pub(crate) async fn confirm_blob<T>(
     if !enabled {
         return stat.await;
     }
+    let at = Instant::now();
+    let mut first: Vec<&str> = Vec::new();
     for key in keys {
         let lock = crate::acquire_publish_lock(publish_locks, key);
         let _guard = lock.lock().await;
-        CONFIRMED_BLOBS
-            .lock()
-            .insert(key.to_string(), Instant::now());
+        if CONFIRMED_BLOBS.lock().insert(key.to_string(), at).is_none() {
+            first.push(key);
+        }
     }
     let found = stat.await;
     if found.is_none() {
+        // Forget only what this call recorded for the first time and nobody refreshed since.
+        // `None` is also what a failed stat answers: it must not take away the confirmation
+        // an earlier or a concurrent request gave a client.
         let mut confirmed = CONFIRMED_BLOBS.lock();
-        for key in keys {
-            confirmed.remove(*key);
+        for key in first {
+            if confirmed.get(key) == Some(&at) {
+                confirmed.remove(key);
+            }
         }
     }
     found
+}
+
+/// The artifact an orphan sidecar belongs to (checksum, npm `.meta`, npm provenance), for the
+/// last look before its delete.
+fn sidecar_primary(key: &str) -> Option<&str> {
+    if let Some(primary) = crate::registry::npm::origin_primary(key) {
+        return Some(primary);
+    }
+    let packages = ["maven/", "npm/", "pypi/"];
+    if packages.iter().any(|p| key.starts_with(p)) && is_orphanable_sidecar(key) {
+        return primary_key_for_sidecar(key);
+    }
+    None
 }
 
 /// Drop the confirmations older than `grace_secs`: the sweep no longer honours them.
@@ -362,6 +382,16 @@ pub async fn run_gc(
         {
             skipped_recent += 1;
             continue;
+        }
+        // A sidecar was judged orphan because the listing did not hold its artifact. A
+        // listing can leave an entry out (the local backend skips a file whose metadata it
+        // cannot read) and the artifact can have been stored since: one look at the artifact
+        // itself before the delete, and a sidecar whose artifact answers is live.
+        if let Some(primary) = sidecar_primary(key) {
+            if storage.stat(primary).await.is_some() {
+                skipped_recent += 1;
+                continue;
+            }
         }
 
         if dry_run {
@@ -5165,6 +5195,14 @@ mod fail_closed_tests {
         confirm_blob(false, &publish_locks, &[unused], storage.stat(unused)).await;
         assert!(!recently_confirmed(absent, 7 * DAY));
         assert!(!recently_confirmed(unused, 7 * DAY));
+
+        // A later request whose stat fails (`None` is also what a timed-out HEAD answers) does
+        // not take away the confirmation the first client was given.
+        let failed = std::future::ready(None::<()>);
+        assert!(confirm_blob(true, &publish_locks, &[reused], failed)
+            .await
+            .is_none());
+        assert!(recently_confirmed(reused, 7 * DAY));
 
         let result = gc(&storage, 7 * DAY).await;
 

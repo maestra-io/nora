@@ -85,14 +85,7 @@ pub(crate) async fn run_cleanup_scheduler(
                 }
                 // Wake-time based, so same-interval passes stay phase-locked
                 // and a pass overrunning its interval fires on the next loop.
-                // A zero interval would make the pass due again the moment it ends, and
-                // the scheduler a busy loop under the lock.
-                due[i] = now
-                    + if pass.interval.is_zero() {
-                        ZERO_INTERVAL_FLOOR
-                    } else {
-                        pass.interval
-                    };
+                due[i] = now + pass.interval;
                 // A panicking pass is reported like a task panic, and the others still run.
                 if let Err(panic) = std::panic::AssertUnwindSafe((pass.run)())
                     .catch_unwind()
@@ -103,6 +96,12 @@ pub(crate) async fn run_cleanup_scheduler(
                         pass = pass.name,
                         "cleanup pass panicked — continuing with remaining passes"
                     );
+                }
+                // A zero interval would make the pass due again the moment it ends, and the
+                // scheduler a busy loop under the lock: its floor counts from the end of the
+                // pass, however long the pass took.
+                if pass.interval.is_zero() {
+                    due[i] = Instant::now() + ZERO_INTERVAL_FLOOR;
                 }
             }
 
@@ -180,7 +179,8 @@ mod tests {
                     if runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 100 {
                         cancel.cancel();
                     }
-                    async {}.boxed()
+                    // Longer than the floor: the wait counts from the end of the pass.
+                    tokio::time::sleep(Duration::from_secs(2)).boxed()
                 }),
             }
         };
@@ -189,13 +189,13 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(())),
             cancel.clone(),
         );
-        tokio::time::sleep(Duration::from_millis(3500)).await;
+        tokio::time::sleep(Duration::from_millis(7500)).await;
         cancel.cancel();
         handle.await.unwrap();
         assert_eq!(
             runs.load(std::sync::atomic::Ordering::SeqCst),
-            4,
-            "at boot, then once a second"
+            3,
+            "at 0 s, 3 s and 6 s: two seconds of pass, then one second of floor"
         );
     }
 

@@ -67,7 +67,7 @@ pub static RETENTION_SKIPPED_UNKNOWN: LazyLock<IntCounter> = LazyLock::new(|| {
 pub static RETENTION_DELETE_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "nora_retention_delete_failures_total",
-        "Versions retention planned whose delete the store refused part-way; what was not deleted stays and is planned again next pass"
+        "Versions retention planned with at least one delete the store refused: the version stays whole when its artifact could not be deleted, else a sidecar is left behind; the log names the keys"
     )
     .expect("retention_delete_failures metric")
 });
@@ -619,16 +619,19 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
 async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
     let listed = list_meta(storage, "npm/").await;
     // Provenance sidecars live under an internal prefix that the listing above hides. Without
-    // this listing a retired tarball leaves its sidecar behind, and GC reaps it as an orphan.
-    let origins: std::collections::HashSet<String> = storage
+    // this listing a retired tarball would leave its sidecar behind, where no later retention
+    // pass finds it: npm is left alone for this pass.
+    let origins: std::collections::HashSet<String> = match storage
         .list_internal(&crate::registry::npm::origin_key("npm/"))
         .await
-        .unwrap_or_else(|e| {
-            tracing::error!("Failed to list npm provenance sidecars: {}", e);
-            Vec::new()
-        })
-        .into_iter()
-        .collect();
+    {
+        Ok(keys) => keys.into_iter().collect(),
+        Err(e) => {
+            tracing::error!("Failed to list npm provenance sidecars, retention keeps npm/: {e}");
+            RETENTION_SKIPPED_UNKNOWN.inc();
+            return Vec::new();
+        }
+    };
     let mut packages: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
 
@@ -933,8 +936,9 @@ fn aggregate_meta(listed: &Listed, keys: &[String]) -> Option<(u64, u64)> {
 pub struct RetentionResult {
     pub planned: usize,
     pub deleted_keys: usize,
-    /// Planned versions whose delete the store refused part-way (not a dry run): what was not
-    /// deleted stays, and the version is planned again next pass.
+    /// Planned versions with at least one delete the store refused (not a dry run). The version
+    /// stays whole, and is planned again, when its artifact could not be deleted; otherwise a
+    /// sidecar is left behind and the log names it.
     pub delete_failures: usize,
     pub bytes_freed: u64,
     pub duration_secs: f64,
@@ -1072,7 +1076,7 @@ pub async fn run_retention(
     if delete_failures > 0 {
         tracing::warn!(
             versions = delete_failures,
-            "Retention: the store refused deletes; those versions are planned again next pass"
+            "Retention: the store refused deletes; the keys are in the warnings above"
         );
         RETENTION_DELETE_FAILURES.inc_by(delete_failures as u64);
     }
@@ -1110,10 +1114,12 @@ pub async fn run_retention(
 }
 
 /// Delete the keys of one planned version, in order, each under its publish lock (so a
-/// publish of the same key is not deleted under). Stops at the first delete the store
-/// refuses: `keys` opens with the artifact, and a sidecar deleted while its artifact stayed
-/// would leave a file retention can no longer see. A key already gone is not a refusal.
-/// Returns how many keys are gone.
+/// publish of the same key is not deleted under). `keys` opens with the artifact. When the
+/// store refuses that delete nothing else of the version is touched: a sidecar deleted while
+/// its artifact stayed would leave a file retention can no longer see. Once the artifact is
+/// gone every other key is attempted, refused or not: what is left then describes nothing, and
+/// a version document left behind would be put back into the index. A key already gone is not
+/// a refusal. Returns how many keys are gone.
 async fn delete_plan(
     storage: &Storage,
     publish_locks: &PublishLocks,
@@ -1127,8 +1133,10 @@ async fn delete_plan(
             Ok(()) | Err(crate::storage::StorageError::NotFound) => deleted += 1,
             Err(e) => {
                 tracing::warn!(key = %key, version = %plan.version_name, error = %e,
-                    "Retention: delete failed, the rest of the version is kept");
-                break;
+                    "Retention: delete failed");
+                if deleted == 0 {
+                    break;
+                }
             }
         }
     }
@@ -2593,6 +2601,60 @@ mod format_retention_tests {
             keys_under(&storage, "npm/foo/tarballs/").await,
             [v1[0], v1[1], "npm/foo/tarballs/foo-3.0.0.tgz"]
         );
+    }
+
+    /// R4-C14: once the artifact is gone the rest of the version is attempted even when one
+    /// delete in the middle is refused, so the version document does not outlive the tarball
+    /// (the packument is rebuilt from the documents).
+    #[tokio::test]
+    async fn a_refused_sidecar_delete_does_not_keep_the_version_document() {
+        let (storage, outage) = outage_storage();
+        put_all(
+            &storage,
+            &[
+                "npm/foo/tarballs/foo-1.0.0.tgz",
+                "npm/foo/tarballs/foo-1.0.0.tgz.sha256",
+                "npm/foo/versions/1.0.0.json",
+                "npm/foo/tarballs/foo-2.0.0.tgz",
+                "npm/foo/versions/2.0.0.json",
+            ],
+        )
+        .await;
+        outage.fail_deletes_of(".sha256");
+
+        let rules = [rule("npm", None, Some(1), None)];
+        let result = run_retention(&storage, &locks(), None, &rules, false).await;
+
+        assert_eq!((result.planned, result.delete_failures), (1, 1));
+        assert_eq!(
+            result.deleted_keys, 2,
+            "the tarball and its version document"
+        );
+        assert_eq!(
+            keys_under(&storage, "npm/foo/versions/").await,
+            ["npm/foo/versions/2.0.0.json"]
+        );
+    }
+
+    /// R4-C02: without the listing of the provenance sidecars a retired tarball would leave
+    /// its sidecar where no later pass finds it, so npm is left alone and the skip is counted.
+    #[tokio::test]
+    async fn npm_is_left_alone_when_its_provenance_sidecars_cannot_be_listed() {
+        let (storage, outage) = outage_storage();
+        let tarballs = [
+            "npm/foo/tarballs/foo-1.0.0.tgz",
+            "npm/foo/tarballs/foo-2.0.0.tgz",
+        ];
+        put_all(&storage, &tarballs).await;
+        outage.fail_listings_of(&crate::registry::npm::origin_key("npm/"));
+        let before = RETENTION_SKIPPED_UNKNOWN.get();
+
+        let rules = [rule("npm", None, Some(1), None)];
+        let result = run_retention(&storage, &locks(), None, &rules, false).await;
+
+        assert_eq!(result.planned, 0);
+        assert!(RETENTION_SKIPPED_UNKNOWN.get() > before);
+        assert_eq!(keys_under(&storage, "npm/").await, tarballs);
     }
 
     /// R4-C14: a key that is already gone is not a refusal: the rest of the version (here a

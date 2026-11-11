@@ -2553,7 +2553,7 @@ async fn main() {
                 println!("  Keys deleted:       {}", result.deleted_keys);
                 if result.delete_failures > 0 {
                     println!(
-                        "  Deletes refused:    {} version(s), kept and planned again next run",
+                        "  Deletes refused:    {} version(s), deletion incomplete; see the warnings in the log",
                         result.delete_failures
                     );
                 }

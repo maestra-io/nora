@@ -82,7 +82,7 @@ with `registry=~"pypi(:.*)?"`, not `registry="pypi"`.
 | `nora_retention_duration_seconds` | histogram | — | Retention sweep duration |
 | `nora_retention_last_run_timestamp` | gauge | — | Unix timestamp of last retention run |
 | `nora_retention_skipped_unknown_total` | counter | — | Listings retention could not read, plus versions whose age it could not read. All of them were kept; nonzero means the rules are not enforced there |
-| `nora_retention_delete_failures_total` | counter | — | Planned versions whose delete the store refused part-way; what stayed is planned again next pass |
+| `nora_retention_delete_failures_total` | counter | — | Planned versions with at least one delete the store refused: the version stays whole when its artifact could not be deleted, else a sidecar is left behind; the log names the keys |
 
 ### Garbage Collection
 
