@@ -2216,22 +2216,29 @@ fn with_json(data: Vec<u8>) -> Response {
 fn with_json_gzip(data: Vec<u8>) -> Response {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     match std::io::Write::write_all(&mut encoder, &data).and_then(|_| encoder.finish()) {
-        Ok(compressed) => (
-            StatusCode::OK,
-            [
-                (
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/json"),
-                ),
-                (header::CONTENT_ENCODING, HeaderValue::from_static("gzip")),
-                (
-                    header::CACHE_CONTROL,
-                    HeaderValue::from_static("public, max-age=60, must-revalidate"),
-                ),
-            ],
-            compressed,
-        )
-            .into_response(),
+        Ok(compressed) => {
+            let mut resp = (
+                StatusCode::OK,
+                [
+                    (
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    ),
+                    (header::CONTENT_ENCODING, HeaderValue::from_static("gzip")),
+                    (
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static("public, max-age=60, must-revalidate"),
+                    ),
+                ],
+                compressed,
+            )
+                .into_response();
+            // For the metadata filter and the leak scan behind this handler (R4-P06):
+            // the document itself, so neither inflates the body just built.
+            resp.extensions_mut()
+                .insert(crate::metrics::PlainBody(data.into()));
+            resp
+        }
         Err(_) => with_json(data), // fallback: plain JSON if gzip fails
     }
 }

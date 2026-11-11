@@ -489,9 +489,10 @@ pub struct AppState {
     /// Single-flight coalescer for the proxy cache-miss path: collapses a
     /// thundering herd of concurrent requests for the same key into one
     /// upstream fetch (#595). In-memory and rebuildable (empty after restart).
-    pub(crate) proxy_coalesce: proxy_coalesce::InflightMap<Bytes>,
+    pub(crate) proxy_coalesce: proxy_coalesce::InflightMap<Bytes, registry::ProxyError>,
     /// Single-flight of proxied artifact cold misses, whose body may be spooled to disk.
-    pub(crate) artifact_flights: proxy_coalesce::InflightMap<registry::ProxyBody>,
+    pub(crate) artifact_flights:
+        proxy_coalesce::InflightMap<registry::ProxyBody, registry::ProxyError>,
     /// Disk spool directory and byte budget (proxied artifacts, NuGet pushes, PyPI uploads).
     pub(crate) spool: Arc<registry::SpoolBudget>,
     /// Docker blob fills in flight, shared by every request for the blob (#1003).
