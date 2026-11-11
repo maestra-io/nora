@@ -1520,6 +1520,7 @@ mod integration_tests {
             cfg.curation.deb.min_release_age = Some("0d".into());
             cfg.curation.deb.quarantine = Some(QuarantineMode::Observe);
         });
+        let holders = ctx.state.storage.holders();
         served(&ctx).await;
 
         // The upstream takes longer than a client waits: the previous build is served
@@ -1542,7 +1543,7 @@ mod integration_tests {
         );
 
         // The refresh outlived that request and finished on its own.
-        tokio::time::sleep(delay + std::time::Duration::from_secs(1)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         let (_, pkgs) = served(&ctx).await;
         assert_eq!(pkgs, [("a".into(), "2".into())]);
     }

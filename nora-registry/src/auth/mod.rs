@@ -1967,9 +1967,21 @@ mod tests {
         for _ in 0..5 {
             tracker.record_failure(ip, "alice");
         }
-        // Cleanup should remove entries older than 2x max_lockout_secs
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        // Cleanup should remove entries older than 2x max_lockout_secs: the last failure is
+        // dated 3 s back (the clock the tracker reads), not waited for.
+        let backdate = |last: &mut Instant| *last -= std::time::Duration::from_secs(3);
+        {
+            let mut entries = tracker.entries.lock();
+            entries.accounts.values_mut().for_each(|(_, l)| backdate(l));
+            entries
+                .addresses
+                .values_mut()
+                .for_each(|(_, l)| backdate(l));
+        }
         tracker.cleanup();
+        let entries = tracker.entries.lock();
+        assert!(entries.accounts.is_empty() && entries.addresses.is_empty());
+        drop(entries);
         assert!(tracker.check_blocked(&ip, "alice").is_none());
     }
 

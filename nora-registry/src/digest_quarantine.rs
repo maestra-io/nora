@@ -1390,7 +1390,7 @@ mod tests {
         assert!(!DigestStore::load(storage(&tmp), path).await.loaded());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_background_load_is_loaded_only_when_read_whole() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().to_str().unwrap();
@@ -1684,10 +1684,12 @@ mod tests {
     async fn a_memory_backdate_writes_nothing() {
         let tmp = TempDir::new().unwrap();
         let store = DigestStore::empty(storage(&tmp));
+        let holders = store.storage.holders();
         store.record("docker", "sha256:aa", "up", None);
         wait_for(&storage(&tmp), ".nora-quarantine/docker/sha256:aa").await;
         store.backdate("docker", "sha256:aa", 1, false);
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Every write the store started has ended: a persisted move would be on disk.
+        crate::test_helpers::background_writes_done(&store.storage, holders).await;
         assert!(storage(&tmp)
             .stat(".nora-quarantine/docker/sha256:aa.dated")
             .await
