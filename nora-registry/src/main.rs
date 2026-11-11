@@ -271,6 +271,7 @@ async fn gc_pass(
     dry_run: bool,
     grace_secs: u64,
     npm_is_proxy: bool,
+    go_is_proxy: bool,
     proxy_cache_max_bytes: u64,
     docker_cache: (u64, &[String]),
     curation: &curation::CurationEngine,
@@ -281,6 +282,7 @@ async fn gc_pass(
         dry_run,
         grace_secs,
         npm_is_proxy,
+        go_is_proxy,
         proxy_cache_max_bytes,
         curation,
     )
@@ -2397,6 +2399,7 @@ async fn main() {
                 dry_run,
                 config.gc.grace_secs,
                 !config.npm.upstream_urls().is_empty(),
+                config.go.proxy.is_some(),
                 config.gc.proxy_cache_max_bytes,
                 &curation,
             )
@@ -2548,6 +2551,12 @@ async fn main() {
                 println!("Retention Applied:");
                 println!("  Versions deleted:   {}", result.planned);
                 println!("  Keys deleted:       {}", result.deleted_keys);
+                if result.delete_failures > 0 {
+                    println!(
+                        "  Deletes refused:    {} version(s), kept and planned again next run",
+                        result.delete_failures
+                    );
+                }
                 println!("  Bytes freed:        {}", result.bytes_freed);
                 if result.planned > 0 {
                     let audit = AuditLog::new(&config.storage.path, config.audit.mode.clone());
@@ -3901,8 +3910,8 @@ async fn run_server(mut config: Config, storage: Storage) {
                     )
                     .await;
                     info!(
-                        "Retention scheduler: done in {:.1}s — {} versions, {} keys, {} bytes freed",
-                        result.duration_secs, result.planned, result.deleted_keys, result.bytes_freed
+                        "Retention scheduler: done in {:.1}s — {} versions, {} keys, {} bytes freed, {} versions with refused deletes",
+                        result.duration_secs, result.planned, result.deleted_keys, result.bytes_freed, result.delete_failures
                     );
                 }
                 .boxed()
@@ -3941,6 +3950,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         let dry_run = state.config.gc.dry_run;
         let grace_secs = state.config.gc.grace_secs;
         let npm_is_proxy = !state.config.npm.upstream_urls().is_empty();
+        let go_is_proxy = state.config.go.proxy.is_some();
         let proxy_cache_max_bytes = state.config.gc.proxy_cache_max_bytes;
         let docker_cache_max_bytes = state.config.gc.docker_proxy_cache_max_bytes;
         let docker_namespaces = docker_proxy_namespaces(&state.config);
@@ -3965,6 +3975,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                         dry_run,
                         grace_secs,
                         npm_is_proxy,
+                        go_is_proxy,
                         proxy_cache_max_bytes,
                         (docker_cache_max_bytes, &docker_namespaces),
                         &curation.curation_engine,
@@ -4448,6 +4459,7 @@ async fn maintenance_tick(state: &AppState, tick_count: u64, work: &MaintenanceW
         locks.retain(|_, arc| Arc::strong_count(arc) > 1);
         drop(locks);
         state.storage.prune_locks();
+        gc::forget_old_confirmations(state.config.gc.grace_secs);
         let storage_path = state.config.storage.path.clone();
         let spool_dir = state.config.server.spool_dir(&storage_path);
         tokio::task::spawn_blocking(move || {
@@ -6281,6 +6293,7 @@ mod cleanup_pass_tests {
             false,
             0,
             false,
+            false,
             300,
             (0, &[]),
             &no_curation(),
@@ -6303,6 +6316,7 @@ mod cleanup_pass_tests {
             index,
             true,
             0,
+            false,
             false,
             300,
             (0, &[]),
@@ -6570,6 +6584,7 @@ mod cleanup_pass_tests {
             index,
             false,
             0,
+            false,
             false,
             300,
             (0, &[]),

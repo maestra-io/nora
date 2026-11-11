@@ -1387,6 +1387,19 @@ impl Config {
             }
         }
 
+        // An interval of 0 is not "disabled": every pass would be due again the moment it
+        // ends, listing the whole store back to back under the cleanup lock.
+        for (name, enabled, interval) in [
+            ("gc", self.gc.enabled, self.gc.interval),
+            ("retention", self.retention.enabled, self.retention.interval),
+        ] {
+            if enabled && interval == 0 {
+                errors.push(format!(
+                    "{name}.interval must be at least 1 second, got 0 (to turn it off set {name}.enabled=false)"
+                ));
+            }
+        }
+
         // 8. "Enabled but empty" — subsystems that silently do nothing
         if self.gc.enabled && self.gc.dry_run {
             warnings.push(
@@ -4113,6 +4126,31 @@ proxies = [
             assert_eq!(warned(secs), 0, "{secs} s");
         }
         assert_eq!(warned(Config::default().server.keep_alive_timeout), 0);
+    }
+
+    /// R4-C13: an enabled cleanup pass with interval 0 is a config error, not a busy loop.
+    #[test]
+    fn test_validate_cleanup_interval_zero_is_an_error() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.gc.interval = 0;
+        config.retention.interval = 0;
+        assert!(
+            config.validate().1.is_empty(),
+            "disabled passes: any interval"
+        );
+        config.gc.enabled = true;
+        config.retention.enabled = true;
+        assert_eq!(
+            config.validate().1,
+            vec![
+                "gc.interval must be at least 1 second, got 0 (to turn it off set gc.enabled=false)",
+                "retention.interval must be at least 1 second, got 0 (to turn it off set retention.enabled=false)",
+            ]
+        );
+        config.gc.interval = 1;
+        config.retention.interval = 1;
+        assert!(config.validate().1.is_empty());
     }
 
     /// Below three maintenance ticks one failing tick would fail liveness.

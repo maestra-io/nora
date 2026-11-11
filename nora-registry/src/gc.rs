@@ -100,6 +100,107 @@ pub static GC_DOCKER_MARK_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("gc_docker_mark_failures metric")
 });
 
+pub static GC_LIST_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "nora_gc_list_failures_total",
+        "Listings GC could not read; everything they cover was kept for the pass. Nonzero means GC is not reclaiming that space; alert on it"
+    )
+    .expect("gc_list_failures metric")
+});
+
+pub static GC_DELETE_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "nora_gc_delete_failures_total",
+        "Deletes GC or proxy-cache eviction attempted that the store refused; the object is still there"
+    )
+    .expect("gc_delete_failures metric")
+});
+
+/// A listing GC decides from, with the size and time the listing itself carries. `None` when
+/// the store could not answer: the caller then keeps everything under `prefix` (fail-closed),
+/// and the failure is counted in `nora_gc_list_failures_total`.
+type Listed = Option<Vec<(String, crate::storage::FileMeta)>>;
+
+async fn gc_list_meta(storage: &Storage, prefix: &str) -> Listed {
+    match storage.list_with_meta(prefix).await {
+        Ok(entries) => Some(entries),
+        Err(e) => {
+            tracing::error!("GC: listing {prefix} failed, keeping what it covers: {e}");
+            GC_LIST_FAILURES.inc();
+            None
+        }
+    }
+}
+
+/// [`gc_list_meta`] for a walk that needs only the keys; a failed listing is empty.
+async fn gc_list(storage: &Storage, prefix: &str) -> Vec<String> {
+    storage.list(prefix).await.unwrap_or_else(|e| {
+        tracing::error!("GC: listing {prefix} failed, keeping what it covers: {e}");
+        GC_LIST_FAILURES.inc();
+        Vec::new()
+    })
+}
+
+// ============================================================================
+// Blobs a client was just told exist (R4-C06)
+// ============================================================================
+
+/// Docker blob keys a `HEAD` or a mount confirmed to a client, with the time. A client told
+/// "this layer exists" skips its upload and references the layer from a manifest it has not
+/// pushed yet, so to GC the blob is as live as one written at that moment: the sweep treats a
+/// confirmation younger than `grace_secs` like an mtime younger than it. In memory, so it
+/// costs the HEAD no storage write; it covers one process: a second replica (or `nora gc` run
+/// from the CLI beside the server) does not see the confirmations of the first.
+static CONFIRMED_BLOBS: LazyLock<parking_lot::Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(Default::default);
+
+/// Run `stat`, the existence check behind a blob `HEAD` or mount of `keys`, so that the GC
+/// sweep cannot delete a blob the client is told exists. Each key is recorded under its
+/// publish lock BEFORE the check: the sweep deletes under the same lock, so it either sees the
+/// record and keeps the blob, or has already deleted it and `stat` answers "absent". A key
+/// that turns out absent is forgotten again, so the set holds only existing blobs, and the
+/// maintenance tick drops records older than the grace ([`forget_old_confirmations`]).
+/// `enabled` is `gc.enabled`: with no sweep in this process there is nothing to protect from.
+pub(crate) async fn confirm_blob<T>(
+    enabled: bool,
+    publish_locks: &PublishLocks,
+    keys: &[&str],
+    stat: impl std::future::Future<Output = Option<T>>,
+) -> Option<T> {
+    if !enabled {
+        return stat.await;
+    }
+    for key in keys {
+        let lock = crate::acquire_publish_lock(publish_locks, key);
+        let _guard = lock.lock().await;
+        CONFIRMED_BLOBS
+            .lock()
+            .insert(key.to_string(), Instant::now());
+    }
+    let found = stat.await;
+    if found.is_none() {
+        let mut confirmed = CONFIRMED_BLOBS.lock();
+        for key in keys {
+            confirmed.remove(*key);
+        }
+    }
+    found
+}
+
+/// Drop the confirmations older than `grace_secs`: the sweep no longer honours them.
+pub(crate) fn forget_old_confirmations(grace_secs: u64) {
+    CONFIRMED_BLOBS
+        .lock()
+        .retain(|_, at| at.elapsed().as_secs() < grace_secs);
+}
+
+fn recently_confirmed(key: &str, grace_secs: u64) -> bool {
+    CONFIRMED_BLOBS
+        .lock()
+        .get(key)
+        .is_some_and(|at| at.elapsed().as_secs() < grace_secs)
+}
+
 // ============================================================================
 // GC Result
 // ============================================================================
@@ -154,12 +255,14 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_gc(
     storage: &Storage,
     publish_locks: &PublishLocks,
     dry_run: bool,
     grace_secs: u64,
     npm_is_proxy: bool,
+    go_is_proxy: bool,
     proxy_cache_max_bytes: u64,
     curation: &crate::curation::CurationEngine,
 ) -> GcResult {
@@ -178,20 +281,29 @@ pub async fn run_gc(
     let docker_mark_failed = docker_result.failed;
     all_orphans.extend(docker_result.orphans);
 
+    // npm/ and pypi/ are listed once for the whole pass: sidecar detection, the metadata
+    // phantom check and proxy-cache eviction all decide from these two listings.
+    let npm_listed = gc_list_meta(storage, "npm/").await;
+    let pypi_listed = gc_list_meta(storage, "pypi/").await;
+
     // Checksum orphan detection (Maven, npm, PyPI)
-    let checksum_result = detect_checksum_orphans(storage).await;
+    let checksum_result = detect_checksum_orphans(storage, &npm_listed, &pypi_listed).await;
     total_candidates += checksum_result.total;
     all_orphans.extend(checksum_result.orphans);
 
     // npm cache provenance sidecars (internal prefix, hidden from list())
-    let origin_result = detect_origin_orphans(storage).await;
+    let origin_result = detect_origin_orphans(storage, &npm_listed).await;
     total_candidates += origin_result.total;
     all_orphans.extend(origin_result.orphans);
 
-    // Go incomplete version detection
-    let go_result = detect_go_incomplete_versions(storage).await;
-    total_candidates += go_result.total;
-    all_orphans.extend(go_result.orphans);
+    // Go incomplete version detection. A Go proxy caches each file a client asks for under
+    // its own key, and the go tool routinely asks for `.info`/`.mod` alone, so with an
+    // upstream a version without its `.zip` is a normal cache entry, not a leftover.
+    if !go_is_proxy {
+        let go_result = detect_go_incomplete_versions(storage).await;
+        total_candidates += go_result.total;
+        all_orphans.extend(go_result.orphans);
+    }
 
     // Cargo index/crate cross-check
     let cargo_result = detect_cargo_orphans(storage).await;
@@ -217,6 +329,7 @@ pub async fn run_gc(
     let mut bytes_freed = 0u64;
     let mut skipped_recent = 0usize;
     let mut stat_failures = 0usize;
+    let mut delete_failures = 0u64;
     let now = now_unix_secs();
 
     for key in &all_orphans {
@@ -233,12 +346,20 @@ pub async fn run_gc(
         // keep the artifact rather than risk reaping a live one, and count it
         // separately (`stat_failures`) — a nonzero count means GC may be unable
         // to make progress, which is alertable.
+        //
+        // The age is read under the key's publish lock, the one a write of the key, a blob
+        // `HEAD` and a mount take ([`confirm_blob`]): what was written or confirmed to a client
+        // before this point is seen here, and nothing can be between the check and the delete.
+        let lock = crate::acquire_publish_lock(publish_locks, key);
+        let _guard = lock.lock().await;
         let Some(meta) = storage.stat(key).await else {
             warn!("GC: cannot stat {}, keeping it (age unknown)", key);
             stat_failures += 1;
             continue;
         };
-        if grace_secs > 0 && now.saturating_sub(meta.modified) < grace_secs {
+        if (grace_secs > 0 && now.saturating_sub(meta.modified) < grace_secs)
+            || recently_confirmed(key, grace_secs)
+        {
             skipped_recent += 1;
             continue;
         }
@@ -249,16 +370,19 @@ pub async fn run_gc(
             continue;
         }
 
-        // Serialize with concurrent publish to prevent deleting an artifact
-        // under a same-key write.
-        let lock = crate::acquire_publish_lock(publish_locks, key);
-        let _guard = lock.lock().await;
-        if storage.delete(key).await.is_ok() {
-            deleted += 1;
-            bytes_freed += meta.size;
-            info!("Deleted: {}", key);
+        match storage.delete(key).await {
+            Ok(()) => {
+                deleted += 1;
+                bytes_freed += meta.size;
+                info!("Deleted: {}", key);
+            }
+            Err(e) => {
+                warn!("GC: deleting {} failed, it stays: {}", key, e);
+                delete_failures += 1;
+            }
         }
     }
+    GC_DELETE_FAILURES.inc_by(delete_failures);
 
     if skipped_recent > 0 {
         info!(
@@ -282,8 +406,15 @@ pub async fn run_gc(
 
     // Metadata phantom cleanup (npm/PyPI) — acquires per-key publish_lock
     // to prevent lost-update race with concurrent publish (#529).
-    let metadata_phantoms_removed =
-        detect_and_clean_metadata_phantoms(storage, publish_locks, dry_run, npm_is_proxy).await;
+    let metadata_phantoms_removed = detect_and_clean_metadata_phantoms(
+        storage,
+        publish_locks,
+        dry_run,
+        npm_is_proxy,
+        &npm_listed,
+        &pypi_listed,
+    )
+    .await;
     if metadata_phantoms_removed > 0 {
         if !dry_run {
             GC_METADATA_PHANTOMS.inc_by(metadata_phantoms_removed as u64);
@@ -303,6 +434,8 @@ pub async fn run_gc(
         proxy_cache_max_bytes,
         dry_run,
         curation,
+        &npm_listed,
+        &pypi_listed,
     )
     .await;
 
@@ -328,11 +461,7 @@ pub async fn run_gc(
         "github/",
         "hashicorp/",
     ] {
-        let keys = storage.list(prefix).await.unwrap_or_else(|e| {
-            tracing::error!("GC: storage.list({}) failed: {}", prefix, e);
-            Vec::new()
-        });
-        let count = keys.len();
+        let count = gc_list(storage, prefix).await.len();
         if count > 0 {
             let name = prefix.trim_end_matches('/').to_string();
             uncovered.push((name, count));
@@ -664,55 +793,63 @@ fn primary_key_for_sidecar(key: &str) -> Option<&str> {
 
 /// npm cache provenance sidecars (#1055) whose cached object is gone. They live under
 /// an internal prefix that `list()` hides, so they are walked separately.
-async fn detect_origin_orphans(storage: &Storage) -> DetectionResult {
+///
+/// "Gone" is read off the `npm/` listing of the pass, never a `stat` per sidecar: `stat`
+/// cannot tell an absent object from a failed call, and a sidecar judged orphan on a timed-out
+/// HEAD leaves its tarball outside proxy-cache eviction for good. No listing, no orphans.
+async fn detect_origin_orphans(storage: &Storage, npm_listed: &Listed) -> DetectionResult {
     use crate::registry::npm::{origin_key, origin_primary};
-    let sidecars = storage
-        .list_internal(&origin_key("npm/"))
-        .await
-        .unwrap_or_else(|e| {
+    let Some(npm_listed) = npm_listed else {
+        return DetectionResult {
+            total: 0,
+            orphans: Vec::new(),
+        };
+    };
+    let sidecars = match storage.list_internal(&origin_key("npm/")).await {
+        Ok(sidecars) => sidecars,
+        Err(e) => {
             tracing::error!("GC: listing npm provenance sidecars failed: {}", e);
+            GC_LIST_FAILURES.inc();
             Vec::new()
-        });
-    let total = sidecars.len();
-    let mut orphans = Vec::new();
-    for sidecar in sidecars {
-        if let Some(primary) = origin_primary(&sidecar) {
-            if storage.stat(primary).await.is_none() {
-                orphans.push(sidecar);
-            }
         }
-    }
+    };
+    let present: HashSet<&str> = npm_listed.iter().map(|(key, _)| key.as_str()).collect();
+    let total = sidecars.len();
+    let orphans = sidecars
+        .into_iter()
+        .filter(|sidecar| origin_primary(sidecar).is_some_and(|p| !present.contains(p)))
+        .collect();
     DetectionResult { total, orphans }
 }
 
-async fn detect_checksum_orphans(storage: &Storage) -> DetectionResult {
-    let mut checksums: Vec<String> = Vec::new();
-
-    // Scan Maven, npm, PyPI prefixes for checksum sidecar files
-    for prefix in &["maven/", "npm/", "pypi/"] {
-        let keys = storage.list(prefix).await.unwrap_or_else(|e| {
-            tracing::error!("GC: storage.list({}) failed: {}", prefix, e);
-            Vec::new()
-        });
-        for key in keys {
-            if is_orphanable_sidecar(&key) {
-                checksums.push(key);
-            }
-        }
-    }
-
-    let total = checksums.len();
+/// Checksum and `.meta` sidecars whose primary artifact is absent from the same listing that
+/// produced the sidecar (see [`detect_origin_orphans`] for why not a `stat`). A prefix whose
+/// listing failed contributes nothing.
+async fn detect_checksum_orphans(
+    storage: &Storage,
+    npm_listed: &Listed,
+    pypi_listed: &Listed,
+) -> DetectionResult {
+    let maven = gc_list(storage, "maven/").await;
+    let mut total = 0;
     let mut orphans = Vec::new();
-
-    for checksum_key in &checksums {
-        if let Some(primary) = primary_key_for_sidecar(checksum_key) {
-            // If the primary artifact doesn't exist, the checksum is orphaned
-            if storage.stat(primary).await.is_none() {
-                orphans.push(checksum_key.clone());
+    let listings: [Vec<&str>; 3] = [
+        maven.iter().map(String::as_str).collect(),
+        (npm_listed.iter().flatten().map(|(k, _)| k.as_str())).collect(),
+        (pypi_listed.iter().flatten().map(|(k, _)| k.as_str())).collect(),
+    ];
+    for keys in listings {
+        let present: HashSet<&str> = keys.iter().copied().collect();
+        for key in keys {
+            if !is_orphanable_sidecar(key) {
+                continue;
+            }
+            total += 1;
+            if primary_key_for_sidecar(key).is_some_and(|primary| !present.contains(primary)) {
+                orphans.push(key.to_string());
             }
         }
     }
-
     DetectionResult { total, orphans }
 }
 
@@ -723,10 +860,7 @@ async fn detect_checksum_orphans(storage: &Storage) -> DetectionResult {
 /// Go modules store 3 files per version: .info, .mod, .zip
 /// If any file is missing, the remaining files are orphaned (partial upload or failed delete).
 async fn detect_go_incomplete_versions(storage: &Storage) -> DetectionResult {
-    let keys = storage.list("go/").await.unwrap_or_else(|e| {
-        tracing::error!("GC: storage.list(go/) failed: {}", e);
-        Vec::new()
-    });
+    let keys = gc_list(storage, "go/").await;
     let mut versions: HashMap<String, Vec<String>> = HashMap::new();
 
     for key in &keys {
@@ -770,10 +904,7 @@ async fn detect_go_incomplete_versions(storage: &Storage) -> DetectionResult {
 /// Cargo stores .crate files and index entries separately.
 /// Orphan = index entry without .crate file, or .crate without index entry.
 async fn detect_cargo_orphans(storage: &Storage) -> DetectionResult {
-    let keys = storage.list("cargo/").await.unwrap_or_else(|e| {
-        tracing::error!("GC: storage.list(cargo/) failed: {}", e);
-        Vec::new()
-    });
+    let keys = gc_list(storage, "cargo/").await;
     let mut crate_files: HashSet<String> = HashSet::new(); // names with a .crate
     let mut crate_keys: Vec<String> = Vec::new();
     // Names any index key speaks for: the index, NORA's upstream copy, the assembled index, an
@@ -928,6 +1059,8 @@ async fn detect_and_clean_metadata_phantoms(
     publish_locks: &PublishLocks,
     dry_run: bool,
     npm_is_proxy: bool,
+    npm_listed: &Listed,
+    pypi_listed: &Listed,
 ) -> usize {
     let mut total_removed = 0usize;
 
@@ -938,14 +1071,10 @@ async fn detect_and_clean_metadata_phantoms(
         info!("GC: skipping npm phantom cleanup (proxy mode — tarballs are cached on demand)");
     }
     if !npm_is_proxy {
-        let npm_keys = storage.list("npm/").await.unwrap_or_else(|e| {
-            tracing::error!("GC: storage.list(npm/) failed: {}", e);
-            Vec::new()
-        });
         let mut npm_meta_keys: Vec<String> = Vec::new();
         let mut npm_tarball_keys: HashSet<String> = HashSet::new();
 
-        for key in &npm_keys {
+        for (key, _) in npm_listed.iter().flatten() {
             if ends_with_ci(key, "/metadata.json") {
                 npm_meta_keys.push(key.clone());
             } else if key.contains("/tarballs/") {
@@ -964,14 +1093,10 @@ async fn detect_and_clean_metadata_phantoms(
     }
 
     // PyPI metadata cleanup
-    let pypi_keys = storage.list("pypi/").await.unwrap_or_else(|e| {
-        tracing::error!("GC: storage.list(pypi/) failed: {}", e);
-        Vec::new()
-    });
     let mut pypi_meta_keys: Vec<String> = Vec::new();
     let mut pypi_file_keys: HashSet<String> = HashSet::new();
 
-    for key in &pypi_keys {
+    for (key, _) in pypi_listed.iter().flatten() {
         if ends_with_ci(key, "/metadata.json") {
             pypi_meta_keys.push(key.clone());
         } else if !ends_with_ci(key, ".sha256")
@@ -998,6 +1123,12 @@ async fn detect_and_clean_metadata_phantoms(
 ///
 /// npm metadata has `versions` and `time` objects keyed by version string.
 /// A phantom = a version key with no corresponding tarball in storage.
+///
+/// `all_tarball_keys` is the listing taken at the start of the pass, while the metadata is
+/// read now, under the package lock: a version published in between is in the metadata and
+/// not in the listing. So the listing only nominates candidates; each is confirmed against a
+/// listing of the package's tarballs taken under the lock, and when that listing fails nothing
+/// is removed.
 async fn clean_npm_metadata(
     storage: &Storage,
     publish_locks: &PublishLocks,
@@ -1019,25 +1150,30 @@ async fn clean_npm_metadata(
         .strip_suffix("/metadata.json")?;
 
     let versions = json.get("versions")?.as_object()?.clone();
-    let mut phantoms: Vec<String> = Vec::new();
+    // npm tarballs: npm/{name}/tarballs/{name}-{version}.tgz
+    // For scoped packages @scope/name, tarball uses just "name" part
+    let name_part = package_name.rsplit('/').next().unwrap_or(package_name);
+    let tarball_key =
+        |version: &str| format!("npm/{package_name}/tarballs/{name_part}-{version}.tgz");
+    let mut phantoms: Vec<String> = versions
+        .keys()
+        .filter(|version| !all_tarball_keys.contains(&tarball_key(version)))
+        .cloned()
+        .collect();
 
-    for ver_key in versions.keys() {
-        // npm tarballs: npm/{name}/tarballs/{name}-{version}.tgz
-        // For scoped packages @scope/name, tarball uses just "name" part
-        let name_part = if package_name.contains('/') {
-            package_name.rsplit('/').next().unwrap_or(package_name)
-        } else {
-            package_name
-        };
-        let tarball_key = format!(
-            "npm/{}/tarballs/{}-{}.tgz",
-            package_name, name_part, ver_key
-        );
-        if !all_tarball_keys.contains(&tarball_key) {
-            phantoms.push(ver_key.clone());
-        }
+    if phantoms.is_empty() {
+        return Some(0);
     }
-
+    let tarballs_prefix = format!("npm/{package_name}/tarballs/");
+    let fresh: HashSet<String> = match storage.list(&tarballs_prefix).await {
+        Ok(keys) => keys.into_iter().collect(),
+        Err(e) => {
+            warn!("GC: listing {tarballs_prefix} failed, npm metadata left as is: {e}");
+            GC_LIST_FAILURES.inc();
+            return None;
+        }
+    };
+    phantoms.retain(|version| !fresh.contains(&tarball_key(version)));
     if phantoms.is_empty() {
         return Some(0);
     }
@@ -1106,6 +1242,8 @@ async fn clean_pypi_metadata(
 
     let releases = json.get("releases")?.as_object()?.clone();
     let mut phantoms: Vec<String> = Vec::new();
+    // As in `clean_npm_metadata`: the pass listing nominates, a listing under the lock confirms.
+    let mut fresh: Option<HashSet<String>> = None;
 
     for (ver_key, files_val) in &releases {
         let files = match files_val.as_array() {
@@ -1127,7 +1265,26 @@ async fn clean_pypi_metadata(
         });
 
         if !has_file && !files.is_empty() {
-            phantoms.push(ver_key.clone());
+            if fresh.is_none() {
+                let prefix = format!("pypi/{package_name}/");
+                match storage.list(&prefix).await {
+                    Ok(keys) => fresh = Some(keys.into_iter().collect()),
+                    Err(e) => {
+                        warn!("GC: listing {prefix} failed, PyPI metadata left as is: {e}");
+                        GC_LIST_FAILURES.inc();
+                        return None;
+                    }
+                }
+            }
+            let landed = files.iter().any(|f| {
+                let name = f.get("filename").and_then(|v| v.as_str());
+                name.zip(fresh.as_ref()).is_some_and(|(name, fresh)| {
+                    fresh.contains(&format!("pypi/{package_name}/{name}"))
+                })
+            });
+            if !landed {
+                phantoms.push(ver_key.clone());
+            }
         }
     }
 
@@ -1250,6 +1407,8 @@ async fn evict_proxy_cache(
     max_bytes: u64,
     dry_run: bool,
     curation: &crate::curation::CurationEngine,
+    npm_listed: &Listed,
+    pypi_listed: &Listed,
 ) -> ProxyCacheEviction {
     use crate::curation::{is_internal_namespace, RegistryType};
     use crate::registry::npm::{origin_key, origin_primary};
@@ -1368,25 +1527,18 @@ async fn evict_proxy_cache(
                 .filter_map(|sidecar| origin_primary(sidecar))
                 .filter(|key| key.contains("/tarballs/"))
                 .collect();
-            if !cached.is_empty() {
-                match storage.list_with_meta("npm/").await {
-                    Ok(entries) => {
-                        for (key, meta) in entries {
-                            let Some(name) = key
-                                .strip_prefix("npm/")
-                                .and_then(|rest| rest.split_once("/tarballs/"))
-                                .map(|(name, _)| name)
-                            else {
-                                continue;
-                            };
-                            if cached.contains(key.as_str())
-                                && !is_internal_namespace(curation, RegistryType::Npm, name)
-                            {
-                                proxy_files.push((key, meta.size, meta.modified));
-                            }
-                        }
-                    }
-                    Err(e) => tracing::error!("GC proxy-cache: list_with_meta(npm/) failed: {e}"),
+            for (key, meta) in npm_listed.iter().flatten() {
+                let Some(name) = key
+                    .strip_prefix("npm/")
+                    .and_then(|rest| rest.split_once("/tarballs/"))
+                    .map(|(name, _)| name)
+                else {
+                    continue;
+                };
+                if cached.contains(key.as_str())
+                    && !is_internal_namespace(curation, RegistryType::Npm, name)
+                {
+                    proxy_files.push((key.clone(), meta.size, meta.modified));
                 }
             }
         }
@@ -1402,19 +1554,12 @@ async fn evict_proxy_cache(
                 .filter_map(|m| m.strip_prefix(crate::registry::npm::ORIGINS_PREFIX))
                 .filter(|key| key.starts_with("pypi/"))
                 .collect();
-            if !cached.is_empty() {
-                match storage.list_with_meta("pypi/").await {
-                    Ok(entries) => {
-                        for (key, meta) in entries {
-                            let project = key.split('/').nth(1).unwrap_or_default();
-                            if cached.contains(key.as_str())
-                                && !is_internal_namespace(curation, RegistryType::PyPI, project)
-                            {
-                                proxy_files.push((key, meta.size, meta.modified));
-                            }
-                        }
-                    }
-                    Err(e) => tracing::error!("GC proxy-cache: list_with_meta(pypi/) failed: {e}"),
+            for (key, meta) in pypi_listed.iter().flatten() {
+                let project = key.split('/').nth(1).unwrap_or_default();
+                if cached.contains(key.as_str())
+                    && !is_internal_namespace(curation, RegistryType::PyPI, project)
+                {
+                    proxy_files.push((key.clone(), meta.size, meta.modified));
                 }
             }
         }
@@ -1458,6 +1603,7 @@ async fn evict_oldest(
 
     let mut bytes_freed = 0u64;
     let mut evicted = 0usize;
+    let mut failed = 0u64;
     let bytes_to_free = total_bytes - max_bytes;
 
     for (key, size, _mtime) in &proxy_files {
@@ -1469,19 +1615,25 @@ async fn evict_oldest(
         } else {
             let lock = crate::acquire_publish_lock(publish_locks, key);
             let _guard = lock.lock().await;
-            if storage.delete(key).await.is_ok() {
-                info!("proxy-cache evicted: {} ({} bytes)", key, size);
-                if key.starts_with("npm/") {
-                    let _ = storage.delete(&origin_key(key)).await;
-                }
-                if key.starts_with("pypi/") {
-                    evict_pypi_companions(storage, key).await;
-                }
+            // Only a delete the store confirmed frees anything: a refused one is not counted,
+            // so the loop goes on to the next file and the totals say what is really gone.
+            if let Err(e) = storage.delete(key).await {
+                warn!("proxy-cache: evicting {} failed, it stays: {}", key, e);
+                failed += 1;
+                continue;
+            }
+            info!("proxy-cache evicted: {} ({} bytes)", key, size);
+            if key.starts_with("npm/") {
+                let _ = storage.delete(&origin_key(key)).await;
+            }
+            if key.starts_with("pypi/") {
+                evict_pypi_companions(storage, key).await;
             }
         }
         bytes_freed += size;
         evicted += 1;
     }
+    GC_DELETE_FAILURES.inc_by(failed);
 
     if !dry_run && evicted > 0 {
         GC_PROXY_CACHE_EVICTED.inc_by(evicted as u64);
@@ -1570,6 +1722,40 @@ mod tests {
         crate::curation::CurationEngine::new(crate::config::CurationConfig::default())
     }
 
+    /// R4-T04: the local directory and the in-process object store (the S3 code path), for the
+    /// tests whose rules do not depend on a file's age. The directory lives as long as the
+    /// returned guard.
+    pub(super) fn both_backends() -> [(Option<tempfile::TempDir>, Storage); 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let local = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let object = Storage::from_backend(std::sync::Arc::new(
+            crate::storage::ObjectStorage::in_memory(),
+        ));
+        [(Some(dir), local), (None, object)]
+    }
+
+    /// `evict_proxy_cache` as a pass calls it: from fresh listings of `npm/` and `pypi/`.
+    async fn evict_proxy_cache(
+        storage: &Storage,
+        publish_locks: &PublishLocks,
+        max_bytes: u64,
+        dry_run: bool,
+        curation: &crate::curation::CurationEngine,
+    ) -> ProxyCacheEviction {
+        let npm = gc_list_meta(storage, "npm/").await;
+        let pypi = gc_list_meta(storage, "pypi/").await;
+        super::evict_proxy_cache(
+            storage,
+            publish_locks,
+            max_bytes,
+            dry_run,
+            curation,
+            &npm,
+            &pypi,
+        )
+        .await
+    }
+
     fn test_publish_locks() -> PublishLocks {
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
     }
@@ -1617,9 +1803,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_gc_docker_keeps_subject_referrers() {
+        for (_dir, storage) in both_backends() {
+            test_gc_docker_keeps_subject_referrers_on(storage).await;
+        }
+    }
+
+    async fn test_gc_docker_keeps_subject_referrers_on(storage: Storage) {
         use sha2::Digest;
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().to_str().unwrap());
         let image =
             serde_json::json!({"config":{"digest":"sha256:image-config"},"layers":[]}).to_string();
         let digest = format!(
@@ -1660,6 +1850,7 @@ mod tests {
             &test_publish_locks(),
             false,
             0,
+            false,
             false,
             0,
             &no_curation(),
@@ -1709,6 +1900,7 @@ mod tests {
             false,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -1746,6 +1938,7 @@ mod tests {
             &test_publish_locks(),
             false,
             0,
+            false,
             false,
             0,
             &no_curation(),
@@ -1798,6 +1991,7 @@ mod tests {
             false,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -1833,6 +2027,7 @@ mod tests {
             &test_publish_locks(),
             false,
             0,
+            false,
             false,
             0,
             &no_curation(),
@@ -1872,6 +2067,7 @@ mod tests {
             &test_publish_locks(),
             false,
             0,
+            false,
             false,
             0,
             &no_curation(),
@@ -1922,6 +2118,7 @@ mod tests {
                 &test_publish_locks(),
                 false,
                 0,
+                false,
                 false,
                 0,
                 &no_curation(),
@@ -1980,6 +2177,7 @@ mod tests {
             false,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -1997,6 +2195,7 @@ mod tests {
             &test_publish_locks(),
             true,
             0,
+            false,
             false,
             0,
             &no_curation(),
@@ -2037,6 +2236,7 @@ mod tests {
             &test_publish_locks(),
             true,
             0,
+            false,
             false,
             0,
             &no_curation(),
@@ -2080,6 +2280,7 @@ mod tests {
             true,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -2118,6 +2319,7 @@ mod tests {
             false,
             3600,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -2144,6 +2346,7 @@ mod tests {
             true,
             3600,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -2160,6 +2363,7 @@ mod tests {
             &test_publish_locks(),
             false,
             0,
+            false,
             false,
             0,
             &no_curation(),
@@ -2202,6 +2406,7 @@ mod tests {
             false,
             60,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -2231,6 +2436,7 @@ mod tests {
             &test_publish_locks(),
             false,
             3600,
+            false,
             false,
             0,
             &no_curation(),
@@ -2336,6 +2542,7 @@ mod tests {
             false,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -2361,7 +2568,7 @@ mod tests {
 
     /// #610 (hardening for #584): the GC delete path and a concurrent publish to
     /// the same key serialise through `publish_lock` — never a torn write, panic
-    /// or deadlock. This races `run_gc(grace=0)` (which reaps orphans under the
+    /// or deadlock. This races `run_gc(grace=0, false)` (which reaps orphans under the
     /// lock) against a writer re-putting the same keys under the SAME locks.
     /// Non-deterministic by nature; it asserts only that every key ends in a
     /// clean terminal state.
@@ -2393,7 +2600,7 @@ mod tests {
 
         let curation = no_curation();
         let (_gc, ()) = tokio::join!(
-            run_gc(&storage, &locks, false, 0, false, 0, &curation),
+            run_gc(&storage, &locks, false, 0, false, false, 0, &curation),
             writer
         );
 
@@ -2446,6 +2653,7 @@ mod tests {
             false,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -2470,9 +2678,13 @@ mod tests {
     /// them: one whose object is gone is reaped, a live one is kept.
     #[tokio::test]
     async fn test_gc_reaps_orphan_origin_sidecars() {
+        for (_dir, storage) in both_backends() {
+            test_gc_reaps_orphan_origin_sidecars_on(storage).await;
+        }
+    }
+
+    async fn test_gc_reaps_orphan_origin_sidecars_on(storage: Storage) {
         use crate::registry::npm::origin_key;
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
         let gone = origin_key("npm/gone/tarballs/gone-1.0.0.tgz");
         let live = origin_key("npm/live/tarballs/live-1.0.0.tgz");
         storage.put(&gone, b"npm:https://r.example").await.unwrap();
@@ -2487,6 +2699,7 @@ mod tests {
             &test_publish_locks(),
             false,
             0,
+            false,
             false,
             0,
             &no_curation(),
@@ -2503,9 +2716,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_gc_docker_deletes_orphans() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        for (_dir, storage) in both_backends() {
+            test_gc_docker_deletes_orphans_on(storage).await;
+        }
+    }
 
+    async fn test_gc_docker_deletes_orphans_on(storage: Storage) {
         let manifest = serde_json::json!({
             "config": {"digest": "sha256:configabc"},
             "layers": []
@@ -2532,6 +2748,7 @@ mod tests {
             false,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -2554,9 +2771,13 @@ mod tests {
     /// .meta.json sidecar with them instead of leaking it.
     #[tokio::test]
     async fn test_gc_keeps_tag_manifest_digest_alias_and_reaps_sidecars() {
+        for (_dir, storage) in both_backends() {
+            test_gc_keeps_tag_manifest_digest_alias_and_reaps_sidecars_on(storage).await;
+        }
+    }
+
+    async fn test_gc_keeps_tag_manifest_digest_alias_and_reaps_sidecars_on(storage: Storage) {
         use sha2::Digest;
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
 
         let manifest = serde_json::json!({
             "config": {"digest": "sha256:cfg"},
@@ -2605,6 +2826,7 @@ mod tests {
             false,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -2633,8 +2855,12 @@ mod tests {
     /// meta write failed) still has its .stats.json reaped with it.
     #[tokio::test]
     async fn gc_reaps_stats_sidecar_without_meta() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        for (_dir, storage) in both_backends() {
+            gc_reaps_stats_sidecar_without_meta_on(storage).await;
+        }
+    }
+
+    async fn gc_reaps_stats_sidecar_without_meta_on(storage: Storage) {
         storage
             .put("docker/t/manifests/sha256:dead.json", b"{}")
             .await
@@ -2652,6 +2878,7 @@ mod tests {
             false,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -2665,9 +2892,12 @@ mod tests {
     /// Manifest list (image index) tag transitively protects sub-manifest blobs.
     #[tokio::test]
     async fn test_gc_manifest_list_references() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        for (_dir, storage) in both_backends() {
+            test_gc_manifest_list_references_on(storage).await;
+        }
+    }
 
+    async fn test_gc_manifest_list_references_on(storage: Storage) {
         // Manifest list (image index) references two sub-manifests by digest.
         let manifest = serde_json::json!({
             "manifests": [
@@ -2727,6 +2957,7 @@ mod tests {
             &test_publish_locks(),
             true,
             0,
+            false,
             false,
             0,
             &no_curation(),
@@ -2791,9 +3022,12 @@ mod tests {
     /// manifest and its exclusive blobs orphaned.
     #[tokio::test]
     async fn test_gc_tag_rooted_repush_orphans_old_blobs() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        for (_dir, storage) in both_backends() {
+            test_gc_tag_rooted_repush_orphans_old_blobs_on(storage).await;
+        }
+    }
 
+    async fn test_gc_tag_rooted_repush_orphans_old_blobs_on(storage: Storage) {
         // Simulate: tag "latest" was pushed with content A, then re-pushed with B.
         // After re-push, the tag manifest points to B's content. The old digest
         // manifest (sha256:old_digest) still exists alongside B.
@@ -3053,9 +3287,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_gc_scans_all_registries() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        for (_dir, storage) in both_backends() {
+            test_gc_scans_all_registries_on(storage).await;
+        }
+    }
 
+    async fn test_gc_scans_all_registries_on(storage: Storage) {
         // Cargo: crate without index = orphan
         storage
             .put("cargo/serde/1.0.0/serde-1.0.0.crate", b"crate-data")
@@ -3074,6 +3311,7 @@ mod tests {
             &test_publish_locks(),
             true,
             0,
+            false,
             false,
             0,
             &no_curation(),
@@ -3113,6 +3351,7 @@ mod tests {
             true,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -3139,6 +3378,7 @@ mod tests {
             &test_publish_locks(),
             true,
             0,
+            false,
             false,
             0,
             &no_curation(),
@@ -3331,6 +3571,7 @@ mod tests {
             true,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -3343,9 +3584,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_gc_cargo_orphan_index_without_crate() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        for (_dir, storage) in both_backends() {
+            test_gc_cargo_orphan_index_without_crate_on(storage).await;
+        }
+    }
 
+    async fn test_gc_cargo_orphan_index_without_crate_on(storage: Storage) {
         // Index entry but no .crate file
         storage
             .put("cargo/index/se/rd/serde", b"index-data")
@@ -3357,6 +3601,7 @@ mod tests {
             &test_publish_locks(),
             true,
             0,
+            false,
             false,
             0,
             &no_curation(),
@@ -3370,9 +3615,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_gc_maven_checksum_orphan() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        for (_dir, storage) in both_backends() {
+            test_gc_maven_checksum_orphan_on(storage).await;
+        }
+    }
 
+    async fn test_gc_maven_checksum_orphan_on(storage: Storage) {
         // Primary artifact exists with its checksums
         storage
             .put("maven/com/example/1.0/lib.jar", b"jar-data")
@@ -3398,6 +3646,7 @@ mod tests {
             false,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -3415,9 +3664,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_gc_npm_checksum_orphan() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        for (_dir, storage) in both_backends() {
+            test_gc_npm_checksum_orphan_on(storage).await;
+        }
+    }
 
+    async fn test_gc_npm_checksum_orphan_on(storage: Storage) {
         storage
             .put("npm/lodash/tarballs/lodash-4.17.21.tgz", b"tarball")
             .await
@@ -3437,6 +3689,7 @@ mod tests {
             &test_publish_locks(),
             false,
             0,
+            false,
             false,
             0,
             &no_curation(),
@@ -3474,6 +3727,7 @@ mod tests {
             &test_publish_locks(),
             false,
             0,
+            false,
             false,
             0,
             &no_curation(),
@@ -3521,6 +3775,7 @@ mod tests {
             false,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -3561,6 +3816,7 @@ mod tests {
             true,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -3597,6 +3853,7 @@ mod tests {
             &test_publish_locks(),
             false,
             0,
+            false,
             false,
             0,
             &no_curation(),
@@ -3635,6 +3892,7 @@ mod tests {
             &test_publish_locks(),
             true,
             0,
+            false,
             false,
             0,
             &no_curation(),
@@ -3677,6 +3935,7 @@ mod tests {
             true,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -3691,9 +3950,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_gc_npm_phantom_cleaned() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        for (_dir, storage) in both_backends() {
+            test_gc_npm_phantom_cleaned_on(storage).await;
+        }
+    }
 
+    async fn test_gc_npm_phantom_cleaned_on(storage: Storage) {
         let meta = serde_json::json!({
             "versions": {
                 "1.0.0": {"name": "lodash"},
@@ -3721,6 +3983,7 @@ mod tests {
             &test_publish_locks(),
             false,
             0,
+            false,
             false,
             0,
             &no_curation(),
@@ -3765,6 +4028,7 @@ mod tests {
             true,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -3774,9 +4038,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_gc_pypi_phantom_detected() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        for (_dir, storage) in both_backends() {
+            test_gc_pypi_phantom_detected_on(storage).await;
+        }
+    }
 
+    async fn test_gc_pypi_phantom_detected_on(storage: Storage) {
         let meta = serde_json::json!({
             "releases": {
                 "1.0.0": [{"filename": "flask-1.0.0.tar.gz"}],
@@ -3802,6 +4069,7 @@ mod tests {
             false,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -3817,9 +4085,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_gc_mixed_orphans_and_phantoms() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        for (_dir, storage) in both_backends() {
+            test_gc_mixed_orphans_and_phantoms_on(storage).await;
+        }
+    }
 
+    async fn test_gc_mixed_orphans_and_phantoms_on(storage: Storage) {
         // Docker: 1 orphan blob
         let manifest = serde_json::json!({
             "config": {"digest": "sha256:cfg1"},
@@ -3864,6 +4135,7 @@ mod tests {
             false,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -3906,6 +4178,7 @@ mod tests {
             true,
             0,
             false,
+            false,
             0,
             &no_curation(),
         )
@@ -3922,6 +4195,7 @@ mod tests {
             true,
             0,
             true,
+            false,
             0,
             &no_curation(),
         )
@@ -4446,7 +4720,7 @@ mod docker_gc_reachability {
 
     /// The keys a dry run would delete.
     async fn would_delete(storage: &Storage) -> Vec<String> {
-        run_gc(storage, &locks(), true, 0, false, 0, &no_curation())
+        run_gc(storage, &locks(), true, 0, false, false, 0, &no_curation())
             .await
             .orphan_keys
     }
@@ -4553,7 +4827,17 @@ mod docker_gc_reachability {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &locks(), false, 600, false, 0, &no_curation()).await;
+        let result = run_gc(
+            &storage,
+            &locks(),
+            false,
+            600,
+            false,
+            false,
+            0,
+            &no_curation(),
+        )
+        .await;
         assert!(
             storage.get("docker/b/blobs/sha256:shared").await.is_ok(),
             "a mounted blob was deleted before its manifest landed: {:?}",
@@ -4592,5 +4876,329 @@ mod docker_gc_reachability {
                 "docker/library/nginx/blobs/sha256:layer".to_string(),
             ],
         );
+    }
+}
+
+/// Review round 4: the pass fails closed. A stat, a listing or a delete that fails, and a
+/// write or a confirmation that lands during the pass, each keep the object.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod fail_closed_tests {
+    use super::tests::both_backends;
+    use super::*;
+    use crate::test_helpers::outage_storage;
+
+    const DAY: u64 = 86_400;
+
+    fn locks() -> PublishLocks {
+        std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()))
+    }
+
+    async fn gc(storage: &Storage, grace_secs: u64) -> GcResult {
+        let curation = crate::curation::CurationEngine::new(Default::default());
+        run_gc(
+            storage,
+            &locks(),
+            false,
+            grace_secs,
+            false,
+            false,
+            0,
+            &curation,
+        )
+        .await
+    }
+
+    async fn put_all(storage: &Storage, keys: &[&str]) {
+        for key in keys {
+            storage.put(key, b"0123456789").await.unwrap();
+        }
+    }
+
+    async fn keys_under(storage: &Storage, prefix: &str) -> Vec<String> {
+        let mut keys = storage.list(prefix).await.unwrap();
+        keys.sort();
+        keys
+    }
+
+    /// R4-C01: a version published after the pass listed `npm/` is in the metadata read under
+    /// the lock and not in that listing. It is not a phantom: its tarball is there.
+    #[tokio::test]
+    async fn a_version_published_during_the_pass_is_not_a_phantom() {
+        for (_dir, storage) in both_backends() {
+            let meta_key = "npm/@corp/foo/metadata.json";
+            let meta = serde_json::json!({
+                "versions": {"0.9.0": {}, "1.0.0": {}, "1.2.3": {}},
+                "time": {"0.9.0": "t", "1.0.0": "t", "1.2.3": "t"}
+            });
+            storage
+                .put(meta_key, meta.to_string().as_bytes())
+                .await
+                .unwrap();
+            let old = "npm/@corp/foo/tarballs/foo-1.0.0.tgz";
+            put_all(
+                &storage,
+                &[
+                    old,
+                    // Published during the pass: tarball and version document.
+                    "npm/@corp/foo/tarballs/foo-1.2.3.tgz",
+                    "npm/@corp/foo/versions/1.2.3.json",
+                ],
+            )
+            .await;
+            // What the pass listed before the publish; 0.9.0 never had a tarball.
+            let listed_before = HashSet::from([old.to_string()]);
+
+            let removed =
+                clean_npm_metadata(&storage, &locks(), meta_key, &listed_before, false).await;
+
+            assert_eq!(removed, Some(1), "only the version without a tarball");
+            let after: serde_json::Value =
+                serde_json::from_slice(&storage.get(meta_key).await.unwrap()).unwrap();
+            let versions: Vec<&String> = after["versions"].as_object().unwrap().keys().collect();
+            assert_eq!(versions, ["1.0.0", "1.2.3"]);
+            assert!(
+                storage
+                    .stat("npm/@corp/foo/versions/1.2.3.json")
+                    .await
+                    .is_some(),
+                "the version document of the fresh publish stays"
+            );
+        }
+    }
+
+    /// R4-C01: when the tarballs cannot be listed under the lock, nothing is a phantom.
+    #[tokio::test]
+    async fn npm_metadata_is_left_alone_when_its_tarballs_cannot_be_listed() {
+        let (storage, outage) = outage_storage();
+        let meta_key = "npm/foo/metadata.json";
+        let meta = serde_json::json!({"versions": {"1.0.0": {}}}).to_string();
+        storage.put(meta_key, meta.as_bytes()).await.unwrap();
+        outage.fail_listings_of("npm/foo/tarballs/");
+        let before = GC_LIST_FAILURES.get();
+
+        let removed =
+            clean_npm_metadata(&storage, &locks(), meta_key, &HashSet::new(), false).await;
+
+        assert_eq!(removed, None);
+        assert_eq!(storage.get(meta_key).await.unwrap(), meta.as_bytes());
+        assert!(GC_LIST_FAILURES.get() > before);
+    }
+
+    /// R4-C07: a `stat` of the primary that fails (a HEAD that timed out) does not make its
+    /// sidecars orphans; the listing says the primary is there.
+    #[tokio::test]
+    async fn a_failed_stat_of_the_primary_does_not_orphan_its_sidecars() {
+        let (storage, outage) = outage_storage();
+        let origin = crate::registry::npm::origin_key("npm/foo/tarballs/foo-1.0.0.tgz");
+        let live = [
+            "npm/foo/tarballs/foo-1.0.0.tgz",
+            "npm/foo/tarballs/foo-1.0.0.tgz.sha256",
+            "maven/g/a/1.0/a-1.0.jar",
+            "maven/g/a/1.0/a-1.0.jar.sha1",
+            "pypi/p/p-1.0.tar.gz",
+            "pypi/p/p-1.0.tar.gz.sha256",
+            origin.as_str(),
+        ];
+        put_all(&storage, &live).await;
+        // Real orphans beside them: still found, from the same listing.
+        put_all(&storage, &["npm/foo/tarballs/foo-0.1.0.tgz.sha256"]).await;
+        for primary in [".tgz", ".jar", ".tar.gz"] {
+            outage.fail_stats_of(primary);
+        }
+
+        let result = gc(&storage, 0).await;
+
+        assert_eq!(
+            result.orphan_keys,
+            ["npm/foo/tarballs/foo-0.1.0.tgz.sha256"]
+        );
+        assert_eq!(result.deleted, 1);
+        outage.end();
+        for key in live {
+            assert!(storage.stat(key).await.is_some(), "{key} kept");
+        }
+    }
+
+    /// R4-C07/T04: a failed listing of `npm/` keeps every npm sidecar, the provenance ones
+    /// under the internal prefix too, and is counted; other registries are still collected.
+    #[tokio::test]
+    async fn a_failed_listing_keeps_what_it_covers() {
+        let (storage, outage) = outage_storage();
+        let origin = crate::registry::npm::origin_key("npm/gone/tarballs/gone-1.0.0.tgz");
+        put_all(
+            &storage,
+            &[
+                origin.as_str(),
+                "npm/gone/tarballs/gone-1.0.0.tgz.sha256",
+                "maven/g/a/1.0/a-1.0.jar.sha1",
+            ],
+        )
+        .await;
+        outage.fail_listings_of("npm/");
+        let before = GC_LIST_FAILURES.get();
+
+        let result = gc(&storage, 0).await;
+
+        assert_eq!(result.orphan_keys, ["maven/g/a/1.0/a-1.0.jar.sha1"]);
+        assert!(GC_LIST_FAILURES.get() > before);
+        outage.end();
+        assert!(storage.stat(&origin).await.is_some());
+        assert!(storage
+            .stat("npm/gone/tarballs/gone-1.0.0.tgz.sha256")
+            .await
+            .is_some());
+    }
+
+    /// R4-T04: Docker objects cannot be listed: the mark fails, nothing of Docker is swept.
+    #[tokio::test]
+    async fn a_failed_docker_listing_sweeps_no_docker_object() {
+        let (storage, outage) = outage_storage();
+        put_all(&storage, &["docker/app/blobs/sha256:orphan"]).await;
+        outage.fail_listings_of("docker/");
+
+        let result = gc(&storage, 0).await;
+
+        assert!(result.docker_mark_failed);
+        assert_eq!(result.deleted, 0);
+        outage.end();
+        assert!(storage
+            .stat("docker/app/blobs/sha256:orphan")
+            .await
+            .is_some());
+    }
+
+    /// R4-T04: a delete the store refuses in the middle of the sweep is not counted as
+    /// deleted, is metered, and does not stop the orphans after it.
+    #[tokio::test]
+    async fn a_refused_delete_mid_sweep_is_not_counted_and_the_sweep_goes_on() {
+        let (storage, outage) = outage_storage();
+        let orphans = [
+            "docker/app/blobs/sha256:a",
+            "docker/app/blobs/sha256:b",
+            "docker/app/blobs/sha256:c",
+        ];
+        put_all(&storage, &orphans).await;
+        outage.fail_deletes_of("sha256:b");
+        let before = GC_DELETE_FAILURES.get();
+
+        let result = gc(&storage, 0).await;
+
+        assert_eq!(result.orphaned, 3);
+        assert_eq!((result.deleted, result.bytes_freed), (2, 20));
+        assert!(GC_DELETE_FAILURES.get() > before);
+        assert_eq!(
+            keys_under(&storage, "docker/").await,
+            ["docker/app/blobs/sha256:b"]
+        );
+    }
+
+    /// R4-C12: eviction counts a file as evicted only when its delete succeeded, and goes on
+    /// to the next file until the cap is really met.
+    #[tokio::test]
+    async fn eviction_counts_only_what_the_store_deleted() {
+        let (storage, outage) = outage_storage();
+        let files: Vec<String> = (0..5).map(|i| format!("hf/models/m/blobs/{i}")).collect();
+        for file in &files {
+            storage.put(file, b"0123456789").await.unwrap();
+        }
+        outage.fail_deletes_of("blobs/0");
+        let before = GC_DELETE_FAILURES.get();
+
+        let proxy_files = files.iter().map(|key| (key.clone(), 10, 0)).collect();
+        let result = evict_oldest(&storage, &locks(), proxy_files, 30, false, "test").await;
+
+        assert_eq!((result.evicted_files, result.bytes_freed), (2, 20));
+        assert!(GC_DELETE_FAILURES.get() > before);
+        assert_eq!(
+            keys_under(&storage, "hf/").await,
+            [files[0].as_str(), &files[3], &files[4]],
+            "the refused file stays, the next two went, the cap is met"
+        );
+    }
+
+    /// R4-C20: with a Go upstream each requested file is cached on its own, so a version
+    /// holding only `.info` and `.mod` is a normal cache entry and is kept.
+    #[tokio::test]
+    async fn a_go_proxy_version_without_its_zip_is_kept() {
+        for (_dir, storage) in both_backends() {
+            let files = [
+                "go/example.com/mod/@v/v1.0.0.info",
+                "go/example.com/mod/@v/v1.0.0.mod",
+            ];
+            put_all(&storage, &files).await;
+            let curation = crate::curation::CurationEngine::new(Default::default());
+
+            let proxied = run_gc(&storage, &locks(), false, 0, false, true, 0, &curation).await;
+            assert_eq!(proxied.orphaned, 0);
+            assert_eq!(keys_under(&storage, "go/").await, files);
+
+            let hosted = run_gc(&storage, &locks(), false, 0, false, false, 0, &curation).await;
+            assert_eq!(
+                hosted.deleted, 2,
+                "without an upstream the rule still applies"
+            );
+        }
+    }
+
+    /// R4-C06: an old unreferenced layer that a client was just told exists (it will reference
+    /// it from a manifest it has not pushed yet) is kept for the grace period, like a layer
+    /// written now; one nobody asked about is swept.
+    #[tokio::test]
+    async fn a_blob_confirmed_to_a_client_survives_the_sweep() {
+        let (storage, outage) = outage_storage();
+        let reused = "docker/c06-unit/blobs/sha256:reused";
+        let unused = "docker/c06-unit/blobs/sha256:unused";
+        put_all(&storage, &[reused, unused]).await;
+        outage.age_all(30 * DAY);
+        let publish_locks = locks();
+
+        let found = confirm_blob(true, &publish_locks, &[reused], storage.stat(reused)).await;
+        assert!(found.is_some());
+        // An absent blob leaves no record behind; a disabled GC records nothing.
+        let absent = "docker/c06-unit/blobs/sha256:absent";
+        assert!(
+            confirm_blob(true, &publish_locks, &[absent], storage.stat(absent))
+                .await
+                .is_none()
+        );
+        confirm_blob(false, &publish_locks, &[unused], storage.stat(unused)).await;
+        assert!(!recently_confirmed(absent, 7 * DAY));
+        assert!(!recently_confirmed(unused, 7 * DAY));
+
+        let result = gc(&storage, 7 * DAY).await;
+
+        assert_eq!((result.deleted, result.skipped_recent), (1, 1));
+        assert_eq!(keys_under(&storage, "docker/").await, [reused]);
+    }
+
+    /// R4-C06 through the registry: `HEAD /v2/<name>/blobs/<digest>` answering 200 is what
+    /// makes a pushing client skip the upload, so it is what protects the layer.
+    #[tokio::test]
+    async fn a_blob_head_protects_the_layer_from_the_sweep() {
+        use sha2::Digest;
+        let (storage, outage) = outage_storage();
+        let layer = b"base layer";
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(layer)));
+        let key = format!("docker/c06-http/blobs/{digest}");
+        storage.put(&key, layer).await.unwrap();
+        outage.age_all(30 * DAY);
+        let ctx = crate::test_helpers::create_test_context_with_storage_and_config(
+            storage.clone(),
+            |config| config.gc.enabled = true,
+        );
+
+        let head = crate::test_helpers::send(
+            &ctx.app,
+            axum::http::Method::HEAD,
+            &format!("/v2/c06-http/blobs/{digest}"),
+            "",
+        )
+        .await;
+        assert_eq!(head.status(), axum::http::StatusCode::OK);
+
+        let result = gc(&storage, 7 * DAY).await;
+        assert_eq!((result.deleted, result.skipped_recent), (0, 1));
+        assert!(storage.stat(&key).await.is_some());
     }
 }

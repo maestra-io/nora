@@ -20,6 +20,10 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+/// What a pass with a zero interval waits between two runs. Config validation refuses an
+/// interval of 0 for an enabled pass; this floor holds for any caller.
+const ZERO_INTERVAL_FLOOR: Duration = Duration::from_secs(1);
+
 pub(crate) struct CleanupPass {
     pub name: &'static str,
     pub interval: Duration,
@@ -81,7 +85,14 @@ pub(crate) async fn run_cleanup_scheduler(
                 }
                 // Wake-time based, so same-interval passes stay phase-locked
                 // and a pass overrunning its interval fires on the next loop.
-                due[i] = now + pass.interval;
+                // A zero interval would make the pass due again the moment it ends, and
+                // the scheduler a busy loop under the lock.
+                due[i] = now
+                    + if pass.interval.is_zero() {
+                        ZERO_INTERVAL_FLOOR
+                    } else {
+                        pass.interval
+                    };
                 // A panicking pass is reported like a task panic, and the others still run.
                 if let Err(panic) = std::panic::AssertUnwindSafe((pass.run)())
                     .catch_unwind()
@@ -152,6 +163,40 @@ mod tests {
             assert!(Instant::now() < deadline, "only recorded {seen:?}");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// R4-C13: a pass with a zero interval is not due again the moment it ends. Without the
+    /// floor the scheduler spins and the pass cancels it after 100 runs within one instant.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_interval_is_not_a_busy_loop() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancel = CancellationToken::new();
+        let pass = {
+            let (runs, cancel) = (runs.clone(), cancel.clone());
+            CleanupPass {
+                name: "gc",
+                interval: Duration::ZERO,
+                run: Box::new(move || {
+                    if runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 100 {
+                        cancel.cancel();
+                    }
+                    async {}.boxed()
+                }),
+            }
+        };
+        let handle = spawn_cleanup_scheduler(
+            vec![pass],
+            Arc::new(tokio::sync::Mutex::new(())),
+            cancel.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        cancel.cancel();
+        handle.await.unwrap();
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "at boot, then once a second"
+        );
     }
 
     /// The first cycle runs at boot and chains retention → GC in order.
