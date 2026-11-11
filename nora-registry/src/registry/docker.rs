@@ -2899,6 +2899,25 @@ async fn get_manifest(
     // A served copy's pull statistics live beside it: a bare-key (hosted) hit counts against
     // the pushed image's own metadata, a namespaced hit against the proxied copy's.
     let served_ns = if hosted { None } else { ns.as_deref() };
+    // `Cache-Control: only-if-cached` (RFC 9111 5.2.1.7): answer from what NORA holds, never
+    // from an upstream. A quarantine probe (github-actions base-image check) reads the verdict
+    // of a digest without fetching it, so the probe never starts a digest's clock itself
+    // (issues-maestra#1649). Not cached: 504, as the RFC says. A cached tag answers its copy,
+    // fresh or not.
+    if only_if_cached(&headers) {
+        return match cached {
+            Some(ref data) => serve_cached_manifest(&state, data, &name, &reference, served_ns),
+            None => (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(json!({"errors": [{
+                    "code": "MANIFEST_UNKNOWN",
+                    "message": "not in NORA's cache (only-if-cached)",
+                    "detail": {"name": name, "reference": reference},
+                }]})),
+            )
+                .into_response(),
+        };
+    }
     // Digest references are immutable (content-addressed) → the cache is authoritative forever.
     // Tag references on PROXIED copies are MUTABLE: a tag can be re-pushed to point at a
     // different manifest, so a proxied tag must be revalidated against upstream before it is
@@ -3057,6 +3076,16 @@ async fn get_manifest(
             reference: &reference,
         },
     )
+}
+
+/// The request's `Cache-Control` holds `only-if-cached` (any case, among other directives).
+fn only_if_cached(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|d| d.trim().eq_ignore_ascii_case("only-if-cached"))
 }
 
 /// Serve a manifest from local cache with all required headers and side-effects.
@@ -11593,8 +11622,10 @@ mod integration_tests {
         use super::super::manifest_key;
         use super::*;
         use crate::config::DockerUpstream;
-        use crate::digest_quarantine::QuarantineMode;
-        use crate::test_helpers::{create_test_context_with_config, TestContext};
+        use crate::digest_quarantine::{QuarantineMode, QuarantineStatus};
+        use crate::test_helpers::{
+            create_test_context_with_config, send_with_headers, TestContext,
+        };
         use axum::response::Response;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -12426,6 +12457,77 @@ mod integration_tests {
                     "{label}"
                 );
             }
+        }
+
+        /// `Cache-Control: only-if-cached` reads the verdict of what NORA holds and never asks
+        /// the upstream: a digest NORA has not seen is a 504 and gets no first-seen record
+        /// (the github-actions base-image check, issues-maestra#1649).
+        #[tokio::test]
+        async fn only_if_cached_never_reaches_the_upstream_nor_starts_a_clock() {
+            let (server, image, _) = upstream_with_image().await;
+            let ctx = context(&server, false, QuarantineMode::Observe);
+            let probe = |rest: String, m: Method| {
+                let app = ctx.app.clone();
+                async move {
+                    send_with_headers(
+                        &app,
+                        m,
+                        &format!("/v2/library/demo/{rest}"),
+                        vec![("cache-control", "no-cache, Only-If-Cached")],
+                        Body::empty(),
+                    )
+                    .await
+                }
+            };
+            let by_digest = format!("manifests/{}", sha(&image));
+            for m in [Method::GET, Method::HEAD] {
+                for rest in [by_digest.clone(), "manifests/v1".to_string()] {
+                    let r = probe(rest.clone(), m.clone()).await;
+                    assert_eq!(r.status(), StatusCode::GATEWAY_TIMEOUT, "{m} {rest}");
+                }
+            }
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                0,
+                "the upstream was asked"
+            );
+            assert_eq!(
+                ctx.state.digest_store.check("docker", &sha(&image), 1),
+                QuarantineStatus::New,
+                "a probe recorded a first sight"
+            );
+
+            // A real pull caches it (tag and digest copy) and starts the clock: the probe
+            // then reads the verdict, still without the upstream.
+            assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::OK);
+            let key = manifest_key(Some("quay.io"), "library/demo", &sha(&image));
+            for _ in 0..200 {
+                if ctx.state.storage.get(&key).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            let asked = server.received_requests().await.unwrap().len();
+            for m in [Method::GET, Method::HEAD] {
+                for rest in [by_digest.clone(), "manifests/v1".to_string()] {
+                    let r = probe(rest.clone(), m.clone()).await;
+                    assert_eq!(r.status(), StatusCode::OK, "{m} {rest}");
+                    assert_eq!(
+                        header(&r, "x-nora-quarantine"),
+                        Some("pending"),
+                        "{m} {rest}"
+                    );
+                    assert!(
+                        header(&r, "x-nora-quarantine-until").is_some(),
+                        "{m} {rest}"
+                    );
+                    assert_eq!(
+                        header(&r, "docker-content-digest"),
+                        Some(sha(&image).as_str())
+                    );
+                }
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), asked);
         }
 
         /// The verdict rides on every manifest answer, 200 included, so `observe` can be
