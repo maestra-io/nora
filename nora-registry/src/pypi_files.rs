@@ -112,6 +112,8 @@ pub struct FileEntry {
 /// Extract filename from PyPI download URL.
 pub fn extract_filename(url: &str) -> Option<&str> {
     let url = url.split('#').next()?;
+    // A signed URL carries a query (`file.whl?sig=...`): it is no part of the file name.
+    let url = url.split('?').next()?;
     let filename = url.rsplit('/').next()?;
 
     served_extension(filename).map(|_| filename)
@@ -129,23 +131,39 @@ pub fn parse_upstream_files(html: &str, page_url: &str) -> Vec<FileEntry> {
     let mut files = Vec::new();
     let mut offset = 0;
 
-    while let Some(href_start) = html[offset..].find("href=\"") {
-        let value_start = offset + href_start + 6;
-        let Some(href_len) = html[value_start..].find('"') else {
+    while let Some(href_start) = html[offset..].find("href=") {
+        // Either quote: private indexes and static mirrors write `href='...'` too.
+        let quote_at = offset + href_start + 5;
+        let Some(quote) = html[quote_at..]
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '"' | '\''))
+        else {
+            offset = quote_at;
+            continue;
+        };
+        let value_start = quote_at + 1;
+        let Some(href_len) = html[value_start..].find(quote) else {
             break;
         };
-        let url = &html[value_start..value_start + href_len];
+        // An attribute value is HTML-escaped: the `&amp;` of a signed URL is `&`.
+        let url = html_unescape(&html[value_start..value_start + href_len]);
+        let url = url.as_str();
         offset = value_start + href_len;
         if let Some(filename) = extract_filename(url) {
             // The anchor's attributes: from its `<a` to the first `>` outside quotes
             // (some mirrors leave `data-requires-python=">=3.8"` unescaped).
             let tag_start = html[..value_start].rfind("<a").unwrap_or(0);
-            let mut quoted = false;
+            let mut quoted: Option<char> = None;
             let tag_end = html[offset + 1..]
                 .char_indices()
                 .find(|&(_, c)| {
-                    quoted ^= c == '"';
-                    c == '>' && !quoted
+                    match quoted {
+                        Some(q) if q == c => quoted = None,
+                        None if matches!(c, '"' | '\'') => quoted = Some(c),
+                        _ => {}
+                    }
+                    c == '>' && quoted.is_none()
                 })
                 .map_or(html.len(), |(e, _)| offset + 1 + e);
             let tag = &html[tag_start..tag_end];
@@ -163,7 +181,14 @@ pub fn parse_upstream_files(html: &str, page_url: &str) -> Vec<FileEntry> {
                     .into_owned(),
                 sha256: url.find("#sha256=").map(|pos| url[pos + 8..].to_string()),
                 requires_python: html_attr(tag, "data-requires-python").map(html_unescape),
-                yanked: html_attr(tag, "data-yanked").map(html_unescape),
+                // PEP 592: `data-yanked` may carry no value; the file is yanked all the same.
+                yanked: html_attr(tag, "data-yanked")
+                    .map(html_unescape)
+                    .or_else(|| {
+                        tag.split_ascii_whitespace()
+                            .any(|word| word == "data-yanked")
+                            .then(String::new)
+                    }),
                 core_metadata: html_attr(tag, "data-core-metadata")
                     .or_else(|| html_attr(tag, "data-dist-info-metadata"))
                     .map(html_unescape),
@@ -175,17 +200,25 @@ pub fn parse_upstream_files(html: &str, page_url: &str) -> Vec<FileEntry> {
     files
 }
 
-/// Value of a double-quoted attribute `name="..."` inside an HTML tag, raw (still escaped).
+/// Value of a quoted attribute `name="..."` or `name='...'` inside an HTML tag, raw (still
+/// escaped).
 fn html_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
-    let needle = format!("{name}=\"");
+    let needle = format!("{name}=");
     let mut from = 0;
     while let Some(pos) = tag[from..].find(&needle) {
         let start = from + pos;
         from = start + needle.len();
+        let quote = tag[from..]
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '"' | '\''));
         // Whole attribute name only: `data-yanked` must not match `xdata-yanked`.
-        if tag[..start].ends_with(|c: char| c.is_ascii_whitespace()) {
-            let end = tag[from..].find('"')?;
-            return Some(&tag[from..from + end]);
+        if let (Some(quote), true) = (
+            quote,
+            tag[..start].ends_with(|c: char| c.is_ascii_whitespace()),
+        ) {
+            let value = &tag[from + 1..];
+            return Some(&value[..value.find(quote)?]);
         }
     }
     None

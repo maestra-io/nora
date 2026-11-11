@@ -154,10 +154,8 @@ async fn package_versions_filtered(
         return resp;
     }
     // A hosted (imported) project lists only its own publishes: no upstream date holds them.
-    if own_records(&state.storage, &normalized)
-        .await
-        .is_some_and(|records| records.hosted())
-    {
+    // `package_versions` read the project's records already and says so on its response.
+    if resp.extensions().get::<HostedProject>().is_some() {
         return resp;
     }
     let dates = ensure_pypi_dates_cached(&state, &normalized, None).await;
@@ -166,6 +164,10 @@ async fn package_versions_filtered(
     })
     .await
 }
+
+/// Set on the index response of a hosted project, for [`package_versions_filtered`].
+#[derive(Clone)]
+struct HostedProject;
 
 /// When proxy is configured, merges the upstream index with locally cached/uploaded
 /// files, so pip sees all available wheels (e.g. both cp310 and cp314) regardless of
@@ -195,7 +197,15 @@ async fn package_versions(
     );
     // A project imported from the operator's own registry is NORA's: neither its index nor its
     // dates are asked of an upstream, and it lists only its own files.
-    let Some(records) = own_records(&state.storage, &normalized).await else {
+    // The three listings of a project (records, files, hash markers) run together: each is a
+    // LIST on an object store, and in a row they were three round-trips per index request.
+    let marker_prefix = format!("{HASH_MARKER_PREFIX}{normalized}/");
+    let (records, keys, marker_listing) = tokio::join!(
+        own_records(&state.storage, &normalized),
+        state.storage.list_with_meta(&prefix),
+        state.storage.list(&marker_prefix),
+    );
+    let Some(records) = records else {
         return crate::registry::storage_unavailable("pypi", &own_prefix(&normalized));
     };
     let hosted = records.hosted();
@@ -203,7 +213,7 @@ async fn package_versions(
     // Collect local files with their hashes and sizes. `list_with_meta` carries the
     // size from the listing itself; a per-key `stat()` is a HEAD per file on S3 and
     // must never appear on this path (#738, regressed on the JSON index by #969).
-    let keys = match state.storage.list_with_meta(&prefix).await {
+    let keys = match keys {
         Ok(k) => k,
         Err(e) => {
             tracing::error!(error = ?e, "pypi: failed to list storage for package versions");
@@ -215,8 +225,7 @@ async fn package_versions(
     // marker (stored before markers existed, or left with a stale one) is served from its
     // sidecar and queued for backfill. If the listing fails, the sidecars still serve every
     // digest, and nothing is queued against a storage that is failing.
-    let marker_prefix = format!("{HASH_MARKER_PREFIX}{normalized}/");
-    let (marker_keys, markers_listed) = match state.storage.list(&marker_prefix).await {
+    let (marker_keys, markers_listed) = match marker_listing {
         Ok(marker_keys) => (marker_keys, true),
         Err(e) => {
             tracing::warn!(error = ?e, "pypi: failed to list hash markers, reading sidecars");
@@ -368,6 +377,9 @@ async fn package_versions(
                 header::WARNING,
                 header::HeaderValue::from_static("110 - \"Response is Stale\""),
             );
+        }
+        if hosted {
+            response.extensions_mut().insert(HostedProject);
         }
         return response;
     }
@@ -679,12 +691,14 @@ async fn download_file(
     let hosted = internal
         || own_file
         || ((quarantine_on || state.config.server.trust_upstream_dates)
-            && state.storage.stat(&key).await.is_some()
+            // The marker first: it alone tells a proxied copy, the common hit, so that one
+            // costs a single HEAD before its GET.
             && state
                 .storage
                 .stat(&proxied_marker_key(&key))
                 .await
-                .is_none());
+                .is_none()
+            && state.storage.stat(&key).await.is_some());
     if hosted {
         q_mode = crate::digest_quarantine::QuarantineMode::Off;
     }
@@ -1125,6 +1139,10 @@ async fn core_metadata(state: &AppState, normalized: &str, wheel: &str) -> Respo
 // Twine upload (PEP 503 — POST /simple/)
 // ============================================================================
 
+/// The text form fields of an upload that NORA reads are held in memory, each up to this many
+/// bytes.
+const MAX_UPLOAD_TEXT_FIELD: usize = 8 * 1024;
+
 /// POST /simple/ — upload a package via twine.
 ///
 /// twine sends multipart/form-data with fields:
@@ -1179,10 +1197,24 @@ async fn upload(
 
         match field_name.as_str() {
             ":action" | "name" | "version" | "sha256_digest" | "requires_python" => {
-                let value = match field.text().await {
-                    Ok(value) => value,
-                    Err(e) => return reject(e),
-                };
+                // Read in chunks under a small cap: `field.text()` would hold a field as
+                // large as `server.body_limit_mb` allows in memory before any validation.
+                let mut raw = Vec::new();
+                loop {
+                    match field.chunk().await {
+                        Ok(Some(chunk)) if raw.len() + chunk.len() > MAX_UPLOAD_TEXT_FIELD => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                format!("Field {field_name} exceeds {MAX_UPLOAD_TEXT_FIELD} bytes"),
+                            )
+                                .into_response();
+                        }
+                        Ok(Some(chunk)) => raw.extend_from_slice(&chunk),
+                        Ok(None) => break,
+                        Err(e) => return reject(e),
+                    }
+                }
+                let value = String::from_utf8_lossy(&raw).into_owned();
                 match field_name.as_str() {
                     ":action" => action = value,
                     "name" => name = value,
@@ -1319,6 +1351,8 @@ async fn upload(
         return e.into_response();
     }
 
+    warn_if_mixed_with_upstream(&state, &normalized).await;
+
     state.metrics.record_upload("pypi");
     let artifact = format!("{}-{}", name, version);
     state.audit.log(AuditEntry::new(
@@ -1337,6 +1371,45 @@ async fn upload(
     state.repo_index.invalidate("pypi");
 
     StatusCode::OK.into_response()
+}
+
+/// R4-R04: an upload to a project that is neither hosted (imported) nor in
+/// `curation.internal_namespaces`, while an upstream is configured, makes a mixed project: its
+/// index lists the uploaded files together with whatever an upstream publishes under the same
+/// name, now or later (dependency confusion). The upload is stored as before; the operator is
+/// told, with whether the cached upstream index already lists the name.
+async fn warn_if_mixed_with_upstream(state: &AppState, normalized: &str) {
+    if state.config.pypi.upstreams().is_empty()
+        || crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::PyPI,
+            normalized,
+        )
+        || own_records(&state.storage, normalized)
+            .await
+            .is_some_and(|records| records.hosted())
+    {
+        return;
+    }
+    // Only the cached index is read: an upload never sends the name to an upstream.
+    let key = format!("pypi/{normalized}/{UPSTREAM_INDEX_FILE}");
+    let upstream_lists = match state.storage.get(&key).await {
+        Ok(data) => match serde_json::from_slice::<Vec<FileEntry>>(&data) {
+            Ok(files) if files.is_empty() => "no",
+            Ok(_) => "yes",
+            Err(_) => "unknown",
+        },
+        Err(_) => "unknown",
+    };
+    crate::metrics::PYPI_MIXED_PROJECT_UPLOADS_TOTAL
+        .with_label_values(&[upstream_lists])
+        .inc();
+    tracing::warn!(
+        registry = "pypi",
+        project = %normalized,
+        upstream_lists,
+        "[SECURITY] upload to a project outside curation.internal_namespaces while an upstream is configured: upstream files of the same name are merged into its index (dependency confusion); add the name to curation.internal_namespaces"
+    );
 }
 
 /// Store a validated distribution file of `project` as an upload does, under the file's
@@ -2786,6 +2859,42 @@ mod tests {
         assert_eq!(files[0].sha256.as_deref(), Some("aaa"));
         assert_eq!(files[1].filename, "pkg-1.0-cp314-cp314-linux_x86_64.whl");
         assert_eq!(files[1].sha256.as_deref(), Some("bbb"));
+    }
+
+    /// R4-R18: what private indexes and mirrors write: single-quoted and escaped hrefs, a
+    /// signed URL's query, a bare `data-yanked`.
+    #[test]
+    fn test_parse_upstream_files_of_other_indexes() {
+        let html = r#"<a href='https://m.example/p/pkg-1.0.tar.gz#sha256=aaa' data-requires-python='&gt;=3.8'>pkg</a>
+<a href="https://m.example/p/pkg-2.0-py3-none-any.whl?sig=a%2Fb&amp;exp=1#sha256=bbb" data-yanked>pkg</a>
+<a href="pkg-3.0.tar.gz" data-yanked="it's broken">pkg</a>
+<a href="pkg-4.0.tar.gz" xdata-yanked>pkg</a>"#;
+        let files = parse_upstream_files(html, "https://m.example/simple/pkg/");
+        let names: Vec<&str> = files.iter().map(|f| f.filename.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "pkg-1.0.tar.gz",
+                "pkg-2.0-py3-none-any.whl",
+                "pkg-3.0.tar.gz",
+                "pkg-4.0.tar.gz"
+            ]
+        );
+        assert_eq!(files[0].sha256.as_deref(), Some("aaa"));
+        assert_eq!(files[0].requires_python.as_deref(), Some(">=3.8"));
+        assert_eq!(files[0].yanked, None);
+        assert_eq!(
+            files[1].url.as_deref(),
+            Some("https://m.example/p/pkg-2.0-py3-none-any.whl?sig=a%2Fb&exp=1")
+        );
+        assert_eq!(files[1].sha256.as_deref(), Some("bbb"));
+        assert_eq!(files[1].yanked.as_deref(), Some(""));
+        assert_eq!(files[2].yanked.as_deref(), Some("it's broken"));
+        assert_eq!(
+            files[2].url.as_deref(),
+            Some("https://m.example/simple/pkg/pkg-3.0.tar.gz")
+        );
+        assert_eq!(files[3].yanked, None);
     }
 
     #[test]
@@ -4817,6 +4926,36 @@ mod integration_tests {
         );
     }
 
+    /// R4-R17: a text form field is read under a small cap, not buffered whole.
+    #[tokio::test]
+    async fn upload_refuses_an_oversized_text_field() {
+        let ctx = create_test_context();
+        let long = "a".repeat(super::MAX_UPLOAD_TEXT_FIELD + 1);
+        for field in [
+            "name",
+            "version",
+            "sha256_digest",
+            "requires_python",
+            ":action",
+        ] {
+            let mut fields = vec![("name", "foo"), ("version", "1.0")];
+            fields.retain(|(name, _)| *name != field);
+            fields.push((field, long.as_str()));
+            let resp = twine_upload(&ctx.app, &fields, "foo-1.0.tar.gz", b"data").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{field}");
+            let body = crate::test_helpers::body_bytes(resp).await;
+            assert!(body.ends_with(b"exceeds 8192 bytes"), "{field}: {body:?}");
+        }
+        let fits = "a".repeat(super::MAX_UPLOAD_TEXT_FIELD);
+        let fields = [
+            ("name", "foo"),
+            ("version", "1.0"),
+            ("requires_python", &fits),
+        ];
+        let resp = twine_upload(&ctx.app, &fields, "foo-1.0.tar.gz", b"data").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// C44: the uploaded filename must name the form's project and version.
     #[tokio::test]
     async fn upload_rejects_a_filename_of_another_project_or_version() {
@@ -5356,6 +5495,125 @@ mod integration_tests {
             0,
             "a warm /simple/ costs no storage round-trip"
         );
+    }
+
+    /// R4-P12: the three listings of an index request run together, not in a row, and the
+    /// filtered index does not list the project's records a second time.
+    #[tokio::test]
+    async fn index_listings_run_together_and_once() {
+        use crate::test_helpers::{
+            create_test_context_with_storage_and_config, op_counting_storage,
+        };
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+        });
+        let file = "pypi/joined/joined-1.0.tar.gz";
+        ctx.state.storage.put(file, b"x").await.unwrap();
+        ops.reset();
+        ops.stall_lists(Some("pypi/joined/"));
+        let app = ctx.app.clone();
+        let request =
+            tokio::spawn(async move { send(&app, Method::GET, "/simple/joined/", "").await });
+        let listed = || {
+            ops.calls("list", "pypi-own/joined/") == 1
+                && ops.calls("list", "pypi-sha256/joined/") == 1
+        };
+        for _ in 0..1000 {
+            if listed() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            listed(),
+            "the listings wait for one another: {:?}",
+            ops.snapshot()
+        );
+        ops.stall_lists(None);
+        request.await.unwrap();
+        assert_eq!(ops.calls("list", "pypi-own/joined/"), 1);
+    }
+
+    /// R4-P12: a proxied copy is told by its provenance marker alone: one HEAD before the
+    /// GET of the file, not a HEAD of the file as well.
+    #[tokio::test]
+    async fn a_proxied_hit_costs_one_head_before_its_get() {
+        use crate::test_helpers::{
+            create_test_context_with_storage_and_config, op_counting_storage,
+        };
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Observe);
+        });
+        let key = "pypi/hit/hit-1.0.tar.gz";
+        let marker = super::proxied_marker_key(key);
+        ctx.state.storage.put(key, b"sdist").await.unwrap();
+        ctx.state.storage.put(&marker, b"cached").await.unwrap();
+        ops.reset();
+        let resp = send(&ctx.app, Method::GET, "/simple/hit/hit-1.0.tar.gz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(ops.calls("stat", &marker), 1, "{:?}", ops.snapshot());
+        assert_eq!(ops.calls("stat", key), 0, "{:?}", ops.snapshot());
+    }
+
+    /// R4-R04: an upload outside `curation.internal_namespaces` while an upstream is
+    /// configured is stored as before, and reported: a WARN and a counter saying whether
+    /// the cached upstream index lists the name. An internal name is not reported, and no
+    /// upload sends the name to the upstream.
+    #[tokio::test]
+    async fn an_upload_mixed_with_an_upstream_is_reported() {
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["acme-*".to_string()];
+        });
+        let index = br#"[{"filename":"mixed-9.0.tar.gz","url":"https://up/mixed-9.0.tar.gz"}]"#;
+        let storage = &ctx.state.storage;
+        storage
+            .put("pypi/mixed/upstream-index.json", index)
+            .await
+            .unwrap();
+        let count = |label: &str| {
+            crate::metrics::PYPI_MIXED_PROJECT_UPLOADS_TOTAL
+                .with_label_values(&[label])
+                .get()
+        };
+        let (listed, unknown) = (count("yes"), count("unknown"));
+
+        let (logs, _guard) = crate::test_helpers::LogCapture::start();
+        for (name, file) in [
+            ("mixed", "mixed-1.0.tar.gz"),
+            ("fresh", "fresh-1.0.tar.gz"),
+            ("acme-utils", "acme_utils-1.0.tar.gz"),
+        ] {
+            let fields = [("name", name), ("version", "1.0")];
+            let resp = twine_upload(&ctx.app, &fields, file, b"data").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{name}");
+        }
+        let logs = logs.text();
+        for (project, lists) in [("mixed", "yes"), ("fresh", "unknown")] {
+            let line = logs
+                .lines()
+                .find(|l| {
+                    l.contains("dependency confusion") && l.contains(&format!("project={project} "))
+                })
+                .unwrap_or_else(|| panic!("no warning for {project}: {logs}"));
+            assert!(
+                line.contains("WARN") && line.contains(&format!("upstream_lists=\"{lists}\"")),
+                "{line}"
+            );
+        }
+        assert!(!logs.contains("project=acme-utils"), "{logs}");
+        assert!(count("yes") > listed && count("unknown") > unknown);
+        assert!(upstream.received_requests().await.unwrap().is_empty());
     }
 
     // ── A name with an empty segment never names another key's file ─────────
