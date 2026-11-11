@@ -476,10 +476,11 @@ async fn registration_index(
     // Read cache eagerly so stale data is available on upstream failure; the
     // freshness check rides the same store round trip.
     let ttl = state.config.nuget.metadata_ttl;
-    let (read, fresh) = tokio::join!(
+    let (read, validated_at) = tokio::join!(
         state.storage.get(&storage_key),
-        crate::registry::stored_fresh(&state.storage, &storage_key, ttl)
+        crate::registry::stored_validated_at(&state.storage, &storage_key)
     );
+    let fresh = validated_at.is_some_and(|t| crate::cache_ttl::is_within_ttl(t, ttl));
     let (cached_data, read_failure) = crate::registry::cached_read(read);
 
     // TTL cache — rewrite URLs on read (cache may contain pre-fix entries)
@@ -487,9 +488,7 @@ async fn registration_index(
         if fresh {
             state.metrics.record_download("nuget");
             state.metrics.record_cache_hit("nuget");
-            let text = String::from_utf8_lossy(data);
-            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
-            return with_json_gzip(rewritten.into_bytes());
+            return registration_response(data.clone(), &upstream, &base_url).await;
         }
     }
 
@@ -498,9 +497,7 @@ async fn registration_index(
         if let Some(ref data) = cached_data {
             state.metrics.record_download("nuget");
             state.metrics.record_cache_hit("nuget");
-            let text = String::from_utf8_lossy(data);
-            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
-            return with_json_gzip(rewritten.into_bytes());
+            return registration_response(data.clone(), &upstream, &base_url).await;
         }
         if let Some(e) = &read_failure {
             return crate::registry::local_copy_unreadable("nuget", &storage_key, e);
@@ -516,10 +513,7 @@ async fn registration_index(
     // No upstream when the operator switched it off: what is stored is all there is.
     if upstream_url(&state).is_none() {
         return match cached_data {
-            Some(data) => {
-                let text = String::from_utf8_lossy(&data);
-                with_json_gzip(rewrite_registration_urls(&text, &upstream, &base_url).into_bytes())
-            }
+            Some(data) => registration_response(data, &upstream, &base_url).await,
             None => StatusCode::NOT_FOUND.into_response(),
         };
     }
@@ -529,24 +523,17 @@ async fn registration_index(
         id_lower
     );
 
-    if state.config.nuget.serve_stale {
+    if stale_while_revalidate(&state, validated_at) {
         if let Some(ref data) = cached_data {
             refresh_in_background(&state, &storage_key, &url);
             state.metrics.record_download("nuget");
             state.metrics.record_cache_hit("nuget");
-            let text = String::from_utf8_lossy(data);
-            return mark_stale(with_json_gzip(
-                rewrite_registration_urls(&text, &upstream, &base_url).into_bytes(),
-            ));
+            return mark_stale(registration_response(data.clone(), &upstream, &base_url).await);
         }
     }
     let rewrite = Some((upstream.as_str(), base_url.as_str()));
     match refresh_metadata(&state, &storage_key, &url, Some(id_lower.clone())).await {
-        Ok(raw) => {
-            let text = String::from_utf8_lossy(&raw);
-            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
-            with_json_gzip(rewritten.into_bytes())
-        }
+        Ok(raw) => registration_response(raw, &upstream, &base_url).await,
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::debug!(error = ?e, "NuGet registration error");
@@ -594,10 +581,11 @@ async fn registration_page(
     // Read cache eagerly so stale data is available on upstream failure; the
     // freshness check rides the same store round trip.
     let ttl = state.config.nuget.metadata_ttl;
-    let (read, fresh) = tokio::join!(
+    let (read, validated_at) = tokio::join!(
         state.storage.get(&storage_key),
-        crate::registry::stored_fresh(&state.storage, &storage_key, ttl)
+        crate::registry::stored_validated_at(&state.storage, &storage_key)
     );
+    let fresh = validated_at.is_some_and(|t| crate::cache_ttl::is_within_ttl(t, ttl));
     let (cached_data, read_failure) = crate::registry::cached_read(read);
 
     // TTL cache (a 304 revalidation keeps a page fresh without re-uploading it, C56)
@@ -605,9 +593,7 @@ async fn registration_page(
         if fresh {
             state.metrics.record_download("nuget");
             state.metrics.record_cache_hit("nuget");
-            let text = String::from_utf8_lossy(data);
-            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
-            return with_json_gzip(rewritten.into_bytes());
+            return registration_response(data.clone(), &upstream, &base_url).await;
         }
     }
 
@@ -622,9 +608,7 @@ async fn registration_page(
         if let Some(ref data) = cached_data {
             state.metrics.record_download("nuget");
             state.metrics.record_cache_hit("nuget");
-            let text = String::from_utf8_lossy(data);
-            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
-            return with_json_gzip(rewritten.into_bytes());
+            return registration_response(data.clone(), &upstream, &base_url).await;
         }
         if let Some(e) = &read_failure {
             return crate::registry::local_copy_unreadable("nuget", &storage_key, e);
@@ -640,10 +624,7 @@ async fn registration_page(
     // No upstream when the operator switched it off: what is stored is all there is.
     if upstream_url(&state).is_none() {
         return match cached_data {
-            Some(data) => {
-                let text = String::from_utf8_lossy(&data);
-                with_json_gzip(rewrite_registration_urls(&text, &upstream, &base_url).into_bytes())
-            }
+            Some(data) => registration_response(data, &upstream, &base_url).await,
             None => StatusCode::NOT_FOUND.into_response(),
         };
     }
@@ -657,23 +638,16 @@ async fn registration_page(
 
     // Single-flight (C48) and conditional revalidation (C56), as the index.
     let activity = Some(format!("{}/page/{}/{}", id_lower, lower, upper));
-    if state.config.nuget.serve_stale {
+    if stale_while_revalidate(&state, validated_at) {
         if let Some(ref data) = cached_data {
             refresh_in_background(&state, &storage_key, &url);
             state.metrics.record_download("nuget");
             state.metrics.record_cache_hit("nuget");
-            let text = String::from_utf8_lossy(data);
-            return mark_stale(with_json_gzip(
-                rewrite_registration_urls(&text, &upstream, &base_url).into_bytes(),
-            ));
+            return mark_stale(registration_response(data.clone(), &upstream, &base_url).await);
         }
     }
     match refresh_metadata(&state, &storage_key, &url, activity).await {
-        Ok(raw) => {
-            let text = String::from_utf8_lossy(&raw);
-            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
-            with_json_gzip(rewritten.into_bytes())
-        }
+        Ok(raw) => registration_response(raw, &upstream, &base_url).await,
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::debug!(error = ?e, "NuGet registration page error");
@@ -733,10 +707,11 @@ async fn version_list(state: AppState, id: &str) -> Response {
     // Read cache eagerly so stale data is available on upstream failure; the
     // freshness check rides the same store round trip.
     let ttl = state.config.nuget.metadata_ttl;
-    let (read, fresh) = tokio::join!(
+    let (read, validated_at) = tokio::join!(
         state.storage.get(&storage_key),
-        crate::registry::stored_fresh(&state.storage, &storage_key, ttl)
+        crate::registry::stored_validated_at(&state.storage, &storage_key)
     );
+    let fresh = validated_at.is_some_and(|t| crate::cache_ttl::is_within_ttl(t, ttl));
     let (cached_data, read_failure) = crate::registry::cached_read(read);
 
     // TTL cache
@@ -785,7 +760,7 @@ async fn version_list(state: AppState, id: &str) -> Response {
     );
 
     let activity = Some(format!("{}/versions", id_lower));
-    if state.config.nuget.serve_stale {
+    if stale_while_revalidate(&state, validated_at) {
         if let Some(ref data) = cached_data {
             refresh_in_background(&state, &storage_key, &url);
             state.metrics.record_download("nuget");
@@ -836,6 +811,17 @@ fn refresh_in_background(state: &AppState, storage_key: &str, url: &str) {
     });
 }
 
+/// Whether a copy past its TTL, last written or revalidated at `validated_at`, is answered
+/// at once and refreshed behind the response: `serve_stale`, and only within
+/// `nuget.max_stale`. An older copy is revalidated before the answer (R4-R02): without the
+/// bound a version list last asked for a week ago was served as it was, and the first
+/// restore of a version published since failed with NU1102.
+fn stale_while_revalidate(state: &AppState, validated_at: Option<u64>) -> bool {
+    state.config.nuget.serve_stale
+        && validated_at
+            .is_some_and(|t| crate::cache_ttl::is_within_ttl(t, state.config.nuget.max_stale))
+}
+
 /// A response served past its TTL: clients must not cache it, and `x-nora-stale` says so.
 fn mark_stale(mut resp: Response) -> Response {
     let headers = resp.headers_mut();
@@ -871,7 +857,7 @@ async fn refresh_metadata(
 ) -> Result<Bytes, ProxyError> {
     let client = activity.is_some();
     let fetch = async {
-        let validators = if state.config.nuget.revalidate {
+        let mut validators = if state.config.nuget.revalidate {
             read_validators(&state.storage, storage_key)
                 .await
                 .unwrap_or_default()
@@ -879,26 +865,43 @@ async fn refresh_metadata(
             Validators::default()
         };
         let had_validators = validators.is_some();
-        match proxy_fetch_conditional(
-            &state.http_client,
-            url,
-            Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
-            expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
-            &validators,
-            &state.circuit_breaker,
-            RegistryType::Nuget,
-        )
-        .await
-        {
+        let (fetched, cached_body) = loop {
+            let fetched = proxy_fetch_conditional(
+                &state.http_client,
+                url,
+                Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
+                expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
+                &validators,
+                &state.circuit_breaker,
+                RegistryType::Nuget,
+            )
+            .await;
+            // A 304 for a body that is gone (deleted by hand, or a half-finished drop that
+            // left the validators): the validators describe nothing. Drop them and fetch
+            // whole, once — else every request is a 304 and a 502 (R4-R10).
+            if !matches!(fetched, Ok(Revalidation::NotModified)) {
+                break (fetched, None);
+            }
+            match state.storage.get(storage_key).await {
+                Ok(body) => break (fetched, Some(body)),
+                Err(crate::storage::StorageError::NotFound) if validators.is_some() => {
+                    let _ = state
+                        .storage
+                        .delete(&crate::registry::validators_key(storage_key))
+                        .await;
+                    validators = Validators::default();
+                }
+                Err(e) => return Err(ProxyError::Network(format!("cached body unreadable: {e}"))),
+            }
+        };
+        match fetched {
             // Upstream unchanged — serve the cached body and record the revalidation
             // so we do not revalidate again until the next TTL window. No body is
             // downloaded, and none is re-uploaded (C56).
             Ok(Revalidation::NotModified) => {
-                let body = state
-                    .storage
-                    .get(storage_key)
-                    .await
-                    .map_err(|e| ProxyError::Network(format!("cached body unreadable: {e}")))?;
+                let Some(body) = cached_body else {
+                    return Err(ProxyError::Network("cached body unreadable".into()));
+                };
                 crate::metrics::PROXY_UPSTREAM_304_TOTAL
                     .with_label_values(&["nuget"])
                     .inc();
@@ -2234,6 +2237,30 @@ fn with_json_gzip(data: Vec<u8>) -> Response {
             .into_response(),
         Err(_) => with_json(data), // fallback: plain JSON if gzip fails
     }
+}
+
+/// A stored registration document up to this size is rewritten and compressed on the
+/// request's own task: cheaper than a hop to the blocking pool.
+const REGISTRATION_INLINE_MAX: usize = 64 * 1024;
+
+/// The response for the stored registration document `raw`: upstream URLs rewritten to
+/// NORA's, gzip. A popular ID's index with inlined pages is megabytes, and its copy,
+/// rewrite and gzip are tens of milliseconds of CPU per request: above
+/// [`REGISTRATION_INLINE_MAX`] that runs on the blocking pool, not on an async worker
+/// every other request shares (R4-P13).
+async fn registration_response(raw: Bytes, upstream: &str, base_url: &str) -> Response {
+    let big = raw.len() > REGISTRATION_INLINE_MAX;
+    let (upstream, base_url) = (upstream.to_string(), base_url.to_string());
+    let render = move || {
+        let text = String::from_utf8_lossy(&raw);
+        with_json_gzip(rewrite_registration_urls(&text, &upstream, &base_url).into_bytes())
+    };
+    if !big {
+        return render();
+    }
+    tokio::task::spawn_blocking(render)
+        .await
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// JSON response with `X-Nora-Stale: true` header indicating degraded/fallback data.
@@ -6110,6 +6137,197 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["x-nora-stale"], "true");
     }
+
+    /// The stored metadata documents of `stale.pkg` and the requests that read them:
+    /// version list, registration index, registration page.
+    const STALE_DOCS: [(&str, &str, &str); 3] = [
+        (
+            "nuget/flatcontainer/stale.pkg/index.json",
+            "/nuget/v3/flatcontainer/stale.pkg/index.json",
+            "/v3-flatcontainer/stale.pkg/index.json",
+        ),
+        (
+            "nuget/registration/stale.pkg/index.json",
+            "/nuget/v3/registration/stale.pkg/index.json",
+            "/v3/registration5-gz-semver2/stale.pkg/index.json",
+        ),
+        (
+            "nuget/registration/stale.pkg/page/1.0.0/2.0.0.json",
+            "/nuget/v3/registration/stale.pkg/page/1.0.0/2.0.0.json",
+            "/v3/registration5-gz-semver2/stale.pkg/page/1.0.0/2.0.0.json",
+        ),
+    ];
+
+    /// An upstream that answers every document of [`STALE_DOCS`] with the version the
+    /// cached copies lack, and a context whose copies were written `days` ago.
+    async fn stale_docs(
+        days: u64,
+        max_stale: Option<i64>,
+    ) -> (wiremock::MockServer, crate::test_helpers::TestContext) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::builder().start().await;
+        for (_, _, upstream_path) in STALE_DOCS {
+            Mock::given(method("GET"))
+                .and(path(upstream_path))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"{"versions":["1.0.0","2.1.0"],"items":[]}"#),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.nuget.metadata_ttl = 0; // every copy is past its TTL
+            if let Some(max_stale) = max_stale {
+                cfg.nuget.max_stale = max_stale;
+            }
+        });
+        for (key, _, _) in STALE_DOCS {
+            crate::test_helpers::put_written_days_ago(
+                &ctx,
+                key,
+                br#"{"versions":["1.0.0"],"items":[]}"#,
+                days,
+            )
+            .await;
+        }
+        (upstream, ctx)
+    }
+
+    /// R4-R02: a copy older than `nuget.max_stale` is not served as it is. A version list
+    /// last asked for six days ago lacked the version published since, and the first
+    /// `dotnet restore` naming it failed with NU1102; now the copy is revalidated before
+    /// the answer, on all three metadata documents.
+    #[tokio::test]
+    async fn test_copy_past_max_stale_is_refreshed_before_the_answer() {
+        let (_upstream, ctx) = stale_docs(6, None).await;
+        for (_, uri, _) in STALE_DOCS {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert!(resp.headers().get("x-nora-stale").is_none(), "{uri}");
+            assert_eq!(
+                json_body(resp).await["versions"],
+                serde_json::json!(["1.0.0", "2.1.0"]),
+                "{uri}: the upstream's document, not the six-day-old copy"
+            );
+        }
+    }
+
+    /// Inside the window the stale copy still answers at once and is refreshed behind the
+    /// response, and `max_stale = -1` puts no bound on its age.
+    #[tokio::test]
+    async fn test_copy_within_max_stale_is_served_stale() {
+        for (days, max_stale) in [(0, None), (6, Some(7 * 86400)), (6, Some(-1))] {
+            let (_upstream, ctx) = stale_docs(days, max_stale).await;
+            for (_, uri, _) in STALE_DOCS {
+                let resp = send(&ctx.app, Method::GET, uri, "").await;
+                assert_eq!(
+                    resp.headers().get("x-nora-stale").map(|v| v.as_bytes()),
+                    Some(&b"true"[..]),
+                    "{uri} written {days}d ago, max_stale {max_stale:?}"
+                );
+                assert_eq!(
+                    json_body(resp).await["versions"],
+                    serde_json::json!(["1.0.0"])
+                );
+            }
+        }
+    }
+
+    /// R4-R10: a 304 for a document whose cached body is gone (deleted by hand, the
+    /// validators left behind) is not a 502 for as long as the upstream keeps answering
+    /// 304: the validators are dropped and the document is fetched whole.
+    #[tokio::test]
+    async fn test_304_for_a_missing_body_refetches_whole() {
+        use crate::registry::{read_validators, write_validators, Validators};
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v2\"")
+                    .set_body_string(r#"{"versions":["1.0.0"]}"#),
+            )
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.nuget.serve_stale = false;
+        });
+        let key = "nuget/flatcontainer/gone.pkg/index.json";
+        let orphan = Validators {
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+        };
+        write_validators(&ctx.state.storage, key, &orphan).await;
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/flatcontainer/gone.pkg/index.json",
+            "",
+        )
+        .await;
+        assert_eq!(
+            json_body(resp).await["versions"],
+            serde_json::json!(["1.0.0"])
+        );
+        let conditional: Vec<bool> = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.headers.contains_key("if-none-match"))
+            .collect();
+        assert_eq!(conditional, [true, false], "one 304, then one whole fetch");
+        assert_eq!(
+            read_validators(&ctx.state.storage, key)
+                .await
+                .unwrap_or_default()
+                .etag
+                .as_deref(),
+            Some("\"v2\""),
+            "the validators describe the body just stored"
+        );
+    }
+
+    /// R4-P13: a registration document too big for the request's own task is rewritten and
+    /// compressed on the blocking pool, and reads the same as a small one rendered inline.
+    #[tokio::test]
+    async fn test_big_registration_document_renders_as_a_small_one() {
+        let upstream = "https://api.nuget.org";
+        let leaf =
+            format!(r#"{{"@id":"{upstream}/v3/registration5-gz-semver2/big.pkg/1.0.0.json"}}"#);
+        for leaves in [1, 2000] {
+            let doc = format!(r#"{{"items":[{}]}}"#, vec![leaf.as_str(); leaves].join(","));
+            assert_eq!(doc.len() > super::REGISTRATION_INLINE_MAX, leaves > 1);
+            let resp = super::registration_response(
+                super::Bytes::from(doc.clone()),
+                upstream,
+                "http://nora.test",
+            )
+            .await;
+            assert_eq!(resp.headers()["content-encoding"], "gzip");
+            let expected: serde_json::Value = serde_json::from_str(
+                &super::rewrite_registration_urls(&doc, upstream, "http://nora.test"),
+            )
+            .unwrap();
+            assert!(!expected.to_string().contains("api.nuget.org"));
+            assert_eq!(json_body(resp).await, expected);
+        }
+    }
 }
 
 // ── Spec conformance tests (#390) ─────────────────────────────────────
@@ -6808,8 +7026,11 @@ mod nuget_release_dates {
     }
 
     /// An upstream whose every package is its own bytes: two versions never share a digest.
+    /// Unpooled: wiremock hands a dropped pooled server on to the next one started, and the
+    /// version-list fetch an earlier context spawned behind a download may still reach it,
+    /// where a test asserts that it asked the upstream for nothing.
     async fn upstream() -> MockServer {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path_regex(r"^/v3-flatcontainer/[^/]+/[^/]+/[^/]+\.nupkg$"))
             .respond_with(|req: &wiremock::Request| {

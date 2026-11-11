@@ -26,6 +26,15 @@ pub struct NugetConfig {
     pub metadata_ttl: i64,
     #[serde(default = "super::super::default_true")]
     pub serve_stale: bool,
+    /// Stale-while-revalidate bound (seconds) for the version list and the registration
+    /// index and pages. With `serve_stale`, a copy past `metadata_ttl` is answered at once
+    /// and refreshed behind the response only while it was written or revalidated within
+    /// this window; an older copy is revalidated before the answer, so a request after an
+    /// idle period sees the versions published meanwhile. `0` always revalidates first,
+    /// `-1` puts no bound. An upstream outage still serves a copy of any age. Env:
+    /// `NORA_NUGET_MAX_STALE`.
+    #[serde(default = "default_nuget_max_stale")]
+    pub max_stale: i64,
     /// Revalidate stale metadata with a conditional request (`If-None-Match` /
     /// `If-Modified-Since`) instead of always re-downloading the full body.
     /// Fail-open: any error falls back to a full fetch. nuget.org returns
@@ -70,6 +79,12 @@ fn default_nuget_autocomplete() -> String {
     "https://azuresearch-usnc.nuget.org/autocomplete".to_string()
 }
 
+/// One hour, 12 x the default `metadata_ttl`: a package a CI wave keeps asking for is
+/// refreshed every TTL and never gets near it; one idle for longer is revalidated first.
+fn default_nuget_max_stale() -> i64 {
+    3600
+}
+
 /// 10 s: a large registration index (hundreds of versions) on a busy link takes
 /// longer than the former 2 s, and every timeout on a cold key is a failed restore.
 fn default_nuget_metadata_timeout() -> u64 {
@@ -86,6 +101,7 @@ impl Default for NugetConfig {
             metadata_proxy_timeout: default_nuget_metadata_timeout(),
             metadata_ttl: 300,
             serve_stale: true,
+            max_stale: default_nuget_max_stale(),
             revalidate: true,
             search_service: default_nuget_search(),
             autocomplete: default_nuget_autocomplete(),
@@ -125,6 +141,9 @@ impl NugetConfig {
         }
         if let Ok(val) = env::var("NORA_NUGET_SERVE_STALE") {
             self.serve_stale = !matches!(val.as_str(), "false" | "0");
+        }
+        if let Ok(val) = env::var("NORA_NUGET_MAX_STALE") {
+            super::super::parse_env_warn("NORA_NUGET_MAX_STALE", &val, &mut self.max_stale);
         }
         if let Ok(val) = env::var("NORA_NUGET_REVALIDATE") {
             self.revalidate = !matches!(val.as_str(), "false" | "0");
