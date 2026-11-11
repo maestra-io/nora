@@ -8,6 +8,7 @@
 
 use crate::storage::Storage;
 use indicatif::{ProgressBar, ProgressStyle};
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 /// Migration options
@@ -24,8 +25,10 @@ pub struct MigrateStats {
     pub total_keys: usize,
     /// Number of keys successfully migrated
     pub migrated: usize,
-    /// Number of keys skipped (already exist in destination)
+    /// Number of keys skipped (the destination holds the same bytes)
     pub skipped: usize,
+    /// Number of keys the source no longer had when they were read
+    pub gone: usize,
     /// Number of keys that failed to migrate
     pub failed: usize,
     /// Total bytes transferred
@@ -112,8 +115,11 @@ pub async fn migrate(
     };
 
     for key in &keys {
-        // Check if already exists in destination
-        if to.stat(key).await.is_some() {
+        // Skipped only when the destination holds the same bytes, by pin: a key that
+        // changed in the source since an earlier run (a tag, a packument, an index) is
+        // copied again. An absent or unpinned destination object has no pin.
+        let dst_pin = to.pin(key).await;
+        if dst_pin.is_some() && dst_pin == from.pin(key).await {
             stats.skipped += 1;
             pb.inc(1);
             continue;
@@ -131,6 +137,14 @@ pub async fn migrate(
 
         // Fetch from source
         match from.get(key).await {
+            // A source object without a pin: compare the bytes themselves.
+            Ok(data)
+                if dst_pin
+                    .as_deref()
+                    .is_some_and(|pin| pin == hex::encode(Sha256::digest(&data))) =>
+            {
+                stats.skipped += 1;
+            }
             Ok(data) => {
                 // Write to destination
                 match to.put(key, &data).await {
@@ -143,6 +157,11 @@ pub async fn migrate(
                         stats.failed += 1;
                     }
                 }
+            }
+            // Deleted in the source since the listing (a live source: GC, eviction).
+            Err(crate::storage::StorageError::NotFound) => {
+                pb.println(format!("Gone from the source since the listing: {key}"));
+                stats.gone += 1;
             }
             Err(e) => {
                 warn!("Failed to read {}: {}", key, e);
@@ -159,12 +178,18 @@ pub async fn migrate(
     println!("Migration summary:");
     println!("  Total artifacts: {}", stats.total_keys);
     println!("  Migrated: {}", stats.migrated);
-    println!("  Skipped (already exists): {}", stats.skipped);
+    println!("  Skipped (same bytes in destination): {}", stats.skipped);
+    println!("  Gone from the source meanwhile: {}", stats.gone);
     println!("  Failed: {}", stats.failed);
     println!("  Total bytes: {} KB", stats.total_bytes / 1024);
 
+    // A migration that left objects behind is a failed one: the caller must not cut over.
     if stats.failed > 0 {
-        warn!("{} artifacts failed to migrate", stats.failed);
+        return Err(format!(
+            "{} of {} objects could not be read or written; the destination is incomplete, \
+             run the migration again",
+            stats.failed, stats.total_keys
+        ));
     }
 
     if options.dry_run {
@@ -321,6 +346,9 @@ mod tests {
         assert!(dst.stat(state).await.is_some());
     }
 
+    /// R4-C10: a key the destination already has is skipped only when it holds the same
+    /// bytes. One that changed in the source since an earlier run is copied again, so a
+    /// catch-up run does not leave the destination on the first run's tags and packuments.
     #[tokio::test]
     async fn test_migrate_skips_existing() {
         let src_dir = TempDir::new().unwrap();
@@ -329,20 +357,55 @@ mod tests {
         let src = Storage::new_local(src_dir.path().to_str().unwrap());
         let dst = Storage::new_local(dst_dir.path().to_str().unwrap());
 
-        // Add same file to both
-        src.put("test/file", b"source").await.unwrap();
-        dst.put("test/file", b"destination").await.unwrap();
+        src.put("test/same", b"bytes").await.unwrap();
+        src.put("docker/app/manifests/latest.json", b"monday")
+            .await
+            .unwrap();
+        // A source object without a pin is compared by its bytes.
+        let unpinned = src_dir.path().join("upload");
+        std::fs::write(&unpinned, b"blob").unwrap();
+        src.put_from_path("test/unpinned", &unpinned, None)
+            .await
+            .unwrap();
+        let stats = migrate(&src, &dst, MigrateOptions::default())
+            .await
+            .unwrap();
+        assert_eq!((stats.migrated, stats.skipped), (3, 0));
 
+        src.put("docker/app/manifests/latest.json", b"friday")
+            .await
+            .unwrap();
+        let dry = migrate(&src, &dst, MigrateOptions { dry_run: true })
+            .await
+            .unwrap();
+        assert_eq!(dry.migrated, 2, "a dry run reads no bytes to compare");
         let stats = migrate(&src, &dst, MigrateOptions::default())
             .await
             .unwrap();
 
-        assert_eq!(stats.migrated, 0);
-        assert_eq!(stats.skipped, 1);
+        assert_eq!((stats.migrated, stats.skipped), (1, 2));
+        let data = dst.get("docker/app/manifests/latest.json").await.unwrap();
+        assert_eq!(&*data, b"friday");
+    }
 
-        // Destination should still have original content
-        let data = dst.get("test/file").await.unwrap();
-        assert_eq!(&*data, b"destination");
+    /// R4-C11: a migration that could not read an object fails, and says how many.
+    #[tokio::test]
+    async fn test_migrate_fails_when_an_object_cannot_be_read() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+        let src = Storage::new_local(src_dir.path().to_str().unwrap());
+        let dst = Storage::new_local(dst_dir.path().to_str().unwrap());
+        src.put("test/good", b"good").await.unwrap();
+        src.put("test/tampered", b"body").await.unwrap();
+        // The bytes no longer match the pin: the read is refused.
+        std::fs::write(src_dir.path().join("test/tampered"), b"else").unwrap();
+
+        let err = migrate(&src, &dst, MigrateOptions::default())
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("1 of 2 objects"), "{err}");
+        assert!(dst.get("test/good").await.is_ok(), "the rest is copied");
     }
 
     #[tokio::test]

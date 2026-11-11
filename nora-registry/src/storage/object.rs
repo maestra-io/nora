@@ -660,7 +660,9 @@ impl StorageBackend for ObjectStorage {
                 .await
             {
                 Ok(r) => r,
-                Err(_) if key.contains('@') => {
+                // Only an absent object is looked up again: a timeout or a 5xx of the store
+                // says nothing about where the object is, and would double the wait.
+                Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
                     // Fallback: try legacy _at_ encoding for pre-#534 data.
                     let legacy_path = Path::from(encode_object_key_legacy(key));
                     bounded_edge_retry(METADATA_OP_TIMEOUT, || {
@@ -759,8 +761,9 @@ impl StorageBackend for ObjectStorage {
         let path = Path::from(encoded);
         let meta = match bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.head(&path)).await {
             Ok(m) => m,
-            Err(_) if key.contains('@') => {
-                // Fallback: try legacy _at_ encoding for pre-#534 data
+            Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
+                // Fallback: try legacy _at_ encoding for pre-#534 data. Only for an absent
+                // object, as in `pin`.
                 let legacy_path = Path::from(encode_object_key_legacy(key));
                 bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.head(&legacy_path))
                     .await
@@ -1069,6 +1072,27 @@ mod tests {
             object.stat(key).await.is_none(),
             "deleted under the legacy encoding"
         );
+    }
+
+    /// R4-P11: the legacy `_at_` lookup follows an absent object only. A store that does not
+    /// answer is not asked a second time under the other name, which doubled the wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_store_that_does_not_answer_is_not_asked_again_under_the_legacy_key() {
+        use object_store::throttle::{ThrottleConfig, ThrottledStore};
+        let stalled = over(ThrottledStore::new(
+            object_store::memory::InMemory::new(),
+            ThrottleConfig {
+                wait_get_per_call: Duration::from_secs(3600),
+                ..Default::default()
+            },
+        ));
+        let key = "npm/@scope/pkg/metadata.json";
+        let started = tokio::time::Instant::now();
+        assert!(stalled.stat(key).await.is_none());
+        assert_eq!(started.elapsed(), METADATA_OP_TIMEOUT, "stat: one request");
+        let started = tokio::time::Instant::now();
+        assert!(stalled.pin(key).await.is_none());
+        assert_eq!(started.elapsed(), METADATA_OP_TIMEOUT, "pin: one request");
     }
 
     #[test]

@@ -35,6 +35,9 @@ pub struct BackupMetadata {
     pub artifact_count: usize,
     pub total_bytes: u64,
     pub storage_backend: String,
+    /// Objects the backup could not read and does not hold. Absent in older archives.
+    #[serde(default)]
+    pub failed_count: usize,
 }
 
 /// Archive prefix of node-local state in archives from before it moved to storage.
@@ -127,13 +130,20 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
 
     let mut total_bytes: u64 = 0;
     let mut artifact_count = 0;
+    let mut failed_count = 0;
 
     for key in &keys {
         // Get file data
         let data = match storage.get(key).await {
             Ok(data) => data,
+            // Deleted since the listing (a running server: GC, eviction).
+            Err(crate::storage::StorageError::NotFound) => {
+                pb.println(format!("Gone since the listing: {key}"));
+                continue;
+            }
             Err(e) => {
                 pb.println(format!("Warning: Failed to read {}: {}", key, e));
+                failed_count += 1;
                 continue;
             }
         };
@@ -167,6 +177,7 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
         artifact_count,
         total_bytes,
         storage_backend: storage.backend_name().to_string(),
+        failed_count,
     };
 
     let metadata_json = serde_json::to_vec_pretty(&metadata)
@@ -199,6 +210,23 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
     file.sync_all()
         .map_err(|e| format!("Failed to fsync backup archive: {}", e))?;
     drop(file);
+    // An archive that misses objects never replaces a backup and never reads as one: it is
+    // kept beside the output for whoever needs what it does hold, and the run fails.
+    if failed_count > 0 {
+        let mut partial = output.as_os_str().to_owned();
+        partial.push(".partial");
+        let partial = PathBuf::from(partial);
+        std::fs::rename(&tmp_output, &partial)
+            .map_err(|e| format!("Failed to keep the partial archive: {}", e))?;
+        return Err(format!(
+            "{} of {} objects could not be read; no backup written to {}, the partial \
+             archive is at {}",
+            failed_count,
+            keys.len(),
+            output.display(),
+            partial.display()
+        ));
+    }
     std::fs::rename(&tmp_output, output)
         .map_err(|e| format!("Failed to publish backup archive: {}", e))?;
     {
@@ -406,6 +434,7 @@ mod tests {
             artifact_count: 42,
             total_bytes: 1024000,
             storage_backend: "local".to_string(),
+            failed_count: 0,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"version\":\"0.3.0\""));
@@ -437,6 +466,7 @@ mod tests {
             artifact_count: 100,
             total_bytes: 999999,
             storage_backend: "local".to_string(),
+            failed_count: 0,
         };
         let json = serde_json::to_value(&meta).unwrap();
         let restored: BackupMetadata = serde_json::from_value(json).unwrap();
@@ -488,6 +518,33 @@ mod tests {
             "refused for another reason: {err}"
         );
         assert!(!root.join(".nora-staging/0b1c/17.tmp").exists());
+    }
+
+    /// R4-C11: a backup that could not read an object fails and says how many; the
+    /// previous backup at the output path stays, and the partial archive is kept apart.
+    #[tokio::test]
+    async fn a_backup_that_misses_an_object_fails_and_keeps_the_previous_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let storage = Storage::new_local(data.to_str().unwrap());
+        storage.put("raw/good", b"good").await.unwrap();
+        storage.put("raw/tampered", b"body").await.unwrap();
+        // The bytes no longer match the pin: the read is refused.
+        fs::write(data.join("raw/tampered"), b"else").unwrap();
+        let output = dir.path().join("backup.tar.gz");
+        fs::write(&output, b"last night's backup").unwrap();
+
+        let err = create_backup(&storage, &output).await.unwrap_err();
+
+        assert!(err.contains("1 of 2 objects"), "{err}");
+        assert_eq!(fs::read(&output).unwrap(), b"last night's backup");
+        let partial = dir.path().join("backup.tar.gz.partial");
+        let restored = Storage::new_local(dir.path().join("restored").to_str().unwrap());
+        let stats = restore_backup(&restored, &partial).await.unwrap();
+        assert_eq!(
+            stats.artifact_count, 1,
+            "the partial archive holds the rest"
+        );
     }
 
     #[tokio::test]
