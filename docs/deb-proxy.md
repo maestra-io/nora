@@ -77,7 +77,10 @@ stored in its storage (`deb/<repo>/.nora-meta/proxy/ledger/`). An index NORA see
 first time dates everything it lists as 0 ("before NORA"), so switching the hold on, or a
 build asking for a new suite, never hides a whole distribution. A version that appeared
 upstream while nobody asked NORA for that suite is dated by NORA's next look: it is held
-longer, never shorter.
+longer, never shorter. One pool file listed by several suites (Ubuntu's `jammy-updates`
+and `jammy-security` share a kernel `.deb`, often days apart) is as old as its first
+sighting in any of them: a suite dates its young files from the other suites' ledgers of
+the same component and architecture.
 
 1. `dists/<suite>/InRelease` is fetched under `metadata_ttl` and refused unless a key of
    `upstream_keyring_dir` signed it. Each `<component>/binary-<arch>/Packages` it lists
@@ -96,7 +99,8 @@ longer, never shorter.
    `Acquire-By-Hash: yes`. Translations, Contents and other index files are not served.
    It is signed as `InRelease` and `Release.gpg`. A suite is rebuilt when the upstream
    `InRelease` changes or a held version matures.
-4. A `.deb` of a held version is refused (403, curation `enforce`; logged in `audit`). The
+4. A `.deb` of a held version is refused (403, curation `enforce`; logged in `audit`),
+   unless a suite serves that file: apt found it in that suite's index. The
    allow list (`[curation.deb] allow`) releases a version early. Packages pass the digest
    quarantine like any proxied file.
 

@@ -711,6 +711,16 @@ async fn build_suite(
     let mut plain = BTreeMap::new();
     let mut matures_at: Option<i64> = None;
     let mut young: BTreeMap<String, BTreeMap<String, (String, String, i64)>> = BTreeMap::new();
+    let mut served: HashSet<String> = HashSet::new();
+    // Every suite's ledgers: one pool file can be listed by several suites.
+    let ledgers = match min_age {
+        Some(_) => state
+            .storage
+            .list(&format!("{}/ledger/", meta(repo)))
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
     for ((comp, arch), path) in &indexes {
         let (hash, _) = rel.sha256[path].clone();
         let lkey = ledger_key(repo, suite, comp, arch);
@@ -774,7 +784,23 @@ async fn build_suite(
         .map_err(|e| BuildError::Internal(e.to_string()))?
         .map_err(BuildError::Refused)?;
         let (mut current_st, dropped) = parsed;
-        let (seen, retired) = update_ledger(prev.as_ref(), &mut current_st, dropped, min_age, now);
+        let (mut seen, mut retired) =
+            update_ledger(prev.as_ref(), &mut current_st, dropped, min_age, now);
+        let tail = format!("/{comp}/{arch}.json");
+        let siblings: Vec<&String> = ledgers
+            .iter()
+            .filter(|k| k.ends_with(&tail) && **k != lkey)
+            .collect();
+        date_from_siblings(
+            state,
+            &siblings,
+            &mut current_st,
+            &mut retired,
+            &mut seen,
+            min_age,
+            now,
+        )
+        .await;
 
         let hidden = |s: &Stanza| -> Option<i64> {
             let held = crate::curation::is_internal_namespace(engine, RegistryType::Deb, &s.name)
@@ -824,6 +850,7 @@ async fn build_suite(
             held = held.len(),
             "deb proxy: index built"
         );
+        served.extend(chosen.iter().map(|s| s.filename.clone()));
         let text = packages_text(&chosen);
         let (plain_sha, plain_len, gz) = tokio::task::spawn_blocking(move || {
             gzip(text.as_bytes()).map(|gz| (sha256_hex(text.as_bytes()), text.len() as u64, gz))
@@ -868,7 +895,7 @@ async fn build_suite(
         return Err(BuildError::Upstream(ProxyError::NotFound));
     }
     // Held versions first, so a direct package fetch is refused before apt can see them.
-    update_young(state, repo, suite, young)
+    update_young(state, repo, suite, young, &served)
         .await
         .map_err(BuildError::Internal)?;
 
@@ -950,11 +977,66 @@ fn release_text(
     out
 }
 
+/// A pool file is as old as the first suite that listed it: jammy-updates and
+/// jammy-security list one kernel `.deb`, often days apart. Dates the young files of
+/// one index from `siblings`, the other suites' ledgers of the same component and
+/// architecture. A file no suite has listed for `min_age` stays young.
+async fn date_from_siblings(
+    state: &AppState,
+    siblings: &[&String],
+    current: &mut [Stanza],
+    retired: &mut [Stanza],
+    seen: &mut BTreeMap<String, i64>,
+    min_age: Option<i64>,
+    now: i64,
+) {
+    let Some(age) = min_age else { return };
+    let wanted: HashSet<String> = current
+        .iter()
+        .chain(retired.iter())
+        .filter(|s| now - s.first_seen < age)
+        .map(|s| s.filename.clone())
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+    let mut earliest: HashMap<String, i64> = HashMap::new();
+    // ponytail: parses every sibling ledger of this comp/arch once per build; a
+    // repo-wide first-seen map if builds of many suites get slow.
+    for key in siblings {
+        let Some(ledger) = get_json::<Ledger>(state, key).await else {
+            continue;
+        };
+        let dates = ledger
+            .seen
+            .iter()
+            .map(|(f, t)| (f, *t))
+            .chain(ledger.retired.iter().map(|s| (&s.filename, s.first_seen)));
+        for (f, t) in dates {
+            if wanted.contains(f) {
+                let e = earliest.entry(f.clone()).or_insert(t);
+                *e = (*e).min(t);
+            }
+        }
+    }
+    for s in current.iter_mut().chain(retired.iter_mut()) {
+        if let Some(&t) = earliest.get(&s.filename) {
+            if t < s.first_seen {
+                s.first_seen = t;
+                if let Some(v) = seen.get_mut(&s.filename) {
+                    *v = t;
+                }
+            }
+        }
+    }
+}
+
 async fn update_young(
     state: &AppState,
     repo: &str,
     suite: &str,
     held: BTreeMap<String, BTreeMap<String, (String, String, i64)>>,
+    served: &HashSet<String>,
 ) -> Result<(), String> {
     let key = young_key(repo);
     let lock = state.publish_lock(&key);
@@ -962,6 +1044,12 @@ async fn update_young(
     let mut young: Young = get_json(state, &key).await.unwrap_or_default();
     let prefix = format!("{suite}/");
     young.retain(|k, _| !k.starts_with(&prefix));
+    // A file this suite serves is not held by another suite's younger sighting of it:
+    // apt finds it in this suite's index.
+    for files in young.values_mut() {
+        files.retain(|f, _| !served.contains(f));
+    }
+    young.retain(|_, files| !files.is_empty());
     young.extend(held.into_iter().filter(|(_, v)| !v.is_empty()));
     put_json(state, &key, &young).await?;
     state
@@ -1273,6 +1361,17 @@ mod integration_tests {
         delay: std::time::Duration,
     ) {
         server.reset().await;
+        mount_suite(server, key, "bookworm", stanzas, delay).await;
+    }
+
+    /// Mount one signed suite beside what `server` already serves.
+    async fn mount_suite(
+        server: &MockServer,
+        key: &SignedSecretKey,
+        suite: &str,
+        stanzas: &[(&str, &str)],
+        delay: std::time::Duration,
+    ) {
         let text: String = stanzas.iter().map(|(n, v)| stanza(n, v) + "\n").collect();
         let packages = gz(text.as_bytes());
         let release = format!(
@@ -1294,7 +1393,7 @@ mod integration_tests {
                 .await;
         };
         Mock::given(method("GET"))
-            .and(path("/dists/bookworm/InRelease"))
+            .and(path(format!("/dists/{suite}/InRelease")))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_bytes(signed.into_bytes())
@@ -1303,7 +1402,7 @@ mod integration_tests {
             .mount(server)
             .await;
         mount(
-            "/dists/bookworm/main/binary-amd64/Packages.gz".into(),
+            format!("/dists/{suite}/main/binary-amd64/Packages.gz"),
             packages,
         )
         .await;
@@ -1318,10 +1417,19 @@ mod integration_tests {
 
     /// The served Release (verified with NORA's public key) and the Packages it names.
     async fn served(ctx: &TestContext) -> (String, Vec<(String, String)>) {
-        let get = |p: &'static str| send(&ctx.app, Method::GET, p, "");
-        let key = body_bytes(get("/deb/debian/pubkey.gpg").await).await;
+        served_in(ctx, "bookworm").await
+    }
+
+    async fn served_in(ctx: &TestContext, suite: &str) -> (String, Vec<(String, String)>) {
+        let key = body_bytes(send(&ctx.app, Method::GET, "/deb/debian/pubkey.gpg", "").await).await;
         let (key, _) = SignedPublicKey::from_armor_single(std::io::Cursor::new(&key[..])).unwrap();
-        let resp = get("/deb/debian/dists/bookworm/InRelease").await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/deb/debian/dists/{suite}/InRelease"),
+            "",
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_bytes(resp).await;
         let release = super::verify_inrelease(&body, &[key]).expect("signed by NORA");
@@ -1330,7 +1438,7 @@ mod integration_tests {
         let resp = send(
             &ctx.app,
             Method::GET,
-            &format!("/deb/debian/dists/bookworm/main/binary-amd64/by-hash/SHA256/{sha}"),
+            &format!("/deb/debian/dists/{suite}/main/binary-amd64/by-hash/SHA256/{sha}"),
             "",
         )
         .await;
@@ -1462,6 +1570,55 @@ mod integration_tests {
             resp.status(),
             StatusCode::NOT_FOUND,
             "only the files NORA's Release names"
+        );
+    }
+
+    /// jammy-updates and jammy-security list one pool file, days apart (issues-maestra#1649).
+    #[tokio::test]
+    async fn a_pool_file_two_suites_list_is_as_old_as_its_first_sighting() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        let z = std::time::Duration::ZERO;
+        let uri = server.uri();
+        let dir = keydir.path().to_str().unwrap().to_string();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.deb.enabled = true;
+            cfg.deb.metadata_ttl = 0;
+            cfg.deb.upstream_keyring_dir = dir;
+            cfg.deb
+                .proxies
+                .insert("debian".into(), RepoProxyEntry::Simple(uri));
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.deb.min_release_age = Some("3d".into());
+        });
+        let get = |p: &'static str| send(&ctx.app, Method::GET, p, "");
+        let k2 = "/deb/debian/pool/main/k_2_amd64.deb";
+
+        // security lists k 1 before NORA, then k 2: k 2 is young there, and refused.
+        mount_suite(&server, &key, "security", &[("k", "1")], z).await;
+        served_in(&ctx, "security").await;
+        server.reset().await;
+        mount_suite(&server, &key, "security", &[("k", "2")], z).await;
+        served_in(&ctx, "security").await;
+        assert_eq!(get(k2).await.status(), StatusCode::FORBIDDEN);
+
+        // updates has listed k 2 since before NORA: apt sees it there, the file is served.
+        mount_suite(&server, &key, "updates", &[("k", "2")], z).await;
+        let (_, pkgs) = served_in(&ctx, "updates").await;
+        assert_eq!(pkgs, [("k".into(), "2".into())]);
+        assert_eq!(get(k2).await.status(), StatusCode::OK);
+
+        // security's next build dates k 2 from updates; l 1, new in both, stays held.
+        server.reset().await;
+        mount_suite(&server, &key, "updates", &[("k", "2")], z).await;
+        mount_suite(&server, &key, "security", &[("k", "2"), ("l", "1")], z).await;
+        let (_, pkgs) = served_in(&ctx, "security").await;
+        assert_eq!(pkgs, [("k".into(), "2".into())]);
+        assert_eq!(get(k2).await.status(), StatusCode::OK);
+        assert_eq!(
+            get("/deb/debian/pool/main/l_1_amd64.deb").await.status(),
+            StatusCode::FORBIDDEN,
+            "a file no suite has listed for 3 days is still held"
         );
     }
 
