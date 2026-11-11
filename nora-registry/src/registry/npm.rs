@@ -1954,37 +1954,29 @@ async fn published_state(storage: &crate::Storage, name: &str) -> Published {
             return Published::Unknown;
         }
     };
-    if listed.is_empty() {
-        // Remembered: the checks below already said "not published" for this listing.
-        let Some(claim) = claim else {
-            return Published::No;
-        };
-        let (state, sure) = published_without_versions(storage, name).await;
-        if sure && matches!(state, Published::No) {
-            claim.remember();
-        }
-        return state;
+    if !listed.is_empty() {
+        return Published::Yes(
+            listed
+                .iter()
+                .filter_map(|k| k.strip_prefix(&prefix)?.strip_suffix(".json"))
+                .map(str::to_string)
+                .collect(),
+        );
     }
-    Published::Yes(
-        listed
-            .iter()
-            .filter_map(|k| k.strip_prefix(&prefix)?.strip_suffix(".json"))
-            .map(str::to_string)
-            .collect(),
-    )
-}
-
-/// [`published_state`] of a package whose `versions/` listing is empty. That listing beside
-/// a packument NORA assembled is not taken at its word: the package was published, and a
-/// backend that answers "nothing here" for files it cannot read must not hand its name to
-/// an upstream. The flag says whether a "no" is sure enough to remember: the store answered
-/// about the provenance record (it is absent, or names another origin), not failed to.
-async fn published_without_versions(storage: &crate::Storage, name: &str) -> (Published, bool) {
+    // Remembered: the checks below already said "not published" for this listing.
+    let Some(claim) = claim else {
+        return Published::No;
+    };
+    // An empty listing beside a packument NORA assembled is not taken at its word: the
+    // package was published, and a backend that answers "nothing here" for files it cannot
+    // read must not hand its name to an upstream.
     let key = published_packument_key(name);
     // The record decides first: without one naming NORA the document cannot be one it
     // assembled, whatever its bytes. The same key holds the upstream copy a release
     // before 1.4.0 cached (`legacy_cache_key`), megabytes per package.
     let record = storage.get(&origin_key(&key)).await;
+    // A "no" is remembered only when the store answered about the record (it is absent,
+    // or names another origin), not when it failed to.
     let answered = matches!(record, Ok(_) | Err(crate::storage::StorageError::NotFound));
     let names_nora = record
         .ok()
@@ -1993,14 +1985,17 @@ async fn published_without_versions(storage: &crate::Storage, name: &str) -> (Pu
         .and_then(|r| r.split_once('\n'))
         .is_some_and(|(origin, _)| origin == ASSEMBLED_BY_NORA);
     if !names_nora {
-        return (Published::No, answered);
+        if answered {
+            claim.remember();
+        }
+        return Published::No;
     }
     match storage.get(&key).await {
         Ok(data) if is_assembled_by_nora(storage, &key, &data).await => {
             tracing::warn!(registry = "npm", package = %name, "npm: no published versions listed beside an assembled packument");
-            (Published::Unknown, false)
+            Published::Unknown
         }
-        _ => (Published::No, false),
+        _ => Published::No,
     }
 }
 
@@ -16089,5 +16084,60 @@ mod shared_packument_render {
             let served: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(served["versions"].as_object().unwrap().len(), 2, "{accept}");
         }
+    }
+}
+
+#[cfg(test)]
+mod published_memo_tests {
+    use super::*;
+    use crate::test_helpers::op_counting_storage;
+
+    /// R4-P01: "is this package published here?" cost a LIST and a GET on every proxied
+    /// tarball, packument and audit name. A proxied package now costs them once per
+    /// `EMPTY_PREFIX_TTL`; and a version published through this process is seen by the
+    /// very next request, never answered from memory as "not published" (its name
+    /// would go to an upstream).
+    #[tokio::test]
+    async fn proxied_package_is_asked_once_and_a_publish_is_seen_at_once() {
+        let (storage, ops) = op_counting_storage();
+        for _ in 0..5 {
+            assert!(matches!(
+                published_state(&storage, "left-pad").await,
+                Published::No
+            ));
+        }
+        assert_eq!(
+            ops.calls("list", "npm/left-pad/versions/"),
+            1,
+            "five requests, one LIST: {:?}",
+            ops.snapshot()
+        );
+        assert_eq!(ops.total(), 2, "and one record read: {:?}", ops.snapshot());
+
+        storage
+            .put("npm/left-pad/versions/1.0.0.json", b"{}")
+            .await
+            .unwrap();
+        match published_state(&storage, "left-pad").await {
+            Published::Yes(versions) => assert!(versions.contains("1.0.0")),
+            _ => panic!("published from the moment the version write is acknowledged"),
+        }
+    }
+
+    /// A "no" is remembered only when the store answered about the provenance record:
+    /// a failed read of it decides this request and is asked again by the next.
+    #[tokio::test]
+    async fn unanswered_record_read_is_not_remembered() {
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        outage.fail_reads_of(&origin_key(&published_packument_key("pkg")));
+        assert!(matches!(
+            published_state(&storage, "pkg").await,
+            Published::No
+        ));
+        let (_, claim) = storage
+            .list_claiming_empty("npm/pkg/versions/")
+            .await
+            .unwrap();
+        assert!(claim.is_some(), "the listing is asked again");
     }
 }
