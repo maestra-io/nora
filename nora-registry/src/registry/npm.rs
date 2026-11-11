@@ -6825,6 +6825,7 @@ mod integration_tests {
             .await
             .unwrap();
 
+        let holders = ctx.state.storage.holders();
         let response = send(&ctx.app, Method::GET, "/npm/hybrid", "").await;
         assert_eq!(
             response.status(),
@@ -6832,8 +6833,8 @@ mod integration_tests {
             "the request is still served"
         );
 
-        // The proxy cache write is detached; give it room to land.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // The proxy cache write is detached: wait until every write the request started has ended.
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
 
         let recorded = writes.lock().expect("writes mutex").clone();
         let to_packument: Vec<&(String, String)> = recorded
@@ -6860,7 +6861,7 @@ mod integration_tests {
     /// them serially on the first request after the packument went missing. A backend
     /// that records how many reads are in flight at once proves the fan-out is real; a
     /// sequential walk never exceeds one.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn npm_packument_rebuild_reads_versions_concurrently() {
         use crate::storage::{FileMeta, ObjectStorage, Storage, StorageBackend};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7131,7 +7132,6 @@ mod integration_tests {
             publish(&ctx.app, "corp-pkg", "1.0.0").await,
             StatusCode::CREATED
         );
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
         let json = packument(&ctx.app, "corp-pkg").await;
         assert!(json["versions"].get("1.0.0").is_some(), "{json}");
@@ -7159,7 +7159,6 @@ mod integration_tests {
             publish(&ctx.app, "@corp/lib", "1.0.0").await,
             StatusCode::CREATED
         );
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
         let resp = send(&ctx.app, Method::GET, "/npm/@corp/lib", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -7692,7 +7691,6 @@ mod integration_tests {
             cfg.npm.proxy = Some(upstream.uri());
             cfg.npm.metadata_ttl = 0;
         });
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         let before = crate::metrics::PROXY_UPSTREAM_304_TOTAL
             .with_label_values(&["npm"])
             .get();
@@ -7756,9 +7754,10 @@ mod integration_tests {
             cfg.curation.mode = crate::config::CurationMode::Enforce;
             cfg.curation.allowlist_path = Some(allowlist.to_string_lossy().into_owned());
         });
+        let holders = ctx.state.storage.holders();
         let resp = send(&ctx.app, Method::GET, "/npm/pinned/-/pinned-1.0.0.tgz", "").await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         assert!(ctx
             .state
             .storage
@@ -7789,6 +7788,7 @@ mod integration_tests {
         );
         let small = "npm/corp/tarballs/corp-1.0.0.tgz";
         std::fs::write(root.join(small), b"rot").unwrap();
+        let holders = ctx.state.storage.holders();
         let resp = send(&ctx.app, Method::GET, "/npm/corp/-/corp-1.0.0.tgz", "").await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -7809,7 +7809,7 @@ mod integration_tests {
             .await
             .is_err());
 
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         for key in [small, big] {
             assert!(ctx.state.storage.stat(key).await.is_some(), "{key} kept");
         }
@@ -7837,6 +7837,7 @@ mod integration_tests {
         let key = "npm/prox/tarballs/prox-1.0.0.tgz";
         let uri = "/npm/prox/-/prox-1.0.0.tgz";
         let origin = super::origin_key(key);
+        let holders = ctx.state.storage.holders();
         let resp = send(&ctx.app, Method::GET, uri, "").await;
         assert_eq!(&body_bytes(resp).await[..], b"upstream");
         for _ in 0..100 {
@@ -7869,7 +7870,7 @@ mod integration_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(recached, "the refetched tarball is cached again");
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
 
         assert_eq!(
             publish(&ctx.app, "prox", "1.0.0").await,
@@ -9279,6 +9280,7 @@ mod index_cost_tests {
         assert_eq!(ops.calls("get", meta), 0, "no read: {:?}", ops.snapshot());
 
         ops.reset();
+        let holders = ctx.state.storage.holders();
         let resp = send(&ctx.app, Method::GET, "/npm/pkg/-/pkg-1.0.0.tgz", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(packument_fetches().await, 1, "the tarball reuses the cache");
@@ -9287,7 +9289,7 @@ mod index_cost_tests {
         assert_eq!(ops.calls("get", meta), 1, "{:?}", ops.snapshot());
         assert_eq!(ops.calls("get", "npm/pkg/upstream/dates.json"), 1);
         // The cold download stores the tarball behind the response.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         ops.reset();
         let resp = send(&ctx.app, Method::GET, "/npm/pkg/-/pkg-1.0.0.tgz", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -11918,10 +11920,11 @@ mod published_and_upstream_keys {
             faulty(true, false),
             move |cfg| cfg.npm.proxy = Some(uri),
         );
+        let holders = ctx.state.storage.holders();
         let resp = send(&ctx.app, Method::GET, "/npm/corp-lib/9.9.9", "").await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(server.received_requests().await.unwrap().len(), 0);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         let written = ctx.state.storage.list("npm/").await.unwrap();
         assert!(written.is_empty(), "nothing cached on a guess: {written:?}");
     }
@@ -11941,6 +11944,7 @@ mod published_and_upstream_keys {
             faulty(true, false),
             move |cfg| cfg.npm.proxy = Some(uri),
         );
+        let holders = ctx.state.storage.holders();
         let mut wrong = Vec::new();
         for path in [
             "/npm/left-pad",
@@ -11961,7 +11965,7 @@ mod published_and_upstream_keys {
             .map(|r| r.url.path().to_string())
             .collect();
         assert!(asked.is_empty(), "upstream asked: {asked:?}");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         let written = ctx.state.storage.list("npm/").await.unwrap();
         assert!(written.is_empty(), "nothing cached on a guess: {written:?}");
     }
@@ -12148,11 +12152,12 @@ mod published_and_upstream_keys {
             .mount(&server)
             .await;
         let ctx = context(&server, 3600);
+        let holders = ctx.state.storage.holders();
         for _ in 0..2 {
             let resp = send(&ctx.app, Method::GET, "/npm/-/v1/search?text=x", "").await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         assert!(ctx.state.storage.list("npm/").await.unwrap().is_empty());
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
@@ -15281,9 +15286,10 @@ mod tarball_redirects {
             .mount(&upstream)
             .await;
         let ctx = context(&upstream.uri(), &open_server().await.uri());
+        let holders = ctx.state.storage.holders();
         let (status, _) = get(&ctx, "/npm/pkg").await;
         assert_eq!(status, StatusCode::OK);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         let (status, body) = get(&ctx, "/npm/pkg/-/pkg-1.1.0.tgz").await;
         assert_eq!(
             (status, body.as_slice()),
@@ -15611,6 +15617,7 @@ mod scoped_metadata_origin {
         let private = redirecting(&foreign.uri()).await;
         let public = MockServer::start().await;
         let ctx = context(&public.uri(), &private.uri());
+        let holders = ctx.state.storage.holders();
         let mut wrong = Vec::new();
         for (uri, expected) in [
             ("/npm/@vendor%2fpkg", StatusCode::BAD_GATEWAY),
@@ -15634,7 +15641,7 @@ mod scoped_metadata_origin {
         let asked = foreign.received_requests().await.unwrap();
         assert!(asked.is_empty(), "the other origin was asked: {asked:?}");
         assert!(public.received_requests().await.unwrap().is_empty());
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         let written = ctx.state.storage.list("npm/").await.unwrap();
         assert!(written.is_empty(), "cached: {written:?}");
     }

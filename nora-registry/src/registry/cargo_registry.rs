@@ -4154,7 +4154,16 @@ mod published_index_table {
         let ctx = proxied(faulty(Listing::Normal, false, false), &server);
         let app = ctx.app.clone();
         let get = tokio::spawn(async move { get_index(&app).await });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // The publish starts once the upstream holds the GET (it answers 800 ms later).
+        let asked = async {
+            while server.received_requests().await.unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        };
+        // CANCEL-SAFETY: the wait only reads the mock's request log.
+        tokio::time::timeout(std::time::Duration::from_secs(30), asked)
+            .await
+            .expect("the GET never reached the upstream");
         assert_eq!(publish(&ctx.app, "0.1.0").await, StatusCode::OK);
         let _ = get.await.unwrap();
         wait_for(&ctx.state.storage, COPY).await;

@@ -1540,7 +1540,7 @@ mod tests {
     /// two would lose the pin it just recorded: the stored copy is then unpinned, so a reader that
     /// needs a pin fetches it again, and a reader that does not serves it unchecked. The delete
     /// therefore holds the key's commit lock across both steps, as a write does.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test(start_paused = true)]
     async fn a_delete_holds_the_commit_lock_across_body_and_pin() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(LocalStorage::new(dir.path().to_str().unwrap()));
@@ -2899,7 +2899,7 @@ mod tests {
 
     /// #1153: a read of a key whose write is under way waits for it, so bytes and pin come
     /// from one version; the write renames the body before it records the pin.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_read_during_a_write_returns_one_version() {
         use sha2::Digest;
         use tokio::io::AsyncReadExt;

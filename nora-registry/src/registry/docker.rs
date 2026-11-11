@@ -7653,6 +7653,7 @@ mod integration_tests {
             let ctx = create_test_context_with_config(move |cfg| {
                 cfg.docker.upstreams = upstreams;
             });
+            let holders = ctx.state.storage.holders();
             let resp = send(&ctx.app, Method::GET, &request, Body::empty()).await;
             let status = resp.status();
             let served = body_bytes(resp).await;
@@ -7666,7 +7667,7 @@ mod integration_tests {
                 other.as_slice(),
                 "{case}: served bytes of another digest ({status})"
             );
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
             let cached: Vec<String> = ctx
                 .state
                 .storage
@@ -7841,6 +7842,7 @@ mod integration_tests {
             }];
         });
 
+        let holders = ctx.state.storage.holders();
         let resp = send(
             &ctx.app,
             Method::GET,
@@ -7853,7 +7855,8 @@ mod integration_tests {
             body_bytes(resp).await.as_ref(),
             upstream_manifest.as_slice()
         );
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // The proxied copy is cached first, so the push below must replace it.
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
 
         let pushed =
             manifest("sha256:0000000000000000000000000000000000000000000000000000000000000000");
@@ -8986,6 +8989,7 @@ mod integration_tests {
             .await
             .expect("meta written at push");
 
+        let holders = ctx.state.storage.holders();
         for _ in 0..5 {
             let resp = send(
                 &ctx.app,
@@ -8996,8 +9000,8 @@ mod integration_tests {
             .await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
-        // Give any off-request-path stats work time to land before asserting.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Every off-request-path stats write has ended before the assertion.
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
 
         let after = ctx
             .state
@@ -9049,6 +9053,7 @@ mod integration_tests {
             .await
             .expect("meta written at push");
 
+        let holders = ctx.state.storage.holders();
         let mut handles = Vec::new();
         for _ in 0..12 {
             let app = ctx.app.clone();
@@ -9066,8 +9071,8 @@ mod integration_tests {
         for h in handles {
             assert_eq!(h.await.unwrap(), StatusCode::OK);
         }
-        // Let any off-request-path stats work settle before asserting.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Every off-request-path stats write has ended before the assertion.
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
 
         let after = ctx
             .state
@@ -16359,7 +16364,7 @@ mod hosted_pull_stats_every_writer_takes_the_lock {
     /// A pull's statistics task that starts while the delete is in flight must not read the old
     /// metadata and write it back (that would hand the deleted push's date to curation of the
     /// same reference): it waits for the delete's lock and then finds the manifest gone.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_delete_holds_the_lock_until_the_metadata_is_gone() {
         // Local storage: on an object backend with an upstream namespace the delete leaves the
         // hosted manifest in place (a separate, older defect), and the task rightly counts it.
@@ -16831,7 +16836,7 @@ mod manifest_before_metadata_one_lock_order {
 
     /// the flush's existence answer is held; a whole delete runs; on
     /// release the flush must not resurrect the deleted manifest's stats sidecar.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn delete_while_the_flush_check_is_held_leaves_no_stats() {
         let f = fx(false, true).await;
         pull(&f.state, "v1").await;
@@ -16945,7 +16950,7 @@ mod manifest_before_metadata_one_lock_order {
 
     /// the pull's statistics take only the metadata lock — a pull during a re-push (held at
     /// its manifest write) must not leave the push waiting forever.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_pull_during_a_re_push_does_not_deadlock() {
         let f = fx(false, false).await;
         f.held.arm(PUT, TAG_MANIFEST);
@@ -16962,7 +16967,7 @@ mod manifest_before_metadata_one_lock_order {
 
     /// a push writes all of its metadata while it still holds the manifest lock — a delete
     /// that arrives mid-push runs after it, and leaves no metadata of the deleted manifest.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_delete_during_a_push_leaves_no_metadata() {
         let f = fx(false, false).await;
         let dm = format!("docker/race-img/manifests/{}.json", f.digest);

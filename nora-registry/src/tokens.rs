@@ -903,8 +903,11 @@ mod tests {
         );
 
         // After cache_ttl, B's entry is stale -> slow path re-reads storage -> the
-        // revoked (deleted) token is rejected. The TTL bounds the window.
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // revoked (deleted) token is rejected. The TTL bounds the window. The entry is dated
+        // 1.1 s back on the clock the cache reads instead of waiting that long.
+        for cached in replica_b.cache.write().values_mut() {
+            cached.cached_at -= Duration::from_millis(1100);
+        }
         assert!(
             matches!(
                 replica_b.verify_token(&token).await,

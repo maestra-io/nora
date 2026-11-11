@@ -1074,22 +1074,32 @@ mod tests {
     /// breaker a newer probe owned.
     #[test]
     fn stale_probe_report_is_fenced() {
-        use std::thread::sleep;
         use std::time::Duration;
         let cb = CircuitBreakerRegistry::new(enabled_config(1, 1)); // threshold 1, reset 1s
         let reg = "stale_probe_fence_test";
+        // The breaker's clock moves by backdating its stored `Instant`s, as in
+        // `test_halfopen_stalled_probe_recovers`.
+        let elapse = |cb: &CircuitBreakerRegistry| {
+            let mut b = cb.breakers.write();
+            let br = b.get_mut(reg).unwrap();
+            let back = |t: &mut Option<std::time::Instant>| {
+                *t = t.map(|t| t - Duration::from_millis(1100));
+            };
+            back(&mut br.last_failure);
+            back(&mut br.half_open_started);
+        };
 
         // Trip to Open (threshold 1).
         cb.record_failure(reg, ProbeToken::BACKGROUND);
         assert!(matches!(cb.check(reg), Err(ProxyError::CircuitOpen(_))));
 
         // After reset_timeout -> HalfOpen, probe g1.
-        sleep(Duration::from_millis(1100));
+        elapse(&cb);
         let t1 = cb.check(reg).expect("half-open should grant probe g1");
 
         // g1 stalls (outlives reset_timeout) -> a fresh check grants probe g2;
         // g1 is now superseded ("lost").
-        sleep(Duration::from_millis(1100));
+        elapse(&cb);
         let t2 = cb.check(reg).expect("stalled probe -> fresh probe g2");
         assert_ne!(t1, t2, "fresh probe must be a new generation");
 

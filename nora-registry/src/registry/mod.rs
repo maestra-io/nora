@@ -3002,7 +3002,7 @@ mod tests {
     /// C53: an immutable cache write of a spooled body serialises with an upload of the
     /// same file on its publish lock, so an upload that got there first wins: the fill
     /// neither overwrites it nor reports a write (after which provenance would follow).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn spooled_immutable_cache_write_never_overwrites_an_upload() {
         use sha2::Digest;
         let ctx = crate::test_helpers::create_test_context();
