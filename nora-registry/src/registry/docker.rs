@@ -1261,6 +1261,8 @@ async fn docker_v2_dispatch(
                             state,
                             Path((name.to_string(), upload_id)),
                             axum::extract::Query(params),
+                            &headers,
+                            true,
                             body,
                         )
                         .await
@@ -1276,8 +1278,15 @@ async fn docker_v2_dispatch(
             }
         } else {
             match method {
+                Method::GET => upload_status(state, name, after),
                 Method::PATCH => {
-                    patch_blob(state, Path((name.to_string(), after.to_string())), body).await
+                    patch_blob(
+                        state,
+                        Path((name.to_string(), after.to_string())),
+                        &headers,
+                        body,
+                    )
+                    .await
                 }
                 Method::PUT => {
                     let params = parse_query_string(uri.query());
@@ -1285,6 +1294,8 @@ async fn docker_v2_dispatch(
                         state,
                         Path((name.to_string(), after.to_string())),
                         axum::extract::Query(params),
+                        &headers,
+                        false,
                         body,
                     )
                     .await
@@ -1292,7 +1303,7 @@ async fn docker_v2_dispatch(
                 Method::DELETE => {
                     cancel_upload(state, Path((name.to_string(), after.to_string()))).await
                 }
-                _ => method_not_allowed("PATCH, PUT, DELETE"),
+                _ => method_not_allowed("GET, PATCH, PUT, DELETE"),
             }
         };
     }
@@ -1309,7 +1320,14 @@ async fn docker_v2_dispatch(
             return StatusCode::FORBIDDEN.into_response();
         }
         return match method {
-            Method::HEAD => check_blob(state, Path((name.to_string(), digest.to_string()))).await,
+            Method::HEAD => {
+                check_blob(
+                    state,
+                    &headers,
+                    Path((name.to_string(), digest.to_string())),
+                )
+                .await
+            }
             Method::GET => {
                 download_blob(state, headers, Path((name.to_string(), digest.to_string()))).await
             }
@@ -1472,6 +1490,7 @@ async fn catalog(State(state): State<AppState>) -> Response {
 
 async fn check_blob(
     State(state): State<AppState>,
+    headers: &axum::http::HeaderMap,
     Path((name, digest)): Path<(String, String)>,
 ) -> Response {
     let c = canonicalize(&name, &state.config.docker);
@@ -1486,6 +1505,11 @@ async fn check_blob(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
+    // The gates of the GET, so that HEAD never reports a blob the GET refuses.
+    if let (_, Some(response)) = blob_curation_gate(&state, headers, &name, &digest) {
+        return response;
+    }
+
     let key = blob_key(c.namespace.as_deref(), &name, &digest);
     let legacy_key = blob_key(None, &name, &digest);
     // Use stat() instead of get() to avoid loading multi-GB blobs into memory
@@ -1498,14 +1522,58 @@ async fn check_blob(
             if let Some(resp) = quarantine_cache_serve_gate(&state, &digest, None) {
                 return resp;
             }
+            if let Some(response) = crate::curation::verify_integrity_by_hash(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::Docker,
+                &name,
+                Some(&digest),
+                &digest,
+            ) {
+                return response;
+            }
+            // The headers of the GET (OCI: HEAD SHOULD carry Docker-Content-Digest).
             (
                 StatusCode::OK,
-                [(header::CONTENT_LENGTH, meta.size.to_string())],
+                [
+                    (header::CONTENT_LENGTH, meta.size.to_string()),
+                    (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    (HeaderName::from_static("docker-content-digest"), digest),
+                ],
             )
                 .into_response()
         }
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// The curation gate of a blob read (GET and HEAD): whether the name is in an internal
+/// namespace — operator-owned, never checked and never proxied (#733) — and the refusal, if
+/// curation refuses the download.
+fn blob_curation_gate(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    name: &str,
+    digest: &str,
+) -> (bool, Option<Response>) {
+    let internal = crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Docker,
+        name,
+    );
+    if internal {
+        return (true, None);
+    }
+    let refusal = crate::curation::check_download(
+        &state.curation().curation_engine,
+        state.bypass_token().as_deref(),
+        headers,
+        crate::curation::RegistryType::Docker,
+        name,
+        crate::curation::RequestVersion::Known(digest.to_string()),
+        None,
+    );
+    (false, refusal)
 }
 
 /// Serve a blob already in storage (`key`, or the pre-namespace `legacy_key`): curation
@@ -1519,9 +1587,19 @@ async fn serve_local_blob(
     key: &str,
     legacy_key: &str,
 ) -> Option<Response> {
-    let (size, reader) = storage_get_reader_with_fallback(&state.storage, key, legacy_key)
-        .await
-        .ok()?;
+    // A Range request is answered by a ranged read: the object is described by a stat, not by
+    // opening a read of the whole blob that is then dropped unread (a second GET and a
+    // connection lost to the pool on S3). The full read is opened only for the 200.
+    let ranged = headers.contains_key(header::RANGE);
+    let (size, reader) = if ranged {
+        let meta = storage_stat_with_fallback(&state.storage, key, legacy_key).await?;
+        (meta.size, None)
+    } else {
+        let (size, reader) = storage_get_reader_with_fallback(&state.storage, key, legacy_key)
+            .await
+            .ok()?;
+        (size, Some(reader))
+    };
     // Curation integrity check using digest from URL (no full-data rehash).
     // Docker blobs are content-addressed: the URL digest IS the integrity.
     if let Some(response) = crate::curation::verify_integrity_by_hash(
@@ -1573,6 +1651,13 @@ async fn serve_local_blob(
         return Some(response);
     }
 
+    // No usable range after all (malformed, or the ranged read failed): the whole blob.
+    let (size, reader) = match reader {
+        Some(reader) => (size, reader),
+        None => storage_get_reader_with_fallback(&state.storage, key, legacy_key)
+            .await
+            .ok()?,
+    };
     state.metrics.record_download("docker");
     state.metrics.record_cache_hit("docker");
     state.activity.push(ActivityEntry::new(
@@ -1617,23 +1702,9 @@ async fn download_blob(
     // Curation check — defense in depth: check blobs too. #733 serve-local: an internal-namespace
     // image is operator-owned — skip curation and serve any local blob below; block the upstream
     // branch separately (never proxy an internal name).
-    let internal = crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Docker,
-        &name,
-    );
-    if !internal {
-        if let Some(response) = crate::curation::check_download(
-            &state.curation().curation_engine,
-            state.bypass_token().as_deref(),
-            &headers,
-            crate::curation::RegistryType::Docker,
-            &name,
-            crate::curation::RequestVersion::Known(digest.to_string()),
-            None,
-        ) {
-            return response;
-        }
+    let (internal, refusal) = blob_curation_gate(&state, &headers, &name, &digest);
+    if let Some(response) = refusal {
+        return response;
     }
 
     let key = blob_key(ns.as_deref(), &name, &digest);
@@ -1920,11 +1991,87 @@ async fn start_upload(State(state): State<AppState>, Path(name): Path<String>) -
         .into_response()
 }
 
+/// The first byte a chunk's `Content-Range: <start>-<end>` names (OCI: `^[0-9]+-[0-9]+$`).
+/// `None` without the header or with one in another form: such a chunk is appended where the
+/// upload stands, as a chunk without the header is (the docker client sends none).
+fn chunk_start(headers: &axum::http::HeaderMap) -> Option<u64> {
+    let value = headers.get(header::CONTENT_RANGE)?.to_str().ok()?;
+    let (start, end) = value.trim().split_once('-')?;
+    end.parse::<u64>().ok()?;
+    start.parse().ok()
+}
+
+/// `Range` of an upload holding `size` bytes: `0-<last byte>`, and `0-0` for an empty one.
+fn upload_range(size: u64) -> String {
+    format!("0-{}", size.saturating_sub(1))
+}
+
+/// 416 for a chunk that does not start where the upload stands (OCI: out of order), with the
+/// `Range` the upload holds so the client resumes from it — a retried chunk is not appended a
+/// second time.
+fn chunk_out_of_order(name: &str, uuid: &str, size: u64) -> Response {
+    (
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        upload_headers(name, uuid, size),
+    )
+        .into_response()
+}
+
+fn upload_headers(name: &str, uuid: &str, size: u64) -> [(HeaderName, String); 3] {
+    [
+        (
+            header::LOCATION,
+            format!("/v2/{}/blobs/uploads/{}", name, uuid),
+        ),
+        (header::RANGE, upload_range(size)),
+        (
+            HeaderName::from_static("docker-upload-uuid"),
+            uuid.to_string(),
+        ),
+    ]
+}
+
+/// 404 `BLOB_UPLOAD_UNKNOWN` per the OCI Distribution Spec: no such upload, or it expired.
+fn blob_upload_unknown_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "errors": [{
+                "code": "BLOB_UPLOAD_UNKNOWN",
+                "message": "blob upload unknown to registry",
+            }]
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /v2/<name>/blobs/uploads/<uuid>`: where an upload stands — 204 with `Location` and
+/// `Range: 0-<last byte>` — for a client that lost a chunk's answer or got a 416.
+fn upload_status(State(state): State<AppState>, name: &str, uuid: &str) -> Response {
+    let c = canonicalize(name, &state.config.docker);
+    if let Some(r) = c.denied_response() {
+        return r;
+    }
+    if validate_upload_uuid(uuid).is_err() {
+        return blob_upload_unknown_response();
+    }
+    let sessions = state.upload_sessions.read();
+    match sessions.get(uuid) {
+        Some(s) if s.name == c.name && s.created_at.elapsed() < SESSION_TTL => (
+            StatusCode::NO_CONTENT,
+            upload_headers(&c.name, uuid, s.size),
+        )
+            .into_response(),
+        _ => blob_upload_unknown_response(),
+    }
+}
+
 /// PATCH handler for chunked blob uploads
 /// Docker client sends data chunks via PATCH, then finalizes with PUT
 async fn patch_blob(
     State(state): State<AppState>,
     Path((name, uuid)): Path<(String, String)>,
+    headers: &axum::http::HeaderMap,
     body: Body,
 ) -> Response {
     let c = canonicalize(&name, &state.config.docker);
@@ -1976,6 +2123,11 @@ async fn patch_blob(
             let _ = std::fs::remove_file(&session.temp_path);
             sessions.remove(&uuid);
             return (StatusCode::NOT_FOUND, "Upload session expired").into_response();
+        }
+
+        // A chunk that names its range starts where the upload stands, or is refused.
+        if chunk_start(headers).is_some_and(|start| start != session.size) {
+            return chunk_out_of_order(&name, &uuid, session.size);
         }
 
         (session.temp_path.clone(), session.size)
@@ -2141,6 +2293,10 @@ async fn upload_blob(
     State(state): State<AppState>,
     Path((name, uuid)): Path<(String, String)>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: &axum::http::HeaderMap,
+    // The single-POST form (`POST …/uploads/?digest=`): the whole blob is the body and no
+    // session was opened. A PUT always closes a session.
+    monolithic: bool,
     body: Body,
 ) -> Response {
     let c = canonicalize(&name, &state.config.docker);
@@ -2171,19 +2327,36 @@ async fn upload_blob(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    // Remove session from map under brief lock, then do file I/O outside
-    let session_opt = {
-        let mut sessions = state.upload_sessions.write();
-        sessions.remove(&uuid)
-    }; // lock released before file I/O
-
-    // Only sha256 digests are supported for verification
+    // Only sha256 digests are supported for verification. Checked before the session is
+    // taken: a refused request leaves the upload as it was.
     if !digest.starts_with("sha256:") {
         return (
             StatusCode::BAD_REQUEST,
             "Only sha256 digests are supported for blob uploads",
         )
             .into_response();
+    }
+
+    // Remove session from map under brief lock, then do file I/O outside
+    let session_opt = {
+        let mut sessions = state.upload_sessions.write();
+        // A final chunk that names its range starts where the upload stands, or is refused
+        // with the upload kept (OCI: 416).
+        if let Some(session) = sessions.get(&uuid) {
+            if session.name == name
+                && chunk_start(headers).is_some_and(|start| start != session.size)
+            {
+                return chunk_out_of_order(&name, &uuid, session.size);
+            }
+        }
+        sessions.remove(&uuid)
+    }; // lock released before file I/O
+
+    // A PUT closes an upload: without one (never opened, expired, or lost in a restart) the
+    // body is not the blob, and hashing it alone would report corruption (DIGEST_INVALID)
+    // where the client has to start the upload again.
+    if session_opt.is_none() && !monolithic {
+        return blob_upload_unknown_response();
     }
 
     let cap = effective_upload_cap(state.config.server.body_limit_mb);
@@ -3165,53 +3338,88 @@ fn serve_cached_manifest(
     manifest_response(Bytes::copy_from_slice(data), content_type, digest)
 }
 
-/// Return the first blob / sub-manifest digest a manifest references that is NOT present
-/// in storage, or `None` when every referenced item exists. Per the OCI Distribution Spec
-/// a manifest pointing at content we do not have must be rejected (`MANIFEST_BLOB_UNKNOWN`)
-/// rather than stored as a broken image. Bodies we cannot parse return `None` — malformed
-/// manifests are out of scope here.
-async fn missing_manifest_ref(body: &[u8], storage: &Storage, name: &str) -> Option<String> {
-    let json = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+/// Return the first blob / sub-manifest digest a pushed manifest references that NORA does not
+/// hold for the repository, or `None` when every referenced item exists. Per the OCI
+/// Distribution Spec a manifest pointing at content we do not have must be rejected
+/// (`MANIFEST_BLOB_UNKNOWN`) rather than stored as a broken image. Bodies we cannot parse return
+/// `None` — malformed manifests are out of scope here.
+///
+/// "Holds" is what the blob HEAD reports, so a client that skipped an upload on its 200 can
+/// push the manifest: the pushed (bare) copy, or the proxied copy under `ns`. A proxied copy
+/// is copied into the pushed layout — the pushed image must not depend on a cache that
+/// eviction empties — unless the quarantine still holds its digest, as a mount refuses it.
+/// A child manifest taken over this way has its own references checked the same way.
+async fn missing_manifest_ref(
+    state: &AppState,
+    ns: Option<&str>,
+    name: &str,
+    body: &[u8],
+) -> Option<String> {
+    let storage = &state.storage;
+    let mut pending = vec![Bytes::copy_from_slice(body)];
+    while let Some(body) = pending.pop() {
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            continue;
+        };
 
-    // Image index / manifest list: referenced sub-manifests live under manifests/.
-    if let Some(manifests) = json.get("manifests").and_then(|v| v.as_array()) {
-        for m in manifests {
-            if let Some(d) = m.get("digest").and_then(|v| v.as_str()) {
-                if storage
-                    .stat(&format!("docker/{}/manifests/{}.json", name, d))
-                    .await
-                    .is_none()
+        // Image index / manifest list: referenced sub-manifests live under manifests/.
+        if let Some(manifests) = json.get("manifests").and_then(|v| v.as_array()) {
+            for m in manifests {
+                let Some(d) = m.get("digest").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let pushed = manifest_key(None, name, d);
+                if storage.stat(&pushed).await.is_some() {
+                    continue;
+                }
+                let proxied = manifest_key(ns, name, d);
+                let Ok(child) = storage.get(&proxied).await else {
+                    return Some(d.to_string());
+                };
+                if proxied == pushed
+                    || !content_has_digest(d, &child)
+                    || quarantine_cache_serve_gate(state, d, Some(&child)).is_some()
+                    || storage.put(&pushed, &child).await.is_err()
                 {
                     return Some(d.to_string());
                 }
+                pending.push(child);
             }
+            continue;
         }
-        return None;
-    }
 
-    // Image manifest: the config descriptor and every layer are blobs.
-    let mut refs: Vec<&str> = Vec::new();
-    if let Some(d) = json
-        .get("config")
-        .and_then(|c| c.get("digest"))
-        .and_then(|v| v.as_str())
-    {
-        refs.push(d);
-    }
-    if let Some(layers) = json.get("layers").and_then(|v| v.as_array()) {
-        for l in layers {
-            if let Some(d) = l.get("digest").and_then(|v| v.as_str()) {
-                refs.push(d);
+        // Image manifest: the config descriptor and every layer are blobs.
+        let mut refs: Vec<&str> = Vec::new();
+        if let Some(d) = json
+            .get("config")
+            .and_then(|c| c.get("digest"))
+            .and_then(|v| v.as_str())
+        {
+            refs.push(d);
+        }
+        if let Some(layers) = json.get("layers").and_then(|v| v.as_array()) {
+            for l in layers {
+                if let Some(d) = l.get("digest").and_then(|v| v.as_str()) {
+                    refs.push(d);
+                }
             }
         }
-    }
-    for d in refs {
-        if storage
-            .stat(&format!("docker/{}/blobs/{}", name, d))
-            .await
-            .is_none()
-        {
-            return Some(d.to_string());
+        for d in refs {
+            let pushed = blob_key(None, name, d);
+            if storage.stat(&pushed).await.is_some() {
+                continue;
+            }
+            let proxied = blob_key(ns, name, d);
+            if proxied == pushed
+                || storage.stat(&proxied).await.is_none()
+                || quarantine_cache_serve_gate(state, d, None).is_some()
+                || storage
+                    .copy(&proxied, &pushed, d.strip_prefix("sha256:"))
+                    .await
+                    .is_err()
+            {
+                return Some(d.to_string());
+            }
         }
     }
     None
@@ -3303,7 +3511,7 @@ async fn put_manifest(
 
     // Reject a manifest that references content (config / layers / sub-manifests) we do
     // not have — a broken image must not be pushable (OCI MANIFEST_BLOB_UNKNOWN).
-    if let Some(missing) = missing_manifest_ref(&body, &state.storage, &name).await {
+    if let Some(missing) = missing_manifest_ref(&state, ns.as_deref(), &name, &body).await {
         tracing::warn!(
             name = %name,
             reference = %reference,
@@ -3528,6 +3736,36 @@ async fn write_manifest_meta(
     state.storage.put(&key, json).await
 }
 
+/// Delete the namespaced copy of an object and its bare one. Ok when either was deleted,
+/// NotFound when neither was there, and any other failure is the answer, so the client
+/// retries instead of believing the object gone.
+async fn delete_copies(
+    storage: &Storage,
+    key: &str,
+    legacy_key: &str,
+) -> crate::storage::Result<()> {
+    use crate::storage::StorageError;
+    let mut results = vec![storage.delete(key).await];
+    if legacy_key != key {
+        results.push(storage.delete(legacy_key).await);
+    }
+    let (mut failure, mut deleted) = (None, false);
+    for r in results {
+        match r {
+            Ok(()) => deleted = true,
+            Err(StorageError::NotFound) => {}
+            Err(e) => {
+                failure.get_or_insert(e);
+            }
+        }
+    }
+    match (failure, deleted) {
+        (Some(e), _) => Err(e),
+        (None, true) => Ok(()),
+        (None, false) => Err(StorageError::NotFound),
+    }
+}
+
 /// Delete a manifest — the namespaced copy and the bare one (`both`), or the namespaced copy
 /// and, when it is missing, the bare one — and then, once the manifest is gone, its metadata
 /// (namespaced and bare), each under the metadata lock. The caller holds the manifest's lock.
@@ -3543,26 +3781,7 @@ async fn delete_manifest_and_meta(
     // Every copy goes, the namespaced one and a pre-migration bare one: a read falls back to the
     // bare copy, so a delete that stopped at the first copy left the manifest served. A failure
     // other than "not there" is the answer, so the client retries instead of believing it gone.
-    use crate::storage::StorageError;
-    let mut results = vec![state.storage.delete(&key).await];
-    if legacy_key != key {
-        results.push(state.storage.delete(&legacy_key).await);
-    }
-    let (mut failure, mut deleted) = (None, false);
-    for r in results {
-        match r {
-            Ok(()) => deleted = true,
-            Err(StorageError::NotFound) => {}
-            Err(e) => {
-                failure.get_or_insert(e);
-            }
-        }
-    }
-    let result = match (failure, deleted) {
-        (Some(e), _) => Err(e),
-        (None, true) => Ok(()),
-        (None, false) => Err(StorageError::NotFound),
-    };
+    let result = delete_copies(&state.storage, &key, &legacy_key).await;
     // Metadata goes only once the manifest is gone (deleted now, or not there at all).
     if matches!(result, Ok(()) | Err(crate::storage::StorageError::NotFound)) {
         let mut meta_keys = vec![manifest_meta_key(ns, name, reference)];
@@ -3823,11 +4042,9 @@ async fn delete_blob(
 
     let key = blob_key(ns.as_deref(), &name, &digest);
     let legacy_key = blob_key(None, &name, &digest);
-    // Delete from both locations during migration
-    if key != legacy_key {
-        let _ = state.storage.delete(&legacy_key).await;
-    }
-    match state.storage.delete(&key).await {
+    // Both copies go — the namespaced (proxied) one and the bare one a push writes — and the
+    // answer is theirs together: deleted if either was there, unknown only if neither was.
+    match delete_copies(&state.storage, &key, &legacy_key).await {
         Ok(()) => {
             state.audit.log(AuditEntry::new(
                 "delete",
@@ -13267,6 +13484,328 @@ mod index_cost_tests {
             small, large,
             "_catalog must cost the same storage round-trips for 1 and 100 repositories: {small_ops} vs {large_ops}"
         );
+    }
+}
+
+/// Review round 4: chunked uploads honour Content-Range and report their status (R4-R08), a
+/// refused or session-less finalize (R4-R19), blob DELETE/HEAD answers (R4-R05, R4-R21), a
+/// pushed manifest over proxied content (R4-R06) and Range without a full read (R4-P15).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod r4_upload_and_blob_tests {
+    use crate::config::DockerUpstream;
+    use crate::test_helpers::{
+        body_bytes, create_test_context, create_test_context_with_config,
+        create_test_context_with_storage, send, send_with_headers, TestContext,
+    };
+    use axum::body::Body;
+    use axum::http::{header, Method, StatusCode};
+    use sha2::Digest;
+
+    fn digest_of(body: &[u8]) -> String {
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(body)))
+    }
+
+    fn proxying_ctx() -> TestContext {
+        create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = vec![DockerUpstream {
+                trust_upstream_dates: false,
+                date_token_file: None,
+                url: "http://127.0.0.1:1".into(),
+                auth: None,
+                auth_env: None,
+                namespace: Some("docker.io".into()),
+                prefix: None,
+                namespaces: Vec::new(),
+            }];
+        })
+    }
+
+    /// Opens an upload and returns its URL.
+    async fn start(ctx: &TestContext) -> String {
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            "/v2/team/app/blobs/uploads/",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        resp.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn chunk(
+        ctx: &TestContext,
+        method: Method,
+        uri: &str,
+        range: Option<&str>,
+        body: &'static [u8],
+    ) -> axum::http::Response<Body> {
+        let headers = range
+            .map(|r| vec![("content-range", r)])
+            .unwrap_or_default();
+        send_with_headers(&ctx.app, method, uri, headers, Body::from(body)).await
+    }
+
+    async fn error_code(resp: axum::http::Response<Body>) -> String {
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        json["errors"][0]["code"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// R4-R08: a retried chunk is refused with 416 and the Range the upload holds, instead of
+    /// being appended twice; GET on the upload URL reports the same Range; the blob that
+    /// results is the bytes sent once.
+    #[tokio::test]
+    async fn a_retried_chunk_is_416_and_the_upload_reports_its_range() {
+        let ctx = create_test_context();
+        let upload = start(&ctx).await;
+
+        let resp = send(&ctx.app, Method::GET, &upload, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.headers()[header::RANGE], "0-0");
+
+        let resp = chunk(&ctx, Method::PATCH, &upload, Some("0-3"), b"abcd").await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(resp.headers()[header::RANGE], "0-3");
+
+        // The answer was lost: the client sends the chunk again.
+        let resp = chunk(&ctx, Method::PATCH, &upload, Some("0-3"), b"abcd").await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(resp.headers()[header::RANGE], "0-3");
+        assert_eq!(resp.headers()[header::LOCATION].to_str().unwrap(), upload);
+
+        let resp = send(&ctx.app, Method::GET, &upload, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.headers()[header::RANGE], "0-3");
+        assert_eq!(resp.headers()[header::LOCATION].to_str().unwrap(), upload);
+        assert!(resp.headers().contains_key("docker-upload-uuid"));
+
+        // A final chunk out of order is refused too, and the upload stays open.
+        let digest = digest_of(b"abcdefgh");
+        let close = format!("{upload}?digest={digest}");
+        let resp = chunk(&ctx, Method::PUT, &close, Some("0-3"), b"efgh").await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+
+        let resp = chunk(&ctx, Method::PUT, &close, Some("4-7"), b"efgh").await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let stored = ctx
+            .state
+            .storage
+            .get(&format!("docker/team/app/blobs/{digest}"))
+            .await
+            .unwrap();
+        assert_eq!(&stored[..], b"abcdefgh");
+
+        // A chunk without Content-Range (the docker client) is appended where the upload stands.
+        let upload = start(&ctx).await;
+        for part in [&b"ab"[..], &b"cd"[..]] {
+            let resp = chunk(&ctx, Method::PATCH, &upload, None, part).await;
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        }
+        let close = format!("{upload}?digest={}", digest_of(b"abcd"));
+        let resp = chunk(&ctx, Method::PUT, &close, None, b"").await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// R4-R08/R4-R19: an upload NORA does not hold is 404 BLOB_UPLOAD_UNKNOWN for the status
+    /// GET and for the closing PUT — not DIGEST_INVALID over the PUT body alone.
+    #[tokio::test]
+    async fn an_unknown_upload_is_blob_upload_unknown() {
+        let ctx = create_test_context();
+        let gone = "/v2/team/app/blobs/uploads/00000000-0000-4000-8000-000000000000";
+        let resp = send(&ctx.app, Method::GET, gone, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error_code(resp).await, "BLOB_UPLOAD_UNKNOWN");
+
+        let close = format!("{gone}?digest={}", digest_of(b"abcd"));
+        let resp = chunk(&ctx, Method::PUT, &close, None, b"").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error_code(resp).await, "BLOB_UPLOAD_UNKNOWN");
+
+        // The single-POST form has no session by design and still stores the blob.
+        let post = format!("/v2/team/app/blobs/uploads/?digest={}", digest_of(b"abcd"));
+        let resp = chunk(&ctx, Method::POST, &post, None, b"abcd").await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// R4-R19: a finalize refused for its digest algorithm leaves the upload open.
+    #[tokio::test]
+    async fn a_finalize_refused_for_its_digest_keeps_the_upload() {
+        let ctx = create_test_context();
+        let upload = start(&ctx).await;
+        let resp = chunk(&ctx, Method::PATCH, &upload, None, b"abcd").await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let sha512 = format!("{upload}?digest=sha512:{}", "a".repeat(128));
+        let resp = chunk(&ctx, Method::PUT, &sha512, None, b"").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = send(&ctx.app, Method::GET, &upload, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let close = format!("{upload}?digest={}", digest_of(b"abcd"));
+        let resp = chunk(&ctx, Method::PUT, &close, None, b"").await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// R4-R05: with an upstream configured a pushed blob has a namespaced key it is not under.
+    /// Its delete answers 202, and 404 only once nothing is left.
+    #[tokio::test]
+    async fn deleting_a_pushed_blob_is_accepted_with_an_upstream_configured() {
+        let ctx = proxying_ctx();
+        let digest = digest_of(b"layer");
+        let key = format!("docker/team/app/blobs/{digest}");
+        ctx.state.storage.put(&key, b"layer").await.unwrap();
+        let uri = format!("/v2/team/app/blobs/{digest}");
+
+        let resp = send(&ctx.app, Method::DELETE, &uri, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert!(ctx.state.storage.stat(&key).await.is_none());
+
+        let resp = send(&ctx.app, Method::DELETE, &uri, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error_code(resp).await, "BLOB_UNKNOWN");
+    }
+
+    fn image(config: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "size": 6,
+                "digest": config
+            },
+            "layers": []
+        }))
+        .unwrap()
+    }
+
+    /// R4-R06: HEAD reports a blob cached by a pull, the client skips its upload, and the
+    /// manifest push is accepted; the blob is copied into the pushed layout so the image does
+    /// not live off the proxy cache. The same for an index over a cached child manifest.
+    #[tokio::test]
+    async fn a_manifest_over_proxy_cached_content_can_be_pushed() {
+        let ctx = proxying_ctx();
+        let storage = &ctx.state.storage;
+        let config = digest_of(b"config");
+        let cached = "docker/docker.io/library/alpine";
+        storage
+            .put(&format!("{cached}/blobs/{config}"), b"config")
+            .await
+            .unwrap();
+
+        let head = format!("/v2/library/alpine/blobs/{config}");
+        let resp = send(&ctx.app, Method::HEAD, &head, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let child = image(&config);
+        let put = "/v2/library/alpine/manifests/prod";
+        let resp = send(&ctx.app, Method::PUT, put, Body::from(child.clone())).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let pushed = format!("docker/library/alpine/blobs/{config}");
+        assert_eq!(&storage.get(&pushed).await.unwrap()[..], b"config");
+
+        // An index whose child manifest and its blob are only in the cache.
+        let other = digest_of(b"other!");
+        storage
+            .put(&format!("{cached}/blobs/{other}"), b"other!")
+            .await
+            .unwrap();
+        let child = image(&other);
+        let child_digest = digest_of(&child);
+        storage
+            .put(&format!("{cached}/manifests/{child_digest}.json"), &child)
+            .await
+            .unwrap();
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [{
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "size": child.len(),
+                "digest": child_digest
+            }]
+        }))
+        .unwrap();
+        let put = "/v2/library/alpine/manifests/multi";
+        let resp = send(&ctx.app, Method::PUT, put, Body::from(index)).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        for key in [
+            format!("docker/library/alpine/manifests/{child_digest}.json"),
+            format!("docker/library/alpine/blobs/{other}"),
+        ] {
+            assert!(storage.stat(&key).await.is_some(), "{key} not taken over");
+        }
+
+        // Content NORA holds nowhere is still refused.
+        let absent = image(&digest_of(b"absent"));
+        let resp = send(&ctx.app, Method::PUT, put, Body::from(absent)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(resp).await, "MANIFEST_BLOB_UNKNOWN");
+    }
+
+    /// R4-R21: HEAD of a blob carries the headers of its GET, and curation refuses it as it
+    /// refuses the GET.
+    #[tokio::test]
+    async fn head_blob_has_the_get_headers_and_the_curation_gate() {
+        let ctx = create_test_context();
+        let digest = digest_of(b"layer");
+        let key = format!("docker/team/app/blobs/{digest}");
+        ctx.state.storage.put(&key, b"layer").await.unwrap();
+        let uri = format!("/v2/team/app/blobs/{digest}");
+        let resp = send(&ctx.app, Method::HEAD, &uri, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let headers = resp.headers();
+        assert_eq!(headers["docker-content-digest"].to_str().unwrap(), digest);
+        assert_eq!(headers[header::CONTENT_LENGTH], "5");
+        assert_eq!(headers[header::CONTENT_TYPE], "application/octet-stream");
+        assert_eq!(headers[header::ACCEPT_RANGES], "bytes");
+
+        let (_dir, blocklist) = crate::test_helpers::blocklist_file("docker", "team/app");
+        let blocked = create_test_context_with_config(|cfg| {
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+        });
+        blocked.state.storage.put(&key, b"layer").await.unwrap();
+        for method in [Method::GET, Method::HEAD] {
+            let resp = send(&blocked.app, method.clone(), &uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method}");
+        }
+    }
+
+    /// R4-P15: a Range request costs one ranged read and no read of the whole blob; a Range
+    /// that cannot be used still gets the whole blob.
+    #[tokio::test]
+    async fn a_range_request_does_not_open_the_whole_blob() {
+        let (storage, counts) = crate::test_helpers::op_counting_storage();
+        let ctx = create_test_context_with_storage(storage);
+        let digest = digest_of(b"0123456789");
+        let key = format!("docker/team/app/blobs/{digest}");
+        ctx.state.storage.put(&key, b"0123456789").await.unwrap();
+        let uri = format!("/v2/team/app/blobs/{digest}");
+
+        counts.reset();
+        let range = vec![("range", "bytes=2-5")];
+        let resp = send_with_headers(&ctx.app, Method::GET, &uri, range, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body_bytes(resp).await[..], b"2345");
+        assert_eq!(counts.calls("get_reader", &key), 0);
+        assert_eq!(counts.calls("get_range", &key), 1);
+
+        let range = vec![("range", "bytes=20-30")];
+        let resp = send_with_headers(&ctx.app, Method::GET, &uri, range, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+
+        let range = vec![("range", "lines=1-2")];
+        let resp = send_with_headers(&ctx.app, Method::GET, &uri, range, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"0123456789");
     }
 }
 
