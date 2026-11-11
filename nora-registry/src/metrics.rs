@@ -1702,6 +1702,42 @@ mod tests {
         );
     }
 
+    /// The middleware `run_server` wraps every route in: one request is one increment
+    /// of `nora_http_requests_total` under the route's registry, the method and the
+    /// status, and one observation of its duration.
+    #[tokio::test]
+    async fn metrics_middleware_counts_the_request_under_registry_method_and_status() {
+        use tower::ServiceExt;
+        // A label set no other test produces: the metrics are process-wide.
+        let labels = ["ui", "PATCH", "418"];
+        let app = axum::Router::new()
+            .route(
+                "/ui/metrics-middleware-canary",
+                axum::routing::patch(|| async { axum::http::StatusCode::IM_A_TEAPOT }),
+            )
+            .layer(axum::middleware::from_fn(metrics_middleware));
+        let requests = || HTTP_REQUESTS_TOTAL.with_label_values(&labels).get();
+        let timed = || {
+            HTTP_REQUEST_DURATION
+                .with_label_values(&["ui", "PATCH"])
+                .get_sample_count()
+        };
+        let (requests_before, timed_before) = (requests(), timed());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PATCH")
+                    .uri("/ui/metrics-middleware-canary")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::IM_A_TEAPOT);
+        assert_eq!(requests(), requests_before + 1);
+        assert!(timed() > timed_before);
+    }
+
     /// Leak-counter delta for one GET of `/npm/x` returning `body`.
     async fn npm_leak_delta(label: &'static str, body: &'static str) -> u64 {
         use tower::ServiceExt;

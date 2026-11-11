@@ -1,7 +1,9 @@
 [nora]
 packages = ["nora-registry"]
 engine = "Llvm"
-fail-under = 60
+# Measured 88.4% on 11.11.2026 with main.rs included; the floor leaves room for a
+# run's noise, not for a PR that lands untested code (the diff gate covers that too).
+fail-under = 86
 out = ["Json", "Html", "Lcov"]
 output-dir = "coverage"
 test-timeout = "5m"
