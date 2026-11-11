@@ -520,28 +520,34 @@ pub fn namespace_match(pattern: &str, value: &str) -> bool {
     segments_match(&pat, &val)
 }
 
-/// Recursive segment matcher backing [`namespace_match`]. Patterns are operator
-/// config of a handful of segments, so the worst-case branching on `**` is not a
-/// practical concern.
+/// Segment matcher backing [`namespace_match`]: `**` takes zero or more value segments,
+/// any other pattern segment exactly one. One pass over the pattern with one row of
+/// reachable value positions, so the cost is (pattern segments) x (value segments) segment
+/// comparisons whatever the pattern holds. The recursive version it replaces tried every
+/// split for every `**`: eight of them against a 41-segment value took 14 s, and the value
+/// is the request's artifact coordinate.
 fn segments_match(pat: &[&str], val: &[&str]) -> bool {
-    match pat.split_first() {
-        // Pattern exhausted: match iff the value is also exhausted (anchored end).
-        None => val.is_empty(),
-        // `**` consumes zero or more value segments.
-        Some((&"**", rest)) => {
-            // Zero consumed:
-            if segments_match(rest, val) {
-                return true;
+    // reach[j]: the pattern segments read so far match exactly val[..j].
+    let mut reach = vec![false; val.len() + 1];
+    reach[0] = true;
+    for &seg in pat {
+        if seg == "**" {
+            // Zero or more segments: every position at or past a reachable one.
+            let mut seen = false;
+            for r in reach.iter_mut() {
+                seen |= *r;
+                *r = seen;
             }
-            // One or more consumed (suffixes val[1..], val[2..], …, []):
-            (0..val.len()).any(|i| segments_match(rest, &val[i + 1..]))
-        }
-        // Any other segment consumes exactly one value segment; `*` inside it
-        // matches within that segment only (never across `/`).
-        Some((&seg, rest)) => {
-            !val.is_empty() && segment_glob(seg, val[0]) && segments_match(rest, &val[1..])
+        } else {
+            // Exactly one segment; `*` inside it never crosses `/`. Right to left, so
+            // reach[j - 1] is still the previous row's.
+            for j in (1..=val.len()).rev() {
+                reach[j] = reach[j - 1] && segment_glob(seg, val[j - 1]);
+            }
+            reach[0] = false;
         }
     }
+    reach[val.len()]
 }
 
 /// Char-level glob for one path segment: `*` matches any run of characters
@@ -1397,6 +1403,61 @@ mod encoding_guard_tests {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod segments_match_cost_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// The matcher this module had before: the definition of the semantics, exponential in
+    /// the number of `**`.
+    fn recursive(pat: &[&str], val: &[&str]) -> bool {
+        match pat.split_first() {
+            None => val.is_empty(),
+            Some((&"**", rest)) => (0..=val.len()).any(|i| recursive(rest, &val[i..])),
+            Some((&seg, rest)) => {
+                !val.is_empty() && segment_glob(seg, val[0]) && recursive(rest, &val[1..])
+            }
+        }
+    }
+
+    /// 24 `**` against a 41-segment value: the recursive matcher needed 14 s for eight of
+    /// them and did not finish twelve. Run on a thread so that a regression fails here
+    /// instead of hanging the suite; the answer takes microseconds, the bound is 10 s.
+    #[test]
+    fn many_double_stars_against_a_long_value_answer_at_once() {
+        for (tail, expected) in [("zz", false), ("a", true)] {
+            let pattern = format!("{}{tail}", "**/".repeat(24));
+            let value = format!("{}a", "a/".repeat(40));
+            let (done, result) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = done.send(namespace_match(&pattern, &value));
+            });
+            let matched = result
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("namespace_match did not answer: its cost grows with the number of `**`");
+            assert_eq!(matched, expected, "pattern ending in {tail}");
+        }
+    }
+
+    proptest! {
+        // Same answers as the recursive definition, on patterns and values small enough
+        // for it: literal, `*`-glob and `**` segments in any order.
+        #[test]
+        fn prop_agrees_with_the_recursive_definition(
+            pat in proptest::collection::vec(
+                prop_oneof![Just("**"), Just("*"), Just("a"), Just("b"), Just("a*"), Just("*b")],
+                0..7,
+            ),
+            val in proptest::collection::vec(
+                prop_oneof![Just("a"), Just("b"), Just("ab"), Just("ba")],
+                0..7,
+            ),
+        ) {
+            prop_assert_eq!(segments_match(&pat, &val), recursive(&pat, &val));
         }
     }
 }
