@@ -130,7 +130,8 @@ config:
     # -- Any other [server] key is rendered as is, e.g. body_limit_mb (2048),
     # shutdown_timeout (15, see terminationGracePeriodSeconds), proxy_coalesce,
     # trust_upstream_dates, stream_threshold_mb (16), spool_max_mb (4096, see
-    # spool), proxy_max_artifact_mb (2048).
+    # spool), proxy_max_artifact_mb (2048), proxy_max_buffered_mb (512: largest
+    # upstream body read whole into memory, i.e. metadata).
     # body_limit_mb: 256
     # shutdown_timeout: 15
     # -- internal_port: detailed /health and /metrics move to this port, exposed

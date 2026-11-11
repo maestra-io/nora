@@ -111,6 +111,11 @@ impl<'a> BreakerScope<'a> {
         }
     }
 
+    /// The configured upstream this scope names, if it names one.
+    pub(crate) fn upstream_url(&self) -> Option<&'a str> {
+        self.upstream
+    }
+
     /// The format this call belongs to (the label of the per-format metrics).
     pub(crate) fn registry(&self) -> RegistryType {
         self.registry

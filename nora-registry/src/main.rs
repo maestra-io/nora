@@ -495,7 +495,7 @@ pub struct AppState {
     pub(crate) proxy_coalesce: proxy_coalesce::InflightMap<Bytes, registry::ProxyError>,
     /// Single-flight of proxied artifact cold misses, whose body may be spooled to disk.
     pub(crate) artifact_flights:
-        proxy_coalesce::InflightMap<registry::ProxyBody, registry::ProxyError>,
+        proxy_coalesce::InflightMap<registry::ArtifactFill, registry::ProxyError>,
     /// Disk spool directory and byte budget (proxied artifacts, NuGet pushes, PyPI uploads).
     pub(crate) spool: Arc<registry::SpoolBudget>,
     /// Docker blob fills in flight, shared by every request for the blob (#1003).
@@ -3815,6 +3815,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     }));
 
     let leak_finders = metrics::LeakFinders::new(config.upstream_hostnames());
+    registry::set_max_buffered_body(config.server.proxy_max_buffered());
 
     let enabled_registries = Arc::new(enabled_registries);
     // Cancellation token for graceful shutdown of background tasks (#306). Created

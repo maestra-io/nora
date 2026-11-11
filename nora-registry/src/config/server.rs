@@ -102,6 +102,14 @@ pub struct ServerConfig {
     /// cap. Default 2048; 0 = no cap.
     #[serde(default = "default_proxy_max_artifact_mb")]
     pub proxy_max_artifact_mb: u64,
+    /// Largest upstream body in MB nora reads whole into memory: the metadata of
+    /// every format (a packument, a registration index, a simple page) and the
+    /// artifacts of the formats that do not spool to disk. A bigger one is refused
+    /// with 507 on its `Content-Length`, or as soon as the running count crosses the
+    /// cap, instead of being buffered until the process is OOM-killed. Default 512
+    /// (the largest npm packuments are about 40 MB); 0 = no cap.
+    #[serde(default = "default_proxy_max_buffered_mb")]
+    pub proxy_max_buffered_mb: u64,
     /// Maestra: where people open the web UI to sign in and mint a token, shown on
     /// the `/ui/setup` page (the Teleport app; the UI is not on the public host).
     #[serde(default = "default_ui_docs_login_url")]
@@ -171,6 +179,10 @@ pub(super) fn default_proxy_max_artifact_mb() -> u64 {
     2048
 }
 
+pub(super) fn default_proxy_max_buffered_mb() -> u64 {
+    512
+}
+
 pub(super) fn default_maintenance_stall_secs() -> u64 {
     300
 }
@@ -203,6 +215,7 @@ impl Default for ServerConfig {
             spool_dir: None,
             spool_max_mb: default_spool_max_mb(),
             proxy_max_artifact_mb: default_proxy_max_artifact_mb(),
+            proxy_max_buffered_mb: default_proxy_max_buffered_mb(),
             ui_docs_login_url: default_ui_docs_login_url(),
         }
     }
@@ -226,6 +239,12 @@ impl ServerConfig {
     pub fn proxy_max_artifact(&self) -> Option<u64> {
         (self.proxy_max_artifact_mb > 0)
             .then(|| self.proxy_max_artifact_mb.saturating_mul(1024 * 1024))
+    }
+
+    /// `proxy_max_buffered_mb` in bytes; `None` = no cap.
+    pub fn proxy_max_buffered(&self) -> Option<u64> {
+        (self.proxy_max_buffered_mb > 0)
+            .then(|| self.proxy_max_buffered_mb.saturating_mul(1024 * 1024))
     }
 
     /// The spool directory: `spool_dir`, else `{storage_path}/tmp`.
@@ -369,6 +388,13 @@ impl ServerConfig {
                 &mut self.proxy_max_artifact_mb,
             );
         }
+        if let Ok(val) = env::var("NORA_PROXY_MAX_BUFFERED_MB") {
+            super::parse_env_warn(
+                "NORA_PROXY_MAX_BUFFERED_MB",
+                &val,
+                &mut self.proxy_max_buffered_mb,
+            );
+        }
         if let Ok(val) = env::var("NORA_PUBLISH_BODY_LIMIT_MB") {
             super::parse_env_warn(
                 "NORA_PUBLISH_BODY_LIMIT_MB",
@@ -488,6 +514,16 @@ mod tests {
             (d.spool_max_mb, d.proxy_max_artifact()),
             (4096, Some(2048 << 20))
         );
+        // R4-P14: bodies read whole into memory are capped too.
+        assert_eq!(d.proxy_max_buffered(), Some(512 << 20));
+        let mut buffered = ServerConfig::default();
+        std::env::set_var("NORA_PROXY_MAX_BUFFERED_MB", "64");
+        buffered.apply_env_overrides();
+        assert_eq!(buffered.proxy_max_buffered(), Some(64 << 20));
+        std::env::set_var("NORA_PROXY_MAX_BUFFERED_MB", "0");
+        buffered.apply_env_overrides();
+        std::env::remove_var("NORA_PROXY_MAX_BUFFERED_MB");
+        assert_eq!(buffered.proxy_max_buffered(), None);
         let mut config = ServerConfig::default();
         std::env::set_var("NORA_SPOOL_DIR", "/spool");
         std::env::set_var("NORA_SPOOL_MAX_MB", "100");

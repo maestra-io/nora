@@ -381,9 +381,9 @@ impl Storage {
         STORAGE_OPERATIONS.with_label_values(&["put", status]).inc();
     }
 
-    /// Buffered read through the fail-closed integrity gate, returning the bytes
-    /// and the pin they were checked against (`None` = open-world key).
-    async fn get_pinned(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+    /// Buffered read through the fail-closed integrity gate: the bytes with the
+    /// witness of the pin they were checked against (`Unpinned` = open-world key).
+    async fn get_pinned(&self, key: &str) -> Result<nora_registry::verified::GateOutcome> {
         validate_storage_key(key)?;
         let (data, pin) = match Self::timed("get", self.inner.get(key)).await {
             Ok(v) => v,
@@ -399,19 +399,22 @@ impl Storage {
     }
 
     /// The fail-closed gate of [`get_pinned`](Self::get_pinned) on a body already read:
-    /// `Ok` only after a digest match, or for an open-world (unpinned) key.
+    /// `Ok` only after a digest match, or for an open-world (unpinned) key. The one
+    /// SHA-256 of the body runs inside the sound constructor of the witness
+    /// (`Blob::<Verified>::verify`), which keeps the digest for the callers (R4-P05).
     async fn verify_pinned(
         key: &str,
         data: Bytes,
         pin: Option<String>,
-    ) -> Result<(Bytes, Option<String>)> {
+    ) -> Result<nora_registry::verified::GateOutcome> {
+        use nora_registry::verified::{Blob, GateOutcome, IntegrityError};
         let label = registry_label(key);
         STORAGE_GET_BYTES
             .with_label_values(&[label])
             .observe(data.len() as f64);
 
         let Some(expected) = pin else {
-            return Ok((data, None));
+            return Ok(GateOutcome::Unpinned(Blob::raw(data)));
         };
 
         // SHA-256 verification — offloaded from the tokio worker for the same
@@ -424,17 +427,16 @@ impl Storage {
         // deliberate cost of fail-closed delivery; #602 instruments that cost
         // via STORAGE_VERIFY_DURATION_SECONDS rather than weakening the
         // guarantee.
-        let bytes = data.clone();
         let verify_start = std::time::Instant::now();
-        let outcome = tokio::task::spawn_blocking(move || sha256_hex(&bytes)).await;
+        let outcome = tokio::task::spawn_blocking(move || Blob::verify(data, &expected)).await;
         STORAGE_VERIFY_DURATION_SECONDS
             .with_label_values(&[label])
             .observe(verify_start.elapsed().as_secs_f64());
         match outcome {
-            Ok(actual) if actual == expected => Ok((data, Some(expected))),
+            Ok(Ok(blob)) => Ok(GateOutcome::Verified(blob)),
             // Genuine hash mismatch — tampering or at-rest corruption.
             // Fail-closed: never serve the tampered bytes (#582).
-            Ok(actual) => {
+            Ok(Err(IntegrityError::DigestMismatch { expected, actual })) => {
                 STORAGE_OPERATIONS
                     .with_label_values(&["get", "integrity_fail"])
                     .inc();
@@ -468,7 +470,9 @@ impl Storage {
         // that does not depend on the transitive get_pinned() validation below surviving a future
         // refactor (trust-boundary invariant — mirrors get_verified).
         validate_storage_key(key)?;
-        self.get_pinned(key).await.map(|(data, _)| data)
+        self.get_pinned(key)
+            .await
+            .map(nora_registry::verified::GateOutcome::accept_open_world)
     }
 
     /// Buffered, integrity-gated read returning a compile-time integrity
@@ -489,11 +493,9 @@ impl Storage {
     /// [`GateOutcome::Unpinned`]: nora_registry::verified::GateOutcome::Unpinned
     ///
     /// The witness is minted by the sound smart-constructor
-    /// [`Blob::<Verified>::verify`](nora_registry::verified::Blob::verify), which
-    /// re-hashes the bytes — one extra SHA-256 over [`get`] on the pinned path.
-    /// The pilot accepts that cost to keep the witness sound-by-construction
-    /// without duplicating the security-critical gate; folding the witness into
-    /// `get` so the hash runs once is the rollout step.
+    /// [`Blob::<Verified>::verify`](nora_registry::verified::Blob::verify) inside the
+    /// gate itself: one SHA-256 per read, on the blocking pool, and the witness
+    /// carries the digest it matched.
     pub async fn get_verified(&self, key: &str) -> Result<nora_registry::verified::GateOutcome> {
         // Validate locally as the first act, like every Storage wrapper method:
         // a choke point that does not depend on the transitive get() validation
@@ -501,24 +503,7 @@ impl Storage {
         validate_storage_key(key)?;
         // Reuse the fail-closed gate: it returns Ok only after a digest match or
         // on the open-world / no-pin branch.
-        let (data, pin) = self.get_pinned(key).await?;
-        Self::witness(data, pin)
-    }
-
-    /// Mint the [`GateOutcome`](nora_registry::verified::GateOutcome) for bytes that
-    /// passed [`verify_pinned`](Self::verify_pinned).
-    fn witness(data: Bytes, pin: Option<String>) -> Result<nora_registry::verified::GateOutcome> {
-        use nora_registry::verified::{Blob, GateOutcome};
-        match pin {
-            Some(pin) => match Blob::verify(data, &pin) {
-                Ok(blob) => Ok(GateOutcome::Verified(blob)),
-                // The gate already verified these bytes against the same pin, so
-                // a mismatch here is unreachable in practice; treat it as a
-                // tamper signal and fail closed rather than downgrade.
-                Err(_) => Err(StorageError::IntegrityViolation),
-            },
-            None => Ok(GateOutcome::Unpinned(Blob::raw(data))),
-        }
+        self.get_pinned(key).await
     }
 
     /// [`get_verified`](Self::get_verified) for objects up to `max_buffered` bytes; a
@@ -552,8 +537,9 @@ impl Storage {
             .map_err(|_| {
                 StorageError::Network(format!("body read exceeded {} s", limit.as_secs()))
             })??;
-        let (data, pin) = Self::verify_pinned(key, Bytes::from(buf), pin).await?;
-        Self::witness(data, pin).map(BoundedRead::Buffered)
+        Self::verify_pinned(key, Bytes::from(buf), pin)
+            .await
+            .map(BoundedRead::Buffered)
     }
 
     pub async fn delete(&self, key: &str) -> Result<()> {
@@ -1548,7 +1534,12 @@ mod tests {
         let key = "raw/v/app.bin";
         storage.put(key, b"verified-bytes").await.unwrap();
         match storage.get_verified(key).await.unwrap() {
-            GateOutcome::Verified(blob) => assert_eq!(&blob.into_inner()[..], b"verified-bytes"),
+            GateOutcome::Verified(blob) => {
+                // R4-P05: the witness carries the digest the gate computed, so no
+                // caller hashes the body a second time.
+                assert_eq!(blob.sha256(), sha256_hex(b"verified-bytes"));
+                assert_eq!(&blob.into_inner()[..], b"verified-bytes");
+            }
             GateOutcome::Unpinned(_) => panic!("pinned key must yield Verified"),
         }
 
