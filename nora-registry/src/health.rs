@@ -206,7 +206,7 @@ mod tests {
 
     /// A maintenance loop that stopped ticking fails liveness: `/health` answers 503
     /// once the loop has been silent longer than it may be, and 200 again after a tick.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn health_is_503_while_the_maintenance_loop_is_silent_too_long() {
         let silence = Duration::from_secs(2);
         let ctx = create_test_context();
@@ -238,7 +238,7 @@ mod tests {
 
     /// The silence `/health` tolerates is `server.maintenance_stall_secs`: with a 1 s window
     /// and no tick completing, the probe fails after it; with the default it does not.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_stall_window_is_the_configured_one() {
         let short = create_test_context_with_config(|c| c.server.maintenance_stall_secs = 1);
         let default = create_test_context();

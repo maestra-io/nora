@@ -501,7 +501,7 @@ mod tests {
 
     /// Restart: the task runs again after a panic, the panic is counted, and one panic
     /// does not fail liveness.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_task_that_panics_once_is_restarted() {
         let tasks = supervisor();
         let runs = Arc::new(AtomicU64::new(0));
@@ -562,7 +562,7 @@ mod tests {
 
     /// Restart, crash loop: a task that keeps panicking soon after each start fails
     /// liveness by name, and clears it once a run lasts.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_task_in_a_crash_loop_fails_liveness_until_it_recovers() {
         let tasks = supervisor();
         let runs = Arc::new(AtomicU64::new(0));
@@ -638,7 +638,7 @@ mod tests {
 
     /// A detached run that panics late is logged and counted under its name, and does not
     /// keep the next start from running.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_detached_run_that_panics_is_reported_and_the_next_runs() {
         let work = supervisor().detached("test_detached_panic");
         let run = work
@@ -661,7 +661,7 @@ mod tests {
     }
 
     /// A stalled heartbeat names its task.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_stalled_heartbeat_fails_liveness() {
         let heartbeat = Arc::new(Heartbeat::new(TICK * 3));
         let tasks = Supervisor::new(vec![("test_beat", Arc::clone(&heartbeat))]);

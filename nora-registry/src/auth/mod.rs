@@ -5126,6 +5126,9 @@ Jd74nq6dNCjpWG4drIsyhqX+
         );
 
         let ctx = create_oidc_test_context(&mock_server.uri());
+        // Read again: the mint above and this build take seconds under load, and a JWT dated
+        // from the first reading would by now be past the 60 s leeway, a 401 and not this 403.
+        let now = now_secs();
         let expired = make_jwt(&mock_server.uri(), subject, "nora", now - 630, now - 30);
         assert_eq!(mint(&ctx, expired).await, StatusCode::FORBIDDEN);
         assert!(
