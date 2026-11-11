@@ -898,10 +898,11 @@ pub(super) async fn registration_page(
     }
 }
 
-/// `GET /nuget/v3/registration/{id}/{version}.json`. Proxied IDs have no leaf route
-/// upstream-side either, so a non-hosted ID stays a 404.
+/// `GET /nuget/v3/registration/{id}/{version}.json`. A non-hosted ID is answered from
+/// its proxied registration ([`super::registration_leaf`]).
 async fn registration_leaf(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((id, leaf_name)): Path<(String, String)>,
 ) -> Response {
     let id_lower = id.to_lowercase();
@@ -912,7 +913,15 @@ async fn registration_leaf(
         return StatusCode::BAD_REQUEST.into_response();
     }
     match lookup(&state, &id_lower).await {
-        Lookup::NotHosted => StatusCode::NOT_FOUND.into_response(),
+        Lookup::NotHosted => {
+            super::registration_leaf(
+                State(state),
+                headers,
+                Path((id, leaf_name)),
+                super::HIVE_SEMVER2,
+            )
+            .await
+        }
         Lookup::Unavailable => unavailable(),
         Lookup::Hosted(pkg) => match pkg
             .versions

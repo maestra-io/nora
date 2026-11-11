@@ -223,6 +223,14 @@ fn routes_with_prefix(prefix: &str) -> Router<AppState> {
             get(registration_page_gz_semver1),
         )
         .route(
+            &format!("/{prefix}/v3/{HIVE_SEMVER1}/{{id}}/{{leaf}}"),
+            get(|s, h, p| registration_leaf(s, h, p, HIVE_SEMVER1)),
+        )
+        .route(
+            &format!("/{prefix}/v3/{HIVE_GZ_SEMVER1}/{{id}}/{{leaf}}"),
+            get(|s, h, p| registration_leaf(s, h, p, HIVE_GZ_SEMVER1)),
+        )
+        .route(
             &format!("/{prefix}/v3/flatcontainer/{{*path}}"),
             get(flatcontainer_handler),
         )
@@ -2037,28 +2045,25 @@ async fn registration_page_filtered(
 /// The SemVer 1.0.0 registration hives the older `RegistrationsBaseUrl` types promise
 /// (as api.nuget.org's `registration5-semver1` / `registration5-gz-semver1`): the bare,
 /// `/3.0.0-beta` and `/3.0.0-rc` types read [`HIVE_SEMVER1`] (no Content-Encoding),
-/// `/3.4.0` reads [`HIVE_GZ_SEMVER1`] (gzip); both leave out SemVer 2.0.0 versions.
-/// `/3.6.0` and `/Versioned` stay on `registration/` (gzip, SemVer 2.0.0 included).
+/// `/3.4.0` reads [`HIVE_GZ_SEMVER1`] (gzip); both leave out SemVer 2.0.0 packages.
+/// `/3.6.0` and `/Versioned` stay on [`HIVE_SEMVER2`] (gzip, SemVer 2.0.0 included).
 const HIVE_SEMVER1: &str = "registration-semver1";
 const HIVE_GZ_SEMVER1: &str = "registration-gz-semver1";
+const HIVE_SEMVER2: &str = "registration";
 
 async fn registration_index_semver1(
     state: State<AppState>,
     headers: axum::http::HeaderMap,
     id: Path<String>,
 ) -> Response {
-    semver1_hive(
-        registration_index_filtered(state, headers, id).await,
-        HIVE_SEMVER1,
-    )
-    .await
+    semver1_index(state, headers, id, HIVE_SEMVER1).await
 }
 
 async fn registration_page_semver1(
     state: State<AppState>,
     path: Path<(String, String, String)>,
 ) -> Response {
-    semver1_hive(registration_page_filtered(state, path).await, HIVE_SEMVER1).await
+    semver1_page(state, path, HIVE_SEMVER1).await
 }
 
 async fn registration_index_gz_semver1(
@@ -2066,101 +2071,334 @@ async fn registration_index_gz_semver1(
     headers: axum::http::HeaderMap,
     id: Path<String>,
 ) -> Response {
-    semver1_hive(
-        registration_index_filtered(state, headers, id).await,
-        HIVE_GZ_SEMVER1,
-    )
-    .await
+    semver1_index(state, headers, id, HIVE_GZ_SEMVER1).await
 }
 
 async fn registration_page_gz_semver1(
     state: State<AppState>,
     path: Path<(String, String, String)>,
 ) -> Response {
-    semver1_hive(
-        registration_page_filtered(state, path).await,
-        HIVE_GZ_SEMVER1,
-    )
-    .await
+    semver1_page(state, path, HIVE_GZ_SEMVER1).await
 }
 
-/// A `registration/` answer turned into one of `hive`: SemVer 2.0.0 leaves dropped, its
-/// registration URLs pointed at `hive`, gzip only for [`HIVE_GZ_SEMVER1`]. Non-200 as is.
-async fn semver1_hive(resp: Response, hive: &str) -> Response {
-    if resp.status() != StatusCode::OK {
-        return resp;
+/// `f` on the blocking pool when `big` (a registration document past
+/// [`REGISTRATION_INLINE_MAX`], as in [`registration_response`]), else on this task.
+async fn on_pool_if<T: Send + 'static>(
+    big: bool,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    if !big {
+        return Some(f());
     }
-    let (mut parts, body) = resp.into_parts();
+    tokio::task::spawn_blocking(f).await.ok()
+}
+
+/// The JSON of a 200 registration answer (gzip or not), its header parts and whether it
+/// is big ([`on_pool_if`]). Any other answer comes back as `Err`, unchanged.
+async fn registration_json(
+    resp: Response,
+) -> Result<(axum::http::response::Parts, serde_json::Value, bool), Response> {
+    if resp.status() != StatusCode::OK {
+        return Err(resp);
+    }
+    let (parts, body) = resp.into_parts();
     let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
     };
     let gzipped = parts
         .headers
         .get(header::CONTENT_ENCODING)
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"gzip"));
-    let plain = if gzipped {
-        let mut out = Vec::new();
-        if std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&bytes[..]), &mut out)
-            .is_err()
-        {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    // Registration JSON gzips about 8:1: judge the size it inflates to.
+    let big = bytes.len() > REGISTRATION_INLINE_MAX / if gzipped { 8 } else { 1 };
+    let parse = move || {
+        if !gzipped {
+            return serde_json::from_slice::<serde_json::Value>(&bytes).ok();
         }
-        out
-    } else {
-        bytes.to_vec()
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&bytes[..]), &mut out).ok()?;
+        serde_json::from_slice(&out).ok()
     };
-    let Some(doc) = semver1_registration(&plain, hive) else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
+    match on_pool_if(big, parse).await.flatten() {
+        Some(doc) => Ok((parts, doc, big)),
+        None => Err(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    }
+}
+
+/// `doc` as `hive` serves it: every `/v3/registration/` URL moved to `/v3/<hive>/`, gzip
+/// unless [`HIVE_SEMVER1`].
+async fn hive_response(
+    mut parts: axum::http::response::Parts,
+    doc: serde_json::Value,
+    hive: &'static str,
+    big: bool,
+) -> Response {
     parts.headers.remove(header::CONTENT_LENGTH);
     parts.headers.remove(header::CONTENT_ENCODING);
-    if hive == HIVE_GZ_SEMVER1 {
+    let gzip = hive != HIVE_SEMVER1;
+    let render = move || -> Option<Vec<u8>> {
+        let text = serde_json::to_string(&doc).ok()?;
+        let text = text.replace("/v3/registration/", &format!("/v3/{hive}/"));
+        if !gzip {
+            return Some(text.into_bytes());
+        }
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        let Ok(z) = std::io::Write::write_all(&mut enc, &doc).and_then(|_| enc.finish()) else {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        };
+        std::io::Write::write_all(&mut enc, text.as_bytes()).ok()?;
+        enc.finish().ok()
+    };
+    let Some(body) = on_pool_if(big, render).await.flatten() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if gzip {
         parts
             .headers
             .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-        return Response::from_parts(parts, axum::body::Body::from(z));
     }
-    Response::from_parts(parts, axum::body::Body::from(doc))
+    Response::from_parts(parts, axum::body::Body::from(body))
 }
 
-/// A registration index or page without its SemVer 2.0.0 leaves, `count` fixed where the
-/// leaves are inline, and every `/v3/registration/` URL moved to `/v3/<hive>/`. An
-/// inlined page left empty is dropped.
-// ponytail: only the leaf's own version decides; api.nuget.org also drops a SemVer 1
-// version whose dependency ranges are SemVer 2. `lower`/`upper` keep the full page's
-// bounds (looser, never wrong). Add both if a pre-4.3 client needs them.
-fn semver1_registration(body: &[u8], hive: &str) -> Option<Vec<u8>> {
-    fn leaf_version(leaf: &serde_json::Value) -> Option<&str> {
-        leaf.get("catalogEntry")?.get("version")?.as_str()
+async fn semver1_page(
+    State(state): State<AppState>,
+    path: Path<(String, String, String)>,
+    hive: &'static str,
+) -> Response {
+    let resp = registration_page_filtered(State(state), path).await;
+    let (parts, mut doc, big) = match registration_json(resp).await {
+        Ok(ok) => ok,
+        Err(resp) => return resp,
+    };
+    semver1_registration(&mut doc);
+    hive_response(parts, doc, hive, big).await
+}
+
+/// A SemVer 1 index. A page served by reference takes its `count` and bounds from the
+/// SemVer 1 page itself, and one with no SemVer 1 package left is dropped.
+// ponytail: every referenced page is read for this (one storage read each once cached);
+// only pre-4.3 clients ask these hives.
+async fn semver1_index(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    hive: &'static str,
+) -> Response {
+    let resp = registration_index_filtered(State(state.clone()), headers, Path(id.clone())).await;
+    let (parts, mut doc, big) = match registration_json(resp).await {
+        Ok(ok) => ok,
+        Err(resp) => return resp,
+    };
+    semver1_registration(&mut doc);
+    if let Some(items) = doc.get_mut("items").and_then(|i| i.as_array_mut()) {
+        let summaries = futures::future::join_all(
+            items
+                .iter()
+                .map(|page| semver1_page_summary(&state, &id, page)),
+        )
+        .await;
+        let mut keep = Vec::with_capacity(items.len());
+        for (mut page, summary) in std::mem::take(items).into_iter().zip(summaries) {
+            match summary {
+                Some((0, _)) => continue,
+                Some((count, bounds)) => {
+                    page["count"] = serde_json::json!(count);
+                    if let Some((lower, upper)) = bounds {
+                        page["lower"] = serde_json::json!(lower);
+                        page["upper"] = serde_json::json!(upper);
+                    }
+                }
+                None => {}
+            }
+            keep.push(page);
+        }
+        *items = keep;
+        let pages = items.len();
+        doc["count"] = serde_json::json!(pages);
     }
+    hive_response(parts, doc, hive, big).await
+}
+
+/// The `/page/<lower>/<upper>.json` route parameters of a page's `@id`.
+fn page_ref(page: &serde_json::Value) -> Option<(String, String)> {
+    let url = page.get("@id")?.as_str()?;
+    let (lower, upper) = url.rsplit_once("/page/")?.1.split_once('/')?;
+    Some((lower.to_string(), upper.to_string()))
+}
+
+/// For a page served by reference: the count and bounds of its SemVer 1 packages.
+/// `None` for an inlined page, or when the page cannot be read (the entry stays as is).
+async fn semver1_page_summary(
+    state: &AppState,
+    id: &str,
+    page: &serde_json::Value,
+) -> Option<(usize, Option<(String, String)>)> {
+    if page.get("items").is_some() {
+        return None;
+    }
+    let (lower, upper) = page_ref(page)?;
+    let resp =
+        registration_page_filtered(State(state.clone()), Path((id.to_string(), lower, upper)))
+            .await;
+    let (_, mut doc, _) = registration_json(resp).await.ok()?;
+    semver1_registration(&mut doc);
+    let leaves = doc.get("items")?.as_array()?;
+    Some((leaves.len(), semver1_bounds(leaves)))
+}
+
+/// Whether a registration leaf belongs to SemVer 2.0.0 only, as NuGet classifies it: its
+/// version, or a bound of one of its dependency ranges, is SemVer 2.0.0.
+fn semver2_leaf(leaf: &serde_json::Value) -> bool {
+    let Some(entry) = leaf.get("catalogEntry") else {
+        return false;
+    };
+    if entry
+        .get("version")
+        .and_then(|v| v.as_str())
+        .is_some_and(is_semver2_version)
+    {
+        return true;
+    }
+    let groups = entry.get("dependencyGroups").and_then(|g| g.as_array());
+    groups
+        .into_iter()
+        .flatten()
+        .filter_map(|g| g.get("dependencies")?.as_array())
+        .flatten()
+        .filter_map(|d| d.get("range")?.as_str())
+        .flat_map(|range| range.trim_matches(['[', ']', '(', ')', ' ']).split(','))
+        .any(|bound| is_semver2_version(bound.trim()))
+}
+
+/// Lowest and highest version among `leaves`, as their `catalogEntry` spells them.
+fn semver1_bounds(leaves: &[serde_json::Value]) -> Option<(String, String)> {
+    let mut versions = leaves
+        .iter()
+        .filter_map(|l| l.get("catalogEntry")?.get("version")?.as_str());
+    let first = versions.next()?;
+    let order = |a: &str, b: &str| hosted::compare_versions(&a.to_lowercase(), &b.to_lowercase());
+    let (lower, upper) = versions.fold((first, first), |(lo, hi), v| {
+        (
+            if order(v, lo).is_lt() { v } else { lo },
+            if order(v, hi).is_gt() { v } else { hi },
+        )
+    });
+    Some((lower.to_string(), upper.to_string()))
+}
+
+/// A registration index or page without its SemVer 2.0.0 leaves ([`semver2_leaf`]):
+/// `count`, `lower` and `upper` follow the leaves kept, an inlined page left empty is
+/// dropped. A page served by reference is left to [`semver1_index`].
+fn semver1_registration(doc: &mut serde_json::Value) {
     fn retain_semver1(page: &mut serde_json::Value) {
         let Some(leaves) = page.get_mut("items").and_then(|i| i.as_array_mut()) else {
             return;
         };
-        leaves.retain(|l| leaf_version(l).is_none_or(|v| !is_semver2_version(v)));
-        page["count"] = serde_json::json!(leaves.len());
-    }
-    let mut doc: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let items = doc.get_mut("items")?.as_array_mut()?;
-    if items.iter().any(|i| i.get("catalogEntry").is_some()) {
-        retain_semver1(&mut doc);
-    } else {
-        for page in items.iter_mut() {
-            retain_semver1(page);
+        leaves.retain(|l| !semver2_leaf(l));
+        let count = leaves.len();
+        let bounds = semver1_bounds(leaves);
+        page["count"] = serde_json::json!(count);
+        if let Some((lower, upper)) = bounds {
+            page["lower"] = serde_json::json!(lower);
+            page["upper"] = serde_json::json!(upper);
         }
-        items.retain(|p| p.get("items").is_none() || p["count"] != 0);
-        let pages = items.len();
-        doc["count"] = serde_json::json!(pages);
     }
-    let text = serde_json::to_string(&doc).ok()?;
-    Some(
-        text.replace("/v3/registration/", &format!("/v3/{hive}/"))
-            .into_bytes(),
-    )
+    let Some(items) = doc.get_mut("items").and_then(|i| i.as_array_mut()) else {
+        return;
+    };
+    if items.iter().any(|i| i.get("catalogEntry").is_some()) {
+        retain_semver1(doc);
+        return;
+    }
+    for page in items.iter_mut() {
+        retain_semver1(page);
+    }
+    items.retain(|p| p.get("items").is_none() || p["count"] != 0);
+    let pages = items.len();
+    doc["count"] = serde_json::json!(pages);
+}
+
+/// A registration leaf (`/v3/<hive>/{id}/{version}.json`, the `@id` of every leaf an
+/// index or page lists), built from the leaf in that hive's index or page: hidden and,
+/// in the SemVer 1 hives, SemVer 2.0.0 versions are 404 as they are absent there.
+async fn registration_leaf(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((id, leaf)): Path<(String, String)>,
+    hive: &'static str,
+) -> Response {
+    let Some(version) = leaf.strip_suffix(".json").map(str::to_lowercase) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !is_valid_version(&version) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let index = match hive {
+        HIVE_SEMVER2 => {
+            registration_index_filtered(State(state.clone()), headers, Path(id.clone())).await
+        }
+        _ => semver1_index(State(state.clone()), headers, Path(id.clone()), hive).await,
+    };
+    let (_, doc, _) = match registration_json(index).await {
+        Ok(ok) => ok,
+        Err(resp) => return resp,
+    };
+    let mut found = None;
+    for page in doc
+        .get("items")
+        .and_then(|i| i.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if let Some(leaves) = page.get("items").and_then(|i| i.as_array()) {
+            found = find_leaf(leaves, &version);
+        } else if let Some(RegistrationHit::Page(..)) =
+            registration_hit(&serde_json::json!({ "items": [page] }), &version)
+        {
+            let Some((lower, upper)) = page_ref(page) else {
+                continue;
+            };
+            let path = Path((id.clone(), lower, upper));
+            let resp = match hive {
+                HIVE_SEMVER2 => registration_page_filtered(State(state.clone()), path).await,
+                _ => semver1_page(State(state.clone()), path, hive).await,
+            };
+            if let Ok((_, page, _)) = registration_json(resp).await {
+                found = find_leaf(
+                    page.get("items")
+                        .and_then(|i| i.as_array())
+                        .map_or(&[], |v| v),
+                    &version,
+                );
+            }
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+    let Some(item) = found else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let entry = &item["catalogEntry"];
+    let mut out = serde_json::Map::new();
+    for (key, value) in [
+        ("@id", item.get("@id")),
+        ("catalogEntry", entry.get("@id")),
+        ("listed", entry.get("listed")),
+        ("packageContent", item.get("packageContent")),
+        ("published", entry.get("published")),
+        ("registration", item.get("registration")),
+    ] {
+        if let Some(value) = value {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    out.entry("listed").or_insert(serde_json::json!(true));
+    let Ok(body) = serde_json::to_vec(&out) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if hive == HIVE_SEMVER1 {
+        with_json(body)
+    } else {
+        with_json_gzip(body)
+    }
 }
 
 /// Flat-container `index.json` — what `dotnet restore` resolves ranges against.
@@ -6838,20 +7076,27 @@ mod spec_conformance_tests {
     }
 
     #[test]
-    fn test_semver1_registration_drops_semver2_and_moves_urls() {
+    fn test_semver1_registration_drops_semver2_and_fixes_counts_and_bounds() {
         let leaf = |v: &str| {
             serde_json::json!({
                 "@id": format!("http://nora:4000/nuget/v3/registration/foo/{v}.json"),
                 "catalogEntry": {"version": v},
-                "packageContent": format!("http://nora:4000/nuget/v3/flatcontainer/foo/{v}/foo.{v}.nupkg")
             })
         };
-        let index = serde_json::json!({
+        // A SemVer 1 version whose dependency range names a SemVer 2 version is SemVer 2.
+        let with_range = |v: &str, range: &str| {
+            let mut l = leaf(v);
+            l["catalogEntry"]["dependencyGroups"] =
+                serde_json::json!([{"dependencies": [{"id": "Bar", "range": range}]}]);
+            l
+        };
+        let mut index = serde_json::json!({
             "count": 3,
             "items": [
                 {"@id": "http://nora:4000/nuget/v3/registration/foo/index.json#page/1.0.0/2.0.0-rc.1",
-                 "count": 2, "lower": "1.0.0", "upper": "2.0.0-rc.1",
-                 "items": [leaf("1.0.0"), leaf("2.0.0-rc.1")]},
+                 "count": 4, "lower": "1.0.0", "upper": "2.0.0-rc.1",
+                 "items": [leaf("1.0.0"), with_range("1.1.0", "[1.0.0, 2.0.0)"),
+                           with_range("1.2.0", "[1.0.0-alpha.1, )"), leaf("2.0.0-rc.1")]},
                 {"@id": "http://nora:4000/nuget/v3/registration/foo/index.json#page/3.0.0-rc.1/3.0.0-rc.2",
                  "count": 2, "lower": "3.0.0-rc.1", "upper": "3.0.0-rc.2",
                  "items": [leaf("3.0.0-rc.1"), leaf("3.0.0-rc.2")]},
@@ -6859,33 +7104,34 @@ mod spec_conformance_tests {
                  "count": 64, "lower": "4.0.0", "upper": "5.0.0"}
             ]
         });
-        let out = semver1_registration(index.to_string().as_bytes(), HIVE_SEMVER1).unwrap();
-        let text = String::from_utf8(out).unwrap();
-        assert!(!text.contains("/v3/registration/"), "{text}");
-        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
-        // The all-SemVer-2 inlined page is gone, the page served by reference stays.
-        assert_eq!(doc["count"], 2);
-        let pages = doc["items"].as_array().unwrap();
-        assert_eq!(pages[0]["count"], 1);
-        assert_eq!(pages[0]["items"][0]["catalogEntry"]["version"], "1.0.0");
+        semver1_registration(&mut index);
+        // The all-SemVer-2 inlined page is gone; the page served by reference is left
+        // to semver1_index.
+        assert_eq!(index["count"], 2);
+        let pages = index["items"].as_array().unwrap();
+        let versions: Vec<&str> = pages[0]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["catalogEntry"]["version"].as_str().unwrap())
+            .collect();
+        assert_eq!(versions, ["1.0.0", "1.1.0"]);
+        assert_eq!(pages[0]["count"], 2);
         assert_eq!(
-            pages[0]["items"][0]["@id"],
-            "http://nora:4000/nuget/v3/registration-semver1/foo/1.0.0.json"
+            (&pages[0]["lower"], &pages[0]["upper"]),
+            (&serde_json::json!("1.0.0"), &serde_json::json!("1.1.0"))
         );
-        assert_eq!(
-            pages[1]["@id"],
-            "http://nora:4000/nuget/v3/registration-semver1/foo/page/4.0.0/5.0.0.json"
-        );
-        // flat-container URLs are not registration URLs
-        assert!(text.contains("/v3/flatcontainer/foo/1.0.0/foo.1.0.0.nupkg"));
+        assert_eq!(pages[1]["count"], 64);
+        assert_eq!(pages[1]["upper"], "5.0.0");
 
-        let page = serde_json::json!({"count": 2, "items": [leaf("4.0.0"), leaf("4.1.0+build")]});
-        let out = semver1_registration(page.to_string().as_bytes(), HIVE_GZ_SEMVER1).unwrap();
-        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(doc["count"], 1);
+        // A page document: its own count and bounds follow the leaves kept.
+        let mut page = serde_json::json!({"count": 3, "lower": "4.0.0", "upper": "4.2.0",
+            "items": [leaf("4.0.0"), leaf("4.1.0"), leaf("4.2.0+build")]});
+        semver1_registration(&mut page);
+        assert_eq!(page["count"], 2);
         assert_eq!(
-            doc["items"][0]["@id"],
-            "http://nora:4000/nuget/v3/registration-gz-semver1/foo/4.0.0.json"
+            (&page["lower"], &page["upper"]),
+            (&serde_json::json!("4.0.0"), &serde_json::json!("4.1.0"))
         );
     }
 
@@ -6981,6 +7227,212 @@ mod spec_conformance_tests {
                 "{hive}: {text}"
             );
         }
+    }
+
+    /// Pages served by reference take the SemVer 1 page's own count and bounds in a
+    /// SemVer 1 index (an all-SemVer-2 one is dropped), and every leaf `@id` a hive lists
+    /// answers, with the hive's own visibility.
+    #[tokio::test]
+    async fn test_semver1_hives_page_refs_and_leaves() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use std::io::Read;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+        let up = "https://api.nuget.org/v3/registration5-gz-semver2/foo";
+        let leaf = |v: &str| {
+            serde_json::json!({
+                "@id": format!("{up}/{v}.json"),
+                "catalogEntry": {"@id": format!("https://api.nuget.org/v3/catalog0/data/foo.{v}.json"),
+                                 "id": "Foo", "version": v, "published": "2024-01-01T00:00:00Z"},
+                "packageContent": format!("https://api.nuget.org/v3-flatcontainer/foo/{v}/foo.{v}.nupkg"),
+                "registration": format!("{up}/index.json")
+            })
+        };
+        let index = serde_json::json!({
+            "count": 3,
+            "items": [
+                {"@id": format!("{up}/index.json#page/1.0.0/2.0.0-rc.1"), "count": 2,
+                 "lower": "1.0.0", "upper": "2.0.0-rc.1", "items": [leaf("1.0.0"), leaf("2.0.0-rc.1")]},
+                {"@id": format!("{up}/page/4.0.0/5.0.0-beta.2.json"), "count": 3,
+                 "lower": "4.0.0", "upper": "5.0.0-beta.2"},
+                {"@id": format!("{up}/page/6.0.0-rc.1/6.0.0-rc.2.json"), "count": 2,
+                 "lower": "6.0.0-rc.1", "upper": "6.0.0-rc.2"}
+            ]
+        });
+        let page = |lower: &str, upper: &str, versions: &[&str]| {
+            serde_json::json!({
+                "@id": format!("{up}/page/{lower}/{upper}.json"), "count": versions.len(),
+                "lower": lower, "upper": upper,
+                "items": versions.iter().map(|v| leaf(v)).collect::<Vec<_>>()
+            })
+        };
+        for (key, doc) in [
+            ("nuget/registration/foo/index.json".to_string(), index),
+            (
+                registration_page_key("foo", "4.0.0", "5.0.0-beta.2"),
+                page(
+                    "4.0.0",
+                    "5.0.0-beta.2",
+                    &["4.0.0", "4.5.0-rc.1", "5.0.0-beta.2"],
+                ),
+            ),
+            (
+                registration_page_key("foo", "6.0.0-rc.1", "6.0.0-rc.2"),
+                page("6.0.0-rc.1", "6.0.0-rc.2", &["6.0.0-rc.1", "6.0.0-rc.2"]),
+            ),
+        ] {
+            ctx.state
+                .storage
+                .put(&key, doc.to_string().as_bytes())
+                .await
+                .unwrap();
+        }
+        let get = |path: String| {
+            let app = ctx.app.clone();
+            async move {
+                let resp = send(&app, Method::GET, &path, "").await;
+                let status = resp.status();
+                let gzip = resp.headers().get("content-encoding").is_some();
+                let body = body_bytes(resp).await;
+                let text = if gzip {
+                    let mut s = String::new();
+                    flate2::read::GzDecoder::new(&body[..])
+                        .read_to_string(&mut s)
+                        .unwrap();
+                    s
+                } else {
+                    String::from_utf8(body.to_vec()).unwrap()
+                };
+                (
+                    status,
+                    serde_json::from_str::<serde_json::Value>(&text).ok(),
+                )
+            }
+        };
+
+        for hive in ["registration-semver1", "registration-gz-semver1"] {
+            let (status, doc) = get(format!("/nuget/v3/{hive}/foo/index.json")).await;
+            assert_eq!(status, StatusCode::OK, "{hive}");
+            let doc = doc.unwrap();
+            assert_eq!(doc["count"], 2, "{hive}: {doc}");
+            let r = &doc["items"][1];
+            assert_eq!(r["count"], 1, "{hive}: {r}");
+            assert_eq!(
+                (r["lower"].as_str(), r["upper"].as_str()),
+                (Some("4.0.0"), Some("4.0.0"))
+            );
+            assert!(r.get("items").is_none(), "{hive}: stays by reference");
+            // The page URL keeps the full page's bounds, and the page agrees with the index.
+            let page_url = r["@id"].as_str().unwrap();
+            assert!(
+                page_url.ends_with(&format!("/{hive}/foo/page/4.0.0/5.0.0-beta.2.json")),
+                "{page_url}"
+            );
+            let (status, page) = get(page_url
+                .split_once("/nuget/")
+                .map(|(_, p)| format!("/nuget/{p}"))
+                .unwrap())
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let page = page.unwrap();
+            assert_eq!(
+                (page["count"].clone(), page["upper"].clone()),
+                (serde_json::json!(1), serde_json::json!("4.0.0"))
+            );
+
+            // Leaves: an inlined and a referenced SemVer 1 one answer; a SemVer 2 one is absent.
+            for (version, want) in [
+                ("1.0.0", StatusCode::OK),
+                ("4.0.0", StatusCode::OK),
+                ("4.5.0-rc.1", StatusCode::NOT_FOUND),
+                ("2.0.0-rc.1", StatusCode::NOT_FOUND),
+            ] {
+                let (status, body) = get(format!("/nuget/v3/{hive}/foo/{version}.json")).await;
+                assert_eq!(status, want, "{hive} {version}");
+                if want == StatusCode::OK {
+                    let body = body.unwrap();
+                    assert!(
+                        body["@id"]
+                            .as_str()
+                            .unwrap()
+                            .ends_with(&format!("/nuget/v3/{hive}/foo/{version}.json")),
+                        "{body}"
+                    );
+                    assert_eq!(body["listed"], true);
+                    assert_eq!(body["published"], "2024-01-01T00:00:00Z");
+                    assert!(
+                        body["packageContent"]
+                            .as_str()
+                            .unwrap()
+                            .contains("/v3/flatcontainer/foo/"),
+                        "{body}"
+                    );
+                    assert!(
+                        body["registration"]
+                            .as_str()
+                            .unwrap()
+                            .ends_with(&format!("/{hive}/foo/index.json")),
+                        "{body}"
+                    );
+                    assert!(
+                        body["catalogEntry"].as_str().unwrap().contains("catalog0"),
+                        "{body}"
+                    );
+                }
+            }
+        }
+        // The SemVer 2 hive serves its SemVer 2 leaves, inlined and referenced.
+        for version in ["2.0.0-rc.1", "4.5.0-rc.1"] {
+            let (status, _) = get(format!("/nuget/v3/registration/foo/{version}.json")).await;
+            assert_eq!(status, StatusCode::OK, "{version}");
+        }
+        let (status, _) = get("/nuget/v3/registration/foo/9.9.9.json".to_string()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A registration document past REGISTRATION_INLINE_MAX goes through the hive on the
+    /// blocking pool and reads the same as a small one.
+    #[tokio::test]
+    async fn test_semver1_hive_big_document() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::Method;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+        let leaves: Vec<_> = (0..1500)
+            .map(|i| {
+                let v = if i % 2 == 0 { format!("1.0.{i}") } else { format!("1.0.{i}-rc.1") };
+                serde_json::json!({"@id": format!("https://api.nuget.org/v3/registration5-gz-semver2/foo/{v}.json"),
+                                   "catalogEntry": {"id": "Foo", "version": v}})
+            })
+            .collect();
+        let index = serde_json::json!({"count": 1, "items": [{
+            "@id": "https://api.nuget.org/v3/registration5-gz-semver2/foo/index.json#page/1.0.0/1.0.1499-rc.1",
+            "count": leaves.len(), "lower": "1.0.0", "upper": "1.0.1499-rc.1", "items": leaves}]});
+        let raw = index.to_string();
+        assert!(raw.len() > REGISTRATION_INLINE_MAX * 2);
+        ctx.state
+            .storage
+            .put("nuget/registration/foo/index.json", raw.as_bytes())
+            .await
+            .unwrap();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration-semver1/foo/index.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(doc["items"][0]["count"], 750);
+        assert_eq!(doc["items"][0]["upper"], "1.0.1498");
     }
 
     #[tokio::test]
