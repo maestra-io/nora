@@ -4447,6 +4447,8 @@ async fn maintenance_tick(state: &AppState, tick_count: u64, work: &MaintenanceW
         }
         let mut locks = state.publish_locks.lock();
         locks.retain(|_, arc| Arc::strong_count(arc) > 1);
+        drop(locks);
+        state.storage.prune_locks();
         let storage_path = state.config.storage.path.clone();
         let spool_dir = state.config.server.spool_dir(&storage_path);
         tokio::task::spawn_blocking(move || {

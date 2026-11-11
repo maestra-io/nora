@@ -10,7 +10,7 @@
 //! bypassing NORA).
 //!
 //! Persistence: append-only NDJSON file (`.nora-pins.ndjson`) compacted on
-//! startup. Each line: `{"k":"storage/key","h":"sha256hex"}`. An empty `h`
+//! startup and when it outgrows its live entries. Each line: `{"k":"storage/key","h":"sha256hex"}`. An empty `h`
 //! marks a deletion (tombstone).
 //!
 //! Durability: every pin write **propagates** its I/O result to the caller,
@@ -23,12 +23,12 @@
 //! `fsync` on `put_from_path`, so the pin is never made *more* durable than the
 //! bytes it pins.)
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-use tracing::warn;
+use tracing::{error, warn};
 
 #[derive(Serialize, Deserialize)]
 struct PinEntry {
@@ -36,8 +36,22 @@ struct PinEntry {
     h: String,
 }
 
+/// The log file as its writers see it. One writer at a time holds it, for the whole of
+/// check, append and map update.
+struct Log {
+    /// Lines in the file, live or not.
+    lines: usize,
+    /// Whether the file may be rewritten from the map. False after a load that did not read
+    /// every entry: a rewrite would then drop the pins that were not read.
+    complete: bool,
+}
+
+/// A log shorter than this is never compacted while running.
+const COMPACT_MIN_LINES: usize = 4096;
+
 pub struct HashPinStore {
     pins: RwLock<HashMap<String, String>>,
+    log: Mutex<Log>,
     path: PathBuf,
 }
 
@@ -46,18 +60,70 @@ impl HashPinStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let mut pins = HashMap::new();
+        let mut log = Log {
+            lines: 0,
+            complete: true,
+        };
 
-        // Replay NDJSON log — last entry per key wins.
+        // Replay NDJSON log — last entry per key wins. A line that cannot be read is skipped
+        // and the ones after it still load: stopping there would drop every later pin.
         match std::fs::File::open(&path) {
             Ok(file) => {
-                let reader = std::io::BufReader::new(file);
-                for line in reader.lines().map_while(Result::ok) {
-                    if let Ok(entry) = serde_json::from_str::<PinEntry>(&line) {
-                        if entry.h.is_empty() {
+                let mut reader = std::io::BufReader::new(file);
+                let mut line = Vec::new();
+                let mut bad = 0usize;
+                let mut torn = false;
+                loop {
+                    line.clear();
+                    match reader.read_until(b'\n', &mut line) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                path = %path.display(),
+                                loaded = pins.len(),
+                                "hash-pin log read failed part way; the pins after this point \
+                                 are NOT loaded (their keys verify open-world until this is fixed)"
+                            );
+                            log.complete = false;
+                            break;
+                        }
+                    }
+                    log.lines += 1;
+                    torn = line.last() != Some(&b'\n');
+                    if line.iter().all(u8::is_ascii_whitespace) {
+                        continue;
+                    }
+                    match serde_json::from_slice::<PinEntry>(&line) {
+                        Ok(entry) if entry.h.is_empty() => {
                             pins.remove(&entry.k);
-                        } else {
+                        }
+                        Ok(entry) => {
                             pins.insert(entry.k, entry.h);
                         }
+                        Err(_) => bad += 1,
+                    }
+                }
+                if bad > 0 {
+                    error!(
+                        path = %path.display(),
+                        unreadable_lines = bad,
+                        loaded = pins.len(),
+                        "hash-pin log has lines that do not parse; their pins are NOT loaded \
+                         and the log is left as it is (no compaction) until it is repaired"
+                    );
+                    log.complete = false;
+                }
+                // A last line without its newline (a crash mid-append) would swallow the
+                // next entry appended after it.
+                if torn {
+                    if let Err(e) = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .and_then(|mut f| f.write_all(b"\n"))
+                    {
+                        warn!(error = %e, path = %path.display(), "hash-pin log: could not end its last line");
                     }
                 }
             }
@@ -68,31 +134,28 @@ impl HashPinStore {
             // surface it loudly so the operator notices the integrity index did
             // not load rather than discovering it only on a missed tamper.
             Err(e) => {
-                warn!(
+                error!(
                     error = %e,
                     path = %path.display(),
                     "hash-pin log present but unreadable; integrity index NOT loaded \
                      (keys verify open-world until this is fixed)"
                 );
+                log.complete = false;
             }
         }
 
         let store = Self {
             pins: RwLock::new(pins),
+            log: Mutex::new(log),
             path,
         };
 
         // Compact on startup to remove tombstones and duplicates. Compaction is
         // an optimization, not an integrity-critical write: a failure leaves the
         // (correct, already-persisted) uncompacted log in place, so it is logged
-        // and tolerated rather than fatal.
-        if let Err(e) = store.compact() {
-            warn!(
-                error = %e,
-                path = %store.path.display(),
-                "hash-pin compaction on startup failed; continuing with uncompacted log"
-            );
-        }
+        // and tolerated rather than fatal. A log that was not read in full is never
+        // rewritten or removed: it still holds the pins this process could not load.
+        store.compact(&mut store.log.lock());
         store
     }
 
@@ -112,16 +175,18 @@ impl HashPinStore {
             "record_hash: expected 64-char hex SHA-256, got: {hash}"
         );
 
-        // Atomic per key: hold the write lock across check → append → insert.
-        // The disk append happens before the in-memory update (durability), and
-        // no concurrent record_hash() for the same key can interleave its append
-        // and insert with ours, so disk and memory cannot diverge. (An earlier
-        // two-lock version — read-check, release, append, write-insert — had a
-        // TOCTOU where two same-key writers' append and insert orders disagreed.)
-        let mut pins = self.pins.write();
-        if pins.get(key).is_none_or(|existing| *existing != hash) {
+        // One writer at a time, across check → append → insert: the disk append happens
+        // before the in-memory update (durability), and two writers of one key cannot
+        // interleave their appends and inserts, so disk and memory cannot diverge. (An
+        // earlier version without it had a TOCTOU where the two orders disagreed.) Readers
+        // wait only for the map update, never for the file I/O: the map's own lock is taken
+        // after the append.
+        let mut log = self.log.lock();
+        if self.get(key).as_deref() != Some(hash) {
             Self::append_to_file(&self.path, key, hash)?;
-            pins.insert(key.to_string(), hash.to_string());
+            log.lines += 1;
+            self.pins.write().insert(key.to_string(), hash.to_string());
+            self.compact_if_grown(&mut log);
         }
         Ok(())
     }
@@ -134,11 +199,13 @@ impl HashPinStore {
     /// before verification, and a later `put()` of the key overwrites the pin —
     /// so callers may treat a remove failure as non-fatal.
     pub fn remove(&self, key: &str) -> io::Result<()> {
-        // Atomic tombstone: append + drop under one write lock (see record_hash()).
-        let mut pins = self.pins.write();
-        if pins.contains_key(key) {
+        // Tombstone, then the map, as one writer (see record_hash()).
+        let mut log = self.log.lock();
+        if self.get(key).is_some() {
             Self::append_to_file(&self.path, key, "")?;
-            pins.remove(key);
+            log.lines += 1;
+            self.pins.write().remove(key);
+            self.compact_if_grown(&mut log);
         }
         Ok(())
     }
@@ -148,22 +215,52 @@ impl HashPinStore {
         self.pins.read().get(key).cloned()
     }
 
+    /// Compact once the log holds more than twice the live pins: every overwrite of a
+    /// mutable key appends a line, and the file would otherwise grow until a restart. The
+    /// rewrite is amortized over the appends that caused it and runs on the writer's
+    /// thread (the blocking pool); readers are not held.
+    fn compact_if_grown(&self, log: &mut Log) {
+        let live = self.pins.read().len();
+        if log.lines > COMPACT_MIN_LINES && log.lines / 2 > live {
+            self.compact(log);
+        }
+    }
+
     /// Compact the NDJSON file: rewrite with only live entries via a temp file
-    /// and an atomic rename. Returns any I/O error; the caller decides whether a
-    /// compaction failure is fatal (it is not — see [`HashPinStore::new`]).
-    fn compact(&self) -> io::Result<()> {
+    /// and an atomic rename. Does nothing to a log whose load was incomplete. A failure is
+    /// logged and tolerated: the uncompacted log stays, correct as it is.
+    fn compact(&self, log: &mut Log) {
+        if !log.complete {
+            return;
+        }
+        match self.rewrite() {
+            Ok(lines) => log.lines = lines,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    path = %self.path.display(),
+                    "hash-pin compaction failed; continuing with uncompacted log"
+                );
+                // Ask again only after the log has grown as much once more.
+                log.lines = self.pins.read().len();
+            }
+        }
+    }
+
+    /// The file rewritten from the map; returns its line count.
+    fn rewrite(&self) -> io::Result<usize> {
         let pins = self.pins.read();
         if pins.is_empty() {
             // No live pins: remove the file if present; an absent file is fine.
             return match std::fs::remove_file(&self.path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Ok(()) => Ok(0),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
                 Err(e) => Err(e),
             };
         }
 
         let temp_path = self.path.with_extension("ndjson.tmp");
-        let mut file = std::fs::File::create(&temp_path)?;
+        let mut file = io::BufWriter::new(std::fs::File::create(&temp_path)?);
         for (key, hash) in pins.iter() {
             let entry = PinEntry {
                 k: key.clone(),
@@ -172,8 +269,12 @@ impl HashPinStore {
             let line = serde_json::to_string(&entry).map_err(io::Error::other)?;
             writeln!(file, "{line}")?;
         }
+        // On disk before it replaces the log: a crash must not leave an empty index.
+        file.into_inner()
+            .map_err(io::IntoInnerError::into_error)?
+            .sync_all()?;
         std::fs::rename(&temp_path, &self.path)?;
-        Ok(())
+        Ok(pins.len())
     }
 
     /// Append a single entry to the NDJSON file (static, safe to call from any
@@ -374,5 +475,123 @@ mod tests {
             "in-memory pin must match the durably-recorded pin (no TOCTOU divergence)"
         );
         assert!(in_memory.is_some(), "some writer must have recorded a pin");
+    }
+
+    fn line(key: &str, data: &[u8]) -> String {
+        format!("{{\"k\":\"{key}\",\"h\":\"{}\"}}\n", sha(data))
+    }
+
+    /// R4-C04: a line that does not read (here: not UTF-8) in the middle of the log costs
+    /// that line only. The pins after it load, and the log is not rewritten from the partial
+    /// map: the damaged line stays for a repair.
+    #[test]
+    fn a_corrupt_line_in_the_middle_loses_no_other_pin_and_blocks_compaction() {
+        let dir = TempDir::new().unwrap();
+        let path = pin_path(&dir);
+        let mut bytes = line("a", b"a").into_bytes();
+        bytes.extend_from_slice(b"{\"k\":\"b\",\"h\":\"\xff\xfe\"}\n");
+        bytes.extend_from_slice(line("c", b"c").as_bytes());
+        bytes.extend_from_slice(line("a", b"a2").as_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let store = HashPinStore::new(&path);
+        assert_eq!(store.get("a"), Some(sha(b"a2")));
+        assert_eq!(store.get("c"), Some(sha(b"c")), "a pin after the bad line");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "the log is untouched");
+
+        // Writes still append, and a store of nothing but tombstones removes nothing.
+        store.record_hash("d", &sha(b"d")).unwrap();
+        for key in ["a", "c", "d"] {
+            store.remove(key).unwrap();
+        }
+        let after = std::fs::read(&path).unwrap();
+        assert!(after.starts_with(&bytes), "the log only grew");
+        drop(store);
+        assert_eq!(HashPinStore::new(&path).get("d"), None);
+        assert!(path.exists());
+    }
+
+    /// R4-C04: a log that exists and cannot be read is neither removed nor rewritten by the
+    /// start that could not load it. (A directory under the name: `open` succeeds and the
+    /// read fails, for root as well.)
+    #[test]
+    fn an_unreadable_log_is_left_in_place() {
+        let dir = TempDir::new().unwrap();
+        let path = pin_path(&dir);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("evidence"), b"x").unwrap();
+
+        let store = HashPinStore::new(&path);
+        assert_eq!(store.get("a"), None);
+        assert!(!store.log.lock().complete);
+        assert!(path.join("evidence").exists(), "nothing was removed");
+    }
+
+    /// R4-C04, the open-fails arm: the log is a file this process may not open.
+    #[cfg(unix)]
+    #[test]
+    fn a_log_that_cannot_be_opened_is_left_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = pin_path(&dir);
+        let content = line("a", b"a");
+        std::fs::write(&path, &content).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            return; // root reads anything: the arm cannot be reached here
+        }
+
+        let store = HashPinStore::new(&path);
+        assert_eq!(store.get("a"), None);
+        drop(store);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        assert_eq!(HashPinStore::new(&path).get("a"), Some(sha(b"a")));
+    }
+
+    /// A last line cut by a crash mid-append does not swallow the entry appended next.
+    #[test]
+    fn an_append_after_a_torn_last_line_is_read_back() {
+        let dir = TempDir::new().unwrap();
+        let path = pin_path(&dir);
+        std::fs::write(&path, format!("{}{{\"k\":\"torn", line("a", b"a"))).unwrap();
+
+        let store = HashPinStore::new(&path);
+        store.record_hash("b", &sha(b"b")).unwrap();
+        drop(store);
+        let store = HashPinStore::new(&path);
+        assert_eq!(store.get("a"), Some(sha(b"a")));
+        assert_eq!(store.get("b"), Some(sha(b"b")));
+    }
+
+    /// R4-P17: the log of a running store is compacted once it holds more than twice the
+    /// live pins, not only at the next start.
+    #[test]
+    fn a_log_of_overwrites_is_compacted_while_running() {
+        let dir = TempDir::new().unwrap();
+        let path = pin_path(&dir);
+        let store = HashPinStore::new(&path);
+        for i in 0..=COMPACT_MIN_LINES {
+            store
+                .record_hash("npm/a/metadata.json", &sha(&i.to_le_bytes()))
+                .unwrap();
+        }
+        let lines = std::fs::read_to_string(&path).unwrap().lines().count();
+        assert_eq!(lines, 1, "one live pin, one line");
+        assert_eq!(
+            store.get("npm/a/metadata.json"),
+            Some(sha(&COMPACT_MIN_LINES.to_le_bytes()))
+        );
+    }
+
+    /// R4-P17: a pin append that is stuck on the disk holds no reader. The writer lock is
+    /// held here as an append in progress holds it.
+    #[test]
+    fn a_read_does_not_wait_for_an_append() {
+        let dir = TempDir::new().unwrap();
+        let store = HashPinStore::new(pin_path(&dir));
+        store.record_hash("k", &sha(b"v")).unwrap();
+        let _appending = store.log.lock();
+        assert_eq!(store.get("k"), Some(sha(b"v")));
     }
 }
