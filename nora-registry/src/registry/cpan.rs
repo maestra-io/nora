@@ -382,6 +382,21 @@ async fn distribution_proxy(
                 ) {
                     return response;
                 }
+                // The fallback serves a cached copy: the cache-hit quarantine gate holds here too.
+                if let Some(resp) = crate::digest_quarantine::cache_gate_dated(
+                    &state.digest_store,
+                    &state.storage,
+                    &storage_key,
+                    "cpan",
+                    data,
+                    &q_mode,
+                    q_secs,
+                    None,
+                )
+                .await
+                {
+                    return resp;
+                }
                 state.metrics.record_download("cpan");
                 state.metrics.record_cache_hit("cpan");
                 state.activity.push(ActivityEntry::new(
@@ -406,6 +421,21 @@ async fn distribution_proxy(
                         data,
                     ) {
                         return response;
+                    }
+                    // The fallback serves a cached copy: the cache-hit quarantine gate holds here too.
+                    if let Some(resp) = crate::digest_quarantine::cache_gate_dated(
+                        &state.digest_store,
+                        &state.storage,
+                        &storage_key,
+                        "cpan",
+                        data,
+                        &q_mode,
+                        q_secs,
+                        None,
+                    )
+                    .await
+                    {
+                        return resp;
                     }
                     tracing::warn!(
                         registry = "cpan",
@@ -1661,6 +1691,57 @@ mod cpan_fallback_holds_the_pin {
         let status = resp.status();
         let stale = resp.headers().contains_key("x-nora-stale");
         (status, stale, body_bytes(resp).await.to_vec())
+    }
+
+    /// The same fallbacks under quarantine `enforce`: the stored copy's digest was first seen
+    /// `seen_days_ago`.
+    async fn quarantined_fallback(upstream_404: bool, seen_days_ago: i64) -> StatusCode {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let upstream = if upstream_404 {
+            server.uri()
+        } else {
+            "http://127.0.0.1:9".to_string()
+        };
+        let storage = Storage::from_backend(std::sync::Arc::new(SecondReadFails {
+            inner: ObjectStorage::in_memory(),
+            reads: AtomicUsize::new(0),
+        }));
+        let ctx = create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.cpan.enabled = true;
+            cfg.cpan.proxy = Some(upstream);
+            cfg.cpan.serve_stale = true;
+            cfg.curation.cpan.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+            cfg.curation.cpan.quarantine_ttl = Some("7d".to_string());
+        });
+        ctx.state.storage.put(KEY, STORED).await.unwrap();
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(STORED)));
+        let seen = chrono::Utc::now().timestamp() - seen_days_ago * 86400;
+        ctx.state
+            .digest_store
+            .record("cpan", &digest, "https://upstream.example", Some(seen));
+        send(&ctx.app, Method::GET, URI, "").await.status()
+    }
+
+    /// A cached copy served on a fallback passes the cache-hit quarantine gate: a digest the
+    /// quarantine holds is refused there too, a matured one is served.
+    #[tokio::test]
+    async fn the_fallbacks_hold_the_quarantine() {
+        for upstream_404 in [true, false] {
+            assert_eq!(
+                quarantined_fallback(upstream_404, 0).await,
+                StatusCode::FORBIDDEN,
+                "held, upstream_404={upstream_404}"
+            );
+            assert_eq!(
+                quarantined_fallback(upstream_404, 30).await,
+                StatusCode::OK,
+                "matured, upstream_404={upstream_404}"
+            );
+        }
     }
 
     #[tokio::test]
