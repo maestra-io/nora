@@ -1,9 +1,14 @@
 [nora]
 packages = ["nora-registry"]
 engine = "Llvm"
-fail-under = 60
+# Measured 88.4% on 11.11.2026 with main.rs included; the floor leaves room for a
+# run's noise, not for a PR that lands untested code (the diff gate covers that too).
+fail-under = 86
 out = ["Json", "Html", "Lcov"]
 output-dir = "coverage"
 test-timeout = "5m"
-exclude-files = ["nora-registry/src/ui/*", "nora-registry/src/main.rs", "nora-registry/src/openapi.rs"]
+# main.rs is measured: startup, the middleware stack and the maintenance loop live there.
+exclude-files = ["nora-registry/src/ui/*", "nora-registry/src/openapi.rs"]
+# Without it tarpaulin pins RUST_TEST_THREADS=1 and the suite takes about four times as long.
+implicit-test-threads = true
 workspace = false

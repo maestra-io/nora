@@ -274,11 +274,15 @@ for file in "$REGISTRY_DIR"/*.rs; do
 done
 
 # ── Check 5: concurrent test coverage ──
+# A test that publishes the same artifact from several tasks at once carries the marker
+# `lock-audit: concurrent-publish-test` in a comment. The marker is searched in the
+# format's own source file: a name or a comment that merely mentions concurrency does
+# not count, and neither does a test in another format's file.
 echo ""
 echo "--- Check 5: concurrent publish tests ---"
 
 for format in maven cargo npm pypi docker; do
-    if grep -rq "concurrent.*publish\|concurrent.*upload\|tokio::join.*publish" "$REGISTRY_DIR/../" --include="*.rs" 2>/dev/null | grep -qi "$format"; then
+    if grep -qs "lock-audit: concurrent-publish-test" "$REGISTRY_DIR"/"$format"*.rs; then
         green "$format has concurrent publish test"
     else
         info "$format — no concurrent publish test found"

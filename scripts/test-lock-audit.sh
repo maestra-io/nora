@@ -100,6 +100,19 @@ async fn handler(state: AppState, key: String) -> Response {
 }
 RS
 
+# Check 5 fixtures: the marker in the format's own file counts; prose about concurrency
+# without the marker does not (the check used to pipe `grep -q` into a second grep and
+# could never report a test).
+cat > "$TMP/cargo_registry.rs" <<'RS'
+// lock-audit: concurrent-publish-test
+#[tokio::test]
+async fn two_publishes_at_once() {}
+RS
+cat > "$TMP/npm.rs" <<'RS'
+// concurrent publish of two versions is serialized by the lock
+async fn publish() {}
+RS
+
 OUT="$(bash "$AUDIT" "$TMP" 2>&1)"
 
 expect_reported() {
@@ -126,6 +139,11 @@ expect_silent   "exclusive.rs" "a write on a mutually exclusive branch is not re
 expect_silent   "annotated.rs" "a write with a LOCK-SAFE reason in its block is not reported"
 expect_reported "annotated_no_reason.rs" "a bare LOCK-SAFE marker with no reason does not silence"
 expect_silent   "annotated_outer.rs" "a LOCK-SAFE reason one block out still covers the write"
+
+echo "=== lock-audit Check 5 self-test ==="
+expect_reported "cargo has concurrent publish test" "a marked test in the format's file is found"
+expect_reported "npm — no concurrent publish test found" "prose about concurrency without the marker is not a test"
+expect_reported "maven — no concurrent publish test found" "a format with no file has no test"
 
 # The audit must behave the same on whatever awk the machine has: gawk here, mawk on
 # Debian, Ubuntu and the CI images. A gawk-only construct aborts under mawk, and an

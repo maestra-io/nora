@@ -52,8 +52,13 @@ COPY --from=builder /nora /nora
 # ── Cross-compile arm64 (runs natively on x86, no QEMU) ──────────────────
 FROM rust:1-alpine3.23@sha256:42c2519fdf75d9e34cc61a1aaf34b1a684da9bfd65fe5daefef98d92a801b001 AS cross-arm64
 
+# musl.cc publishes no versioned URL: the archive is pinned by sha256 (it matches the
+# site's SHA512SUMS as of 2026-11-11), so a changed or tampered toolchain fails the build.
 RUN apk add --no-cache musl-dev \
-    && wget -qO- https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /opt
+    && wget -qO /tmp/musl-cross.tgz https://musl.cc/aarch64-linux-musl-cross.tgz \
+    && echo "c909817856d6ceda86aa510894fa3527eac7989f0ef6e87b5721c58737a06c38  /tmp/musl-cross.tgz" | sha256sum -c - \
+    && tar xzf /tmp/musl-cross.tgz -C /opt \
+    && rm /tmp/musl-cross.tgz
 
 ENV PATH="/opt/aarch64-linux-musl-cross/bin:$PATH" \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc

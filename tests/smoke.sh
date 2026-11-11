@@ -6,6 +6,8 @@ set -euo pipefail
 # Exit code 0 = all passed, non-zero = failures.
 
 NORA_BIN="${NORA_BIN:-./target/release/nora}"
+# Absolute: the npm section changes directory before the mirror section runs the binary.
+NORA_BIN="$(cd "$(dirname "$NORA_BIN")" && pwd)/$(basename "$NORA_BIN")"
 PORT="${NORA_TEST_PORT:-14000}"
 BASE="http://localhost:${PORT}"
 STORAGE_DIR=$(mktemp -d)
@@ -14,7 +16,9 @@ FAILED=0
 NORA_PID=""
 
 cleanup() {
-    [ -n "$NORA_PID" ] && kill "$NORA_PID" 2>/dev/null || true
+    # Wait for the shutdown: the server still writes into the storage directory while it
+    # stops, and a failed `rm` in this trap would become the script's exit code.
+    [ -n "$NORA_PID" ] && kill "$NORA_PID" 2>/dev/null && wait "$NORA_PID" 2>/dev/null || true
     rm -rf "$STORAGE_DIR"
 }
 trap cleanup EXIT
@@ -429,14 +433,14 @@ else
     fail "Raw path traversal returned $TRAVERSAL"
 fi
 
-# Test: Raw overwrite
+# Test: Raw is immutable — a second PUT with other bytes is 409 and the first stays
 echo "version-1" | curl -sf -X PUT --data-binary @- "$BASE/raw/integration/overwrite.txt" >/dev/null 2>&1
-echo "version-2" | curl -sf -X PUT --data-binary @- "$BASE/raw/integration/overwrite.txt" >/dev/null 2>&1
+REPUT=$(echo "version-2" | curl -s -o /dev/null -w "%{http_code}" -X PUT --data-binary @- "$BASE/raw/integration/overwrite.txt")
 CONTENT=$(curl -sf "$BASE/raw/integration/overwrite.txt" 2>/dev/null)
-if [ "$CONTENT" = "version-2" ]; then
-    pass "Raw overwrite works"
+if [ "$REPUT" = "409" ] && [ "$CONTENT" = "version-1" ]; then
+    pass "Raw re-PUT rejected (409), content unchanged"
 else
-    fail "Raw overwrite: got '$CONTENT'"
+    fail "Raw re-PUT returned $REPUT, content '$CONTENT'"
 fi
 
 # Test: Raw delete

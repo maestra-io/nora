@@ -5024,6 +5024,7 @@ mod crate_name_one_canon {
 
     /// Two spellings published at once: the canon's lock lets one through and the other finds its
     /// record — one 200, one 409 — even when reading the record takes long enough for both to start.
+    // lock-audit: concurrent-publish-test
     #[tokio::test]
     async fn two_spellings_published_at_once_do_not_both_pass() {
         let server = squatter().await;
