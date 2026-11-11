@@ -153,6 +153,12 @@ under `observe`, where nothing is refused (fluxcd `scripts/nora-image-check.py`)
 | 200, admitted (past the TTL, dated past it by the registry, quarantine off, or a local push with no proxy record) | `mature` | absent |
 | 403 under `enforce` | `pending` or `new`, as before | unix seconds the hold ends |
 
+A plain request for a digest NORA has not cached fetches it and starts its clock. To read a
+verdict without that, send `Cache-Control: only-if-cached` (RFC 9111 5.2.1.7): NORA answers
+from its cache only, never asks an upstream and records nothing; a manifest it does not hold
+is `504` (`MANIFEST_UNKNOWN`), a cached tag answers its cached copy. The github-actions
+`base-images` PR check asks this way (issues-maestra#1649).
+
 ## Break-glass: admit a held image before the TTL (`quarantine_exceptions`)
 
 When to use: an urgent fix (a CVE, an outage) needs an image digest that the quarantine holds,
