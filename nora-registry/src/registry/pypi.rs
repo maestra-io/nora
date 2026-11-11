@@ -5541,7 +5541,10 @@ mod integration_tests {
     }
 
     /// R4-P12: a proxied copy is told by its provenance marker alone: one HEAD before the
-    /// GET of the file, not a HEAD of the file as well.
+    /// GET of the file, not a HEAD of the file as well. The one exception is the first hit
+    /// on a digest the quarantine ledger holds no record of (R4-C05): that hit reads the
+    /// file's write time once to date it, and the record it leaves makes every later hit
+    /// cost the marker HEAD alone.
     #[tokio::test]
     async fn a_proxied_hit_costs_one_head_before_its_get() {
         use crate::test_helpers::{
@@ -5555,6 +5558,17 @@ mod integration_tests {
         let marker = super::proxied_marker_key(key);
         ctx.state.storage.put(key, b"sdist").await.unwrap();
         ctx.state.storage.put(&marker, b"cached").await.unwrap();
+        ops.reset();
+        let resp = send(&ctx.app, Method::GET, "/simple/hit/hit-1.0.tar.gz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(ops.calls("stat", &marker), 1, "{:?}", ops.snapshot());
+        assert_eq!(
+            ops.calls("stat", key),
+            1,
+            "first sight: {:?}",
+            ops.snapshot()
+        );
+
         ops.reset();
         let resp = send(&ctx.app, Method::GET, "/simple/hit/hit-1.0.tar.gz", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
