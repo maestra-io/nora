@@ -714,12 +714,14 @@ async fn build_suite(
     let mut served: HashSet<String> = HashSet::new();
     // Every ledger of the repo: one pool file can be listed by several suites, components
     // and architectures.
+    // An unreadable ledger fails the build: dating without it would hold, and write to
+    // this suite's ledger, a file another suite serves.
     let ledgers = match min_age {
         Some(_) => state
             .storage
             .list(&format!("{}/ledger/", meta(repo)))
             .await
-            .unwrap_or_default(),
+            .map_err(|e| BuildError::Internal(e.to_string()))?,
         None => Vec::new(),
     };
     for ((comp, arch), path) in &indexes {
@@ -795,7 +797,9 @@ async fn build_suite(
                 .map(|s| s.filename.clone())
                 .collect();
             let others: Vec<String> = ledgers.iter().filter(|k| **k != lkey).cloned().collect();
-            let earliest = earliest_seen(state, &others, &wanted).await;
+            let earliest = earliest_seen(state, &others, &wanted)
+                .await
+                .map_err(BuildError::Internal)?;
             for s in current_st.iter_mut().chain(retired.iter_mut()) {
                 if let Some(&t) = earliest.get(&s.filename) {
                     if t < s.first_seen {
@@ -996,16 +1000,19 @@ async fn earliest_seen(
     state: &AppState,
     keys: &[String],
     files: &HashSet<String>,
-) -> HashMap<String, i64> {
+) -> Result<HashMap<String, i64>, String> {
     let mut earliest: HashMap<String, i64> = HashMap::new();
     if files.is_empty() {
-        return earliest;
+        return Ok(earliest);
     }
     // ponytail: parses every ledger of the repo when a build has young files; a
     // repo-wide first-seen map if that gets slow.
     for key in keys {
-        let Some(ledger) = get_json::<Ledger>(state, key).await else {
-            continue;
+        let ledger: Ledger = match state.storage.get(key).await {
+            Ok(data) => serde_json::from_slice(&data).map_err(|e| format!("{key}: {e}"))?,
+            // Listed, then replaced or removed meanwhile: nothing to date from.
+            Err(crate::storage::StorageError::NotFound) => continue,
+            Err(e) => return Err(format!("{key}: {e}")),
         };
         let dates = ledger
             .seen
@@ -1019,7 +1026,7 @@ async fn earliest_seen(
             }
         }
     }
-    earliest
+    Ok(earliest)
 }
 
 async fn update_young(
@@ -1054,13 +1061,13 @@ async fn update_young(
                 .storage
                 .list_with_meta(&format!("{}/ledger/", meta(repo)))
                 .await
-                .unwrap_or_default()
+                .map_err(|e| e.to_string())?
                 .into_iter()
                 // A minute early: the storage clock may lag this one.
                 .filter(|(_, m)| m.modified as i64 >= since - 60)
                 .map(|(k, _)| k)
                 .collect();
-            let earliest = earliest_seen(state, &fresh, &files).await;
+            let earliest = earliest_seen(state, &fresh, &files).await?;
             let curation = state.curation();
             let engine = &curation.curation_engine;
             for m in held.values_mut() {
@@ -1721,6 +1728,24 @@ mod integration_tests {
         let files = &young["security/main/amd64"];
         assert!(!files.contains_key(&f), "{files:?}");
         assert!(files.contains_key(&corp), "{files:?}");
+    }
+
+    /// A ledger that cannot be read fails the dating, so the build fails and keeps the
+    /// last one, instead of holding a file the unread ledger dates older.
+    #[tokio::test]
+    async fn an_unreadable_ledger_fails_the_dating() {
+        let ctx = create_test_context_with_config(|cfg| cfg.deb.enabled = true);
+        let state = &ctx.state;
+        let bad = super::ledger_key("debian", "updates", "main", "amd64");
+        state.storage.put(&bad, b"not json").await.unwrap();
+        let gone = super::ledger_key("debian", "gone", "main", "amd64");
+        let files: std::collections::HashSet<String> =
+            ["pool/main/k_2_amd64.deb".to_string()].into();
+        assert!(super::earliest_seen(state, &[bad], &files).await.is_err());
+        assert_eq!(
+            super::earliest_seen(state, &[gone], &files).await,
+            Ok(Default::default())
+        );
     }
 
     #[tokio::test]
