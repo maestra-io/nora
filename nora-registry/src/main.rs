@@ -4897,8 +4897,10 @@ mod maintenance_loop_tests {
     }
 
     /// After a cut tick the next one starts at its slot: the slots the cut tick overran are
-    /// skipped, not run back to back against a store that is not answering.
-    #[tokio::test]
+    /// skipped, not run back to back against a store that is not answering. On tokio's
+    /// paused clock: with 50 ms slots on the wall clock a loaded runner (the coverage job)
+    /// measured 24 ms between two starts that are one slot apart.
+    #[tokio::test(start_paused = true)]
     async fn a_cut_tick_keeps_the_cadence() {
         const SLOT: Duration = Duration::from_millis(50);
         // A 150 ms deadline: tick 2 (at 50 ms) is cut at 200 ms, past the slots at 100 and 150.
