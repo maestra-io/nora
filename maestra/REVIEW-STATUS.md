@@ -212,7 +212,7 @@ Review of `769364f` (v1.3.3-maestra.3); verdict in issues-maestra#1442. `R2-NN` 
 
 ## Round 4 review (86)
 
-Full review of `maestra/main` d3285f3 on 11.11.2026 (core, format handlers, performance, tests and CI): 86 findings `R4-NN`, prefix `C` core, `R` format handlers, `T` tests and CI, `P` performance. Fixed in #151, #153, #155-#159, #161, #163-#176, #179, #180 (#174 fixed a red `maestra/main` between two of them). `deferred` rows and `(partly)` / `(minimum)` / `(report only)` notes wait on an owner decision.
+Full review of `maestra/main` d3285f3 on 11.11.2026 (core, format handlers, performance, tests and CI): 86 findings `R4-NN`, prefix `C` core, `R` format handlers, `T` tests and CI, `P` performance. Fixed in #151, #153, #155-#159, #161, #163-#176, #179, #180, #184 (#174 fixed a red `maestra/main` between two of them). `deferred` rows and `(partly)` / `(minimum)` / `(report only)` notes wait on an owner decision.
 
 Counts: deferred 2, fixed 84 (total 86).
 
@@ -277,7 +277,7 @@ Counts: deferred 2, fixed 84 (total 86).
 | R4-T15 | minor | ci | tower_governor is built with default features and pulls tonic (gRPC), which the service does not use (`nora-registry/Cargo.toml:52`) | fixed #161 | `tower_governor` without default features; `tonic` left the tree. |
 | R4-T16 | minor | ci | The fault-injection and demo features compile in no CI job; release-panic-check runs nowhere (`nora-registry/Cargo.toml:126`) | fixed #151 | Clippy for `fault-injection,demo`; a `release panic check` job. |
 | R4-T17 | minor | ci | lock-audit.sh Check 5 can never find a concurrency test: grep -q in a pipe prints nothing (`scripts/lock-audit.sh:284`) | fixed #151 | Check 5 looks for a marker in the format file; its self-test covers both outcomes. Marker exists for cargo only. |
-| R4-T18 | minor | cleanliness | 130 tests sleep on the real clock; some assert exact values after a fixed pause (`nora-registry/src/supervise.rs:516`) | fixed #173 (partly) | 35 of 130 wall-clock tests converted, each mutation-proven; two load flakes fixed at the cause. 94 remain. |
+| R4-T18 | minor | cleanliness | 130 tests sleep on the real clock; some assert exact values after a fixed pause (`nora-registry/src/supervise.rs:516`) | fixed #173, #184 (partly) | 67 of 130 wall-clock tests converted (35 in #173, 32 in #184), each mutation-proven; two load flakes fixed at the cause. 62 remain: 46 sleep as the poll interval of an event wait with a ceiling, 11 use real loopback sockets, 5 need a product clock seam. |
 | R4-T19 | minor | ci | The "upstream Release disabled" state lives outside git, and release.yml fires on any v* tag (`.github/workflows/release.yml:5`) | fixed #151 | `check-upstream-workflows.sh` fails on an unknown or active upstream workflow. |
 | R4-T20 | minor | ci | Kani: one proof for the whole project, and its workflow does not fire on PRs to maestra/main (`.github/workflows/kani.yml:12`) | fixed #151 | `kani proofs` job. |
 | R4-T21 | minor | ci | The image build pulls base images, toolchain and crates straight from public sources; the arm64 stage downloads musl.cc with no checksum (`Dockerfile:15`) | fixed #151 (partly) | musl.cc archive checked by sha256. Base images and crates still come from public sources. |
