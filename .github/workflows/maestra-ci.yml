@@ -217,6 +217,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: bash maestra/scripts/check-upstream-workflows.sh
 
+      # The import scripts write to the production registry daily; their tests run
+      # against fakes and never open a connection.
+      - name: Import script tests
+        working-directory: maestra/scripts/import
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet requests==2.32.5
+          for t in test_common test_enumerate test_import; do
+            "$RUNNER_TEMP/venv/bin/python" "$t.py" || exit 1
+          done
+
   # tarpaulin.toml holds the floor (`fail-under`); the diff gate fails a PR whose
   # changed .rs lines are covered below 70% (scripts/diff-coverage.py).
   coverage:
