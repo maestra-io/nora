@@ -950,7 +950,11 @@ pub(crate) async fn proxy_fetch_capped(
         false,
         auth,
         None,
-        move |r| async move { read_capped(r, cap).await.map(Bytes::from) },
+        // The caller's cap, never above `server.proxy_max_buffered_mb`.
+        move |r| async move {
+            let cap = cap.min(MAX_BUFFERED_BODY.load(std::sync::atomic::Ordering::Relaxed));
+            read_capped(r, cap).await.map(Bytes::from)
+        },
         cb,
         scope,
     )
@@ -1290,6 +1294,17 @@ async fn next_chunk(
     }
 }
 
+/// The byte cap of a proxied artifact. With spooling off (`threshold == 0`) the whole
+/// artifact is held in memory: it is a buffered body, under `buffered`
+/// (`server.proxy_max_buffered_mb`) as well as under `cap`.
+fn artifact_cap(threshold: u64, cap: Option<u64>, buffered: u64) -> Option<u64> {
+    if threshold == 0 {
+        Some(cap.map_or(buffered, |cap| cap.min(buffered)))
+    } else {
+        cap
+    }
+}
+
 /// Read an upstream response body, each chunk under the `idle` timeout: whole into
 /// memory up to `threshold` bytes (0 = always), else to a spool file under `spool`'s
 /// budget with a running SHA-256, never holding more than one chunk of it. A body
@@ -1304,6 +1319,11 @@ async fn read_or_spool(
 ) -> Result<ProxyBody, ProxyError> {
     use sha2::Digest;
     use tokio::io::AsyncWriteExt;
+    let cap = artifact_cap(
+        threshold,
+        cap,
+        MAX_BUFFERED_BODY.load(std::sync::atomic::Ordering::Relaxed),
+    );
     let over_cap = |len: u64| cap.is_some_and(|cap| len > cap);
     let too_large = || ProxyError::Spool(SpoolError::TooLarge(cap.unwrap_or_default()));
     let in_memory = |len: u64| threshold == 0 || len <= threshold;
@@ -1406,6 +1426,64 @@ pub(crate) async fn proxy_fetch_artifact(
 /// stays in the flight, and the first request to ask for it gets it and caches it.
 const ORPHAN_FILL_HOLD: Duration = Duration::from_secs(120);
 
+/// In-memory bodies kept for a retry, all fills together: past it an orphaned fill is
+/// dropped instead of kept (a spooled one is under the spool budget already). Clients
+/// that start many small downloads and leave cannot pin more than this.
+const ORPHAN_MEM_MAX: u64 = 256 * MIB;
+static ORPHAN_MEM_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A share of [`ORPHAN_MEM_MAX`], given back on drop.
+struct OrphanMem(u64);
+
+impl OrphanMem {
+    /// Room for keeping `body`; `None` when the kept in-memory bodies are at their limit.
+    fn reserve(body: &ProxyBody) -> Option<Self> {
+        Self::reserve_len(match body {
+            ProxyBody::Mem(b) => b.len() as u64,
+            ProxyBody::File(_) => 0,
+        })
+    }
+
+    fn reserve_len(len: u64) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        ORPHAN_MEM_HELD
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                (held + len <= ORPHAN_MEM_MAX).then_some(held + len)
+            })
+            .ok()
+            .map(|_| OrphanMem(len))
+    }
+}
+
+impl Drop for OrphanMem {
+    fn drop(&mut self) {
+        ORPHAN_MEM_HELD.fetch_sub(self.0, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// How long a fill goes on after the request that started it went away. An attended
+/// download is bounded by progress alone (the idle timeout); one nobody asked to finish
+/// must not hold an upstream connection and a spool reservation for as long as the
+/// upstream keeps trickling bytes.
+const UNATTENDED_FILL_LIMIT: Duration = Duration::from_secs(30 * 60);
+
+/// `fetch`, given up [`UNATTENDED_FILL_LIMIT`] after the request `waiting` answers went away.
+async fn while_attended<T, A>(
+    fetch: impl std::future::Future<Output = Result<T, ProxyError>>,
+    waiting: &mut tokio::sync::oneshot::Sender<A>,
+) -> Result<T, ProxyError> {
+    let unattended = async {
+        waiting.closed().await;
+        tokio::time::sleep(UNATTENDED_FILL_LIMIT).await;
+    };
+    tokio::select! {
+        result = fetch => result,
+        () = unattended => Err(ProxyError::Timeout(format!(
+            "fill abandoned: nobody waited for it for {UNATTENDED_FILL_LIMIT:?}"
+        ))),
+    }
+}
+
 /// What a cold-miss artifact flight shares: the body, and whether it still has to be
 /// cached by whoever takes it (the request that led the fill went away).
 #[derive(Clone)]
@@ -1500,16 +1578,16 @@ async fn fill_detached(
     use std::sync::atomic::{AtomicBool, Ordering};
     let flights = state.artifact_flights.clone();
     let flight_key = format!("fetch:{key}");
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (mut tx, rx) = tokio::sync::oneshot::channel();
     let task = async move {
         let orphaned = std::sync::Arc::new(AtomicBool::new(false));
         // `fetch` runs at most once per caller: as the leader, or as a follower whose
         // leader was cancelled or outlasted the budget. Its own result wins.
         let mut own = None;
-        let (own_slot, flag, waiting) = (&mut own, std::sync::Arc::clone(&orphaned), &tx);
+        let (own_slot, flag, waiting) = (&mut own, std::sync::Arc::clone(&orphaned), &mut tx);
         let shared = flights
             .coalesced_try_leased(&flight_key, registry, budget, move || async move {
-                let result = fetch.await;
+                let result = while_attended(fetch, waiting).await;
                 let shared = match &result {
                     Ok(Fetched::Body(body)) => {
                         // Nobody is waiting for this answer any more: whoever takes
@@ -1528,6 +1606,11 @@ async fn fill_detached(
                 shared
             })
             .await;
+        // Room to keep the body this task fetched, should its request be gone.
+        let kept = match &own {
+            Some(Ok(Fetched::Body(body))) => OrphanMem::reserve(body),
+            _ => None,
+        };
         let (answer, lease, took_over) = match (own, shared) {
             (Some(result), shared) => (
                 result.map(Filled::Own).map_err(Some),
@@ -1561,11 +1644,12 @@ async fn fill_detached(
         if let Some(flag) = took_over {
             flag.store(true, Ordering::Release);
         }
-        if let Some(lease) = lease {
-            orphaned.store(true, Ordering::Release);
-            tokio::time::sleep(ORPHAN_FILL_HOLD).await;
-            drop(lease);
-        }
+        let Some((lease, _room)) = lease.zip(kept) else {
+            return; // Nothing fetched to keep, or no room to keep it in memory.
+        };
+        orphaned.store(true, Ordering::Release);
+        tokio::time::sleep(ORPHAN_FILL_HOLD).await;
+        drop(lease);
     };
     tokio::spawn(async move {
         if let Err(panic) = std::panic::AssertUnwindSafe(task).catch_unwind().await {
@@ -3249,6 +3333,59 @@ mod tests {
                 .unwrap();
         assert!(!pinned);
         assert_eq!(artifact.digest(), format!("sha256:{}", hex_of(b"no pin")));
+    }
+
+    /// An artifact held whole in memory (spooling off) is capped as a buffered body; one
+    /// that spools keeps the artifact cap alone.
+    #[test]
+    fn artifact_in_memory_is_under_the_buffered_cap() {
+        assert_eq!(
+            artifact_cap(0, Some(2048 * MIB), 512 * MIB),
+            Some(512 * MIB)
+        );
+        assert_eq!(artifact_cap(0, Some(64 * MIB), 512 * MIB), Some(64 * MIB));
+        assert_eq!(artifact_cap(0, None, 512 * MIB), Some(512 * MIB));
+        assert_eq!(
+            artifact_cap(16 * MIB, Some(2048 * MIB), 512 * MIB),
+            Some(2048 * MIB)
+        );
+        assert_eq!(artifact_cap(16 * MIB, None, 512 * MIB), None);
+    }
+
+    /// In-memory bodies kept for a retry share one budget: a fill that does not fit is
+    /// not kept, and room comes back when a kept one is dropped.
+    #[test]
+    fn kept_orphan_bodies_share_a_budget() {
+        assert!(OrphanMem::reserve_len(ORPHAN_MEM_MAX + 1).is_none());
+        let before = ORPHAN_MEM_HELD.load(std::sync::atomic::Ordering::Acquire);
+        let room = OrphanMem::reserve_len(MIB).expect("a small body fits");
+        drop(room);
+        // Other tests may hold room at the same time: only this one's share is checked.
+        assert!(ORPHAN_MEM_HELD.load(std::sync::atomic::Ordering::Acquire) <= before + MIB);
+    }
+
+    /// A fill goes on for as long as its request waits, however long; once the request
+    /// is gone it is given up after `UNATTENDED_FILL_LIMIT`.
+    #[tokio::test(start_paused = true)]
+    async fn unattended_fill_is_given_up_after_its_limit() {
+        let never = || std::future::pending::<Result<(), ProxyError>>();
+        let (mut tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let attended =
+            tokio::time::timeout(UNATTENDED_FILL_LIMIT * 10, while_attended(never(), &mut tx))
+                .await;
+        assert!(
+            attended.is_err(),
+            "an attended fill has no deadline of its own"
+        );
+
+        drop(rx);
+        let started = tokio::time::Instant::now();
+        let abandoned = while_attended(never(), &mut tx).await;
+        assert!(
+            matches!(abandoned, Err(ProxyError::Timeout(_))),
+            "{abandoned:?}"
+        );
+        assert_eq!(started.elapsed(), UNATTENDED_FILL_LIMIT);
     }
 
     /// R4-P03: a client that disconnects while its cold miss is being downloaded does
