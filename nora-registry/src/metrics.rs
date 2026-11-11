@@ -231,6 +231,19 @@ pub static PROXY_UPSTREAM_304_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| 
     .expect("failed to create PROXY_UPSTREAM_304_TOTAL metric at startup")
 });
 
+/// PyPI uploads to a project that is neither hosted nor in `curation.internal_namespaces`
+/// while an upstream is configured: its index mixes the uploaded files with the upstream's of
+/// the same name (R4-R04). Label `upstream_lists` (`yes` | `no` | `unknown`): whether the
+/// cached upstream index lists the name already.
+pub static PYPI_MIXED_PROJECT_UPLOADS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_pypi_mixed_project_uploads_total",
+        "PyPI uploads to a project whose index is merged with an upstream's",
+        &["upstream_lists"]
+    )
+    .expect("failed to create PYPI_MIXED_PROJECT_UPLOADS_TOTAL metric at startup")
+});
+
 /// Upstream 4xx responses that carried a policy/geo block signature (e.g. an AWS
 /// WAF geo rule via `x-amzn-waf-reason`) and were relayed as a bare 404. Lets an
 /// operator tell an effective region/policy outage apart from a genuine not-found
