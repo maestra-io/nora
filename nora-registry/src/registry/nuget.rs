@@ -2439,16 +2439,35 @@ fn generate_service_index(base_url: &str) -> String {
             "comment": "Base URL of NuGet package storage"
         }),
         serde_json::json!({
-            "@id": format!("{}/v3/registration/", nora_nuget),
-            "@type": "RegistrationsBaseUrl/3.6.0",
-            "comment": "Base URL of NuGet package registration info"
-        }),
-        serde_json::json!({
             "@id": format!("{}/v3/package", nora_nuget),
             "@type": "PackagePublish/2.0.0",
             "comment": "Push, unlist (DELETE) and relist (POST) hosted packages"
         }),
     ];
+    // Every registration @type api.nuget.org publishes, all on the one hive. A client takes the
+    // first type of its own list that the index has: NuGet.Protocol up to 6.x asks only for
+    // `/Versioned`, `/3.4.0` and `/3.0.0-beta`, newer ones also `/3.6.0`, `/3.0.0-rc` and the
+    // bare type; with `/3.6.0` alone an old client gets no registration base URL at all.
+    let registration = format!("{}/v3/registration/", nora_nuget);
+    for version in [
+        "",
+        "/3.0.0-beta",
+        "/3.0.0-rc",
+        "/3.4.0",
+        "/3.6.0",
+        "/Versioned",
+    ] {
+        let mut resource = serde_json::json!({
+            "@id": registration,
+            "@type": format!("RegistrationsBaseUrl{version}"),
+            "comment": "Base URL of NuGet package registration info (gzip, SemVer 2.0.0)"
+        });
+        if version == "/Versioned" {
+            // As on api.nuget.org: the oldest client that reads gzip + SemVer 2.0.0 hives.
+            resource["clientVersion"] = "4.3.0-alpha".into();
+        }
+        resources.push(resource);
+    }
     // Same @type set as api.nuget.org. The NuGet client resolves search only via
     // `/Versioned`, `/3.4.0` or `/3.0.0-beta` (autocomplete: `/Versioned`, `/3.0.0-beta`):
     // the bare and `/3.5.0` types alone make `dotnet package search` report
@@ -3287,7 +3306,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["version"], "3.0.0");
         let resources = json["resources"].as_array().unwrap();
-        assert_eq!(resources.len(), 11);
+        assert_eq!(resources.len(), 16);
         assert!(result.contains("http://nora:4000/nuget/v3/flatcontainer/"));
         assert!(result.contains("http://nora:4000/nuget/v3/registration/"));
         assert!(result.contains("http://nora:4000/nuget/v3/query"));
@@ -3332,6 +3351,106 @@ mod tests {
         assert!(!types.iter().any(|t| t.contains("Catalog")));
         assert!(!types.iter().any(|t| t.contains("RepositorySignatures")));
         assert!(!types.iter().any(|t| t.contains("Vulnerability")));
+    }
+
+    #[test]
+    fn test_generate_service_index_registration_aliases() {
+        let result = generate_service_index("http://nora:4000");
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let resources = json["resources"].as_array().unwrap();
+        for t in [
+            "RegistrationsBaseUrl",
+            "RegistrationsBaseUrl/3.0.0-beta",
+            "RegistrationsBaseUrl/3.0.0-rc",
+            "RegistrationsBaseUrl/3.4.0",
+            "RegistrationsBaseUrl/3.6.0",
+            "RegistrationsBaseUrl/Versioned",
+        ] {
+            let r = resources
+                .iter()
+                .find(|r| r["@type"] == t)
+                .unwrap_or_else(|| panic!("{t} missing"));
+            assert_eq!(r["@id"], "http://nora:4000/nuget/v3/registration/", "{t}");
+        }
+        let versioned = resources
+            .iter()
+            .find(|r| r["@type"] == "RegistrationsBaseUrl/Versioned")
+            .unwrap();
+        assert_eq!(versioned["clientVersion"], "4.3.0-alpha");
+    }
+
+    /// The ordered @type lists of `NuGet.Protocol.ServiceTypes` in 6.3.4 (pulled by
+    /// Microsoft.CodeAnalysis.Testing 1.1.3) and on NuGet.Client `dev`: the client takes the
+    /// first type it finds, so each list must hit at least one resource of the index.
+    #[test]
+    fn test_generate_service_index_resolves_for_old_and_new_nuget_clients() {
+        let result = generate_service_index("http://nora:4000");
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let types: Vec<&str> = json["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["@type"].as_str().unwrap())
+            .collect();
+        let client_lists: [(&str, &[&str]); 9] = [
+            (
+                "6.3.4 RegistrationsBaseUrl",
+                &[
+                    "RegistrationsBaseUrl/Versioned",
+                    "RegistrationsBaseUrl/3.4.0",
+                    "RegistrationsBaseUrl/3.0.0-beta",
+                ],
+            ),
+            (
+                "dev RegistrationsBaseUrl",
+                &[
+                    "RegistrationsBaseUrl/Versioned",
+                    "RegistrationsBaseUrl/3.6.0",
+                    "RegistrationsBaseUrl/3.4.0",
+                    "RegistrationsBaseUrl/3.0.0-rc",
+                    "RegistrationsBaseUrl/3.0.0-beta",
+                    "RegistrationsBaseUrl",
+                ],
+            ),
+            (
+                "SearchQueryService",
+                &[
+                    "SearchQueryService/Versioned",
+                    "SearchQueryService/3.4.0",
+                    "SearchQueryService/3.0.0-beta",
+                ],
+            ),
+            (
+                "SearchAutocompleteService",
+                &[
+                    "SearchAutocompleteService/Versioned",
+                    "SearchAutocompleteService/3.0.0-beta",
+                ],
+            ),
+            (
+                "PackageBaseAddress",
+                &["PackageBaseAddress/Versioned", "PackageBaseAddress/3.0.0"],
+            ),
+            (
+                "PackagePublish",
+                &["PackagePublish/Versioned", "PackagePublish/2.0.0"],
+            ),
+            ("dev SearchQueryService350", &["SearchQueryService/3.5.0"]),
+            (
+                "6.3.4 RegistrationsBaseUrl/3.4.0 only",
+                &["RegistrationsBaseUrl/3.4.0"],
+            ),
+            (
+                "6.3.4 RegistrationsBaseUrl/3.0.0-beta only",
+                &["RegistrationsBaseUrl/3.0.0-beta"],
+            ),
+        ];
+        for (name, list) in client_lists {
+            assert!(
+                list.iter().any(|t| types.contains(t)),
+                "{name}: none of {list:?} in the index"
+            );
+        }
     }
 
     #[test]

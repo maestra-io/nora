@@ -25,6 +25,7 @@ set -euo pipefail
 #  [x] All service index @id URLs point to Nora
 #  [x] Flatcontainer version normalization (lowercase)
 #  [x] dotnet package search resolves the search service
+#  [x] NuGet.Protocol 6.3.4 resolves a registration (legacy RegistrationsBaseUrl aliases)
 #
 # ── What this suite does NOT prove ───────────────────────────────────────
 #  [ ] dotnet SDK telemetry/DNS: <clear/> removes NuGet sources but does NOT
@@ -199,7 +200,7 @@ cat > "$SCRIPT_DIR/11-ChocolateyAlias/NuGet.Config" <<CHOCOCFG
 <configuration>
   <packageSources>
     <clear />
-    <add key="nora-choco" value="$BASE/chocolatey/v3/index.json" />
+    <add key="nora-choco" value="$BASE/chocolatey/v3/index.json" allowInsecureConnections="true" />
   </packageSources>
 </configuration>
 CHOCOCFG
@@ -294,17 +295,18 @@ else
 fi
 rm -f "$REG_HEADER_FILE"
 
-# 2.6 Service index @type versions (PackageBaseAddress/3.0.0 + RegistrationsBaseUrl/3.6.0)
+# 2.6 Service index @type versions: PackageBaseAddress/3.0.0 + every RegistrationsBaseUrl alias
 if [ -n "$SVC_BODY" ]; then
     TYPE_CHECK=$(echo "$SVC_BODY" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 types = [r['@type'] for r in data.get('resources', [])]
-ok = 'PackageBaseAddress/3.0.0' in types and 'RegistrationsBaseUrl/3.6.0' in types
+reg = ['RegistrationsBaseUrl' + v for v in ('', '/3.0.0-beta', '/3.0.0-rc', '/3.4.0', '/3.6.0', '/Versioned')]
+ok = 'PackageBaseAddress/3.0.0' in types and all(t in types for t in reg)
 print('OK' if ok else 'FAIL')
 " 2>/dev/null || echo "FAIL")
     if [ "$TYPE_CHECK" = "OK" ]; then
-        pass "service index @type versions: PackageBaseAddress/3.0.0 + RegistrationsBaseUrl/3.6.0"
+        pass "service index @type versions: PackageBaseAddress/3.0.0 + all RegistrationsBaseUrl aliases"
     else
         fail "service index @type versions incorrect"
     fi
@@ -382,6 +384,7 @@ PROJECTS=(
     "09-LockFile"
     "10-DeepTransitive"
     "11-ChocolateyAlias"
+    "12-LegacyRegistration"
 )
 
 for proj in "${PROJECTS[@]}"; do
@@ -557,6 +560,15 @@ if SEARCH_OUT=$("$DOTNET" package search Newtonsoft.Json --exact-match \
     pass "dotnet package search returns results"
 else
     fail "dotnet package search: $SEARCH_OUT"
+fi
+
+# 4.12 NuGet.Protocol 6.3.4 (Microsoft.CodeAnalysis.Testing 1.1.3) knows RegistrationsBaseUrl only
+# as /Versioned, /3.4.0, /3.0.0-beta: it must still resolve a registration through Nora alone.
+if LEGACY_OUT=$(NUGET_PACKAGES="$NUGET_PACKAGES" "$DOTNET" run --project "$SCRIPT_DIR/12-LegacyRegistration" \
+    --no-restore -- "$BASE/nuget/v3/index.json" Newtonsoft.Json 13.0.3 2>&1); then
+    pass "NuGet.Protocol 6.3.4 resolves a registration via Nora"
+else
+    fail "NuGet.Protocol 6.3.4 registration: $LEGACY_OUT"
 fi
 
 echo ""
