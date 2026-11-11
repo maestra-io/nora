@@ -2819,7 +2819,11 @@ async fn hosted_versions(
     if crate::validation::validate_storage_key(crate::validation::listing_key(&prefix)).is_err() {
         return Some(imported::Versions::none());
     }
-    match storage.list(&prefix).await {
+    // Asked on every request of every ID, and empty for all but the imported ones: an
+    // empty answer is remembered for `EMPTY_PREFIX_TTL` (R4-P01). A record written
+    // through this process is seen at once, one written by another (a `nora import`
+    // run, a second replica) within the TTL.
+    match storage.list_often_empty(&prefix).await {
         Ok(keys) => Some(imported::Versions::from_listing(
             keys.iter().filter_map(|k| k.strip_prefix(&prefix)),
         )),

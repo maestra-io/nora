@@ -2240,7 +2240,11 @@ async fn own_records(storage: &crate::storage::Storage, normalized: &str) -> Opt
     if crate::validation::validate_storage_key(crate::validation::listing_key(&prefix)).is_err() {
         return Some(own::Records::none());
     }
-    match storage.list(&prefix).await {
+    // Asked on every request of every project, and empty for all but NORA's own: an
+    // empty answer is remembered for `EMPTY_PREFIX_TTL` (R4-P01). A record written
+    // through this process (an upload) is seen at once, one written by another (a
+    // `nora import` run, a second replica) within the TTL.
+    match storage.list_often_empty(&prefix).await {
         Ok(keys) => Some(own::Records::from_listing(
             keys.iter().filter_map(|k| k.strip_prefix(&prefix)),
         )),

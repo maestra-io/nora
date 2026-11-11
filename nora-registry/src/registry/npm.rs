@@ -1942,37 +1942,65 @@ enum Published {
 
 async fn published_state(storage: &crate::Storage, name: &str) -> Published {
     let prefix = format!("npm/{name}/versions/");
-    match storage.list(&prefix).await {
-        // An empty listing beside a packument NORA assembled is not taken at its word: the
-        // package was published, and a backend that answers "nothing here" for files it cannot
-        // read must not hand its name to an upstream.
-        Ok(keys) if keys.is_empty() => {
-            let key = published_packument_key(name);
-            // The record decides first: without one naming NORA the document cannot be one it
-            // assembled, whatever its bytes. The same key holds the upstream copy a release
-            // before 1.4.0 cached (`legacy_cache_key`), megabytes per package, and this runs
-            // on every proxied tarball, packument and audit name.
-            if !recorded_as_assembled(storage, &key).await {
-                return Published::No;
-            }
-            match storage.get(&key).await {
-                Ok(data) if is_assembled_by_nora(storage, &key, &data).await => {
-                    tracing::warn!(registry = "npm", package = %name, "npm: no published versions listed beside an assembled packument");
-                    Published::Unknown
-                }
-                _ => Published::No,
-            }
-        }
-        Ok(keys) => Published::Yes(
-            keys.iter()
-                .filter_map(|k| k.strip_prefix(&prefix)?.strip_suffix(".json"))
-                .map(str::to_string)
-                .collect(),
-        ),
+    // Asked on every proxied tarball, packument and audit name, and "no" for all but the
+    // packages published here: a "no" is remembered for `EMPTY_PREFIX_TTL` (R4-P01), the
+    // listing and the record read below with it. A version published through this
+    // process is seen at once (its write under `versions/` voids the memo before the
+    // publish is acknowledged), one published by another replica within the TTL.
+    let (listed, claim) = match storage.list_claiming_empty(&prefix).await {
+        Ok(listed) => listed,
         Err(e) => {
             tracing::warn!(registry = "npm", package = %name, error = %e, "npm: versions listing failed");
-            Published::Unknown
+            return Published::Unknown;
         }
+    };
+    if listed.is_empty() {
+        // Remembered: the checks below already said "not published" for this listing.
+        let Some(claim) = claim else {
+            return Published::No;
+        };
+        let (state, sure) = published_without_versions(storage, name).await;
+        if sure && matches!(state, Published::No) {
+            claim.remember();
+        }
+        return state;
+    }
+    Published::Yes(
+        listed
+            .iter()
+            .filter_map(|k| k.strip_prefix(&prefix)?.strip_suffix(".json"))
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// [`published_state`] of a package whose `versions/` listing is empty. That listing beside
+/// a packument NORA assembled is not taken at its word: the package was published, and a
+/// backend that answers "nothing here" for files it cannot read must not hand its name to
+/// an upstream. The flag says whether a "no" is sure enough to remember: the store answered
+/// about the provenance record (it is absent, or names another origin), not failed to.
+async fn published_without_versions(storage: &crate::Storage, name: &str) -> (Published, bool) {
+    let key = published_packument_key(name);
+    // The record decides first: without one naming NORA the document cannot be one it
+    // assembled, whatever its bytes. The same key holds the upstream copy a release
+    // before 1.4.0 cached (`legacy_cache_key`), megabytes per package.
+    let record = storage.get(&origin_key(&key)).await;
+    let answered = matches!(record, Ok(_) | Err(crate::storage::StorageError::NotFound));
+    let names_nora = record
+        .ok()
+        .as_deref()
+        .and_then(|r| std::str::from_utf8(r).ok())
+        .and_then(|r| r.split_once('\n'))
+        .is_some_and(|(origin, _)| origin == ASSEMBLED_BY_NORA);
+    if !names_nora {
+        return (Published::No, answered);
+    }
+    match storage.get(&key).await {
+        Ok(data) if is_assembled_by_nora(storage, &key, &data).await => {
+            tracing::warn!(registry = "npm", package = %name, "npm: no published versions listed beside an assembled packument");
+            (Published::Unknown, false)
+        }
+        _ => (Published::No, false),
     }
 }
 
@@ -2015,17 +2043,6 @@ fn assembled_by_nora(record: Option<&str>, stored_digest: &str) -> bool {
         .is_some_and(|(origin, digest)| {
             origin == ASSEMBLED_BY_NORA && !digest.is_empty() && digest == stored_digest
         })
-}
-
-/// Whether the provenance record of `key` names [`ASSEMBLED_BY_NORA`]: the part of
-/// [`assembled_by_nora`] that needs neither the document nor its digest.
-async fn recorded_as_assembled(storage: &crate::Storage, key: &str) -> bool {
-    let record = storage.get(&origin_key(key)).await.ok();
-    record
-        .as_deref()
-        .and_then(|r| std::str::from_utf8(r).ok())
-        .and_then(|r| r.split_once('\n'))
-        .is_some_and(|(origin, _)| origin == ASSEMBLED_BY_NORA)
 }
 
 /// [`assembled_by_nora`] for the object at `key` holding `data`.
