@@ -403,6 +403,8 @@ pub struct LocalStorage {
     pins: Arc<HashPinStore>,
     /// Per-key commit locks, see [`Self::commit_lock`].
     commit_locks: crate::PublishLocks,
+    /// Counts the prunes of `commit_locks` that removed a lock, see [`Self::open_version`].
+    lock_prunes: AtomicU64,
     /// This instance's staging directory, see [`Staging`].
     staging: StagingCell,
     /// Outcome of the last write probe, served by `health_check()`. Starts `false`, so
@@ -556,6 +558,7 @@ impl LocalStorage {
             base_path,
             pins,
             commit_locks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            lock_prunes: AtomicU64::new(0),
             staging: Arc::new(std::sync::OnceLock::new()),
             cached_reachable: AtomicBool::new(false),
             last_refresh_unix: AtomicU64::new(0),
@@ -592,21 +595,31 @@ impl LocalStorage {
     /// new body with the old pin. A key written by this process has a lock, and the read waits
     /// for it. A key without one is read without waiting, then asked again: a write that began
     /// meanwhile created its lock before its rename, and the read is done again under it.
-    /// Reads never add locks, so they cost the lock map nothing.
+    /// So is a read that a prune of the lock map ran beside: the lock of a write that began
+    /// and ended meanwhile may be gone again.
     async fn open_version(
         &self,
         key: &str,
     ) -> Result<(fs::File, std::fs::Metadata, Option<String>)> {
         let path = self.key_to_path(key);
-        let held = || self.commit_locks.lock().get(key).cloned();
-        if held().is_none() {
+        let seen = || {
+            let locks = self.commit_locks.lock();
+            (
+                locks.get(key).cloned(),
+                self.lock_prunes.load(Ordering::Relaxed),
+            )
+        };
+        let (mut lock, prunes) = seen();
+        if lock.is_none() {
             let (file, meta) = open_object(&path).await?;
             let pin = self.pins.get(key);
-            if held().is_none() {
+            let (now, prunes_now) = seen();
+            if now.is_none() && prunes_now == prunes {
                 return Ok((file, meta, pin));
             }
+            lock = now;
         }
-        let lock = self.commit_lock(key);
+        let lock = lock.unwrap_or_else(|| self.commit_lock(key));
         let _commit = lock.lock().await;
         let (file, meta) = open_object(&path).await?;
         Ok((file, meta, self.pins.get(key)))
@@ -896,14 +909,13 @@ impl StorageBackend for LocalStorage {
     }
 
     async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
-        let path = self.key_to_path(key);
+        // Body and pin of one version, as the streamed reads get them (#1153).
+        let (mut file, meta, pin) = self.open_version(key).await?;
 
-        let (mut file, _) = open_object(&path).await?;
-
-        let mut buffer = Vec::new();
+        let mut buffer = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
         file.read_to_end(&mut buffer).await?;
 
-        Ok((Bytes::from(buffer), self.pins.get(key)))
+        Ok((Bytes::from(buffer), pin))
     }
 
     async fn pin(&self, key: &str) -> Option<String> {
@@ -1046,6 +1058,17 @@ impl StorageBackend for LocalStorage {
             .store(crate::cache_ttl::now_unix(), Ordering::Relaxed);
     }
 
+    fn prune_locks(&self) {
+        // Under the map's lock nobody can take a clone, so a count of one is a lock that
+        // no write holds and no read waits on.
+        let mut locks = self.commit_locks.lock();
+        let before = locks.len();
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        if locks.len() != before {
+            self.lock_prunes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     async fn refresh_total_size(&self) {
         // The whole tree, as long as it takes; health requests read the count.
         let base = self.base_path.clone();
@@ -1130,12 +1153,29 @@ impl StorageBackend for LocalStorage {
         let _commit = lock.lock().await;
         // Hard link: the two keys share one inode, so a mounted blob costs no
         // extra bytes and cannot drift from its source.
-        let linked = match fs::hard_link(&src_path, &dst_path).await {
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                fs::remove_file(&dst_path).await?;
-                fs::hard_link(&src_path, &dst_path).await
+        let linked = if src_path == dst_path {
+            // Onto itself: nothing to publish, only the pin below.
+            fs::metadata(&src_path).await.map(|_| ())
+        } else {
+            match fs::hard_link(&src_path, &dst_path).await {
+                // An existing destination is replaced in one step, as a write replaces it:
+                // the link is made under a temp name and renamed over the key, so the key
+                // never goes missing and a source that is gone leaves it as it was.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // The guard removes the temp name: a rename onto another link of the
+                    // same file is a no-op that leaves it behind.
+                    let tmp = TmpFileGuard::new(tmp_path_with_seq(&dst_path, next_tmp_seq()));
+                    match fs::hard_link(&src_path, tmp.path()).await {
+                        Ok(()) => fs::rename(tmp.path(), &dst_path).await,
+                        Err(e) => {
+                            // Not ours to remove: the link did not create it.
+                            tmp.published();
+                            Err(e)
+                        }
+                    }
+                }
+                other => other,
             }
-            other => other,
         };
         match linked {
             Ok(()) => {
@@ -1162,15 +1202,18 @@ impl StorageBackend for LocalStorage {
                 sync_parent_dir(&dst_path).await?;
             }
             Err(e) if is_missing(&e) => return Err(StorageError::NotFound),
-            // Cross-device, or a filesystem without links — copy the bytes.
+            // Cross-device, or a filesystem without links — copy the bytes, to a temp file
+            // that is fsynced and renamed over the key: a crash leaves no partial object.
             Err(_) => {
-                fs::copy(&src_path, &dst_path).await.map_err(|e| {
-                    if is_missing(&e) {
-                        StorageError::NotFound
-                    } else {
-                        StorageError::Io(e)
-                    }
-                })?;
+                let tmp = self
+                    .copy_to_tmp(&src_path, &dst_path, TmpPlace::BesideKey)
+                    .await
+                    .map_err(|e| match e {
+                        StorageError::Io(io) if is_missing(&io) => StorageError::NotFound,
+                        other => other,
+                    })?;
+                fs::rename(tmp.path(), &dst_path).await?;
+                tmp.published();
                 sync_parent_dir(&dst_path).await?;
             }
         }
@@ -2864,14 +2907,19 @@ mod tests {
         let storage = std::sync::Arc::new(LocalStorage::new(dir.path().to_str().unwrap()));
         let sha = |b: &[u8]| hex::encode(sha2::Sha256::digest(b));
         storage.put("raw/k", b"one", &sha(b"one")).await.unwrap();
-        for range in [false, true] {
+        // The streamed read, the ranged read and the buffered `get` (R4-C03).
+        for (range, next) in [(0, &b"new"[..]), (1, b"two"), (2, b"six")] {
             // A write of the key holds its commit lock from the rename to the pin.
             let lock = storage.commit_lock("raw/k");
             let commit = lock.lock().await;
             let reader = {
                 let storage = storage.clone();
                 tokio::spawn(async move {
-                    let (_, pin, mut r) = if range {
+                    if range == 2 {
+                        let (bytes, pin) = storage.get("raw/k").await.unwrap();
+                        return (bytes.to_vec(), pin);
+                    }
+                    let (_, pin, mut r) = if range == 1 {
                         storage.get_range("raw/k", 0, 2).await.unwrap()
                     } else {
                         storage.get_reader("raw/k").await.unwrap()
@@ -2886,7 +2934,6 @@ mod tests {
                 !reader.is_finished(),
                 "range={range}: the read waits for the write"
             );
-            let next: &[u8] = if range { b"two" } else { b"new" };
             std::fs::write(dir.path().join("raw/k"), next).unwrap();
             storage.record_pin("raw/k", &sha(next)).await.unwrap();
             drop(commit);
@@ -2939,5 +2986,69 @@ mod tests {
                 .collect();
             assert_eq!(meta, full, "list_with_meta {prefix:?}");
         }
+    }
+
+    /// R4-C08 / R4-P16: the commit lock of a finished write leaves the map at the next
+    /// prune; one a write still holds stays, and a read of its key still waits for it.
+    #[tokio::test]
+    async fn commit_locks_of_finished_writes_are_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        for key in ["raw/a", "raw/b", "raw/gone"] {
+            put_key(&storage, key).await;
+        }
+        storage.delete("raw/gone").await.unwrap();
+        assert_eq!(storage.commit_locks.lock().len(), 3);
+
+        let held = storage.commit_lock("raw/a");
+        let writing = held.lock().await;
+        storage.prune_locks();
+        let left: Vec<String> = storage.commit_locks.lock().keys().cloned().collect();
+        assert_eq!(left, ["raw/a"]);
+        assert_eq!(storage.lock_prunes.load(Ordering::Relaxed), 1);
+        storage.get("raw/b").await.unwrap();
+
+        drop(writing);
+        drop(held);
+        storage.prune_locks();
+        assert!(storage.commit_locks.lock().is_empty());
+        // Reads leave no lock behind.
+        storage.get("raw/a").await.unwrap();
+        storage.get_reader("raw/b").await.unwrap();
+        assert!(storage.commit_locks.lock().is_empty());
+    }
+
+    /// R4-C15: a copy onto an existing key replaces it in one step. A source that is gone
+    /// leaves the destination as it was, a copy onto itself keeps the object, and no temp
+    /// name is left beside the key.
+    #[tokio::test]
+    async fn a_copy_over_an_existing_key_never_removes_it() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        let sha = |b: &[u8]| hex::encode(sha2::Sha256::digest(b));
+        storage.put("raw/src", b"new", &sha(b"new")).await.unwrap();
+        storage.put("raw/dst", b"old", &sha(b"old")).await.unwrap();
+
+        assert!(matches!(
+            storage.copy("raw/absent", "raw/dst", None).await,
+            Err(StorageError::NotFound)
+        ));
+        let old = (Bytes::from_static(b"old"), Some(sha(b"old")));
+        assert_eq!(storage.get("raw/dst").await.unwrap(), old);
+
+        storage.copy("raw/src", "raw/dst", None).await.unwrap();
+        let new = (Bytes::from_static(b"new"), Some(sha(b"new")));
+        assert_eq!(storage.get("raw/dst").await.unwrap(), new);
+        // Once more, onto a link of the same file, and onto itself.
+        storage.copy("raw/src", "raw/dst", None).await.unwrap();
+        storage.copy("raw/dst", "raw/dst", None).await.unwrap();
+        assert_eq!(storage.get("raw/dst").await.unwrap(), new);
+        assert_eq!(storage.get("raw/src").await.unwrap(), new);
+        assert_eq!(
+            storage.list("raw/").await.unwrap(),
+            ["raw/dst", "raw/src"],
+            "no temp name left"
+        );
     }
 }

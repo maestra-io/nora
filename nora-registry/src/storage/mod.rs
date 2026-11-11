@@ -184,6 +184,9 @@ pub trait StorageBackend: Send + Sync {
     /// `health_check`, so a probe never waits on the store. No-op for backends whose
     /// `health_check` asks the store itself.
     async fn refresh_reachability(&self) {}
+    /// Drop the per-key write locks nobody holds, so the lock map does not keep every key
+    /// ever written. No-op for backends without such locks.
+    fn prune_locks(&self) {}
     /// Refresh any cached size data. No-op for backends without caching. It may take as
     /// long as listing the whole store, and does not say whether the store answers.
     async fn refresh_total_size(&self) {}
@@ -739,6 +742,11 @@ impl Storage {
     /// See [`StorageBackend::refresh_reachability`].
     pub async fn refresh_reachability(&self) {
         self.inner.refresh_reachability().await;
+    }
+
+    /// See [`StorageBackend::prune_locks`].
+    pub fn prune_locks(&self) {
+        self.inner.prune_locks();
     }
 
     /// Recount the size `total_size` serves, walking the whole store.
