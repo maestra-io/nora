@@ -225,8 +225,7 @@ pub fn validate_docker_name(name: &str) -> Result<(), ValidationError> {
         ));
     }
 
-    // No consecutive separators (except ..)
-    if name.contains("//") || name.contains("--") || name.contains("__") {
+    if name.contains("//") {
         return Err(ValidationError::InvalidDockerName(
             "consecutive separators not allowed".to_string(),
         ));
@@ -250,9 +249,48 @@ pub fn validate_docker_name(name: &str) -> Result<(), ValidationError> {
                 "segment must start with alphanumeric".to_string(),
             ));
         }
+        if !is_docker_name_component(segment) {
+            return Err(ValidationError::InvalidDockerName(
+                "path component must be alphanumerics separated by '.', '_', '__' or dashes"
+                    .to_string(),
+            ));
+        }
     }
 
     Ok(())
+}
+
+/// One path component of a repository name, as the OCI distribution spec writes it:
+/// `[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*` — runs of alphanumerics joined by one `.`, one or two
+/// `_`, or any run of `-`. `my--image` and `a__b` are names; `a___b`, `a-` and `a.-b` are not.
+fn is_docker_name_component(component: &str) -> bool {
+    let alnum = |b: &[u8]| {
+        b.iter()
+            .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            .count()
+    };
+    let mut rest = component.as_bytes();
+    let mut first = true;
+    while first || !rest.is_empty() {
+        if !first {
+            let separator = match rest {
+                [b'_', b'_', ..] => 2,
+                [b'.' | b'_', ..] => 1,
+                _ => rest.iter().take_while(|c| **c == b'-').count(),
+            };
+            if separator == 0 {
+                return false;
+            }
+            rest = &rest[separator..];
+        }
+        let run = alnum(rest);
+        if run == 0 {
+            return false;
+        }
+        rest = &rest[run..];
+        first = false;
+    }
+    true
 }
 
 /// Validate content digest format.
@@ -782,8 +820,32 @@ mod tests {
     #[test]
     fn test_docker_name_consecutive_separators() {
         assert!(validate_docker_name("foo//bar").is_err());
-        assert!(validate_docker_name("foo--bar").is_err());
-        assert!(validate_docker_name("foo__bar").is_err());
+        // R4-R12: `--` (any run of dashes) and `__` are separators of the OCI name grammar,
+        // `[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*` per path component; Docker Hub and GHCR hold such
+        // repositories.
+        for valid in [
+            "foo--bar",
+            "foo__bar",
+            "org/my--image",
+            "org/a__b",
+            "a---b",
+            "a.b_c-d",
+        ] {
+            assert!(validate_docker_name(valid).is_ok(), "{valid}");
+        }
+        for invalid in [
+            "foo___bar",
+            "foo-",
+            "org/foo_",
+            "foo.",
+            "a.-b",
+            "a_-b",
+            "a-_b",
+            "a._b",
+            "org/-a",
+        ] {
+            assert!(validate_docker_name(invalid).is_err(), "{invalid}");
+        }
     }
 
     // Digest tests
@@ -878,9 +940,8 @@ mod proptests {
 
     /// Valid lowercase Docker name component
     fn docker_component() -> impl Strategy<Value = String> {
-        "[a-z0-9][a-z0-9._-]{0,30}".prop_filter("no consecutive separators", |s| {
-            !s.contains("..") && !s.contains("//") && !s.contains("--") && !s.contains("__")
-        })
+        // The OCI grammar of one path component: `[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*`.
+        "[a-z0-9]{1,8}((\\.|_|__|-{1,3})[a-z0-9]{1,6}){0,3}"
     }
 
     /// Valid sha256 hex string
