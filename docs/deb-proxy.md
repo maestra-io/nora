@@ -74,10 +74,17 @@ image's Debian/Ubuntu sources for one `RUN` and reads the token from the BuildKi
 An apt `Packages` stanza has no publish date. NORA dates each pool file (`Filename`) by the
 first time it saw it in an upstream index of that suite, component and architecture,
 stored in its storage (`deb/<repo>/.nora-meta/proxy/ledger/`). An index NORA sees for the
-first time dates everything it lists as 0 ("before NORA"), so switching the hold on, or a
-build asking for a new suite, never hides a whole distribution. A version that appeared
+first time dates everything it lists as 0 ("before NORA"), except a file another ledger
+already dates, so switching the hold on, or a build asking for a new suite, never hides a
+whole distribution and never releases a version another suite still holds. A version that appeared
 upstream while nobody asked NORA for that suite is dated by NORA's next look: it is held
-longer, never shorter.
+longer, never shorter. One pool file listed by several suites (Ubuntu's `jammy-updates`
+and `jammy-security` share a kernel `.deb`, often days apart) is as old as its first
+sighting in any of them: a build dates its young files from every other ledger of the
+repository (other suites, components and architectures: an `_all.deb` is in every arch
+index), and checks its holds again, under the lock of the held-version map, against the
+ledgers written while it ran. Once a suite is published, another index's hold of a file it
+serves is dropped.
 
 1. `dists/<suite>/InRelease` is fetched under `metadata_ttl` and refused unless a key of
    `upstream_keyring_dir` signed it. Each `<component>/binary-<arch>/Packages` it lists
@@ -96,7 +103,8 @@ longer, never shorter.
    `Acquire-By-Hash: yes`. Translations, Contents and other index files are not served.
    It is signed as `InRelease` and `Release.gpg`. A suite is rebuilt when the upstream
    `InRelease` changes or a held version matures.
-4. A `.deb` of a held version is refused (403, curation `enforce`; logged in `audit`). The
+4. A `.deb` of a held version is refused (403, curation `enforce`; logged in `audit`),
+   unless a published suite serves that file: apt found it in that suite's index. The
    allow list (`[curation.deb] allow`) releases a version early. Packages pass the digest
    quarantine like any proxied file.
 

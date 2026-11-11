@@ -711,6 +711,19 @@ async fn build_suite(
     let mut plain = BTreeMap::new();
     let mut matures_at: Option<i64> = None;
     let mut young: BTreeMap<String, BTreeMap<String, (String, String, i64)>> = BTreeMap::new();
+    let mut served: HashSet<String> = HashSet::new();
+    // Every ledger of the repo: one pool file can be listed by several suites, components
+    // and architectures.
+    // An unreadable ledger fails the build: dating without it would hold, and write to
+    // this suite's ledger, a file another suite serves.
+    let ledgers = match min_age {
+        Some(_) => state
+            .storage
+            .list(&format!("{}/ledger/", meta(repo)))
+            .await
+            .map_err(|e| BuildError::Internal(e.to_string()))?,
+        None => Vec::new(),
+    };
     for ((comp, arch), path) in &indexes {
         let (hash, _) = rel.sha256[path].clone();
         let lkey = ledger_key(repo, suite, comp, arch);
@@ -774,17 +787,37 @@ async fn build_suite(
         .map_err(|e| BuildError::Internal(e.to_string()))?
         .map_err(BuildError::Refused)?;
         let (mut current_st, dropped) = parsed;
-        let (seen, retired) = update_ledger(prev.as_ref(), &mut current_st, dropped, min_age, now);
+        let (mut seen, mut retired) =
+            update_ledger(prev.as_ref(), &mut current_st, dropped, min_age, now);
+        if let Some(age) = min_age {
+            // An index's first build dates what it lists 0 ("before NORA") unless another
+            // ledger already dates the file; later builds backdate their young files.
+            let first = prev.is_none();
+            let wanted: HashSet<String> = current_st
+                .iter()
+                .chain(&retired)
+                .filter(|s| first || now - s.first_seen < age)
+                .map(|s| s.filename.clone())
+                .collect();
+            let others: Vec<String> = ledgers.iter().filter(|k| **k != lkey).cloned().collect();
+            let earliest = earliest_seen(state, &others, &wanted)
+                .await
+                .map_err(BuildError::Internal)?;
+            for s in current_st.iter_mut().chain(retired.iter_mut()) {
+                if let Some(&t) = earliest.get(&s.filename) {
+                    if first || t < s.first_seen {
+                        s.first_seen = t;
+                        if let Some(v) = seen.get_mut(&s.filename) {
+                            *v = t;
+                        }
+                    }
+                }
+            }
+        }
 
         let hidden = |s: &Stanza| -> Option<i64> {
-            let held = crate::curation::is_internal_namespace(engine, RegistryType::Deb, &s.name)
-                || engine.hides_from_metadata(
-                    RegistryType::Deb,
-                    &s.name,
-                    &s.version,
-                    Some(s.first_seen),
-                );
-            held.then(|| s.first_seen + min_age.unwrap_or(0))
+            held_by_policy(engine, &s.name, &s.version, s.first_seen)
+                .then(|| s.first_seen + min_age.unwrap_or(0))
         };
         let mut cached = HashSet::new();
         for s in &retired {
@@ -824,6 +857,7 @@ async fn build_suite(
             held = held.len(),
             "deb proxy: index built"
         );
+        served.extend(chosen.iter().map(|s| s.filename.clone()));
         let text = packages_text(&chosen);
         let (plain_sha, plain_len, gz) = tokio::task::spawn_blocking(move || {
             gzip(text.as_bytes()).map(|gz| (sha256_hex(text.as_bytes()), text.len() as u64, gz))
@@ -868,7 +902,7 @@ async fn build_suite(
         return Err(BuildError::Upstream(ProxyError::NotFound));
     }
     // Held versions first, so a direct package fetch is refused before apt can see them.
-    update_young(state, repo, suite, young)
+    update_young(state, repo, suite, young, min_age, now)
         .await
         .map_err(BuildError::Internal)?;
 
@@ -920,6 +954,9 @@ async fn build_suite(
     };
     put_json(state, &state_key, &new_state)
         .await
+        .map_err(BuildError::Internal)?;
+    clear_served(state, repo, &served)
+        .await
         .map_err(BuildError::Internal)
 }
 
@@ -950,11 +987,61 @@ fn release_text(
     out
 }
 
+/// Whether curation hides a version first seen at `first_seen` from the indexes.
+fn held_by_policy(
+    engine: &crate::curation::CurationEngine,
+    name: &str,
+    version: &str,
+    first_seen: i64,
+) -> bool {
+    crate::curation::is_internal_namespace(engine, RegistryType::Deb, name)
+        || engine.hides_from_metadata(RegistryType::Deb, name, version, Some(first_seen))
+}
+
+/// The earliest date the ledgers `keys` give each of `files`. A pool file is as old as
+/// its first sighting in any suite, component or architecture: jammy-updates and
+/// jammy-security list one kernel `.deb` days apart, every arch index lists an
+/// `_all.deb`.
+async fn earliest_seen(
+    state: &AppState,
+    keys: &[String],
+    files: &HashSet<String>,
+) -> Result<HashMap<String, i64>, String> {
+    let mut earliest: HashMap<String, i64> = HashMap::new();
+    if files.is_empty() {
+        return Ok(earliest);
+    }
+    // ponytail: parses every ledger of the repo when a build has young files; a
+    // repo-wide first-seen map if that gets slow.
+    for key in keys {
+        let ledger: Ledger = match state.storage.get(key).await {
+            Ok(data) => serde_json::from_slice(&data).map_err(|e| format!("{key}: {e}"))?,
+            // Listed, then replaced or removed meanwhile: nothing to date from.
+            Err(crate::storage::StorageError::NotFound) => continue,
+            Err(e) => return Err(format!("{key}: {e}")),
+        };
+        let dates = ledger
+            .seen
+            .iter()
+            .map(|(f, t)| (f, *t))
+            .chain(ledger.retired.iter().map(|s| (&s.filename, s.first_seen)));
+        for (f, t) in dates {
+            if files.contains(f) {
+                let e = earliest.entry(f.clone()).or_insert(t);
+                *e = (*e).min(t);
+            }
+        }
+    }
+    Ok(earliest)
+}
+
 async fn update_young(
     state: &AppState,
     repo: &str,
     suite: &str,
     held: BTreeMap<String, BTreeMap<String, (String, String, i64)>>,
+    min_age: Option<i64>,
+    since: i64,
 ) -> Result<(), String> {
     let key = young_key(repo);
     let lock = state.publish_lock(&key);
@@ -962,7 +1049,67 @@ async fn update_young(
     let mut young: Young = get_json(state, &key).await.unwrap_or_default();
     let prefix = format!("{suite}/");
     young.retain(|k, _| !k.starts_with(&prefix));
+    let mut held = held;
+    if min_age.is_some() {
+        // Ledgers another build wrote after this one read them (a suite's first build
+        // dates everything 0): under the lock, so that build's own update has run or
+        // will run after this one and clear what it serves.
+        let files: HashSet<String> = held.values().flat_map(|m| m.keys().cloned()).collect();
+        if !files.is_empty() {
+            let fresh: Vec<String> = state
+                .storage
+                .list_with_meta(&format!("{}/ledger/", meta(repo)))
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                // A minute early: the storage clock may lag this one.
+                .filter(|(_, m)| m.modified as i64 >= since - 60)
+                .map(|(k, _)| k)
+                .collect();
+            let earliest = earliest_seen(state, &fresh, &files).await?;
+            let curation = state.curation();
+            let engine = &curation.curation_engine;
+            for m in held.values_mut() {
+                m.retain(|f, (name, version, seen)| {
+                    let Some(&t) = earliest.get(f) else {
+                        return true;
+                    };
+                    *seen = (*seen).min(t);
+                    // Held for its name (an internal namespace) whatever its age.
+                    held_by_policy(engine, name, version, *seen)
+                });
+            }
+        }
+    }
     young.extend(held.into_iter().filter(|(_, v)| !v.is_empty()));
+    put_json(state, &key, &young).await?;
+    state
+        .deb_young
+        .lock()
+        .insert(key, (Instant::now(), Arc::new(young)));
+    Ok(())
+}
+
+/// After a suite is published: a file it serves is not held by another index's later
+/// sighting of it, apt finds it in this suite's index. Serving it took a ledger date
+/// older than `min_release_age` and no rule on its name.
+async fn clear_served(
+    state: &AppState,
+    repo: &str,
+    served: &HashSet<String>,
+) -> Result<(), String> {
+    let key = young_key(repo);
+    let lock = state.publish_lock(&key);
+    let _g = lock.lock().await;
+    let mut young: Young = get_json(state, &key).await.unwrap_or_default();
+    let before: usize = young.values().map(BTreeMap::len).sum();
+    for files in young.values_mut() {
+        files.retain(|f, _| !served.contains(f));
+    }
+    young.retain(|_, files| !files.is_empty());
+    if young.values().map(BTreeMap::len).sum::<usize>() == before {
+        return Ok(());
+    }
     put_json(state, &key, &young).await?;
     state
         .deb_young
@@ -1273,13 +1420,49 @@ mod integration_tests {
         delay: std::time::Duration,
     ) {
         server.reset().await;
-        let text: String = stanzas.iter().map(|(n, v)| stanza(n, v) + "\n").collect();
-        let packages = gz(text.as_bytes());
+        mount_suite(server, key, "bookworm", "main", stanzas, delay).await;
+    }
+
+    /// Mount one signed suite beside what `server` already serves.
+    async fn mount_suite(
+        server: &MockServer,
+        key: &SignedSecretKey,
+        suite: &str,
+        comp: &str,
+        stanzas: &[(&str, &str)],
+        delay: std::time::Duration,
+    ) {
+        mount_suite_comps(server, key, suite, &[(comp, stanzas)], delay).await;
+    }
+
+    /// `mount_suite` with one amd64 index per component.
+    async fn mount_suite_comps(
+        server: &MockServer,
+        key: &SignedSecretKey,
+        suite: &str,
+        comps: &[(&str, &[(&str, &str)])],
+        delay: std::time::Duration,
+    ) {
+        let mut sums = String::new();
+        let mut files = Vec::new();
+        for (comp, stanzas) in comps {
+            let text: String = stanzas.iter().map(|(n, v)| stanza(n, v) + "\n").collect();
+            let packages = gz(text.as_bytes());
+            sums.push_str(&format!(
+                " {} {} {comp}/binary-amd64/Packages.gz\n {} 0 {comp}/binary-i386/Packages.gz\n",
+                super::sha256_hex(&packages),
+                packages.len(),
+                super::sha256_hex(b""),
+            ));
+            files.push((
+                format!("/dists/{suite}/{comp}/binary-amd64/Packages.gz"),
+                packages,
+            ));
+        }
+        let names: Vec<&str> = comps.iter().map(|(c, _)| *c).collect();
         let release = format!(
-            "Origin: Test\nSuite: stable\nCodename: bookworm\nDate: Tue, 03 Nov 2026 00:00:00 UTC\nArchitectures: amd64 i386\nComponents: main\nSigned-By: ABCDEF\nSHA256:\n {} {} main/binary-amd64/Packages.gz\n {} 0 main/binary-i386/Packages.gz\n",
-            super::sha256_hex(&packages),
-            packages.len(),
-            super::sha256_hex(b""),
+            "Origin: Test\nSuite: stable\nCodename: bookworm\nDate: Tue, 03 Nov 2026 00:00:00 UTC\nArchitectures: amd64 i386\nComponents: {}\nSigned-By: ABCDEF\nSHA256:\n{sums}",
+            names.join(" "),
         );
         let signed =
             CleartextSignedMessage::sign(rand::thread_rng(), &release, &**key, &Password::empty())
@@ -1294,7 +1477,7 @@ mod integration_tests {
                 .await;
         };
         Mock::given(method("GET"))
-            .and(path("/dists/bookworm/InRelease"))
+            .and(path(format!("/dists/{suite}/InRelease")))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_bytes(signed.into_bytes())
@@ -1302,12 +1485,10 @@ mod integration_tests {
             )
             .mount(server)
             .await;
-        mount(
-            "/dists/bookworm/main/binary-amd64/Packages.gz".into(),
-            packages,
-        )
-        .await;
-        for (n, v) in stanzas {
+        for (at, packages) in files {
+            mount(at, packages).await;
+        }
+        for (n, v) in comps.iter().flat_map(|(_, s)| s.iter()) {
             mount(
                 format!("/pool/main/{n}_{v}_amd64.deb"),
                 format!("{n}-{v}").into_bytes(),
@@ -1318,19 +1499,32 @@ mod integration_tests {
 
     /// The served Release (verified with NORA's public key) and the Packages it names.
     async fn served(ctx: &TestContext) -> (String, Vec<(String, String)>) {
-        let get = |p: &'static str| send(&ctx.app, Method::GET, p, "");
-        let key = body_bytes(get("/deb/debian/pubkey.gpg").await).await;
+        served_in(ctx, "bookworm", "main").await
+    }
+
+    async fn served_in(
+        ctx: &TestContext,
+        suite: &str,
+        comp: &str,
+    ) -> (String, Vec<(String, String)>) {
+        let key = body_bytes(send(&ctx.app, Method::GET, "/deb/debian/pubkey.gpg", "").await).await;
         let (key, _) = SignedPublicKey::from_armor_single(std::io::Cursor::new(&key[..])).unwrap();
-        let resp = get("/deb/debian/dists/bookworm/InRelease").await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/deb/debian/dists/{suite}/InRelease"),
+            "",
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_bytes(resp).await;
         let release = super::verify_inrelease(&body, &[key]).expect("signed by NORA");
         let rel = super::parse_release(&release);
-        let (sha, _) = rel.sha256["main/binary-amd64/Packages.gz"].clone();
+        let (sha, _) = rel.sha256[&format!("{comp}/binary-amd64/Packages.gz")].clone();
         let resp = send(
             &ctx.app,
             Method::GET,
-            &format!("/deb/debian/dists/bookworm/main/binary-amd64/by-hash/SHA256/{sha}"),
+            &format!("/deb/debian/dists/{suite}/{comp}/binary-amd64/by-hash/SHA256/{sha}"),
             "",
         )
         .await;
@@ -1462,6 +1656,162 @@ mod integration_tests {
             resp.status(),
             StatusCode::NOT_FOUND,
             "only the files NORA's Release names"
+        );
+    }
+
+    /// jammy-updates and jammy-security list one pool file, days apart (issues-maestra#1649);
+    /// here under different components, as an `_all.deb` is under different architectures.
+    #[tokio::test]
+    async fn a_pool_file_two_suites_list_is_as_old_as_its_first_sighting() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        let z = std::time::Duration::ZERO;
+        let uri = server.uri();
+        let dir = keydir.path().to_str().unwrap().to_string();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.deb.enabled = true;
+            cfg.deb.metadata_ttl = 0;
+            cfg.deb.upstream_keyring_dir = dir;
+            cfg.deb
+                .proxies
+                .insert("debian".into(), RepoProxyEntry::Simple(uri));
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.deb.min_release_age = Some("3d".into());
+        });
+        let get = |p: &'static str| send(&ctx.app, Method::GET, p, "");
+        let k2 = "/deb/debian/pool/main/k_2_amd64.deb";
+
+        // security lists k 1 before NORA, then k 2: k 2 is young there, and refused.
+        mount_suite(&server, &key, "security", "extra", &[("k", "1")], z).await;
+        served_in(&ctx, "security", "extra").await;
+        server.reset().await;
+        mount_suite(&server, &key, "security", "extra", &[("k", "2")], z).await;
+        served_in(&ctx, "security", "extra").await;
+        assert_eq!(get(k2).await.status(), StatusCode::FORBIDDEN);
+
+        // updates has listed k 2 for 4 days (its ledger says so): apt sees it there, and
+        // once updates is published the file is served.
+        let old = crate::cache_ttl::now_unix() as i64 - 4 * 86_400;
+        let ledger = super::Ledger {
+            upstream: None,
+            seen: [("pool/main/k_2_amd64.deb".to_string(), old)].into(),
+            retired: Vec::new(),
+        };
+        let updates = super::ledger_key("debian", "updates", "main", "amd64");
+        super::put_json(&ctx.state, &updates, &ledger)
+            .await
+            .unwrap();
+        mount_suite(&server, &key, "updates", "main", &[("k", "2")], z).await;
+        let (_, pkgs) = served_in(&ctx, "updates", "main").await;
+        assert_eq!(pkgs, [("k".into(), "2".into())]);
+        assert_eq!(get(k2).await.status(), StatusCode::OK);
+
+        // security's next build dates k 2 from updates; l 1, new in both, stays held.
+        server.reset().await;
+        mount_suite(&server, &key, "updates", "main", &[("k", "2")], z).await;
+        mount_suite(
+            &server,
+            &key,
+            "security",
+            "extra",
+            &[("k", "2"), ("l", "1")],
+            z,
+        )
+        .await;
+        let (_, pkgs) = served_in(&ctx, "security", "extra").await;
+        assert_eq!(pkgs, [("k".into(), "2".into())]);
+        assert_eq!(get(k2).await.status(), StatusCode::OK);
+        let l1 = "/deb/debian/pool/main/l_1_amd64.deb";
+        assert_eq!(
+            get(l1).await.status(),
+            StatusCode::FORBIDDEN,
+            "a file no suite has listed for 3 days is still held"
+        );
+
+        // A suite new to NORA lists l 1 and n 1: n 1 predates NORA, l 1 is dated by the
+        // ledger that already knows it, so it is neither served nor released.
+        mount_suite(
+            &server,
+            &key,
+            "backports",
+            "main",
+            &[("l", "1"), ("n", "1")],
+            z,
+        )
+        .await;
+        let (_, pkgs) = served_in(&ctx, "backports", "main").await;
+        assert_eq!(pkgs, [("n".into(), "1".into())]);
+        assert_eq!(get(l1).await.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// A build that read the ledgers before another suite wrote an older date for its
+    /// held file drops the hold under the lock; a ledger it had read already is not
+    /// read again, and a file held for its name stays held whatever its date.
+    #[tokio::test]
+    async fn a_hold_is_checked_against_ledgers_written_during_the_build() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.deb.enabled = true;
+            cfg.curation.deb.min_release_age = Some("3d".into());
+            cfg.curation.internal_namespaces = vec!["corp-*".to_string()];
+        });
+        let state = &ctx.state;
+        let now = crate::cache_ttl::now_unix() as i64;
+        let f = "pool/main/k_2_amd64.deb".to_string();
+        let corp = "pool/main/corp-x_1_amd64.deb".to_string();
+        let ledger = super::Ledger {
+            upstream: None,
+            seen: [(f.clone(), 0), (corp.clone(), 0)].into(),
+            retired: Vec::new(),
+        };
+        super::put_json(
+            state,
+            &super::ledger_key("debian", "updates", "main", "amd64"),
+            &ledger,
+        )
+        .await
+        .unwrap();
+        let held = |seen: i64| -> std::collections::BTreeMap<_, _> {
+            [(
+                "security/main/amd64".to_string(),
+                [
+                    (f.clone(), ("k".to_string(), "2".to_string(), seen)),
+                    (corp.clone(), ("corp-x".to_string(), "1".to_string(), seen)),
+                ]
+                .into(),
+            )]
+            .into()
+        };
+        let age = Some(3 * 86_400);
+        // Read before the build started (since = later): the hold stays.
+        super::update_young(state, "debian", "security", held(now), age, now + 3600)
+            .await
+            .unwrap();
+        assert!(super::load_young(state, "debian").await["security/main/amd64"].contains_key(&f));
+        // Written during the build: the hold goes, but not the one on an internal name.
+        super::update_young(state, "debian", "security", held(now), age, now)
+            .await
+            .unwrap();
+        let young = super::load_young(state, "debian").await;
+        let files = &young["security/main/amd64"];
+        assert!(!files.contains_key(&f), "{files:?}");
+        assert!(files.contains_key(&corp), "{files:?}");
+    }
+
+    /// A ledger that cannot be read fails the dating, so the build fails and keeps the
+    /// last one, instead of holding a file the unread ledger dates older.
+    #[tokio::test]
+    async fn an_unreadable_ledger_fails_the_dating() {
+        let ctx = create_test_context_with_config(|cfg| cfg.deb.enabled = true);
+        let state = &ctx.state;
+        let bad = super::ledger_key("debian", "updates", "main", "amd64");
+        state.storage.put(&bad, b"not json").await.unwrap();
+        let gone = super::ledger_key("debian", "gone", "main", "amd64");
+        let files: std::collections::HashSet<String> =
+            ["pool/main/k_2_amd64.deb".to_string()].into();
+        assert!(super::earliest_seen(state, &[bad], &files).await.is_err());
+        assert_eq!(
+            super::earliest_seen(state, &[gone], &files).await,
+            Ok(Default::default())
         );
     }
 
