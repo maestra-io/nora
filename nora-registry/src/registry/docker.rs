@@ -1348,9 +1348,13 @@ async fn docker_v2_dispatch(
                 }
             }
             Method::PUT => match axum::body::to_bytes(body, MAX_MANIFEST_BYTES).await {
-                Ok(b) => {
-                    put_manifest(state, Path((name.to_string(), reference.to_string())), b).await
-                }
+                Ok(b) => match manifest_media_type_mismatch(&headers, &b) {
+                    Some(reason) => manifest_invalid_response(reason),
+                    None => {
+                        put_manifest(state, Path((name.to_string(), reference.to_string())), b)
+                            .await
+                    }
+                },
                 Err(_) => (StatusCode::PAYLOAD_TOO_LARGE, "Manifest too large").into_response(),
             },
             Method::DELETE => {
@@ -1369,7 +1373,14 @@ async fn docker_v2_dispatch(
             return (StatusCode::BAD_REQUEST, "Invalid image name").into_response();
         }
         return match method {
-            Method::GET => list_tags(state, Path(name.to_string())).await,
+            Method::GET => {
+                list_tags(
+                    state,
+                    Path(name.to_string()),
+                    parse_query_string(uri.query()),
+                )
+                .await
+            }
             _ => method_not_allowed("GET"),
         };
     }
@@ -2335,7 +2346,7 @@ async fn upload_blob(
 /// `None` if all upstreams failed.
 /// `rate_limited` is set to the upstream `Retry-After` (if any) when an upstream
 /// answered 429, so the caller can report throttling rather than a missing manifest.
-/// `cached` is the copy held under `cache_key` and the namespace it is served from: a tag
+/// `cached` is the copy held for the reference and the namespace it is served from: a tag
 /// that moved to a held digest falls back to it ([`admitted_copy`]).
 #[allow(clippy::too_many_arguments)]
 async fn try_fetch_and_cache(
@@ -2345,10 +2356,14 @@ async fn try_fetch_and_cache(
     upstream_name: &str,
     name: &str,
     reference: &str,
-    cache_key: &str,
+    cache_ns: Option<&str>,
     cached: Option<(&Bytes, Option<&str>)>,
     rate_limited: &mut Option<Option<String>>,
 ) -> Option<Response> {
+    // Every copy this fetch writes — the tag, the digest copy and both metadata files — goes
+    // under the namespace the request resolved to, where the reads look for them. On the
+    // fallback chain that is its first upstream's, whichever upstream answered.
+    let cache_key = manifest_key(cache_ns, name, reference);
     for (upstream, miss) in upstreams.iter().zip(misses.iter_mut()) {
         tracing::debug!(upstream_url = %upstream.url, upstream_name = %upstream_name, "Trying upstream");
         match fetch_manifest_from_upstream(
@@ -2382,6 +2397,13 @@ async fn try_fetch_and_cache(
                     &data,
                 ) {
                     return Some(response);
+                }
+                // A 200 that is not a manifest (a captive portal, an error page) is a failed
+                // upstream too: neither served nor cached under the tag.
+                if let Some(reason) = upstream_manifest_invalid(&data) {
+                    tracing::warn!(upstream = %upstream.url, name = %upstream_name, reference = %reference, reason, "Docker upstream answered 200 with a body that is not a manifest; trying next");
+                    miss.record(&ProxyError::Upstream(502));
+                    continue;
                 }
                 state.metrics.record_download("docker");
                 state.metrics.record_cache_miss("docker");
@@ -2542,11 +2564,7 @@ async fn try_fetch_and_cache(
                     // admitted copy or a refusal. The tag copy stays: it is the fallback.
                     if enforce && held {
                         let storage = state.storage.clone();
-                        let key_clone = manifest_key(
-                            Some(upstream.resolved_namespace().as_str()),
-                            name,
-                            &digest,
-                        );
+                        let key_clone = manifest_key(cache_ns, name, &digest);
                         let repo_index = Arc::clone(&state.repo_index);
                         let held_data = data.clone();
                         tokio::spawn(async move {
@@ -2577,9 +2595,9 @@ async fn try_fetch_and_cache(
                 }
 
                 // Cache manifest and create metadata (fire and forget)
-                let upstream_ns = Some(upstream.resolved_namespace());
+                let upstream_ns = cache_ns.map(String::from);
                 let storage = state.storage.clone();
-                let key_clone = cache_key.to_string();
+                let key_clone = cache_key.clone();
                 let data_clone = data.clone();
                 let name_clone = name.to_string();
                 let reference_clone = reference.to_string();
@@ -2992,7 +3010,7 @@ async fn get_manifest(
         &name,
         &name,
         &reference,
-        &key,
+        ns.as_deref(),
         copy,
         &mut rate_limited,
     )
@@ -3012,7 +3030,7 @@ async fn get_manifest(
             &library_name,
             &name,
             &reference,
-            &key,
+            ns.as_deref(),
             copy,
             &mut rate_limited,
         )
@@ -3199,6 +3217,48 @@ async fn missing_manifest_ref(body: &[u8], storage: &Storage, name: &str) -> Opt
     None
 }
 
+/// Why `body` is not a manifest NORA stores or caches, or `None` when it is one: a JSON object
+/// with `schemaVersion` 2, as every OCI and Docker v2 manifest and index is.
+fn manifest_invalid(body: &[u8]) -> Option<&'static str> {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Object(m)) if m.get("schemaVersion").and_then(Value::as_u64) == Some(2) => None,
+        Ok(Value::Object(_)) => Some("schemaVersion must be 2"),
+        _ => Some("manifest is not a JSON object"),
+    }
+}
+
+/// Why a pushed manifest's `mediaType` field disagrees with the request's `Content-Type`, or
+/// `None` when either is absent or they agree (media type parameters are not compared).
+fn manifest_media_type_mismatch(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Option<&'static str> {
+    let content_type = headers.get(header::CONTENT_TYPE)?.to_str().ok()?;
+    let content_type = content_type.split(';').next().unwrap_or_default().trim();
+    let json = serde_json::from_slice::<Value>(body).ok()?;
+    let media_type = json.get("mediaType")?.as_str()?;
+    (!content_type.eq_ignore_ascii_case(media_type))
+        .then_some("mediaType does not match the Content-Type header")
+}
+
+/// 400 `MANIFEST_INVALID` per the OCI Distribution Spec.
+fn manifest_invalid_response(reason: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "errors": [{ "code": "MANIFEST_INVALID", "message": "manifest invalid", "detail": reason }]
+        })),
+    )
+        .into_response()
+}
+
+/// The lock that orders a push of `digest` against a tag delete deciding whether the digest
+/// copy still has a tag: taken after the tag's own lock, never before it. Not the lock of the
+/// digest's manifest key, which a delete by digest holds while it takes tag locks.
+fn digest_refs_lock_key(name: &str, digest: &str) -> String {
+    format!("{}#refs", manifest_key(None, name, digest))
+}
+
 async fn put_manifest(
     State(state): State<AppState>,
     Path((name, reference)): Path<(String, String)>,
@@ -3229,6 +3289,12 @@ async fn put_manifest(
             })),
         )
             .into_response();
+    }
+
+    // A body that is not a manifest is never stored: a pull would answer with it, and one
+    // unreadable manifest stops the GC sweep of every repository.
+    if let Some(reason) = manifest_invalid(&body) {
+        return manifest_invalid_response(reason);
     }
 
     // Calculate digest
@@ -3268,13 +3334,18 @@ async fn put_manifest(
     let key = format!("docker/{}/manifests/{}.json", name, reference);
     let manifest_lock = state.publish_lock(&manifest_key(ns.as_deref(), &name, &reference));
     let _manifest_guard = manifest_lock.lock().await;
-    if state.storage.put(&key, &body).await.is_err() {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    // The digest copy and the tag are written under the digest's reference lock, which a
+    // tag delete holds while it decides whether the digest copy has another tag left.
+    let refs_lock = state.publish_lock(&digest_refs_lock_key(&name, &digest));
+    let _refs_guard = refs_lock.lock().await;
 
-    // Also store by digest for direct digest lookups
+    // The digest copy first, the tag last: a push that fails half-way has not moved the tag
+    // to a manifest that a pull by digest cannot find.
     let digest_key = format!("docker/{}/manifests/{}.json", name, digest);
     if state.storage.put(&digest_key, &body).await.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if key != digest_key && state.storage.put(&key, &body).await.is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -3333,8 +3404,16 @@ async fn put_manifest(
         .into_response()
 }
 
-async fn list_tags(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    let c = canonicalize(&name, &state.config.docker);
+/// `GET /v2/<name>/tags/list[?n=<int>][&last=<tag>]`: the tags NORA holds for the repository
+/// (pushed, or cached by a pull), in ASCII order. `last` starts after that tag, `n` caps the
+/// page and a `Link: …; rel="next"` header names the next one. A repository NORA holds
+/// nothing of is 404 `NAME_UNKNOWN`.
+async fn list_tags(
+    State(state): State<AppState>,
+    Path(raw_name): Path<String>,
+    params: HashMap<String, String>,
+) -> Response {
+    let c = canonicalize(&raw_name, &state.config.docker);
     if let Some(r) = c.denied_response() {
         return r;
     }
@@ -3343,38 +3422,78 @@ async fn list_tags(State(state): State<AppState>, Path(name): Path<String>) -> R
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
-    let prefix = manifest_prefix(ns.as_deref(), &name);
-    let legacy_prefix = manifest_prefix(None, &name);
-    let mut keys = match state.storage.list(&prefix).await {
-        Ok(k) => k,
+    let n = match params.get("n").map(|n| n.parse::<usize>()) {
+        Some(Ok(n)) => Some(n),
+        Some(Err(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"errors": [{
+                    "code": "PAGINATION_NUMBER_INVALID",
+                    "message": "invalid number of results requested",
+                    "detail": { "n": params.get("n") }
+                }]})),
+            )
+                .into_response();
+        }
+        None => None,
+    };
+    let (mut tags, mut known) = match repository_tags(&state, ns.as_deref(), &name).await {
+        Ok(found) => found,
         Err(e) => {
             tracing::error!(error = ?e, "docker: failed to list manifests for tags");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    // Also include legacy non-namespaced keys during migration
-    if prefix != legacy_prefix {
-        match state.storage.list(&legacy_prefix).await {
-            Ok(legacy_keys) => {
-                keys.extend(legacy_keys);
-                keys.sort();
-                keys.dedup();
+    // No manifest yet: the repository still exists while it holds a blob (a push in flight).
+    if !known {
+        let blobs = blob_key(ns.as_deref(), &name, "");
+        let legacy_blobs = blob_key(None, &name, "");
+        for prefix in [&blobs, &legacy_blobs] {
+            match state.storage.list(prefix).await {
+                Ok(keys) => known |= !keys.is_empty(),
+                Err(e) => {
+                    tracing::error!(error = ?e, "docker: failed to list blobs for tags");
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = ?e, "docker: failed to list legacy manifests, continuing with namespaced only");
+            if known || blobs == legacy_blobs {
+                break;
             }
         }
     }
-    let tags: Vec<String> = keys
-        .iter()
-        .filter_map(|k| {
-            k.strip_prefix(&prefix)
-                .or_else(|| k.strip_prefix(&legacy_prefix))
-                .and_then(tag_from_manifest_file)
-                .map(String::from)
-        })
-        .collect();
-    (StatusCode::OK, Json(json!({"name": name, "tags": tags}))).into_response()
+    if !known {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"errors": [{
+                "code": "NAME_UNKNOWN",
+                "message": "repository name not known to registry",
+                "detail": { "name": name }
+            }]})),
+        )
+            .into_response();
+    }
+    if let Some(last) = params.get("last") {
+        tags.retain(|t| t.as_str() > last.as_str());
+    }
+    let mut link = None;
+    if let Some(n) = n {
+        // `n=0` is an empty list with no Link (OCI); otherwise a full page names the next.
+        if n > 0 && tags.len() > n {
+            let last = percent_encoding::utf8_percent_encode(
+                &tags[n - 1],
+                percent_encoding::NON_ALPHANUMERIC,
+            );
+            link = Some(format!(
+                "</v2/{raw_name}/tags/list?n={n}&last={last}>; rel=\"next\""
+            ));
+        }
+        tags.truncate(n);
+    }
+    let mut response = (StatusCode::OK, Json(json!({"name": name, "tags": tags}))).into_response();
+    if let Some(link) = link.and_then(|l| axum::http::HeaderValue::from_str(&l).ok()) {
+        response.headers_mut().insert(header::LINK, link);
+    }
+    response
 }
 
 // ============================================================================
@@ -3503,6 +3622,55 @@ async fn delete_proxied_tag(state: &AppState, ns: &str, name: &str, reference: &
     let _ = state.storage.delete(&meta_key).await;
 }
 
+/// The tags of a repository, sorted and distinct: the tag files under its namespaced and bare
+/// manifest prefixes (digest copies and sidecars are not tags), and whether the repository
+/// holds any manifest file at all. Err when either listing fails: a partial list is not the
+/// list.
+async fn repository_tags(
+    state: &AppState,
+    ns: Option<&str>,
+    name: &str,
+) -> crate::storage::Result<(Vec<String>, bool)> {
+    let prefix = manifest_prefix(ns, name);
+    let legacy_prefix = manifest_prefix(None, name);
+    let mut keys = state.storage.list(&prefix).await?;
+    if prefix != legacy_prefix {
+        keys.extend(state.storage.list(&legacy_prefix).await?);
+    }
+    let mut tags: Vec<String> = keys
+        .iter()
+        .filter_map(|k| {
+            k.strip_prefix(&prefix)
+                .or_else(|| k.strip_prefix(&legacy_prefix))
+                .and_then(tag_from_manifest_file)
+                .map(String::from)
+        })
+        .collect();
+    tags.sort();
+    tags.dedup();
+    Ok((tags, !keys.is_empty()))
+}
+
+/// The tags of a repository that answer with the manifest `digest`, each resolved as a read
+/// resolves it. Err when the listing or any tag cannot be read.
+async fn tags_resolving_to(
+    state: &AppState,
+    ns: Option<&str>,
+    name: &str,
+    digest: &str,
+) -> crate::storage::Result<Vec<String>> {
+    use sha2::Digest as _;
+    let mut resolving = Vec::new();
+    for tag in repository_tags(state, ns, name).await?.0 {
+        if let Some((data, _)) = resolve_manifest(state, ns, name, &tag, None).await? {
+            if format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data))) == digest {
+                resolving.push(tag);
+            }
+        }
+    }
+    Ok(resolving)
+}
+
 /// Delete every tag manifest that resolves to `digest` (#658).
 ///
 /// NORA stores a tag and its digest as independent files, so deleting a manifest
@@ -3519,37 +3687,10 @@ async fn delete_tags_for_digest(
 ) -> crate::storage::Result<()> {
     use sha2::Digest as _;
 
-    let prefix = manifest_prefix(ns, name);
-    let legacy_prefix = manifest_prefix(None, name);
-    let mut keys = state.storage.list(&prefix).await?;
-    if prefix != legacy_prefix {
-        keys.extend(state.storage.list(&legacy_prefix).await?);
-    }
-    // Distinct tag references only — skip digest files and sidecars.
-    let mut tags: Vec<String> = keys
-        .iter()
-        .filter_map(|k| {
-            k.strip_prefix(&prefix)
-                .or_else(|| k.strip_prefix(&legacy_prefix))
-                .and_then(tag_from_manifest_file)
-                .map(String::from)
-        })
-        .collect();
-    tags.sort();
-    tags.dedup();
-
     let resolves_to_digest =
         |data: &Bytes| format!("sha256:{}", hex::encode(sha2::Sha256::digest(data))) == digest;
     // Every tag resolved before anything is deleted: an unreadable one stops the delete here.
-    let mut candidates = Vec::new();
-    for tag in tags {
-        if let Some((data, _)) = resolve_manifest(state, ns, name, &tag, None).await? {
-            if resolves_to_digest(&data) {
-                candidates.push(tag);
-            }
-        }
-    }
-    for tag in candidates {
+    for tag in tags_resolving_to(state, ns, name, digest).await? {
         let key = manifest_key(ns, name, &tag);
         // Serialize with put_manifest on this tag.
         let lock = state.publish_lock(&key);
@@ -3593,9 +3734,12 @@ async fn delete_manifest(
     let lock = state.publish_lock(&key);
     let _guard = lock.lock().await;
 
-    // If reference is a tag, also delete digest-keyed copy
+    // If reference is a tag, also delete the digest-keyed copy — unless another tag of the
+    // repository still answers with that digest: the copy is theirs too, and a client that
+    // resolved the other tag pulls it by digest. `_refs_guard` is held to the end of the
+    // handler, so a push of the same digest cannot land between the check and the delete.
     let is_tag = !reference.starts_with("sha256:");
-    if is_tag {
+    let _refs_guard = if is_tag {
         // The manifest the tag answers with, as a read resolves it (a recorded push first). A read
         // that fails is the answer: a delete that cannot tell what the tag answers with removes
         // nothing, as a pull of the tag answers 500 — never the tag without its manifest.
@@ -3603,10 +3747,25 @@ async fn delete_manifest(
             Ok(Some((data, _))) => {
                 use sha2::Digest;
                 let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
-                // Delete from both namespaced and legacy locations, then the metadata.
-                let _ = delete_manifest_and_meta(&state, ns.as_deref(), &name, &digest).await;
+                let refs_lock = state.publish_lock(&digest_refs_lock_key(&name, &digest));
+                let guard = refs_lock.lock_owned().await;
+                match tags_resolving_to(&state, ns.as_deref(), &name, &digest).await {
+                    Ok(tags) if tags.iter().any(|t| *t != reference) => {
+                        tracing::debug!(name = %name, reference = %reference, digest = %digest, "delete: the digest copy stays, another tag answers with it");
+                    }
+                    // Delete from both namespaced and legacy locations, then the metadata.
+                    Ok(_) => {
+                        let _ =
+                            delete_manifest_and_meta(&state, ns.as_deref(), &name, &digest).await;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, name = %name, reference = %reference, "delete: reading the other tags of the digest failed; nothing deleted");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                }
+                Some(guard)
             }
-            Ok(None) => {}
+            Ok(None) => None,
             Err(e) => {
                 tracing::error!(error = %e, name = %name, reference = %reference, "delete: reading what the tag answers with failed; nothing deleted");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -3620,7 +3779,8 @@ async fn delete_manifest(
             tracing::error!(error = %e, name = %name, reference = %reference, "delete by digest: reading the tags failed; nothing deleted");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-    }
+        None
+    };
 
     // Delete manifest — try namespaced key first, then legacy fallback — then its metadata.
     match delete_manifest_and_meta(&state, ns.as_deref(), &name, &reference).await {
@@ -4871,13 +5031,58 @@ pub async fn fetch_manifest_from_upstream(
         .unwrap_or("application/vnd.docker.distribution.manifest.v2+json")
         .to_string();
 
-    let bytes = response.bytes().await.map_err(|e| {
-        cb.record_failure(&cb_key, probe);
-        ProxyError::Network(e.to_string())
-    })?;
+    // Read under the cap a pushed manifest has: an upstream cannot make NORA buffer more.
+    let mut response = response;
+    let mut bytes = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if bytes.len() + chunk.len() > MAX_MANIFEST_BYTES => {
+                tracing::warn!(url = %url, cap = MAX_MANIFEST_BYTES, "Upstream manifest exceeds the size cap; not served");
+                // The registry answered: alive, though this answer is unusable.
+                cb.record_alive(&cb_key, probe);
+                return Err(ProxyError::Upstream(502));
+            }
+            Ok(Some(chunk)) => bytes.extend_from_slice(&chunk),
+            Ok(None) => break,
+            Err(e) => {
+                cb.record_failure(&cb_key, probe);
+                return Err(ProxyError::Network(e.to_string()));
+            }
+        }
+    }
+    // Only a manifest media type is passed on; anything else is read off the manifest.
+    let essence = content_type.split(';').next().unwrap_or_default().trim();
+    let content_type = if MANIFEST_MEDIA_TYPES
+        .iter()
+        .any(|t| essence.eq_ignore_ascii_case(t))
+    {
+        content_type
+    } else {
+        detect_manifest_media_type(&bytes)
+    };
 
     cb.record_success(&cb_key, probe);
-    Ok((bytes.to_vec(), content_type))
+    Ok((bytes, content_type))
+}
+
+/// The media types a manifest is served with.
+const MANIFEST_MEDIA_TYPES: [&str; 6] = [
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v1+prettyjws",
+];
+
+/// Why an upstream's 200 body is not a manifest, or `None` when it is one: a JSON object with
+/// a numeric `schemaVersion` (1 for the schema an old registry may still hold, 2 otherwise).
+fn upstream_manifest_invalid(body: &[u8]) -> Option<&'static str> {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Object(m)) if m.get("schemaVersion").is_some_and(Value::is_u64) => None,
+        Ok(Value::Object(_)) => Some("no schemaVersion"),
+        _ => Some("not a JSON object"),
+    }
 }
 
 /// Detect manifest media type from its JSON content
@@ -10399,6 +10604,7 @@ mod integration_tests {
             },
             "layers": []
         });
+        seed_zero_config(&ctx.state, "myapp").await;
         send(
             &ctx.app,
             Method::PUT,
@@ -16217,5 +16423,390 @@ mod only_the_metadata_section_builds_metadata_keys {
             "\nfn quiet() {\n    // the .meta.json sidecar is written elsewhere\n}\n",
         );
         assert_eq!(violations(&comment), Vec::<String>::new());
+    }
+}
+
+/// Review round 4: a tag delete keeps a shared digest copy (R4-R01), tags/list pages and knows
+/// an unknown repository (R4-R09), a push stores only a manifest and moves the tag last
+/// (R4-R14), an upstream answer is capped and must be a manifest (R4-R15), and one fetch
+/// caches under one namespace (R4-R16).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod r4_manifest_and_tag_tests {
+    use crate::config::DockerUpstream;
+    use crate::test_helpers::{
+        body_bytes, create_test_context, create_test_context_with_config,
+        create_test_context_with_storage, send, send_with_headers, TestContext,
+    };
+    use axum::body::Body;
+    use axum::http::{header, Method, StatusCode};
+    use sha2::Digest;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const CFG: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    const V2: &str = "application/vnd.docker.distribution.manifest.v2+json";
+
+    fn manifest() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": V2,
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": CFG
+            },
+            "layers": []
+        }))
+        .unwrap()
+    }
+
+    fn digest_of(body: &[u8]) -> String {
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(body)))
+    }
+
+    fn upstream(url: String, namespace: &str) -> DockerUpstream {
+        DockerUpstream {
+            trust_upstream_dates: false,
+            date_token_file: None,
+            url,
+            auth: None,
+            auth_env: None,
+            namespace: Some(namespace.into()),
+            prefix: None,
+            namespaces: Vec::new(),
+        }
+    }
+
+    async fn push(ctx: &TestContext, repo: &str, tag: &str) -> StatusCode {
+        ctx.state
+            .storage
+            .put(&format!("docker/{repo}/blobs/{CFG}"), b"x")
+            .await
+            .unwrap();
+        send(
+            &ctx.app,
+            Method::PUT,
+            &format!("/v2/{repo}/manifests/{tag}"),
+            Body::from(manifest()),
+        )
+        .await
+        .status()
+    }
+
+    async fn status(ctx: &TestContext, method: Method, uri: &str) -> StatusCode {
+        send(&ctx.app, method, uri, Body::empty()).await.status()
+    }
+
+    /// R4-R01: two tags answer with one manifest. Deleting one keeps the digest copy the other
+    /// is pulled by; deleting the last one removes it. With and without an upstream configured
+    /// (the tag then has a namespaced key and a bare one).
+    #[tokio::test]
+    async fn deleting_one_tag_keeps_the_digest_another_tag_answers_with() {
+        for with_upstream in [false, true] {
+            let ctx = create_test_context_with_config(|cfg| {
+                if with_upstream {
+                    cfg.docker.upstreams = vec![upstream("http://127.0.0.1:1".into(), "docker.io")];
+                }
+            });
+            assert_eq!(push(&ctx, "team/app", "abc123").await, StatusCode::CREATED);
+            assert_eq!(push(&ctx, "team/app", "latest").await, StatusCode::CREATED);
+            let by_digest = format!("/v2/team/app/manifests/{}", digest_of(&manifest()));
+
+            assert_eq!(
+                status(&ctx, Method::DELETE, "/v2/team/app/manifests/abc123").await,
+                StatusCode::ACCEPTED
+            );
+            // Gone here: 404 hosted-only, 502 when the unreachable upstream is asked for it.
+            let gone = if with_upstream {
+                StatusCode::BAD_GATEWAY
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            assert_eq!(
+                status(&ctx, Method::GET, "/v2/team/app/manifests/abc123").await,
+                gone
+            );
+            assert_eq!(
+                status(&ctx, Method::GET, &by_digest).await,
+                StatusCode::OK,
+                "the digest copy went with the first tag (upstream: {with_upstream})"
+            );
+            assert_eq!(
+                status(&ctx, Method::GET, "/v2/team/app/manifests/latest").await,
+                StatusCode::OK
+            );
+
+            // The last tag takes the digest copy and its metadata with it.
+            assert_eq!(
+                status(&ctx, Method::DELETE, "/v2/team/app/manifests/latest").await,
+                StatusCode::ACCEPTED
+            );
+            let left = ctx.state.storage.list("docker/team/app/manifests/").await;
+            assert_eq!(left.unwrap(), Vec::<String>::new());
+        }
+    }
+
+    /// R4-R14: a body that is not a schemaVersion 2 JSON object, or whose mediaType is not the
+    /// request's Content-Type, is 400 MANIFEST_INVALID and nothing is stored.
+    #[tokio::test]
+    async fn a_push_that_is_not_a_manifest_is_refused() {
+        let ctx = create_test_context();
+        ctx.state
+            .storage
+            .put(&format!("docker/app/blobs/{CFG}"), b"x")
+            .await
+            .unwrap();
+        let schema1 = br#"{"schemaVersion":1,"name":"app"}"#.to_vec();
+        let cases: [(Vec<u8>, Option<&str>); 4] = [
+            (b"<html>not a manifest</html>".to_vec(), None),
+            (b"[1,2]".to_vec(), None),
+            (schema1, None),
+            (
+                manifest(),
+                Some("application/vnd.oci.image.manifest.v1+json"),
+            ),
+        ];
+        for (body, content_type) in cases {
+            let headers = content_type
+                .map(|c| vec![("content-type", c)])
+                .unwrap_or_default();
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::PUT,
+                "/v2/app/manifests/latest",
+                headers,
+                Body::from(body),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            assert_eq!(json["errors"][0]["code"], "MANIFEST_INVALID");
+        }
+        let stored = ctx.state.storage.list("docker/app/manifests/").await;
+        assert_eq!(stored.unwrap(), Vec::<String>::new());
+
+        // The manifest's own media type, with a parameter, is accepted.
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/v2/app/manifests/latest",
+            vec![(
+                "content-type",
+                "application/vnd.docker.distribution.manifest.v2+json; charset=utf-8",
+            )],
+            Body::from(manifest()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// R4-R14: the digest copy is written before the tag, so a push whose digest write fails
+    /// answers 500 with the tag still where it was.
+    #[tokio::test]
+    async fn a_push_whose_digest_copy_fails_does_not_move_the_tag() {
+        let (storage, counts) = crate::test_helpers::op_counting_storage();
+        let ctx = create_test_context_with_storage(storage);
+        let digest_key = format!("{}.json", digest_of(&manifest()));
+        counts.fail_puts_ending(Some(&digest_key));
+        assert_eq!(
+            push(&ctx, "app", "latest").await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(ctx
+            .state
+            .storage
+            .stat("docker/app/manifests/latest.json")
+            .await
+            .is_none());
+    }
+
+    async fn proxy_ctx(server: &MockServer) -> TestContext {
+        let url = server.uri();
+        create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![upstream(url, "up.example")];
+        })
+    }
+
+    /// R4-R15: a 200 that is not a manifest, or one over the manifest cap, is a failed upstream:
+    /// not served and not cached under the tag.
+    #[tokio::test]
+    async fn an_upstream_answer_that_is_not_a_manifest_is_not_served_or_cached() {
+        let oversized = format!(
+            r#"{{"schemaVersion":2,"pad":"{}"}}"#,
+            "a".repeat(super::MAX_MANIFEST_BYTES)
+        );
+        for (content_type, body) in [
+            ("text/html", b"<html>login</html>".to_vec()),
+            (V2, oversized.into_bytes()),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", content_type)
+                        .set_body_bytes(body),
+                )
+                .mount(&server)
+                .await;
+            let ctx = proxy_ctx(&server).await;
+            let holders = ctx.state.storage.holders();
+            assert_eq!(
+                status(&ctx, Method::GET, "/v2/library/alpine/manifests/3.20").await,
+                StatusCode::BAD_GATEWAY,
+                "{content_type}"
+            );
+            crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
+            assert_eq!(
+                ctx.state.storage.list("docker/").await.unwrap(),
+                Vec::<String>::new()
+            );
+        }
+    }
+
+    /// R4-R15: a manifest the upstream labels with something that is no manifest media type is
+    /// served with the type read off the manifest.
+    #[tokio::test]
+    async fn an_upstream_manifest_with_a_foreign_content_type_gets_its_own() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_bytes(manifest()),
+            )
+            .mount(&server)
+            .await;
+        let ctx = proxy_ctx(&server).await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/alpine/manifests/3.20",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], V2);
+    }
+
+    /// R4-R16: on the fallback chain the second upstream answers. The tag, the digest copy and
+    /// both metadata files are all cached under the chain's namespace (its first upstream's),
+    /// where a pull by digest and the publish-date read look for them.
+    #[tokio::test]
+    async fn a_chain_fetch_caches_every_copy_under_one_namespace() {
+        let first = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&first)
+            .await;
+        let second = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/prom/x/manifests/1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", V2)
+                    .set_body_bytes(manifest()),
+            )
+            .mount(&second)
+            .await;
+        let (a, b) = (first.uri(), second.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams =
+                vec![upstream(a, "first.example"), upstream(b, "second.example")];
+        });
+        let holders = ctx.state.storage.holders();
+        assert_eq!(
+            status(&ctx, Method::GET, "/v2/prom/x/manifests/1").await,
+            StatusCode::OK
+        );
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
+
+        let digest = digest_of(&manifest());
+        let mut keys = ctx.state.storage.list("docker/").await.unwrap();
+        keys.sort();
+        let dir = "docker/first.example/prom/x/manifests";
+        let mut expected = vec![
+            format!("{dir}/1.json"),
+            format!("{dir}/1.meta.json"),
+            format!("{dir}/{digest}.json"),
+            format!("{dir}/{digest}.meta.json"),
+        ];
+        expected.sort();
+        assert_eq!(keys, expected);
+
+        // The digest is served from that cache with both upstreams gone.
+        drop((first, second));
+        assert_eq!(
+            status(&ctx, Method::GET, &format!("/v2/prom/x/manifests/{digest}")).await,
+            StatusCode::OK
+        );
+    }
+
+    async fn tags(ctx: &TestContext, uri: &str) -> (StatusCode, Option<String>, serde_json::Value) {
+        let resp = send(&ctx.app, Method::GET, uri, Body::empty()).await;
+        let status = resp.status();
+        let link = resp
+            .headers()
+            .get(header::LINK)
+            .map(|v| v.to_str().unwrap().to_string());
+        let json = serde_json::from_slice(&body_bytes(resp).await).unwrap_or_default();
+        (status, link, json)
+    }
+
+    /// R4-R09: `n` caps the page and a Link names the next one, `last` starts after a tag,
+    /// `n=0` is an empty list without a Link, a bad `n` is 400.
+    #[tokio::test]
+    async fn tags_list_pages_with_n_last_and_link() {
+        let ctx = create_test_context();
+        for tag in ["c", "a", "b"] {
+            assert_eq!(push(&ctx, "team/app", tag).await, StatusCode::CREATED);
+        }
+        let (status, link, json) = tags(&ctx, "/v2/team/app/tags/list").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(link, None);
+        assert_eq!(json["tags"], serde_json::json!(["a", "b", "c"]));
+
+        let (_, link, json) = tags(&ctx, "/v2/team/app/tags/list?n=2").await;
+        assert_eq!(json["tags"], serde_json::json!(["a", "b"]));
+        assert_eq!(
+            link.as_deref(),
+            Some(r#"</v2/team/app/tags/list?n=2&last=b>; rel="next""#)
+        );
+
+        let (_, link, json) = tags(&ctx, "/v2/team/app/tags/list?n=2&last=b").await;
+        assert_eq!(json["tags"], serde_json::json!(["c"]));
+        assert_eq!(link, None);
+
+        let (_, link, json) = tags(&ctx, "/v2/team/app/tags/list?last=a").await;
+        assert_eq!(json["tags"], serde_json::json!(["b", "c"]));
+        assert_eq!(link, None);
+
+        let (status, link, json) = tags(&ctx, "/v2/team/app/tags/list?n=0").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["tags"], serde_json::json!([]));
+        assert_eq!(link, None);
+
+        let (status, _, json) = tags(&ctx, "/v2/team/app/tags/list?n=many").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errors"][0]["code"], "PAGINATION_NUMBER_INVALID");
+    }
+
+    /// R4-R09: a repository NORA holds nothing of is 404 NAME_UNKNOWN; one that holds only a
+    /// blob (a push in flight) exists and has no tags.
+    #[tokio::test]
+    async fn tags_list_of_an_unknown_repository_is_name_unknown() {
+        let ctx = create_test_context();
+        let (status, _, json) = tags(&ctx, "/v2/team/typo/tags/list").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["errors"][0]["code"], "NAME_UNKNOWN");
+
+        ctx.state
+            .storage
+            .put(&format!("docker/team/app/blobs/{CFG}"), b"x")
+            .await
+            .unwrap();
+        let (status, _, json) = tags(&ctx, "/v2/team/app/tags/list").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["tags"], serde_json::json!([]));
     }
 }
