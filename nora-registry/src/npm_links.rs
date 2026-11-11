@@ -470,9 +470,33 @@ pub fn tarball_step<E>(
 
 /// The link the packument `doc` names for the tarball of `version`, if it lists that version.
 pub fn listed_link(doc: &[u8], version: &str) -> Option<String> {
+    listed(doc, version)?.tarball
+}
+
+/// The digest a packument gives for a version's tarball.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TarballDigest {
+    Sha512(Vec<u8>),
+    Sha1(Vec<u8>),
+}
+
+/// What a packument says of one version's tarball.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Listed {
+    /// `dist.tarball`.
+    pub tarball: Option<String>,
+    /// The sha512 of `dist.integrity`, else `dist.shasum` (sha1); `None` when the version
+    /// carries neither in a form that reads.
+    pub digest: Option<TarballDigest>,
+}
+
+/// What the packument `doc` says of the tarball of `version`, if it lists that version.
+pub fn listed(doc: &[u8], version: &str) -> Option<Listed> {
     #[derive(serde::Deserialize)]
     struct Dist {
         tarball: Option<String>,
+        integrity: Option<String>,
+        shasum: Option<String>,
     }
     #[derive(serde::Deserialize)]
     struct Version {
@@ -482,12 +506,32 @@ pub fn listed_link(doc: &[u8], version: &str) -> Option<String> {
     struct Document {
         versions: Option<std::collections::HashMap<String, Version>>,
     }
-    serde_json::from_slice::<Document>(doc)
+    let version = serde_json::from_slice::<Document>(doc)
         .ok()?
         .versions?
-        .remove(version)?
-        .dist?
-        .tarball
+        .remove(version)?;
+    let Some(dist) = version.dist else {
+        return Some(Listed::default());
+    };
+    use base64::Engine;
+    // Subresource Integrity: space-separated `alg-base64[?options]`.
+    let sha512 = dist.integrity.as_deref().and_then(|sri| {
+        sri.split_ascii_whitespace().find_map(|entry| {
+            let encoded = entry.strip_prefix("sha512-")?.split('?').next()?;
+            let hash = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()?;
+            (hash.len() == 64).then_some(TarballDigest::Sha512(hash))
+        })
+    });
+    let sha1 = || {
+        let hash = hex::decode(dist.shasum.as_deref()?).ok()?;
+        (hash.len() == 20).then_some(TarballDigest::Sha1(hash))
+    };
+    Some(Listed {
+        digest: sha512.or_else(sha1),
+        tarball: dist.tarball,
+    })
 }
 
 /// Why an upstream npm document cannot be served as NORA's after the rewrite.
@@ -771,6 +815,29 @@ pub fn semver_key(v: &str) -> (u64, u64, u64, bool) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// R4-R03: the digest of a version's tarball is the sha512 of `dist.integrity`, else
+    /// `dist.shasum`; one that does not read is no digest, not an error.
+    #[test]
+    fn listed_reads_the_digest_of_a_version() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode([7u8; 64]);
+        let doc = serde_json::json!({ "versions": {
+            "1.0.0": { "dist": { "tarball": "t", "shasum": "00".repeat(20),
+                "integrity": format!("sha1-AAAA sha512-{b64}?x=y") } },
+            "1.0.1": { "dist": { "shasum": "ab".repeat(20), "integrity": "sha512-!!" } },
+            "1.0.2": { "dist": { "shasum": "abcd", "integrity": "md5-AAAA" } },
+            "1.0.3": {},
+        }});
+        let doc = serde_json::to_vec(&doc).unwrap();
+        let of = |v| listed(&doc, v).map(|l| l.digest);
+        assert_eq!(of("1.0.0"), Some(Some(TarballDigest::Sha512(vec![7; 64]))));
+        assert_eq!(of("1.0.1"), Some(Some(TarballDigest::Sha1(vec![0xab; 20]))));
+        assert_eq!(of("1.0.2"), Some(None));
+        assert_eq!(of("1.0.3"), Some(None));
+        assert_eq!(of("2.0.0"), None);
+        assert_eq!(listed_link(&doc, "1.0.0").as_deref(), Some("t"));
+    }
 
     const NORA: &str = "https://nora.example/npm";
     const PROJECT: &str = "/api/v4/projects/7/packages/npm";

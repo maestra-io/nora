@@ -1479,6 +1479,32 @@ impl ProxyBody {
         }
     }
 
+    /// The digest `D` of the body, taken on the blocking pool (a spool file is read back).
+    pub(crate) async fn hash<D: sha2::Digest + Send + 'static>(&self) -> std::io::Result<Vec<u8>> {
+        let body = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut hasher = D::new();
+            match &body {
+                ProxyBody::Mem(b) => hasher.update(b),
+                ProxyBody::File(spool) => {
+                    use std::io::Read;
+                    let mut file = std::fs::File::open(&spool.path)?;
+                    let mut chunk = vec![0u8; 64 * 1024];
+                    loop {
+                        let n = file.read(&mut chunk)?;
+                        if n == 0 {
+                            break;
+                        }
+                        hasher.update(&chunk[..n]);
+                    }
+                }
+            }
+            Ok(hasher.finalize().to_vec())
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
     /// Response body: the buffer itself, or the spool file streamed through an EOF
     /// check against the digest taken while spooling.
     pub(crate) async fn into_body(self, key: &str) -> std::io::Result<Body> {
@@ -1689,6 +1715,20 @@ pub(crate) async fn read_cached_artifact(
     key: &str,
     internal: bool,
 ) -> Result<Option<CachedArtifact>, Response> {
+    Ok(read_cached_artifact_pinned(state, registry, key, internal)
+        .await?
+        .map(|(artifact, _)| artifact))
+}
+
+/// [`read_cached_artifact`], saying whether the copy carries a storage pin: a buffered one was
+/// checked against it by the read, a streamed one is as it goes out. An unpinned copy (stored
+/// before pins) was checked against nothing.
+pub(crate) async fn read_cached_artifact_pinned(
+    state: &AppState,
+    registry: &str,
+    key: &str,
+    internal: bool,
+) -> Result<Option<(CachedArtifact, bool)>, Response> {
     use crate::storage::{BoundedRead, StorageError};
     let read = state
         .storage
@@ -1701,16 +1741,23 @@ pub(crate) async fn read_cached_artifact(
         cache_read(read, registry, key, fail_closed)?.map(|read| match read {
             BoundedRead::Buffered(outcome) => {
                 use nora_registry::verified::{verified_body, GateOutcome};
-                CachedArtifact::Buffered(match outcome {
-                    GateOutcome::Verified(blob) => verified_body(blob),
-                    GateOutcome::Unpinned(blob) => blob.into_inner(),
-                })
+                match outcome {
+                    GateOutcome::Verified(blob) => {
+                        (CachedArtifact::Buffered(verified_body(blob)), true)
+                    }
+                    GateOutcome::Unpinned(blob) => {
+                        (CachedArtifact::Buffered(blob.into_inner()), false)
+                    }
+                }
             }
-            BoundedRead::Streamed { len, pin, reader } => CachedArtifact::Streamed {
-                len,
-                sha256: pin,
-                reader,
-            },
+            BoundedRead::Streamed { len, pin, reader } => (
+                CachedArtifact::Streamed {
+                    len,
+                    sha256: pin,
+                    reader,
+                },
+                true,
+            ),
         }),
     )
 }
