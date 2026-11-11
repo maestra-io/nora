@@ -780,6 +780,7 @@ mod integration_tests {
         )
         .await;
         let ctx = create_test_context_with_config(|cfg| configure(cfg, &server));
+        let holders = ctx.state.storage.holders();
 
         for (file, body) in [("tool_linux_amd64.tar.gz", "tool"), ("plain.txt", "plain")] {
             let uri = format!("/github/o/r/releases/download/v1.0.0/{file}");
@@ -787,7 +788,7 @@ mod integration_tests {
             assert_eq!(resp.status(), StatusCode::OK, "{uri}");
             assert_eq!(body_bytes(resp).await, body.as_bytes());
         }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         assert!(ctx
             .state
             .storage
@@ -824,9 +825,10 @@ mod integration_tests {
     async fn owner_and_repo_case_shares_one_cache_entry() {
         let server = github("v1.0.0", "v1.0.0", OLD, &[("t.tar.gz", b"t", true)]).await;
         let ctx = create_test_context_with_config(|cfg| configure(cfg, &server));
+        let holders = ctx.state.storage.holders();
         let resp = get(&ctx, "/github/o/r/releases/download/v1.0.0/t.tar.gz").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         drop(server);
         let resp = get(&ctx, "/github/O/R/releases/download/v1.0.0/t.tar.gz").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -870,9 +872,10 @@ mod integration_tests {
             .mount(&server)
             .await;
         let ctx = create_test_context_with_config(|cfg| configure(cfg, &server));
+        let holders = ctx.state.storage.holders();
         let resp = get(&ctx, "/github/o/r/releases/download/v1/a.bin").await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         assert!(ctx
             .state
             .storage

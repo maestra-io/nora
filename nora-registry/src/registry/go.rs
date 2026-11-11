@@ -1392,8 +1392,9 @@ mod go_version_curation {
                 cfg.curation.mode = crate::config::CurationMode::Enforce;
                 cfg.curation.allowlist_path = Some(allowlist);
             });
+            let holders = ctx.state.storage.holders();
             let first = send(&ctx.app, Method::GET, path, "").await;
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
             let second = send(&ctx.app, Method::GET, path, "").await;
             assert_eq!(
                 second.status(),

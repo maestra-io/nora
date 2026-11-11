@@ -1358,6 +1358,7 @@ mod integration_tests {
             cfg.curation.apk.quarantine_ttl = Some("3d".into());
         });
 
+        let holders = ctx.state.storage.holders();
         let names: Vec<_> = served(&ctx, &cfg_apk)
             .await
             .into_iter()
@@ -1374,7 +1375,7 @@ mod integration_tests {
         let resp = send(&ctx.app, Method::GET, &get("lib-1-r0.apk"), "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_bytes(resp).await, lib1);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
 
         // The upstream replaces lib 1-r0 with a young 2-r0 and deletes 1-r0, and adds a
         // package NORA never cached a version of.

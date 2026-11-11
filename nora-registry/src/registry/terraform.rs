@@ -2739,10 +2739,11 @@ mod integration_tests {
         let git = "git::https://github.com/acme/terraform-aws-vpc?ref=v1.0.0";
         let server = module_upstream(|_| git.to_string(), Vec::new()).await;
         let ctx = tf_ctx(server.uri());
+        let holders = ctx.state.storage.holders();
         let resp = send(&ctx.app, Method::GET, MODULE_DL, "").await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         assert_eq!(resp.headers().get("x-terraform-get").unwrap(), git);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         assert!(ctx
             .state
             .storage
@@ -2834,9 +2835,10 @@ mod integration_tests {
         )
         .await;
         let ctx = tf_ctx(server.uri());
+        let holders = ctx.state.storage.holders();
         let resp = send(&ctx.app, Method::GET, MODULE_DL, "").await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         let resp = send(
             &ctx.app,
             Method::GET,
@@ -2845,7 +2847,7 @@ mod integration_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         assert!(ctx.state.storage.get(SOURCE_KEY).await.is_err());
     }
 
