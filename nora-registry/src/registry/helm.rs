@@ -955,6 +955,7 @@ mod integration_tests {
             cfg.helm.allow_private_chart_hosts = true;
         });
 
+        let holders = ctx.state.storage.holders();
         let doc = index_json(&ctx).await;
         assert_eq!(doc["apiVersion"], "v1");
         let urls: Vec<&str> = doc["entries"]["demo"]
@@ -975,7 +976,7 @@ mod integration_tests {
             assert_eq!(body_bytes(resp).await, body.as_bytes());
         }
         // Cached: the second read never reaches the file host (`expect(1)`).
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         let resp = send(
             &ctx.app,
             Method::GET,
@@ -1019,6 +1020,7 @@ mod integration_tests {
             // mock upstreams listen on loopback
             cfg.helm.allow_private_chart_hosts = true;
         });
+        let holders = ctx.state.storage.holders();
         let resp = send(
             &ctx.app,
             Method::GET,
@@ -1027,7 +1029,7 @@ mod integration_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         assert!(ctx
             .state
             .storage

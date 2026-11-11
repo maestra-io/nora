@@ -584,14 +584,38 @@ mod tests {
         );
     }
 
-    /// R4-P17: a pin append that is stuck on the disk holds no reader. The writer lock is
-    /// held here as an append in progress holds it.
+    /// R4-P17: a pin append that is stuck on the disk holds no reader. The log is a FIFO
+    /// nobody reads, so the append blocks in `open` for as long as the test wants; a reader
+    /// that waited for it would not answer.
+    #[cfg(unix)]
     #[test]
     fn a_read_does_not_wait_for_an_append() {
         let dir = TempDir::new().unwrap();
-        let store = HashPinStore::new(pin_path(&dir));
+        let path = pin_path(&dir);
+        let store = HashPinStore::new(&path);
         store.record_hash("k", &sha(b"v")).unwrap();
-        let _appending = store.log.lock();
-        assert_eq!(store.get("k"), Some(sha(b"v")));
+        std::fs::remove_file(&path).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(made.success());
+
+        std::thread::scope(|threads| {
+            let appending = threads.spawn(|| store.record_hash("k2", &sha(b"w")));
+            while !store.log.is_locked() {
+                std::thread::yield_now();
+            }
+            let (read, answer) = std::sync::mpsc::channel();
+            let store = &store;
+            threads.spawn(move || read.send(store.get("k")));
+            let read = answer.recv_timeout(std::time::Duration::from_secs(10));
+            // Read the FIFO to its end: the append goes through, and both threads end.
+            let appended = std::fs::read_to_string(&path).unwrap();
+            appending.join().unwrap().unwrap();
+            assert_eq!(read, Ok(Some(sha(b"v"))), "the read waited for the append");
+            assert!(appended.contains("\"k2\""), "{appended}");
+        });
+        assert_eq!(store.get("k2"), Some(sha(b"w")));
     }
 }

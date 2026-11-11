@@ -461,7 +461,7 @@ mod tests {
 
     /// M concurrent callers on the same key → `fetch` runs exactly once; the
     /// other M-1 receive the leader's value. (Acceptance: M→1 fetch.)
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn coalesces_concurrent_callers_to_single_fetch() {
         let map: InflightMap<u64> = InflightMap::new();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -658,7 +658,7 @@ mod tests {
     /// Leader cancellation (its future dropped mid-fetch) releases the key, so
     /// a subsequent request fetches cleanly with no permanent stall.
     /// (Acceptance: cancellation releases the key.)
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn leader_cancellation_releases_key() {
         let map: InflightMap<u64> = InflightMap::new();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -717,7 +717,7 @@ mod tests {
 
     /// While the leader holds its lease, a caller arriving after the fetch returned still
     /// gets the leader's value; once the lease drops, the next caller leads a new fetch.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn lease_keeps_the_slot_for_late_callers() {
         let map: InflightMap<u64> = InflightMap::new();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -753,7 +753,7 @@ mod tests {
     }
 
     /// Followers waiting on a leader are woken when it publishes, not when its lease ends.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn followers_get_the_value_at_publish_not_at_release() {
         let map: InflightMap<u64> = InflightMap::new();
         let leader_map = map.clone();
@@ -813,7 +813,7 @@ mod tests {
 
     /// A leader that fails before publishing makes its waiters elect ONE new leader
     /// among themselves, not one fetch each.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn failed_leader_hands_over_to_one_new_leader() {
         let map: InflightMap<u64> = InflightMap::new();
         let calls = Arc::new(AtomicUsize::new(0));

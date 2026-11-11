@@ -3289,6 +3289,7 @@ mod published_index_ownership {
             cfg.cargo.proxy = Some(uri);
             cfg.cargo.metadata_ttl = 0;
         });
+        let holders = ctx.state.storage.holders();
         let resp = send(
             &ctx.app,
             Method::PUT,
@@ -3300,7 +3301,7 @@ mod published_index_ownership {
 
         let resp = send(&ctx.app, Method::GET, "/cargo/index/co/rp/corp-lib", "").await;
         let served = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         let stored = ctx
             .state
             .storage
@@ -3793,10 +3794,11 @@ mod published_index_table {
     async fn row11_a_failed_listing_without_an_own_index_caches_nothing() {
         let server = squatter().await;
         let ctx = proxied(faulty(Listing::Fails, false, false), &server);
+        let holders = ctx.state.storage.holders();
         let (status, body) = get_index(&ctx.app).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("9.9.9"), "{body}");
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         assert!(
             ctx.state.storage.stat(INDEX).await.is_none(),
             "upstream answer cached"
@@ -3963,11 +3965,12 @@ mod published_index_table {
             },
         );
         ctx.state.storage.put(INDEX, OWN.as_bytes()).await.unwrap();
+        let holders = ctx.state.storage.holders();
         let (status, body) = get_index(&ctx.app).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, OWN);
         assert_eq!(asked(&server).await, 0);
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         assert!(ctx.state.storage.stat(COPY).await.is_none());
     }
 

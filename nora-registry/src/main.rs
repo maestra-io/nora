@@ -4661,8 +4661,8 @@ mod background_task_tests {
 #[cfg(test)]
 mod maintenance_loop_tests {
     //! The maintenance loop under its supervisor: a panicking tick restarts the
-    //! loop, ticks that never complete and a hung tick fail `/health`. Real time at a 20 ms
-    //! cadence: the margins are whole ticks.
+    //! loop, ticks that never complete and a hung tick fail `/health`. A 20 ms cadence on
+    //! tokio's paused clock; the tick that blocks its thread runs on the wall clock.
     use super::{run_maintenance, tick_deadline};
     use crate::supervise::{Heartbeat, Supervisor, Timing};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4683,7 +4683,7 @@ mod maintenance_loop_tests {
         (Arc::new(tasks), heartbeat)
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_panicking_tick_restarts_the_loop() {
         let (tasks, heartbeat) = supervised(Duration::from_secs(300));
         let runs = Arc::new(AtomicU64::new(0));
@@ -4724,7 +4724,7 @@ mod maintenance_loop_tests {
 
     /// A loop whose every tick panics never flushes tokens or refreshes readiness again,
     /// though the supervisor keeps restarting it: that fails liveness.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_tick_that_panics_every_time_fails_liveness() {
         let (tasks, _heartbeat) = supervised(PERIOD * 10);
         let hb = Arc::clone(&_heartbeat);
@@ -4741,7 +4741,7 @@ mod maintenance_loop_tests {
 
     /// Ticks that each fail only after running a while — past the supervisor's stable run,
     /// so no crash loop shows — still never complete: the heartbeat fails liveness.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn ticks_that_fail_late_every_time_fail_liveness() {
         // A window whose tick deadline (120 ms) is well past the panic.
         let heartbeat = Arc::new(Heartbeat::new(PERIOD * 19));
@@ -4795,7 +4795,7 @@ mod maintenance_loop_tests {
 
     /// A tick that waits on something that never answers (a silent store) is cut at its
     /// deadline: the loop goes on ticking on schedule, so liveness holds.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_tick_waiting_on_a_silent_store_is_cut_and_liveness_holds() {
         let (tasks, heartbeat) = supervised(PERIOD * 10);
         let hb = Arc::clone(&heartbeat);
@@ -4826,7 +4826,7 @@ mod maintenance_loop_tests {
     }
 
     /// Every tick waiting, none ever completing: each cut tick is progress, so liveness holds.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn ticks_that_all_wait_on_the_store_keep_liveness() {
         let (tasks, heartbeat) = supervised(PERIOD * 10);
         let hb = Arc::clone(&heartbeat);
@@ -5068,7 +5068,7 @@ mod maintenance_storage_tests {
     /// (1.6 s) takes longer than a tick may run (633 ms with a 2 s window). Readiness comes
     /// from that first page, so `/ready` turns 200 and stays 200; the size, counted from the
     /// whole listing apart from the tick, shows once that listing ends.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_large_bucket_is_ready_and_its_size_follows() {
         let storage = slow_listing_storage(Duration::from_millis(400));
         for i in 0..5 {
@@ -5112,7 +5112,7 @@ mod maintenance_storage_tests {
 
     /// Counting the store's size panics, late, every time: the panic is logged and counted
     /// under `storage_size`, the next count starts again, and the loop and readiness go on.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_panic_counting_the_size_is_reported_and_the_loop_goes_on() {
         let panics = || {
             super::metrics::TASK_PANICS_TOTAL
@@ -5139,7 +5139,7 @@ mod maintenance_storage_tests {
 
     /// A tick panics once while the size count it started still runs: the loop is restarted,
     /// and the restarted loop does not start a second count beside the first.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_restarted_loop_does_not_start_a_second_size_count() {
         let (storage, counts) = long_count_storage();
         let ctx = create_test_context_with_storage_and_config(storage, |_| {});
@@ -5161,7 +5161,7 @@ mod maintenance_storage_tests {
     /// A store that accepted the connection and went silent: `/health` stays 200 for
     /// twice the stall window, `/ready` is 503; once the store answers again `/ready`
     /// turns 200 under the same loop, which never failed.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_silent_store_fails_readiness_not_liveness() {
         let (storage, outage) = outage_storage();
         outage.silence();

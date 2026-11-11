@@ -770,10 +770,11 @@ mod tests {
     #[tokio::test]
     async fn gems_info_hides_young_versions_per_platform() {
         let (up, ctx) = gems_ctx(CurationMode::Enforce).await;
+        let holders = ctx.state.storage.holders();
         let served = "---\n1.0.0 |checksum:aa\n1.1.0 |checksum:bb,ruby:>= 2.7\n";
         assert_eq!(gems_info_served(&ctx).await, served);
         // Served again from the cache with the kept dates: still filtered, no new API call.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         assert_eq!(gems_info_served(&ctx).await, served);
         let asked = up
             .received_requests()

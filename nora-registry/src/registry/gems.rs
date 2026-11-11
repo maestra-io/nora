@@ -3358,27 +3358,31 @@ mod gem_file_name_work {
     #[test]
     fn an_overlong_gem_file_name_is_refused_at_once_on_both_paths() {
         let stem = all_versions(60_000);
+        // The runtime and the server are built before the clock starts: on a loaded host
+        // building them alone can take longer than the limit, which is for reading the name.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ctx = {
+            let _in_runtime = runtime.enter();
+            create_test_context_with_config(|cfg| {
+                cfg.gems.enabled = true;
+                cfg.gems.proxy = None;
+            })
+        };
         let statuses = done_within(Duration::from_secs(10), move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    let ctx = create_test_context_with_config(|cfg| {
-                        cfg.gems.enabled = true;
-                        cfg.gems.proxy = None;
-                    });
-                    let gem =
-                        send(&ctx.app, Method::GET, &format!("/gems/gems/{stem}.gem"), "").await;
-                    let spec = send(
-                        &ctx.app,
-                        Method::GET,
-                        &format!("/gems/quick/Marshal.4.8/{stem}.gemspec.rz"),
-                        "",
-                    )
-                    .await;
-                    (gem.status(), spec.status())
-                })
+            runtime.block_on(async move {
+                let gem = send(&ctx.app, Method::GET, &format!("/gems/gems/{stem}.gem"), "").await;
+                let spec = send(
+                    &ctx.app,
+                    Method::GET,
+                    &format!("/gems/quick/Marshal.4.8/{stem}.gemspec.rz"),
+                    "",
+                )
+                .await;
+                (gem.status(), spec.status())
+            })
         });
         assert_eq!(statuses, (StatusCode::BAD_REQUEST, StatusCode::BAD_REQUEST));
     }

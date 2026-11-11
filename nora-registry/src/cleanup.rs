@@ -267,7 +267,7 @@ mod tests {
 
     /// The periodic cycle parks on a held cleanup lock instead of skipping —
     /// the starvation the split schedulers had is gone.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cycle_waits_for_cleanup_lock_instead_of_skipping() {
         let rec = recorder();
         let interval = Duration::from_millis(100);
@@ -297,7 +297,7 @@ mod tests {
 
     /// A shutdown requested while the cycle is parked on the lock must break
     /// promptly, not wait out the holder.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancel_while_parked_on_lock_stops_scheduler() {
         let rec = recorder();
         let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
