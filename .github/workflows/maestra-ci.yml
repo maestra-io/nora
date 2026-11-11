@@ -2,7 +2,7 @@ name: Maestra CI
 
 # Everything upstream's ci.yml and kani.yml run for `main`, for our default branch: PRs
 # into maestra/main and pushes to it (so a red merge commit is visible). fmt, clippy and
-# cargo test for the default, release and fault-injection/demo feature sets; coverage
+# cargo test for the default and release feature sets, clippy for the test-only ones; coverage
 # floor and diff coverage; the repo's coherence scripts; cargo deny; the built binary
 # against real clients (docker, npm, dotnet, uv) and real S3 servers; the release panic
 # check; Kani proofs; a bounded fuzz run; the vendored chart. A PR changing only *.md
@@ -103,9 +103,10 @@ jobs:
       - name: Run tests (release features)
         run: cargo test --package nora-registry --no-default-features --features mimalloc,deb --locked
 
-      # Off in every shipped build, so nothing else compiles them: `fault-injection` is
-      # what scripts/release-panic-check.sh builds, `demo` is the demo-site banner.
-      - name: Clippy (fault-injection, demo)
+      # The two features no shipped build has, so nothing else compiles their code: the
+      # panic routes scripts/release-panic-check.sh builds with, and the demo-site banner.
+      # main.rs `no_shipped_build_enables_fault_injection` allows exactly this line.
+      - name: Clippy (features of no shipped build)
         run: cargo clippy -p nora-registry --all-targets --features fault-injection,demo --locked -- -D warnings
 
   # Vendored Helm chart (maestra/charts/nora, see its MAESTRA-CHART.md).
@@ -360,7 +361,8 @@ jobs:
       - name: PyPI client (uv)
         run: bash tests/pypi-client/run-uv-tests.sh
 
-  # The image the release ships, on three S3 servers (MinIO, SeaweedFS, Garage):
+  # The image the release ships, on three S3 servers (MinIO, SeaweedFS, Garage;
+  # images pinned in maestra/ci/s3-backends.images.yml):
   # unit tests only see object_store's in-memory backend and wiremock.
   s3-backends:
     name: s3 backends
@@ -368,6 +370,9 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     runs-on: runs-on=${{ github.run_id }}-s3/pool=build
     timeout-minutes: 60
+    env:
+      # Relative to tests/s3-backends; test.sh calls `docker compose` there too.
+      COMPOSE_FILE: docker-compose.yml:../../maestra/ci/s3-backends.images.yml
     steps:
       - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 

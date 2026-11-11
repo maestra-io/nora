@@ -773,11 +773,11 @@ pub async fn metrics_middleware(
 
     // Record metrics
     HTTP_REQUESTS_TOTAL
-        .with_label_values(&[&registry, method, &status])
+        .with_label_values(&[registry.as_str(), method, status.as_str()])
         .inc();
 
     HTTP_REQUEST_DURATION
-        .with_label_values(&[&registry, method])
+        .with_label_values(&[registry.as_str(), method])
         .observe(duration);
 
     response

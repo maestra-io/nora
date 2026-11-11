@@ -943,8 +943,20 @@ mod panic_strategy_tests {
 
     /// Lines of the build inputs that may pass `--all-features`: cargo-deny's check, which
     /// builds nothing.
-    const ALL_FEATURES_ALLOWED: &[(&str, &str)] =
-        &[(".github/workflows/ci.yml", "arguments: --all-features")];
+    const ALL_FEATURES_ALLOWED: &[(&str, &str)] = &[
+        (".github/workflows/ci.yml", "arguments: --all-features"),
+        (
+            ".github/workflows/maestra-ci.yml",
+            "arguments: --all-features",
+        ),
+    ];
+
+    /// The one line of the build inputs that may name the feature: the clippy run that keeps
+    /// its code compiling. It checks, and ships nothing.
+    const FAULT_INJECTION_ALLOWED: &[(&str, &str)] = &[(
+        ".github/workflows/maestra-ci.yml",
+        "run: cargo clippy -p nora-registry --all-targets --features fault-injection,demo --locked -- -D warnings",
+    )];
 
     /// The `/__fi/` panic routes are in no shipped build: neither the default features nor any
     /// other feature turn it on, however indirectly; no build file names it, and none builds
@@ -966,12 +978,17 @@ mod panic_strategy_tests {
         }
         for file in build_inputs(root).into_iter().filter(|f| *f != manifest) {
             let text = std::fs::read_to_string(&file).unwrap();
-            assert!(!text.contains("fault-injection"), "{}", file.display());
             let relative = file
                 .strip_prefix(root)
                 .unwrap()
                 .to_string_lossy()
                 .into_owned();
+            for line in text.lines().filter(|l| l.contains("fault-injection")) {
+                assert!(
+                    FAULT_INJECTION_ALLOWED.contains(&(relative.as_str(), line.trim())),
+                    "{relative}: {line}"
+                );
+            }
             for line in text.lines().filter(|line| line.contains("--all-features")) {
                 assert!(
                     ALL_FEATURES_ALLOWED.contains(&(relative.as_str(), line.trim())),
