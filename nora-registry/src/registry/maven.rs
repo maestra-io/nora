@@ -389,11 +389,14 @@ static REDATE_TRIED: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<String, i64>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// A cached artifact the quarantine holds is dated again before it is served: a cache hit
-/// asks no upstream, so a lookup that failed on the miss (a throttled search, the 30 s
-/// misses of 11.11.2026) would hold a years-old artifact for the whole TTL. `lookup` runs
-/// once per digest per [`REDATE_RETRY_SECS`]; its date only moves the clock back
-/// (`backdate`, persisted), never forward, and no date keeps first_seen.
+/// A cached artifact the quarantine holds, or has no entry for, is dated before it is served:
+/// a cache hit asks no upstream, so a lookup that failed on the miss (a throttled search, the
+/// 30 s misses of 11.11.2026) would hold a years-old artifact for the whole TTL. No entry is
+/// the common case after a restart: an artifact dated past the prune line on its miss is not
+/// persisted (`DigestStore::record`), so the next hit would start its clock at now (216
+/// first hits held on 11.11.2026 after the .16 rollout). `lookup` runs once per digest per
+/// [`REDATE_RETRY_SECS`]; its date only moves the clock back (`backdate`, persisted), never
+/// forward, and no date keeps first_seen.
 async fn redate_held<F, Fut>(
     store: &crate::digest_quarantine::DigestStore,
     digest: &str,
@@ -403,10 +406,8 @@ async fn redate_held<F, Fut>(
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Option<i64>>,
 {
-    if !matches!(
-        store.check("maven", digest, quarantine_secs),
-        crate::digest_quarantine::QuarantineStatus::Pending { .. }
-    ) {
+    let was = store.check("maven", digest, quarantine_secs);
+    if was == crate::digest_quarantine::QuarantineStatus::Mature {
         return;
     }
     let now = crate::cache_ttl::now_unix() as i64;
@@ -424,7 +425,8 @@ async fn redate_held<F, Fut>(
     let Some(at) = lookup().await else {
         return;
     };
-    let was = store.check("maven", digest, quarantine_secs);
+    // Creates a missing entry at the date; an existing one keeps its own until backdated.
+    store.record("maven", digest, "cache", Some(at));
     if let Some(entry) = store.backdate("maven", digest, at, true) {
         if entry.first_seen == at {
             tracing::info!(
@@ -1872,6 +1874,21 @@ mod tests {
                 calls.load(Ordering::SeqCst),
                 2,
                 "a mature digest is not looked up"
+            );
+
+            // No entry (a restart forgot one dated past the prune line): dated, not held.
+            let unrecorded = "sha256:redate-unrecorded";
+            redate_held(&store, unrecorded, ttl, lookup(Some(1_173_268_800))).await;
+            assert_eq!(
+                store.check("maven", unrecorded, ttl),
+                QuarantineStatus::Mature
+            );
+            // No entry and no date: left to the gate, which starts first_seen at now.
+            let unrecorded_undated = "sha256:redate-unrecorded-undated";
+            redate_held(&store, unrecorded_undated, ttl, lookup(None)).await;
+            assert_eq!(
+                store.check("maven", unrecorded_undated, ttl),
+                QuarantineStatus::New
             );
 
             let young = "sha256:redate-young";
