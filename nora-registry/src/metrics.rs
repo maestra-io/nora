@@ -783,10 +783,20 @@ pub async fn metrics_middleware(
     response
 }
 
+/// The uncompressed bytes of a gzip response, attached as a response extension by the
+/// code that compressed them (NuGet registration), so the middlewares after it read the
+/// document without inflating what was deflated a moment ago (R4-P06).
+#[derive(Clone)]
+pub(crate) struct PlainBody(pub(crate) axum::body::Bytes);
+
 /// Middleware to detect upstream URL leaks in JSON response bodies (#386).
 ///
 /// Scans outgoing JSON responses for configured upstream hostnames.
 /// Detection only — never blocks responses. Increments counter and logs WARN.
+///
+/// Every JSON response of a known size up to [`LEAK_SCAN_MAX_BYTES`] is scanned: no
+/// sampling. The scan is one pass over the bytes; a body is parsed (npm readmes, Docker
+/// manifest `urls`) only when that pass found a hostname, see [`needs_reduction`].
 pub async fn leak_detection_middleware(
     State(state): State<AppState>,
     request: Request<Body>,
@@ -870,7 +880,8 @@ pub async fn leak_detection_middleware(
     // dropped, the body is partially consumed and cannot be restored. The size pre-check
     // above ensures we only reach here for known-size bodies within the limit, so
     // cancellation would only occur from external timeout, not from exceeding the limit.
-    let (parts, body) = response.into_parts();
+    let (mut parts, body) = response.into_parts();
+    let plain = parts.extensions.remove::<PlainBody>();
     let body_bytes = match axum::body::to_bytes(body, LEAK_SCAN_MAX_BYTES).await {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -899,25 +910,30 @@ pub async fn leak_detection_middleware(
         return Response::from_parts(parts, Body::from(body_bytes));
     }
 
-    // Decompress gzip if needed, scan decompressed bytes
+    // A gzip body is scanned uncompressed: the bytes its handler compressed when it
+    // attached them, else inflated here.
     let scan_bytes: Vec<u8>;
-    let haystack = if is_gzip {
-        match decompress_gzip(&body_bytes) {
+    let haystack = match (&plain, is_gzip) {
+        (Some(PlainBody(plain)), true) => &plain[..],
+        (_, true) => match decompress_gzip(&body_bytes) {
             Some(decompressed) => {
                 scan_bytes = decompressed;
                 &scan_bytes
             }
             None => &body_bytes[..],
-        }
-    } else {
-        &body_bytes[..]
+        },
+        _ => &body_bytes[..],
     };
+    // The two reductions below parse the whole document; they run only for a body the
+    // raw pass does not clear (R4-P06: every packument up to 2 MB was parsed and
+    // serialized again just to be searched).
+    let reduce = needs_reduction(&state.leak_finders, haystack);
 
     // npm READMEs are prose: `fetch('https://registry.npmjs.org/…')` samples and cache keys
     // (make-fetch-happen, cacache) name the upstream, but no client follows them. Not JSON →
     // scan the raw bytes (over-report, never miss).
     let stripped: Vec<u8>;
-    let haystack = match (detect_registry(&path) == "npm")
+    let haystack = match (reduce && detect_registry(&path) == "npm")
         .then(|| strip_npm_readmes(haystack))
         .flatten()
     {
@@ -936,7 +952,8 @@ pub async fn leak_detection_middleware(
     let urls_only: Vec<u8>;
     // Only a served manifest: an OCI error body (`errors[].message`/`detail`) may
     // quote the upstream and keeps the full scan.
-    let haystack = match (parts.status.is_success()
+    let haystack = match (reduce
+        && parts.status.is_success()
         && detect_registry(&path) == "docker"
         && path.contains("/manifests/"))
     .then(|| docker_manifest_urls(haystack))
@@ -949,7 +966,9 @@ pub async fn leak_detection_middleware(
         None => haystack,
     };
 
-    if let Some((registry, hostname)) = state.leak_finders.scan(haystack) {
+    // `!reduce`: the raw pass already found these bytes clean.
+    let found = reduce.then(|| state.leak_finders.scan(haystack)).flatten();
+    if let Some((registry, hostname)) = found {
         UPSTREAM_URL_LEAK_TOTAL.with_label_values(&[registry]).inc();
         tracing::warn!(
             registry = registry,
@@ -962,6 +981,17 @@ pub async fn leak_detection_middleware(
 
     // Return original (possibly gzip-compressed) body unchanged
     Response::from_parts(parts, Body::from(body_bytes))
+}
+
+/// Whether a body must go through the parsing reductions before the verdict: the raw
+/// bytes name an upstream, or carry a `\u00xx` escape. Both reductions only take text
+/// away (readmes, everything but `urls`), so bytes the raw scan clears stay clear after
+/// them, with one exception: they re-serialize, which decodes JSON escapes, and a
+/// hostname spelled with ASCII escapes (`registry\u002enpmjs.org`) is invisible to the
+/// raw scan. Such a body is parsed, as every body was before, so the detector catches
+/// exactly what it caught.
+fn needs_reduction(finders: &LeakFinders, raw: &[u8]) -> bool {
+    finders.scan(raw).is_some() || memmem::find(raw, b"\\u00").is_some()
 }
 
 /// The packument re-serialized without top-level `readme` and `versions.*.readme`;
@@ -1697,6 +1727,115 @@ mod tests {
         assert_eq!(npm_leak_delta("canary-readme-b", tarball).await, 1);
         let broken = r#"{"name":"x","readme":"fetch('https://registry.npmjs.org/x')","versions":"#;
         assert_eq!(npm_leak_delta("canary-readme-c", broken).await, 1);
+    }
+
+    /// R4-P06: a body is parsed only when the raw pass does not clear it, and the
+    /// detector still catches what the parse caught: a hostname hidden behind JSON
+    /// escapes in a field a client follows, and nothing in a readme.
+    #[tokio::test]
+    async fn npm_leak_scan_parses_only_what_the_raw_pass_does_not_clear() {
+        let finders = LeakFinders::new(vec![("npm".into(), "registry.npmjs.org".into())]);
+        let clean = br#"{"name":"x","readme":"prose","versions":{"1.0.0":{"dist":{"tarball":"https://packages.maestra.io/npm/x/-/x-1.0.0.tgz"}}}}"#;
+        assert!(!needs_reduction(&finders, clean), "clean bytes: no parse");
+        let readme = br#"{"name":"x","readme":"fetch('https://registry.npmjs.org/x')"}"#;
+        assert!(needs_reduction(&finders, readme), "a raw hit is parsed");
+
+        let escaped = r#"{"name":"x","versions":{"1.0.0":{"dist":{"tarball":"https://registry\u002enpmjs.org/x/-/x-1.0.0.tgz"}}}}"#;
+        assert!(needs_reduction(&finders, escaped.as_bytes()));
+        assert_eq!(npm_leak_delta("canary-escaped-a", escaped).await, 1);
+        let escaped_readme = r#"{"name":"x","readme":"https://registry\u002enpmjs.org/x"}"#;
+        assert_eq!(npm_leak_delta("canary-escaped-b", escaped_readme).await, 0);
+    }
+
+    /// R4-P06: a gzip response carrying its own uncompressed bytes ([`PlainBody`]) is
+    /// scanned from them, not inflated again. The body here is not gzip at all, so the
+    /// leak can only be seen through the attached bytes.
+    #[tokio::test]
+    async fn gzip_response_is_scanned_from_its_attached_plain_bytes() {
+        use tower::ServiceExt;
+        let label = "canary-plain-body";
+        let finders = LeakFinders::new(vec![(label.into(), "api.nuget.org".into())]);
+        let mut state = crate::test_helpers::create_test_context().state.clone();
+        state.leak_finders = finders;
+        let handler = || async {
+            let plain = axum::body::Bytes::from_static(
+                br#"{"items":[{"@id":"https://api.nuget.org/v3/registration5-gz-semver2/x/index.json"}]}"#,
+            );
+            let mut resp = (
+                [
+                    (axum::http::header::CONTENT_TYPE, "application/json"),
+                    (axum::http::header::CONTENT_ENCODING, "gzip"),
+                ],
+                "not a gzip stream at all",
+            )
+                .into_response();
+            resp.extensions_mut().insert(PlainBody(plain));
+            resp
+        };
+        let app = Router::new()
+            .route("/nuget/x", get(handler))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                leak_detection_middleware,
+            ))
+            .with_state(state);
+        let before = UPSTREAM_URL_LEAK_TOTAL.with_label_values(&[label]).get();
+        let req = axum::http::Request::builder().uri("/nuget/x");
+        let resp = app
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = crate::test_helpers::body_bytes(resp).await;
+        assert_eq!(&body[..], b"not a gzip stream at all", "body untouched");
+        assert_eq!(
+            UPSTREAM_URL_LEAK_TOTAL.with_label_values(&[label]).get() - before,
+            1
+        );
+    }
+
+    /// Cost of the leak scan of a clean 1.5 MB packument, before (parse, drop readmes,
+    /// serialize, scan) and after (one raw pass) R4-P06. Not a gate: run by hand with
+    /// `cargo test --release -p nora-registry leak_scan_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn leak_scan_cost() {
+        let finders = LeakFinders::new(vec![("npm".into(), "registry.npmjs.org".into())]);
+        let versions: serde_json::Map<String, serde_json::Value> = (0..2500)
+            .map(|i| {
+                let v = format!("1.0.{i}");
+                let doc = serde_json::json!({
+                    "name": "pkg", "version": v, "description": "d".repeat(200),
+                    "dependencies": {"a": "^1.0.0", "b": "^2.0.0", "c": "^3.0.0"},
+                    "dist": {
+                        "tarball": format!("https://packages.maestra.io/npm/pkg/-/pkg-{v}.tgz"),
+                        "shasum": "0".repeat(40), "integrity": "sha512-".to_string() + &"A".repeat(88),
+                    },
+                });
+                (v, doc)
+            })
+            .collect();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "name": "pkg", "readme": "r".repeat(20_000), "versions": versions,
+        }))
+        .unwrap();
+        let time = |f: &dyn Fn() -> bool| {
+            let n = 50;
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                assert!(!std::hint::black_box(f()));
+            }
+            start.elapsed() / n
+        };
+        let before = time(&|| {
+            let stripped = strip_npm_readmes(&body).unwrap();
+            finders.scan(&stripped).is_some()
+        });
+        let after = time(&|| needs_reduction(&finders, &body));
+        println!(
+            "leak scan of a clean {} KiB packument: parse+scan {before:?}, raw pass {after:?}",
+            body.len() / 1024
+        );
     }
 
     /// Metric name -> "counter" | "gauge" | "histogram", read off every

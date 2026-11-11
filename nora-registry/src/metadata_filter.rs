@@ -42,22 +42,39 @@ pub async fn rewrite_body(
         .headers
         .get(header::CONTENT_ENCODING)
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"gzip"));
-    let plain = if gzip {
-        let mut out = Vec::new();
-        flate2::read::GzDecoder::new(&bytes[..])
-            .read_to_end(&mut out)
-            .ok()
-            .map(|_| out)
-    } else {
-        Some(bytes.to_vec())
+    // The uncompressed document, when the handler that gzipped it attached it (R4-P06):
+    // no inflate of what was deflated a moment ago.
+    let attached = parts.extensions.remove::<crate::metrics::PlainBody>();
+    let decoded;
+    let plain: Option<&[u8]> = match (&attached, gzip) {
+        (Some(crate::metrics::PlainBody(plain)), true) => Some(plain),
+        (_, true) => {
+            let mut out = Vec::new();
+            decoded = flate2::read::GzDecoder::new(&bytes[..])
+                .read_to_end(&mut out)
+                .ok()
+                .map(|_| out);
+            decoded.as_deref()
+        }
+        _ => Some(&bytes),
     };
-    let Some(filtered) = plain.and_then(|p| filter(&p)) else {
+    let Some(filtered) = plain.and_then(filter) else {
+        // Body unchanged: its uncompressed bytes still describe it.
+        if let Some(attached) = attached {
+            parts.extensions.insert(attached);
+        }
         return Response::from_parts(parts, Body::from(bytes));
     };
     let out = if gzip {
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         match enc.write_all(&filtered).and_then(|_| enc.finish()) {
-            Ok(z) => z,
+            Ok(z) => {
+                // The filtered document is what is served now, and what is scanned.
+                parts
+                    .extensions
+                    .insert(crate::metrics::PlainBody(filtered.into()));
+                z
+            }
             Err(_) => {
                 parts.headers.remove(header::CONTENT_ENCODING);
                 filtered

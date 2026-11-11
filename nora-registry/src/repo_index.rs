@@ -5,7 +5,8 @@
 //!
 //! Design:
 //! - Built at startup and every [`REFRESH_INTERVAL`] ([`RepoIndex::refresh`]), and
-//!   after every write that invalidates it
+//!   after a write that invalidates it, at most as often as its build cost allows
+//!   ([`REBUILD_COOLDOWN_FACTOR`])
 //! - A request never runs a full rebuild: it starts one in the background and waits
 //!   at most [`REBUILD_WAIT`], then serves the stale index, or an empty one with
 //!   [`RepoIndex::is_ready`] false before the first build (R2 listings of a large
@@ -36,6 +37,17 @@ const REBUILD_WAIT: Duration = Duration::from_millis(250);
 /// (`nora import`, `nora nuget rebuild`, a restore).
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(600);
 
+/// A build that took longer than this is a large registry (many LIST pages on R2).
+/// Shorter builds are cheap enough to run on every invalidation.
+const CHEAP_BUILD: Duration = Duration::from_secs(2);
+
+/// After a build that was not cheap, invalidations start the next one only after this
+/// many times its duration (capped at [`REFRESH_INTERVAL`]), so the listing of a busy
+/// registry takes under 5% of the time instead of running back to back (R4-P09: every
+/// cached artifact marks the index dirty, and the 60 s gauge tick relisted the whole
+/// prefix each time). The periodic refresh and an admin reindex are not held back.
+const REBUILD_COOLDOWN_FACTOR: u32 = 20;
+
 /// Repository info for UI display
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RepoInfo {
@@ -55,6 +67,9 @@ pub struct RegistryIndex {
     /// A build has completed: before that, an empty `data` means "not indexed yet".
     ready: AtomicBool,
     rebuild_lock: AsyncMutex<()>,
+    /// Until then a dirty index is served stale instead of rebuilt by a read or the
+    /// gauge tick ([`REBUILD_COOLDOWN_FACTOR`]). `None`: the last build was cheap.
+    cooldown_until: parking_lot::Mutex<Option<tokio::time::Instant>>,
 }
 
 impl RegistryIndex {
@@ -64,6 +79,7 @@ impl RegistryIndex {
             dirty: AtomicBool::new(true),
             ready: AtomicBool::new(false),
             rebuild_lock: AsyncMutex::new(()),
+            cooldown_until: parking_lot::Mutex::new(None),
         }
     }
 
@@ -74,6 +90,22 @@ impl RegistryIndex {
 
     fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Acquire)
+    }
+
+    /// Dirty, and far enough from its last expensive build to be rebuilt on demand.
+    fn wants_rebuild(&self) -> bool {
+        self.is_dirty()
+            && self
+                .cooldown_until
+                .lock()
+                .is_none_or(|until| tokio::time::Instant::now() >= until)
+    }
+
+    /// Record how long a build took: an expensive one holds back the next on-demand build.
+    fn built_in(&self, elapsed: Duration) {
+        *self.cooldown_until.lock() = (elapsed > CHEAP_BUILD).then(|| {
+            tokio::time::Instant::now() + (elapsed * REBUILD_COOLDOWN_FACTOR).min(REFRESH_INTERVAL)
+        });
     }
 
     fn get_cached(&self) -> Arc<Vec<RepoInfo>> {
@@ -181,7 +213,8 @@ impl RepoIndex {
     }
 
     /// Start a background rebuild of every dirty index among `registries` and wait for
-    /// them, together, at most [`REBUILD_WAIT`]. Never waits on a whole rebuild.
+    /// them, together, at most [`REBUILD_WAIT`]. Never waits on a whole rebuild. An index
+    /// whose last build was expensive stays stale until its cooldown ends.
     pub async fn settle(
         &self,
         registries: impl IntoIterator<Item = RegistryType>,
@@ -189,7 +222,11 @@ impl RepoIndex {
     ) {
         let rebuilds: Vec<_> = registries
             .into_iter()
-            .filter(|rt| self.indexes.get(rt).is_some_and(RegistryIndex::is_dirty))
+            .filter(|rt| {
+                self.indexes
+                    .get(rt)
+                    .is_some_and(RegistryIndex::wants_rebuild)
+            })
             .map(|rt| {
                 let state = state.clone();
                 tokio::spawn(async move { state.repo_index.rebuild(rt, &state).await })
@@ -230,8 +267,10 @@ impl RepoIndex {
         if !index.dirty.swap(false, Ordering::AcqRel) {
             return; // another rebuild already covered every invalidation
         }
-        let started = std::time::Instant::now();
-        match build(reg_type, state).await {
+        let started = tokio::time::Instant::now();
+        let built = build(reg_type, state).await;
+        index.built_in(started.elapsed());
+        match built {
             Some(data) => {
                 info!(
                     registry = reg_type.as_str(),
@@ -1574,6 +1613,71 @@ mod tests {
         let repos = idx.get("npm", &ctx.state).await;
         assert_eq!(repos.len(), 1, "the next read rebuilds and sees the write");
         assert_eq!(repos[0].name, "late");
+    }
+
+    /// R4-P09: every cached artifact marks the index dirty, and the 60 s gauge tick (or
+    /// any read) then relisted the whole registry prefix, back to back on a large one.
+    /// After an expensive build the next on-demand one waits 20x its duration; the
+    /// periodic refresh is not held back.
+    #[tokio::test(start_paused = true)]
+    async fn expensive_build_is_not_repeated_on_every_invalidation() {
+        use crate::test_helpers::{create_test_context_with_storage, op_counting_storage};
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage(storage);
+        let idx = &ctx.state.repo_index;
+        let lists = || ops.calls("list_with_meta", "npm/");
+
+        // A build whose listing takes 10 s.
+        ops.stall_lists(Some("npm/"));
+        let state = ctx.state.clone();
+        let rebuild =
+            tokio::spawn(async move { state.repo_index.rebuild(RegistryType::Npm, &state).await });
+        while lists() == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(10)).await;
+        ops.stall_lists(None);
+        rebuild.await.unwrap();
+        assert_eq!(lists(), 1);
+
+        // Writes keep landing: neither the gauge tick nor a read relists for 200 s.
+        for _ in 0..3 {
+            idx.invalidate("npm");
+            idx.settle([RegistryType::Npm], &ctx.state).await;
+            idx.get("npm", &ctx.state).await;
+            tokio::time::advance(Duration::from_secs(60)).await;
+        }
+        assert_eq!(lists(), 1, "no rebuild inside the cooldown");
+        assert!(idx.indexes[&RegistryType::Npm].is_dirty(), "still owed");
+
+        // The periodic refresh ignores the cooldown (it is cheap now: no new cooldown).
+        idx.refresh(&ctx.state).await;
+        assert_eq!(lists(), 2);
+
+        // A cheap build is repeated on every invalidation, as before.
+        idx.invalidate("npm");
+        idx.get("npm", &ctx.state).await;
+        assert_eq!(
+            lists(),
+            3,
+            "a cheap index answers fresh right after a write"
+        );
+    }
+
+    /// The cooldown of an expensive build ends: the owed rebuild then runs on demand.
+    #[tokio::test(start_paused = true)]
+    async fn owed_rebuild_runs_once_the_cooldown_ends() {
+        let index = RegistryIndex::new();
+        index.built_in(Duration::from_secs(10));
+        assert!(!index.wants_rebuild(), "dirty, but cooling down");
+        tokio::time::advance(Duration::from_secs(199)).await;
+        assert!(!index.wants_rebuild());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(index.wants_rebuild(), "10 s x 20 have passed");
+        // Capped at the periodic refresh interval.
+        index.built_in(Duration::from_secs(120));
+        tokio::time::advance(REFRESH_INTERVAL).await;
+        assert!(index.wants_rebuild());
     }
 
     /// a .stats.json sidecar is not a tag in the docker repo index.

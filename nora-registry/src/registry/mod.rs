@@ -239,7 +239,7 @@ pub(crate) fn nora_base_url(state: &AppState) -> String {
     state.config.server.public_base_url()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum ProxyError {
     NotFound,
     Upstream(u16),
@@ -923,28 +923,32 @@ pub(crate) async fn proxy_fetch_shared(
         return fetch.await.map(|b| (b, true));
     }
     // `fetch` runs at most once per caller: as the leader, or as a follower whose
-    // leader failed. Its own result (error included) wins over a shared one.
+    // leader was cancelled or outlasted the budget. Its own result wins over a shared one.
     let mut own = None;
     let own_slot = &mut own;
     let shared = state
         .proxy_coalesce
-        .coalesced(
+        .coalesced_try(
             &format!("fetch:{key}"),
             registry,
             crate::proxy_coalesce::follower_budget(proxy_timeout_secs),
             move || async move {
                 let result = fetch.await;
-                let value = result.as_ref().ok().cloned();
+                let shared = match &result {
+                    Ok(value) => Ok(value.clone()),
+                    Err(e) => Err(Some(e.clone())),
+                };
                 *own_slot = Some(result);
-                value
+                shared
             },
         )
         .await;
     match own {
         Some(result) => result.map(|b| (b, true)),
-        None => shared
-            .map(|b| (b, false))
-            .ok_or_else(|| ProxyError::Network("coalesced fetch returned nothing".into())),
+        // A follower: the leader's body, or the leader's own failure (R4-P08).
+        None => shared.map(|b| (b, false)).map_err(|e| {
+            e.unwrap_or_else(|| ProxyError::Network("coalesced fetch returned nothing".into()))
+        }),
     }
 }
 
@@ -989,6 +993,17 @@ pub(crate) enum SpoolError {
     TooLarge(u64),
     /// Local disk failure (path in the message).
     Io(std::io::Error),
+}
+
+/// A copy for the followers of a failed flight (`InflightMap::coalesced_try`).
+impl Clone for SpoolError {
+    fn clone(&self) -> Self {
+        match self {
+            SpoolError::Busy => SpoolError::Busy,
+            SpoolError::TooLarge(n) => SpoolError::TooLarge(*n),
+            SpoolError::Io(e) => SpoolError::Io(std::io::Error::new(e.kind(), e.to_string())),
+        }
+    }
 }
 
 impl SpoolError {
@@ -1351,23 +1366,27 @@ pub(crate) async fn proxy_fetch_artifact_with(
     let own_slot = &mut own;
     let shared = state
         .artifact_flights
-        .coalesced(
+        .coalesced_try(
             &format!("fetch:{key}"),
             registry,
             crate::proxy_coalesce::follower_budget(timeout_secs).max(ARTIFACT_FOLLOWER_BUDGET),
             move || async move {
                 let result = fetch.await;
-                let value = result.as_ref().ok().cloned();
+                let shared = match &result {
+                    Ok(value) => Ok(value.clone()),
+                    Err(e) => Err(Some(e.clone())),
+                };
                 *own_slot = Some(result);
-                value
+                shared
             },
         )
         .await;
     match own {
         Some(result) => result.map(|b| (b, true)),
-        None => shared
-            .map(|b| (b, false))
-            .ok_or_else(|| ProxyError::Network("coalesced fetch returned nothing".into())),
+        // A follower: the leader's body, or the leader's own failure (R4-P08).
+        None => shared.map(|b| (b, false)).map_err(|e| {
+            e.unwrap_or_else(|| ProxyError::Network("coalesced fetch returned nothing".into()))
+        }),
     }
 }
 
@@ -1381,8 +1400,8 @@ pub(crate) enum ArtifactHop {
 
 /// [`proxy_fetch_artifact_with`] for one URL of a redirect chain (npm tarballs, upstream
 /// 1.4.3): a body is spooled and shared as any artifact's; a redirect is the answer,
-/// [`ArtifactHop::Redirect`], one request per hop. Only a body is shared (the flights hold
-/// bodies): a follower whose leader got a redirect, or failed, asks the hop itself.
+/// [`ArtifactHop::Redirect`], one request per hop. A body or a failure is shared (the
+/// flights hold bodies): a follower whose leader got a redirect asks the hop itself.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn proxy_fetch_artifact_hop(
     state: &AppState,
@@ -1435,25 +1454,29 @@ pub(crate) async fn proxy_fetch_artifact_hop(
     let first = fetch();
     let shared = state
         .artifact_flights
-        .coalesced(
+        .coalesced_try(
             &format!("fetch:{key}"),
             registry,
             crate::proxy_coalesce::follower_budget(timeout_secs).max(ARTIFACT_FOLLOWER_BUDGET),
             move || async move {
                 let result = first.await;
-                let body = match &result {
-                    Ok(Fetched::Body(body)) => Some(body.clone()),
-                    _ => None,
+                let shared = match &result {
+                    Ok(Fetched::Body(body)) => Ok(body.clone()),
+                    // A redirect is this caller's answer only: no detail to share.
+                    Ok(Fetched::Redirect(_)) => Err(None),
+                    Err(e) => Err(Some(e.clone())),
                 };
                 *own_slot = Some(result);
-                body
+                shared
             },
         )
         .await;
     match (own, shared) {
         (Some(result), _) => result.map(|f| hop(f, true)),
-        (None, Some(body)) => Ok(ArtifactHop::Body(body, false)),
-        (None, None) => fetch().await.map(|f| hop(f, true)),
+        (None, Ok(body)) => Ok(ArtifactHop::Body(body, false)),
+        // The leader's failure is the flight's (R4-P08); its redirect is not ours.
+        (None, Err(Some(e))) => Err(e),
+        (None, Err(None)) => fetch().await.map(|f| hop(f, true)),
     }
 }
 
