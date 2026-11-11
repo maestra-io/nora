@@ -2819,7 +2819,11 @@ async fn hosted_versions(
     if crate::validation::validate_storage_key(crate::validation::listing_key(&prefix)).is_err() {
         return Some(imported::Versions::none());
     }
-    match storage.list(&prefix).await {
+    // Asked on every request of every ID, and empty for all but the imported ones: an
+    // empty answer is remembered for `EMPTY_PREFIX_TTL` (R4-P01). A record written
+    // through this process is seen at once, one written by another (a `nora import`
+    // run, a second replica) within the TTL.
+    match storage.list_often_empty(&prefix).await {
         Ok(keys) => Some(imported::Versions::from_listing(
             keys.iter().filter_map(|k| k.strip_prefix(&prefix)),
         )),
@@ -8114,5 +8118,39 @@ mod nuget_release_dates {
             assert_eq!(nuget_version_order(a, b), Some(want), "{a} vs {b}");
         }
         assert_eq!(nuget_version_order("not.a.version.x", "1.0.0"), None);
+    }
+}
+
+#[cfg(test)]
+mod imported_memo_tests {
+    use super::*;
+    use crate::test_helpers::op_counting_storage;
+
+    /// R4-P01: "is this ID imported?" cost a LIST on every request (two on a version
+    /// list under the metadata filter). A proxied ID now costs one per
+    /// `EMPTY_PREFIX_TTL`; and an ID whose marker or record is written through this
+    /// process is hosted for the very next request, never answered from memory as proxied.
+    #[tokio::test]
+    async fn proxied_id_is_listed_once_and_an_import_is_seen_at_once() {
+        let (storage, ops) = op_counting_storage();
+        let lists = || ops.calls("list", "nuget/hosted/newtonsoft.json/");
+        for _ in 0..5 {
+            let versions = hosted_versions(&storage, "newtonsoft.json").await.unwrap();
+            assert!(!versions.hosted());
+        }
+        assert_eq!(lists(), 1, "five requests, one LIST: {:?}", ops.snapshot());
+
+        storage
+            .put(&hosted_marker_key("newtonsoft.json"), b"")
+            .await
+            .unwrap();
+        assert!(
+            hosted_versions(&storage, "newtonsoft.json")
+                .await
+                .unwrap()
+                .hosted(),
+            "hosted from the moment the marker write is acknowledged"
+        );
+        assert_eq!(lists(), 2);
     }
 }

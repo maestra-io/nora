@@ -2240,7 +2240,11 @@ async fn own_records(storage: &crate::storage::Storage, normalized: &str) -> Opt
     if crate::validation::validate_storage_key(crate::validation::listing_key(&prefix)).is_err() {
         return Some(own::Records::none());
     }
-    match storage.list(&prefix).await {
+    // Asked on every request of every project, and empty for all but NORA's own: an
+    // empty answer is remembered for `EMPTY_PREFIX_TTL` (R4-P01). A record written
+    // through this process (an upload) is seen at once, one written by another (a
+    // `nora import` run, a second replica) within the TTL.
+    match storage.list_often_empty(&prefix).await {
         Ok(keys) => Some(own::Records::from_listing(
             keys.iter().filter_map(|k| k.strip_prefix(&prefix)),
         )),
@@ -7563,5 +7567,36 @@ mod upstream_index_digest {
         for key in [format!("pypi/hm/{FILE}"), format!("pypi/hm/{FILE}.sha256")] {
             assert!(stored.contains(&key), "control: {key} not in {stored:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod own_memo_tests {
+    use super::*;
+    use crate::test_helpers::op_counting_storage;
+
+    /// R4-P01: "is this project NORA's own?" cost a LIST on every request. A proxied
+    /// project now costs one per `EMPTY_PREFIX_TTL`; and a project made hosted through
+    /// this process is hosted for the very next request, never answered from memory as
+    /// proxied (its name would go to an upstream).
+    #[tokio::test]
+    async fn proxied_project_is_listed_once_and_a_claim_is_seen_at_once() {
+        let (storage, ops) = op_counting_storage();
+        let lists = || ops.calls("list", "pypi-own/requests/");
+        for _ in 0..5 {
+            let records = own_records(&storage, "requests").await.unwrap();
+            assert!(!records.hosted());
+        }
+        assert_eq!(lists(), 1, "five requests, one LIST: {:?}", ops.snapshot());
+
+        claim_imported_project(&storage, "requests").await.unwrap();
+        assert!(
+            own_records(&storage, "requests").await.unwrap().hosted(),
+            "hosted from the moment the claim is acknowledged"
+        );
+        assert_eq!(lists(), 2);
+        // A hosted project is not memoized: its records are read every time.
+        assert!(own_records(&storage, "requests").await.unwrap().hosted());
+        assert_eq!(lists(), 3);
     }
 }

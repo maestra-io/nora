@@ -16,6 +16,8 @@ const READS: &[&str] = &[
     "list",
     "list_internal",
     "list_with_meta",
+    "list_often_empty",
+    "list_claiming_empty",
     "stat",
     "total_size",
     "backend_name",

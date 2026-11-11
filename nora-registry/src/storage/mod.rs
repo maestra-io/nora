@@ -263,12 +263,79 @@ pub trait StorageBackend: Send + Sync {
 #[derive(Clone)]
 pub struct Storage {
     inner: Arc<dyn StorageBackend>,
+    /// Listing prefixes found empty a moment ago ([`Storage::known_empty`]).
+    empty: Arc<EmptyPrefixes>,
+}
+
+/// How long a listing prefix found empty is taken to still be empty by this process
+/// when nothing was written under it through this [`Storage`] meanwhile. A write by
+/// ANOTHER process (a second replica, `nora import`) is seen after at most this long.
+pub const EMPTY_PREFIX_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Prefixes remembered before the whole memo is dropped.
+// ponytail: whole-map drop at the cap; an LRU if the set of asked names gets that big.
+const EMPTY_PREFIX_MAX: usize = 65_536;
+
+/// Negative memo of listings (R4-P01): "nothing is stored under this prefix", the
+/// answer every proxied NuGet/npm/PyPI request needs to "is this name hosted here?"
+/// and paid a LIST for.
+///
+/// Sound within one process: every write through [`Storage`] forgets the prefixes above
+/// its key, before and after the backend call, and a listing that was already running
+/// when a write landed is never remembered (its ticket is void). So from the moment a
+/// `put` returns, no reader of this process is told "empty" for a prefix above that key.
+#[derive(Default)]
+struct EmptyPrefixes(parking_lot::Mutex<EmptyState>);
+
+#[derive(Default)]
+struct EmptyState {
+    /// Prefix -> when its emptiness expires.
+    empty: std::collections::HashMap<String, tokio::time::Instant>,
+    /// Prefix -> ticket of the listing now establishing whether it is empty.
+    pending: std::collections::HashMap<String, u64>,
+    next_ticket: u64,
+}
+
+impl EmptyPrefixes {
+    /// A key under any remembered or pending prefix was (or is being) written.
+    fn wrote(&self, key: &str) {
+        let mut state = self.0.lock();
+        if state.empty.is_empty() && state.pending.is_empty() {
+            return;
+        }
+        for (at, _) in key.match_indices('/') {
+            let prefix = &key[..=at];
+            state.empty.remove(prefix);
+            state.pending.remove(prefix);
+        }
+    }
+}
+
+/// Ticket of a listing, taken before the backend is asked.
+#[derive(Debug, Clone, Copy)]
+struct EmptyTicket(u64);
+
+/// An empty listing just read from the backend, not remembered yet: the caller
+/// [`remember`](Self::remember)s it once its own checks agree the name is absent.
+pub struct EmptyClaim {
+    storage: Storage,
+    prefix: String,
+    ticket: EmptyTicket,
+}
+
+impl EmptyClaim {
+    /// Remember the prefix as empty, unless a write under it started or ended since
+    /// the listing began.
+    pub fn remember(self) {
+        self.storage.remember_empty(&self.prefix, self.ticket);
+    }
 }
 
 impl Storage {
     pub fn new_local(path: &str) -> Self {
         Self {
             inner: Arc::new(LocalStorage::new(path)),
+            empty: Arc::default(),
         }
     }
 
@@ -291,6 +358,7 @@ impl Storage {
                 credentials_dir,
                 virtual_hosted,
             )),
+            empty: Arc::default(),
         }
     }
 
@@ -305,6 +373,7 @@ impl Storage {
                 service_account_path,
                 base_url,
             )),
+            empty: Arc::default(),
         }
     }
 
@@ -313,7 +382,88 @@ impl Storage {
     /// driving GC's fail-closed "age unknown → keep and count" branch (#610).
     #[cfg(test)]
     pub(crate) fn from_backend(inner: Arc<dyn StorageBackend>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            empty: Arc::default(),
+        }
+    }
+
+    /// Whether a listing of `prefix` (ending in `/`) found nothing within
+    /// [`EMPTY_PREFIX_TTL`] and nothing was written under it through this store since.
+    fn known_empty(&self, prefix: &str) -> bool {
+        let state = self.empty.0.lock();
+        state
+            .empty
+            .get(prefix)
+            .is_some_and(|until| tokio::time::Instant::now() < *until)
+    }
+
+    /// Taken BEFORE asking the backend whether `prefix` is empty.
+    fn watch_empty(&self, prefix: &str) -> EmptyTicket {
+        let mut state = self.empty.0.lock();
+        state.next_ticket += 1;
+        let ticket = state.next_ticket;
+        state.pending.insert(prefix.to_string(), ticket);
+        EmptyTicket(ticket)
+    }
+
+    /// Remember that `prefix` is empty, unless a write under it started or ended since
+    /// `ticket` was taken: that answer may predate the write.
+    fn remember_empty(&self, prefix: &str, ticket: EmptyTicket) {
+        let mut state = self.empty.0.lock();
+        if state.pending.get(prefix) != Some(&ticket.0) {
+            return;
+        }
+        state.pending.remove(prefix);
+        if state.empty.len() >= EMPTY_PREFIX_MAX {
+            state.empty.clear();
+        }
+        state.empty.insert(
+            prefix.to_string(),
+            tokio::time::Instant::now() + EMPTY_PREFIX_TTL,
+        );
+    }
+
+    /// [`list`](Self::list) for a prefix asked about on every request and almost always
+    /// empty (the hosted records of a proxied name): an empty answer is served from
+    /// memory for [`EMPTY_PREFIX_TTL`], see [`EmptyPrefixes`].
+    pub async fn list_often_empty(&self, prefix: &str) -> Result<Vec<String>> {
+        let (keys, claim) = self.list_claiming_empty(prefix).await?;
+        if let Some(claim) = claim {
+            claim.remember();
+        }
+        Ok(keys)
+    }
+
+    /// [`list_often_empty`](Self::list_often_empty) for a caller with a check of its
+    /// own before "nothing here" may be remembered: an empty listing read from the
+    /// backend comes with an [`EmptyClaim`] to remember it by; one answered from
+    /// memory, and a non-empty one, come without.
+    pub async fn list_claiming_empty(
+        &self,
+        prefix: &str,
+    ) -> Result<(Vec<String>, Option<EmptyClaim>)> {
+        if self.known_empty(prefix) {
+            return Ok((Vec::new(), None));
+        }
+        let ticket = self.watch_empty(prefix);
+        let keys = self.list(prefix).await?;
+        let claim = keys.is_empty().then(|| EmptyClaim {
+            storage: self.clone(),
+            prefix: prefix.to_string(),
+            ticket,
+        });
+        Ok((keys, claim))
+    }
+
+    /// Run a backend write of `key`, forgetting the empty prefixes above it before the
+    /// call (readers list again while it runs) and after it, whatever its outcome (a
+    /// listing that overlapped it is not remembered; a timed-out write may have landed).
+    async fn writing<T>(&self, key: &str, write: impl std::future::Future<Output = T>) -> T {
+        self.empty.wrote(key);
+        let out = write.await;
+        self.empty.wrote(key);
+        out
     }
 
     /// One backend call, observed into [`STORAGE_OPERATION_DURATION_SECONDS`] under
@@ -342,7 +492,8 @@ impl Storage {
     /// uploaded from that one refcounted buffer, never copied.
     pub async fn put_bytes(&self, key: &str, data: Bytes) -> Result<()> {
         let hash = Self::hash_for_put(key, &data).await?;
-        let result = Self::timed("put", self.inner.put_bytes(key, data, &hash)).await;
+        let write = Self::timed("put", self.inner.put_bytes(key, data, &hash));
+        let result = self.writing(key, write).await;
         Self::count_put(&result);
         result
     }
@@ -352,7 +503,8 @@ impl Storage {
     /// [`StorageBackend::put_if_absent`]). `Ok(false)`: the key existed, nothing written.
     pub async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<bool> {
         let hash = Self::hash_for_put(key, &data).await?;
-        let result = Self::timed("put", self.inner.put_if_absent(key, data, &hash)).await;
+        let write = Self::timed("put", self.inner.put_if_absent(key, data, &hash));
+        let result = self.writing(key, write).await;
         Self::count_put(&result);
         result
     }
@@ -750,7 +902,8 @@ impl Storage {
     pub async fn put_from_path(&self, key: &str, src: &Path, sha256: Option<&str>) -> Result<()> {
         validate_storage_key(key)?;
         let sha256 = sha256.map(str::to_ascii_lowercase);
-        match Self::timed("put", self.inner.put_from_path(key, src, sha256.as_deref())).await {
+        let write = Self::timed("put", self.inner.put_from_path(key, src, sha256.as_deref()));
+        match self.writing(key, write).await {
             Ok(()) => {
                 STORAGE_OPERATIONS.with_label_values(&["put", "ok"]).inc();
                 Ok(())
@@ -774,7 +927,8 @@ impl Storage {
         validate_storage_key(src)?;
         validate_storage_key(dst)?;
         let sha256 = sha256.map(str::to_ascii_lowercase);
-        match Self::timed("copy", self.inner.copy(src, dst, sha256.as_deref())).await {
+        let write = Self::timed("copy", self.inner.copy(src, dst, sha256.as_deref()));
+        match self.writing(dst, write).await {
             Ok(()) => {
                 STORAGE_OPERATIONS.with_label_values(&["copy", "ok"]).inc();
                 Ok(())
@@ -1520,6 +1674,97 @@ mod tests {
         assert_eq!(&storage.get(unpinned).await.unwrap()[..], b"no-pin");
     }
 
+    /// R4-P01: an empty listing is remembered, so the next "is this name hosted?" costs
+    /// no LIST; a write under the prefix through this store ends that at once, an
+    /// outside write within [`EMPTY_PREFIX_TTL`].
+    #[tokio::test(start_paused = true)]
+    async fn empty_listing_is_remembered_until_a_write_or_the_ttl() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let prefix = "nuget/hosted/left.pad/";
+
+        assert!(!storage.known_empty(prefix));
+        assert!(storage.list_often_empty(prefix).await.unwrap().is_empty());
+        assert!(storage.known_empty(prefix));
+        // A sibling prefix is its own question.
+        assert!(!storage.known_empty("nuget/hosted/left/"));
+
+        // Another process writes (straight to disk): unseen until the TTL ends.
+        let outside = dir.path().join("nuget/hosted/left.pad/imported");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, b"").unwrap();
+        assert!(storage.list_often_empty(prefix).await.unwrap().is_empty());
+        tokio::time::advance(EMPTY_PREFIX_TTL).await;
+        assert_eq!(storage.list_often_empty(prefix).await.unwrap().len(), 1);
+        assert!(
+            !storage.known_empty(prefix),
+            "a non-empty answer is not kept"
+        );
+
+        // A write through this store is seen by the very next question, for every
+        // kind of write, at any depth under the prefix.
+        let src = dir.path().join("upload.tmp");
+        for (n, kind) in ["put", "put_if_absent", "put_from_path", "copy"]
+            .into_iter()
+            .enumerate()
+        {
+            let prefix = format!("npm/pkg{n}/versions/");
+            let key = format!("{prefix}deep/1.0.0.json");
+            assert!(storage.list_often_empty(&prefix).await.unwrap().is_empty());
+            assert!(storage.known_empty(&prefix), "{kind}");
+            match kind {
+                "put" => storage.put(&key, b"{}").await.unwrap(),
+                "put_if_absent" => {
+                    assert!(storage
+                        .put_if_absent(&key, Bytes::from_static(b"{}"))
+                        .await
+                        .unwrap())
+                }
+                "put_from_path" => {
+                    std::fs::write(&src, b"{}").unwrap();
+                    storage.put_from_path(&key, &src, None).await.unwrap()
+                }
+                _ => {
+                    storage.put("raw/src.json", b"{}").await.unwrap();
+                    storage.copy("raw/src.json", &key, None).await.unwrap()
+                }
+            }
+            assert!(!storage.known_empty(&prefix), "{kind} ends the memo");
+            assert_eq!(
+                storage.list_often_empty(&prefix).await.unwrap().len(),
+                1,
+                "{kind}"
+            );
+        }
+    }
+
+    /// R4-P01, the publish race: a listing that was already running when a write under
+    /// its prefix landed answers "empty" from before the write. It must not be
+    /// remembered, or a name published here would be asked of an upstream after its
+    /// publish was acknowledged.
+    #[tokio::test]
+    async fn listing_overlapping_a_write_is_not_remembered() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let prefix = "pypi-own/pkg/";
+        // The listing starts and finds nothing ...
+        let ticket = storage.watch_empty(prefix);
+        assert!(storage.list(prefix).await.unwrap().is_empty());
+        // ... a publish lands and is acknowledged ...
+        storage.put("pypi-own/pkg/imported", b"").await.unwrap();
+        // ... then the listing's stale answer arrives.
+        storage.remember_empty(prefix, ticket);
+        assert!(!storage.known_empty(prefix));
+
+        // A newer listing voids an older ticket too: only the latest may answer.
+        let old = storage.watch_empty("npm/a/versions/");
+        let new = storage.watch_empty("npm/a/versions/");
+        storage.remember_empty("npm/a/versions/", old);
+        assert!(!storage.known_empty("npm/a/versions/"));
+        storage.remember_empty("npm/a/versions/", new);
+        assert!(storage.known_empty("npm/a/versions/"));
+    }
+
     /// `get_verified` reflects the gate outcome in the type: a pinned key yields
     /// `GateOutcome::Verified`, an unpinned (open-world) key yields `Unpinned`,
     /// and a tampered pinned artifact still fails closed — no witness is minted
@@ -1936,7 +2181,9 @@ mod tests {
         "get_verified",
         "get_verified_bounded",
         "list",
+        "list_claiming_empty",
         "list_internal",
+        "list_often_empty",
         "list_with_meta",
         "pin",
         "put",
@@ -2009,6 +2256,14 @@ mod tests {
                     ("list", s.list(prefix).await.is_err()),
                     ("list_internal", s.list_internal(prefix).await.is_err()),
                     ("list_with_meta", s.list_with_meta(prefix).await.is_err()),
+                    (
+                        "list_often_empty",
+                        s.list_often_empty(prefix).await.is_err(),
+                    ),
+                    (
+                        "list_claiming_empty",
+                        s.list_claiming_empty(prefix).await.is_err(),
+                    ),
                 ];
                 for (method, ok) in checks {
                     assert!(ok, "{b} {method} {prefix}");
