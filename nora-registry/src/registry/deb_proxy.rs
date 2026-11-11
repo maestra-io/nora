@@ -809,14 +809,8 @@ async fn build_suite(
         }
 
         let hidden = |s: &Stanza| -> Option<i64> {
-            let held = crate::curation::is_internal_namespace(engine, RegistryType::Deb, &s.name)
-                || engine.hides_from_metadata(
-                    RegistryType::Deb,
-                    &s.name,
-                    &s.version,
-                    Some(s.first_seen),
-                );
-            held.then(|| s.first_seen + min_age.unwrap_or(0))
+            held_by_policy(engine, &s.name, &s.version, s.first_seen)
+                .then(|| s.first_seen + min_age.unwrap_or(0))
         };
         let mut cached = HashSet::new();
         for s in &retired {
@@ -983,6 +977,17 @@ fn release_text(
     out
 }
 
+/// Whether curation hides a version first seen at `first_seen` from the indexes.
+fn held_by_policy(
+    engine: &crate::curation::CurationEngine,
+    name: &str,
+    version: &str,
+    first_seen: i64,
+) -> bool {
+    crate::curation::is_internal_namespace(engine, RegistryType::Deb, name)
+        || engine.hides_from_metadata(RegistryType::Deb, name, version, Some(first_seen))
+}
+
 /// The earliest date the ledgers `keys` give each of `files`. A pool file is as old as
 /// its first sighting in any suite, component or architecture: jammy-updates and
 /// jammy-security list one kernel `.deb` days apart, every arch index lists an
@@ -1039,7 +1044,7 @@ async fn update_young(
     }
     young.retain(|_, files| !files.is_empty());
     let mut held = held;
-    if let Some(age) = min_age {
+    if min_age.is_some() {
         // Ledgers another build wrote after this one read them (a suite's first build
         // dates everything 0): under the lock, so that build's own update has run or
         // will run after this one and clear what it serves.
@@ -1056,14 +1061,16 @@ async fn update_young(
                 .map(|(k, _)| k)
                 .collect();
             let earliest = earliest_seen(state, &fresh, &files).await;
+            let curation = state.curation();
+            let engine = &curation.curation_engine;
             for m in held.values_mut() {
-                m.retain(|f, v| match earliest.get(f) {
-                    Some(&t) if since - t >= age => false,
-                    Some(&t) => {
-                        v.2 = v.2.min(t);
-                        true
-                    }
-                    None => true,
+                m.retain(|f, (name, version, seen)| {
+                    let Some(&t) = earliest.get(f) else {
+                        return true;
+                    };
+                    *seen = (*seen).min(t);
+                    // Held for its name (an internal namespace) whatever its age.
+                    held_by_policy(engine, name, version, *seen)
                 });
             }
         }
@@ -1656,19 +1663,21 @@ mod integration_tests {
 
     /// A build that read the ledgers before another suite wrote an older date for its
     /// held file drops the hold under the lock; a ledger it had read already is not
-    /// read again.
+    /// read again, and a file held for its name stays held whatever its date.
     #[tokio::test]
     async fn a_hold_is_checked_against_ledgers_written_during_the_build() {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.deb.enabled = true;
             cfg.curation.deb.min_release_age = Some("3d".into());
+            cfg.curation.internal_namespaces = vec!["corp-*".to_string()];
         });
         let state = &ctx.state;
         let now = crate::cache_ttl::now_unix() as i64;
         let f = "pool/main/k_2_amd64.deb".to_string();
+        let corp = "pool/main/corp-x_1_amd64.deb".to_string();
         let ledger = super::Ledger {
             upstream: None,
-            seen: [(f.clone(), 0)].into(),
+            seen: [(f.clone(), 0), (corp.clone(), 0)].into(),
             retired: Vec::new(),
         };
         super::put_json(
@@ -1681,7 +1690,11 @@ mod integration_tests {
         let held = |seen: i64| -> std::collections::BTreeMap<_, _> {
             [(
                 "security/main/amd64".to_string(),
-                [(f.clone(), ("k".to_string(), "2".to_string(), seen))].into(),
+                [
+                    (f.clone(), ("k".to_string(), "2".to_string(), seen)),
+                    (corp.clone(), ("corp-x".to_string(), "1".to_string(), seen)),
+                ]
+                .into(),
             )]
             .into()
         };
@@ -1700,11 +1713,14 @@ mod integration_tests {
         .await
         .unwrap();
         assert!(super::load_young(state, "debian").await["security/main/amd64"].contains_key(&f));
-        // Written during the build: the hold goes.
+        // Written during the build: the hold goes, but not the one on an internal name.
         super::update_young(state, "debian", "security", held(now), &none, age, now)
             .await
             .unwrap();
-        assert!(super::load_young(state, "debian").await.is_empty());
+        let young = super::load_young(state, "debian").await;
+        let files = &young["security/main/amd64"];
+        assert!(!files.contains_key(&f), "{files:?}");
+        assert!(files.contains_key(&corp), "{files:?}");
     }
 
     #[tokio::test]
