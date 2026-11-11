@@ -241,9 +241,9 @@ fn is_mutable_maven_path(path: &str) -> bool {
 }
 
 /// True when a URL points at Maven Central (one of its canonical hosts) — the only
-/// Maven upstream with a per-artifact date source (its search API). A private mirror
-/// (Nexus/Artifactory) returns false, so its coordinates are never sent to the public
-/// search.maven.org (#68/#733).
+/// Maven upstream NORA reads a per-artifact date from (`Last-Modified`, its search API).
+/// A private mirror (Nexus/Artifactory) returns false, so its coordinates are never sent
+/// to the public search.maven.org (#68/#733).
 fn url_is_maven_central(u: &str) -> bool {
     u.contains("repo1.maven.org")
         || u.contains("repo.maven.apache.org")
@@ -251,49 +251,247 @@ fn url_is_maven_central(u: &str) -> bool {
         || u.contains("central.sonatype")
 }
 
-/// True when a configured Maven proxy points at Maven Central. Gates the search
-/// query so internal coordinates are never sent to search.maven.org.
-fn maven_upstream_is_central(state: &AppState) -> bool {
-    state
+/// Central's search API: the fallback date source when the file's own `Last-Modified` is
+/// not available.
+const MAVEN_CENTRAL_SEARCH: &str = "https://search.maven.org";
+
+/// Why a date lookup gave no date: the `outcome` label of `nora_maven_date_lookup_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DateMiss {
+    Timeout,
+    Transport,
+    Status(u16),
+    /// Central has no such file / GAV: not a failure, the artifact is not on Central.
+    NotFound,
+    /// Answered without a date (no `Last-Modified`, no `timestamp`).
+    Missing,
+    Parse,
+}
+
+impl DateMiss {
+    fn outcome(self) -> &'static str {
+        match self {
+            DateMiss::Timeout => "timeout",
+            DateMiss::Transport => "transport",
+            DateMiss::Status(_) => "status",
+            DateMiss::NotFound => "not_found",
+            DateMiss::Missing => "missing",
+            DateMiss::Parse => "parse",
+        }
+    }
+
+    fn from_send(e: &reqwest::Error) -> Self {
+        if e.is_timeout() {
+            DateMiss::Timeout
+        } else {
+            DateMiss::Transport
+        }
+    }
+
+    fn from_status(status: reqwest::StatusCode) -> Self {
+        if status == reqwest::StatusCode::NOT_FOUND {
+            DateMiss::NotFound
+        } else {
+            DateMiss::Status(status.as_u16())
+        }
+    }
+}
+
+/// `Last-Modified` of the file on Central (a HEAD): Central files are immutable, so it is
+/// the upload date.
+async fn central_last_modified(
+    client: &reqwest::Client,
+    file_url: &str,
+    auth: Option<&str>,
+    timeout: Duration,
+) -> Result<i64, DateMiss> {
+    let mut request = client.head(file_url).timeout(timeout);
+    if let Some(credentials) = auth {
+        let value = UpstreamAuth::Basic(credentials)
+            .header_value()
+            .map_err(|_| DateMiss::Transport)?;
+        request = request.header(header::AUTHORIZATION, value);
+    }
+    let resp = request.send().await.map_err(|e| DateMiss::from_send(&e))?;
+    if !resp.status().is_success() {
+        return Err(DateMiss::from_status(resp.status()));
+    }
+    let lm = resp
+        .headers()
+        .get(header::LAST_MODIFIED)
+        .ok_or(DateMiss::Missing)?;
+    let lm = lm.to_str().map_err(|_| DateMiss::Parse)?;
+    chrono::DateTime::parse_from_rfc2822(lm)
+        .map(|at| at.timestamp())
+        .map_err(|_| DateMiss::Parse)
+}
+
+/// Upload timestamp of a GAV from the Central search API.
+async fn central_search_date(
+    client: &reqwest::Client,
+    search_base: &str,
+    (group, artifact, version): (&str, &str, &str),
+    timeout: Duration,
+) -> Result<i64, DateMiss> {
+    let url = format!(
+        "{}/solrsearch/select?q=g:%22{}%22+AND+a:%22{}%22+AND+v:%22{}%22&core=gav&rows=1&wt=json",
+        search_base, group, artifact, version
+    );
+    let resp = client
+        .get(&url)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| DateMiss::from_send(&e))?;
+    if !resp.status().is_success() {
+        return Err(DateMiss::from_status(resp.status()));
+    }
+    let json: serde_json::Value = resp.json().await.map_err(|e| {
+        if e.is_timeout() {
+            DateMiss::Timeout
+        } else {
+            DateMiss::Parse
+        }
+    })?;
+    let docs = json["response"]["docs"].as_array().ok_or(DateMiss::Parse)?;
+    let doc = docs.first().ok_or(DateMiss::NotFound)?;
+    let ts_ms = doc["timestamp"].as_i64().ok_or(DateMiss::Missing)?;
+    Ok(ts_ms / 1000)
+}
+
+fn record_date_lookup(source: &str, result: Result<i64, DateMiss>, path: &str) {
+    let outcome = result.map_or_else(DateMiss::outcome, |_| "ok");
+    crate::metrics::MAVEN_DATE_LOOKUP_TOTAL
+        .with_label_values(&[source, outcome])
+        .inc();
+    match result {
+        Ok(_) => {}
+        // Not on Central (a maven.google.com artifact): expected, nothing to act on.
+        Err(DateMiss::NotFound) => {
+            tracing::debug!(source, path, "Maven Central has no date for this artifact")
+        }
+        Err(miss) => tracing::warn!(
+            source,
+            path,
+            reason = outcome,
+            status = ?match miss { DateMiss::Status(code) => Some(code), _ => None },
+            "Maven Central date lookup failed; the quarantine falls back to first_seen"
+        ),
+    }
+}
+
+/// Upload date of a Maven Central file: its `Last-Modified`, else the search API's GAV
+/// `timestamp`, both within one `budget` (a slow or throttled lookup must not hold the
+/// download). `None` leaves the quarantine on NORA's first-seen clock; every failure is
+/// logged at WARN with its reason and counted in `nora_maven_date_lookup_total`.
+async fn maven_central_publish_date(
+    client: &reqwest::Client,
+    file_url: &str,
+    auth: Option<&str>,
+    search_base: &str,
+    gav: (&str, &str, &str),
+    budget: Duration,
+) -> Option<i64> {
+    let started = std::time::Instant::now();
+    let head = central_last_modified(client, file_url, auth, budget).await;
+    record_date_lookup("last_modified", head, file_url);
+    match head {
+        Ok(ts) => return Some(ts),
+        // Not on Central / out of budget: the search cannot answer either.
+        Err(DateMiss::NotFound | DateMiss::Timeout) => return None,
+        Err(_) => {}
+    }
+    let remaining = budget.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        record_date_lookup("search", Err(DateMiss::Timeout), file_url);
+        return None;
+    }
+    let search = central_search_date(client, search_base, gav, remaining).await;
+    record_date_lookup("search", search, file_url);
+    search.ok()
+}
+
+/// [`maven_central_publish_date`] of `path` on the configured Central proxy; `None` with no
+/// Central proxy, so a private mirror's coordinates never reach Central (#68/#733).
+async fn central_publish_date(
+    state: &AppState,
+    path: &str,
+    maven_name: &str,
+    version: &str,
+) -> Option<i64> {
+    let central = state
         .config
         .maven
         .proxies
         .iter()
-        .any(|p| url_is_maven_central(p.url()))
+        .find(|p| url_is_maven_central(p.url()))?;
+    let (group, artifact) = maven_name.split_once(':')?;
+    maven_central_publish_date(
+        &state.http_client,
+        &format!("{}/{}", central.url().trim_end_matches('/'), path),
+        central.auth(),
+        MAVEN_CENTRAL_SEARCH,
+        (group, artifact, version),
+        Duration::from_secs(state.config.maven.date_lookup_timeout),
+    )
+    .await
 }
 
-/// Best-effort upload timestamp for a Maven Central GAV via the Central search
-/// API. Maven's repo protocol exposes no per-artifact date, so this is the only
-/// source; any failure → `None` (the quarantine falls back to NORA's own clock).
-async fn fetch_maven_central_date(
-    client: &reqwest::Client,
-    group: &str,
-    artifact: &str,
-    version: &str,
-    timeout_secs: u64,
-) -> Option<i64> {
-    let url = format!(
-        "https://search.maven.org/solrsearch/select?q=g:%22{}%22+AND+a:%22{}%22+AND+v:%22{}%22&core=gav&rows=1&wt=json",
-        group, artifact, version
-    );
-    let resp = client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
+/// A held digest is dated again at most once per this many seconds.
+const REDATE_RETRY_SECS: i64 = 3600;
+
+/// When each held digest was last dated again (unix seconds).
+// ponytail: process-local; a restart retries every held digest once, which is the point.
+static REDATE_TRIED: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, i64>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// A cached artifact the quarantine holds is dated again before it is served: a cache hit
+/// asks no upstream, so a lookup that failed on the miss (a throttled search, the 30 s
+/// misses of 11.11.2026) would hold a years-old artifact for the whole TTL. `lookup` runs
+/// once per digest per [`REDATE_RETRY_SECS`]; its date only moves the clock back
+/// (`backdate`, persisted), never forward, and no date keeps first_seen.
+async fn redate_held<F, Fut>(
+    store: &crate::digest_quarantine::DigestStore,
+    digest: &str,
+    quarantine_secs: i64,
+    lookup: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<i64>>,
+{
+    if !matches!(
+        store.check("maven", digest, quarantine_secs),
+        crate::digest_quarantine::QuarantineStatus::Pending { .. }
+    ) {
+        return;
     }
-    let json: serde_json::Value = resp.json().await.ok()?;
-    let ts_ms = json
-        .get("response")?
-        .get("docs")?
-        .as_array()?
-        .first()?
-        .get("timestamp")?
-        .as_i64()?;
-    Some(ts_ms / 1000)
+    let now = crate::cache_ttl::now_unix() as i64;
+    {
+        let mut tried = REDATE_TRIED.lock();
+        if tried
+            .get(digest)
+            .is_some_and(|at| now - at < REDATE_RETRY_SECS)
+        {
+            return;
+        }
+        tried.retain(|_, at| now - *at < REDATE_RETRY_SECS);
+        tried.insert(digest.to_string(), now);
+    }
+    let Some(at) = lookup().await else {
+        return;
+    };
+    let was = store.check("maven", digest, quarantine_secs);
+    if let Some(entry) = store.backdate("maven", digest, at, true) {
+        if entry.first_seen == at {
+            tracing::info!(
+                digest,
+                first_seen = at,
+                ?was,
+                "Quarantine: held Maven artifact dated by Central"
+            );
+        }
+    }
 }
 
 // ============================================================================
@@ -349,10 +547,12 @@ async fn download(
         .unwrap_or(false);
 
     // Release date for the digest-quarantine first-seen clock (#748/#750), hoisted
-    // to function scope so the serve gate below can use it. Maven's repo layout
-    // exposes no per-artifact upload date, so for a Maven Central upstream we query
-    // the Central search API (gated to a Central proxy to avoid leaking coordinates);
+    // to function scope so the serve gate below can use it. For a Maven Central upstream
+    // it is the file's `Last-Modified` on Central, else the Central search API, within
+    // `maven.date_lookup_timeout` (gated to a Central proxy to avoid leaking coordinates);
     // other proxies have no date (None → NORA's own clock). Hosted-only uses mtime.
+    // The search used to run on `proxy_timeout` and fail silently: a throttled search
+    // added 30 s to every cold miss and held years-old artifacts by first_seen.
     //
     // #754: the Central query only happens on a cache MISS. On a cache hit the digest
     // is already recorded (quarantine `record` is idempotent → the date is ignored),
@@ -363,26 +563,10 @@ async fn download(
         if let Some((ref maven_name, ref maven_version)) = curation_coords {
             if state.config.maven.proxies.is_empty() {
                 crate::curation::extract_mtime_as_publish_date(&state.storage, &key).await
-            } else if !already_cached
-                && !internal
-                && state.config.server.trust_upstream_dates
-                && maven_upstream_is_central(&state)
-            {
-                // #68/#733: never send an internal-namespace GAV to the hardcoded public
-                // search.maven.org — that would leak operator-internal coordinates.
-                match maven_name.split_once(':') {
-                    Some((group, artifact)) => {
-                        fetch_maven_central_date(
-                            &state.http_client,
-                            group,
-                            artifact,
-                            maven_version,
-                            state.config.maven.proxy_timeout,
-                        )
-                        .await
-                    }
-                    None => None,
-                }
+            } else if !already_cached && !internal && state.config.server.trust_upstream_dates {
+                // #68/#733: never send an internal-namespace GAV to Central — that would
+                // leak operator-internal coordinates.
+                central_publish_date(&state, &path, maven_name, maven_version).await
             } else {
                 None
             }
@@ -511,6 +695,15 @@ async fn download(
                 .log(AuditEntry::new("cache_hit", "proxy", "", "maven", ""));
             // Quarantine only real version artifacts (.jar/.pom/.sha1, immutable per version).
             if let Some(digest) = digest.as_deref().filter(|_| quarantine_on) {
+                if let Some((maven_name, maven_version)) = curation_coords
+                    .as_ref()
+                    .filter(|_| !internal && state.config.server.trust_upstream_dates)
+                {
+                    redate_held(&state.digest_store, digest, q_secs, || {
+                        central_publish_date(&state, &path, maven_name, maven_version)
+                    })
+                    .await;
+                }
                 if let Some(resp) = crate::digest_quarantine::proxy_gate_digest(
                     &state.digest_store,
                     "maven",
@@ -1504,6 +1697,227 @@ mod tests {
         assert!(!url_is_maven_central("https://artifactory.acme.io/maven"));
         assert!(!url_is_maven_central("https://maven.pkg.github.com/acme"));
         assert!(!url_is_maven_central(""));
+    }
+
+    mod central_date {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const JAR: &str = "/maven2/org/x/a/1.0/a-1.0.jar";
+        const GAV: (&str, &str, &str) = ("org.x", "a", "1.0");
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// Runs the lookup with a log capture; returns (date, elapsed, log).
+        async fn lookup(server: &MockServer, budget: Duration) -> (Option<i64>, Duration, String) {
+            let sink = Sink::default();
+            let writer = sink.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let started = std::time::Instant::now();
+            let date = maven_central_publish_date(
+                &reqwest::Client::new(),
+                &format!("{}{}", server.uri(), JAR),
+                None,
+                &server.uri(),
+                GAV,
+                budget,
+            )
+            .await;
+            let log = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+            (date, started.elapsed(), log)
+        }
+
+        fn search_hit() -> ResponseTemplate {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "response": {"docs": [{"timestamp": 1_173_268_800_000_i64}]}
+            }))
+        }
+
+        /// The date comes from the file's `Last-Modified`; the search API is not asked.
+        #[tokio::test]
+        async fn last_modified_is_the_date() {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .and(path(JAR))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("last-modified", "Wed, 07 Mar 2007 12:00:00 GMT"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(path("/solrsearch/select"))
+                .respond_with(search_hit())
+                .expect(0)
+                .mount(&server)
+                .await;
+            let (date, _, log) = lookup(&server, Duration::from_secs(5)).await;
+            assert_eq!(date, Some(1_173_268_800));
+            assert!(!log.contains("WARN"), "{log}");
+        }
+
+        /// No `Last-Modified` → the search API answers; the miss is logged with its reason.
+        #[tokio::test]
+        async fn search_is_the_fallback() {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            Mock::given(path("/solrsearch/select"))
+                .respond_with(search_hit())
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (date, _, log) = lookup(&server, Duration::from_secs(5)).await;
+            assert_eq!(date, Some(1_173_268_800));
+            assert!(
+                log.contains("WARN") && log.contains("last_modified") && log.contains("missing"),
+                "{log}"
+            );
+        }
+
+        /// A throttled HEAD and a hung search (the 11.11.2026 30 s misses) give no date
+        /// within the lookup budget, each failure logged at WARN with its reason and counted.
+        #[tokio::test]
+        async fn hung_search_is_bounded_by_the_budget() {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .respond_with(ResponseTemplate::new(403))
+                .mount(&server)
+                .await;
+            Mock::given(path("/solrsearch/select"))
+                .respond_with(search_hit().set_delay(Duration::from_secs(30)))
+                .mount(&server)
+                .await;
+            let timeouts = || {
+                crate::metrics::MAVEN_DATE_LOOKUP_TOTAL
+                    .with_label_values(&["search", "timeout"])
+                    .get()
+            };
+            let before = timeouts();
+            let (date, elapsed, log) = lookup(&server, Duration::from_secs(1)).await;
+            assert_eq!(date, None, "no date → first_seen");
+            // 1 s budget against a 30 s hang; the margin absorbs a loaded CI runner.
+            assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+            assert!(timeouts() > before);
+            let warns: Vec<&str> = log.lines().filter(|l| l.contains("WARN")).collect();
+            assert_eq!(warns.len(), 2, "{log}");
+            assert!(
+                warns[0].contains("last_modified") && warns[0].contains("status=Some(403)"),
+                "{log}"
+            );
+            assert!(
+                warns[1].contains("search") && warns[1].contains("timeout"),
+                "{log}"
+            );
+        }
+
+        /// A HEAD that times out spends the whole budget: no search after it.
+        #[tokio::test]
+        async fn hung_head_skips_the_search() {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+                .mount(&server)
+                .await;
+            Mock::given(path("/solrsearch/select"))
+                .respond_with(search_hit())
+                .expect(0)
+                .mount(&server)
+                .await;
+            let (date, elapsed, log) = lookup(&server, Duration::from_secs(1)).await;
+            assert_eq!(date, None);
+            // 1 s budget against a 30 s hang; the margin absorbs a loaded CI runner.
+            assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+            assert!(log.contains("WARN") && log.contains("timeout"), "{log}");
+        }
+
+        /// A cached artifact held on first_seen is dated again, once per retry window: a
+        /// Central date matures it, no date keeps it held, a mature one is not looked up.
+        #[tokio::test]
+        async fn held_cached_artifact_is_dated_again() {
+            use crate::digest_quarantine::{DigestStore, QuarantineStatus};
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = DigestStore::empty(crate::storage::Storage::new_local(
+                tmp.path().to_str().unwrap(),
+            ));
+            let ttl = 7 * 86400;
+            let calls = AtomicUsize::new(0);
+            let lookup = |date: Option<i64>| {
+                let calls = &calls;
+                move || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    date
+                }
+            };
+            let held = |d: &str| {
+                matches!(
+                    store.check("maven", d, ttl),
+                    QuarantineStatus::Pending { .. }
+                )
+            };
+
+            let undated = "sha256:redate-undated";
+            store.record("maven", undated, "u", None);
+            redate_held(&store, undated, ttl, lookup(None)).await;
+            assert!(held(undated), "no date keeps first_seen");
+            redate_held(&store, undated, ttl, lookup(Some(1_173_268_800))).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "retried within the window");
+            assert!(held(undated));
+
+            let old = "sha256:redate-old";
+            store.record("maven", old, "u", None);
+            redate_held(&store, old, ttl, lookup(Some(1_173_268_800))).await;
+            assert_eq!(store.check("maven", old, ttl), QuarantineStatus::Mature);
+            redate_held(&store, old, ttl, lookup(Some(1_173_268_800))).await;
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "a mature digest is not looked up"
+            );
+
+            let young = "sha256:redate-young";
+            store.record("maven", young, "u", None);
+            let yesterday = crate::cache_ttl::now_unix() as i64 - 86400;
+            redate_held(&store, young, ttl, lookup(Some(yesterday))).await;
+            assert!(held(young), "a young Central date still holds");
+        }
+
+        /// Not on Central (a maven.google.com artifact): no date, no search, no WARN.
+        #[tokio::test]
+        async fn not_on_central_is_quiet() {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            Mock::given(path("/solrsearch/select"))
+                .respond_with(search_hit())
+                .expect(0)
+                .mount(&server)
+                .await;
+            let (date, _, log) = lookup(&server, Duration::from_secs(5)).await;
+            assert_eq!(date, None);
+            assert!(!log.contains("WARN"), "{log}");
+        }
     }
 
     #[test]

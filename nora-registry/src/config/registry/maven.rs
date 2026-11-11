@@ -13,6 +13,10 @@ pub struct MavenConfig {
     pub proxies: Vec<MavenProxyEntry>,
     #[serde(default = "super::super::default_timeout")]
     pub proxy_timeout: u64,
+    /// Budget (seconds) for the Maven Central publish-date lookup on a cache miss
+    /// (`Last-Modified`, then the search API). Kept short: the download waits for it.
+    #[serde(default = "default_date_lookup_timeout")]
+    pub date_lookup_timeout: u64,
     /// Verify client-uploaded checksums against server-computed values
     #[serde(default = "super::super::default_true")]
     pub checksum_verify: bool,
@@ -73,12 +77,17 @@ fn default_maven_proxies() -> Vec<MavenProxyEntry> {
     )]
 }
 
+fn default_date_lookup_timeout() -> u64 {
+    5
+}
+
 impl Default for MavenConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             proxies: default_maven_proxies(),
             proxy_timeout: 30,
+            date_lookup_timeout: default_date_lookup_timeout(),
             checksum_verify: true,
             immutable_releases: true,
             metadata_ttl: 300,
@@ -110,6 +119,13 @@ impl MavenConfig {
         }
         if let Ok(val) = env::var("NORA_MAVEN_PROXY_TIMEOUT") {
             super::super::parse_env_warn("NORA_MAVEN_PROXY_TIMEOUT", &val, &mut self.proxy_timeout);
+        }
+        if let Ok(val) = env::var("NORA_MAVEN_DATE_LOOKUP_TIMEOUT") {
+            super::super::parse_env_warn(
+                "NORA_MAVEN_DATE_LOOKUP_TIMEOUT",
+                &val,
+                &mut self.date_lookup_timeout,
+            );
         }
         if let Ok(val) = env::var("NORA_MAVEN_CHECKSUM_VERIFY") {
             self.checksum_verify = val.to_lowercase() == "true" || val == "1";

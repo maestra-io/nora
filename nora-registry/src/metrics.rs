@@ -67,6 +67,18 @@ pub static CURATION_DECISIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| 
     .expect("failed to create CURATION_DECISIONS_TOTAL metric at startup")
 });
 
+/// Maven Central publish-date lookups on a cache miss. `source` ∈ {last_modified, search},
+/// `outcome` ∈ {ok, timeout, transport, status, not_found, missing, parse}: anything but ok
+/// / not_found leaves the artifact on the quarantine's first-seen clock.
+pub static MAVEN_DATE_LOOKUP_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_maven_date_lookup_total",
+        "Maven Central publish-date lookups by source and outcome",
+        &["source", "outcome"]
+    )
+    .expect("failed to create MAVEN_DATE_LOOKUP_TOTAL metric at startup")
+});
+
 /// Downloads younger than `min_release_age` let through because their exact version is
 /// on `[curation.<registry>] allow` — each one a deliberate cooldown exemption.
 pub static CURATION_MIN_AGE_ALLOWED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
