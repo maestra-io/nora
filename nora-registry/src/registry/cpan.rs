@@ -66,7 +66,15 @@ async fn mailrc_index(State(state): State<AppState>) -> Response {
 
 async fn fetch_index(state: &AppState, filename: &str) -> Response {
     let storage_key = format!("cpan/{}", filename);
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let cached_data = match crate::registry::cache_read(
+        state.storage.get(&storage_key).await,
+        "cpan",
+        &storage_key,
+        false,
+    ) {
+        Ok(cached) => cached,
+        Err(response) => return response,
+    };
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.cpan.metadata_ttl) {
@@ -178,7 +186,15 @@ async fn distribution_proxy(
     let filename = dist_path.rsplit('/').next().unwrap_or(dist_path);
 
     // Eager cache read — preserve data for serve-stale fallback
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let cached_data = match crate::registry::cache_read(
+        state.storage.get(&storage_key).await,
+        "cpan",
+        &storage_key,
+        false,
+    ) {
+        Ok(cached) => cached,
+        Err(response) => return response,
+    };
 
     // Curation check — extract name and optional version from dist filename
     let (dist_name, dist_version) = parse_dist_filename(filename);
@@ -687,6 +703,35 @@ mod tests {
 mod integration_tests {
     use crate::test_helpers::*;
     use axum::http::{header, Method, StatusCode};
+
+    /// R4-T13: a store that cannot be read is a retryable 503, not a cache miss answered by
+    /// the upstream.
+    #[tokio::test]
+    async fn an_unreadable_store_is_503_not_a_miss() {
+        use axum::http::{Method, StatusCode};
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        let ctx =
+            crate::test_helpers::create_test_context_with_storage_and_config(storage, move |cfg| {
+                cfg.cpan.enabled = true;
+                cfg.cpan.proxy = Some(uri);
+            });
+        outage.fail_reads();
+        for path in [
+            "/cpan/modules/02packages.details.txt.gz",
+            "/cpan/authors/id/A/AU/AUTHOR/Foo-1.0.tar.gz",
+        ] {
+            let resp = crate::test_helpers::send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        }
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn test_cpan_disabled_returns_404() {

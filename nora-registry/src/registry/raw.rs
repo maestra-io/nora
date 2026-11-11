@@ -65,28 +65,8 @@ async fn download(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    // mtime fallback — Raw is always hosted (no proxy)
-    let publish_date = crate::curation::extract_mtime_as_publish_date(&state.storage, &key).await;
-
-    // Curation check — raw files are treated as name=path, no version. #733: raw is hosted-only
-    // (no upstream), so an internal-namespace file is operator-owned — skip curation and serve the
-    // local copy below; a missing one 404s naturally (nothing is ever proxied).
-    if !crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Raw,
-        &path,
-    ) {
-        if let Some(response) = crate::curation::check_download(
-            &state.curation().curation_engine,
-            state.bypass_token().as_deref(),
-            &headers,
-            crate::curation::RegistryType::Raw,
-            &path,
-            crate::curation::RequestVersion::Unspecified,
-            publish_date,
-        ) {
-            return response;
-        }
+    if let Some(response) = curation_gate(&state, &headers, &path, &key).await {
+        return response;
     }
 
     // Streamed serve with STREAMING integrity verification. The buffered
@@ -110,7 +90,7 @@ async fn download(
                 pin.as_deref(),
             ) {
                 let etag_val = format!("\"{}\"", stored_hash);
-                if inm.trim() == etag_val || inm.trim() == "*" {
+                if if_none_match_matches(inm, &etag_val) {
                     return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag_val)]).into_response();
                 }
             }
@@ -134,7 +114,7 @@ async fn download(
             if if_range_matches {
                 let mut extra = vec![(
                     header::CACHE_CONTROL,
-                    state.config.raw.cache_control.clone(),
+                    state.config.raw.cache_control().to_string(),
                 )];
                 for (name, value) in download_safety_headers() {
                     extra.push((name, value.to_string()));
@@ -176,7 +156,7 @@ async fn download(
                 .header(header::CONTENT_TYPE, content_type)
                 .header(header::CONTENT_LENGTH, len.to_string())
                 .header(header::ACCEPT_RANGES, "bytes")
-                .header(header::CACHE_CONTROL, &state.config.raw.cache_control);
+                .header(header::CACHE_CONTROL, state.config.raw.cache_control());
             for (name, value) in download_safety_headers() {
                 builder = builder.header(name, value);
             }
@@ -563,6 +543,10 @@ async fn delete_file(
     if enforce_namespace_scope(&authority, &path).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
+    // The lock an upload holds from its precondition check to its put: a delete never lands
+    // between an `If-Match` that passed and the overwrite it allowed.
+    let lock = state.publish_lock(&key);
+    let _guard = lock.lock().await;
     match state.storage.delete(&key).await {
         Ok(()) => {
             state.audit.log(AuditEntry::new(
@@ -583,7 +567,48 @@ async fn delete_file(
     }
 }
 
-async fn check_exists(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+/// The curation answer for a read of `path`, `None` to serve it; GET and HEAD share it, so a
+/// blocked file does not answer HEAD with its size and digest. Raw files are name=path with no
+/// version, dated by their mtime (raw is hosted, no proxy). #733: an internal-namespace file is
+/// operator-owned and skips curation; a missing one 404s naturally.
+async fn curation_gate(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    path: &str,
+    key: &str,
+) -> Option<Response> {
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Raw,
+        path,
+    ) {
+        return None;
+    }
+    let publish_date = crate::curation::extract_mtime_as_publish_date(&state.storage, key).await;
+    crate::curation::check_download(
+        &state.curation().curation_engine,
+        state.bypass_token().as_deref(),
+        headers,
+        crate::curation::RegistryType::Raw,
+        path,
+        crate::curation::RequestVersion::Unspecified,
+        publish_date,
+    )
+}
+
+/// Whether an `If-None-Match` value names `etag` (quoted): a comma-separated list compared
+/// weakly (`W/"x"` matches `"x"`), or `*` (RFC 9110 §13.1.2).
+fn if_none_match_matches(value: &str, etag: &str) -> bool {
+    value.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+    })
+}
+
+async fn check_exists(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(path): Path<String>,
+) -> Response {
     if !state.config.raw.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -592,13 +617,17 @@ async fn check_exists(State(state): State<AppState>, Path(path): Path<String>) -
     if validate_storage_key(&key).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    if let Some(response) = curation_gate(&state, &headers, &path, &key).await {
+        return response;
+    }
     match state.storage.stat(&key).await {
         Some(meta) => {
             let mut builder = axum::http::Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_LENGTH, meta.size.to_string())
                 .header(header::CONTENT_TYPE, guess_content_type(&key))
-                .header(header::CACHE_CONTROL, &state.config.raw.cache_control);
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CACHE_CONTROL, state.config.raw.cache_control());
             if let Some(hash) = state.storage.pin(&key).await {
                 builder = builder.header(header::ETAG, format!("\"{}\"", hash));
             }
@@ -2216,5 +2245,92 @@ mod integration_tests {
             resp.status()
         );
         assert!(ctx.state.storage.get("raw/releases/x.bin").await.is_err());
+    }
+
+    /// R4-R20: HEAD runs the curation gate GET runs: a blocked file does not answer with its
+    /// size and digest.
+    #[tokio::test]
+    async fn head_of_a_curation_blocked_file_is_refused_like_get() {
+        let (_dir, bp) = crate::test_helpers::blocklist_file("raw", "secret*");
+        let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(bp);
+        });
+        for path in ["/raw/secret.txt", "/raw/public.txt"] {
+            let put = send(&ctx.app, Method::PUT, path, b"data".to_vec()).await;
+            assert_eq!(put.status(), StatusCode::OK);
+        }
+        let blocked = send(&ctx.app, Method::HEAD, "/raw/secret.txt", "").await;
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        assert!(blocked.headers().get("etag").is_none());
+        let open = send(&ctx.app, Method::HEAD, "/raw/public.txt", "").await;
+        assert_eq!(open.status(), StatusCode::OK);
+        assert_eq!(open.headers().get("accept-ranges").unwrap(), "bytes");
+    }
+
+    /// R4-R20: `If-None-Match` is a list compared weakly, not one exact string.
+    #[tokio::test]
+    async fn if_none_match_takes_a_list_and_weak_validators() {
+        let ctx = create_test_context();
+        send(&ctx.app, Method::PUT, "/raw/inm.txt", b"hello".to_vec()).await;
+        let head = send(&ctx.app, Method::HEAD, "/raw/inm.txt", "").await;
+        let etag = head.headers().get("etag").unwrap().to_str().unwrap();
+        for (value, status) in [
+            (format!("\"other\", {etag}"), StatusCode::NOT_MODIFIED),
+            (format!("W/{etag}"), StatusCode::NOT_MODIFIED),
+            (
+                format!("\"a\" , W/{etag} , \"b\""),
+                StatusCode::NOT_MODIFIED,
+            ),
+            ("*".to_string(), StatusCode::NOT_MODIFIED),
+            ("\"a\", \"b\"".to_string(), StatusCode::OK),
+        ] {
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/raw/inm.txt",
+                vec![("if-none-match", value.as_str())],
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), status, "If-None-Match: {value}");
+        }
+    }
+
+    /// R4-R20: DELETE waits for the key's publish lock, which an upload holds from its
+    /// precondition check to its put.
+    #[tokio::test(start_paused = true)]
+    async fn delete_waits_for_the_publish_lock_of_the_key() {
+        let ctx = crate::test_helpers::create_test_context_with_storage(Storage::from_backend(
+            std::sync::Arc::new(crate::storage::ObjectStorage::in_memory()),
+        ));
+        send(&ctx.app, Method::PUT, "/raw/locked.txt", b"v1".to_vec()).await;
+        let lock = ctx.state.publish_lock("raw/locked.txt");
+        let guard = lock.lock().await;
+        let mut delete = Box::pin(send(&ctx.app, Method::DELETE, "/raw/locked.txt", ""));
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(60), &mut delete).await;
+        assert!(waited.is_err(), "the delete ran while the lock was held");
+        assert!(ctx.state.storage.stat("raw/locked.txt").await.is_some());
+        drop(guard);
+        assert_eq!(delete.await.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// R4-T10: a `raw.cache_control` that cannot be a header value never panics a request:
+    /// the default is sent.
+    #[tokio::test]
+    async fn an_invalid_cache_control_sends_the_default() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.raw.cache_control = "public,\nmax-age=60\n".into();
+        });
+        send(&ctx.app, Method::PUT, "/raw/cc.txt", b"hello".to_vec()).await;
+        for (method, headers) in [
+            (Method::GET, vec![]),
+            (Method::HEAD, vec![]),
+            (Method::GET, vec![("range", "bytes=0-1")]),
+        ] {
+            let resp = send_with_headers(&ctx.app, method, "/raw/cc.txt", headers, "").await;
+            assert!(resp.status().is_success(), "{}", resp.status());
+            assert_eq!(resp.headers().get("cache-control").unwrap(), "no-cache");
+        }
     }
 }

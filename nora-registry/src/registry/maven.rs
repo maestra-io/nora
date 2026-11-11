@@ -1036,9 +1036,24 @@ async fn upload(
         MavenPathKind::VersionFile(coords) if is_checksum_file(&coords.filename) => {
             // Client uploading a checksum — verify against our computed value
             if state.config.maven.checksum_verify {
+                // The lock of the artifact's upload: the comparison and the rollback below
+                // see one upload, never half of a concurrent one.
+                let lock = state.publish_lock(&format!(
+                    "maven/{}/{}/maven-metadata.xml",
+                    coords.group_path, coords.artifact_id
+                ));
+                let _guard = lock.lock().await;
                 if let Ok(computed) = state.storage.get(&key).await {
-                    let computed_str = String::from_utf8_lossy(&computed).trim().to_string();
-                    let client_str = String::from_utf8_lossy(&body).trim().to_string();
+                    // A checksum file is the digest, in either case, optionally followed by
+                    // the file name (`<hex>  foo.jar`).
+                    let digest = |raw: &[u8]| {
+                        String::from_utf8_lossy(raw)
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or_default()
+                            .to_ascii_lowercase()
+                    };
+                    let (computed_str, client_str) = (digest(&computed), digest(&body));
                     if computed_str != client_str {
                         tracing::warn!(
                             path = %path,
@@ -1046,8 +1061,24 @@ async fn upload(
                             received = %client_str,
                             "SECURITY: Maven checksum mismatch on upload"
                         );
+                        if roll_back_unvouched_artifact(&state, &key).await {
+                            update_artifact_metadata(
+                                &state,
+                                &coords.group_path,
+                                &coords.artifact_id,
+                            )
+                            .await;
+                            state.repo_index.invalidate("maven");
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                "Checksum mismatch: the artifact was removed, deploy it again",
+                            )
+                                .into_response();
+                        }
                         return (StatusCode::BAD_REQUEST, "Checksum mismatch").into_response();
                     }
+                    // The same digest: the stored checksum already says it.
+                    return StatusCode::CREATED.into_response();
                 }
             }
             match state.storage.put(&key, &body).await {
@@ -1193,6 +1224,40 @@ fn checksum_hex(suffix: &str, data: &[u8]) -> Option<String> {
         "sha512" => Some(hex::encode(sha2::Sha512::digest(data))),
         _ => None,
     }
+}
+
+/// How long after an artifact is stored a mismatching client checksum still removes it. Maven
+/// uploads a file's checksums right after the file; a later mismatch is not that deploy's, and
+/// must not let a publisher remove a settled release.
+const CHECKSUM_ROLLBACK_WINDOW_SECS: i64 = 600;
+
+/// The client's checksum at `checksum_key` does not match the artifact just stored: the
+/// publisher does not vouch for these bytes. Remove the artifact and its computed checksums, so
+/// the deploy can be retried instead of meeting `immutable_releases` on a file nobody vouches
+/// for. Only within [`CHECKSUM_ROLLBACK_WINDOW_SECS`] of the upload. Returns whether it was
+/// removed.
+async fn roll_back_unvouched_artifact(state: &AppState, checksum_key: &str) -> bool {
+    let Some(artifact_key) = metadata_document_key(checksum_key) else {
+        return false;
+    };
+    let just_stored = state.storage.stat(artifact_key).await.is_some_and(|meta| {
+        crate::cache_ttl::is_within_ttl(meta.modified, CHECKSUM_ROLLBACK_WINDOW_SECS)
+    });
+    if !just_stored {
+        return false;
+    }
+    if let Err(e) = state.storage.delete(artifact_key).await {
+        tracing::error!(key = %artifact_key, error = %e, "maven: failed to remove an artifact whose checksum did not match");
+        return false;
+    }
+    for suffix in ["md5", "sha1", "sha256", "sha512"] {
+        let _ = state
+            .storage
+            .delete(&format!("{artifact_key}.{suffix}"))
+            .await;
+    }
+    tracing::warn!(key = %artifact_key, "maven: removed an artifact whose uploaded checksum did not match");
+    true
 }
 
 async fn compute_and_store_checksums(storage: &crate::storage::Storage, key: &str, data: &[u8]) {
@@ -1388,7 +1453,12 @@ async fn merge_and_cache_proxy_metadata(
     let lock = state.publish_lock(&key);
     let _guard = lock.lock().await;
 
-    let cached = state.storage.get(&key).await.ok();
+    // The stored copy only adds its `lastUpdated` and spares an identical write: unreadable,
+    // the merge of the upstream and the stored versions is still whole.
+    let (cached, unreadable) = crate::registry::cached_read(state.storage.get(&key).await);
+    if let Some(e) = unreadable {
+        tracing::warn!(key = %key, error = %e, "maven: stored metadata unreadable, merging without it");
+    }
     let last_updated = [Some(upstream), cached.as_deref()]
         .into_iter()
         .flatten()
@@ -1439,7 +1509,13 @@ async fn update_artifact_metadata(state: &AppState, group_path: &str, artifact_i
 
     let prefix = format!("maven/{}/{}/", group_path, artifact_id);
     let metadata_key = format!("{}maven-metadata.xml", prefix);
-    let current = state.storage.get(&metadata_key).await.ok();
+    // Unreadable: the document is regenerated from the stored versions, which lists the
+    // version just uploaded; versions only an upstream has return at its next revalidation.
+    let (current, unreadable) =
+        crate::registry::cached_read(state.storage.get(&metadata_key).await);
+    if let Some(e) = unreadable {
+        tracing::warn!(key = %metadata_key, error = %e, "maven: stored metadata unreadable, regenerating it from the stored versions");
+    }
     let group_id_dotted = group_path.replace('/', ".");
     let last_updated = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
     let xml = merge_artifact_metadata(
@@ -2406,6 +2482,107 @@ mod integration_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// R4-R22: a checksum that does not match removes the artifact just stored, so the deploy
+    /// is retried instead of meeting `immutable_releases`; the digest is compared in either
+    /// case and without the file name some clients append.
+    #[tokio::test]
+    async fn a_checksum_mismatch_rolls_the_fresh_artifact_back() {
+        let ctx = create_test_context();
+        let jar = "/maven2/com/example/rb/1.0/rb-1.0.jar";
+        let app = &ctx.app;
+        let put = move |path: String, body: Vec<u8>| async move {
+            send(app, Method::PUT, &path, body).await
+        };
+
+        assert_eq!(
+            put(jar.into(), b"v1".to_vec()).await.status(),
+            StatusCode::CREATED
+        );
+        let bad = put(format!("{jar}.sha1"), b"0000".to_vec()).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let get = send(&ctx.app, Method::GET, jar, "").await;
+        assert_eq!(
+            get.status(),
+            StatusCode::NOT_FOUND,
+            "the artifact is removed"
+        );
+        let sums = ctx.state.storage.list("maven/com/example/rb/1.0/").await;
+        assert_eq!(sums.unwrap(), Vec::<String>::new(), "with its checksums");
+
+        // The retry is not a 409, and its checksum is accepted in the forms clients write.
+        assert_eq!(
+            put(jar.into(), b"v1".to_vec()).await.status(),
+            StatusCode::CREATED
+        );
+        let sha1 = hex::encode(sha1::Sha1::digest(b"v1"));
+        for form in [
+            sha1.clone(),
+            sha1.to_uppercase(),
+            format!("{sha1}  rb-1.0.jar\n"),
+        ] {
+            let ok = put(format!("{jar}.sha1"), form.clone().into_bytes()).await;
+            assert_eq!(ok.status(), StatusCode::CREATED, "{form:?}");
+        }
+        let stored = ctx
+            .state
+            .storage
+            .get("maven/com/example/rb/1.0/rb-1.0.jar.sha1");
+        assert_eq!(&stored.await.unwrap()[..], sha1.as_bytes());
+    }
+
+    /// R4-R22: a mismatching checksum for a release that settled long ago removes nothing.
+    #[tokio::test]
+    async fn a_checksum_mismatch_keeps_a_settled_artifact() {
+        let ctx = create_test_context();
+        let key = "maven/com/example/old/1.0/old-1.0.jar";
+        crate::test_helpers::put_written_days_ago(&ctx, key, b"v1", 1).await;
+        let sha1 = hex::encode(sha1::Sha1::digest(b"v1"));
+        let sidecar = format!("{key}.sha1");
+        ctx.state
+            .storage
+            .put(&sidecar, sha1.as_bytes())
+            .await
+            .unwrap();
+
+        let path = "/maven2/com/example/old/1.0/old-1.0.jar.sha1";
+        let bad = send(&ctx.app, Method::PUT, path, "0000").await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        assert!(ctx.state.storage.stat(key).await.is_some());
+        assert_eq!(
+            &ctx.state.storage.get(&sidecar).await.unwrap()[..],
+            sha1.as_bytes()
+        );
+    }
+
+    /// R4-T13: an unreadable stored `maven-metadata.xml` is logged, and the upload still
+    /// regenerates the document with its version.
+    #[tokio::test]
+    async fn an_unreadable_stored_metadata_is_logged_and_regenerated() {
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        let ctx = crate::test_helpers::create_test_context_with_storage(storage);
+        let app = &ctx.app;
+        let put = move |v: &'static str| async move {
+            let path = format!("/maven2/com/example/um/{v}/um-{v}.jar");
+            send(app, Method::PUT, &path, "jar").await
+        };
+        assert_eq!(put("1.0").await.status(), StatusCode::CREATED);
+        outage.fail_reads_of("um/maven-metadata.xml");
+        let (logs, _guard) = crate::test_helpers::LogCapture::start();
+        assert_eq!(put("2.0").await.status(), StatusCode::CREATED);
+        outage.end();
+        assert!(
+            logs.text().contains("stored metadata unreadable"),
+            "{}",
+            logs.text()
+        );
+        let xml = ctx
+            .state
+            .storage
+            .get("maven/com/example/um/maven-metadata.xml");
+        let xml = String::from_utf8(xml.await.unwrap().to_vec()).unwrap();
+        assert!(xml.contains("<version>1.0</version>") && xml.contains("<version>2.0</version>"));
     }
 
     // ── Immutability ────────────────────────────────────────────────────

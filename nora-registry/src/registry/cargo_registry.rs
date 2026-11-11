@@ -172,11 +172,27 @@ async fn sparse_index(
     let assembled = assembled_index(&state.storage, &expected_prefix, &crate_name).await;
     // What an older release left at the crate's index: its upstream cache, or a crate published
     // before per-version entries.
-    let stored_index = state.storage.get(&index_key).await.ok();
+    let stored_index = match crate::registry::cache_read(
+        state.storage.get(&index_key).await,
+        "cargo",
+        &index_key,
+        false,
+    ) {
+        Ok(cached) => cached,
+        Err(response) => return response,
+    };
     // NORA's copy of an upstream's index lives at its own key, never at the crate's index, so a
     // first publish never finds an upstream crate where its index goes.
     let copy_key = upstream_copy_key(&expected_prefix, &crate_name);
-    let upstream_copy = state.storage.get(&copy_key).await.ok();
+    let upstream_copy = match crate::registry::cache_read(
+        state.storage.get(&copy_key).await,
+        "cargo",
+        &copy_key,
+        false,
+    ) {
+        Ok(cached) => cached,
+        Err(response) => return response,
+    };
     // The sparse index is MUTABLE (new versions append and `yanked` flips at any time), so a
     // proxied copy is revalidated unless a positive `metadata_ttl` keeps it fresh; without an
     // upstream the copy is all there is. Only NORA's upstream copy has a TTL.
@@ -1918,6 +1934,41 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
     use crate::test_helpers::{body_bytes, create_test_context, send};
+
+    /// R4-T13: a store that cannot be read is a retryable 503, not a cache miss answered by
+    /// the upstream.
+    #[tokio::test]
+    async fn an_unreadable_store_is_503_not_a_miss() {
+        for key in [
+            "cargo/index/se/rd/serde".to_string(),
+            super::upstream_copy_key("se/rd", "serde"),
+        ] {
+            an_unreadable_index_key_is_503(&key).await;
+        }
+    }
+
+    async fn an_unreadable_index_key_is_503(key: &str) {
+        use axum::http::{Method, StatusCode};
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        let ctx =
+            crate::test_helpers::create_test_context_with_storage_and_config(storage, move |cfg| {
+                cfg.cargo.enabled = true;
+                cfg.cargo.proxy = Some(uri);
+            });
+        outage.fail_reads_of(key);
+        for path in ["/cargo/index/se/rd/serde"] {
+            let resp = crate::test_helpers::send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        }
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
 
     /// A cold miss is "not found" only when the upstream said so: the sparse index, the crate
     /// metadata and a `.crate` download whose upstream failed (5xx after the retry,

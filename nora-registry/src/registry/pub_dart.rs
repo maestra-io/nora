@@ -122,7 +122,11 @@ async fn search_packages(State(state): State<AppState>, RawQuery(raw_query): Raw
         hex::encode(sha2::Sha256::digest(raw_query.as_bytes()))
     );
 
-    let cached_data = state.storage.get(&key).await.ok();
+    let cached_data =
+        match crate::registry::cache_read(state.storage.get(&key).await, "pub", &key, false) {
+            Ok(cached) => cached,
+            Err(response) => return response,
+        };
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&key).await {
             if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
@@ -207,7 +211,11 @@ async fn package_listing(
     }
 
     let key = format!("pub/api/packages/{}.json", package);
-    let cached_data = state.storage.get(&key).await.ok();
+    let cached_data =
+        match crate::registry::cache_read(state.storage.get(&key).await, "pub", &key, false) {
+            Ok(cached) => cached,
+            Err(response) => return response,
+        };
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&key).await {
             let ttl = state.config.pub_dart.metadata_ttl;
@@ -336,7 +344,11 @@ async fn version_metadata(
     }
 
     let key = format!("pub/api/packages/{}/versions/{}.json", package, version);
-    let cached_data = state.storage.get(&key).await.ok();
+    let cached_data =
+        match crate::registry::cache_read(state.storage.get(&key).await, "pub", &key, false) {
+            Ok(cached) => cached,
+            Err(response) => return response,
+        };
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&key).await {
             if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
@@ -416,7 +428,11 @@ async fn package_advisories(
     }
 
     let key = format!("pub/api/packages/{}/advisories.json", package);
-    let cached_data = state.storage.get(&key).await.ok();
+    let cached_data =
+        match crate::registry::cache_read(state.storage.get(&key).await, "pub", &key, false) {
+            Ok(cached) => cached,
+            Err(response) => return response,
+        };
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&key).await {
             if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
@@ -1066,6 +1082,37 @@ fn is_valid_pub_version(version: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+
+    /// R4-T13: a store that cannot be read is a retryable 503, not a cache miss answered by
+    /// the upstream.
+    #[tokio::test]
+    async fn an_unreadable_store_is_503_not_a_miss() {
+        use axum::http::{Method, StatusCode};
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        let ctx =
+            crate::test_helpers::create_test_context_with_storage_and_config(storage, move |cfg| {
+                cfg.pub_dart.enabled = true;
+                cfg.pub_dart.proxy = Some(uri);
+            });
+        outage.fail_reads();
+        for path in [
+            "/pub/api/packages?q=http",
+            "/pub/api/packages/http",
+            "/pub/api/packages/http/versions/1.0.0",
+            "/pub/api/packages/http/advisories",
+        ] {
+            let resp = crate::test_helpers::send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        }
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
 
     /// The next page is the upstream's only under its own `/api/packages`: a longer segment,
     /// or a host that only starts like the upstream's, is not moved under NORA.

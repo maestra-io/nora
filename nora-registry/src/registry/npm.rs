@@ -3520,7 +3520,20 @@ async fn write_publish(
         for (tag, ver) in new_dist_tags {
             if let Some(ver_str) = ver.as_str() {
                 let tag_key = format!("npm/{}/dist-tags/{}", package_name, tag);
-                let old = storage.get(&tag_key).await.ok();
+                // The target the tag had, for the undo. Unreadable, it is unknown: an undo
+                // could neither restore the tag nor tell it was new, so the publish fails
+                // before moving it.
+                let old = match storage.get(&tag_key).await {
+                    Ok(target) => Some(target),
+                    Err(
+                        crate::storage::StorageError::NotFound
+                        | crate::storage::StorageError::Validation(_),
+                    ) => None,
+                    Err(e) => {
+                        tracing::error!(key = %tag_key, error = %e, "npm publish: failed to read dist-tag");
+                        return Err(internal_error());
+                    }
+                };
                 if let Err(e) = storage.put(&tag_key, ver_str.as_bytes()).await {
                     tracing::warn!(key = %tag_key, error = ?e, "npm publish: failed to store dist-tag");
                 }
@@ -6940,6 +6953,39 @@ mod integration_tests {
         );
         let doc = packument(&ctx.app, "race").await;
         assert_eq!(doc["versions"].as_object().unwrap().len(), 1);
+    }
+
+    /// R4-T13: a dist-tag whose current target cannot be read is not moved: the publish
+    /// fails and is undone, instead of recording "no tag before" for an undo to delete.
+    #[tokio::test]
+    async fn publish_fails_when_the_moved_dist_tag_is_unreadable() {
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        let ctx = crate::test_helpers::create_test_context_with_storage(storage);
+        let tagged = |ver: &str| {
+            let payload = serde_json::json!({
+                "name": "tagged",
+                "dist-tags": { "latest": ver },
+                "versions": { ver: { "name": "tagged", "version": ver, "dist": {} } },
+                "_attachments": { format!("tagged-{ver}.tgz"): {
+                    "data": base64::engine::general_purpose::STANDARD.encode(b"tgz")
+                } },
+            });
+            let body = Body::from(serde_json::to_vec(&payload).unwrap());
+            send(&ctx.app, Method::PUT, "/npm/tagged", body)
+        };
+        assert!(tagged("1.0.0").await.status().is_success());
+
+        outage.fail_reads_of("npm/tagged/dist-tags/latest");
+        let failed = tagged("1.0.1").await.status();
+        outage.end();
+        assert_eq!(failed, StatusCode::INTERNAL_SERVER_ERROR);
+        let storage = &ctx.state.storage;
+        let latest = storage.get("npm/tagged/dist-tags/latest").await.unwrap();
+        assert_eq!(&latest[..], b"1.0.0");
+        assert!(storage
+            .stat("npm/tagged/versions/1.0.1.json")
+            .await
+            .is_none());
     }
 
     /// A package published here, outside any internal namespace, is never
