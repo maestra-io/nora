@@ -15,7 +15,7 @@ use std::net::{IpAddr, SocketAddr};
 use utoipa::ToSchema;
 
 use crate::audit::AuditEntry;
-use crate::tokens::{MintLifetime, MintedToken, Role, SECS_PER_DAY};
+use crate::tokens::{MintLifetime, MintedToken, Role, TokenError, SECS_PER_DAY};
 use crate::AppState;
 
 use super::{lockout_rule, resolve_client_ip, too_many_failed_attempts, BasicDecision};
@@ -278,18 +278,20 @@ async fn revoke_token(
     // Owner-scope: a self-service caller may revoke only its own tokens. 404 (not
     // 403) so a non-owner cannot probe which token IDs exist
     // (GHSA-78cx-cfhm-rgmx — cross-user token revocation).
-    if !token_store
-        .list_tokens(&req.username)
-        .await
-        .iter()
-        .any(|t| t.file_id == req.hash_prefix)
-    {
-        return (StatusCode::NOT_FOUND, "Token not found").into_response();
-    }
-
-    match token_store.revoke_token(&req.hash_prefix).await {
+    // A store that cannot be read is 503, never "not found": the token is still
+    // there and still works.
+    let revoked = match token_store.token_owner(&req.hash_prefix).await {
+        Ok(owner) if owner == req.username => token_store.revoke_token(&req.hash_prefix).await,
+        Ok(_) => Err(TokenError::NotFound),
+        Err(e) => Err(e),
+    };
+    match revoked {
         Ok(()) => (StatusCode::OK, "Token revoked").into_response(),
-        Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+        Err(TokenError::Storage(e)) => {
+            tracing::error!(error = %e, "token store failed during revoke");
+            (StatusCode::SERVICE_UNAVAILABLE, "Token store unavailable").into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "Token not found").into_response(),
     }
 }
 

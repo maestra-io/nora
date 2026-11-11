@@ -15,6 +15,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -176,6 +177,49 @@ pub struct TokenStore {
     /// record) only if no revoke came in between, so a verify racing a revoke
     /// cannot cache, or put back, the revoked token.
     revocations: Arc<AtomicU64>,
+    /// Single-flight of the verify slow path: SHA256(token) -> the lock its
+    /// verifications take in turn. The requests that miss the cache together
+    /// (TTL expiry, restart) do one storage read and one Argon2, the rest read
+    /// the cache the first one filled. An entry lives while a request holds it.
+    verify_flights: Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+/// A request's hold on its token's entry in `verify_flights`; the entry leaves
+/// the map with the last holder, so unknown tokens do not accumulate there.
+struct VerifyFlight<'a> {
+    flights: &'a parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    cache_key: &'a str,
+    turn: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Drop for VerifyFlight<'_> {
+    fn drop(&mut self) {
+        let mut flights = self.flights.lock();
+        // Handles are cloned under this lock: the map's and this one are the last two.
+        if Arc::strong_count(&self.turn) == 2 {
+            flights.remove(self.cache_key);
+        }
+    }
+}
+
+/// Run an Argon2 computation (19 MiB, tens of ms) on the blocking pool, off the
+/// async workers. A task that did not finish is a store failure (503), never a
+/// credential verdict.
+// ponytail: no cap on concurrent hashes of DIFFERENT tokens (one per token via
+// verify_flights); a semaphore as in auth/htpasswd.rs if a fleet of tokens shows up.
+async fn off_worker<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, TokenError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| TokenError::Storage(format!("hash task failed: {e}")))
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 impl TokenStore {
@@ -195,6 +239,7 @@ impl TokenStore {
             pending_last_used: Arc::new(RwLock::new(HashMap::new())),
             record_lock: Arc::new(tokio::sync::Mutex::new(())),
             revocations: Arc::new(AtomicU64::new(0)),
+            verify_flights: Arc::default(),
         }
     }
 
@@ -230,7 +275,8 @@ impl TokenStore {
             TOKEN_PREFIX,
             Uuid::new_v4().to_string().replace("-", "")
         );
-        let token_hash = hash_token_argon2(&raw_token)?;
+        let to_hash = Zeroizing::new(raw_token.clone());
+        let token_hash = off_worker(move || hash_token_argon2(&to_hash)).await??;
         // Use SHA256 of token as the record id (deterministic, for lookup)
         let file_id = sha256_hex(&raw_token);
 
@@ -282,30 +328,23 @@ impl TokenStore {
         let cache_key = sha256_hex(token);
 
         // Fast path: check in-memory cache
-        {
-            let cache = self.cache.read();
-            if let Some(cached) = cache.get(&cache_key) {
-                if cached.cached_at.elapsed() < self.cache_ttl {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if now > cached.expires_at {
-                        return Err(TokenError::Expired);
-                    }
-                    // Schedule deferred last_used update
-                    self.pending_last_used
-                        .write()
-                        .insert(cache_key[..16].to_string(), now);
-                    return Ok((cached.user.clone(), cached.role.clone()));
-                }
-            }
+        if let Some(verdict) = self.cached_verdict(&cache_key) {
+            return verdict;
         }
 
-        // Slow path: one storage read and Argon2. Misses are not cached (no negative
-        // cache): an unknown token costs a read each time, and brute force is bounded
-        // by the auth rate limiter, not here.
-        // A revoke after the read keeps the result out of the cache (see `revocations`).
+        // Slow path: one storage read and Argon2, one request at a time per token;
+        // a request that waited its turn reads the cache the one before it filled.
+        // Misses are not cached (no negative cache): an unknown token costs a read
+        // each time, and brute force is bounded by the auth rate limiter, not here.
+        // A revoke after the read keeps the result out of the cache (see `revocations`),
+        // and the requests behind then read the record themselves.
+        // ponytail: failed verifications of one token queue too (a store outage answers
+        // them one timeout apart); share the failure if that ever shows.
+        let flight = self.verify_flight(&cache_key);
+        let _turn = flight.turn.lock().await;
+        if let Some(verdict) = self.cached_verdict(&cache_key) {
+            return verdict;
+        }
         let key = record_key(&cache_key[..16]);
         let seen = self.revocations.load(Ordering::SeqCst);
         let content = match self.storage.get(&key).await {
@@ -319,14 +358,16 @@ impl TokenStore {
 
         // Verify hash: try Argon2id first, fall back to legacy SHA256
         let hash_valid = if info.token_hash.starts_with("$argon2") {
-            verify_token_argon2(token, &info.token_hash)
+            let (token, hash) = (Zeroizing::new(token.to_owned()), info.token_hash.clone());
+            off_worker(move || verify_token_argon2(&token, &hash)).await?
         } else {
             // Legacy SHA256 hash (no salt) — verify and migrate
             let legacy_hash = sha256_hex(token);
             if info.token_hash == legacy_hash {
                 // Migrate to Argon2id. Best effort: skipped while a revoke runs, and
                 // when one came in since the read; a later verify retries.
-                if let Ok(new_hash) = hash_token_argon2(token) {
+                let to_hash = Zeroizing::new(token.to_owned());
+                if let Ok(Ok(new_hash)) = off_worker(move || hash_token_argon2(&to_hash)).await {
                     info.token_hash = new_hash;
                     if let Ok(json) = serde_json::to_vec_pretty(&info) {
                         self.rewrite_unless_revoked(seen, &key, &json).await;
@@ -343,10 +384,7 @@ impl TokenStore {
         }
 
         // Check expiration
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = now_secs();
 
         if now > info.expires_at {
             return Err(TokenError::Expired);
@@ -365,12 +403,65 @@ impl TokenStore {
             },
         );
 
-        // Schedule deferred last_used update
-        self.pending_last_used
-            .write()
-            .insert(cache_key[..16].to_string(), now);
+        self.touch_last_used(&cache_key[..16], now);
 
         Ok((info.user, info.role))
+    }
+
+    /// The cached verdict for a token, if it was verified within the TTL.
+    fn cached_verdict(&self, cache_key: &str) -> Option<Result<(String, Role), TokenError>> {
+        let (user, role, expires_at) = {
+            let cache = self.cache.read();
+            let cached = cache
+                .get(cache_key)
+                .filter(|c| c.cached_at.elapsed() < self.cache_ttl)?;
+            (cached.user.clone(), cached.role.clone(), cached.expires_at)
+        };
+        let now = now_secs();
+        if now > expires_at {
+            return Some(Err(TokenError::Expired));
+        }
+        self.touch_last_used(&cache_key[..16], now);
+        Some(Ok((user, role)))
+    }
+
+    /// Schedule the deferred last_used update of token `id`. Further uses within
+    /// the same second take the read lock only.
+    fn touch_last_used(&self, id: &str, now: u64) {
+        if self.pending_last_used.read().get(id) == Some(&now) {
+            return;
+        }
+        self.pending_last_used.write().insert(id.to_string(), now);
+    }
+
+    /// This request's hold on the single-flight entry of a token.
+    fn verify_flight<'a>(&'a self, cache_key: &'a str) -> VerifyFlight<'a> {
+        let turn = Arc::clone(
+            self.verify_flights
+                .lock()
+                .entry(cache_key.to_string())
+                .or_default(),
+        );
+        VerifyFlight {
+            flights: &self.verify_flights,
+            cache_key,
+            turn,
+        }
+    }
+
+    /// The owner of the token `hash_prefix`, from its record: one read, where a
+    /// listing answers "no tokens" when the store cannot be read.
+    pub async fn token_owner(&self, hash_prefix: &str) -> Result<String, TokenError> {
+        if !is_valid_hash_prefix(hash_prefix) {
+            return Err(TokenError::NotFound);
+        }
+        match self.storage.get(&record_key(hash_prefix)).await {
+            Ok(content) => serde_json::from_slice::<TokenInfo>(&content)
+                .map(|info| info.user)
+                .map_err(|e| TokenError::Storage(e.to_string())),
+            Err(StorageError::NotFound) => Err(TokenError::NotFound),
+            Err(e) => Err(TokenError::Storage(e.to_string())),
+        }
     }
 
     /// List all tokens for a user (returns TokenListEntry with file_id)
@@ -445,6 +536,12 @@ impl TokenStore {
     // ponytail: replicas flushing at once can drop each other's stamps (advisory
     // data), and ids of revoked tokens stay in the map (a few bytes each).
     pub async fn flush_last_used(&self) {
+        // Verdicts past the TTL are never served again: drop them here, so the
+        // cache holds the tokens in use, not every token ever seen.
+        self.cache
+            .write()
+            .retain(|_, cached| cached.cached_at.elapsed() < self.cache_ttl);
+
         let pending: HashMap<String, u64> = {
             let mut map = self.pending_last_used.write();
             std::mem::take(&mut *map)
@@ -525,11 +622,8 @@ impl TokenStore {
         // From the delete to the count: a migration rewrite waits, so it cannot put
         // the record back.
         let _held = self.record_lock.lock().await;
-        // An object-store delete of a missing key succeeds, so ask first.
-        match self.storage.stat(&key).await {
-            Some(_) => {}
-            None => return Err(TokenError::NotFound),
-        }
+        // `delete` answers NotFound for a missing record on every backend and a
+        // store failure as such: a record that could not be reached is not "gone".
         match self.storage.delete(&key).await {
             Ok(()) => {
                 // Count the revoke before purging the cache, so a verify that read
@@ -547,8 +641,12 @@ impl TokenStore {
     pub async fn revoke_all_for_user(&self, user: &str) -> usize {
         let mut count = 0;
         for token in self.list_tokens(user).await {
-            if self.revoke_token(&token.file_id).await.is_ok() {
-                count += 1;
+            match self.revoke_token(&token.file_id).await {
+                Ok(()) => count += 1,
+                Err(TokenError::NotFound) => {}
+                Err(e) => {
+                    tracing::warn!(id = %token.file_id, error = %e, "token revoke failed");
+                }
             }
         }
         count
@@ -1063,6 +1161,183 @@ mod tests {
 
         let result = store.verify_token(&token).await;
         assert!(matches!(result, Err(TokenError::NotFound)));
+    }
+
+    /// R4-C19/R4-P04: the requests that miss the cache together (TTL expiry, a
+    /// restart) do one storage read and one Argon2; the rest wait their turn and
+    /// read the cache. Nothing is left in the single-flight map afterwards.
+    #[tokio::test]
+    async fn concurrent_misses_of_one_token_verify_once() {
+        let (storage, counts) = crate::test_helpers::op_counting_storage();
+        let token = TokenStore::new(storage.clone())
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let key = record_key(&sha256_hex(&token)[..16]);
+        // A second store over the same storage: an empty cache.
+        let store = TokenStore::new(storage);
+        counts.stall_gets(Some(&key));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let (store, token) = (store.clone(), token.clone());
+            tasks.spawn(async move { store.verify_token(&token).await });
+        }
+        // Every request is parked, in the read or behind it, before the read answers.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        counts.stall_gets(None);
+        while let Some(verdict) = tasks.join_next().await {
+            assert_eq!(verdict.unwrap().unwrap(), ("ci".to_string(), Role::Read));
+        }
+        assert_eq!(counts.calls("get", &key), 1);
+        assert!(store.verify_flights.lock().is_empty());
+
+        // An unknown token leaves nothing in the map either.
+        assert!(store.verify_token("nra_unknown").await.is_err());
+        assert!(store.verify_flights.lock().is_empty());
+    }
+
+    /// R4-C19/R4-P04: a revoke between the first request's read and the turn of the
+    /// ones behind it is seen by those: they read the store, not a stale verdict.
+    #[tokio::test]
+    async fn a_request_behind_a_revoked_verification_is_refused() {
+        let (storage, counts) = crate::test_helpers::op_counting_storage();
+        let store = TokenStore::new(storage);
+        let token = store
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let id = sha256_hex(&token)[..16].to_string();
+        let key = record_key(&id);
+        counts.stall_gets(Some(&key));
+        let verify = || {
+            let (store, token) = (store.clone(), token.clone());
+            tokio::spawn(async move { store.verify_token(&token).await })
+        };
+        let (first, second) = (verify(), verify());
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        // The first holds the record it read; the revoke lands before it caches.
+        let revoke = {
+            let store = store.clone();
+            tokio::spawn(async move { store.revoke_token(&id).await })
+        };
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        counts.stall_gets(None);
+        revoke.await.unwrap().unwrap();
+        let _ = first.await.unwrap();
+        assert!(matches!(second.await.unwrap(), Err(TokenError::NotFound)));
+        assert!(store.cache.read().is_empty());
+        assert!(matches!(
+            store.verify_token(&token).await,
+            Err(TokenError::NotFound)
+        ));
+    }
+
+    /// R4-C19/R4-P04: Argon2 runs on the blocking pool. On this one-thread runtime a
+    /// task that only yields keeps being polled while a token is minted and verified;
+    /// hashed on the worker, it would wait a whole Argon2 between two polls.
+    #[tokio::test]
+    async fn argon2_does_not_hold_the_async_worker() {
+        use std::sync::atomic::AtomicBool;
+        let temp_dir = TempDir::new().unwrap();
+        let hash = hash_token_argon2("nra_probe").unwrap();
+        let started = Instant::now();
+        assert!(verify_token_argon2("nra_probe", &hash));
+        let one_check = started.elapsed();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let ticker = {
+            let done = Arc::clone(&done);
+            tokio::spawn(async move {
+                let (mut longest, mut last) = (Duration::ZERO, Instant::now());
+                while !done.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                    longest = longest.max(last.elapsed());
+                    last = Instant::now();
+                }
+                longest
+            })
+        };
+        let token = TokenStore::new(local(&temp_dir))
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let fresh = TokenStore::new(local(&temp_dir));
+        fresh.verify_token(&token).await.unwrap();
+        done.store(true, Ordering::SeqCst);
+        let longest = ticker.await.unwrap();
+        assert!(
+            longest < one_check / 2,
+            "the worker was held for {longest:?} (one Argon2 {one_check:?})"
+        );
+    }
+
+    /// R4-C17: a revoke that cannot reach the store is a store failure, not "not
+    /// found": the record is still there and the token still verifies.
+    #[tokio::test]
+    async fn revoke_reports_a_store_failure_as_such() {
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        let store = TokenStore::new(storage.clone());
+        let token = store
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let id = sha256_hex(&token)[..16].to_string();
+
+        outage.begin();
+        assert!(matches!(
+            store.revoke_token(&id).await,
+            Err(TokenError::Storage(_))
+        ));
+        assert!(matches!(
+            store.token_owner(&id).await,
+            Err(TokenError::Storage(_))
+        ));
+        assert_eq!(store.revoke_all_for_user("ci").await, 0);
+        outage.end();
+
+        assert_eq!(store.token_owner(&id).await.unwrap(), "ci");
+        assert!(TokenStore::new(storage).verify_token(&token).await.is_ok());
+        store.revoke_token(&id).await.unwrap();
+        assert!(matches!(
+            store.revoke_token(&id).await,
+            Err(TokenError::NotFound)
+        ));
+        assert!(matches!(
+            store.token_owner(&id).await,
+            Err(TokenError::NotFound)
+        ));
+    }
+
+    /// R4-P18: the maintenance tick drops the verdicts past the TTL, so the cache
+    /// holds the tokens in use; a verdict within the TTL stays.
+    #[tokio::test]
+    async fn flush_drops_cached_verdicts_past_the_ttl() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(local(&temp_dir));
+        let token = store
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+        store.verify_token(&token).await.unwrap();
+        store.flush_last_used().await;
+        assert_eq!(store.cache.read().len(), 1);
+
+        let expiring = TokenStore::with_cache_ttl(local(&temp_dir), Duration::ZERO);
+        expiring.verify_token(&token).await.unwrap();
+        assert_eq!(expiring.cache.read().len(), 1);
+        expiring.flush_last_used().await;
+        assert!(expiring.cache.read().is_empty());
+        // Nothing pending: the sweep runs all the same.
+        expiring.verify_token(&token).await.unwrap();
+        expiring.pending_last_used.write().clear();
+        expiring.flush_last_used().await;
+        assert!(expiring.cache.read().is_empty());
     }
 
     #[tokio::test]

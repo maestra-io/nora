@@ -1311,18 +1311,23 @@ async fn tokens_revoke(
     // Owner-scope: non-admins may revoke only their own tokens. Return 404 (not
     // 403) so a non-owner cannot probe which token IDs exist
     // (GHSA-78cx-cfhm-rgmx — cross-user token revocation).
+    // A store that cannot be read is 503, never "not found": the token is still
+    // there and still works.
     let is_admin = role.0.can_admin();
-    if !is_admin
-        && !store
-            .list_tokens(&user.0)
-            .await
-            .iter()
-            .any(|t| t.file_id == file_id)
-    {
-        return (StatusCode::NOT_FOUND, Html("Token not found".to_string()));
-    }
-
-    match store.revoke_token(&file_id).await {
+    let owned = if is_admin {
+        Ok(())
+    } else {
+        match store.token_owner(&file_id).await {
+            Ok(owner) if owner == user.0 => Ok(()),
+            Ok(_) => Err(crate::tokens::TokenError::NotFound),
+            Err(e) => Err(e),
+        }
+    };
+    let revoked = match owned {
+        Ok(()) => store.revoke_token(&file_id).await,
+        Err(e) => Err(e),
+    };
+    match revoked {
         Ok(()) => {
             // Return refreshed token list (same owner-scope as the list view)
             let tokens = if is_admin {
@@ -1343,7 +1348,7 @@ async fn tokens_revoke(
                 r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Error: {}</div>"##,
                 components::html_escape(&e.to_string())
             );
-            (StatusCode::INTERNAL_SERVER_ERROR, Html(html))
+            (StatusCode::SERVICE_UNAVAILABLE, Html(html))
         }
     }
 }
