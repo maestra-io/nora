@@ -420,7 +420,11 @@ async fn redate_held<F, Fut>(
             return;
         }
         tried.retain(|_, at| now - *at < REDATE_RETRY_SECS);
-        tried.insert(digest.to_string(), now);
+        // While the ledger loads, its merge prunes an entry dated past the prune line, so
+        // the next hit must be free to date it again.
+        if store.loaded() {
+            tried.insert(digest.to_string(), now);
+        }
     }
     let Some(at) = lookup().await else {
         return;
@@ -1890,6 +1894,14 @@ mod tests {
                 store.check("maven", unrecorded_undated, ttl),
                 QuarantineStatus::New
             );
+
+            // While the ledger loads, a dated digest is not marked tried: the merge may
+            // prune its entry, and the next hit dates it again.
+            let loading = "sha256:redate-loading";
+            store.set_loaded(false);
+            redate_held(&store, loading, ttl, lookup(Some(1_173_268_800))).await;
+            store.set_loaded(true);
+            assert!(!REDATE_TRIED.lock().contains_key(loading));
 
             let young = "sha256:redate-young";
             store.record("maven", young, "u", None);
