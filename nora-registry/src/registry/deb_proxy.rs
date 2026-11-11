@@ -716,7 +716,7 @@ async fn build_suite(
     // and architectures.
     // An unreadable ledger fails the build: dating without it would hold, and write to
     // this suite's ledger, a file another suite serves.
-    let mut ledgers = match min_age {
+    let ledgers = match min_age {
         Some(_) => state
             .storage
             .list(&format!("{}/ledger/", meta(repo)))
@@ -724,10 +724,6 @@ async fn build_suite(
             .map_err(|e| BuildError::Internal(e.to_string()))?,
         None => Vec::new(),
     };
-    // Indexes without a ledger first: they date everything 0, and the ones dated
-    // against every ledger then see theirs.
-    let mut indexes: Vec<_> = indexes.into_iter().collect();
-    indexes.sort_by_key(|((comp, arch), _)| ledgers.contains(&ledger_key(repo, suite, comp, arch)));
     for ((comp, arch), path) in &indexes {
         let (hash, _) = rel.sha256[path].clone();
         let lkey = ledger_key(repo, suite, comp, arch);
@@ -794,10 +790,13 @@ async fn build_suite(
         let (mut seen, mut retired) =
             update_ledger(prev.as_ref(), &mut current_st, dropped, min_age, now);
         if let Some(age) = min_age {
+            // An index's first build dates what it lists 0 ("before NORA") unless another
+            // ledger already dates the file; later builds backdate their young files.
+            let first = prev.is_none();
             let wanted: HashSet<String> = current_st
                 .iter()
                 .chain(&retired)
-                .filter(|s| now - s.first_seen < age)
+                .filter(|s| first || now - s.first_seen < age)
                 .map(|s| s.filename.clone())
                 .collect();
             let others: Vec<String> = ledgers.iter().filter(|k| **k != lkey).cloned().collect();
@@ -806,7 +805,7 @@ async fn build_suite(
                 .map_err(BuildError::Internal)?;
             for s in current_st.iter_mut().chain(retired.iter_mut()) {
                 if let Some(&t) = earliest.get(&s.filename) {
-                    if t < s.first_seen {
+                    if first || t < s.first_seen {
                         s.first_seen = t;
                         if let Some(v) = seen.get_mut(&s.filename) {
                             *v = t;
@@ -897,16 +896,13 @@ async fn build_suite(
         put_json(state, &lkey, &ledger)
             .await
             .map_err(BuildError::Internal)?;
-        if min_age.is_some() && !ledgers.contains(&lkey) {
-            ledgers.push(lkey);
-        }
     }
 
     if files.is_empty() {
         return Err(BuildError::Upstream(ProxyError::NotFound));
     }
     // Held versions first, so a direct package fetch is refused before apt can see them.
-    update_young(state, repo, suite, young, &served, min_age, now)
+    update_young(state, repo, suite, young, min_age, now)
         .await
         .map_err(BuildError::Internal)?;
 
@@ -957,6 +953,9 @@ async fn build_suite(
         plain,
     };
     put_json(state, &state_key, &new_state)
+        .await
+        .map_err(BuildError::Internal)?;
+    clear_served(state, repo, &served)
         .await
         .map_err(BuildError::Internal)
 }
@@ -1041,7 +1040,6 @@ async fn update_young(
     repo: &str,
     suite: &str,
     held: BTreeMap<String, BTreeMap<String, (String, String, i64)>>,
-    served: &HashSet<String>,
     min_age: Option<i64>,
     since: i64,
 ) -> Result<(), String> {
@@ -1051,12 +1049,6 @@ async fn update_young(
     let mut young: Young = get_json(state, &key).await.unwrap_or_default();
     let prefix = format!("{suite}/");
     young.retain(|k, _| !k.starts_with(&prefix));
-    // A file this suite serves is not held by another suite's younger sighting of it:
-    // apt finds it in this suite's index.
-    for files in young.values_mut() {
-        files.retain(|f, _| !served.contains(f));
-    }
-    young.retain(|_, files| !files.is_empty());
     let mut held = held;
     if min_age.is_some() {
         // Ledgers another build wrote after this one read them (a suite's first build
@@ -1090,6 +1082,34 @@ async fn update_young(
         }
     }
     young.extend(held.into_iter().filter(|(_, v)| !v.is_empty()));
+    put_json(state, &key, &young).await?;
+    state
+        .deb_young
+        .lock()
+        .insert(key, (Instant::now(), Arc::new(young)));
+    Ok(())
+}
+
+/// After a suite is published: a file it serves is not held by another index's later
+/// sighting of it, apt finds it in this suite's index. Serving it took a ledger date
+/// older than `min_release_age` and no rule on its name.
+async fn clear_served(
+    state: &AppState,
+    repo: &str,
+    served: &HashSet<String>,
+) -> Result<(), String> {
+    let key = young_key(repo);
+    let lock = state.publish_lock(&key);
+    let _g = lock.lock().await;
+    let mut young: Young = get_json(state, &key).await.unwrap_or_default();
+    let before: usize = young.values().map(BTreeMap::len).sum();
+    for files in young.values_mut() {
+        files.retain(|f, _| !served.contains(f));
+    }
+    young.retain(|_, files| !files.is_empty());
+    if young.values().map(BTreeMap::len).sum::<usize>() == before {
+        return Ok(());
+    }
     put_json(state, &key, &young).await?;
     state
         .deb_young
@@ -1669,7 +1689,18 @@ mod integration_tests {
         served_in(&ctx, "security", "extra").await;
         assert_eq!(get(k2).await.status(), StatusCode::FORBIDDEN);
 
-        // updates has listed k 2 since before NORA: apt sees it there, the file is served.
+        // updates has listed k 2 for 4 days (its ledger says so): apt sees it there, and
+        // once updates is published the file is served.
+        let old = crate::cache_ttl::now_unix() as i64 - 4 * 86_400;
+        let ledger = super::Ledger {
+            upstream: None,
+            seen: [("pool/main/k_2_amd64.deb".to_string(), old)].into(),
+            retired: Vec::new(),
+        };
+        let updates = super::ledger_key("debian", "updates", "main", "amd64");
+        super::put_json(&ctx.state, &updates, &ledger)
+            .await
+            .unwrap();
         mount_suite(&server, &key, "updates", "main", &[("k", "2")], z).await;
         let (_, pkgs) = served_in(&ctx, "updates", "main").await;
         assert_eq!(pkgs, [("k".into(), "2".into())]);
@@ -1690,31 +1721,27 @@ mod integration_tests {
         let (_, pkgs) = served_in(&ctx, "security", "extra").await;
         assert_eq!(pkgs, [("k".into(), "2".into())]);
         assert_eq!(get(k2).await.status(), StatusCode::OK);
+        let l1 = "/deb/debian/pool/main/l_1_amd64.deb";
         assert_eq!(
-            get("/deb/debian/pool/main/l_1_amd64.deb").await.status(),
+            get(l1).await.status(),
             StatusCode::FORBIDDEN,
             "a file no suite has listed for 3 days is still held"
         );
 
-        // A component new to security lists l 1 too: its first index dates it 0, and the
-        // index that held it, built in the same pass, serves it.
-        server.reset().await;
-        let extra: &[(&str, &str)] = &[("k", "2"), ("l", "1"), ("m", "1")];
-        let main: &[(&str, &str)] = &[("l", "1")];
-        mount_suite_comps(
+        // A suite new to NORA lists l 1 and n 1: n 1 predates NORA, l 1 is dated by the
+        // ledger that already knows it, so it is neither served nor released.
+        mount_suite(
             &server,
             &key,
-            "security",
-            &[("extra", extra), ("main", main)],
+            "backports",
+            "main",
+            &[("l", "1"), ("n", "1")],
             z,
         )
         .await;
-        let (_, pkgs) = served_in(&ctx, "security", "extra").await;
-        assert!(pkgs.contains(&("l".into(), "1".into())), "{pkgs:?}");
-        assert!(
-            !pkgs.contains(&("m".into(), "1".into())),
-            "m 1 is new: {pkgs:?}"
-        );
+        let (_, pkgs) = served_in(&ctx, "backports", "main").await;
+        assert_eq!(pkgs, [("n".into(), "1".into())]);
+        assert_eq!(get(l1).await.status(), StatusCode::FORBIDDEN);
     }
 
     /// A build that read the ledgers before another suite wrote an older date for its
@@ -1754,23 +1781,14 @@ mod integration_tests {
             )]
             .into()
         };
-        let none = std::collections::HashSet::new();
         let age = Some(3 * 86_400);
         // Read before the build started (since = later): the hold stays.
-        super::update_young(
-            state,
-            "debian",
-            "security",
-            held(now),
-            &none,
-            age,
-            now + 3600,
-        )
-        .await
-        .unwrap();
+        super::update_young(state, "debian", "security", held(now), age, now + 3600)
+            .await
+            .unwrap();
         assert!(super::load_young(state, "debian").await["security/main/amd64"].contains_key(&f));
         // Written during the build: the hold goes, but not the one on an internal name.
-        super::update_young(state, "debian", "security", held(now), &none, age, now)
+        super::update_young(state, "debian", "security", held(now), age, now)
             .await
             .unwrap();
         let young = super::load_young(state, "debian").await;
