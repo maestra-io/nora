@@ -791,18 +791,22 @@ async fn download_file(
             .log(AuditEntry::new("cache_hit", "proxy", "", "pypi", ""));
 
         if quarantine_on {
-            if let Some(resp) = crate::digest_quarantine::proxy_gate_digest(
+            // A digest with no record counts from when its copy was cached (R4-C05).
+            if let Some(resp) = crate::digest_quarantine::cache_gate_digest(
                 &state.digest_store,
+                &state.storage,
+                &key,
                 "pypi",
                 &cached.digest(),
                 &q_mode,
                 q_secs,
-                "cache",
                 crate::digest_quarantine::first_seen_seed(
                     state.config.server.trust_upstream_dates,
                     publish_date,
                 ),
-            ) {
+            )
+            .await
+            {
                 return resp;
             }
         }
@@ -7162,6 +7166,33 @@ mod release_age_without_the_json_index {
             .await
             .iter()
             .any(|p| p.starts_with("/files/")));
+    }
+
+    /// R4-C05: the ledger forgets a digest 90 days after its first sight. A file cached for
+    /// longer than that is not held for a new TTL by the first cache hit after a restart.
+    #[tokio::test]
+    async fn a_file_cached_past_the_ledgers_memory_is_not_held_again() {
+        let up = upstream(&[("foo-1.0.tar.gz", Some("2019-01-01T00:00:00Z"))], true).await;
+        let ctx = context(&up, false, |cfg| {
+            cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("7d".to_string());
+        });
+        cached_listing(&ctx, r#"{"foo-1.0.tar.gz":"2019-01-01T00:00:00Z"}"#, 30).await;
+        let key = "pypi/foo/foo-1.0.tar.gz";
+        crate::test_helpers::put_written_days_ago(&ctx, key, b"BYTES foo-1.0.tar.gz", 100).await;
+        ctx.state
+            .storage
+            .put(&super::proxied_marker_key(key), b"")
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                send(&ctx.app, Method::GET, "/simple/foo/foo-1.0.tar.gz", "")
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
     }
 
     /// With trusted dates the upload time seeds the quarantine (#750): a file uploaded years
