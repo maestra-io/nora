@@ -406,6 +406,8 @@ pub(crate) struct UpstreamMiss {
     not_found: bool,
     failed: bool,
     refused: bool,
+    /// An upstream's body was over NORA's own size cap: answered, and too big to take.
+    too_large: bool,
     /// The breaker key of the first upstream skipped for its open breaker.
     open: Option<String>,
 }
@@ -425,6 +427,10 @@ impl UpstreamMiss {
         match e {
             ProxyError::NotFound => self.not_found = true,
             ProxyError::Upstream(code) if (400..500).contains(code) => self.not_found = true,
+            ProxyError::Spool(SpoolError::TooLarge(_)) => {
+                self.failed = true;
+                self.too_large = true;
+            }
             // Throttling, auth refusals, timeouts and nora's own spool are never "not found".
             ProxyError::Upstream(_)
             | ProxyError::Network(_)
@@ -444,6 +450,7 @@ impl UpstreamMiss {
     /// under none of them, since a 4xx for one name says nothing about the other.
     pub(crate) fn record_upstream(&mut self, asked: &UpstreamMiss) {
         if asked.failed || asked.refused || asked.open.is_some() {
+            self.too_large |= asked.too_large;
             self.failed |= asked.failed;
             self.refused |= asked.refused;
             if self.open.is_none() {
@@ -455,13 +462,16 @@ impl UpstreamMiss {
     }
 
     /// The status for the miss: 404 when an upstream said "not found" or none was asked;
-    /// otherwise 503 when one was skipped for its open breaker, 502 when every one failed or
-    /// refused NORA's credentials.
+    /// otherwise 503 when one was skipped for its open breaker, 507 when one answered with a
+    /// body over NORA's size cap (`server.proxy_max_buffered_mb`, `proxy_max_artifact_mb`),
+    /// 502 when every one failed or refused NORA's credentials.
     pub(crate) fn status(&self) -> StatusCode {
         if self.not_found {
             StatusCode::NOT_FOUND
         } else if self.open.is_some() {
             StatusCode::SERVICE_UNAVAILABLE
+        } else if self.too_large {
+            StatusCode::INSUFFICIENT_STORAGE
         } else if self.failed || self.refused {
             StatusCode::BAD_GATEWAY
         } else {
@@ -1467,20 +1477,137 @@ impl Drop for OrphanMem {
 /// upstream keeps trickling bytes.
 const UNATTENDED_FILL_LIMIT: Duration = Duration::from_secs(30 * 60);
 
-/// `fetch`, given up [`UNATTENDED_FILL_LIMIT`] after the request `waiting` answers went away.
-async fn while_attended<T, A>(
+/// Fills running with nobody waiting, all keys together. Each holds at most the
+/// in-memory head of a body (`server.stream_threshold_mb`; the rest is under the spool
+/// budget), so this bounds what requests that started a download and left can pin.
+const UNATTENDED_FILLS_MAX: usize = 16;
+static UNATTENDED_FILLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One of the [`UNATTENDED_FILLS_MAX`] places, given back on drop.
+struct UnattendedFill;
+
+impl UnattendedFill {
+    fn take() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        UNATTENDED_FILLS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < UNATTENDED_FILLS_MAX).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| UnattendedFill)
+    }
+}
+
+impl Drop for UnattendedFill {
+    fn drop(&mut self) {
+        UNATTENDED_FILLS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The requests waiting on one artifact flight right now, whatever their role in it.
+#[derive(Default)]
+struct Waiters {
+    count: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+/// Waiters of every running flight, by flight key.
+static FLIGHT_WAITERS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<Waiters>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// A hold on a flight's [`Waiters`]: a request's (`counted`, dropped with the request
+/// future, so a disconnect is seen at once) or its fill task's. The entry leaves the
+/// map with the last hold.
+struct Seat {
+    key: String,
+    waiters: std::sync::Arc<Waiters>,
+    counted: bool,
+}
+
+impl Seat {
+    /// The seat of a request that waits on flight `key`.
+    fn waiting(key: &str) -> Self {
+        let waiters =
+            std::sync::Arc::clone(FLIGHT_WAITERS.lock().entry(key.to_string()).or_default());
+        waiters
+            .count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        waiters.changed.notify_waiters();
+        Seat {
+            key: key.to_string(),
+            waiters,
+            counted: true,
+        }
+    }
+
+    /// The seat of the task that fetches for this request: it keeps the entry, and
+    /// does not count as a waiter.
+    fn of_task(&self) -> Self {
+        let mut map = FLIGHT_WAITERS.lock();
+        // Re-insert under the lock: the entry may have left with another seat.
+        let waiters = std::sync::Arc::clone(
+            map.entry(self.key.clone())
+                .or_insert_with(|| std::sync::Arc::clone(&self.waiters)),
+        );
+        Seat {
+            key: self.key.clone(),
+            waiters,
+            counted: false,
+        }
+    }
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let mut map = FLIGHT_WAITERS.lock();
+        if self.counted {
+            self.waiters.count.fetch_sub(1, Ordering::AcqRel);
+            self.waiters.changed.notify_waiters();
+        }
+        // The map's hold and this one: nobody else is on the flight.
+        if std::sync::Arc::strong_count(&self.waiters) <= 2
+            && map
+                .get(&self.key)
+                .is_some_and(|w| std::sync::Arc::ptr_eq(w, &self.waiters))
+        {
+            map.remove(&self.key);
+        }
+    }
+}
+
+/// `fetch`, given up once nobody has waited on its flight for [`UNATTENDED_FILL_LIMIT`]
+/// in a row, or at once when [`UNATTENDED_FILLS_MAX`] other fills already run unattended.
+/// A retry that joins the flight makes it attended again.
+async fn while_attended<T>(
     fetch: impl std::future::Future<Output = Result<T, ProxyError>>,
-    waiting: &mut tokio::sync::oneshot::Sender<A>,
+    waiters: &Waiters,
 ) -> Result<T, ProxyError> {
     let unattended = async {
-        waiting.closed().await;
-        tokio::time::sleep(UNATTENDED_FILL_LIMIT).await;
+        loop {
+            let changed = waiters.changed.notified();
+            tokio::pin!(changed);
+            // Registered before the count is read: a change in between is not missed.
+            changed.as_mut().enable();
+            if waiters.count.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                changed.await;
+                continue;
+            }
+            let Some(_place) = UnattendedFill::take() else {
+                return "too many fills already run with nobody waiting";
+            };
+            tokio::select! {
+                () = tokio::time::sleep(UNATTENDED_FILL_LIMIT) => {
+                    return "nobody waited for it for 30 minutes";
+                }
+                () = &mut changed => {}
+            }
+        }
     };
     tokio::select! {
         result = fetch => result,
-        () = unattended => Err(ProxyError::Timeout(format!(
-            "fill abandoned: nobody waited for it for {UNATTENDED_FILL_LIMIT:?}"
-        ))),
+        why = unattended => Err(ProxyError::Timeout(format!("fill abandoned: {why}"))),
     }
 }
 
@@ -1578,21 +1705,38 @@ async fn fill_detached(
     use std::sync::atomic::{AtomicBool, Ordering};
     let flights = state.artifact_flights.clone();
     let flight_key = format!("fetch:{key}");
-    let (mut tx, rx) = tokio::sync::oneshot::channel();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // Dropped with this request's future: the flight sees a disconnect at once.
+    let seat = Seat::waiting(&flight_key);
+    let task_seat = seat.of_task();
     let task = async move {
         let orphaned = std::sync::Arc::new(AtomicBool::new(false));
         // `fetch` runs at most once per caller: as the leader, or as a follower whose
         // leader was cancelled or outlasted the budget. Its own result wins.
         let mut own = None;
-        let (own_slot, flag, waiting) = (&mut own, std::sync::Arc::clone(&orphaned), &mut tx);
+        // Whether the body was offered to the flight's followers when it was published.
+        let mut offered = false;
+        let (own_slot, offered_slot, flag, waiting, waiters) = (
+            &mut own,
+            &mut offered,
+            std::sync::Arc::clone(&orphaned),
+            &tx,
+            task_seat.waiters.as_ref(),
+        );
         let shared = flights
             .coalesced_try_leased(&flight_key, registry, budget, move || async move {
-                let result = while_attended(fetch, waiting).await;
+                // A request that left before its fetch started (a follower whose wait
+                // ran out, or whose leader was cancelled) starts none.
+                if waiting.is_closed() {
+                    return Err(None);
+                }
+                let result = while_attended(fetch, waiters).await;
                 let shared = match &result {
                     Ok(Fetched::Body(body)) => {
                         // Nobody is waiting for this answer any more: whoever takes
                         // the body from the flight caches it.
-                        flag.store(waiting.is_closed(), Ordering::Release);
+                        *offered_slot = waiting.is_closed();
+                        flag.store(*offered_slot, Ordering::Release);
                         Ok(ArtifactFill {
                             body: body.clone(),
                             orphaned: flag,
@@ -1647,7 +1791,10 @@ async fn fill_detached(
         let Some((lease, _room)) = lease.zip(kept) else {
             return; // Nothing fetched to keep, or no room to keep it in memory.
         };
-        orphaned.store(true, Ordering::Release);
+        // Offered at publish already, and maybe taken since: never offered twice.
+        if !offered {
+            orphaned.store(true, Ordering::Release);
+        }
         tokio::time::sleep(ORPHAN_FILL_HOLD).await;
         drop(lease);
     };
@@ -1656,11 +1803,13 @@ async fn fill_detached(
             crate::supervise::report_panic("artifact_fill", &panic);
         }
     });
-    rx.await.unwrap_or_else(|_| {
+    let answer = rx.await.unwrap_or_else(|_| {
         Err(Some(ProxyError::Network(
             "artifact fill ended without an answer".into(),
         )))
-    })
+    });
+    drop(seat);
+    answer
 }
 
 /// [`proxy_fetch_artifact`] over `client` instead of the shared one (helm: an
@@ -3364,28 +3513,97 @@ mod tests {
         assert!(ORPHAN_MEM_HELD.load(std::sync::atomic::Ordering::Acquire) <= before + MIB);
     }
 
-    /// A fill goes on for as long as its request waits, however long; once the request
-    /// is gone it is given up after `UNATTENDED_FILL_LIMIT`.
+    /// A fill goes on for as long as a request waits on its flight, however long. With
+    /// nobody waiting it is given up after `UNATTENDED_FILL_LIMIT`, and a retry that
+    /// joins meanwhile starts that time over.
     #[tokio::test(start_paused = true)]
     async fn unattended_fill_is_given_up_after_its_limit() {
         let never = || std::future::pending::<Result<(), ProxyError>>();
-        let (mut tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let attended =
-            tokio::time::timeout(UNATTENDED_FILL_LIMIT * 10, while_attended(never(), &mut tx))
-                .await;
+        let request = Seat::waiting("fetch:test/attendance");
+        let task = request.of_task();
+        let attended = tokio::time::timeout(
+            UNATTENDED_FILL_LIMIT * 10,
+            while_attended(never(), &task.waiters),
+        )
+        .await;
         assert!(
             attended.is_err(),
             "an attended fill has no deadline of its own"
         );
 
-        drop(rx);
-        let started = tokio::time::Instant::now();
-        let abandoned = while_attended(never(), &mut tx).await;
+        // The request leaves; a retry joins before the limit and leaves again.
+        drop(request);
+        let fill = tokio::spawn({
+            let waiters = std::sync::Arc::clone(&task.waiters);
+            async move {
+                let started = tokio::time::Instant::now();
+                let out = while_attended(never(), &waiters).await;
+                (out, started.elapsed())
+            }
+        });
+        tokio::time::sleep(UNATTENDED_FILL_LIMIT - Duration::from_secs(1)).await;
+        let retry = Seat::waiting("fetch:test/attendance");
+        assert!(
+            std::sync::Arc::ptr_eq(&retry.waiters, &task.waiters),
+            "a retry joins the running flight's waiters"
+        );
+        tokio::time::sleep(UNATTENDED_FILL_LIMIT).await;
+        assert!(!fill.is_finished(), "attended again: not given up");
+        drop(retry);
+        let (abandoned, elapsed) = fill.await.unwrap();
         assert!(
             matches!(abandoned, Err(ProxyError::Timeout(_))),
             "{abandoned:?}"
         );
-        assert_eq!(started.elapsed(), UNATTENDED_FILL_LIMIT);
+        assert_eq!(
+            elapsed,
+            UNATTENDED_FILL_LIMIT * 3 - Duration::from_secs(1),
+            "the limit runs from the moment the last waiter left"
+        );
+
+        drop(task);
+        assert!(
+            !FLIGHT_WAITERS.lock().contains_key("fetch:test/attendance"),
+            "the entry leaves with the last seat"
+        );
+    }
+
+    /// Fills that run with nobody waiting are few: past `UNATTENDED_FILLS_MAX` one is
+    /// given up at once instead of holding its buffer for a client that left.
+    #[tokio::test(start_paused = true)]
+    async fn unattended_fills_are_bounded_in_number() {
+        let places: Vec<_> = std::iter::from_fn(UnattendedFill::take).collect();
+        assert!(places.len() <= UNATTENDED_FILLS_MAX);
+        let seat = Seat::waiting("fetch:test/bounded");
+        let task = seat.of_task();
+        drop(seat);
+        let started = tokio::time::Instant::now();
+        let out = while_attended(
+            std::future::pending::<Result<(), ProxyError>>(),
+            &task.waiters,
+        )
+        .await;
+        assert!(matches!(out, Err(ProxyError::Timeout(_))), "{out:?}");
+        assert_eq!(started.elapsed(), Duration::ZERO, "given up at once");
+    }
+
+    /// A miss whose upstream answered with a body over NORA's size cap is a 507, as
+    /// the single-upstream formats answer it, not a 502; "not found" from another
+    /// upstream still decides.
+    #[test]
+    fn miss_over_the_size_cap_is_a_507() {
+        let too_large = ProxyError::Spool(SpoolError::TooLarge(MIB));
+        assert_eq!(
+            UpstreamMiss::of(&too_large).status(),
+            StatusCode::INSUFFICIENT_STORAGE
+        );
+        let mut miss = UpstreamMiss::of(&too_large);
+        miss.record(&ProxyError::NotFound);
+        assert_eq!(miss.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            UpstreamMiss::of(&ProxyError::Spool(SpoolError::Busy)).status(),
+            StatusCode::BAD_GATEWAY
+        );
     }
 
     /// R4-P03: a client that disconnects while its cold miss is being downloaded does
