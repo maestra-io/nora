@@ -26,6 +26,7 @@ set -euo pipefail
 #  [x] Flatcontainer version normalization (lowercase)
 #  [x] dotnet package search resolves the search service
 #  [x] NuGet.Protocol 6.3.4 resolves a registration (legacy RegistrationsBaseUrl aliases)
+#  [x] SemVer 1 registration hives (identity / gzip) for the pre-3.6.0 types
 #
 # ── What this suite does NOT prove ───────────────────────────────────────
 #  [ ] dotnet SDK telemetry/DNS: <clear/> removes NuGet sources but does NOT
@@ -294,6 +295,29 @@ else
     skip "registration gzip (not cached yet)"
 fi
 rm -f "$REG_HEADER_FILE"
+
+# 2.5b SemVer 1 hives of the older RegistrationsBaseUrl types: registration-semver1
+# (bare, /3.0.0-beta, /3.0.0-rc) not compressed, registration-gz-semver1 (/3.4.0) gzip,
+# neither lists a SemVer 2.0.0 version (Microsoft.Extensions.AI lists 9.0.0-preview.9.24507.7 and the like inline).
+for hive in registration-semver1 registration-gz-semver1; do
+    HIVE_HDR=$(mktemp)
+    HIVE_BODY=$(curl -s --compressed -D "$HIVE_HDR" "$BASE/nuget/v3/$hive/microsoft.extensions.ai/index.json" 2>/dev/null || echo "")
+    HIVE_ENC=$({ grep -i '^content-encoding:' "$HIVE_HDR" || true; } | tr -d '\r' | awk '{print tolower($2)}')
+    rm -f "$HIVE_HDR"
+    WANT_ENC=""; [ "$hive" = registration-gz-semver1 ] && WANT_ENC="gzip"
+    HIVE_OK=$(echo "$HIVE_BODY" | python3 -c "
+import sys, json, re
+d = json.load(sys.stdin)
+vs = [l['catalogEntry']['version'] for p in d['items'] for l in p.get('items', [])]
+semver2 = [v for v in vs if '+' in v or ('-' in v and '.' in v.split('-', 1)[1])]
+print('OK' if vs and not semver2 and '/v3/registration/' not in json.dumps(d) else 'FAIL %d %s' % (len(vs), semver2[:3]))
+" 2>/dev/null || echo "FAIL parse")
+    if [ "$HIVE_ENC" = "$WANT_ENC" ] && [ "$HIVE_OK" = "OK" ]; then
+        pass "$hive: Content-Encoding '${WANT_ENC:-none}', no SemVer 2.0.0 versions"
+    else
+        fail "$hive: encoding '$HIVE_ENC' (want '${WANT_ENC:-none}'), $HIVE_OK"
+    fi
+done
 
 # 2.6 Service index @type versions: PackageBaseAddress/3.0.0 + every RegistrationsBaseUrl alias
 if [ -n "$SVC_BODY" ]; then
