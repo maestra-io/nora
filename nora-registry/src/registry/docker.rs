@@ -27,6 +27,7 @@ use axum::{
     Extension, Json, Router,
 };
 use futures::StreamExt;
+use nora_registry::docker_manifest::detect_manifest_media_type;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -3667,9 +3668,6 @@ pub struct FetchedBlob {
     pub path: std::path::PathBuf,
     /// SHA-256 hex digest computed incrementally during download (64 chars, lowercase).
     pub sha256: String,
-    /// Content-Length from upstream response, if provided (None for chunked responses).
-    #[allow(dead_code)]
-    pub content_length: Option<u64>,
     /// RAII guard — deletes temp file on drop unless disarmed.
     pub _guard: TempFileGuard,
 }
@@ -4657,7 +4655,6 @@ pub(crate) async fn spool_upstream_blob(
     Ok(FetchedBlob {
         path: temp_path,
         sha256,
-        content_length,
         _guard: guard,
     })
 }
@@ -4866,41 +4863,6 @@ fn manifest_response(data: impl Into<Bytes>, content_type: String, digest: Strin
         body,
     )
         .into_response()
-}
-
-fn detect_manifest_media_type(data: &[u8]) -> String {
-    // Try to parse as JSON and extract mediaType
-    if let Ok(json) = serde_json::from_slice::<Value>(data) {
-        if let Some(media_type) = json.get("mediaType").and_then(|v| v.as_str()) {
-            return media_type.to_string();
-        }
-
-        // Check schemaVersion for older manifests
-        if let Some(schema_version) = json.get("schemaVersion").and_then(|v| v.as_u64()) {
-            if schema_version == 1 {
-                return "application/vnd.docker.distribution.manifest.v1+json".to_string();
-            }
-            // schemaVersion 2 without mediaType - check config.mediaType to distinguish OCI vs Docker
-            if let Some(config) = json.get("config") {
-                if let Some(config_mt) = config.get("mediaType").and_then(|v| v.as_str()) {
-                    if config_mt.starts_with("application/vnd.docker.") {
-                        return "application/vnd.docker.distribution.manifest.v2+json".to_string();
-                    }
-                    // OCI or Helm or any non-docker config mediaType
-                    return "application/vnd.oci.image.manifest.v1+json".to_string();
-                }
-                // No config.mediaType - assume docker v2
-                return "application/vnd.docker.distribution.manifest.v2+json".to_string();
-            }
-            // If it has "manifests" array, it's an index/list
-            if json.get("manifests").is_some() {
-                return "application/vnd.oci.image.index.v1+json".to_string();
-            }
-        }
-    }
-
-    // Default fallback
-    "application/vnd.docker.distribution.manifest.v2+json".to_string()
 }
 
 /// Extract publish date from Docker manifest `.meta.json` sidecar.
@@ -5553,8 +5515,11 @@ mod tests {
 
     #[test]
     fn test_cleanup_upload_temp_dir_nonexistent_dir() {
-        // Should not panic when directory doesn't exist
-        cleanup_upload_temp_dir("/nonexistent/path/that/does/not/exist");
+        let data = tempfile::tempdir().unwrap();
+        let data_dir = data.path().join("never-created");
+        cleanup_upload_temp_dir(data_dir.to_str().unwrap());
+        // A cleanup of a directory that is not there removes nothing and creates nothing.
+        assert!(!data_dir.exists());
     }
 
     // --- detect_manifest_media_type tests ---

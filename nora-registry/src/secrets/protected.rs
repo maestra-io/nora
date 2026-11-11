@@ -102,43 +102,6 @@ impl<'de> serde::Deserialize<'de> for ProtectedString {
     }
 }
 
-/// S3 credentials with protected secrets
-#[allow(dead_code)] // Scaffolding for future secrets integration (Vault, AWS SM, K8s)
-#[derive(Clone, Zeroize)]
-#[zeroize(drop)]
-pub struct S3Credentials {
-    #[zeroize(skip)] // access_key_id is not sensitive
-    pub access_key_id: String,
-    pub secret_access_key: ProtectedString,
-    pub region: Option<String>,
-}
-
-#[allow(dead_code)]
-impl S3Credentials {
-    pub fn new(access_key_id: String, secret_access_key: String) -> Self {
-        Self {
-            access_key_id,
-            secret_access_key: ProtectedString::new(secret_access_key),
-            region: None,
-        }
-    }
-
-    pub fn with_region(mut self, region: String) -> Self {
-        self.region = Some(region);
-        self
-    }
-}
-
-impl fmt::Debug for S3Credentials {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("S3Credentials")
-            .field("access_key_id", &self.access_key_id)
-            .field("secret_access_key", &"***REDACTED***")
-            .field("region", &self.region)
-            .finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,18 +125,6 @@ mod tests {
     fn test_protected_string_expose() {
         let secret = ProtectedString::new("my-secret".to_string());
         assert_eq!(secret.expose(), "my-secret");
-    }
-
-    #[test]
-    fn test_s3_credentials_redacted_debug() {
-        let creds = S3Credentials::new(
-            "AKIAIOSFODNN7EXAMPLE".to_string(),
-            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
-        );
-        let debug_output = format!("{:?}", creds);
-        assert!(debug_output.contains("AKIAIOSFODNN7EXAMPLE"));
-        assert!(!debug_output.contains("wJalrXUtnFEMI"));
-        assert!(debug_output.contains("REDACTED"));
     }
 
     #[test]

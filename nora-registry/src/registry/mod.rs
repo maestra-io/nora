@@ -240,20 +240,20 @@ pub(crate) fn nora_base_url(state: &AppState) -> String {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) enum ProxyError {
     NotFound,
     Upstream(u16),
-    Network(String),
+    // The messages and the status below are read through `Debug` only, in the logs.
+    Network(#[allow(dead_code)] String),
     CircuitOpen(String),
     /// The request (connect, headers or body) exceeded its timeout.
-    Timeout(String),
+    Timeout(#[allow(dead_code)] String),
     /// Upstream answered 429; carries its `Retry-After` value, if any.
     RateLimited(Option<String>),
     /// Upstream answered 401/403: a credential or policy refusal, not a missing artifact.
     /// With the reason its body gives, when it is a JSON error with a `message`
     /// (GitHub's API: `message` and `documentation_url`).
-    Denied(u16, Option<String>),
+    Denied(#[allow(dead_code)] u16, Option<String>),
     /// The body could not be spooled locally: nora's own disk or budget, not upstream.
     Spool(SpoolError),
     /// The upstream answered and would not let NORA in: it refused the credential configured

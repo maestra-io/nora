@@ -21,6 +21,8 @@
 )]
 //! NORA Registry — library interface for fuzzing and testing
 
+pub mod docker_manifest;
+pub mod maven_paths;
 pub mod npm_links;
 pub mod pypi_files;
 pub mod upstream_rewrite;
@@ -28,29 +30,9 @@ pub mod upstream_url;
 pub mod validation;
 pub mod verified;
 
-/// Re-export Docker manifest parsing for fuzz targets
+/// Re-export Docker manifest parsing for fuzz targets: the server's own reader.
 pub mod docker_fuzz {
-    pub fn detect_manifest_media_type(data: &[u8]) -> String {
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(data) else {
-            return "application/octet-stream".to_string();
-        };
-        if let Some(mt) = value.get("mediaType").and_then(|v| v.as_str()) {
-            return mt.to_string();
-        }
-        if value.get("manifests").is_some() {
-            return "application/vnd.oci.image.index.v1+json".to_string();
-        }
-        if value.get("schemaVersion").and_then(|v| v.as_i64()) == Some(2) {
-            if value.get("layers").is_some() {
-                return "application/vnd.oci.image.manifest.v1+json".to_string();
-            }
-            return "application/vnd.docker.distribution.manifest.v2+json".to_string();
-        }
-        if value.get("schemaVersion").and_then(|v| v.as_i64()) == Some(1) {
-            return "application/vnd.docker.distribution.manifest.v1+json".to_string();
-        }
-        "application/vnd.docker.distribution.manifest.v2+json".to_string()
-    }
+    pub use crate::docker_manifest::detect_manifest_media_type;
 }
 
 /// Re-export npm metadata rewriting for fuzz targets
@@ -83,8 +65,8 @@ pub mod npm_fuzz {
     mod url_leak_tests {
         //! #385: a rewrite must never leak the configured upstream host into
         //! client-facing output. The fuzz target `fuzz_url_leak` explores this;
-        //! these deterministic cases enforce it on every CI run (there is no
-        //! fuzz CI job, so this is the front-loop guard).
+        //! these deterministic cases enforce it on every CI run (the fuzz job
+        //! of maestra-ci is a short smoke run, so this is the front-loop guard).
         use super::rewrite_tarball_urls;
 
         const UPSTREAM: &str = "https://upstream-host.invalid";
@@ -116,129 +98,17 @@ pub mod npm_fuzz {
     }
 }
 
-/// Re-export PyPI HTML parsing for fuzz targets
+/// Re-export PyPI index parsing for fuzz targets: the server's own readers.
 pub mod pypi_fuzz {
-    pub fn extract_filename(url: &str) -> Option<String> {
-        let url = url.split('#').next()?;
-        let filename = url.rsplit('/').next()?;
-
-        crate::pypi_files::served_extension(filename).map(|_| filename.to_string())
-    }
-
-    pub fn parse_upstream_html(html: &str) -> Vec<(String, Option<String>)> {
-        let mut files = Vec::new();
-        let mut remaining = html;
-
-        while let Some(href_start) = remaining.find("href=\"") {
-            remaining = &remaining[href_start + 6..];
-            if let Some(href_end) = remaining.find('"') {
-                let url = &remaining[..href_end];
-                if let Some(filename) = extract_filename(url) {
-                    let sha256 = url.find("#sha256=").map(|pos| url[pos + 8..].to_string());
-                    files.push((filename, sha256));
-                }
-                remaining = &remaining[href_end..];
-            }
-        }
-        files
-    }
+    pub use crate::pypi_files::{extract_filename, parse_upstream_files};
 }
 
-/// Re-export Maven path classification for fuzz targets
+/// Re-export Maven path classification for fuzz targets: the server's own.
 pub mod maven_fuzz {
-    use crate::validation::ends_with_ci;
-
-    #[derive(Debug, PartialEq)]
-    pub enum MavenPathKind {
-        VersionFile {
-            group_path: String,
-            artifact_id: String,
-            version: String,
-            filename: String,
-        },
-        ArtifactMeta {
-            group_path: String,
-            artifact_id: String,
-            filename: String,
-        },
-        Opaque,
-    }
-
-    pub fn classify_path(path: &str) -> MavenPathKind {
-        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-        if segments.len() < 2 {
-            return MavenPathKind::Opaque;
-        }
-
-        let last = segments[segments.len() - 1];
-
-        if (last == "maven-metadata.xml" || last.starts_with("maven-metadata.xml."))
-            && segments.len() >= 2
-        {
-            return MavenPathKind::ArtifactMeta {
-                group_path: segments[..segments.len() - 2].join("/"),
-                artifact_id: segments[segments.len() - 2].to_string(),
-                filename: last.to_string(),
-            };
-        }
-
-        if segments.len() >= 4 {
-            return MavenPathKind::VersionFile {
-                group_path: segments[..segments.len() - 3].join("/"),
-                artifact_id: segments[segments.len() - 3].to_string(),
-                version: segments[segments.len() - 2].to_string(),
-                filename: last.to_string(),
-            };
-        }
-
-        MavenPathKind::Opaque
-    }
-
-    pub fn is_checksum_file(filename: &str) -> bool {
-        ends_with_ci(filename, ".md5")
-            || ends_with_ci(filename, ".sha1")
-            || ends_with_ci(filename, ".sha256")
-            || ends_with_ci(filename, ".sha512")
-    }
-
-    pub fn is_snapshot(version: &str) -> bool {
-        version.ends_with("-SNAPSHOT")
-    }
-
-    pub fn compare_maven_versions(a: &str, b: &str) -> std::cmp::Ordering {
-        let a_base = a.strip_suffix("-SNAPSHOT").unwrap_or(a);
-        let b_base = b.strip_suffix("-SNAPSHOT").unwrap_or(b);
-
-        let a_parts: Vec<&str> = a_base.split(['.', '-']).collect();
-        let b_parts: Vec<&str> = b_base.split(['.', '-']).collect();
-
-        for (ap, bp) in a_parts.iter().zip(b_parts.iter()) {
-            let ord = match (ap.parse::<u64>(), bp.parse::<u64>()) {
-                (Ok(an), Ok(bn)) => an.cmp(&bn),
-                _ => ap.cmp(bp),
-            };
-            if ord != std::cmp::Ordering::Equal {
-                return ord;
-            }
-        }
-
-        let base_ord = a_parts.len().cmp(&b_parts.len());
-        if base_ord != std::cmp::Ordering::Equal {
-            return base_ord;
-        }
-
-        let a_snap = a.ends_with("-SNAPSHOT");
-        let b_snap = b.ends_with("-SNAPSHOT");
-        b_snap.cmp(&a_snap)
-    }
-
-    pub fn xml_escape(s: &str) -> String {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-    }
+    pub use crate::maven_paths::{
+        classify_path, compare_maven_versions, is_checksum_file, is_snapshot, xml_escape,
+        MavenCoordinates, MavenPathKind,
+    };
 }
 
 /// Re-export version parsing for fuzz targets: the server's own readers, so the fuzz targets
@@ -265,22 +135,14 @@ mod one_implementation_tests {
     /// Functions with a body that remain, by name: a new one fails
     /// [`this_file_holds_no_copy_of_server_code_but_these`] until it is listed here. The npm one
     /// holds no rule of its own: it reads the package name and calls the server's rewrite
-    /// ([`crate::npm_links::place_document`]). The others are copies, of no host-boundary code.
-    const COPIES: &[&str] = &[
-        "docker_fuzz::detect_manifest_media_type",
-        "npm_fuzz::rewrite_tarball_urls",
-        "pypi_fuzz::extract_filename",
-        "pypi_fuzz::parse_upstream_html",
-        "maven_fuzz::classify_path",
-        "maven_fuzz::is_checksum_file",
-        "maven_fuzz::is_snapshot",
-        "maven_fuzz::compare_maven_versions",
-        "maven_fuzz::xml_escape",
-    ];
+    /// ([`crate::npm_links::place_document`]). No copy of server code is left.
+    const COPIES: &[&str] = &["npm_fuzz::rewrite_tarball_urls"];
 
     /// The modules of their own files this file declares: the code they hold is compiled once,
     /// for the server and the fuzz targets alike.
     const SHARED: &[&str] = &[
+        "docker_manifest",
+        "maven_paths",
         "npm_links",
         "pypi_files",
         "upstream_rewrite",

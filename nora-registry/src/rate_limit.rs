@@ -215,31 +215,37 @@ mod tests {
     #[test]
     fn test_auth_rate_limiter_creation() {
         let config = RateLimitConfig::default();
-        let _limiter = auth_rate_limiter(
-            limiter_quotas(&config).auth,
-            TrustedProxies::default_loopback(),
-        )
-        .0;
+        let asked = limiter_quotas(&config).auth;
+        let (_limiter, enforced, _state) =
+            auth_rate_limiter(asked, TrustedProxies::default_loopback());
+        assert_eq!(
+            enforced, asked,
+            "the built limiter enforces the configured quota"
+        );
     }
 
     #[test]
     fn test_upload_rate_limiter_creation() {
         let config = RateLimitConfig::default();
-        let _limiter = upload_rate_limiter(
-            limiter_quotas(&config).upload,
-            TrustedProxies::default_loopback(),
-        )
-        .0;
+        let asked = limiter_quotas(&config).upload;
+        let (_limiter, enforced, _state) =
+            upload_rate_limiter(asked, TrustedProxies::default_loopback());
+        assert_eq!(
+            enforced, asked,
+            "the built limiter enforces the configured quota"
+        );
     }
 
     #[test]
     fn test_general_rate_limiter_creation() {
         let config = RateLimitConfig::default();
-        let _limiter = general_rate_limiter(
-            limiter_quotas(&config).general,
-            TrustedProxies::default_loopback(),
-        )
-        .0;
+        let asked = limiter_quotas(&config).general;
+        let (_limiter, enforced, _state) =
+            general_rate_limiter(asked, TrustedProxies::default_loopback());
+        assert_eq!(
+            enforced, asked,
+            "the built limiter enforces the configured quota"
+        );
     }
 
     /// A POST routed through `layer`, from `peer`, carrying `xff` as X-Forwarded-For
@@ -365,21 +371,14 @@ mod tests {
             general_rps: 200,
             general_burst: 400,
         };
-        let _auth = auth_rate_limiter(
-            limiter_quotas(&config).auth,
-            TrustedProxies::default_loopback(),
-        )
-        .0;
-        let _upload = upload_rate_limiter(
-            limiter_quotas(&config).upload,
-            TrustedProxies::default_loopback(),
-        )
-        .0;
-        let _general = general_rate_limiter(
-            limiter_quotas(&config).general,
-            TrustedProxies::default_loopback(),
-        )
-        .0;
+        let quotas = limiter_quotas(&config);
+        let auth = auth_rate_limiter(quotas.auth, TrustedProxies::default_loopback()).1;
+        let upload = upload_rate_limiter(quotas.upload, TrustedProxies::default_loopback()).1;
+        let general = general_rate_limiter(quotas.general, TrustedProxies::default_loopback()).1;
+        // What the built limiters enforce is what the config asked for.
+        assert_eq!((auth.per_second(), auth.burst), (10.0, 20));
+        assert_eq!((upload.per_second(), upload.burst), (500.0, 1000));
+        assert_eq!((general.per_second(), general.burst), (200.0, 400));
     }
 
     #[test]

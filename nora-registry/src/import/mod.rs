@@ -737,23 +737,27 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 }
 
 fn report_result(r: &ImportResult, dry_run: bool, json: bool) {
+    // ImportResult derives Serialize; a bad serialize is not import-fatal.
+    match result_line(r, dry_run, json) {
+        Ok(line) => println!("{line}"),
+        Err(e) => tracing::error!(error = %e, "failed to serialize import result"),
+    }
+}
+
+/// The line [`report_result`] prints: the result as JSON, or a sentence for a person.
+fn result_line(r: &ImportResult, dry_run: bool, json: bool) -> serde_json::Result<String> {
     if json {
-        // ImportResult derives Serialize; a bad serialize is not import-fatal.
-        match serde_json::to_string(r) {
-            Ok(s) => println!("{s}"),
-            Err(e) => tracing::error!(error = %e, "failed to serialize import result"),
-        }
-        return;
+        return serde_json::to_string(r);
     }
     let mode = if dry_run {
         " (dry-run — nothing committed)"
     } else {
         ""
     };
-    println!(
+    Ok(format!(
         "import complete{mode}: {} imported, {} skipped, {} failed, {} bytes ({} total)",
         r.imported, r.skipped, r.failed, r.bytes, r.total
-    );
+    ))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -3269,6 +3273,18 @@ mod integration_tests {
         report_result(&r, false, true); // json
         report_result(&r, true, false); // human dry-run
         report_result(&r, false, false); // human normal
+
+        let json: serde_json::Value =
+            serde_json::from_str(&result_line(&r, false, true).unwrap()).unwrap();
+        assert_eq!(
+            (json["imported"].as_u64(), json["bytes"].as_u64()),
+            (Some(2), Some(42))
+        );
+        assert_eq!(
+            result_line(&r, false, false).unwrap(),
+            "import complete: 2 imported, 1 skipped, 0 failed, 42 bytes (3 total)"
+        );
+        assert!(result_line(&r, true, false).unwrap().contains("dry-run"));
     }
 
     // ── C73: npm / NuGet / PyPI imports are served like uploads ─────────
