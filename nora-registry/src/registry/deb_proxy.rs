@@ -716,7 +716,7 @@ async fn build_suite(
     // and architectures.
     // An unreadable ledger fails the build: dating without it would hold, and write to
     // this suite's ledger, a file another suite serves.
-    let ledgers = match min_age {
+    let mut ledgers = match min_age {
         Some(_) => state
             .storage
             .list(&format!("{}/ledger/", meta(repo)))
@@ -724,6 +724,10 @@ async fn build_suite(
             .map_err(|e| BuildError::Internal(e.to_string()))?,
         None => Vec::new(),
     };
+    // Indexes without a ledger first: they date everything 0, and the ones dated
+    // against every ledger then see theirs.
+    let mut indexes: Vec<_> = indexes.into_iter().collect();
+    indexes.sort_by_key(|((comp, arch), _)| ledgers.contains(&ledger_key(repo, suite, comp, arch)));
     for ((comp, arch), path) in &indexes {
         let (hash, _) = rel.sha256[path].clone();
         let lkey = ledger_key(repo, suite, comp, arch);
@@ -893,6 +897,9 @@ async fn build_suite(
         put_json(state, &lkey, &ledger)
             .await
             .map_err(BuildError::Internal)?;
+        if min_age.is_some() && !ledgers.contains(&lkey) {
+            ledgers.push(lkey);
+        }
     }
 
     if files.is_empty() {
@@ -1405,13 +1412,37 @@ mod integration_tests {
         stanzas: &[(&str, &str)],
         delay: std::time::Duration,
     ) {
-        let text: String = stanzas.iter().map(|(n, v)| stanza(n, v) + "\n").collect();
-        let packages = gz(text.as_bytes());
+        mount_suite_comps(server, key, suite, &[(comp, stanzas)], delay).await;
+    }
+
+    /// `mount_suite` with one amd64 index per component.
+    async fn mount_suite_comps(
+        server: &MockServer,
+        key: &SignedSecretKey,
+        suite: &str,
+        comps: &[(&str, &[(&str, &str)])],
+        delay: std::time::Duration,
+    ) {
+        let mut sums = String::new();
+        let mut files = Vec::new();
+        for (comp, stanzas) in comps {
+            let text: String = stanzas.iter().map(|(n, v)| stanza(n, v) + "\n").collect();
+            let packages = gz(text.as_bytes());
+            sums.push_str(&format!(
+                " {} {} {comp}/binary-amd64/Packages.gz\n {} 0 {comp}/binary-i386/Packages.gz\n",
+                super::sha256_hex(&packages),
+                packages.len(),
+                super::sha256_hex(b""),
+            ));
+            files.push((
+                format!("/dists/{suite}/{comp}/binary-amd64/Packages.gz"),
+                packages,
+            ));
+        }
+        let names: Vec<&str> = comps.iter().map(|(c, _)| *c).collect();
         let release = format!(
-            "Origin: Test\nSuite: stable\nCodename: bookworm\nDate: Tue, 03 Nov 2026 00:00:00 UTC\nArchitectures: amd64 i386\nComponents: {comp}\nSigned-By: ABCDEF\nSHA256:\n {} {} {comp}/binary-amd64/Packages.gz\n {} 0 {comp}/binary-i386/Packages.gz\n",
-            super::sha256_hex(&packages),
-            packages.len(),
-            super::sha256_hex(b""),
+            "Origin: Test\nSuite: stable\nCodename: bookworm\nDate: Tue, 03 Nov 2026 00:00:00 UTC\nArchitectures: amd64 i386\nComponents: {}\nSigned-By: ABCDEF\nSHA256:\n{sums}",
+            names.join(" "),
         );
         let signed =
             CleartextSignedMessage::sign(rand::thread_rng(), &release, &**key, &Password::empty())
@@ -1434,12 +1465,10 @@ mod integration_tests {
             )
             .mount(server)
             .await;
-        mount(
-            format!("/dists/{suite}/{comp}/binary-amd64/Packages.gz"),
-            packages,
-        )
-        .await;
-        for (n, v) in stanzas {
+        for (at, packages) in files {
+            mount(at, packages).await;
+        }
+        for (n, v) in comps.iter().flat_map(|(_, s)| s.iter()) {
             mount(
                 format!("/pool/main/{n}_{v}_amd64.deb"),
                 format!("{n}-{v}").into_bytes(),
@@ -1665,6 +1694,26 @@ mod integration_tests {
             get("/deb/debian/pool/main/l_1_amd64.deb").await.status(),
             StatusCode::FORBIDDEN,
             "a file no suite has listed for 3 days is still held"
+        );
+
+        // A component new to security lists l 1 too: its first index dates it 0, and the
+        // index that held it, built in the same pass, serves it.
+        server.reset().await;
+        let extra: &[(&str, &str)] = &[("k", "2"), ("l", "1"), ("m", "1")];
+        let main: &[(&str, &str)] = &[("l", "1")];
+        mount_suite_comps(
+            &server,
+            &key,
+            "security",
+            &[("extra", extra), ("main", main)],
+            z,
+        )
+        .await;
+        let (_, pkgs) = served_in(&ctx, "security", "extra").await;
+        assert!(pkgs.contains(&("l".into(), "1".into())), "{pkgs:?}");
+        assert!(
+            !pkgs.contains(&("m".into(), "1".into())),
+            "m 1 is new: {pkgs:?}"
         );
     }
 
