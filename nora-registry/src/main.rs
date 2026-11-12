@@ -2198,126 +2198,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         )
     }));
 
-    // Retention is pushed first: it deletes expired versions, creating the
-    // orphans the GC pass then sweeps in the same cycle.
-    let mut cleanup_passes: Vec<cleanup::CleanupPass> = Vec::new();
-
-    if state.config.retention.enabled && !state.config.retention.rules.is_empty() {
-        let storage = state.storage.clone();
-        let publish_locks = state.publish_locks.clone();
-        let signer = state.signer.clone();
-        let rules = state.config.retention.rules.clone();
-        let dry_run = state.config.retention.dry_run;
-        let audit = state.audit.clone();
-        let repo_index = state.repo_index.clone();
-        cleanup_passes.push(cleanup::CleanupPass {
-            name: "retention",
-            interval: std::time::Duration::from_secs(state.config.retention.interval),
-            run: Box::new(move || {
-                let storage = storage.clone();
-                let publish_locks = publish_locks.clone();
-                let signer = signer.clone();
-                let rules = rules.clone();
-                let audit = audit.clone();
-                let repo_index = repo_index.clone();
-                async move {
-                    info!(
-                        dry_run = dry_run,
-                        "Retention scheduler: starting periodic run"
-                    );
-                    let result = retention_pass(
-                        &storage,
-                        &publish_locks,
-                        &repo_index,
-                        signer.as_deref(),
-                        &rules,
-                        dry_run,
-                        &audit,
-                    )
-                    .await;
-                    info!(
-                        "Retention scheduler: done in {:.1}s — {} versions, {} keys, {} bytes freed, {} versions with refused deletes",
-                        result.duration_secs, result.planned, result.deleted_keys, result.bytes_freed, result.delete_failures
-                    );
-                }
-                .boxed()
-            }),
-        });
-        info!(
-            interval_secs = state.config.retention.interval,
-            rules = state.config.retention.rules.len(),
-            dry_run = state.config.retention.dry_run,
-            "Retention scheduler started"
-        );
-    }
-
-    // Hosted NuGet feed (maestra fork): PR pre-release expiry per `[nuget] hosted_pr_*`
-    // plus the orphan blob sweep, on the retention interval and dry-run switch. Its own
-    // knobs gate it (`hosted_pr_retention_days = 0` keeps every version), not the rules.
-    if state.config.nuget.enabled {
-        let state = state.clone();
-        let dry_run = state.config.retention.dry_run;
-        cleanup_passes.push(cleanup::CleanupPass {
-            name: "nuget-hosted-retention",
-            interval: std::time::Duration::from_secs(state.config.retention.interval),
-            run: Box::new(move || {
-                let state = state.clone();
-                async move {
-                    registry::nuget::hosted::run_retention(&state, dry_run).await;
-                }
-                .boxed()
-            }),
-        });
-    }
-
-    if state.config.gc.enabled {
-        let storage = state.storage.clone();
-        let publish_locks = state.publish_locks.clone();
-        let dry_run = state.config.gc.dry_run;
-        let grace_secs = state.config.gc.grace_secs;
-        let npm_is_proxy = !state.config.npm.upstream_urls().is_empty();
-        let go_is_proxy = state.config.go.proxy.is_some();
-        let proxy_cache_max_bytes = state.config.gc.proxy_cache_max_bytes;
-        let docker_cache_max_bytes = state.config.gc.docker_proxy_cache_max_bytes;
-        let docker_namespaces = docker_proxy_namespaces(&state.config);
-        let reloadable = Arc::clone(&state.reloadable);
-        let repo_index = state.repo_index.clone();
-        cleanup_passes.push(cleanup::CleanupPass {
-            name: "gc",
-            interval: std::time::Duration::from_secs(state.config.gc.interval),
-            run: Box::new(move || {
-                let storage = storage.clone();
-                let publish_locks = publish_locks.clone();
-                // The current (SIGHUP-reloadable) internal namespaces, for eviction.
-                let curation = reloadable.load_full();
-                let repo_index = repo_index.clone();
-                let docker_namespaces = docker_namespaces.clone();
-                async move {
-                    info!("GC scheduler: starting periodic run");
-                    let result = gc_pass(
-                        &storage,
-                        &publish_locks,
-                        &repo_index,
-                        dry_run,
-                        grace_secs,
-                        npm_is_proxy,
-                        go_is_proxy,
-                        proxy_cache_max_bytes,
-                        (docker_cache_max_bytes, &docker_namespaces),
-                        &curation.curation_engine,
-                    )
-                    .await;
-                    info!("{}", gc_done_line(&result, dry_run));
-                }
-                .boxed()
-            }),
-        });
-        info!(
-            interval_secs = state.config.gc.interval,
-            dry_run = state.config.gc.dry_run,
-            "GC scheduler started"
-        );
-    }
+    let cleanup_passes = cleanup_passes(&state);
 
     if !cleanup_passes.is_empty() {
         let passes = Arc::new(cleanup_passes);
@@ -2365,26 +2246,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         ))
         .with_state(state.clone());
 
-    // Open this instance's staging directory, removing what dead instances (SIGKILL,
-    // OOM, power cut) left in theirs.
-    state.storage.prepare().await;
-
-    // Clean up stale Docker temp files from previous runs (#530, #580).
-    if state.config.docker.enabled {
-        registry::docker::cleanup_upload_temp_dir(&state.config.storage.path);
-        registry::docker::cleanup_proxy_temp_dir(&state.config.storage.path);
-    }
-    // Spool files (proxied downloads, NuGet pushes, PyPI uploads) of an instance
-    // that died mid-transfer.
-    registry::cleanup_spool_dirs(&state.config.server.spool_dir(&state.config.storage.path));
-    // ...and streamed raw uploads a crash cut off mid-request.
-    if state.config.raw.enabled {
-        registry::raw::cleanup_upload_temp_dir(&state.config.storage.path);
-    }
-    // ...and Hugging Face cache fills a crash cut off mid-file.
-    if state.config.hf.enabled {
-        registry::hf::cleanup_fill_temp_dir(&state.config.storage.path);
-    }
+    clear_dead_instance_files(&state).await;
 
     // Cargo: the name record of every crate published before records existed (`-` and `_` name one
     // crate), before the first request: until then another spelling of such a crate would reach the
@@ -2582,6 +2444,155 @@ async fn run_server(mut config: Config, storage: Storage) {
         uptime_seconds = state.start_time.elapsed().as_secs(),
         "Nora shutdown complete"
     );
+}
+
+/// The passes of the periodic cleanup cycle. Retention is pushed first: it deletes expired
+/// versions, creating the orphans the GC pass then sweeps in the same cycle.
+fn cleanup_passes(state: &AppState) -> Vec<cleanup::CleanupPass> {
+    let mut cleanup_passes: Vec<cleanup::CleanupPass> = Vec::new();
+
+    if state.config.retention.enabled && !state.config.retention.rules.is_empty() {
+        let storage = state.storage.clone();
+        let publish_locks = state.publish_locks.clone();
+        let signer = state.signer.clone();
+        let rules = state.config.retention.rules.clone();
+        let dry_run = state.config.retention.dry_run;
+        let audit = state.audit.clone();
+        let repo_index = state.repo_index.clone();
+        cleanup_passes.push(cleanup::CleanupPass {
+            name: "retention",
+            interval: std::time::Duration::from_secs(state.config.retention.interval),
+            run: Box::new(move || {
+                let storage = storage.clone();
+                let publish_locks = publish_locks.clone();
+                let signer = signer.clone();
+                let rules = rules.clone();
+                let audit = audit.clone();
+                let repo_index = repo_index.clone();
+                async move {
+                    info!(
+                        dry_run = dry_run,
+                        "Retention scheduler: starting periodic run"
+                    );
+                    let result = retention_pass(
+                        &storage,
+                        &publish_locks,
+                        &repo_index,
+                        signer.as_deref(),
+                        &rules,
+                        dry_run,
+                        &audit,
+                    )
+                    .await;
+                    info!(
+                        "Retention scheduler: done in {:.1}s — {} versions, {} keys, {} bytes freed, {} versions with refused deletes",
+                        result.duration_secs, result.planned, result.deleted_keys, result.bytes_freed, result.delete_failures
+                    );
+                }
+                .boxed()
+            }),
+        });
+        info!(
+            interval_secs = state.config.retention.interval,
+            rules = state.config.retention.rules.len(),
+            dry_run = state.config.retention.dry_run,
+            "Retention scheduler started"
+        );
+    }
+
+    // Hosted NuGet feed (maestra fork): PR pre-release expiry per `[nuget] hosted_pr_*`
+    // plus the orphan blob sweep, on the retention interval and dry-run switch. Its own
+    // knobs gate it (`hosted_pr_retention_days = 0` keeps every version), not the rules.
+    if state.config.nuget.enabled {
+        let state = state.clone();
+        let dry_run = state.config.retention.dry_run;
+        cleanup_passes.push(cleanup::CleanupPass {
+            name: "nuget-hosted-retention",
+            interval: std::time::Duration::from_secs(state.config.retention.interval),
+            run: Box::new(move || {
+                let state = state.clone();
+                async move {
+                    registry::nuget::hosted::run_retention(&state, dry_run).await;
+                }
+                .boxed()
+            }),
+        });
+    }
+
+    if state.config.gc.enabled {
+        let storage = state.storage.clone();
+        let publish_locks = state.publish_locks.clone();
+        let dry_run = state.config.gc.dry_run;
+        let grace_secs = state.config.gc.grace_secs;
+        let npm_is_proxy = !state.config.npm.upstream_urls().is_empty();
+        let go_is_proxy = state.config.go.proxy.is_some();
+        let proxy_cache_max_bytes = state.config.gc.proxy_cache_max_bytes;
+        let docker_cache_max_bytes = state.config.gc.docker_proxy_cache_max_bytes;
+        let docker_namespaces = docker_proxy_namespaces(&state.config);
+        let reloadable = Arc::clone(&state.reloadable);
+        let repo_index = state.repo_index.clone();
+        cleanup_passes.push(cleanup::CleanupPass {
+            name: "gc",
+            interval: std::time::Duration::from_secs(state.config.gc.interval),
+            run: Box::new(move || {
+                let storage = storage.clone();
+                let publish_locks = publish_locks.clone();
+                // The current (SIGHUP-reloadable) internal namespaces, for eviction.
+                let curation = reloadable.load_full();
+                let repo_index = repo_index.clone();
+                let docker_namespaces = docker_namespaces.clone();
+                async move {
+                    info!("GC scheduler: starting periodic run");
+                    let result = gc_pass(
+                        &storage,
+                        &publish_locks,
+                        &repo_index,
+                        dry_run,
+                        grace_secs,
+                        npm_is_proxy,
+                        go_is_proxy,
+                        proxy_cache_max_bytes,
+                        (docker_cache_max_bytes, &docker_namespaces),
+                        &curation.curation_engine,
+                    )
+                    .await;
+                    info!("{}", gc_done_line(&result, dry_run));
+                }
+                .boxed()
+            }),
+        });
+        info!(
+            interval_secs = state.config.gc.interval,
+            dry_run = state.config.gc.dry_run,
+            "GC scheduler started"
+        );
+    }
+    cleanup_passes
+}
+
+/// What an instance that died (SIGKILL, OOM, power cut) left behind, cleared before the
+/// first request.
+async fn clear_dead_instance_files(state: &AppState) {
+    // Open this instance's staging directory, removing what dead instances (SIGKILL,
+    // OOM, power cut) left in theirs.
+    state.storage.prepare().await;
+
+    // Clean up stale Docker temp files from previous runs (#530, #580).
+    if state.config.docker.enabled {
+        registry::docker::cleanup_upload_temp_dir(&state.config.storage.path);
+        registry::docker::cleanup_proxy_temp_dir(&state.config.storage.path);
+    }
+    // Spool files (proxied downloads, NuGet pushes, PyPI uploads) of an instance
+    // that died mid-transfer.
+    registry::cleanup_spool_dirs(&state.config.server.spool_dir(&state.config.storage.path));
+    // ...and streamed raw uploads a crash cut off mid-request.
+    if state.config.raw.enabled {
+        registry::raw::cleanup_upload_temp_dir(&state.config.storage.path);
+    }
+    // ...and Hugging Face cache fills a crash cut off mid-file.
+    if state.config.hf.enabled {
+        registry::hf::cleanup_fill_temp_dir(&state.config.storage.path);
+    }
 }
 
 /// Cadence of the maintenance loop.
