@@ -582,117 +582,15 @@ pub fn render_raw_dir(
     auth_enabled: bool,
 ) -> String {
     let t = get_translations(lang);
-
-    // Build breadcrumbs: Raw / docs / api / v1
-    let segments: Vec<&str> = path.split('/').collect();
-    let mut breadcrumbs =
-        r#"<a href="/ui/raw" class="text-blue-400 hover:text-blue-300">Raw</a>"#.to_string();
-    for (i, seg) in segments.iter().enumerate() {
-        let crumb_path = segments[..=i]
-            .iter()
-            .copied()
-            .map(encode_uri_component)
-            .collect::<Vec<_>>()
-            .join("/");
-        if i == segments.len() - 1 {
-            let _ = write!(
-                breadcrumbs,
-                r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
-                html_escape(seg)
-            );
-        } else {
-            let _ = write!(
-                breadcrumbs,
-                r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/raw/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
-                crumb_path,
-                html_escape(seg)
-            );
-        }
-    }
-
-    let rows: String = entries
-        .iter()
-        .map(|entry| {
-            let icon = if entry.is_file {
-                r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>"#
-            } else {
-                r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#
-            };
-            let encoded_path = path
-                .split('/')
-                .map(encode_uri_component)
-                .collect::<Vec<_>>()
-                .join("/");
-            let href = format!("/ui/raw/{}/{}", encoded_path, encode_uri_component(&entry.name));
-            let versions_display = if entry.is_file {
-                String::new()
-            } else {
-                format!("{}", entry.versions)
-            };
-            format!(
-                r##"
-                <tr class="hover:bg-slate-700 cursor-pointer" data-href="{}" onclick="window.location=this.dataset.href">
-                    <td class="px-3 md:px-6 py-3 md:py-4">
-                        <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
-                    </td>
-                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
-                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400 hidden md:table-cell">{}</td>
-                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
-                </tr>
-            "##,
-                html_escape(&href), icon, html_escape(&href), html_escape(&entry.name),
-                versions_display, format_size(entry.size), html_escape(&entry.updated)
-            )
-        })
-        .collect();
-
-    let showing = t.showing_all.replace("{count}", &total.to_string());
-
-    let content = format!(
-        r##"
-        <div class="mb-6">
-            <div class="flex items-center mb-4 text-sm">{breadcrumbs}</div>
-            <div class="flex items-center">
-                <svg class="w-6 h-6 mr-3 text-slate-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>
-                <h1 class="text-2xl font-bold text-slate-200">{title}</h1>
-            </div>
-        </div>
-
-        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
-            <table class="w-full">
-                <thead class="bg-slate-800 border-b border-slate-700">
-                    <tr>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_name}</th>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_versions}</th>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_size}</th>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_updated}</th>
-                    </tr>
-                </thead>
-                <tbody class="divide-y divide-slate-700">
-                    {rows}
-                </tbody>
-            </table>
-            <div class="mt-4 mb-4 ml-4 text-sm text-slate-500">{showing}</div>
-        </div>
-    "##,
-        breadcrumbs = breadcrumbs,
-        title = html_escape(segments.last().unwrap_or(&path)),
-        col_name = t.name,
-        col_versions = t.items,
-        col_size = t.size,
-        col_updated = t.updated,
-        rows = rows,
-        showing = showing,
-    );
-
-    layout_dark(
-        &format!("{} — Raw", path),
-        &content,
-        Some("raw"),
-        "",
-        lang,
-        auth_enabled,
-    )
+    let page = DirPage {
+        slug: "raw",
+        root_crumb: "Raw",
+        registry: None,
+        search_placeholder: None,
+        count_label: t.items,
+        detail_columns: true,
+    };
+    render_dir(&page, path, entries, total, lang, auth_enabled)
 }
 
 /// HTMX search bar that filters a registry's repo list into `#repo-table-body`.
@@ -721,120 +619,19 @@ pub fn render_maven_dir(
     lang: Lang,
     auth_enabled: bool,
 ) -> String {
-    let t = get_translations(lang);
-
-    // Build breadcrumbs: Maven Repository / com / example / webapp
-    let mut breadcrumbs =
-        r#"<a href="/ui/maven" class="text-blue-400 hover:text-blue-300">Maven</a>"#.to_string();
-    if !path.is_empty() {
-        let segments: Vec<&str> = path.split('/').collect();
-        for (i, seg) in segments.iter().enumerate() {
-            let crumb_path = segments[..=i].join("/");
-            if i == segments.len() - 1 {
-                let _ = write!(
-                    breadcrumbs,
-                    r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
-                    html_escape(seg)
-                );
-            } else {
-                let _ = write!(
-                    breadcrumbs,
-                    r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/maven/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
-                    encode_path(&crumb_path),
-                    html_escape(seg)
-                );
-            }
-        }
-    }
-
-    let folder_icon = r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#;
-
-    let rows: String = entries
-        .iter()
-        .map(|entry| {
-            let href = if path.is_empty() {
-                format!("/ui/maven/{}", encode_uri_component(&entry.name))
-            } else {
-                format!("/ui/maven/{}/{}", encode_path(path), encode_uri_component(&entry.name))
-            };
-            format!(
-                r##"
-                <tr class="hover:bg-slate-700 cursor-pointer" data-href="{}" onclick="window.location=this.dataset.href">
-                    <td class="px-3 md:px-6 py-3 md:py-4">
-                        <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
-                    </td>
-                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
-                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400 hidden md:table-cell">{}</td>
-                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
-                </tr>
-            "##,
-                html_escape(&href),
-                folder_icon,
-                html_escape(&href),
-                html_escape(&entry.name),
-                entry.versions,
-                format_size(entry.size),
-                html_escape(&entry.updated),
-            )
-        })
-        .collect();
-
-    let title_display = if path.is_empty() {
-        "Maven Repository".to_string()
-    } else {
-        html_escape(path.rsplit('/').next().unwrap_or(path))
+    let page = DirPage {
+        slug: "maven",
+        root_crumb: "Maven",
+        registry: Some(DirRegistry {
+            root_title: "Maven Repository",
+            page_title: "Maven",
+            icon: icons::MAVEN,
+        }),
+        search_placeholder: Some("Search Maven artifacts…"),
+        count_label: get_translations(lang).items,
+        detail_columns: true,
     };
-    let showing = t.showing_all.replace("{count}", &total.to_string());
-
-    let content = format!(
-        r##"
-        <div class="mb-6">
-            <div class="flex items-center mb-4 text-sm">{breadcrumbs}</div>
-            <div class="flex items-center">
-                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{icon}</svg>
-                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
-            </div>
-        </div>
-
-        {search_bar}
-
-        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
-            <table class="w-full">
-                <thead class="bg-slate-800 border-b border-slate-700">
-                    <tr>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_name}</th>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_items}</th>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_size}</th>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_updated}</th>
-                    </tr>
-                </thead>
-                <tbody id="repo-table-body" class="divide-y divide-slate-700">
-                    {rows}
-                </tbody>
-            </table>
-            <div class="mt-4 mb-4 ml-4 text-sm text-slate-500">{showing}</div>
-        </div>
-    "##,
-        breadcrumbs = breadcrumbs,
-        search_bar = registry_search_bar("maven", "Search Maven artifacts…"),
-        icon = icons::MAVEN,
-        title = title_display,
-        col_name = t.name,
-        col_items = t.items,
-        col_size = t.size,
-        col_updated = t.updated,
-        rows = rows,
-        showing = showing,
-    );
-
-    layout_dark(
-        &format!("Maven — {}", if path.is_empty() { "Browse" } else { path }),
-        &content,
-        Some("maven"),
-        "",
-        lang,
-        auth_enabled,
-    )
+    render_dir(&page, path, entries, total, lang, auth_enabled)
 }
 
 /// Renders a Go module namespace browser with breadcrumbs and folder listing
@@ -845,127 +642,19 @@ pub fn render_go_dir(
     lang: Lang,
     auth_enabled: bool,
 ) -> String {
-    let t = get_translations(lang);
-
-    // Build breadcrumbs: Go Modules / github.com / gin-gonic
-    let mut breadcrumbs =
-        r#"<a href="/ui/go" class="text-blue-400 hover:text-blue-300">Go Modules</a>"#.to_string();
-    if !path.is_empty() {
-        let segments: Vec<&str> = path.split('/').collect();
-        for (i, seg) in segments.iter().enumerate() {
-            let crumb_path = segments[..=i].join("/");
-            if i == segments.len() - 1 {
-                let _ = write!(
-                    breadcrumbs,
-                    r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
-                    html_escape(seg)
-                );
-            } else {
-                let _ = write!(
-                    breadcrumbs,
-                    r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/go/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
-                    encode_path(&crumb_path),
-                    html_escape(seg)
-                );
-            }
-        }
-    }
-
-    let folder_icon = r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#;
-
-    let rows: String = entries
-        .iter()
-        .map(|entry| {
-            let href = if path.is_empty() {
-                format!("/ui/go/{}", encode_uri_component(&entry.name))
-            } else {
-                format!(
-                    "/ui/go/{}/{}",
-                    encode_path(path),
-                    encode_uri_component(&entry.name)
-                )
-            };
-            format!(
-                r##"
-                <tr class="hover:bg-slate-700 cursor-pointer" data-href="{}" onclick="window.location=this.dataset.href">
-                    <td class="px-3 md:px-6 py-3 md:py-4">
-                        <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
-                    </td>
-                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
-                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400 hidden md:table-cell">{}</td>
-                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
-                </tr>
-            "##,
-                html_escape(&href),
-                folder_icon,
-                html_escape(&href),
-                html_escape(&entry.name),
-                entry.versions,
-                format_size(entry.size),
-                html_escape(&entry.updated),
-            )
-        })
-        .collect();
-
-    let title_display = if path.is_empty() {
-        "Go Modules".to_string()
-    } else {
-        html_escape(path.rsplit('/').next().unwrap_or(path))
+    let page = DirPage {
+        slug: "go",
+        root_crumb: "Go Modules",
+        registry: Some(DirRegistry {
+            root_title: "Go Modules",
+            page_title: "Go Modules",
+            icon: icons::GO,
+        }),
+        search_placeholder: Some("Search Go modules…"),
+        count_label: get_translations(lang).items,
+        detail_columns: true,
     };
-    let showing = t.showing_all.replace("{count}", &total.to_string());
-
-    let content = format!(
-        r##"
-        <div class="mb-6">
-            <div class="flex items-center mb-4 text-sm">{breadcrumbs}</div>
-            <div class="flex items-center">
-                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{icon}</svg>
-                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
-            </div>
-        </div>
-
-        {search_bar}
-
-        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
-            <table class="w-full">
-                <thead class="bg-slate-800 border-b border-slate-700">
-                    <tr>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_name}</th>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_items}</th>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_size}</th>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_updated}</th>
-                    </tr>
-                </thead>
-                <tbody id="repo-table-body" class="divide-y divide-slate-700">
-                    {rows}
-                </tbody>
-            </table>
-            <div class="mt-4 mb-4 ml-4 text-sm text-slate-500">{showing}</div>
-        </div>
-    "##,
-        breadcrumbs = breadcrumbs,
-        search_bar = registry_search_bar("go", "Search Go modules…"),
-        icon = icons::GO,
-        title = title_display,
-        col_name = t.name,
-        col_items = t.items,
-        col_size = t.size,
-        col_updated = t.updated,
-        rows = rows,
-        showing = showing,
-    );
-
-    layout_dark(
-        &format!(
-            "Go Modules — {}",
-            if path.is_empty() { "Browse" } else { path }
-        ),
-        &content,
-        Some("go"),
-        "",
-        lang,
-        auth_enabled,
-    )
+    render_dir(&page, path, entries, total, lang, auth_enabled)
 }
 
 /// Renders Ansible Galaxy namespace browser with breadcrumbs
@@ -977,120 +666,20 @@ pub fn render_ansible_dir(
     auth_enabled: bool,
 ) -> String {
     let t = get_translations(lang);
-
-    // Build breadcrumbs: Ansible Galaxy / community / general
-    let mut breadcrumbs =
-        r#"<a href="/ui/ansible" class="text-blue-400 hover:text-blue-300">Ansible Galaxy</a>"#
-            .to_string();
-    if !path.is_empty() {
-        let segments: Vec<&str> = path.split('/').collect();
-        for (i, seg) in segments.iter().enumerate() {
-            let crumb_path = segments[..=i].join("/");
-            if i == segments.len() - 1 {
-                let _ = write!(
-                    breadcrumbs,
-                    r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
-                    html_escape(seg)
-                );
-            } else {
-                let _ = write!(
-                    breadcrumbs,
-                    r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/ansible/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
-                    encode_path(&crumb_path),
-                    html_escape(seg)
-                );
-            }
-        }
-    }
-
-    let folder_icon = r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#;
-
-    let rows: String = entries
-        .iter()
-        .map(|entry| {
-            let href = if path.is_empty() {
-                format!("/ui/ansible/{}", encode_uri_component(&entry.name))
-            } else {
-                format!(
-                    "/ui/ansible/{}/{}",
-                    encode_path(path),
-                    encode_uri_component(&entry.name)
-                )
-            };
-            format!(
-                r##"
-                <tr class="hover:bg-slate-700 cursor-pointer" data-href="{}" onclick="window.location=this.dataset.href">
-                    <td class="px-3 md:px-6 py-3 md:py-4">
-                        <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
-                    </td>
-                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
-                </tr>
-            "##,
-                html_escape(&href),
-                folder_icon,
-                html_escape(&href),
-                html_escape(&entry.name),
-                entry.versions,
-            )
-        })
-        .collect();
-
-    let title_display = if path.is_empty() {
-        "Ansible Galaxy".to_string()
-    } else {
-        html_escape(path.rsplit('/').next().unwrap_or(path))
+    let page = DirPage {
+        slug: "ansible",
+        root_crumb: "Ansible Galaxy",
+        registry: Some(DirRegistry {
+            root_title: "Ansible Galaxy",
+            page_title: "Ansible Galaxy",
+            icon: icons::ANSIBLE,
+        }),
+        search_placeholder: None,
+        // "Items" at the root (namespace count), "Versions" at namespace level
+        count_label: if path.is_empty() { t.items } else { t.versions },
+        detail_columns: false,
     };
-
-    // Column header: "Items" at root (namespace count), "Versions" at namespace level
-    let col_count_label = if path.is_empty() { t.items } else { t.versions };
-
-    let showing = t.showing_all.replace("{count}", &total.to_string());
-
-    let content = format!(
-        r##"
-        <div class="mb-6">
-            <div class="flex items-center mb-4 text-sm">{breadcrumbs}</div>
-            <div class="flex items-center">
-                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{icon}</svg>
-                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
-            </div>
-        </div>
-
-        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
-            <table class="w-full">
-                <thead class="bg-slate-800 border-b border-slate-700">
-                    <tr>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_name}</th>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_count}</th>
-                    </tr>
-                </thead>
-                <tbody class="divide-y divide-slate-700">
-                    {rows}
-                </tbody>
-            </table>
-            <div class="mt-4 mb-4 ml-4 text-sm text-slate-500">{showing}</div>
-        </div>
-    "##,
-        breadcrumbs = breadcrumbs,
-        icon = icons::ANSIBLE,
-        title = title_display,
-        col_name = t.name,
-        col_count = col_count_label,
-        rows = rows,
-        showing = showing,
-    );
-
-    layout_dark(
-        &format!(
-            "Ansible Galaxy — {}",
-            if path.is_empty() { "Browse" } else { path }
-        ),
-        &content,
-        Some("ansible"),
-        "",
-        lang,
-        auth_enabled,
-    )
+    render_dir(&page, path, entries, total, lang, auth_enabled)
 }
 
 /// Renders CPAN directory browser with breadcrumbs
@@ -1101,79 +690,173 @@ pub fn render_cpan_dir(
     lang: Lang,
     auth_enabled: bool,
 ) -> String {
-    let t = get_translations(lang);
+    let page = DirPage {
+        slug: "cpan",
+        root_crumb: "CPAN",
+        registry: Some(DirRegistry {
+            root_title: "CPAN",
+            page_title: "CPAN",
+            icon: icons::CPAN,
+        }),
+        search_placeholder: None,
+        count_label: get_translations(lang).items,
+        detail_columns: false,
+    };
+    render_dir(&page, path, entries, total, lang, auth_enabled)
+}
 
-    let mut breadcrumbs =
-        r#"<a href="/ui/cpan" class="text-blue-400 hover:text-blue-300">CPAN</a>"#.to_string();
-    if !path.is_empty() {
-        let segments: Vec<&str> = path.split('/').collect();
-        for (i, seg) in segments.iter().enumerate() {
-            let crumb_path = segments[..=i]
-                .iter()
-                .copied()
-                .map(encode_uri_component)
-                .collect::<Vec<_>>()
-                .join("/");
-            if i == segments.len() - 1 {
-                let _ = write!(
-                    breadcrumbs,
-                    r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
-                    html_escape(seg)
-                );
-            } else {
-                let _ = write!(
-                    breadcrumbs,
-                    r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/cpan/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
-                    crumb_path,
-                    html_escape(seg)
-                );
-            }
+/// What sets one directory browser page apart from another; [`render_dir`] writes the rest.
+struct DirPage<'a> {
+    /// The page lives under `/ui/{slug}`, which is also its nav entry.
+    slug: &'a str,
+    /// The first breadcrumb, linking to `/ui/{slug}`.
+    root_crumb: &'a str,
+    /// A registry's browser, or `None` for raw storage: it lists files as well as directories,
+    /// heads its pages with a folder, and reads its root as one more (empty) path segment.
+    registry: Option<DirRegistry<'a>>,
+    /// The HTMX search bar over the listing (see [`registry_search_bar`]), when the page has one.
+    search_placeholder: Option<&'a str>,
+    /// The header of the count column.
+    count_label: &'a str,
+    /// Size and last-updated columns after the count.
+    detail_columns: bool,
+}
+
+/// The heading of a registry's browser.
+struct DirRegistry<'a> {
+    /// The heading at the registry's root.
+    root_title: &'a str,
+    /// The page title: `{page_title} — {path}`, or `— Browse` at the root.
+    page_title: &'a str,
+    /// The registry's icon, beside the heading.
+    icon: &'a str,
+}
+
+/// One directory browser page: breadcrumbs, heading, optional search bar and the listing.
+fn render_dir(
+    page: &DirPage,
+    path: &str,
+    entries: &[RepoInfo],
+    total: usize,
+    lang: Lang,
+    auth_enabled: bool,
+) -> String {
+    let t = get_translations(lang);
+    let slug = page.slug;
+    let raw = page.registry.is_none();
+    let segments: Vec<&str> = if path.is_empty() && !raw {
+        Vec::new()
+    } else {
+        path.split('/').collect()
+    };
+
+    // Breadcrumbs: Root / com / example / webapp
+    let mut breadcrumbs = format!(
+        r#"<a href="/ui/{slug}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+        page.root_crumb
+    );
+    for (i, seg) in segments.iter().enumerate() {
+        if i == segments.len() - 1 {
+            let _ = write!(
+                breadcrumbs,
+                r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
+                html_escape(seg)
+            );
+        } else {
+            let _ = write!(
+                breadcrumbs,
+                r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/{slug}/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+                encode_path(&segments[..=i].join("/")),
+                html_escape(seg)
+            );
         }
     }
 
     let folder_icon = r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#;
-
+    let file_icon = r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>"#;
     let rows: String = entries
         .iter()
         .map(|entry| {
-            let encoded_path = path
-                .split('/')
-                .map(encode_uri_component)
-                .collect::<Vec<_>>()
-                .join("/");
-            let href = if path.is_empty() {
-                format!("/ui/cpan/{}", encode_uri_component(&entry.name))
+            let is_file = raw && entry.is_file;
+            let icon = if is_file { file_icon } else { folder_icon };
+            let href = if segments.is_empty() {
+                format!("/ui/{slug}/{}", encode_uri_component(&entry.name))
             } else {
                 format!(
-                    "/ui/cpan/{}/{}",
-                    encoded_path,
+                    "/ui/{slug}/{}/{}",
+                    encode_path(path),
                     encode_uri_component(&entry.name)
                 )
             };
+            let count = if is_file {
+                String::new()
+            } else {
+                entry.versions.to_string()
+            };
+            let details = if page.detail_columns {
+                format!(
+                    r##"                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400 hidden md:table-cell">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
+"##,
+                    format_size(entry.size),
+                    html_escape(&entry.updated)
+                )
+            } else {
+                String::new()
+            };
             format!(
                 r##"
-                <tr class="hover:bg-slate-700 cursor-pointer" data-href="{}" onclick="window.location=this.dataset.href">
+                <tr class="hover:bg-slate-700 cursor-pointer" data-href="{href}" onclick="window.location=this.dataset.href">
                     <td class="px-3 md:px-6 py-3 md:py-4">
-                        <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
+                        <div class="flex items-center gap-3">{icon}<a href="{href}" class="text-blue-400 hover:text-blue-300 font-medium">{name}</a></div>
                     </td>
-                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
-                </tr>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{count}</td>
+{details}                </tr>
             "##,
-                html_escape(&href),
-                folder_icon,
-                html_escape(&href),
-                html_escape(&entry.name),
-                entry.versions,
+                href = html_escape(&href),
+                name = html_escape(&entry.name),
             )
         })
         .collect();
 
-    let title_display = if path.is_empty() {
-        "CPAN".to_string()
-    } else {
-        html_escape(path.rsplit('/').next().unwrap_or(path))
+    let (heading, title) = match &page.registry {
+        None => (
+            r#"<svg class="w-6 h-6 mr-3 text-slate-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>
+                <h1 class="text-2xl font-bold text-slate-200">"#
+                .to_string(),
+            html_escape(segments.last().unwrap_or(&path)),
+        ),
+        Some(registry) => (
+            format!(
+                r#"<svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
+                <h1 class="text-xl md:text-2xl font-bold text-slate-200">"#,
+                registry.icon
+            ),
+            match segments.last() {
+                None => registry.root_title.to_string(),
+                Some(last) => html_escape(last),
+            },
+        ),
     };
-
+    let search_bar = page
+        .search_placeholder
+        .map(|placeholder| format!("{}\n\n        ", registry_search_bar(slug, placeholder)))
+        .unwrap_or_default();
+    let tbody_id = if page.search_placeholder.is_some() {
+        r#" id="repo-table-body""#
+    } else {
+        ""
+    };
+    let detail_headers = if page.detail_columns {
+        format!(
+            r##"
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{}</th>"##,
+            t.size, t.updated
+        )
+    } else {
+        String::new()
+    };
     let showing = t.showing_all.replace("{count}", &total.to_string());
 
     let content = format!(
@@ -1181,43 +864,38 @@ pub fn render_cpan_dir(
         <div class="mb-6">
             <div class="flex items-center mb-4 text-sm">{breadcrumbs}</div>
             <div class="flex items-center">
-                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{icon}</svg>
-                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
+                {heading}{title}</h1>
             </div>
         </div>
 
-        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
+        {search_bar}<div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
             <table class="w-full">
                 <thead class="bg-slate-800 border-b border-slate-700">
                     <tr>
                         <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_name}</th>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_count}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_count}</th>{detail_headers}
                     </tr>
                 </thead>
-                <tbody class="divide-y divide-slate-700">
+                <tbody{tbody_id} class="divide-y divide-slate-700">
                     {rows}
                 </tbody>
             </table>
             <div class="mt-4 mb-4 ml-4 text-sm text-slate-500">{showing}</div>
         </div>
     "##,
-        breadcrumbs = breadcrumbs,
-        icon = icons::CPAN,
-        title = title_display,
         col_name = t.name,
-        col_count = t.items,
-        rows = rows,
-        showing = showing,
+        col_count = page.count_label,
     );
 
-    layout_dark(
-        &format!("CPAN — {}", if path.is_empty() { "Browse" } else { path }),
-        &content,
-        Some("cpan"),
-        "",
-        lang,
-        auth_enabled,
-    )
+    let page_title = match &page.registry {
+        None => format!("{} — Raw", path),
+        Some(registry) => format!(
+            "{} — {}",
+            registry.page_title,
+            if path.is_empty() { "Browse" } else { path }
+        ),
+    };
+    layout_dark(&page_title, &content, Some(slug), "", lang, auth_enabled)
 }
 
 /// Renders package detail page (npm, cargo, pypi)
