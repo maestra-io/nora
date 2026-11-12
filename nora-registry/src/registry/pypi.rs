@@ -1340,6 +1340,10 @@ async fn upload(
         None
     };
 
+    if let Err(response) = claim_uploaded_project(&state, &normalized).await {
+        return response;
+    }
+
     if let Err(e) = store_file(
         &state.storage,
         &state.publish_locks,
@@ -1354,8 +1358,6 @@ async fn upload(
     {
         return e.into_response();
     }
-
-    warn_if_mixed_with_upstream(&state, &normalized).await;
 
     state.metrics.record_upload("pypi");
     let artifact = format!("{}-{}", name, version);
@@ -1377,27 +1379,72 @@ async fn upload(
     StatusCode::OK.into_response()
 }
 
-/// R4-R04: an upload to a project that is neither hosted (imported) nor in
-/// `curation.internal_namespaces`, while an upstream is configured, makes a mixed project: its
-/// index lists the uploaded files together with whatever an upstream publishes under the same
-/// name, now or later (dependency confusion). The upload is stored as before; the operator is
-/// told, with whether the cached upstream index already lists the name.
-async fn warn_if_mixed_with_upstream(state: &AppState, normalized: &str) {
-    if state.config.pypi.upstreams().is_empty()
-        || crate::curation::is_internal_namespace(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::PyPI,
-            normalized,
-        )
-        || own_records(&state.storage, normalized)
-            .await
-            .is_some_and(|records| records.hosted())
+/// R4-R04: a project with a file uploaded here is NORA's own, as a published npm name or a pushed
+/// NuGet ID is. Its first upload makes it hosted before the file is stored, as `nora import`
+/// does: from then on its index, JSON API and files are served from its own files only and its
+/// name is never asked of an upstream (a version registered upstream under the name later is not
+/// served: dependency confusion). What NORA held under the name before stays what it was: a file
+/// stored without the proxy's provenance marker (an earlier upload) is recorded as one of the
+/// project's own first, and a proxy cache copy is no file of it any more: neither listed nor
+/// served. An internal-namespace project is owned by configuration already and is not claimed.
+///
+/// When an upstream is configured, the claim logs a `[SECURITY]` WARN and counts in
+/// `nora_pypi_mixed_project_uploads_total`, with whether the cached upstream index lists the name:
+/// a name the upstream lists stops being proxied here.
+async fn claim_uploaded_project(state: &AppState, normalized: &str) -> Result<(), Response> {
+    let unavailable = || crate::registry::storage_unavailable("pypi", &own_prefix(normalized));
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::PyPI,
+        normalized,
+    ) {
+        return Ok(());
+    }
+    let Some(records) = own_records(&state.storage, normalized).await else {
+        return Err(unavailable());
+    };
+    if records.hosted() {
+        return Ok(());
+    }
+    let prefix = format!("pypi/{normalized}/");
+    let origins = proxied_marker_key(&prefix);
+    // The files first, then their markers: a proxy cache write stores the file before its
+    // marker, so the second listing sees the marker of a file the first caught mid-write.
+    // ponytail: a marker written after both listings makes that copy count as an upload; a
+    // lock over the cache write and the claim would close it, not worth it for a one-time claim.
+    let Ok(keys) = state.storage.list(&prefix).await else {
+        return Err(unavailable());
+    };
+    let Ok(proxied) = state.storage.list_internal(&origins).await else {
+        return Err(unavailable());
+    };
+    let proxied: std::collections::HashSet<&str> = proxied
+        .iter()
+        .filter_map(|key| key.strip_prefix(&origins))
+        .collect();
+    for filename in keys
+        .iter()
+        .filter_map(|key| key.strip_prefix(&prefix))
+        .filter(|f| is_valid_pypi_filename(f) && !proxied.contains(f))
     {
-        return;
+        if let Err(e) = record_own_file(&state.storage, normalized, filename).await {
+            tracing::warn!(registry = "pypi", project = %normalized, file = %filename, error = %e, "pypi: failed to record an earlier upload");
+            return Err(unavailable());
+        }
+    }
+    if let Err(e) = claim_imported_project(&state.storage, normalized).await {
+        tracing::warn!(registry = "pypi", project = %normalized, error = %e, "pypi: failed to make an uploaded project hosted");
+        return Err(unavailable());
+    }
+    if state.config.pypi.upstreams().is_empty() {
+        return Ok(());
     }
     // Only the cached index is read: an upload never sends the name to an upstream.
-    let key = format!("pypi/{normalized}/{UPSTREAM_INDEX_FILE}");
-    let upstream_lists = match state.storage.get(&key).await {
+    let upstream_lists = match state
+        .storage
+        .get(&format!("{prefix}{UPSTREAM_INDEX_FILE}"))
+        .await
+    {
         Ok(data) => match serde_json::from_slice::<Vec<FileEntry>>(&data) {
             Ok(files) if files.is_empty() => "no",
             Ok(_) => "yes",
@@ -1412,8 +1459,9 @@ async fn warn_if_mixed_with_upstream(state: &AppState, normalized: &str) {
         registry = "pypi",
         project = %normalized,
         upstream_lists,
-        "[SECURITY] upload to a project outside curation.internal_namespaces while an upstream is configured: upstream files of the same name are merged into its index (dependency confusion); add the name to curation.internal_namespaces"
+        "[SECURITY] upload to a project outside curation.internal_namespaces while an upstream is configured: the project is now hosted, its name is no longer proxied (dependency confusion) and files cached from an upstream under it are no longer served"
     );
+    Ok(())
 }
 
 /// Store a validated distribution file of `project` as an upload does, under the file's
@@ -5293,15 +5341,17 @@ mod integration_tests {
         assert_eq!(left, 0, "no spool left");
     }
 
-    /// C40: a project only nora has (every upstream answers 404) is looked up upstream
-    /// once per `metadata_ttl`, not on every index request, for HTML and JSON clients.
+    /// C40: a project only nora holds files of (every upstream answers 404) is looked up
+    /// upstream once per `metadata_ttl`, not on every index request, for HTML and JSON clients.
+    /// R4-R04: an uploaded project is hosted, so its name is never looked up at all.
     #[tokio::test]
     async fn hosted_project_upstream_404_is_cached() {
         use crate::test_helpers::create_test_context_with_config;
         use wiremock::matchers::any;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let upstream = MockServer::start().await;
+        // Unpooled: a pooled server can still receive another test's late request.
+        let upstream = MockServer::builder().start().await;
         Mock::given(any())
             .respond_with(ResponseTemplate::new(404))
             .mount(&upstream)
@@ -5316,27 +5366,38 @@ mod integration_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+        // A proxy cache copy whose project the upstreams no longer list.
+        let key = "pypi/gone/gone-1.0.tar.gz";
+        ctx.state.storage.put(key, b"x").await.unwrap();
+        ctx.state
+            .storage
+            .put(&super::proxied_marker_key(key), b"")
+            .await
+            .unwrap();
 
-        for _ in 0..3 {
-            for accept in ["text/html", "application/vnd.pypi.simple.v1+json"] {
-                let resp = send_with_headers(
-                    &ctx.app,
-                    Method::GET,
-                    "/simple/priv/",
-                    vec![("Accept", accept)],
-                    "",
-                )
-                .await;
-                assert_eq!(resp.status(), StatusCode::OK);
-                assert!(text(resp).await.contains("priv-1.0.tar.gz"));
+        for (project, lookups) in [("priv", 0), ("gone", 1)] {
+            let before = upstream.received_requests().await.unwrap().len();
+            for _ in 0..3 {
+                for accept in ["text/html", "application/vnd.pypi.simple.v1+json"] {
+                    let resp = send_with_headers(
+                        &ctx.app,
+                        Method::GET,
+                        &format!("/simple/{project}/"),
+                        vec![("Accept", accept)],
+                        "",
+                    )
+                    .await;
+                    assert_eq!(resp.status(), StatusCode::OK);
+                    assert!(text(resp).await.contains(&format!("{project}-1.0.tar.gz")));
+                }
             }
+            let hits = upstream.received_requests().await.unwrap().len() - before;
+            assert_eq!(
+                hits, lookups,
+                "{project}: at most one index lookup in total, not one per request; no \
+                 upstream lists it, so there is nothing to date"
+            );
         }
-        let hits = upstream.received_requests().await.unwrap().len();
-        assert_eq!(
-            hits, 1,
-            "one index lookup in total, not one per request; no upstream lists it, so \
-             there is nothing to date"
-        );
     }
 
     /// C41: concurrent index requests for one project cost one upstream fetch, and the
@@ -5580,16 +5641,24 @@ mod integration_tests {
         assert_eq!(ops.calls("stat", key), 0, "{:?}", ops.snapshot());
     }
 
-    /// R4-R04: an upload outside `curation.internal_namespaces` while an upstream is
-    /// configured is stored as before, and reported: a WARN and a counter saying whether
-    /// the cached upstream index lists the name. An internal name is not reported, and no
-    /// upload sends the name to the upstream.
+    /// R4-R04: a project with a file uploaded here is owned locally, as a published npm name
+    /// is. The first upload outside `curation.internal_namespaces` makes it hosted: its index
+    /// (HTML and PEP 691) and files come from its own files only, a version the upstream lists
+    /// under the name is neither listed nor fetched, a proxy cache copy from before the upload
+    /// is no longer served, and an earlier upload (no provenance marker) stays one of its own.
+    /// That first upload is counted once, with whether the cached upstream index lists the
+    /// name; an internal name is not claimed; the upstream is never asked.
     #[tokio::test]
-    async fn an_upload_mixed_with_an_upstream_is_reported() {
+    async fn an_uploaded_project_owns_its_name() {
         use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
-        let upstream = MockServer::start().await;
+        // Unpooled: a pooled server can still receive another test's late request.
+        let upstream = MockServer::builder().start().await;
         Mock::given(any())
-            .respond_with(ResponseTemplate::new(500))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"<a href="https://up/mixed-9.0.tar.gz">mixed-9.0.tar.gz</a>"#,
+                ),
+            )
             .mount(&upstream)
             .await;
         let uri = upstream.uri();
@@ -5597,10 +5666,27 @@ mod integration_tests {
             cfg.pypi.proxy = Some(uri);
             cfg.curation.internal_namespaces = vec!["acme-*".to_string()];
         });
-        let index = br#"[{"filename":"mixed-9.0.tar.gz","url":"https://up/mixed-9.0.tar.gz"}]"#;
+        let index = br#"[{"filename":"mixed-9.0.tar.gz","url":"https://up/mixed-9.0.tar.gz"},
+            {"filename":"mixed-0.9.tar.gz","url":"https://up/mixed-0.9.tar.gz"}]"#;
         let storage = &ctx.state.storage;
         storage
             .put("pypi/mixed/upstream-index.json", index)
+            .await
+            .unwrap();
+        // A proxy cache copy, and an upload stored before uploads were recorded.
+        storage
+            .put("pypi/mixed/mixed-0.9.tar.gz", b"proxied")
+            .await
+            .unwrap();
+        storage
+            .put(
+                &super::proxied_marker_key("pypi/mixed/mixed-0.9.tar.gz"),
+                b"",
+            )
+            .await
+            .unwrap();
+        storage
+            .put("pypi/mixed/mixed-0.8.tar.gz", b"earlier")
             .await
             .unwrap();
         let count = |label: &str| {
@@ -5610,31 +5696,59 @@ mod integration_tests {
         };
         let (listed, unknown) = (count("yes"), count("unknown"));
 
-        let (logs, _guard) = crate::test_helpers::LogCapture::start();
-        for (name, file) in [
-            ("mixed", "mixed-1.0.tar.gz"),
-            ("fresh", "fresh-1.0.tar.gz"),
-            ("acme-utils", "acme_utils-1.0.tar.gz"),
+        for (name, version, file) in [
+            ("mixed", "1.0", "mixed-1.0.tar.gz"),
+            ("mixed", "1.1", "mixed-1.1.tar.gz"),
+            ("fresh", "1.0", "fresh-1.0.tar.gz"),
+            ("acme-utils", "1.0", "acme_utils-1.0.tar.gz"),
         ] {
-            let fields = [("name", name), ("version", "1.0")];
+            let fields = [("name", name), ("version", version)];
             let resp = twine_upload(&ctx.app, &fields, file, b"data").await;
-            assert_eq!(resp.status(), StatusCode::OK, "{name}");
+            assert_eq!(resp.status(), StatusCode::OK, "{file}");
         }
-        let logs = logs.text();
-        for (project, lists) in [("mixed", "yes"), ("fresh", "unknown")] {
-            let line = logs
-                .lines()
-                .find(|l| {
-                    l.contains("dependency confusion") && l.contains(&format!("project={project} "))
-                })
-                .unwrap_or_else(|| panic!("no warning for {project}: {logs}"));
-            assert!(
-                line.contains("WARN") && line.contains(&format!("upstream_lists=\"{lists}\"")),
-                "{line}"
-            );
+        // Counted, not read from a log capture: tests running alongside emit the same WARN
+        // callsite, and a capture can miss it when another thread registers the callsite while
+        // the capture starts. Only this test seeds a cached index listing the name ("yes"),
+        // so two uploads of `mixed` counting once is exact.
+        assert_eq!(
+            count("yes") - listed,
+            1,
+            "one report for two uploads of mixed"
+        );
+        assert!(count("unknown") > unknown, "fresh is reported");
+        let internal = super::own_records(storage, "acme-utils").await.unwrap();
+        assert!(!internal.hosted(), "an internal name is not claimed");
+
+        let html = send(&ctx.app, Method::GET, "/simple/mixed/", "").await;
+        assert_eq!(html.status(), StatusCode::OK);
+        let html = String::from_utf8(body_bytes(html).await.to_vec()).unwrap();
+        let json = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/mixed/",
+            vec![("accept", super::PEP691_JSON)],
+            "",
+        )
+        .await;
+        assert_eq!(json.status(), StatusCode::OK);
+        let json = String::from_utf8(body_bytes(json).await.to_vec()).unwrap();
+        for body in [&html, &json] {
+            for own in ["mixed-1.0.tar.gz", "mixed-1.1.tar.gz", "mixed-0.8.tar.gz"] {
+                assert!(body.contains(own), "{own} listed: {body}");
+            }
+            for upstream in ["mixed-9.0.tar.gz", "mixed-0.9.tar.gz"] {
+                assert!(!body.contains(upstream), "{upstream} not listed: {body}");
+            }
         }
-        assert!(!logs.contains("project=acme-utils"), "{logs}");
-        assert!(count("yes") > listed && count("unknown") > unknown);
+        for (file, status) in [
+            ("mixed-1.0.tar.gz", StatusCode::OK),
+            ("mixed-0.8.tar.gz", StatusCode::OK),
+            ("mixed-0.9.tar.gz", StatusCode::NOT_FOUND),
+            ("mixed-9.0.tar.gz", StatusCode::NOT_FOUND),
+        ] {
+            let resp = send(&ctx.app, Method::GET, &format!("/simple/mixed/{file}"), "").await;
+            assert_eq!(resp.status(), status, "{file}");
+        }
         assert!(upstream.received_requests().await.unwrap().is_empty());
     }
 
