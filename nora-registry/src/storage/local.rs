@@ -615,14 +615,24 @@ impl LocalStorage {
             let pin = self.pins.get(key);
             let (now, prunes_now) = seen();
             if now.is_none() && prunes_now == prunes {
-                return Ok((file, meta, pin));
+                return Ok((file, meta, self.loaded_pin(key, pin)?));
             }
             lock = now;
         }
         let lock = lock.unwrap_or_else(|| self.commit_lock(key));
         let _commit = lock.lock().await;
         let (file, meta) = open_object(&path).await?;
-        Ok((file, meta, self.pins.get(key)))
+        Ok((file, meta, self.loaded_pin(key, self.pins.get(key))?))
+    }
+
+    /// `pin` as a read may use it. With a pin log that was not read in full at start, a key
+    /// without a pin may have lost its pin with the unread part, so its read fails closed.
+    fn loaded_pin(&self, key: &str, pin: Option<String>) -> Result<Option<String>> {
+        if pin.is_none() && !self.pins.loaded() {
+            tracing::error!(key = %key, "refusing to serve: no pin loaded for this key and the hash-pin log was not fully loaded");
+            return Err(StorageError::IntegrityViolation);
+        }
+        Ok(pin)
     }
 
     /// Record `sha256` for `key`, on the blocking pool (the append is
@@ -1576,6 +1586,41 @@ mod tests {
             storage.pins.get(key).as_deref(),
             Some(hex::encode(Sha256::digest(b"second")).as_str())
         );
+    }
+
+    /// A pin log the start could not read in full: the storage starts, a key whose pin may be
+    /// in the unread part (here: it has none) is refused instead of served unchecked, a key
+    /// written since is served, and a start that reads the repaired log serves both.
+    #[tokio::test]
+    async fn reads_fail_closed_until_the_pin_log_is_loaded() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("raw")).unwrap();
+        std::fs::write(root.join("raw/unpinned"), b"old").unwrap();
+        std::fs::write(root.join(PIN_FILE), b"{\"k\":\"x\",\"h\":\"\xff\"}\n").unwrap();
+
+        let storage = LocalStorage::new(root.to_str().unwrap());
+        assert!(!storage.pins.loaded());
+        assert!(matches!(
+            storage.get("raw/unpinned").await,
+            Err(StorageError::IntegrityViolation)
+        ));
+        assert!(matches!(
+            storage.get_reader("raw/unpinned").await,
+            Err(StorageError::IntegrityViolation)
+        ));
+        put(&storage, "raw/new", b"new").await.unwrap();
+        assert!(storage.get("raw/new").await.is_ok());
+        drop(storage);
+
+        // The operator removes the bad line; the next start loads the whole log.
+        let log = std::fs::read(root.join(PIN_FILE)).unwrap();
+        let first_line = log.iter().position(|b| *b == b'\n').unwrap() + 1;
+        std::fs::write(root.join(PIN_FILE), &log[first_line..]).unwrap();
+        let storage = LocalStorage::new(root.to_str().unwrap());
+        assert!(storage.pins.loaded());
+        assert!(storage.get("raw/unpinned").await.is_ok());
+        assert!(storage.get("raw/new").await.unwrap().1.is_some());
     }
 
     /// A listing whose own directory cannot be read is an error, not "nothing here"; a directory

@@ -212,6 +212,15 @@ pub static DOCKER_QUARANTINE_EXCEPTIONS_ACTIVE: LazyLock<IntGauge> = LazyLock::n
     .expect("failed to create DOCKER_QUARANTINE_EXCEPTIONS_ACTIVE metric at startup")
 });
 
+/// 1 while the local storage hash-pin log was not read in full at start (hash_pin_store.rs).
+pub static HASH_PIN_LOG_INCOMPLETE: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "nora_hash_pin_log_incomplete",
+        "1 while the local storage hash-pin log was not fully loaded at start: reads of keys without a loaded pin are refused"
+    )
+    .expect("failed to create HASH_PIN_LOG_INCOMPLETE metric at startup")
+});
+
 /// 1 while the quarantine exceptions file on disk is refused and the last good list serves.
 pub static DOCKER_QUARANTINE_EXCEPTIONS_INVALID: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
