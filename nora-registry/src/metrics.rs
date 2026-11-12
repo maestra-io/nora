@@ -192,12 +192,13 @@ pub static DOCKER_QUARANTINE_TAG_HELD_TOTAL: LazyLock<IntCounterVec> = LazyLock:
 });
 
 /// Docker requests a break-glass quarantine exception admitted (Maestra, issues-maestra#1649),
-/// by the listed digest: the manifest itself, or a manifest or blob it names.
+/// by the listed digest (the manifest itself, or a manifest or blob it names) and the entry's
+/// reason, which names the image so the alert can show it.
 pub static DOCKER_QUARANTINE_EXCEPTION_USED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "nora_docker_quarantine_exception_used_total",
-        "Docker requests a break-glass quarantine exception admitted, by listed digest",
-        &["digest"]
+        "Docker requests a break-glass quarantine exception admitted, by listed digest and its reason",
+        &["digest", "reason"]
     )
     .expect("failed to create DOCKER_QUARANTINE_EXCEPTION_USED_TOTAL metric at startup")
 });

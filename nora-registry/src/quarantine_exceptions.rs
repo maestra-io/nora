@@ -165,9 +165,9 @@ impl QuarantineExceptions {
                     .write()
                     .retain(|_, listed| list.contains_key(listed));
                 // The series exists from the load, so an alert on increase() sees the first use.
-                for d in list.keys() {
+                for (d, e) in &list {
                     crate::metrics::DOCKER_QUARANTINE_EXCEPTION_USED_TOTAL
-                        .with_label_values(&[d.as_str()]);
+                        .with_label_values(&[d.as_str(), e.reason.as_str()]);
                 }
                 crate::metrics::DOCKER_QUARANTINE_EXCEPTIONS_ACTIVE.set(active(&list));
                 crate::metrics::DOCKER_QUARANTINE_EXCEPTIONS_INVALID.set(0);

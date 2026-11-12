@@ -933,7 +933,7 @@ fn quarantine_excepted(state: &AppState, digest: &str, manifest: Option<&[u8]>) 
         state.quarantine_exceptions.admit_named(&listed, m);
     }
     crate::metrics::DOCKER_QUARANTINE_EXCEPTION_USED_TOTAL
-        .with_label_values(&[listed.as_str()])
+        .with_label_values(&[listed.as_str(), entry.reason.as_str()])
         .inc();
     tracing::warn!(
         digest = %digest,
@@ -12004,7 +12004,7 @@ mod integration_tests {
         let file = file.to_str().unwrap();
         let used = || {
             crate::metrics::DOCKER_QUARANTINE_EXCEPTION_USED_TOTAL
-                .with_label_values(&[sha(&index).as_str()])
+                .with_label_values(&[sha(&index).as_str(), "hotfix"])
                 .get()
         };
         assert_eq!(

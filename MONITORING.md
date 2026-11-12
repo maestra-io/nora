@@ -111,7 +111,7 @@ Break-glass entries from `[docker] quarantine_exceptions` ([procedure](docs/dock
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `nora_docker_quarantine_exception_used_total` | counter | digest | Held digests admitted past the quarantine, per listed digest, children counted against the entry that named them. The series appears at 0 when the entry loads |
+| `nora_docker_quarantine_exception_used_total` | counter | digest, reason | Held digests admitted past the quarantine, per listed digest and the entry's `reason`, children counted against the entry that named them. The series appears at 0 when the entry loads |
 | `nora_docker_quarantine_exceptions_active` | gauge | — | Listed entries that have not expired, refreshed on every re-read |
 | `nora_docker_quarantine_exceptions_invalid` | gauge | — | 1 while the last read of the file was refused and the last good list is in force, else 0 |
 
@@ -155,7 +155,7 @@ The dashboard includes a `registry` template variable to filter by specific prot
 | `NoraStorageUnreachable` | `nora_storage_reachable == 0` for 2m (readiness failing) | critical |
 | `NoraIntegrityFailure` | any `get` with `status=~"integrity_fail\|verify_error"` | critical |
 | `NoraTaskPanic` | any `nora_task_panics_total` increase in 15m (a background task panicked and was restarted) | warning |
-| `NoraQuarantineExceptionUsed` | any `nora_docker_quarantine_exception_used_total` increase in 15m, by listed `digest`: a break-glass entry of `[docker] quarantine_exceptions` admitted a held image (Maestra fork) | warning |
+| `NoraQuarantineExceptionUsed` | any `nora_docker_quarantine_exception_used_total` increase in 15m, by listed `digest` and `reason` (the summary shows the reason, which names the image): a break-glass entry of `[docker] quarantine_exceptions` admitted a held image (Maestra fork) | warning |
 | `NoraQuarantineExceptionsInvalid` | `nora_docker_quarantine_exceptions_invalid == 1` for 5m: the exceptions file is refused, the last good list stays (Maestra fork) | warning |
 
 ## Integrity recovery
