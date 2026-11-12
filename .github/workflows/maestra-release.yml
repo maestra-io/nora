@@ -61,6 +61,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      id-token: write # `s3 backends` pulls its images through nora with the OIDC token
     uses: ./.github/workflows/maestra-ci.yml
     with:
       ref: refs/tags/${{ inputs.tag || github.ref_name }}

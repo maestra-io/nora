@@ -384,6 +384,9 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     runs-on: runs-on=${{ github.run_id }}-s3/pool=build
     timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write # nora OIDC token: the backend images come through packages.maestra.io
     env:
       # Relative to tests/s3-backends; test.sh calls `docker compose` there too.
       COMPOSE_FILE: docker-compose.yml:../../maestra/ci/s3-backends.images.yml
@@ -397,6 +400,12 @@ jobs:
       # The same build arguments as maestra-release.yml; compose reuses the tag.
       - name: Build the image
         run: docker build --build-arg "CARGO_FEATURES=--no-default-features --features mimalloc,deb" -t nora:local .
+
+      # The backend images come through nora (packages.maestra.io, issues-maestra#1649)
+      # with a GitHub OIDC token, which lives minutes: a credential helper mints a fresh
+      # one per pull.
+      - name: nora docker credentials
+        run: bash maestra/ci/nora-docker-credentials.sh
 
       - name: Start the backends and three NORA instances
         working-directory: tests/s3-backends
@@ -462,6 +471,32 @@ jobs:
 
       - name: Run Kani proofs
         run: cargo kani --package nora-registry
+
+  # The criterion benches (nora-registry/benches) only compile here: a bench that no
+  # longer builds shows red without blocking the PR; timings are taken by hand
+  # (`cargo bench -p nora-registry --bench <name>`), CI runners are too noisy for them.
+  bench-build:
+    name: bench build
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: runs-on=${{ github.run_id }}-bench/pool=build
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install toolchain
+        run: rustup toolchain install || rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: cargo bench --no-run
+        run: cargo bench -p nora-registry --no-run --locked
 
   # A smoke run, not a campaign: every target builds, replays its corpus and survives
   # a minute of new inputs. A crash prints the input to reproduce it with.

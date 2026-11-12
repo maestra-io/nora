@@ -12,42 +12,60 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 nora-registry = { path = "../nora-registry" }
 
+# Every target: test = false and bench = false, as cargo-fuzz writes them. Built as a test
+# harness a target is still libFuzzer's main, so `cargo test --workspace` would fuzz forever.
 [[bin]]
 name = "fuzz_validation"
 path = "fuzz_targets/fuzz_validation.rs"
+test = false
 doc = false
+bench = false
 
 [[bin]]
 name = "fuzz_docker_manifest"
 path = "fuzz_targets/fuzz_docker_manifest.rs"
+test = false
 doc = false
+bench = false
 
 [[bin]]
 name = "fuzz_npm_metadata"
 path = "fuzz_targets/fuzz_npm_metadata.rs"
+test = false
 doc = false
+bench = false
 
 [[bin]]
 name = "fuzz_maven_path"
 path = "fuzz_targets/fuzz_maven_path.rs"
+test = false
 doc = false
+bench = false
 
 [[bin]]
 name = "fuzz_pypi_parse"
 path = "fuzz_targets/fuzz_pypi_parse.rs"
+test = false
 doc = false
+bench = false
 
 [[bin]]
-name = "fuzz_config_toml"
-path = "fuzz_targets/fuzz_config_toml.rs"
+name = "fuzz_validation_edges"
+path = "fuzz_targets/fuzz_validation_edges.rs"
+test = false
 doc = false
+bench = false
 
 [[bin]]
 name = "fuzz_url_leak"
 path = "fuzz_targets/fuzz_url_leak.rs"
+test = false
 doc = false
+bench = false
 
 [[bin]]
 name = "fuzz_rewrite_ansible"
 path = "fuzz_targets/fuzz_rewrite_ansible.rs"
+test = false
 doc = false
+bench = false
