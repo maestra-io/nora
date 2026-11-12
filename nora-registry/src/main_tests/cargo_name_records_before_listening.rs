@@ -17,8 +17,13 @@ fn rebuilt_before_binding(code: &str) -> bool {
         return false;
     };
     let body = &code[start..];
-    let rebuild =
-        body.find(&["registry::rebuild_cargo_name_records", "(&state.storage))"].concat());
+    let rebuild = body.find(
+        &[
+            "AssertUnwindSafe(registry::rebuild_cargo_name_records",
+            "(&state.storage)).catch_unwind().await",
+        ]
+        .concat(),
+    );
     let bind = body.find(&["letlistener=bind_listener", "(&state.config.server.host"].concat());
     matches!((rebuild, bind), (Some(r), Some(b)) if r < b)
 }
@@ -43,4 +48,16 @@ fn the_check_refuses_a_missing_or_late_rebuild() {
         &missing[at..]
     );
     assert!(!rebuilt_before_binding(&late));
+    // named but never awaited: the future is dropped and startup skips the rebuild
+    let dropped = src.replace(
+        &[
+            call.as_str(),
+            ")",
+            "\n                .catch_unwind()\n                .await",
+        ]
+        .concat(),
+        &["drop(", call.as_str(), "))"].concat(),
+    );
+    assert_ne!(dropped, src, "the control must change the source");
+    assert!(!rebuilt_before_binding(&dropped));
 }

@@ -56,7 +56,15 @@ async fn start_with(limits: ConnLimits) -> TestServer {
 }
 
 /// One response off a keep-alive connection: its head and its `content-length` body.
+/// A server that stalls mid-response fails the test after 5 s instead of hanging it.
 async fn read_response(stream: &mut TcpStream) -> String {
+    // CANCEL-SAFETY: on timeout the test fails; the half-read stream is not reused.
+    tokio::time::timeout(Duration::from_secs(5), read_response_whole(stream))
+        .await
+        .expect("no whole response within 5 s")
+}
+
+async fn read_response_whole(stream: &mut TcpStream) -> String {
     let mut raw = Vec::new();
     let mut byte = [0u8; 1];
     while !raw.ends_with(b"\r\n\r\n") {
@@ -321,8 +329,12 @@ async fn h2_alive_until_closed(
         }
         let length = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
         let mut payload = vec![0u8; length];
-        if stream.read_exact(&mut payload).await.is_err() {
-            return (Some(from.elapsed()), answered);
+        let left = limit.saturating_sub(from.elapsed());
+        // CANCEL-SAFETY: as above; a payload stalled past `limit` ends the test too.
+        match tokio::time::timeout(left, stream.read_exact(&mut payload)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => return (Some(from.elapsed()), answered),
+            Err(_) => return (None, answered),
         }
         let (kind, flags, id) = (head[3], head[4], &head[5..9]);
         let reply: Option<Vec<u8>> = match kind {

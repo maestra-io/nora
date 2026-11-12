@@ -348,6 +348,25 @@ fn compact(tokens: &impl ToString) -> String {
     tokens.to_string().split_whitespace().collect()
 }
 
+/// `text` cut at its commas outside parentheses and brackets, empty parts left out.
+fn top_level_parts(text: &str) -> Vec<&str> {
+    let (mut depth, mut start, mut parts) = (0usize, 0, Vec::new());
+    for (i, c) in text.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts.retain(|p| !p.is_empty());
+    parts
+}
+
 fn names_fault_injection(text: &str) -> bool {
     text.contains("fault-injection") || text.contains("fault_injection")
 }
@@ -429,24 +448,16 @@ impl<'ast> syn::visit::Visit<'ast> for CompiledWhen {
             self.predicates.push(compact(&list.tokens));
         } else if path.is_ident("cfg_attr") {
             let all = compact(&list.tokens);
-            // The condition ends at the first comma outside its parentheses: an
-            // `any(a,b)` condition holds commas of its own.
-            let mut depth = 0usize;
-            let cut = all
-                .char_indices()
-                .find(|&(_, c)| {
-                    match c {
-                        '(' => depth += 1,
-                        ')' => depth = depth.saturating_sub(1),
-                        ',' => return depth == 0,
-                        _ => {}
-                    }
-                    false
-                })
-                .map_or(all.len(), |(i, _)| i);
-            let (predicate, applied) = (&all[..cut], all.get(cut + 1..).unwrap_or(""));
-            self.predicates.push(predicate.to_owned());
-            self.applied.push(applied.to_owned());
+            // The condition, then every attribute it applies, cut at the commas outside
+            // parentheses: an `any(a,b)` condition holds commas of its own, and one
+            // `cfg_attr` may apply several attributes.
+            let parts = top_level_parts(&all);
+            let (predicate, applied) = parts.split_first().unwrap_or((&"", &[]));
+            self.predicates.push((*predicate).to_owned());
+            if applied.is_empty() {
+                self.applied.push(String::new());
+            }
+            self.applied.extend(applied.iter().map(|a| (*a).to_owned()));
         }
     }
 
@@ -580,10 +591,22 @@ fn every_way_to_compile_fault_injection_otherwise_is_found() {
             found.predicates
         );
     }
-    let found = CompiledWhen::read("#[cfg_attr(unix, path = \"fault_injection.rs\")] mod fi;");
-    assert!(!CFG_ATTR_APPLIES
-        .iter()
-        .any(|a| found.applied[0].starts_with(a)));
+    for bad in [
+        "#[cfg_attr(unix, path = \"fault_injection.rs\")] mod fi;",
+        "#[cfg_attr(unix, allow(dead_code), path = \"fault_injection.rs\")] mod fi;",
+    ] {
+        let found = CompiledWhen::read(bad);
+        assert!(
+            found
+                .applied
+                .iter()
+                .any(|applied| !CFG_ATTR_APPLIES.iter().any(|a| applied.starts_with(a))),
+            "{bad}: {:?}",
+            found.applied
+        );
+    }
+    let two = CompiledWhen::read("#[cfg_attr(test, allow(a), deny(b))] fn f() {}");
+    assert_eq!(two.applied, ["allow(a)", "deny(b)"]);
     for bad in [
         "#[path = \"fault_injection.rs\"]\nmod fi;",
         "fn f() { include!(concat!(\"fault_\", \"injection.rs\")); }",
