@@ -2100,10 +2100,11 @@ mod integration_tests {
         assert_eq!(asked(&upstream).await, Vec::<String>::new());
     }
 
-    /// An upload to a project nothing imported changes nothing for it: its index is still the
-    /// upload merged with the upstream's, and a file it does not hold is still the upstream's.
+    /// R4-R04: an upload to a project nothing imported owns it as an import does: its index is
+    /// the upload alone, not merged with the upstream's, and a file it does not hold is not
+    /// fetched from the upstream; the name is never asked of it.
     #[tokio::test]
-    async fn an_upload_to_a_project_nothing_imported_still_merges_with_the_upstream() {
+    async fn an_upload_to_a_project_nothing_imported_owns_it_as_an_import_does() {
         use crate::test_helpers::{create_test_context_with_config, send};
         use axum::http::{Method, StatusCode};
 
@@ -2132,19 +2133,16 @@ mod integration_tests {
         );
         let html = simple_index(&ctx.app, "otherpkg").await;
         assert!(html.contains("otherpkg-1.0.0.tar.gz"), "{html}");
-        assert!(html.contains("otherpkg-9.9.9-py3-none-any.whl"), "{html}");
-        send(
+        assert!(!html.contains("otherpkg-9.9.9-py3-none-any.whl"), "{html}");
+        let resp = send(
             &ctx.app,
             Method::GET,
             "/simple/otherpkg/otherpkg-9.9.9-py3-none-any.whl",
             "",
         )
         .await;
-        let asked = asked(&upstream).await;
-        assert!(
-            asked.contains(&"/files/otherpkg-9.9.9-py3-none-any.whl".to_string()),
-            "{asked:?}"
-        );
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(asked(&upstream).await, Vec::<String>::new());
     }
 
     /// A .nupkg imported from a hosted repository is NORA's own: the flat container lists and
