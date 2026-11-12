@@ -13,7 +13,9 @@ use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::circuit_breaker::BreakerScope;
 use crate::config::UpstreamAuth;
-use crate::registry::{method_not_allowed, proxy_fetch, UpstreamMiss};
+use crate::registry::{
+    method_not_allowed, proxy_fetch, proxy_fetch_artifact, ProxyBody, UpstreamMiss,
+};
 use crate::registry_type::RegistryType;
 use crate::storage::StorageError;
 use crate::validation::ends_with_ci;
@@ -843,26 +845,55 @@ async fn download(
             .unwrap_or(&path);
         let url = format!("{}/{}", proxy.url().trim_end_matches('/'), upstream_path);
 
-        match proxy_fetch(
-            &state.http_client,
-            &url,
-            Duration::from_secs(state.config.maven.proxy_timeout),
-            proxy.auth().map(UpstreamAuth::Basic),
-            &state.circuit_breaker,
-            BreakerScope::upstream(RegistryType::Maven, proxy.url()),
-        )
-        .await
-        {
-            Ok(data) => {
+        let auth = proxy.auth().map(UpstreamAuth::Basic);
+        let scope = BreakerScope::upstream(RegistryType::Maven, proxy.url());
+        // maven-metadata.xml is small and merged in memory; an artifact above
+        // `server.stream_threshold_mb` is spooled to disk, as NuGet/npm/PyPI files are:
+        // buffered whole, a jar over `proxy_max_buffered_mb` (awssdk bundle, 641 MB) was refused.
+        let fetched = if metadata_request.is_some() {
+            proxy_fetch(
+                &state.http_client,
+                &url,
+                Duration::from_secs(state.config.maven.proxy_timeout),
+                auth,
+                &state.circuit_breaker,
+                scope,
+            )
+            .await
+            .map(|data| (ProxyBody::Mem(Bytes::from(data)), true))
+        } else {
+            proxy_fetch_artifact(
+                &state,
+                &key,
+                "maven",
+                &url,
+                state.config.maven.proxy_timeout,
+                auth,
+                scope,
+            )
+            .await
+        };
+        match fetched {
+            Ok((data, fetched)) => {
+                let engine = &state.curation().curation_engine;
+                let quarantine_on =
+                    !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off);
+                // Hashed once, only when a gate reads it (a spooled body already carries it).
+                let digest = curation_coords
+                    .as_ref()
+                    .filter(|_| engine.is_active() || quarantine_on)
+                    .map(|_| data.digest());
                 // The allowlist's pinned integrity holds on the first download too, before anything is cached:
                 // the cache-hit branch checks the same rule.
-                if let Some((ref maven_name, ref maven_version)) = curation_coords {
-                    if let Some(response) = crate::curation::verify_integrity(
-                        &state.curation().curation_engine,
+                if let (Some((maven_name, maven_version)), Some(digest)) =
+                    (&curation_coords, &digest)
+                {
+                    if let Some(response) = crate::curation::verify_integrity_by_hash(
+                        engine,
                         crate::curation::RegistryType::Maven,
                         maven_name,
                         Some(maven_version),
-                        &data,
+                        digest,
                     ) {
                         return response;
                     }
@@ -879,50 +910,48 @@ async fn download(
                     .audit
                     .log(AuditEntry::new("proxy_fetch", "proxy", "", "maven", ""));
 
-                let response_data =
-                    if let Some((group_path, artifact_id, document_path, requested_checksum)) =
-                        &metadata_request
-                    {
-                        let metadata = merge_and_cache_proxy_metadata(
-                            &state,
-                            group_path,
-                            artifact_id,
-                            document_path,
-                            &data,
-                        )
-                        .await;
-                        match requested_checksum {
-                            Some(suffix) => match checksum_hex(suffix, &metadata) {
-                                Some(checksum) => Bytes::from(checksum),
-                                None => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-                            },
-                            None => metadata,
-                        }
-                    } else {
-                        state.spawn_cache("maven", key.clone(), Bytes::from(data.clone()));
-                        Bytes::from(data.clone())
+                if let (
+                    Some((group_path, artifact_id, document_path, requested_checksum)),
+                    ProxyBody::Mem(raw),
+                ) = (&metadata_request, &data)
+                {
+                    let metadata = merge_and_cache_proxy_metadata(
+                        &state,
+                        group_path,
+                        artifact_id,
+                        document_path,
+                        raw,
+                    )
+                    .await;
+                    let response_data = match requested_checksum {
+                        Some(suffix) => match checksum_hex(suffix, &metadata) {
+                            Some(checksum) => Bytes::from(checksum),
+                            None => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                        },
+                        None => metadata,
                     };
+                    return with_content_type(&path, response_data).into_response();
+                }
+
+                // Only the caller that fetched caches; coalesced followers share its body.
+                if fetched {
+                    let (state, key, body) = (state.clone(), key.clone(), data.clone());
+                    let immutable = !is_mutable_maven_path(&path);
+                    tokio::spawn(async move {
+                        match body.cache(&state, &key, immutable).await {
+                            Ok(true) => state.repo_index.invalidate("maven"),
+                            Ok(false) => {}
+                            Err(e) => crate::record_cache_write_error("maven", &key, &e),
+                        }
+                    });
+                }
 
                 // Quarantine only real version artifacts; never maven-metadata.xml.
-                if curation_coords.is_some() {
-                    let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                        state.config.curation.maven.quarantine.as_ref().or(state
-                            .config
-                            .curation
-                            .quarantine
-                            .as_ref()),
-                        state
-                            .config
-                            .curation
-                            .maven
-                            .quarantine_ttl
-                            .as_deref()
-                            .or(state.config.curation.quarantine_ttl.as_deref()),
-                    );
-                    if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+                if let Some(digest) = digest.as_deref().filter(|_| quarantine_on) {
+                    if let Some(resp) = crate::digest_quarantine::proxy_gate_digest(
                         &state.digest_store,
                         "maven",
-                        &data,
+                        digest,
                         &q_mode,
                         q_secs,
                         &url,
@@ -931,13 +960,23 @@ async fn download(
                         return resp;
                     }
                 }
-                return with_content_type(&path, response_data).into_response();
+                let len = data.len();
+                return match data.into_body(&key).await {
+                    Ok(body) => {
+                        let mut response = with_content_type(&path, body).into_response();
+                        response
+                            .headers_mut()
+                            .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+                        response
+                    }
+                    Err(e) => {
+                        tracing::warn!(key = %key, error = %e, "maven: spooled artifact unreadable");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                };
             }
             // An open breaker skips this upstream for the next, as a failure does (#1198).
-            Err(e) => {
-                tracing::debug!(error = ?e, upstream = %proxy.url(), path = %path, "Maven proxy fetch failed, trying next");
-                miss.record(&e);
-            }
+            Err(e) => miss.record_from(proxy.url(), &e),
         }
     }
 
@@ -2826,6 +2865,89 @@ mod integration_tests {
         }
         assert!(!down.received_requests().await.unwrap().is_empty());
         assert!(!missing.received_requests().await.unwrap().is_empty());
+    }
+
+    /// Two upstreams for a jar: one has it (`big` bytes), the other answers 404.
+    async fn has_and_missing(big: &[u8]) -> (wiremock::MockServer, wiremock::MockServer) {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let has = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(big.to_vec()))
+            .mount(&has)
+            .await;
+        let missing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+        (has, missing)
+    }
+
+    /// A jar over `proxy_max_buffered_mb` is spooled to disk and served whole, and the
+    /// quarantine still holds it by the spooled body's digest. Buffered whole it was refused,
+    /// and the next upstream's 404 made it a 404 (awssdk bundle-2.29.52.jar, 641 MB).
+    #[tokio::test]
+    async fn an_artifact_over_the_buffer_cap_is_spooled_and_still_quarantined() {
+        use crate::config::MavenProxyEntry;
+        use crate::digest_quarantine::QuarantineMode;
+        let big = vec![7u8; 3 * 1024 * 1024];
+        let (has, missing) = has_and_missing(&big).await;
+        for (mode, want) in [
+            (QuarantineMode::Off, StatusCode::OK),
+            (QuarantineMode::Enforce, StatusCode::FORBIDDEN),
+        ] {
+            let proxies = vec![
+                MavenProxyEntry::Simple(has.uri()),
+                MavenProxyEntry::Simple(missing.uri()),
+            ];
+            let ctx = create_test_context_with_config(move |c| {
+                c.server.proxy_max_buffered_mb = 1;
+                c.server.stream_threshold_mb = 1;
+                c.maven.proxies = proxies;
+                c.curation.maven.quarantine = Some(mode);
+                c.curation.maven.quarantine_ttl = Some("3d".to_string());
+            });
+            let spool = ctx.state.spool.dir(crate::registry::PROXY_SPOOL_SUBDIR);
+            let path = "/maven2/com/example/big/1.0/big-1.0.jar";
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), want);
+            if want == StatusCode::OK {
+                assert_eq!(&body_bytes(resp).await[..], &big[..]);
+            }
+            assert!(spool.is_dir(), "the jar went through the spool");
+        }
+    }
+
+    /// A body over NORA's own artifact cap is the 507 the cap is, whichever upstream answers
+    /// 404 and in whatever order: the upstream has the artifact, so it is never "not found".
+    /// The miss is logged with each upstream's answer.
+    #[tokio::test]
+    async fn an_artifact_over_the_cap_is_507_never_404() {
+        use crate::config::MavenProxyEntry;
+        let (has, missing) = has_and_missing(&vec![7u8; 3 * 1024 * 1024]).await;
+        for order in [[&has, &missing], [&missing, &has]] {
+            let proxies = order
+                .iter()
+                .map(|up| MavenProxyEntry::Simple(up.uri()))
+                .collect();
+            let ctx = create_test_context_with_config(move |c| {
+                c.server.proxy_max_artifact_mb = 1;
+                c.maven.proxies = proxies;
+            });
+            let (logs, _guard) = crate::test_helpers::LogCapture::start();
+            let path = "/maven2/com/example/big/1.0/big-1.0.jar";
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
+            let text = logs.text();
+            assert!(
+                text.lines().any(|line| line.contains(" WARN ")
+                    && line.contains("proxy miss")
+                    && line.contains(&format!("{}: Spool(TooLarge", has.uri()))
+                    && line.contains(&format!("{}: NotFound", missing.uri()))),
+                "{text}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -400,16 +400,20 @@ fn upstream_auth_header(
 /// that refused NORA's credentials did not say "not found" either: it fails the miss like an
 /// outage, and the answer says which it was (#1196). An upstream skipped for its open breaker
 /// was not asked: with no answer from another upstream the miss is the 503 an open breaker is,
-/// with `Retry-After` (#1198).
+/// with `Retry-After` (#1198). An upstream whose body NORA itself could not take (over the size
+/// cap, spool busy or failing) has the artifact: that miss is the spool's answer, never a 404
+/// another upstream's "not found" decides (a 641 MB Maven jar was a 404).
 #[derive(Debug, Default)]
 pub(crate) struct UpstreamMiss {
     not_found: bool,
     failed: bool,
     refused: bool,
-    /// An upstream's body was over NORA's own size cap: answered, and too big to take.
-    too_large: bool,
+    /// The first upstream body NORA refused (size cap, spool budget, local disk).
+    spool: Option<SpoolError>,
     /// The breaker key of the first upstream skipped for its open breaker.
     open: Option<String>,
+    /// `upstream: answer` of each upstream asked through [`Self::record_from`], for the log.
+    answers: Vec<String>,
 }
 
 impl UpstreamMiss {
@@ -423,21 +427,25 @@ impl UpstreamMiss {
     /// Record one upstream's answer. Any 4xx is an answer, even where a fetch reports it as
     /// `Upstream(4xx)` rather than `NotFound` (Docker manifests); 5xx and network errors are
     /// failures; a refused credential and an open breaker are kinds of their own.
+    /// [`Self::record`], keeping `upstream`'s answer for the miss's log line.
+    pub(crate) fn record_from(&mut self, upstream: &str, e: &ProxyError) {
+        self.answers.push(format!("{upstream}: {e:?}"));
+        self.record(e);
+    }
+
     pub(crate) fn record(&mut self, e: &ProxyError) {
         match e {
             ProxyError::NotFound => self.not_found = true,
             ProxyError::Upstream(code) if (400..500).contains(code) => self.not_found = true,
-            ProxyError::Spool(SpoolError::TooLarge(_)) => {
-                self.failed = true;
-                self.too_large = true;
+            ProxyError::Spool(e) => {
+                self.spool.get_or_insert_with(|| e.clone());
             }
-            // Throttling, auth refusals, timeouts and nora's own spool are never "not found".
+            // Throttling, auth refusals and timeouts are never "not found".
             ProxyError::Upstream(_)
             | ProxyError::Network(_)
             | ProxyError::Timeout(_)
             | ProxyError::RateLimited(_)
-            | ProxyError::Denied(..)
-            | ProxyError::Spool(_) => self.failed = true,
+            | ProxyError::Denied(..) => self.failed = true,
             ProxyError::CredentialsRefused => self.refused = true,
             ProxyError::CircuitOpen(key) => {
                 self.open.get_or_insert_with(|| key.clone());
@@ -449,8 +457,11 @@ impl UpstreamMiss {
     /// asks it for `alpine` and `library/alpine`): it said "not found" only if it failed
     /// under none of them, since a 4xx for one name says nothing about the other.
     pub(crate) fn record_upstream(&mut self, asked: &UpstreamMiss) {
+        self.answers.extend(asked.answers.iter().cloned());
+        if self.spool.is_none() {
+            self.spool.clone_from(&asked.spool);
+        }
         if asked.failed || asked.refused || asked.open.is_some() {
-            self.too_large |= asked.too_large;
             self.failed |= asked.failed;
             self.refused |= asked.refused;
             if self.open.is_none() {
@@ -461,17 +472,18 @@ impl UpstreamMiss {
         }
     }
 
-    /// The status for the miss: 404 when an upstream said "not found" or none was asked;
-    /// otherwise 503 when one was skipped for its open breaker, 507 when one answered with a
-    /// body over NORA's size cap (`server.proxy_max_buffered_mb`, `proxy_max_artifact_mb`),
-    /// 502 when every one failed or refused NORA's credentials.
+    /// The status for the miss: the spool's ([`SpoolError::response`]: 507 over NORA's size cap
+    /// `server.proxy_max_buffered_mb` / `proxy_max_artifact_mb` or a full volume, 503 busy, 500)
+    /// when NORA refused an upstream's body; else 404 when an upstream said "not found" or none
+    /// was asked; otherwise 503 when one was skipped for its open breaker, 502 when every one
+    /// failed or refused NORA's credentials.
     pub(crate) fn status(&self) -> StatusCode {
-        if self.not_found {
+        if let Some(e) = &self.spool {
+            e.status()
+        } else if self.not_found {
             StatusCode::NOT_FOUND
         } else if self.open.is_some() {
             StatusCode::SERVICE_UNAVAILABLE
-        } else if self.too_large {
-            StatusCode::INSUFFICIENT_STORAGE
         } else if self.failed || self.refused {
             StatusCode::BAD_GATEWAY
         } else {
@@ -484,7 +496,7 @@ impl UpstreamMiss {
     pub(crate) fn open_key(&self) -> Option<&str> {
         self.open
             .as_deref()
-            .filter(|_| self.status() == StatusCode::SERVICE_UNAVAILABLE)
+            .filter(|_| self.spool.is_none() && self.status() == StatusCode::SERVICE_UNAVAILABLE)
     }
 
     /// Whether the miss is a 502 at least one of whose upstreams refused NORA's credentials.
@@ -495,6 +507,18 @@ impl UpstreamMiss {
     /// The response for the miss, logging a gateway failure for the operator.
     pub(crate) fn response(&self, registry: &str, path: &str) -> Response {
         let status = self.status();
+        // Every miss leaves a line with what each upstream answered (debug alone hid the
+        // 641 MB jar's 404).
+        tracing::warn!(
+            registry,
+            path,
+            status = status.as_u16(),
+            answers = ?self.answers,
+            "proxy miss"
+        );
+        if let Some(e) = &self.spool {
+            return e.response(registry);
+        }
         if let (StatusCode::SERVICE_UNAVAILABLE, Some(key)) = (status, &self.open) {
             tracing::warn!(
                 registry,
@@ -1107,12 +1131,31 @@ impl SpoolError {
     /// 503 + `Retry-After` while the budget is busy (NuGet, npm and pip retry it),
     /// 507 when the body cannot fit or the volume is full, 500 for another local
     /// failure. Never 502: nothing here is upstream's fault.
+    /// Whether this is the volume running out of room rather than another disk failure.
+    fn no_space(&self) -> bool {
+        matches!(self, SpoolError::Io(e) if matches!(
+            e.kind(),
+            std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+        ))
+    }
+
+    /// The status of [`Self::response`].
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            SpoolError::Busy => StatusCode::SERVICE_UNAVAILABLE,
+            SpoolError::TooLarge(_) => StatusCode::INSUFFICIENT_STORAGE,
+            SpoolError::Io(_) if self.no_space() => StatusCode::INSUFFICIENT_STORAGE,
+            SpoolError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
     pub(crate) fn response(&self, registry: &str) -> Response {
+        let status = self.status();
         let (reason, response) = match self {
             SpoolError::Busy => (
                 "busy",
                 (
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    status,
                     [(header::RETRY_AFTER, HeaderValue::from_static("10"))],
                     "spool budget in use, retry shortly",
                 )
@@ -1121,20 +1164,13 @@ impl SpoolError {
             SpoolError::TooLarge(cap) => (
                 "too_large",
                 (
-                    StatusCode::INSUFFICIENT_STORAGE,
+                    status,
                     format!("body exceeds the {} MiB spool cap", cap / MIB),
                 )
                     .into_response(),
             ),
-            SpoolError::Io(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
-                ) =>
-            {
-                ("no_space", StatusCode::INSUFFICIENT_STORAGE.into_response())
-            }
-            SpoolError::Io(_) => ("io", StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+            SpoolError::Io(_) if self.no_space() => ("no_space", status.into_response()),
+            SpoolError::Io(_) => ("io", status.into_response()),
         };
         if let SpoolError::Io(e) = self {
             tracing::error!(registry, reason, error = %e, "local spool failure (not upstream)");
@@ -3587,23 +3623,27 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::ZERO, "given up at once");
     }
 
-    /// A miss whose upstream answered with a body over NORA's size cap is a 507, as
-    /// the single-upstream formats answer it, not a 502; "not found" from another
-    /// upstream still decides.
+    /// A miss whose upstream answered with a body NORA could not take is the spool's answer
+    /// (507 over the size cap, 503 busy), as the single-upstream formats answer it: that
+    /// upstream has the artifact, so "not found" from another upstream, in either order, never
+    /// makes it a 404 (a 641 MB Maven jar was).
     #[test]
-    fn miss_over_the_size_cap_is_a_507() {
-        let too_large = ProxyError::Spool(SpoolError::TooLarge(MIB));
-        assert_eq!(
-            UpstreamMiss::of(&too_large).status(),
-            StatusCode::INSUFFICIENT_STORAGE
-        );
-        let mut miss = UpstreamMiss::of(&too_large);
-        miss.record(&ProxyError::NotFound);
-        assert_eq!(miss.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            UpstreamMiss::of(&ProxyError::Spool(SpoolError::Busy)).status(),
-            StatusCode::BAD_GATEWAY
-        );
+    fn a_body_nora_refused_is_never_a_404() {
+        for (refused, want) in [
+            (SpoolError::TooLarge(MIB), StatusCode::INSUFFICIENT_STORAGE),
+            (SpoolError::Busy, StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let refused = ProxyError::Spool(refused);
+            assert_eq!(UpstreamMiss::of(&refused).status(), want);
+            let mut miss = UpstreamMiss::of(&refused);
+            miss.record(&ProxyError::NotFound);
+            assert_eq!(miss.status(), want);
+            let mut miss = UpstreamMiss::of(&ProxyError::NotFound);
+            miss.record(&refused);
+            assert_eq!(miss.status(), want);
+            assert_eq!(miss.response("test", "p").status(), want);
+            assert_eq!(miss.open_key(), None);
+        }
     }
 
     /// R4-P03: a client that disconnects while its cold miss is being downloaded does
