@@ -1357,13 +1357,17 @@ fn artifact_cap(threshold: u64, cap: Option<u64>, buffered: u64) -> Option<u64> 
 /// memory up to `threshold` bytes (0 = always), else to a spool file under `spool`'s
 /// budget with a running SHA-256, never holding more than one chunk of it. A body
 /// above `cap` is refused on its `Content-Length` before any of it is read, or as
-/// soon as the running count crosses the cap.
+/// soon as the running count crosses the cap. With `live`, every non-empty body is
+/// spooled from its first chunk and each write is published to it as it lands;
+/// one that fits in memory while the spool budget is busy is read whole instead
+/// (`live` is then never started).
 async fn read_or_spool(
     mut response: reqwest::Response,
     spool: &SpoolBudget,
     threshold: u64,
     cap: Option<u64>,
     idle: Duration,
+    live: Option<&LiveTx>,
 ) -> Result<ProxyBody, ProxyError> {
     use sha2::Digest;
     use tokio::io::AsyncWriteExt;
@@ -1374,35 +1378,47 @@ async fn read_or_spool(
     );
     let over_cap = |len: u64| cap.is_some_and(|cap| len > cap);
     let too_large = || ProxyError::Spool(SpoolError::TooLarge(cap.unwrap_or_default()));
-    let in_memory = |len: u64| threshold == 0 || len <= threshold;
+    let fits = |len: u64| threshold == 0 || len <= threshold;
+    let mut live = live;
     let declared = response.content_length();
     if declared.is_some_and(over_cap) {
         return Err(too_large());
     }
-    // A body known to spill reserves its whole length before any of it is read.
-    let mut reservation = match declared.filter(|&n| !in_memory(n)) {
-        Some(n) => Some(spool.reserve(n).map_err(ProxyError::Spool)?),
-        None => None,
-    };
+    // A body that would spill (or stream) reserves its declared length before any of
+    // it is read. A live body that fits in memory falls back to the memory path when
+    // the spool budget is busy, rather than failing a small download.
+    let mut reservation = None;
+    if let Some(n) = declared.filter(|&n| live.is_some() || !fits(n)) {
+        match spool.reserve(n) {
+            Ok(r) => reservation = Some(r),
+            Err(_) if live.is_some() && fits(n) => live = None,
+            Err(e) => return Err(ProxyError::Spool(e)),
+        }
+    }
     // Buffer until the threshold, then spill.
     let mut head = Vec::with_capacity(declared.unwrap_or(0).min(threshold) as usize);
-    loop {
+    let mut reservation = loop {
         let Some(chunk) = next_chunk(&mut response, idle).await? else {
             return Ok(ProxyBody::Mem(Bytes::from(head)));
         };
         head.extend_from_slice(&chunk);
-        if over_cap(head.len() as u64) {
+        let n = head.len() as u64;
+        if over_cap(n) {
             return Err(too_large());
         }
-        if !in_memory(head.len() as u64) {
-            break;
+        if live.is_none() && fits(n) {
+            continue;
         }
-    }
-    let mut len = head.len() as u64;
-    let mut reservation = match reservation.take() {
-        Some(r) => r,
-        None => spool.reserve(len).map_err(ProxyError::Spool)?,
+        if let Some(r) = reservation.take() {
+            break r;
+        }
+        match spool.reserve(n) {
+            Ok(r) => break r,
+            Err(_) if live.is_some() && fits(n) => live = None,
+            Err(e) => return Err(ProxyError::Spool(e)),
+        }
     };
+    let mut len = head.len() as u64;
     let dir = spool.dir(PROXY_SPOOL_SUBDIR);
     let path = dir.join(uuid::Uuid::new_v4().to_string());
     let local = |e| ProxyError::Spool(SpoolError::io(&path)(e));
@@ -1413,6 +1429,10 @@ async fn read_or_spool(
     hasher.update(&head);
     file.write_all(&head).await.map_err(local)?;
     drop(head);
+    if let Some(live) = live {
+        file.flush().await.map_err(local)?;
+        live.start(&path, declared, len).await.map_err(local)?;
+    }
     while let Some(chunk) = next_chunk(&mut response, idle).await? {
         len += chunk.len() as u64;
         if over_cap(len) {
@@ -1421,6 +1441,11 @@ async fn read_or_spool(
         reservation.grow(len).map_err(ProxyError::Spool)?;
         hasher.update(&chunk);
         file.write_all(&chunk).await.map_err(local)?;
+        if let Some(live) = live {
+            // Flushed before it is published: a reader's own handle sees it then.
+            file.flush().await.map_err(local)?;
+            live.shared.progress.send_modify(|s| s.written = len);
+        }
     }
     // Durable before the cache write renames a link to it into place (local backend).
     file.sync_all().await.map_err(local)?;
@@ -1674,7 +1699,9 @@ enum Filled {
 
 /// The upstream request of an artifact fetch as a future that owns everything it
 /// reads, so it can outlive the request that started it. `redirects`: hand an
-/// unfollowed redirect back as [`Fetched::Redirect`] instead of failing on it.
+/// unfollowed redirect back as [`Fetched::Redirect`] instead of failing on it. `live`:
+/// publish the body to a streaming response as it lands ([`proxy_stream_artifact`]).
+#[allow(clippy::too_many_arguments)]
 fn owned_artifact_fetch(
     state: &AppState,
     client: &reqwest::Client,
@@ -1683,6 +1710,7 @@ fn owned_artifact_fetch(
     auth: Option<UpstreamAuth<'_>>,
     scope: BreakerScope<'_>,
     redirects: bool,
+    live: Option<LiveTx>,
 ) -> Result<
     impl std::future::Future<Output = Result<Fetched, ProxyError>> + Send + 'static,
     ProxyError,
@@ -1699,6 +1727,7 @@ fn owned_artifact_fetch(
             Some(upstream) => BreakerScope::upstream(registry_type, upstream),
             None => registry_type.into(),
         };
+        let live = live.as_ref();
         proxy_fetch_prepared(
             &client,
             &url,
@@ -1708,7 +1737,7 @@ fn owned_artifact_fetch(
             None,
             (
                 move |r| async move {
-                    read_or_spool(r, spool, threshold, cap, timeout)
+                    read_or_spool(r, spool, threshold, cap, timeout, live)
                         .await
                         .map(Fetched::Body)
                 },
@@ -1863,7 +1892,28 @@ pub(crate) async fn proxy_fetch_artifact_with(
     auth: Option<UpstreamAuth<'_>>,
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<(ProxyBody, bool), ProxyError> {
-    let fetch = owned_artifact_fetch(state, client, url, timeout_secs, auth, scope.into(), false)?;
+    let fetch = owned_artifact_fetch(
+        state,
+        client,
+        url,
+        timeout_secs,
+        auth,
+        scope.into(),
+        false,
+        None,
+    )?;
+    run_artifact_fill(state, key, registry, timeout_secs, fetch).await
+}
+
+/// Run a body `fetch` (no redirects) of [`proxy_fetch_artifact_with`]: under
+/// single-flight and detached from the request with `proxy_coalesce`, else inline.
+async fn run_artifact_fill(
+    state: &AppState,
+    key: &str,
+    registry: &'static str,
+    timeout_secs: u64,
+    fetch: impl std::future::Future<Output = Result<Fetched, ProxyError>> + Send + 'static,
+) -> Result<(ProxyBody, bool), ProxyError> {
     let body_of = |fetched| match fetched {
         Fetched::Body(body) => Ok((body, true)),
         // Unreachable: without `redirects` a redirect is an `Upstream` error.
@@ -1879,6 +1929,212 @@ pub(crate) async fn proxy_fetch_artifact_with(
         Err(e) => {
             Err(e.unwrap_or_else(|| ProxyError::Network("coalesced fetch returned nothing".into())))
         }
+    }
+}
+
+/// The read side of a fill that a response streams from: published by
+/// [`read_or_spool`] once the spool file holds the first chunk.
+pub(crate) struct LiveStart {
+    file: tokio::fs::File,
+    /// The upstream's declared length.
+    len: Option<u64>,
+    progress: tokio::sync::watch::Receiver<docker::SpoolStatus>,
+}
+
+/// What a fill and the task that answers for it share: the bytes written so far and,
+/// set by that task only, the verdict on the whole body.
+struct LiveShared {
+    progress: tokio::sync::watch::Sender<docker::SpoolStatus>,
+    started: std::sync::atomic::AtomicBool,
+}
+
+/// The fill's end of a streamed fetch ([`proxy_stream_artifact`]).
+pub(crate) struct LiveTx {
+    start: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<LiveStart>>>,
+    shared: std::sync::Arc<LiveShared>,
+}
+
+impl LiveTx {
+    /// Hand the request a read handle on the spool at `path`, `written` bytes in.
+    async fn start(
+        &self,
+        path: &std::path::Path,
+        len: Option<u64>,
+        written: u64,
+    ) -> std::io::Result<()> {
+        let file = tokio::fs::File::open(path).await?;
+        self.shared.progress.send_modify(|s| s.written = written);
+        self.shared
+            .started
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(tx) = self.start.lock().take() {
+            let _ = tx.send(LiveStart {
+                file,
+                len,
+                progress: self.shared.progress.subscribe(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Aborts the task when dropped: the task of a streamed fill lives as long as its
+/// response, so a client that leaves leaves the fill unattended (R4-P03 hold).
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A cold miss answered while it downloads ([`proxy_stream_artifact`]).
+pub(crate) struct LiveFill {
+    /// The upstream's declared length, if any.
+    pub(crate) len: Option<u64>,
+    bytes: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
+    task: AbortOnDrop,
+}
+
+impl LiveFill {
+    /// The next bytes of the body as they land; the last byte only once the whole body
+    /// passed its verdict, an error if it did not or the fill failed.
+    pub(crate) async fn next(&mut self) -> Option<std::io::Result<Bytes>> {
+        use futures::StreamExt as _;
+        self.bytes.next().await
+    }
+
+    /// Response body: `head` (bytes already taken with [`Self::next`]), then the rest
+    /// as it lands, checked against `sha256` (lowercase hex) at the end when given.
+    pub(crate) fn into_body(self, head: Bytes, sha256: Option<String>, key: &str) -> Body {
+        use futures::StreamExt as _;
+        let LiveFill { bytes, task, .. } = self;
+        let head = (!head.is_empty()).then_some(Ok(head));
+        let stream = futures::stream::iter(head).chain(bytes).map(move |chunk| {
+            let _alive = &task;
+            chunk
+        });
+        let reader = tokio_util::io::StreamReader::new(Box::pin(stream));
+        nora_registry::verified::stream_body(nora_registry::verified::verify_while_streaming(
+            Box::pin(reader),
+            sha256,
+            key.to_string(),
+            None,
+        ))
+    }
+}
+
+/// How a [`proxy_stream_artifact`] cold miss is answered.
+pub(crate) enum Served {
+    /// This request's own fetch is running: the body streams from its spool.
+    Live(LiveFill),
+    /// The whole body, as [`proxy_fetch_artifact_with`] gives it (a follower of another
+    /// request's fill, a body that ended at once, or streaming off).
+    Whole(ProxyBody, bool),
+}
+
+/// [`proxy_fetch_artifact_with`] that answers as soon as the first chunk is spooled
+/// instead of after the whole download (R4-P03): the body follows the spool file as it
+/// grows, docker's blob fill reused ([`docker::spool_follower`]). The last byte is held
+/// until `verdict` accepts the complete body; then it is cached, and a refused body or a
+/// failed fill aborts the response short, so a client never completes a bad download and
+/// nothing is cached. The fill runs as before (single-flight, kept for a retry when the
+/// client leaves); a request that only follows another's fill gets [`Served::Whole`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn proxy_stream_artifact<V, VF>(
+    state: &AppState,
+    client: &reqwest::Client,
+    key: &str,
+    registry: &'static str,
+    url: &str,
+    timeout_secs: u64,
+    auth: Option<UpstreamAuth<'_>>,
+    scope: impl Into<BreakerScope<'_>>,
+    verdict: V,
+) -> Result<Served, ProxyError>
+where
+    V: FnOnce(ProxyBody) -> VF + Send + 'static,
+    VF: std::future::Future<Output = Result<(), String>> + Send,
+{
+    // Streaming spools from the first byte: not with spooling off.
+    if state.config.server.stream_threshold() == 0 {
+        return proxy_fetch_artifact_with(
+            state,
+            client,
+            key,
+            registry,
+            url,
+            timeout_secs,
+            auth,
+            scope,
+        )
+        .await
+        .map(|(body, cache)| Served::Whole(body, cache));
+    }
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let shared = std::sync::Arc::new(LiveShared {
+        progress: tokio::sync::watch::channel(docker::SpoolStatus::default()).0,
+        started: std::sync::atomic::AtomicBool::new(false),
+    });
+    let live = LiveTx {
+        start: parking_lot::Mutex::new(Some(start_tx)),
+        shared: std::sync::Arc::clone(&shared),
+    };
+    let fetch = owned_artifact_fetch(
+        state,
+        client,
+        url,
+        timeout_secs,
+        auth,
+        scope.into(),
+        false,
+        Some(live),
+    )?;
+    let (whole_tx, whole_rx) = tokio::sync::oneshot::channel();
+    let (state, key) = (state.clone(), key.to_string());
+    let task = tokio::spawn(async move {
+        let result = run_artifact_fill(&state, &key, registry, timeout_secs, fetch).await;
+        if !shared.started.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = whole_tx.send(result);
+            return;
+        }
+        let done = match result {
+            Ok((body, cache)) => match verdict(body.clone()).await {
+                // Cached before the verdict releases the last byte: a client that got
+                // the whole body never races the cache write.
+                Ok(()) => {
+                    if cache {
+                        spawn_cache_body(&state, registry, key, body);
+                    }
+                    Ok(())
+                }
+                Err(why) => {
+                    tracing::warn!(registry, key = %key, reason = %why, "streamed artifact refused at its end, not cached");
+                    Err(why)
+                }
+            },
+            Err(e) => Err(format!("{e:?}")),
+        };
+        shared.progress.send_modify(|s| s.done = Some(done));
+    });
+    let task = AbortOnDrop(task.abort_handle());
+    match start_rx.await {
+        Ok(start) => {
+            let stall =
+                Duration::from_secs(timeout_secs.saturating_mul(2)) + Duration::from_secs(30);
+            Ok(Served::Live(LiveFill {
+                len: start.len,
+                bytes: Box::pin(docker::spool_follower(start.file, start.progress, 0, stall)),
+                task,
+            }))
+        }
+        // The fill never streamed: its whole result.
+        Err(_) => match whole_rx.await {
+            Ok(result) => result.map(|(body, cache)| Served::Whole(body, cache)),
+            Err(_) => Err(ProxyError::Network(
+                "artifact fill ended without an answer".into(),
+            )),
+        },
     }
 }
 
@@ -1906,7 +2162,7 @@ pub(crate) async fn proxy_fetch_artifact_hop(
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<ArtifactHop, ProxyError> {
     let scope = scope.into();
-    let fetch = || owned_artifact_fetch(state, client, url, timeout_secs, auth, scope, true);
+    let fetch = || owned_artifact_fetch(state, client, url, timeout_secs, auth, scope, true, None);
     let hop = |fetched: Fetched, own: bool| match fetched {
         Fetched::Body(body) => ArtifactHop::Body(body, own),
         Fetched::Redirect(next) => ArtifactHop::Redirect(next),

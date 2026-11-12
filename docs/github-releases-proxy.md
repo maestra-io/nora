@@ -49,9 +49,12 @@ one for the server's audience and sends it as the Basic password (or Bearer).
   time, and an API failure (rate limit included) uses the last copy. A release the API
   does not know, or an asset it does not list, is a 404 and never fetched. The asset is
   fetched from `<download_url>/<owner>/<repo>/releases/download/<tag>/<asset>` only,
-  refused when its sha256 differs from the `digest` GitHub publishes for it (502, not
+  refused when its sha256 differs from the `digest` GitHub publishes for it (not
   cached; assets uploaded before mid-2025 have none), and cached under
-  `github/releases/<owner>/<repo>/<tag>/`.
+  `github/releases/<owner>/<repo>/<tag>/`. An asset with a published digest streams to a
+  GET client as it downloads, its last byte held until the whole file matched: a
+  mismatch breaks the transfer off (the client sees a failed download, never a complete
+  one). A HEAD, or an asset without a digest, is fetched whole first (a mismatch is a 502).
 - Every request goes through the SSRF guard (no loopback, private, link-local or
   metadata address, DNS pinned), and every redirect hop must stay on the
   `download_url` host, the `api_url` host or GitHub's asset CDN

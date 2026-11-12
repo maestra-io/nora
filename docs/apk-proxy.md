@@ -74,6 +74,9 @@ read it from a BuildKit secret mount inside the `RUN` that uses it.
 A package is fetched only under a name and version some index entry lists (404
 otherwise), refused with 403 while younger than `min_release_age` (curation `enforce`),
 and refused with 502 when its control segment does not hash to the entry's `C:` identity.
+A GET streams a cold miss once its control segment checks out, while the rest
+downloads (a curation integrity pin on the package or an enforcing quarantine needs the
+whole file's digest first, so there, and for a HEAD, the package is fetched whole first).
 Packages are cached under `apk/pkgs/` (counted by `gc.proxy_cache_max_bytes`; an evicted
 dropped version can no longer be the fallback) and pass the digest quarantine, seeded
 from the build time with `server.trust_upstream_dates` (the date sits inside the

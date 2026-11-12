@@ -65,7 +65,9 @@ spec:
 - `GET|HEAD /helm/<name>/charts/<chart>/<chart>-<version>.tgz`: the chart. NORA fetches
   it from the URL the cached upstream index names for that chart and version (never
   from client input; https only, plain http only from an upstream configured as http),
-  refuses a body whose sha256 differs from the index `digest` (502, not cached), sends
+  refuses a body whose sha256 differs from the index `digest` (not cached; a GET streams
+  the chart as it downloads with its last byte held until the whole chart matched, so a
+  mismatch breaks the transfer off, while a HEAD fetches it whole first and answers 502), sends
   the upstream credential only to the upstream's own origin, downloads every chart
   (the upstream's own included, which may redirect anywhere) through an SSRF guard (no
   loopback, private, link-local or metadata address, on the first request or any

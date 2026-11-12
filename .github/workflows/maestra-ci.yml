@@ -344,7 +344,10 @@ jobs:
           set -euo pipefail
           curl -sf http://localhost:4000/health | jq .status
           curl -sf http://localhost:4000/ready
-          curl -sf http://localhost:4000/metrics | head -5
+          # Read whole, then trimmed: piped into head, curl fails with 23 (pipefail) when head
+          # exits before the rest of the page is written.
+          curl -sf http://localhost:4000/metrics -o /tmp/metrics.txt
+          head -5 /tmp/metrics.txt
 
       - name: Maven immutable release rejects a re-deploy
         run: |

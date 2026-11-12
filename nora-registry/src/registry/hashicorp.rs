@@ -169,6 +169,8 @@ async fn file(
             upstream: &up,
             breaker_base: &cfg.download_url,
             quarantine: quarantine(&state, &state.config.curation.hashicorp),
+            // Streaming is decided for the helm, apk and GitHub proxies only (R4-P03).
+            stream: false,
         },
     )
     .await
