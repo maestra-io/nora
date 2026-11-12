@@ -1000,7 +1000,8 @@ async fn package(
                     q_secs,
                     &url,
                     publish_date,
-                );
+                )
+                .await;
                 Ok(())
             }
         };
@@ -1099,7 +1100,9 @@ async fn package(
         q_secs,
         &url,
         publish_date,
-    ) {
+    )
+    .await
+    {
         return resp;
     }
     let len = data.len();

@@ -1213,7 +1213,9 @@ async fn flatcontainer_download(
                     q_secs,
                     &url,
                     first_seen,
-                ) {
+                )
+                .await
+                {
                     return resp;
                 }
             }

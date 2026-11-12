@@ -746,7 +746,9 @@ async fn download(
                     state.config.server.trust_upstream_dates,
                     publish_date,
                 ),
-            ) {
+            )
+            .await
+            {
                 return resp;
             }
             (

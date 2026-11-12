@@ -359,7 +359,7 @@ pub(super) async fn lead_fill(
     );
     // Quarantine: the fill continues in the background and lands in the cache;
     // a held digest is answered 403 now (mirrors the manifest proxy path).
-    if let Some(resp) = quarantine_proxy_fetch_gate(state, digest, upstream_url) {
+    if let Some(resp) = quarantine_proxy_fetch_gate(state, digest, upstream_url).await {
         return resp;
     }
     // Answer as soon as upstream has answered: the body follows the spool file
@@ -392,7 +392,7 @@ async fn join_fill(
     // An open handle survives the spool's later rename into storage or its removal.
     let follower = tokio::fs::File::open(&share.path).await.ok()?;
     state.metrics.record_download("docker");
-    if let Some(resp) = quarantine_proxy_fetch_gate(state, digest, upstream_url) {
+    if let Some(resp) = quarantine_proxy_fetch_gate(state, digest, upstream_url).await {
         return Some(resp);
     }
     Some(

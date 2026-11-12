@@ -799,7 +799,9 @@ async fn serve_gem_file(
                 q_secs,
                 &url,
                 publish_date,
-            ) {
+            )
+            .await
+            {
                 return resp;
             }
             with_binary(bytes, "application/octet-stream")

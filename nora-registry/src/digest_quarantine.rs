@@ -49,10 +49,10 @@ pub(crate) const SNAPSHOT_KEY: &str = ".nora-quarantine-snapshot.json";
 const LOAD_CONCURRENCY: usize = 32;
 /// Upper bound on the background ledger load (listing + reads + snapshot).
 const LOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
-/// How long an enforcing cache hit with no record waits for a running ledger load before
+/// How long an enforcing gate waits for a running ledger load ([`ledger_ready`]) before
 /// it answers 503 with [`LOAD_RETRY_AFTER_SECS`].
 const LOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-const LOAD_RETRY_AFTER_SECS: u64 = 30;
+pub(crate) const LOAD_RETRY_AFTER_SECS: u64 = 30;
 
 /// Stale entry TTL: entries older than 90 days are pruned on startup.
 pub(crate) const PRUNE_TTL_SECS: i64 = 90 * 24 * 3600;
@@ -159,8 +159,9 @@ pub struct DigestStore {
     /// read part of it, "no record" says nothing about a digest.
     loaded: Arc<AtomicBool>,
     /// Cancelled once no load runs any more: at once for [`Self::load`] and [`Self::empty`],
-    /// when the background walk ends (whole, in part, or past its deadline) otherwise.
-    load_done: CancellationToken,
+    /// when the background walk ends (whole, in part, or past its deadline) otherwise; and
+    /// how long a gate waits for it ([`LOAD_WAIT`]).
+    load: parking_lot::Mutex<(CancellationToken, std::time::Duration)>,
 }
 
 /// The [`SNAPSHOT_KEY`] document.
@@ -202,7 +203,7 @@ impl DigestStore {
             entries: Arc::new(RwLock::new(entries)),
             storage,
             loaded: Arc::new(AtomicBool::new(whole)),
-            load_done: done_token(),
+            load: parking_lot::Mutex::new((done_token(), LOAD_WAIT)),
         }
     }
 
@@ -211,15 +212,13 @@ impl DigestStore {
     /// (bounded by `LOAD_DEADLINE`; past it the walk is dropped and logged).
     /// Until then a known digest reads as new, so an enforcing quarantine may
     /// hold a cached version for one more TTL; the listener never waits on R2. An enforcing
-    /// cache hit waits for the walk instead ([`cache_gate_digest`]).
+    /// gate waits for the walk instead ([`ledger_ready`]).
     /// Maestra: on 20.10.2026 the blocking load kept packages.maestra.io from
     /// binding its port for minutes on a slow R2 listing, and the startup probe
     /// killed the pod in a loop.
     pub fn load_in_background(storage: Storage, storage_path: &str) -> Self {
-        let mut store = Self::empty(storage.clone());
-        store.set_loaded(false);
-        store.load_done = CancellationToken::new();
-        let done = store.load_done.clone().drop_guard();
+        let store = Self::empty(storage.clone());
+        let done = store.begin_load(LOAD_WAIT).drop_guard();
         let legacy = Path::new(storage_path).join(LEDGER_FILE);
         let entries = Arc::clone(&store.entries);
         let loaded_flag = Arc::clone(&store.loaded);
@@ -265,7 +264,7 @@ impl DigestStore {
             entries: Arc::new(RwLock::new(HashMap::new())),
             storage,
             loaded: Arc::new(AtomicBool::new(true)),
-            load_done: done_token(),
+            load: parking_lot::Mutex::new((done_token(), LOAD_WAIT)),
         }
     }
 
@@ -278,11 +277,19 @@ impl DigestStore {
         self.loaded.store(loaded, Ordering::Release);
     }
 
-    /// Wait up to [`LOAD_WAIT`] for a running ledger load to end; `false` when it still runs.
+    /// A load starts: not loaded until the returned token is cancelled, and a gate waits for
+    /// it at most `wait`.
+    pub(crate) fn begin_load(&self, wait: std::time::Duration) -> CancellationToken {
+        self.set_loaded(false);
+        let done = CancellationToken::new();
+        *self.load.lock() = (done.clone(), wait);
+        done
+    }
+
+    /// Wait for a running ledger load to end, at most its bound; `false` when it still runs.
     async fn wait_for_load(&self) -> bool {
-        tokio::time::timeout(LOAD_WAIT, self.load_done.cancelled())
-            .await
-            .is_ok()
+        let (done, wait) = self.load.lock().clone();
+        tokio::time::timeout(wait, done.cancelled()).await.is_ok()
     }
 
     /// Record a proxy-fetched digest. Returns the entry (existing or new).
@@ -482,7 +489,7 @@ pub fn resolve_global(mode: Option<&QuarantineMode>, ttl: Option<&str>) -> (Quar
 /// hit goes through [`cache_gate_digest`], which does not restart the clock of a copy
 /// cached for longer than that.
 #[must_use = "the returned response blocks a quarantined artifact; dropping it serves the artifact"]
-pub fn proxy_gate(
+pub async fn proxy_gate(
     store: &DigestStore,
     registry: &str,
     bytes: &[u8],
@@ -499,6 +506,7 @@ pub fn proxy_gate(
         upstream,
         None,
     )
+    .await
 }
 
 /// The first-seen a proxy handler gives [`proxy_gate_dated`]: its release date, only when upstream
@@ -516,7 +524,7 @@ pub fn first_seen_seed(trust_upstream_dates: bool, release_date: Option<i64>) ->
 /// immediately, so a provably-old package is not held as "new to this mirror".
 /// `None` falls back to NORA's own clock (the unspoofable default).
 #[must_use = "the returned response blocks a quarantined artifact; dropping it serves the artifact"]
-pub fn proxy_gate_dated(
+pub async fn proxy_gate_dated(
     store: &DigestStore,
     registry: &str,
     bytes: &[u8],
@@ -539,12 +547,16 @@ pub fn proxy_gate_dated(
         upstream,
         trusted_first_seen,
     )
+    .await
 }
 
 /// [`proxy_gate_dated`] for an artifact whose `sha256:<hex>` digest is already
 /// known — a body streamed from a spool file or from storage, never held whole.
+///
+/// Enforce waits for a running ledger load first ([`ledger_ready`]) and answers 503 past
+/// the bound, recording nothing.
 #[must_use = "the returned response blocks a quarantined artifact; dropping it serves the artifact"]
-pub fn proxy_gate_digest(
+pub async fn proxy_gate_digest(
     store: &DigestStore,
     registry: &str,
     digest: &str,
@@ -555,6 +567,18 @@ pub fn proxy_gate_digest(
 ) -> Option<Response> {
     if matches!(mode, QuarantineMode::Off) {
         return None;
+    }
+    if !ledger_ready(
+        store,
+        registry,
+        digest,
+        mode,
+        trusted_first_seen,
+        quarantine_secs,
+    )
+    .await
+    {
+        return Some(ledger_loading(registry, digest));
     }
     store.record(registry, digest, upstream, trusted_first_seen);
     let status = store.check(registry, digest, quarantine_secs);
@@ -596,12 +620,7 @@ pub fn proxy_gate_digest(
 /// that a digest with no record whose copy NORA wrote more than [`PRUNE_TTL_SECS`] ago is
 /// first seen then, not now ([`cached_first_seen`]). The ledger forgets a digest 90 days
 /// after its first sight, and without this every package cached for longer was held for a
-/// new TTL after each restart (R4-C05).
-///
-/// Enforce only: a digest the ledger may still hold (no record, the boot-time load still
-/// running) waits for the load, at most [`LOAD_WAIT`], and past that answers 503 with
-/// `Retry-After`: neither a 403 for a copy the ledger holds as mature, nor serving it
-/// unchecked. Observe never waits.
+/// new TTL after each restart (R4-C05). Waits for a running ledger load like it.
 #[must_use = "the returned response blocks a quarantined artifact; dropping it serves the artifact"]
 #[allow(clippy::too_many_arguments)]
 pub async fn cache_gate_digest(
@@ -621,13 +640,6 @@ pub async fn cache_gate_digest(
         Some(date) => Some(date),
         None => cached_first_seen(store, storage, key, registry, digest).await,
     };
-    if matches!(mode, QuarantineMode::Enforce)
-        && first_seen.is_none_or(|at| Utc::now().timestamp() - at < quarantine_secs)
-        && matches!(store.check(registry, digest, 0), QuarantineStatus::New)
-        && !store.wait_for_load().await
-    {
-        return Some(ledger_loading(registry, digest));
-    }
     proxy_gate_digest(
         store,
         registry,
@@ -637,6 +649,27 @@ pub async fn cache_gate_digest(
         "cache",
         first_seen,
     )
+    .await
+}
+
+/// Whether an enforcing gate can judge `digest` now. With no record while the boot-time
+/// ledger load runs, the ledger may hold it as mature: wait for the load, at most
+/// [`LOAD_WAIT`]. `false` past the bound: the gate answers 503 with `Retry-After`
+/// ([`LOAD_RETRY_AFTER_SECS`]), never a 403 for a digest it could not judge, never the
+/// artifact. `first_seen` is the date the gate would record (a trusted or write-time date):
+/// one already past the TTL is served without the ledger. Observe and off never wait.
+pub async fn ledger_ready(
+    store: &DigestStore,
+    registry: &str,
+    digest: &str,
+    mode: &QuarantineMode,
+    first_seen: Option<i64>,
+    quarantine_secs: i64,
+) -> bool {
+    !matches!(mode, QuarantineMode::Enforce)
+        || first_seen.is_some_and(|at| Utc::now().timestamp() - at >= quarantine_secs)
+        || !matches!(store.check(registry, digest, 0), QuarantineStatus::New)
+        || store.wait_for_load().await
 }
 
 /// [`cache_gate_digest`] for a cached body held whole: hashes `bytes`.
@@ -698,13 +731,13 @@ fn done_token() -> CancellationToken {
     token
 }
 
-/// 503 for a cache hit [`cache_gate_digest`] cannot judge before the ledger load ends.
+/// 503 for an artifact [`proxy_gate_digest`] cannot judge before the ledger load ends.
 fn ledger_loading(registry: &str, digest: &str) -> Response {
     warn!(
         registry = %registry,
         digest = %digest,
         wait_secs = LOAD_WAIT.as_secs(),
-        "quarantine: ledger still loading, cache hit answered 503"
+        "quarantine: ledger still loading, answered 503"
     );
     let body = serde_json::json!({
         "error": "quarantine_loading",
@@ -1597,7 +1630,8 @@ mod tests {
             14 * 86400,
             "https://upstream.example",
             None,
-        );
+        )
+        .await;
         assert!(fetched.is_some(), "first fetched now: held");
         assert!(
             cache_gate(&store, &tmp, "nuget/fresh.nupkg", "sha256:fresh").await,
@@ -1627,11 +1661,8 @@ mod tests {
     async fn an_enforcing_cache_hit_waits_for_the_ledger_load() {
         let tmp = TempDir::new().unwrap();
         cached_days_ago(&tmp, "nuget/known.nupkg", 30).await;
-        let mut store = DigestStore::empty(storage(&tmp));
-        store.set_loaded(false);
-        let load = CancellationToken::new();
-        store.load_done = load.clone();
-        let store = Arc::new(store);
+        let store = Arc::new(DigestStore::empty(storage(&tmp)));
+        let load = store.begin_load(LOAD_WAIT);
         let gate = |mode: QuarantineMode| {
             let (store, st) = (Arc::clone(&store), storage(&tmp));
             async move {
@@ -1674,6 +1705,59 @@ mod tests {
         tokio::time::sleep(LOAD_WAIT / 2).await;
         assert!(!pending.is_finished(), "waits for the load");
         let mut known = entry("sha256:known", Utc::now().timestamp() - 30 * 86400);
+        known.registry = "nuget".into();
+        store
+            .entries
+            .write()
+            .insert(map_key("nuget", "sha256:known"), known);
+        load.cancel();
+        assert!(
+            pending.await.unwrap().is_none(),
+            "the ledger's date serves it"
+        );
+    }
+
+    /// The proxy path the same: bytes fetched now whose digest the loading ledger may hold as
+    /// mature (a copy GC deleted, an uncached blob of an old image) wait for the load and get
+    /// 503 past the bound, never a 403. A trusted date past the TTL needs no ledger.
+    #[tokio::test(start_paused = true)]
+    async fn an_enforcing_proxy_fetch_waits_for_the_ledger_load() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(DigestStore::empty(storage(&tmp)));
+        let load = store.begin_load(LOAD_WAIT);
+        let ttl = 14 * 86400;
+        let gate = |mode: QuarantineMode, digest: &'static str, trusted: Option<i64>| {
+            let store = Arc::clone(&store);
+            async move { proxy_gate_digest(&store, "nuget", digest, &mode, ttl, "up", trusted).await }
+        };
+
+        let started = tokio::time::Instant::now();
+        let resp = gate(QuarantineMode::Enforce, "sha256:known", None)
+            .await
+            .expect("not served unchecked");
+        assert!(started.elapsed() >= LOAD_WAIT, "waited the whole bound");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
+        assert!(store.is_empty(), "a 503 records nothing");
+
+        let started = tokio::time::Instant::now();
+        let old = Utc::now().timestamp() - 30 * 86400;
+        assert!(gate(QuarantineMode::Enforce, "sha256:dated", Some(old))
+            .await
+            .is_none());
+        assert!(gate(QuarantineMode::Observe, "sha256:seen", None)
+            .await
+            .is_none());
+        assert_eq!(
+            started.elapsed(),
+            std::time::Duration::ZERO,
+            "neither waits"
+        );
+
+        let pending = tokio::spawn(gate(QuarantineMode::Enforce, "sha256:known", None));
+        tokio::time::sleep(LOAD_WAIT / 2).await;
+        assert!(!pending.is_finished(), "waits for the load");
+        let mut known = entry("sha256:known", old);
         known.registry = "nuget".into();
         store
             .entries

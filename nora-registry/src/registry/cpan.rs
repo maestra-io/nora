@@ -364,7 +364,9 @@ async fn distribution_proxy(
                 q_secs,
                 &url,
                 None,
-            ) {
+            )
+            .await
+            {
                 return resp;
             }
             with_binary(bytes, "application/octet-stream")

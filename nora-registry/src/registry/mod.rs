@@ -2666,7 +2666,9 @@ pub(crate) async fn repo_proxy_download(
                     q_secs,
                     &url,
                     None,
-                ) {
+                )
+                .await
+                {
                     return resp;
                 }
             } else {

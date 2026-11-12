@@ -1098,7 +1098,9 @@ async fn handle_request(
                         state.config.server.trust_upstream_dates,
                         publish_date,
                     ),
-                ) {
+                )
+                .await
+                {
                     return resp;
                 }
                 return with_content_type(true, data).into_response();
@@ -1570,7 +1572,7 @@ struct TarballGates<'a> {
 
 impl TarballGates<'_> {
     /// Curation integrity, then the digest quarantine, on the tarball's digest.
-    fn check(&self, state: &AppState, digest: &str, upstream: &str) -> Option<Response> {
+    async fn check(&self, state: &AppState, digest: &str, upstream: &str) -> Option<Response> {
         let engine = &state.curation().curation_engine;
         if engine.is_active() {
             if let Some(response) = crate::curation::verify_integrity_by_hash(
@@ -1592,6 +1594,7 @@ impl TarballGates<'_> {
             upstream,
             self.publish_date,
         )
+        .await
     }
 }
 
@@ -1647,7 +1650,7 @@ async fn serve_streamed_tarball(
         publish_date: gates.publish_date.or(cached_at),
         ..gates
     };
-    if let Some(response) = gates.check(state, &digest, "cache") {
+    if let Some(response) = gates.check(state, &digest, "cache").await {
         return response;
     }
     state.metrics.record_download("npm");
@@ -1724,7 +1727,9 @@ async fn serve_spooled_tarball(
         gates.q_secs,
         url,
         gates.publish_date,
-    ) {
+    )
+    .await
+    {
         return response;
     }
     let len = body.len();
