@@ -1805,6 +1805,7 @@ mod per_conan_client {
     use crate::storage::{ObjectStorage, Storage};
     use crate::test_helpers::{create_test_context_with_storage_and_config, send, upstream_paths};
     use axum::http::{Method, StatusCode};
+    use std::time::Duration;
     use wiremock::matchers::any;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1910,17 +1911,26 @@ mod per_conan_client {
     }
 
     // Where the shared file download parts the two on purpose: a package file is fetched
-    // under `proxy_timeout_dl`, a recipe file under `proxy_timeout`. A zero metadata timeout
-    // fails the recipe file and leaves the package file to its own budget.
+    // under `proxy_timeout_dl`, a recipe file under `proxy_timeout`. An upstream that answers
+    // after 2 s fails the recipe file under a 1 s metadata timeout and serves the package
+    // file under its own 30 s. (A zero timeout raced: a fast local answer could still win.)
     #[tokio::test]
     async fn package_files_are_fetched_under_the_download_timeout() {
-        let up = upstream().await;
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes("file")
+                    .set_delay(Duration::from_secs(2)),
+            )
+            .mount(&up)
+            .await;
         let proxy = up.uri();
         let storage = Storage::from_backend(std::sync::Arc::new(ObjectStorage::in_memory()));
         let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
             cfg.conan.enabled = true;
             cfg.conan.proxy = Some(proxy);
-            cfg.conan.proxy_timeout = 0;
+            cfg.conan.proxy_timeout = 1;
             cfg.conan.proxy_timeout_dl = 30;
         });
         let reference = "/conan/v2/conans/zlib/1.3/_/_/revisions/abc123";
