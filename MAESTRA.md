@@ -67,6 +67,15 @@ git checkout maestra/main && git merge main && git push origin maestra/main
 Merge, not rebase: `maestra/main` is the default branch with open PRs on it, a rebase would force-push it and invalidate every branch cut from it; a merge resolves each upstream conflict once, in one commit.
 Changes meant for upstream: branch from `main`, cherry-pick, open the PR against getnora-io/nora.
 
+## Source layout (fork-only, R4-T11/T12)
+
+Decided 12.11.2026: these moves stay in the fork, so an upstream merge conflicts in the files below; resolve by porting the upstream hunk to where the code lives now.
+
+- Test modules live in their own files, one per former inline `#[cfg(test)] mod`, declared where they were: `registry/{docker,npm,nuget,pypi,maven}/*.rs`, `auth/tests.rs` and `auth/*_tests.rs`, `config/tests.rs`, `main_tests/*.rs` (via `#[path]`). Each starts with `#![cfg(test)]`; their insta snapshots sit in `registry/<format>/snapshots/`. The env-lock scan (`test_env.rs`) reads such a file with the env readers of the file that declares it.
+- `registry/docker.rs` production code is split: `docker/upstream.rs` (upstream fetches, spool, single-flight fills, ranged resume) and `docker/pull_stats.rs` (pull counters and `.stats.json` flush), re-exported from `docker.rs`. `main.rs`: `run_server` builds the cleanup cycle in `cleanup_passes()` and sweeps dead-instance files in `clear_dead_instance_files()`.
+- `registry/os_repo.rs`: the rpm and deb handler bodies (download, HEAD, delete, reindex, publish) behind the `OsRepo` trait; `rpm.rs` / `deb.rs` keep parsing, index generation and thin handlers.
+- One helper where two handlers were copies: conan `file_download` (recipe and package files) and `internal_answer`, nuget `proxied_search` (search and autocomplete), terraform `internal_answer` (the #68/#733 branch).
+
 ## CI and releases
 
 - `.github/workflows/maestra-ci.yml`: on PRs into and pushes to `maestra/main` (RunsOn `pool=build`, light jobs `pool=small`; every main commit gets its own run), and called by the release for the tag's commit. A PR changing only `*.md` skips the Rust jobs; `helm chart` and `coherence` always run. Jobs:
