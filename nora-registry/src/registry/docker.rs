@@ -3431,7 +3431,7 @@ async fn missing_manifest_ref(
                     continue;
                 };
                 let pushed = manifest_key(None, name, d);
-                if storage.stat(&pushed).await.is_some() {
+                if confirmed(state, &pushed).await {
                     continue;
                 }
                 let proxied = manifest_key(ns, name, d);
@@ -3468,7 +3468,7 @@ async fn missing_manifest_ref(
         }
         for d in refs {
             let pushed = blob_key(None, name, d);
-            if storage.stat(&pushed).await.is_some() {
+            if confirmed(state, &pushed).await {
                 continue;
             }
             let proxied = blob_key(ns, name, d);
@@ -3485,6 +3485,19 @@ async fn missing_manifest_ref(
         }
     }
     None
+}
+
+/// Whether `key` exists, asked through `gc::confirm_blob`: what a manifest push found is kept
+/// from the GC sweep and from a blob delete until the manifest has landed.
+async fn confirmed(state: &AppState, key: &str) -> bool {
+    crate::gc::confirm_blob(
+        state.config.gc.enabled,
+        &state.publish_locks,
+        &[key],
+        state.storage.stat(key),
+    )
+    .await
+    .is_some()
 }
 
 /// Why `body` is not a manifest NORA stores or caches, or `None` when it is one: a JSON object
@@ -4104,6 +4117,33 @@ async fn delete_blob(
 
     let key = blob_key(ns.as_deref(), &name, &digest);
     let legacy_key = blob_key(None, &name, &digest);
+    // Under the publish locks `gc::confirm_blob` and the GC sweep take: a copy a client was told
+    // exists within `gc.grace_secs` (blob HEAD, mount, a manifest push checking its layers) may
+    // be what a manifest about to land references, so the sweep keeps it and so does a delete.
+    let lock = state.publish_lock(&key);
+    let _guard = lock.lock().await;
+    let legacy_lock = (legacy_key != key).then(|| state.publish_lock(&legacy_key));
+    let _legacy_guard = match &legacy_lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+    let grace = state.config.gc.grace_secs;
+    if crate::gc::recently_confirmed(&key, grace)
+        || crate::gc::recently_confirmed(&legacy_key, grace)
+    {
+        tracing::warn!(name = %name, digest = %digest, "blob delete refused: a push confirmed it within gc.grace_secs");
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "errors": [{
+                    "code": "DENIED",
+                    "message": "blob was confirmed to a push within gc.grace_secs; retry later",
+                    "detail": { "digest": digest }
+                }]
+            })),
+        )
+            .into_response();
+    }
     // Both copies go — the namespaced (proxied) one and the bare one a push writes — and the
     // answer is theirs together: deleted if either was there, unknown only if neither was.
     match delete_copies(&state.storage, &key, &legacy_key).await {
