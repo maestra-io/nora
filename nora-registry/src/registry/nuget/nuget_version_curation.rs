@@ -94,3 +94,68 @@ async fn an_allowlist_entry_admits_its_version_however_spelled() {
     .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+/// R5 pairs: a registration page is curated as its index is. A package the curation refuses
+/// is refused on the index and on every page, in every hive, and none is asked upstream; the
+/// bypass token admits both alike.
+#[tokio::test]
+async fn a_registration_page_is_curated_as_its_index() {
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "count": 0,
+            "items": []
+        })))
+        .mount(&upstream)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let blocklist = write(
+        &dir,
+        "blocklist.json",
+        r#"{"version": 1, "rules": [
+                {"registry": "nuget", "name": "Evil.Lib", "version": "*", "reason": "malware"}
+            ]}"#,
+    );
+    let uri = upstream.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.nuget.enabled = true;
+        cfg.nuget.proxy = Some(uri);
+        cfg.curation.mode = crate::config::CurationMode::Enforce;
+        cfg.curation.blocklist_path = Some(blocklist);
+        cfg.curation.bypass_token = Some(crate::secrets::ProtectedString::from("let-me-in"));
+    });
+    let mut paths = Vec::new();
+    for hive in [
+        "registration",
+        "registration-semver1",
+        "registration-gz-semver1",
+    ] {
+        paths.push(format!("/nuget/v3/{hive}/evil.lib/index.json"));
+        paths.push(format!("/nuget/v3/{hive}/evil.lib/page/1.0.0/2.0.0.json"));
+    }
+    for path in &paths {
+        let resp = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+    let asked = upstream.received_requests().await.unwrap();
+    assert!(asked.is_empty(), "asked upstream: {asked:?}");
+
+    for path in [
+        "/nuget/v3/registration/evil.lib/index.json",
+        "/nuget/v3/registration/evil.lib/page/1.0.0/2.0.0.json",
+    ] {
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            Method::GET,
+            path,
+            vec![("x-nora-bypass-token", "let-me-in")],
+            "",
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "{path} with the bypass token"
+        );
+    }
+}
