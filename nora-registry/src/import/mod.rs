@@ -2108,7 +2108,8 @@ mod integration_tests {
         use crate::test_helpers::{create_test_context_with_config, send};
         use axum::http::{Method, StatusCode};
 
-        let upstream = MockServer::start().await;
+        // Unpooled: a pooled server can still receive another test's late request.
+        let upstream = MockServer::builder().start().await;
         Mock::given(wiremock::matchers::path("/simple/otherpkg/"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"<a href="/files/otherpkg-9.9.9-py3-none-any.whl">otherpkg-9.9.9-py3-none-any.whl</a>"#,
