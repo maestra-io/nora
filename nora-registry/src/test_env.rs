@@ -66,9 +66,14 @@ fn a_panic_under_the_env_lock_does_not_fail_the_waiters() {
 /// to update, and comments and string literals are blanked first, so neither a lock in a
 /// comment nor a fixture in a string counts.
 ///
-/// Known limit: readers are matched by name within one file. A test that reaches env only
-/// through a function of another file is not seen; crate-wide names collide (`load` is
-/// both `Config::load` and `AtomicUsize::load`), so widening needs real name resolution.
+/// A test module in a file of its own (`#![cfg(test)]`, e.g. `config/tests.rs`) also calls
+/// the functions of the file that declares it, so it is scanned with that file's readers
+/// as well (see [`parent_files`]).
+///
+/// Known limit: readers are matched by name within one file and its test-module files. A
+/// test that reaches env only through a function of another file is not seen; crate-wide
+/// names collide (`load` is both `Config::load` and `AtomicUsize::load`), so widening needs
+/// real name resolution.
 #[test]
 fn every_env_touching_test_holds_the_env_lock() {
     matcher_self_test();
@@ -77,19 +82,38 @@ fn every_env_touching_test_holds_the_env_lock() {
     let mut files = Vec::new();
     collect_rs(&src_dir, &mut files);
     files.sort();
+    let sources: Vec<(String, String)> = files
+        .iter()
+        .map(|path| {
+            let rel = path
+                .strip_prefix(&src_dir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            (rel, mask(&std::fs::read_to_string(path).unwrap()))
+        })
+        .collect();
+    let own_readers: std::collections::HashMap<&str, Vec<String>> = sources
+        .iter()
+        .map(|(rel, code)| (rel.as_str(), scan(code, &[]).readers))
+        .collect();
 
     let mut offenders = Vec::new();
     let mut env_test_files = Vec::new();
     let mut lock_defs = Vec::new();
     let mut config_readers = Vec::new();
-    for path in &files {
-        let rel = path
-            .strip_prefix(&src_dir)
-            .unwrap()
-            .to_string_lossy()
-            .replace('\\', "/");
-        let code = mask(&std::fs::read_to_string(path).unwrap());
-        let scan = scan(&code);
+    for (rel, code) in &sources {
+        let (rel, code) = (rel.clone(), code.as_str());
+        let inherited = if code.contains("#![cfg(test)]") {
+            parent_files(&rel)
+                .iter()
+                .find_map(|p| own_readers.get(p.as_str()))
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let scan = scan(code, &inherited);
         if scan.exposed_tests > 0 {
             env_test_files.push(rel.clone());
         }
@@ -97,12 +121,12 @@ fn every_env_touching_test_holds_the_env_lock() {
             config_readers = scan.readers.clone();
         }
         offenders.extend(scan.offenders.into_iter().map(|t| format!("{rel}::{t}")));
-        for item in fn_items(&code) {
+        for item in fn_items(code) {
             if item.name == "env_lock" {
                 lock_defs.push(rel.clone());
             }
         }
-        if rel != "test_env.rs" && has_ident(&code, "ENV_MUTEX") {
+        if rel != "test_env.rs" && has_ident(code, "ENV_MUTEX") {
             lock_defs.push(format!("{rel} (ENV_MUTEX)"));
         }
     }
@@ -135,7 +159,7 @@ fn every_env_touching_test_holds_the_env_lock() {
 
 /// Fixtures that a neutered matcher would pass in silence.
 fn matcher_self_test() {
-    let offenders = |src: &str| scan(&mask(src)).offenders;
+    let offenders = |src: &str| scan(&mask(src), &[]).offenders;
     let none: Vec<String> = Vec::new();
     let t = |name: &str| vec![name.to_string()];
 
@@ -211,6 +235,28 @@ fn matcher_self_test() {
     );
     // a non-test fn that writes env is a reader, not an offender
     assert_eq!(offenders("fn helper() { set_var(\"A\", \"1\"); }"), none);
+    // a reader of the declaring file, called from its test-module file
+    let inherited = vec!["rd".to_string()];
+    assert_eq!(
+        scan(&mask("#[test]\nfn r() { rd(); }"), &inherited).offenders,
+        t("r")
+    );
+    assert_eq!(
+        parent_files("registry/npm/tests.rs"),
+        ["registry/npm.rs", "registry/npm/mod.rs"]
+    );
+    assert_eq!(parent_files("main_tests/x_tests.rs"), ["main.rs"]);
+    assert!(parent_files("main.rs").is_empty());
+}
+
+/// The files that may declare the module in `rel`: `dir.rs` or `dir/mod.rs` for a file
+/// under `dir/`, and `main.rs` for `main_tests/` (declared there with `#[path]`).
+fn parent_files(rel: &str) -> Vec<String> {
+    match rel.rsplit_once('/') {
+        None => Vec::new(),
+        Some(("main_tests", _)) => vec!["main.rs".to_string()],
+        Some((dir, _)) => vec![format!("{dir}.rs"), format!("{dir}/mod.rs")],
+    }
 }
 
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -237,17 +283,20 @@ const WRITERS: [&str; 2] = ["set_var", "remove_var"];
 const READERS: [&str; 4] = ["env::var", "env::var_os", "env::vars", "env::vars_os"];
 
 /// Scans one masked file: its env-touching functions are readers, and every test that
-/// writes env or calls a reader must take the lock before the first such statement.
-fn scan(code: &str) -> Scan {
+/// writes env or calls a reader (its own or one of `inherited`) must take the lock before
+/// the first such statement.
+fn scan(code: &str, inherited: &[String]) -> Scan {
     let items = fn_items(code);
     let touches = |body: &str| first_touch(body, &[]).is_some();
-    let readers: Vec<&str> = items
+    let mut readers: Vec<&str> = items
         .iter()
         .filter(|f| !f.is_test && touches(&code[f.open..=f.close]))
         .map(|f| f.name)
         .collect();
+    let scan_readers = readers.iter().map(|r| r.to_string()).collect();
+    readers.extend(inherited.iter().map(String::as_str));
     let mut scan = Scan {
-        readers: readers.iter().map(|r| r.to_string()).collect(),
+        readers: scan_readers,
         exposed_tests: 0,
         offenders: Vec::new(),
     };
