@@ -548,38 +548,18 @@ async fn download_gem(
     // The file is stored and fetched under its whole name, platform included.
     let artifact = stem.to_string();
     let storage_key = format!("gems/gems/{}.gem", artifact);
-    let GemFileGate {
-        internal,
-        identities,
-        publish_date,
-    } = match gem_file_gate(&state, &headers, stem, &storage_key).await {
+    let gate = match gem_file_gate(&state, &headers, stem, &storage_key).await {
         Ok(gate) => gate,
         Err(refusal) => return *refusal,
     };
-    let cached_meta = state.storage.stat(&storage_key).await;
-
-    // Resolved here, not at the serve site, so the range branch below can see it.
-    let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-        state.config.curation.gems.quarantine.as_ref().or(state
-            .config
-            .curation
-            .quarantine
-            .as_ref()),
-        state
-            .config
-            .curation
-            .gems
-            .quarantine_ttl
-            .as_deref()
-            .or(state.config.curation.quarantine_ttl.as_deref()),
-    );
+    let quarantine = gems_quarantine(&state);
 
     // Resumable download (#657): serve the requested bytes from the backend and skip
     // the full read below. .gem files only — the specs/compact indexes are mutable. A
     // partial read cannot be hashed, so neither the quarantine gate nor the curation
     // integrity check can run on it: the range serve stands down while quarantine holds
     // artifacts or an integrity rule applies to any identity of the file.
-    let integrity_applies = identities.iter().any(|identity| {
+    let integrity_applies = gate.identities.iter().any(|identity| {
         crate::curation::integrity_applies(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Gems,
@@ -587,8 +567,8 @@ async fn download_gem(
             Some(&identity.version),
         )
     });
-    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) && !integrity_applies {
-        if let Some(meta) = cached_meta.as_ref() {
+    if matches!(quarantine.0, crate::digest_quarantine::QuarantineMode::Off) && !integrity_applies {
+        if let Some(meta) = state.storage.stat(&storage_key).await {
             if let Some(response) = crate::registry::range::range_response(
                 &state.storage,
                 &[&storage_key],
@@ -611,6 +591,112 @@ async fn download_gem(
         }
     }
 
+    let upstream_path = format!("gems/{}.gem", artifact);
+    serve_gem_file(
+        &state,
+        gate,
+        quarantine,
+        GemFileKind::Gem,
+        artifact,
+        storage_key,
+        upstream_path,
+    )
+    .await
+}
+
+// ── Gemspec download (immutable) ───────────────────────────────────────
+
+async fn download_gemspec(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(filename): Path<String>,
+) -> Response {
+    // filename = "name-version[-platform].gemspec.rz" — strip suffix and split
+    let stem = match filename.strip_suffix(".gemspec.rz") {
+        Some(s) => s,
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+    // The gemspec is stored and fetched under its whole name, platform included. It is decided
+    // as its gem file is: the same readings, isolation, curation and release date.
+    let artifact = stem.to_string();
+    let storage_key = format!("gems/quick/Marshal.4.8/{}.gemspec.rz", artifact);
+    let gate = match gem_file_gate(&state, &headers, stem, &storage_key).await {
+        Ok(gate) => gate,
+        Err(refusal) => return *refusal,
+    };
+    let upstream_path = format!("quick/Marshal.4.8/{}.gemspec.rz", artifact);
+    serve_gem_file(
+        &state,
+        gate,
+        gems_quarantine(&state),
+        GemFileKind::Gemspec,
+        artifact,
+        storage_key,
+        upstream_path,
+    )
+    .await
+}
+
+/// Which file of a gem release is served. The two are answered alike; only the `.gem` is held
+/// to the curation integrity pins (they name the `.gem`'s digest, not its gemspec's) and
+/// offered for ranged reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GemFileKind {
+    Gem,
+    Gemspec,
+}
+
+/// The gems quarantine mode and TTL: the per-registry setting, else the global one.
+fn gems_quarantine(state: &AppState) -> (crate::digest_quarantine::QuarantineMode, i64) {
+    let curation = &state.config.curation;
+    crate::digest_quarantine::resolve_global(
+        curation
+            .gems
+            .quarantine
+            .as_ref()
+            .or(curation.quarantine.as_ref()),
+        curation
+            .gems
+            .quarantine_ttl
+            .as_deref()
+            .or(curation.quarantine_ttl.as_deref()),
+    )
+}
+
+/// Serve an immutable gem file `gate` admitted: its local copy, else (never for an internal
+/// name, #733) the upstream's at `upstream_path`, cached. Both download paths answer here, so
+/// they cannot drift apart again.
+async fn serve_gem_file(
+    state: &AppState,
+    gate: GemFileGate,
+    (q_mode, q_secs): (crate::digest_quarantine::QuarantineMode, i64),
+    file: GemFileKind,
+    artifact: String,
+    storage_key: String,
+    upstream_path: String,
+) -> Response {
+    let GemFileGate {
+        internal,
+        identities,
+        publish_date,
+    } = gate;
+    // Curation integrity, for every identity of the file: the cached copy and the first
+    // download alike.
+    let pinned = |data: &[u8]| {
+        if file != GemFileKind::Gem {
+            return None;
+        }
+        identities.iter().find_map(|identity| {
+            crate::curation::verify_integrity(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::Gems,
+                &identity.name,
+                Some(&identity.version),
+                data,
+            )
+        })
+    };
+
     // Immutable: if cached, serve directly. get_verified discharges the integrity
     // witness at the serve site (compile-time guarantee — see crate::verified).
     let (cached, read_failure) =
@@ -621,19 +707,9 @@ async fn download_gem(
             GateOutcome::Verified(blob) => verified_body(blob),
             GateOutcome::Unpinned(blob) => blob.into_inner(),
         };
-        // Curation integrity, for every identity of the file.
-        for identity in &identities {
-            if let Some(response) = crate::curation::verify_integrity(
-                &state.curation().curation_engine,
-                crate::curation::RegistryType::Gems,
-                &identity.name,
-                Some(&identity.version),
-                &data,
-            ) {
-                return response;
-            }
+        if let Some(response) = pinned(&data) {
+            return response;
         }
-
         state.metrics.record_download("gems");
         state.metrics.record_cache_hit("gems");
         state.activity.push(ActivityEntry::new(
@@ -658,9 +734,11 @@ async fn download_gem(
             return resp;
         }
         let mut response = with_binary(data.to_vec(), "application/octet-stream");
-        response
-            .headers_mut()
-            .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        if file == GemFileKind::Gem {
+            response
+                .headers_mut()
+                .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        }
         return response;
     }
 
@@ -679,10 +757,10 @@ async fn download_gem(
     }
 
     // Fetch from upstream — none when the operator switched it off.
-    let Some(proxy_url) = upstream_url(&state) else {
+    let Some(proxy_url) = upstream_url(state) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let url = format!("{}/gems/{}.gem", proxy_url.trim_end_matches('/'), artifact);
+    let url = format!("{}/{}", proxy_url.trim_end_matches('/'), upstream_path);
 
     match proxy_fetch(
         &state.http_client,
@@ -695,18 +773,9 @@ async fn download_gem(
     .await
     {
         Ok(bytes) => {
-            // The allowlist's pinned integrity holds on the first download too, before anything is cached:
-            // the cache-hit branch checks the same rule.
-            for identity in &identities {
-                if let Some(response) = crate::curation::verify_integrity(
-                    &state.curation().curation_engine,
-                    crate::curation::RegistryType::Gems,
-                    &identity.name,
-                    Some(&identity.version),
-                    &bytes,
-                ) {
-                    return response;
-                }
+            // The allowlist's pinned integrity holds before anything is cached.
+            if let Some(response) = pinned(&bytes) {
+                return response;
             }
             state.metrics.record_download("gems");
             state.metrics.record_cache_miss("gems");
@@ -738,166 +807,7 @@ async fn download_gem(
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
-            tracing::debug!(error = ?e, "RubyGems download error");
-            StatusCode::BAD_GATEWAY.into_response()
-        }
-    }
-}
-
-// ── Gemspec download (immutable) ───────────────────────────────────────
-
-async fn download_gemspec(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Path(filename): Path<String>,
-) -> Response {
-    // filename = "name-version[-platform].gemspec.rz" — strip suffix and split
-    let stem = match filename.strip_suffix(".gemspec.rz") {
-        Some(s) => s,
-        None => return StatusCode::NOT_FOUND.into_response(),
-    };
-    // The gemspec is stored and fetched under its whole name, platform included. It is decided
-    // as its gem file is: the same readings, isolation, curation and release date.
-    let artifact = stem.to_string();
-    let storage_key = format!("gems/quick/Marshal.4.8/{}.gemspec.rz", artifact);
-    let GemFileGate {
-        internal,
-        publish_date,
-        ..
-    } = match gem_file_gate(&state, &headers, stem, &storage_key).await {
-        Ok(gate) => gate,
-        Err(refusal) => return *refusal,
-    };
-
-    // Immutable cache. get_verified discharges the integrity witness at serve.
-    let (cached, read_failure) =
-        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
-    if let Some(outcome) = cached {
-        use nora_registry::verified::{verified_body, GateOutcome};
-        let data = match outcome {
-            GateOutcome::Verified(blob) => verified_body(blob),
-            GateOutcome::Unpinned(blob) => blob.into_inner(),
-        };
-        state.metrics.record_download("gems");
-        state.metrics.record_cache_hit("gems");
-        state.activity.push(ActivityEntry::new(
-            ActionType::CacheHit,
-            artifact,
-            crate::registry_type::RegistryType::Gems,
-            "CACHE",
-        ));
-        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-            state.config.curation.gems.quarantine.as_ref().or(state
-                .config
-                .curation
-                .quarantine
-                .as_ref()),
-            state
-                .config
-                .curation
-                .gems
-                .quarantine_ttl
-                .as_deref()
-                .or(state.config.curation.quarantine_ttl.as_deref()),
-        );
-        // A digest with no record counts from when its copy was cached (R4-C05).
-        if let Some(resp) = crate::digest_quarantine::cache_gate_dated(
-            &state.digest_store,
-            &state.storage,
-            &storage_key,
-            "gems",
-            &data,
-            &q_mode,
-            q_secs,
-            publish_date,
-        )
-        .await
-        {
-            return resp;
-        }
-        return with_binary(data.to_vec(), "application/octet-stream");
-    }
-
-    // #68 namespace isolation: a cached internal gem's spec was served above; an
-    // internal name with no local copy must not be fetched upstream, and one whose copy the
-    // store could not read is unavailable, not absent.
-    if let Some(e) = read_failure.as_ref().filter(|_| internal.is_some()) {
-        return crate::registry::local_copy_unreadable("gems", &storage_key, e);
-    }
-    if let Some(response) = internal.as_deref().and_then(|name| {
-        crate::curation::check_namespace_isolation(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Gems,
-            name,
-        )
-    }) {
-        return response;
-    }
-
-    let Some(proxy_url) = upstream_url(&state) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let url = format!(
-        "{}/quick/Marshal.4.8/{}.gemspec.rz",
-        proxy_url.trim_end_matches('/'),
-        artifact
-    );
-
-    match proxy_fetch(
-        &state.http_client,
-        &url,
-        Duration::from_secs(state.config.gems.proxy_timeout),
-        expose_opt(&state.config.gems.proxy_auth).map(UpstreamAuth::Basic),
-        &state.circuit_breaker,
-        RegistryType::Gems,
-    )
-    .await
-    {
-        Ok(bytes) => {
-            state.metrics.record_download("gems");
-            state.metrics.record_cache_miss("gems");
-            state.activity.push(ActivityEntry::new(
-                ActionType::ProxyFetch,
-                artifact,
-                crate::registry_type::RegistryType::Gems,
-                "PROXY",
-            ));
-            state
-                .audit
-                .log(AuditEntry::new("proxy_fetch", "proxy", "", "gems", ""));
-
-            state.spawn_cache_immutable("gems", storage_key, Bytes::from(bytes.clone()));
-            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                state.config.curation.gems.quarantine.as_ref().or(state
-                    .config
-                    .curation
-                    .quarantine
-                    .as_ref()),
-                state
-                    .config
-                    .curation
-                    .gems
-                    .quarantine_ttl
-                    .as_deref()
-                    .or(state.config.curation.quarantine_ttl.as_deref()),
-            );
-            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
-                &state.digest_store,
-                "gems",
-                &bytes,
-                &q_mode,
-                q_secs,
-                &url,
-                publish_date,
-            ) {
-                return resp;
-            }
-            with_binary(bytes, "application/octet-stream")
-        }
-        Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
-        Err(e) => {
-            tracing::debug!(error = ?e, "RubyGems gemspec error");
+            tracing::debug!(error = ?e, "RubyGems file download error");
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
@@ -3222,6 +3132,114 @@ mod gem_file_decisions {
             .unwrap();
         let resp = send(&ctx.app, Method::GET, "/gems/gems/evil-1-2.0-java.gem", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // R5 pairs: a `.gem` and its gemspec are served by one function. An internal name with no
+    // local copy fails closed on both paths with the same answer, and neither asks upstream.
+    #[tokio::test]
+    async fn both_files_of_an_internal_gem_fail_closed_alike() {
+        let upstream = upstream().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["corp-*".to_string()];
+        });
+        let mut statuses = Vec::new();
+        for path in [
+            "/gems/gems/corp-tools-1.0.0.gem",
+            "/gems/quick/Marshal.4.8/corp-tools-1.0.0.gemspec.rz",
+        ] {
+            statuses.push(send(&ctx.app, Method::GET, path, "").await.status());
+        }
+        assert_eq!(statuses, [StatusCode::FORBIDDEN, StatusCode::FORBIDDEN]);
+        let asked = asked(&upstream).await;
+        assert!(asked.is_empty(), "asked upstream: {asked:?}");
+    }
+
+    // R5 pairs: the allowlist pin names the `.gem`'s digest, so it holds the `.gem` (cached and
+    // fetched) and never its gemspec, whose bytes differ by construction.
+    #[tokio::test]
+    async fn only_the_gem_is_held_to_its_pin() {
+        let upstream = upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = write(
+            &dir,
+            "allowlist.json",
+            &format!(
+                r#"{{"version": 1, "entries": [
+                    {{"registry": "gems", "name": "pinned", "version": "1.0", "integrity": "sha256:{}"}}
+                ]}}"#,
+                "0".repeat(64)
+            ),
+        );
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        let gem = "/gems/gems/pinned-1.0.gem";
+        let gemspec = "/gems/quick/Marshal.4.8/pinned-1.0.gemspec.rz";
+        // First download, from upstream.
+        assert_eq!(
+            send(&ctx.app, Method::GET, gem, "").await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(&ctx.app, Method::GET, gemspec, "").await.status(),
+            StatusCode::OK
+        );
+        // Cached copies.
+        for key in [
+            "gems/gems/pinned-1.0.gem",
+            "gems/quick/Marshal.4.8/pinned-1.0.gemspec.rz",
+        ] {
+            ctx.state.storage.put(key, b"GEM").await.unwrap();
+        }
+        assert_eq!(
+            send(&ctx.app, Method::GET, gem, "").await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(&ctx.app, Method::GET, gemspec, "").await.status(),
+            StatusCode::OK
+        );
+    }
+
+    // R5 pairs: only the `.gem` offers ranged reads; its gemspec is served whole.
+    #[tokio::test]
+    async fn only_the_gem_offers_ranges() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+        });
+        for key in [
+            "gems/gems/plain-1.0.gem",
+            "gems/quick/Marshal.4.8/plain-1.0.gemspec.rz",
+        ] {
+            ctx.state.storage.put(key, b"GEM").await.unwrap();
+        }
+        let gem = send(&ctx.app, Method::GET, "/gems/gems/plain-1.0.gem", "").await;
+        assert_eq!(gem.status(), StatusCode::OK);
+        assert_eq!(
+            gem.headers()
+                .get(axum::http::header::ACCEPT_RANGES)
+                .unwrap(),
+            "bytes"
+        );
+        let gemspec = send(
+            &ctx.app,
+            Method::GET,
+            "/gems/quick/Marshal.4.8/plain-1.0.gemspec.rz",
+            "",
+        )
+        .await;
+        assert_eq!(gemspec.status(), StatusCode::OK);
+        assert!(gemspec
+            .headers()
+            .get(axum::http::header::ACCEPT_RANGES)
+            .is_none());
     }
 }
 
