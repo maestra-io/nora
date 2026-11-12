@@ -214,7 +214,9 @@ pub(crate) fn forget_old_confirmations(grace_secs: u64) {
         .retain(|_, at| at.elapsed().as_secs() < grace_secs);
 }
 
-fn recently_confirmed(key: &str, grace_secs: u64) -> bool {
+/// Whether `key` was confirmed to a client within `grace_secs`. Read under the key's publish
+/// lock, the answer holds until the lock is released.
+pub(crate) fn recently_confirmed(key: &str, grace_secs: u64) -> bool {
     CONFIRMED_BLOBS
         .lock()
         .get(key)
@@ -5238,5 +5240,143 @@ mod fail_closed_tests {
         let result = gc(&storage, 7 * DAY).await;
         assert_eq!((result.deleted, result.skipped_recent), (0, 1));
         assert!(storage.stat(&key).await.is_some());
+    }
+
+    fn one_layer_manifest(digest: &str, size: usize) -> String {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "size": size,
+                "digest": digest
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                "size": size,
+                "digest": digest
+            }]
+        })
+        .to_string()
+    }
+
+    /// A manifest push checks its layers through `confirm_blob`, under the lock the sweep
+    /// deletes under. A sweep that marked before the manifest landed and holds the layer's
+    /// lock when the push checks it either deletes the layer first, and the push is refused,
+    /// or sees the push's confirmation and keeps it. Before, the check was a bare `stat`: the
+    /// push stored its manifest and the sweep then deleted the layer under it.
+    #[tokio::test]
+    async fn a_sweep_racing_a_manifest_push_never_leaves_it_without_its_layer() {
+        use sha2::Digest;
+        let (storage, outage) = outage_storage();
+        let layer = b"race layer";
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(layer)));
+        let key = format!("docker/race-push/blobs/{digest}");
+        storage.put(&key, layer).await.unwrap();
+        outage.age_all(30 * DAY);
+        let ctx = crate::test_helpers::create_test_context_with_storage_and_config(
+            storage.clone(),
+            |config| config.gc.enabled = true,
+        );
+        let publish_locks = ctx.state.publish_locks.clone();
+
+        // The sweep has marked (no manifest references the layer) and waits for its lock.
+        let lock = crate::acquire_publish_lock(&publish_locks, &key);
+        let held = lock.lock().await;
+        let sweep = tokio::spawn({
+            let (storage, publish_locks) = (storage.clone(), publish_locks.clone());
+            async move {
+                let curation = crate::curation::CurationEngine::new(Default::default());
+                run_gc(
+                    &storage,
+                    &publish_locks,
+                    false,
+                    7 * DAY,
+                    false,
+                    false,
+                    0,
+                    &curation,
+                )
+                .await
+            }
+        });
+        while std::sync::Arc::strong_count(&lock) < 3 {
+            tokio::task::yield_now().await;
+        }
+        let push = tokio::spawn({
+            let app = ctx.app.clone();
+            let body = one_layer_manifest(&digest, layer.len());
+            async move {
+                crate::test_helpers::send(
+                    &app,
+                    axum::http::Method::PUT,
+                    "/v2/race-push/manifests/v1",
+                    body,
+                )
+                .await
+            }
+        });
+        // The push either finishes without the lock or queues behind the sweep for it.
+        while !push.is_finished() && std::sync::Arc::strong_count(&lock) < 4 {
+            tokio::task::yield_now().await;
+        }
+        drop(held);
+        let (sweep, push) = (sweep.await.unwrap(), push.await.unwrap());
+
+        let stored = storage
+            .stat("docker/race-push/manifests/v1.json")
+            .await
+            .is_some();
+        let layer_left = storage.stat(&key).await.is_some();
+        assert!(!stored || layer_left, "a stored manifest lost its layer");
+        assert_eq!(
+            (sweep.deleted, push.status()),
+            (1, axum::http::StatusCode::BAD_REQUEST),
+            "the sweep queued first deletes, the push then finds no layer"
+        );
+    }
+
+    /// A blob `DELETE` keeps what a client was told exists within the grace, as the sweep
+    /// does: after a `HEAD` 200, or a manifest push that checked the layer, the delete is 409
+    /// and the blob stays. A blob nobody asked about is deleted.
+    #[tokio::test]
+    async fn a_blob_delete_keeps_what_a_push_was_told_exists() {
+        use axum::http::{Method, StatusCode};
+        use sha2::Digest;
+        let (storage, _outage) = outage_storage();
+        let blob = |data: &[u8]| format!("sha256:{}", hex::encode(sha2::Sha256::digest(data)));
+        let (headed, pushed, unused) = (blob(b"headed"), blob(b"pushed"), blob(b"unused"));
+        for (digest, data) in [
+            (&headed, b"headed"),
+            (&pushed, b"pushed"),
+            (&unused, b"unused"),
+        ] {
+            let key = format!("docker/c06-delete/blobs/{digest}");
+            storage.put(&key, data).await.unwrap();
+        }
+        let ctx = crate::test_helpers::create_test_context_with_storage_and_config(
+            storage.clone(),
+            |config| config.gc.enabled = true,
+        );
+        let send = |method, uri: String, body: String| {
+            let app = ctx.app.clone();
+            async move { crate::test_helpers::send(&app, method, &uri, body).await }
+        };
+        let blob_uri = |digest: &str| format!("/v2/c06-delete/blobs/{digest}");
+
+        let head = send(Method::HEAD, blob_uri(&headed), String::new()).await;
+        assert_eq!(head.status(), StatusCode::OK);
+        let manifest = one_layer_manifest(&pushed, 6);
+        let put = send(Method::PUT, "/v2/c06-delete/manifests/v1".into(), manifest).await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        for digest in [&headed, &pushed] {
+            let delete = send(Method::DELETE, blob_uri(digest), String::new()).await;
+            assert_eq!(delete.status(), StatusCode::CONFLICT, "{digest}");
+            let key = format!("docker/c06-delete/blobs/{digest}");
+            assert!(storage.stat(&key).await.is_some(), "{digest} stays");
+        }
+        let delete = send(Method::DELETE, blob_uri(&unused), String::new()).await;
+        assert_eq!(delete.status(), StatusCode::ACCEPTED);
     }
 }
