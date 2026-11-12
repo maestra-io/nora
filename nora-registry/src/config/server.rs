@@ -79,7 +79,7 @@ pub struct ServerConfig {
     /// caps. Default 512.
     #[serde(default = "default_publish_body_limit_mb")]
     pub publish_body_limit_mb: usize,
-    /// Proxied NuGet/npm/PyPI artifacts larger than this many MB are never held in
+    /// Proxied NuGet/npm/PyPI/Maven artifacts larger than this many MB are never held in
     /// memory whole: a cold miss is spooled to a temp file under `spool_dir`
     /// and served from it, a cache hit is streamed from storage with its digest
     /// checked as it streams. Smaller ones are buffered as before. Default 16;
@@ -108,7 +108,7 @@ pub struct ServerConfig {
     /// with 507 on its `Content-Length`, or as soon as the running count crosses the
     /// cap, instead of being buffered until the process is OOM-killed. Default 512
     /// (the largest npm packuments are about 40 MB); 0 = no cap. Not a bound on the
-    /// artifacts that spool (NuGet, npm, PyPI, helm, apk, GitHub): those keep up to
+    /// artifacts that spool (NuGet, npm, PyPI, Maven, helm, apk, GitHub): those keep up to
     /// `stream_threshold_mb` in memory whatever this says, and are under this cap only
     /// with `stream_threshold_mb = 0`, when they are held whole in memory.
     #[serde(default = "default_proxy_max_buffered_mb")]
