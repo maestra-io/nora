@@ -348,21 +348,18 @@ fn compact(tokens: &impl ToString) -> String {
     tokens.to_string().split_whitespace().collect()
 }
 
-/// `text` cut at its commas outside parentheses and brackets, empty parts left out.
-fn top_level_parts(text: &str) -> Vec<&str> {
-    let (mut depth, mut start, mut parts) = (0usize, 0, Vec::new());
-    for (i, c) in text.char_indices() {
-        match c {
-            '(' | '[' => depth += 1,
-            ')' | ']' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(&text[start..i]);
-                start = i + 1;
-            }
-            _ => {}
+/// `tokens` cut at their top-level commas, each part without whitespace, empty parts
+/// left out. Token by token: a delimiter inside a group or a string literal is no cut.
+fn top_level_parts<T: ToString>(tokens: impl IntoIterator<Item = T>) -> Vec<String> {
+    let mut parts = vec![String::new()];
+    for token in tokens {
+        let token = compact(&token);
+        if token == "," {
+            parts.push(String::new());
+        } else {
+            parts.last_mut().unwrap().push_str(&token);
         }
     }
-    parts.push(&text[start..]);
     parts.retain(|p| !p.is_empty());
     parts
 }
@@ -447,17 +444,18 @@ impl<'ast> syn::visit::Visit<'ast> for CompiledWhen {
         if path.is_ident("cfg") {
             self.predicates.push(compact(&list.tokens));
         } else if path.is_ident("cfg_attr") {
-            let all = compact(&list.tokens);
-            // The condition, then every attribute it applies, cut at the commas outside
-            // parentheses: an `any(a,b)` condition holds commas of its own, and one
+            // The condition, then every attribute it applies, cut at the top-level
+            // commas: an `any(a,b)` condition holds commas of its own, and one
             // `cfg_attr` may apply several attributes.
-            let parts = top_level_parts(&all);
-            let (predicate, applied) = parts.split_first().unwrap_or((&"", &[]));
-            self.predicates.push((*predicate).to_owned());
+            let parts = top_level_parts(list.tokens.clone());
+            let (predicate, applied) = parts
+                .split_first()
+                .map_or(("", &[][..]), |(p, a)| (p.as_str(), a));
+            self.predicates.push(predicate.to_owned());
             if applied.is_empty() {
                 self.applied.push(String::new());
             }
-            self.applied.extend(applied.iter().map(|a| (*a).to_owned()));
+            self.applied.extend(applied.iter().cloned());
         }
     }
 
@@ -594,6 +592,7 @@ fn every_way_to_compile_fault_injection_otherwise_is_found() {
     for bad in [
         "#[cfg_attr(unix, path = \"fault_injection.rs\")] mod fi;",
         "#[cfg_attr(unix, allow(dead_code), path = \"fault_injection.rs\")] mod fi;",
+        "#[cfg_attr(unix, allow(dead_code, reason = \"(\"), path = \"fault_injection.rs\")] mod fi;",
     ] {
         let found = CompiledWhen::read(bad);
         assert!(
@@ -607,6 +606,13 @@ fn every_way_to_compile_fault_injection_otherwise_is_found() {
     }
     let two = CompiledWhen::read("#[cfg_attr(test, allow(a), deny(b))] fn f() {}");
     assert_eq!(two.applied, ["allow(a)", "deny(b)"]);
+    let quoted = CompiledWhen::read(
+        "#[cfg_attr(test, allow(dead_code, reason = \"),\"), deny(unused_variables))] fn f() {}",
+    );
+    assert_eq!(
+        quoted.applied,
+        [r#"allow(dead_code,reason="),")"#, "deny(unused_variables)"]
+    );
     for bad in [
         "#[path = \"fault_injection.rs\"]\nmod fi;",
         "fn f() { include!(concat!(\"fault_\", \"injection.rs\")); }",

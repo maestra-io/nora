@@ -136,7 +136,10 @@ async fn in_flight_download_finishes_within_the_deadline() {
         all
     });
     // The signal comes once the response has started, however slow the runner.
-    has_started.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), has_started)
+        .await
+        .expect("the response started")
+        .unwrap();
     stop.send(()).unwrap();
     let end = tokio::time::timeout(Duration::from_secs(5), server)
         .await
