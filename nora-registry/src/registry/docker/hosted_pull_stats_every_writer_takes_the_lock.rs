@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 
 const BLOB: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-/// Holds the next put and/or the next delete of one key until released.
+/// Holds the next put, delete and/or read of one key until released.
 struct Held {
     inner: Arc<dyn StorageBackend>,
     key: String,
@@ -25,6 +25,9 @@ struct Held {
     hold_delete: AtomicBool,
     del_reached: Notify,
     del_release: Notify,
+    hold_get: AtomicBool,
+    get_reached: Notify,
+    get_release: Notify,
 }
 
 #[async_trait::async_trait]
@@ -37,6 +40,10 @@ impl StorageBackend for Held {
         self.inner.put(key, data, sha256).await
     }
     async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+        if key == self.key && self.hold_get.swap(false, Ordering::SeqCst) {
+            self.get_reached.notify_one();
+            self.get_release.notified().await;
+        }
         self.inner.get(key).await
     }
     async fn pin(&self, key: &str) -> Option<String> {
@@ -143,6 +150,9 @@ async fn fx(local: bool, held_key: impl Fn(&str) -> String) -> Fx {
         hold_delete: AtomicBool::new(false),
         del_reached: Notify::new(),
         del_release: Notify::new(),
+        hold_get: AtomicBool::new(false),
+        get_reached: Notify::new(),
+        get_release: Notify::new(),
     });
     let mut state = ctx.state.clone();
     state.storage = Storage::from_backend(held.clone());
@@ -358,5 +368,48 @@ async fn a_delete_holds_the_lock_until_the_metadata_is_gone() {
         date(&f.state, "v1").await,
         None,
         "a deleted push's date survived the delete"
+    );
+}
+
+/// Two pushes of different manifests to one tag at once: the tag's lock makes the second
+/// wait for the first, so the tag and its push metadata end on one digest. Without it the
+/// second push writes its tag and metadata while the first is paused between the two (reading
+/// the image config), and the first then records its own digest beside the other's manifest.
+// lock-audit: concurrent-publish-test
+#[tokio::test(start_paused = true)]
+async fn concurrent_pushes_of_one_tag_leave_tag_and_metadata_on_one_digest() {
+    use sha2::Digest as _;
+    let f = fx(false, |_| format!("docker/race-img/blobs/{BLOB}")).await;
+    let mut other: serde_json::Value = serde_json::from_slice(&f.manifest).unwrap();
+    other["annotations"] = serde_json::json!({"push": "second"});
+    let other = Bytes::from(serde_json::to_vec(&other).unwrap());
+
+    f.held.hold_get.store(true, Ordering::SeqCst);
+    let first = tokio::spawn(push(f.state.clone(), "latest".into(), f.manifest.clone()));
+    reached(&f.held.get_reached, "first push's config read not reached").await;
+    let second = tokio::spawn(push(f.state.clone(), "latest".into(), other));
+    // Paused clock: this returns once the second push is blocked or done.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    f.held.get_release.notify_one();
+    assert_eq!(first.await.unwrap(), StatusCode::CREATED);
+    assert_eq!(second.await.unwrap(), StatusCode::CREATED);
+
+    let tag = f
+        .state
+        .storage
+        .get("docker/race-img/manifests/latest.json")
+        .await
+        .unwrap();
+    let meta = f
+        .state
+        .storage
+        .get(&super::manifest_meta_key(None, "race-img", "latest"))
+        .await
+        .unwrap();
+    let meta: serde_json::Value = serde_json::from_slice(&meta).unwrap();
+    assert_eq!(
+        meta["pushed_digest"],
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(&tag))).as_str(),
+        "the tag's metadata names another push's manifest"
     );
 }

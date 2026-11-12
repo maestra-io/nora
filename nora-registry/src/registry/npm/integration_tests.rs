@@ -1635,6 +1635,7 @@ async fn publish_refuses_a_path_that_is_not_a_package_name() {
 
 /// R4-T05: concurrent publishes of different versions serialize on the package's
 /// publish lock: the packument lists every one of them.
+// lock-audit: concurrent-publish-test
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_publishes_keep_every_version() {
     let ctx = create_test_context();

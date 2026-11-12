@@ -1197,3 +1197,72 @@ async fn a_release_upload_under_an_empty_segment_never_overwrites() {
     .await;
     assert_eq!(&body_bytes(get).await[..], b"v1");
 }
+
+/// Deploys of different versions of one artifact at once serialize on its metadata lock:
+/// `maven-metadata.xml`, rebuilt from a listing on every deploy, names every version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_deploys_keep_every_version_in_the_metadata() {
+    let ctx = create_test_context();
+    let deploys = (0..16).map(|i| {
+        let app = ctx.app.clone();
+        tokio::spawn(async move {
+            let uri = format!("/maven2/com/example/race/1.0.{i}/race-1.0.{i}.jar");
+            send(&app, Method::PUT, &uri, Body::from(format!("v{i}")))
+                .await
+                .status()
+        })
+    });
+    for d in futures::future::join_all(deploys).await {
+        assert_eq!(d.unwrap(), StatusCode::CREATED);
+    }
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/maven2/com/example/race/maven-metadata.xml",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let xml = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+    for i in 0..16 {
+        assert!(
+            xml.contains(&format!("<version>1.0.{i}</version>")),
+            "1.0.{i}: {xml}"
+        );
+    }
+}
+
+/// Deploys of one release version at once: exactly one is stored, the rest are
+/// conflicts, and the stored jar and its checksum come from the same deploy.
+// lock-audit: concurrent-publish-test
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_deploys_of_one_release_store_it_once() {
+    let ctx = create_test_context();
+    let uri = "/maven2/com/example/once/1.0.0/once-1.0.0.jar";
+    let deploys = (0..8).map(|i| {
+        let app = ctx.app.clone();
+        tokio::spawn(async move {
+            send(&app, Method::PUT, uri, Body::from(format!("deploy-{i}")))
+                .await
+                .status()
+        })
+    });
+    let mut statuses = Vec::new();
+    for d in futures::future::join_all(deploys).await {
+        statuses.push(d.unwrap());
+    }
+    let created = statuses.iter().filter(|s| **s == StatusCode::CREATED);
+    assert_eq!(created.count(), 1, "{statuses:?}");
+    assert!(
+        statuses
+            .iter()
+            .all(|s| matches!(*s, StatusCode::CREATED | StatusCode::CONFLICT)),
+        "{statuses:?}"
+    );
+    let jar = body_bytes(send(&ctx.app, Method::GET, uri, "").await).await;
+    let sum = body_bytes(send(&ctx.app, Method::GET, &format!("{uri}.sha256"), "").await).await;
+    assert_eq!(
+        String::from_utf8_lossy(&sum).trim(),
+        hex::encode(sha2::Sha256::digest(&jar))
+    );
+}

@@ -2567,3 +2567,92 @@ async fn an_upload_under_an_empty_segment_name_never_overwrites_a_release() {
         b"original"
     );
 }
+
+/// Uploads of one file at once: the file's lock lets exactly one through and the rest are
+/// conflicts; the stored file and its sha256 sidecar come from the same upload.
+// lock-audit: concurrent-publish-test
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_uploads_of_one_file_store_it_once() {
+    let ctx = create_test_context();
+    let uploads = (0..8).map(|i| {
+        let app = ctx.app.clone();
+        tokio::spawn(async move {
+            let content = format!("sdist-{i}").into_bytes();
+            twine_upload(
+                &app,
+                &[
+                    ("name", "race"),
+                    ("version", "1.0"),
+                    ("sha256_digest", &sha256_hex(&content)),
+                ],
+                "race-1.0.tar.gz",
+                &content,
+            )
+            .await
+            .status()
+        })
+    });
+    let mut statuses = Vec::new();
+    for u in futures::future::join_all(uploads).await {
+        statuses.push(u.unwrap());
+    }
+    let stored = statuses.iter().filter(|s| **s == StatusCode::OK);
+    assert_eq!(stored.count(), 1, "{statuses:?}");
+    assert!(
+        statuses
+            .iter()
+            .all(|s| matches!(*s, StatusCode::OK | StatusCode::CONFLICT)),
+        "{statuses:?}"
+    );
+    let storage = &ctx.state.storage;
+    let file = storage.get("pypi/race/race-1.0.tar.gz").await.unwrap();
+    let sidecar = storage
+        .get("pypi/race/race-1.0.tar.gz.sha256")
+        .await
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&sidecar), sha256_hex(&file));
+}
+
+/// Uploads of different files of one project at once: the project's `requires-python`
+/// record, read and rewritten by each, keeps every file's entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_uploads_keep_every_requires_python_entry() {
+    let ctx = create_test_context();
+    let uploads = (0..12).map(|i| {
+        let app = ctx.app.clone();
+        tokio::spawn(async move {
+            let content = format!("sdist-{i}").into_bytes();
+            let version = format!("1.{i}");
+            twine_upload(
+                &app,
+                &[
+                    ("name", "many"),
+                    ("version", &version),
+                    ("sha256_digest", &sha256_hex(&content)),
+                    ("requires_python", ">=3.9"),
+                ],
+                &format!("many-{version}.tar.gz"),
+                &content,
+            )
+            .await
+            .status()
+        })
+    });
+    for u in futures::future::join_all(uploads).await {
+        assert_eq!(u.unwrap(), StatusCode::OK);
+    }
+    let record = ctx
+        .state
+        .storage
+        .get("pypi/many/requires-python.json")
+        .await
+        .unwrap();
+    let record: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&record).unwrap();
+    for i in 0..12 {
+        assert!(
+            record.contains_key(&format!("many-1.{i}.tar.gz")),
+            "1.{i}: {record:?}"
+        );
+    }
+}
