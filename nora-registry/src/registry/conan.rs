@@ -203,7 +203,30 @@ async fn recipe_latest(
     }
 
     let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
-    let storage_key = format!("conan/{}/latest.json", ref_str);
+    serve_mutable_json(&state, &name, &ref_str, "latest").await
+}
+
+// ── Recipe revisions (TTL cached) ─────────────────────────────────────
+
+async fn recipe_revisions(
+    State(state): State<AppState>,
+    Path((name, ver, user, chan)): Path<(String, String, String, String)>,
+) -> Response {
+    if !is_valid_ref(&name) || !is_valid_ref(&ver) || !is_valid_ref(&user) || !is_valid_ref(&chan) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
+    serve_mutable_json(&state, &name, &ref_str, "revisions").await
+}
+
+/// A mutable, TTL-cached JSON document of reference `ref_str` (`rel` under
+/// `/v2/conans/{ref}/`: a recipe or package `latest` or `revisions` listing). Every one of them
+/// is answered here: a fresh copy (written, or confirmed by a 304, within `metadata_ttl`), else
+/// for an internal-namespace recipe its local copy or the isolation refusal, never the upstream
+/// (#68 dependency confusion), else the upstream, with the stale copy kept for its failure.
+async fn serve_mutable_json(state: &AppState, name: &str, ref_str: &str, rel: &str) -> Response {
+    let storage_key = format!("conan/{}/{}.json", ref_str, rel);
 
     // Eager cache read — preserve data for serve-stale fallback
     let (cached_data, read_failure) =
@@ -221,17 +244,14 @@ async fn recipe_latest(
         }
     }
 
-    // #68 namespace isolation: an internal-namespace recipe must never be fetched
-    // upstream (dependency confusion). Serve any local copy (the fresh path returned
-    // above), else block — never proxy.
     if crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
         crate::curation::RegistryType::Conan,
-        &name,
+        name,
     ) {
         return internal_answer(
-            &state,
-            &name,
+            state,
+            name,
             cached_data.as_deref(),
             read_failure.as_ref(),
             &storage_key,
@@ -239,70 +259,15 @@ async fn recipe_latest(
     }
 
     // The fetch helpers answer from storage alone when the upstream is switched off.
-    let proxy_url = upstream_url(&state).unwrap_or_default();
+    let proxy_url = upstream_url(state).unwrap_or_default();
     let url = format!(
-        "{}/v2/conans/{}/latest",
+        "{}/v2/conans/{}/{}",
         proxy_url.trim_end_matches('/'),
-        ref_str
+        ref_str,
+        rel
     );
 
-    fetch_and_cache_json(&state, &url, &storage_key, &ref_str, cached_data).await
-}
-
-// ── Recipe revisions (TTL cached) ─────────────────────────────────────
-
-async fn recipe_revisions(
-    State(state): State<AppState>,
-    Path((name, ver, user, chan)): Path<(String, String, String, String)>,
-) -> Response {
-    if !is_valid_ref(&name) || !is_valid_ref(&ver) || !is_valid_ref(&user) || !is_valid_ref(&chan) {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-
-    let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
-    let storage_key = format!("conan/{}/revisions.json", ref_str);
-
-    let (cached_data, read_failure) =
-        crate::registry::cached_read(state.storage.get(&storage_key).await);
-    if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
-            let ttl = state.config.conan.metadata_ttl;
-            if crate::registry::fresh_within_ttl(&state.storage, &storage_key, meta.modified, ttl)
-                .await
-            {
-                state.metrics.record_download("conan");
-                state.metrics.record_cache_hit("conan");
-                return with_json(data.to_vec());
-            }
-        }
-    }
-
-    // #68 namespace isolation: an internal-namespace recipe must never be fetched
-    // upstream (dependency confusion). Serve any local copy (the fresh path returned
-    // above), else block — never proxy.
-    if crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Conan,
-        &name,
-    ) {
-        return internal_answer(
-            &state,
-            &name,
-            cached_data.as_deref(),
-            read_failure.as_ref(),
-            &storage_key,
-        );
-    }
-
-    // The fetch helpers answer from storage alone when the upstream is switched off.
-    let proxy_url = upstream_url(&state).unwrap_or_default();
-    let url = format!(
-        "{}/v2/conans/{}/revisions",
-        proxy_url.trim_end_matches('/'),
-        ref_str
-    );
-
-    fetch_and_cache_json(&state, &url, &storage_key, &ref_str, cached_data).await
+    fetch_and_cache_json(state, &url, &storage_key, ref_str, cached_data).await
 }
 
 // ── Recipe file listing (immutable — scoped to revision) ──────────────
@@ -426,54 +391,13 @@ async fn package_latest(
     }
 
     let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
-    let storage_key = format!(
-        "conan/{}/revisions/{}/packages/{}/latest.json",
-        ref_str, rrev, pkg_id
-    );
-
-    let (cached_data, read_failure) =
-        crate::registry::cached_read(state.storage.get(&storage_key).await);
-    if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
-            let ttl = state.config.conan.metadata_ttl;
-            if crate::registry::fresh_within_ttl(&state.storage, &storage_key, meta.modified, ttl)
-                .await
-            {
-                state.metrics.record_download("conan");
-                state.metrics.record_cache_hit("conan");
-                return with_json(data.to_vec());
-            }
-        }
-    }
-
-    // #68 namespace isolation: an internal-namespace package must never be fetched
-    // upstream (dependency confusion). Serve any local copy (the fresh path returned
-    // above), else block — never proxy.
-    if crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Conan,
+    serve_mutable_json(
+        &state,
         &name,
-    ) {
-        return internal_answer(
-            &state,
-            &name,
-            cached_data.as_deref(),
-            read_failure.as_ref(),
-            &storage_key,
-        );
-    }
-
-    // The fetch helpers answer from storage alone when the upstream is switched off.
-    let proxy_url = upstream_url(&state).unwrap_or_default();
-    let url = format!(
-        "{}/v2/conans/{}/revisions/{}/packages/{}/latest",
-        proxy_url.trim_end_matches('/'),
-        ref_str,
-        rrev,
-        pkg_id
-    );
-
-    fetch_and_cache_json(&state, &url, &storage_key, &ref_str, cached_data).await
+        &ref_str,
+        &format!("revisions/{rrev}/packages/{pkg_id}/latest"),
+    )
+    .await
 }
 
 // ── Package revisions (TTL cached) ────────────────────────────────────
@@ -500,54 +424,13 @@ async fn package_revisions(
     }
 
     let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
-    let storage_key = format!(
-        "conan/{}/revisions/{}/packages/{}/revisions.json",
-        ref_str, rrev, pkg_id
-    );
-
-    let (cached_data, read_failure) =
-        crate::registry::cached_read(state.storage.get(&storage_key).await);
-    if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
-            let ttl = state.config.conan.metadata_ttl;
-            if crate::registry::fresh_within_ttl(&state.storage, &storage_key, meta.modified, ttl)
-                .await
-            {
-                state.metrics.record_download("conan");
-                state.metrics.record_cache_hit("conan");
-                return with_json(data.to_vec());
-            }
-        }
-    }
-
-    // #68 namespace isolation: an internal-namespace package must never be fetched
-    // upstream (dependency confusion). Serve any local copy (the fresh path returned
-    // above), else block — never proxy.
-    if crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Conan,
+    serve_mutable_json(
+        &state,
         &name,
-    ) {
-        return internal_answer(
-            &state,
-            &name,
-            cached_data.as_deref(),
-            read_failure.as_ref(),
-            &storage_key,
-        );
-    }
-
-    // The fetch helpers answer from storage alone when the upstream is switched off.
-    let proxy_url = upstream_url(&state).unwrap_or_default();
-    let url = format!(
-        "{}/v2/conans/{}/revisions/{}/packages/{}/revisions",
-        proxy_url.trim_end_matches('/'),
-        ref_str,
-        rrev,
-        pkg_id
-    );
-
-    fetch_and_cache_json(&state, &url, &storage_key, &ref_str, cached_data).await
+        &ref_str,
+        &format!("revisions/{rrev}/packages/{pkg_id}/revisions"),
+    )
+    .await
 }
 
 // ── Package file listing (immutable — scoped to PREV) ─────────────────
@@ -1124,8 +1007,6 @@ async fn extract_conan_publish_date(
     crate::curation::parse_iso8601_to_unix(date_str)
 }
 
-/// The configured upstream, or None when the operator switched it off with an empty
-/// NORA_CONAN_PROXY: then nothing is asked of any upstream.
 /// What an internal-namespace reference gets once no fresh copy answered it (#68):
 /// never the upstream. The stored JSON, else the isolation refusal (404 without one); a
 /// copy the store could not read is unavailable, not absent.
@@ -1152,6 +1033,8 @@ fn internal_answer(
     .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
 }
 
+/// The configured upstream, or None when the operator switched it off with an empty
+/// NORA_CONAN_PROXY: then nothing is asked of any upstream.
 fn upstream_url(state: &AppState) -> Option<String> {
     crate::config::configured_upstream(&state.config.conan.proxy).map(str::to_string)
 }
@@ -2127,5 +2010,131 @@ mod quarantine_first_seen {
             StatusCode::OK,
             "package"
         );
+    }
+}
+
+/// R5 pairs: the recipe and package `latest` and `revisions` listings are answered by one
+/// function, so they cache, isolate and fetch alike: each is asked upstream under its own path
+/// and cached under its own key, a fresh copy is served without asking, and an internal recipe
+/// is never asked about.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod mutable_listings_alike {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const RREV: &str = "0123456789abcdef0123456789abcdef";
+    const PKG: &str = "fedcba9876543210fedcba9876543210";
+
+    /// (request path, upstream path, cache key) of each listing of `name`.
+    fn listings(name: &str) -> Vec<(String, String, String)> {
+        let reference = format!("{name}/1.0/_/_");
+        [
+            "latest".to_string(),
+            "revisions".to_string(),
+            format!("revisions/{RREV}/packages/{PKG}/latest"),
+            format!("revisions/{RREV}/packages/{PKG}/revisions"),
+        ]
+        .into_iter()
+        .map(|rel| {
+            (
+                format!("/conan/v2/conans/{reference}/{rel}"),
+                format!("/v2/conans/{reference}/{rel}"),
+                format!("conan/{reference}/{rel}.json"),
+            )
+        })
+        .collect()
+    }
+
+    async fn upstream() -> MockServer {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "revisions": []
+            })))
+            .mount(&upstream)
+            .await;
+        upstream
+    }
+
+    async fn asked(upstream: &MockServer) -> Vec<String> {
+        upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn each_listing_is_asked_upstream_under_its_own_path() {
+        let upstream = upstream().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.conan.enabled = true;
+            cfg.conan.proxy = Some(uri);
+            cfg.conan.metadata_ttl = 3600;
+        });
+        let listings = listings("zlib");
+        for (path, _, _) in &listings {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        }
+        let expected: Vec<String> = listings.iter().map(|(_, up, _)| up.clone()).collect();
+        assert_eq!(asked(&upstream).await, expected);
+    }
+
+    #[tokio::test]
+    async fn each_fresh_listing_is_served_from_its_own_key() {
+        let upstream = upstream().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.conan.enabled = true;
+            cfg.conan.proxy = Some(uri);
+            cfg.conan.metadata_ttl = 3600;
+        });
+        for (path, _, key) in listings("zlib") {
+            let body = format!("{{\"key\":\"{key}\"}}");
+            ctx.state.storage.put(&key, body.as_bytes()).await.unwrap();
+            let resp = send(&ctx.app, Method::GET, &path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            assert_eq!(&body_bytes(resp).await[..], body.as_bytes(), "{path}");
+        }
+        let asked = asked(&upstream).await;
+        assert!(asked.is_empty(), "asked upstream: {asked:?}");
+    }
+
+    #[tokio::test]
+    async fn an_internal_recipe_is_never_asked_about_on_any_listing() {
+        let upstream = upstream().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.conan.enabled = true;
+            cfg.conan.proxy = Some(uri);
+            cfg.conan.metadata_ttl = 0; // every copy stale
+            cfg.curation.internal_namespaces = vec!["corp-*".to_string()];
+        });
+        let listings = listings("corp-lib");
+        // No local copy: refused.
+        for (path, _, _) in &listings {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        // A stale local copy: served as it is.
+        for (path, _, key) in &listings {
+            ctx.state
+                .storage
+                .put(key, b"{\"local\":true}")
+                .await
+                .unwrap();
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            assert_eq!(&body_bytes(resp).await[..], b"{\"local\":true}");
+        }
+        let asked = asked(&upstream).await;
+        assert!(asked.is_empty(), "asked upstream: {asked:?}");
     }
 }
