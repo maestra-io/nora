@@ -24,19 +24,27 @@ Defined **in fluxcd, not in this repo**: `metrics.prometheusRule.extraGroups`, g
 change with a fluxcd PR only. The HelmRelease has
 `kustomize.toolkit.fluxcd.io/substitute: disabled`, so `{{ $value }}` is safe there.
 
-The only OIDC provider is `github-actions` (issuer
-`https://token.actions.githubusercontent.com`, audience `packages.maestra.io`), so the
-alert means **OIDC key-validation failures for tokens claiming that issuer**. It is not
-proof that CI is broken: a token with that issuer and an unknown `kid` counts too (a
-different issuer is `no_provider`). Say CI is affected only after confirming real
-GitHub Actions jobs fail on packages.maestra.io (12.10: they did).
+Three OIDC providers (fluxcd `config.auth.oidc.providers`); the metric has no provider
+label, the log reason names it (`… for <provider>`):
+
+| Provider | Issuer | `jwks_uri` (pinned) | Who |
+|---|---|---|---|
+| `github-actions` | `https://token.actions.githubusercontent.com` | `…/.well-known/jwks` | GitHub Actions jobs (aud `packages.maestra.io`) |
+| `vercel` | `https://oidc.vercel.com/maestra-projects` | `…/maestra-projects/.well-known/jwks` | Vercel builds' installCommand (`scripts/vercel-install-nora.sh`, aud `https://vercel.com/maestra-projects`) |
+| `teleport-workload-identity` | `https://teleport.maestra.io/workload-identity` | `…/workload-identity/jwt-jwks.json` | code-intelligence tbot SVID |
+
+The alert means **OIDC key-validation failures for tokens claiming one of these
+issuers**. It is not proof that builds are broken: a token with that issuer and an
+unknown `kid` counts too (a different issuer is `no_provider`). Say CI or Vercel builds
+are affected only after confirming real jobs or deployments fail on packages.maestra.io
+(12.10, github-actions: they did).
 
 `classify_rejection` maps **any reason containing `JWK`** to `jwks`. Possible reasons
 (`nora-registry/src/auth/oidc.rs`):
 
 | Reason string (log `fields.reason`) | Meaning |
 |---|---|
-| `JWKS fetch failed for github-actions: HTTP error: error sending request for url (<uri>)` | network/timeout to GitHub (5 s per request) |
+| `JWKS fetch failed for github-actions: HTTP error: error sending request for url (<uri>)` | network/timeout to the issuer (5 s per request); `github-actions` here, `vercel` / `teleport-workload-identity` the same way |
 | `JWKS fetch failed for github-actions: JWKS endpoint returned 404 Not Found` (or another status) | wrong JWKS URI or GitHub-side error |
 | `JWKS fetch failed for github-actions: JWKS parse error: …` | body is not a JWKS |
 | `JWKS fetch failed for github-actions: previous fetch failed, retrying shortly` | 5 s failure backoff after a failed fetch (since nora#54) — a symptom, read the first reason before it |
@@ -106,6 +114,10 @@ kubectl --context "$CTX" -n nora get helmrelease nora -o yaml | grep -n 'jwks_ur
 Expected (17:08 UTC 12.10.2026): `200` openid-configuration, `200` `/jwks`, **`404`
 `/jwks.json`**; discovery says `jwks_uri` = `…/.well-known/jwks`; pod egress
 `HTTP/1.1 200 OK`; 4 kids in the set.
+
+For `vercel` / `teleport-workload-identity` reasons, run the same probes on their URIs
+from the table above (09:21 UTC 12.11.2026: Vercel openid-configuration, `/jwks` and
+`/jwks.json` all `200`, 2 kids, pod egress `200 OK`; Teleport `jwt-jwks.json` `200`).
 
 ## Step 4 — DECISION GATE
 
