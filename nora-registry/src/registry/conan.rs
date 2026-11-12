@@ -229,20 +229,13 @@ async fn recipe_latest(
         crate::curation::RegistryType::Conan,
         &name,
     ) {
-        if let Some(ref data) = cached_data {
-            state.metrics.record_download("conan");
-            state.metrics.record_cache_hit("conan");
-            return with_json(data.to_vec());
-        }
-        if let Some(e) = &read_failure {
-            return crate::registry::local_copy_unreadable("conan", &storage_key, e);
-        }
-        return crate::curation::check_namespace_isolation(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Conan,
+        return internal_answer(
+            &state,
             &name,
-        )
-        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+            cached_data.as_deref(),
+            read_failure.as_ref(),
+            &storage_key,
+        );
     }
 
     // The fetch helpers answer from storage alone when the upstream is switched off.
@@ -292,20 +285,13 @@ async fn recipe_revisions(
         crate::curation::RegistryType::Conan,
         &name,
     ) {
-        if let Some(ref data) = cached_data {
-            state.metrics.record_download("conan");
-            state.metrics.record_cache_hit("conan");
-            return with_json(data.to_vec());
-        }
-        if let Some(e) = &read_failure {
-            return crate::registry::local_copy_unreadable("conan", &storage_key, e);
-        }
-        return crate::curation::check_namespace_isolation(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Conan,
+        return internal_answer(
+            &state,
             &name,
-        )
-        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+            cached_data.as_deref(),
+            read_failure.as_ref(),
+            &storage_key,
+        );
     }
 
     // The fetch helpers answer from storage alone when the upstream is switched off.
@@ -402,222 +388,18 @@ async fn recipe_file_download(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
-    let artifact = format!("{} rrev={} {}", ref_str, rrev, filename);
-
-    // Extract publish date from cached revision metadata
-    let publish_date = extract_conan_publish_date(
-        &state.storage,
-        &name,
-        &ver,
-        &user,
-        &chan,
-        state.config.server.trust_upstream_dates,
-    )
-    .await;
-
-    // Curation check. #733 serve-local: an internal-namespace recipe is operator-owned — skip
-    // curation and serve any local copy below; block the upstream branch separately.
-    let internal = crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Conan,
-        &name,
-    );
-    if !internal {
-        if let Some(response) = crate::curation::check_download(
-            &state.curation().curation_engine,
-            state.bypass_token().as_deref(),
-            &headers,
-            crate::curation::RegistryType::Conan,
-            &name,
-            crate::curation::RequestVersion::Known(ver.to_string()),
-            publish_date,
-        ) {
-            return response;
-        }
-    }
-
-    let storage_key = format!("conan/{}/revisions/{}/files/{}", ref_str, rrev, filename);
-
-    // Immutable cache. get_verified discharges the integrity witness at serve
-    // (compile-time guarantee — see crate::verified).
-    let (cached, read_failure) =
-        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
-    if let Some(outcome) = cached {
-        use nora_registry::verified::{verified_body, GateOutcome};
-        let data = match outcome {
-            GateOutcome::Verified(blob) => verified_body(blob),
-            GateOutcome::Unpinned(blob) => blob.into_inner(),
-        };
-        // Curation integrity
-        if let Some(response) = crate::curation::verify_integrity(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Conan,
-            &name,
-            Some(&ver),
-            &data,
-        ) {
-            return response;
-        }
-
-        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-            state.config.curation.conan.quarantine.as_ref().or(state
-                .config
-                .curation
-                .quarantine
-                .as_ref()),
-            state
-                .config
-                .curation
-                .conan
-                .quarantine_ttl
-                .as_deref()
-                .or(state.config.curation.quarantine_ttl.as_deref()),
-        );
-        // A digest with no record counts from when its copy was cached (R4-C05).
-        if let Some(resp) = crate::digest_quarantine::cache_gate_dated(
-            &state.digest_store,
-            &state.storage,
-            &storage_key,
-            "conan",
-            &data,
-            &q_mode,
-            q_secs,
-            crate::digest_quarantine::first_seen_seed(
-                state.config.server.trust_upstream_dates,
-                publish_date,
-            ),
-        )
-        .await
-        {
-            return resp;
-        }
-
-        // Range request: 206 Partial Content, or 416 when the client asks past the
-        // end. The gates above ran on the whole object; the partial body itself
-        // cannot be rehashed, so the client's own checksum covers it (#657).
-        if let Some(response) = crate::registry::range::range_response_from_bytes(
-            &data,
-            &headers,
-            "application/octet-stream",
-            &[],
-        ) {
-            if response.status() == StatusCode::PARTIAL_CONTENT {
-                state.metrics.record_download("conan");
-                state.metrics.record_cache_hit("conan");
-            }
-            return response;
-        }
-
-        state.metrics.record_download("conan");
-        state.metrics.record_cache_hit("conan");
-        state.activity.push(ActivityEntry::new(
-            ActionType::CacheHit,
-            artifact,
-            crate::registry_type::RegistryType::Conan,
-            "CACHE",
-        ));
-        return with_binary(data.to_vec());
-    }
-
-    // #733: an internal-namespace recipe with no local copy is never proxied upstream.
-    if internal {
-        if let Some(e) = &read_failure {
-            return crate::registry::local_copy_unreadable("conan", &storage_key, e);
-        }
-        return crate::curation::check_namespace_isolation(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Conan,
-            &name,
-        )
-        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
-    }
-
-    // Fetch from upstream — none when the operator switched it off.
-    let Some(proxy_url) = upstream_url(&state) else {
-        return StatusCode::NOT_FOUND.into_response();
+    let artifact = format!("{name}/{ver}/{user}/{chan} rrev={rrev} {filename}");
+    let file = FileRef {
+        name: &name,
+        ver: &ver,
+        user: &user,
+        chan: &chan,
+        what: "recipe",
+        rel: format!("revisions/{rrev}/files/{filename}"),
+        artifact,
+        proxy_timeout: state.config.conan.proxy_timeout,
     };
-    let url = format!(
-        "{}/v2/conans/{}/revisions/{}/files/{}",
-        proxy_url.trim_end_matches('/'),
-        ref_str,
-        rrev,
-        filename
-    );
-
-    match proxy_fetch(
-        &state.http_client,
-        &url,
-        Duration::from_secs(state.config.conan.proxy_timeout),
-        expose_opt(&state.config.conan.proxy_auth).map(UpstreamAuth::Basic),
-        &state.circuit_breaker,
-        RegistryType::Conan,
-    )
-    .await
-    {
-        Ok(bytes) => {
-            // The allowlist's pinned integrity holds on the first download too, before anything is cached:
-            // the cache-hit branch checks the same rule.
-            if let Some(response) = crate::curation::verify_integrity(
-                &state.curation().curation_engine,
-                crate::curation::RegistryType::Conan,
-                &name,
-                Some(&ver),
-                &bytes,
-            ) {
-                return response;
-            }
-            state.metrics.record_download("conan");
-            state.metrics.record_cache_miss("conan");
-            state.activity.push(ActivityEntry::new(
-                ActionType::ProxyFetch,
-                artifact,
-                crate::registry_type::RegistryType::Conan,
-                "PROXY",
-            ));
-            state
-                .audit
-                .log(AuditEntry::new("proxy_fetch", "proxy", "", "conan", ""));
-
-            // Immutable cache: put_if_absent
-            state.spawn_cache_immutable("conan", storage_key, Bytes::from(bytes.clone()));
-            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                state.config.curation.conan.quarantine.as_ref().or(state
-                    .config
-                    .curation
-                    .quarantine
-                    .as_ref()),
-                state
-                    .config
-                    .curation
-                    .conan
-                    .quarantine_ttl
-                    .as_deref()
-                    .or(state.config.curation.quarantine_ttl.as_deref()),
-            );
-            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
-                &state.digest_store,
-                "conan",
-                &bytes,
-                &q_mode,
-                q_secs,
-                &url,
-                crate::digest_quarantine::first_seen_seed(
-                    state.config.server.trust_upstream_dates,
-                    publish_date,
-                ),
-            ) {
-                return resp;
-            }
-            with_binary(bytes)
-        }
-        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
-        Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::debug!(error = ?e, "Conan recipe file download error");
-            StatusCode::BAD_GATEWAY.into_response()
-        }
-    }
+    file_download(&state, &headers, file).await
 }
 
 // ── Package latest revision (TTL cached) ──────────────────────────────
@@ -672,20 +454,13 @@ async fn package_latest(
         crate::curation::RegistryType::Conan,
         &name,
     ) {
-        if let Some(ref data) = cached_data {
-            state.metrics.record_download("conan");
-            state.metrics.record_cache_hit("conan");
-            return with_json(data.to_vec());
-        }
-        if let Some(e) = &read_failure {
-            return crate::registry::local_copy_unreadable("conan", &storage_key, e);
-        }
-        return crate::curation::check_namespace_isolation(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Conan,
+        return internal_answer(
+            &state,
             &name,
-        )
-        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+            cached_data.as_deref(),
+            read_failure.as_ref(),
+            &storage_key,
+        );
     }
 
     // The fetch helpers answer from storage alone when the upstream is switched off.
@@ -753,20 +528,13 @@ async fn package_revisions(
         crate::curation::RegistryType::Conan,
         &name,
     ) {
-        if let Some(ref data) = cached_data {
-            state.metrics.record_download("conan");
-            state.metrics.record_cache_hit("conan");
-            return with_json(data.to_vec());
-        }
-        if let Some(e) = &read_failure {
-            return crate::registry::local_copy_unreadable("conan", &storage_key, e);
-        }
-        return crate::curation::check_namespace_isolation(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Conan,
+        return internal_answer(
+            &state,
             &name,
-        )
-        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+            cached_data.as_deref(),
+            read_failure.as_ref(),
+            &storage_key,
+        );
     }
 
     // The fetch helpers answer from storage alone when the upstream is switched off.
@@ -884,34 +652,75 @@ async fn package_file_download(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
+    let artifact = format!("{name}/{ver}/{user}/{chan}#{rrev}:{pkg_id}#{prev} {filename}");
+    let file = FileRef {
+        name: &name,
+        ver: &ver,
+        user: &user,
+        chan: &chan,
+        what: "package",
+        rel: format!("revisions/{rrev}/packages/{pkg_id}/revisions/{prev}/files/{filename}"),
+        artifact,
+        proxy_timeout: state.config.conan.proxy_timeout_dl,
+    };
+    file_download(&state, &headers, file).await
+}
+
+/// A recipe or a package file: the two downloads differ only in the path.
+struct FileRef<'a> {
+    name: &'a str,
+    ver: &'a str,
+    user: &'a str,
+    chan: &'a str,
+    /// "recipe" or "package", for the log.
+    what: &'static str,
+    /// The path under the reference, the same in storage and upstream.
+    rel: String,
+    /// The activity-log name.
+    artifact: String,
+    proxy_timeout: u64,
+}
+
+/// Curation, the immutable cache with its integrity and quarantine gates, Range,
+/// then the upstream fetch (R4-T11: was two copies).
+async fn file_download(state: &AppState, headers: &HeaderMap, file: FileRef<'_>) -> Response {
+    let FileRef {
+        name,
+        ver,
+        user,
+        chan,
+        what,
+        rel,
+        artifact,
+        proxy_timeout,
+    } = file;
     let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
-    let artifact = format!("{}#{}:{}#{} {}", ref_str, rrev, pkg_id, prev, filename);
 
     // Extract publish date from cached revision metadata
     let publish_date = extract_conan_publish_date(
         &state.storage,
-        &name,
-        &ver,
-        &user,
-        &chan,
+        name,
+        ver,
+        user,
+        chan,
         state.config.server.trust_upstream_dates,
     )
     .await;
 
-    // Curation check. #733 serve-local: an internal-namespace package is operator-owned — skip
+    // Curation check. #733 serve-local: an internal-namespace recipe or package is operator-owned — skip
     // curation and serve any local copy below; block the upstream branch separately.
     let internal = crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
         crate::curation::RegistryType::Conan,
-        &name,
+        name,
     );
     if !internal {
         if let Some(response) = crate::curation::check_download(
             &state.curation().curation_engine,
             state.bypass_token().as_deref(),
-            &headers,
+            headers,
             crate::curation::RegistryType::Conan,
-            &name,
+            name,
             crate::curation::RequestVersion::Known(ver.to_string()),
             publish_date,
         ) {
@@ -919,10 +728,7 @@ async fn package_file_download(
         }
     }
 
-    let storage_key = format!(
-        "conan/{}/revisions/{}/packages/{}/revisions/{}/files/{}",
-        ref_str, rrev, pkg_id, prev, filename
-    );
+    let storage_key = format!("conan/{ref_str}/{rel}");
 
     // Immutable cache. get_verified discharges the integrity witness at serve
     // (compile-time guarantee — see crate::verified).
@@ -938,8 +744,8 @@ async fn package_file_download(
         if let Some(response) = crate::curation::verify_integrity(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Conan,
-            &name,
-            Some(&ver),
+            name,
+            Some(ver),
             &data,
         ) {
             return response;
@@ -983,7 +789,7 @@ async fn package_file_download(
         // cannot be rehashed, so the client's own checksum covers it (#657).
         if let Some(response) = crate::registry::range::range_response_from_bytes(
             &data,
-            &headers,
+            headers,
             "application/octet-stream",
             &[],
         ) {
@@ -1005,7 +811,7 @@ async fn package_file_download(
         return with_binary(data.to_vec());
     }
 
-    // #733: an internal-namespace package with no local copy is never proxied upstream.
+    // #733: an internal-namespace recipe or package with no local copy is never proxied upstream.
     if internal {
         if let Some(e) = &read_failure {
             return crate::registry::local_copy_unreadable("conan", &storage_key, e);
@@ -1013,29 +819,24 @@ async fn package_file_download(
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Conan,
-            &name,
+            name,
         )
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     // Fetch from upstream — none when the operator switched it off.
-    let Some(proxy_url) = upstream_url(&state) else {
+    let Some(proxy_url) = upstream_url(state) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let url = format!(
-        "{}/v2/conans/{}/revisions/{}/packages/{}/revisions/{}/files/{}",
-        proxy_url.trim_end_matches('/'),
-        ref_str,
-        rrev,
-        pkg_id,
-        prev,
-        filename
+        "{}/v2/conans/{ref_str}/{rel}",
+        proxy_url.trim_end_matches('/')
     );
 
     match proxy_fetch(
         &state.http_client,
         &url,
-        Duration::from_secs(state.config.conan.proxy_timeout_dl),
+        Duration::from_secs(proxy_timeout),
         expose_opt(&state.config.conan.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Conan,
@@ -1048,8 +849,8 @@ async fn package_file_download(
             if let Some(response) = crate::curation::verify_integrity(
                 &state.curation().curation_engine,
                 crate::curation::RegistryType::Conan,
-                &name,
-                Some(&ver),
+                name,
+                Some(ver),
                 &bytes,
             ) {
                 return response;
@@ -1066,7 +867,7 @@ async fn package_file_download(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "proxy", "", "conan", ""));
 
-            // Immutable cache
+            // Immutable cache: put_if_absent
             state.spawn_cache_immutable("conan", storage_key, Bytes::from(bytes.clone()));
             let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
                 state.config.curation.conan.quarantine.as_ref().or(state
@@ -1101,7 +902,7 @@ async fn package_file_download(
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::debug!(error = ?e, "Conan package file download error");
+            tracing::debug!(error = ?e, "Conan {what} file download error");
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
@@ -1325,6 +1126,32 @@ async fn extract_conan_publish_date(
 
 /// The configured upstream, or None when the operator switched it off with an empty
 /// NORA_CONAN_PROXY: then nothing is asked of any upstream.
+/// What an internal-namespace reference gets once no fresh copy answered it (#68):
+/// never the upstream. The stored JSON, else the isolation refusal (404 without one); a
+/// copy the store could not read is unavailable, not absent.
+fn internal_answer(
+    state: &AppState,
+    name: &str,
+    cached: Option<&[u8]>,
+    read_failure: Option<&crate::storage::StorageError>,
+    key: &str,
+) -> Response {
+    if let Some(data) = cached {
+        state.metrics.record_download("conan");
+        state.metrics.record_cache_hit("conan");
+        return with_json(data.to_vec());
+    }
+    if let Some(e) = read_failure {
+        return crate::registry::local_copy_unreadable("conan", key, e);
+    }
+    crate::curation::check_namespace_isolation(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Conan,
+        name,
+    )
+    .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+}
+
 fn upstream_url(state: &AppState) -> Option<String> {
     crate::config::configured_upstream(&state.config.conan.proxy).map(str::to_string)
 }
@@ -2080,6 +1907,30 @@ mod per_conan_client {
             .mount(&up)
             .await;
         up
+    }
+
+    // Where the shared file download parts the two on purpose: a package file is fetched
+    // under `proxy_timeout_dl`, a recipe file under `proxy_timeout`. A zero metadata timeout
+    // fails the recipe file and leaves the package file to its own budget.
+    #[tokio::test]
+    async fn package_files_are_fetched_under_the_download_timeout() {
+        let up = upstream().await;
+        let proxy = up.uri();
+        let storage = Storage::from_backend(std::sync::Arc::new(ObjectStorage::in_memory()));
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.conan.enabled = true;
+            cfg.conan.proxy = Some(proxy);
+            cfg.conan.proxy_timeout = 0;
+            cfg.conan.proxy_timeout_dl = 30;
+        });
+        let reference = "/conan/v2/conans/zlib/1.3/_/_/revisions/abc123";
+        let package =
+            format!("{reference}/packages/deadbeef/revisions/cafe42/files/conan_package.tgz");
+        let resp = send(&ctx.app, Method::GET, &package, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let recipe = format!("{reference}/files/conanfile.py");
+        let resp = send(&ctx.app, Method::GET, &recipe, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     // Every request the client sends for a reference reaches upstream at the same path, user and
