@@ -121,17 +121,25 @@ async fn an_idle_keep_alive_connection_does_not_hold_shutdown() {
 #[tokio::test]
 async fn in_flight_download_finishes_within_the_deadline() {
     let (addr, stop, server) = start(Duration::from_secs(5)).await;
+    let (started, has_started) = tokio::sync::oneshot::channel();
     let download = tokio::spawn(async move {
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
         client
             .write_all(b"GET /short HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
-        let mut all = Vec::new();
+        let mut all = vec![0u8; 4096];
+        let n = client.read(&mut all).await.unwrap();
+        all.truncate(n);
+        let _ = started.send(());
         client.read_to_end(&mut all).await.unwrap();
         all
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The signal comes once the response has started, however slow the runner.
+    tokio::time::timeout(Duration::from_secs(10), has_started)
+        .await
+        .expect("the response started")
+        .unwrap();
     stop.send(()).unwrap();
     let end = tokio::time::timeout(Duration::from_secs(5), server)
         .await

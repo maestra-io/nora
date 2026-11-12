@@ -48,6 +48,21 @@ fn enforce_accepts_valid_allowlist() {
     let config = config_with_allowlist(CurationMode::Enforce, path.to_str().unwrap().into());
     let engine = build_curation_engine(&config).expect("valid allowlist must build");
     assert!(engine.is_active(), "allowlist filter must be installed");
+    // and it decides: a version the empty allowlist does not list is held
+    use crate::curation::{Decision, FilterRequest, RegistryType, RequestVersion};
+    let request = FilterRequest {
+        registry: RegistryType::Npm,
+        upstream: None,
+        name: "left-pad".into(),
+        version: RequestVersion::Known("1.3.0".into()),
+        integrity: None,
+        bypass: false,
+        publish_date: None,
+    };
+    assert!(
+        matches!(engine.evaluate(&request).decision, Decision::Block { .. }),
+        "an empty allowlist admits nothing in enforce mode"
+    );
 }
 
 /// Q03: the per-registry `allow` list rides the engine `reload_curation()` swaps

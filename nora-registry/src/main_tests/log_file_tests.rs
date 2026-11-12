@@ -15,7 +15,12 @@ fn open_log_file_creates_parent_dirs() {
 
 #[test]
 fn open_log_file_invalid_path() {
-    let result = open_log_file("/nonexistent-root-82371/nora.log");
+    // A directory under a regular file cannot be created, not even by root.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let file = tmp.path().join("plain-file");
+    std::fs::write(&file, b"").unwrap();
+    let path = file.join("dir").join("nora.log");
+    let result = open_log_file(path.to_str().unwrap());
     assert!(result.is_none(), "should return None for invalid path");
 }
 
