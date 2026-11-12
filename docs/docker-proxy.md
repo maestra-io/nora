@@ -177,7 +177,7 @@ edit there restarts nora. Annotate that ConfigMap `reloader.stakater.com/ignore:
 ```toml
 [[exception]]
 digest = "sha256:<64 hex>"   # the manifest digest the pod pins: the index of a multi-arch image
-reason = "CVE-2026-1234 fix, issues-maestra#NNNN"
+reason = "issues-maestra#NNNN: docker.io/library/nginx:1.30.6, CVE-2026-1234 fix"
 expires = "2026-11-08T12:00:00Z"
 ```
 
@@ -185,11 +185,11 @@ expires = "2026-11-08T12:00:00Z"
   digest an admitted manifest names, so the platform manifests, config and layers a pull
   needs are served too. The manifest answer then carries `x-nora-quarantine: exception`.
 - Every use logs `Quarantine: held digest admitted by a break-glass exception` (with `listed`,
-  `reason`, `expires`) and counts `nora_docker_quarantine_exception_used_total{digest}`. The
-  `NoraQuarantineExceptionUsed` alert (warning) shows a used entry.
-- Rules: a non-empty `reason`, `digest` as `sha256:` plus 64 lowercase hex, listed once, and
-  `expires` as RFC 3339 with an offset, at most 7 days after the read. A file that breaks a rule
-  is refused whole: nora keeps the last good list, logs `Quarantine exceptions file refused`,
+  `reason`, `expires`) and counts `nora_docker_quarantine_exception_used_total{digest,reason}`. The
+  `NoraQuarantineExceptionUsed` alert (warning) shows a used entry with its reason.
+- Rules: a non-empty `reason` (name the image and the issue: the alert shows it),
+  `digest` as `sha256:` plus 64 lowercase hex, listed once, and `expires` as RFC 3339 with an
+  offset, at most 7 days after the read. A file that breaks a rule is refused whole: nora keeps the last good list, logs `Quarantine exceptions file refused`,
   sets `nora_docker_quarantine_exceptions_invalid` to 1 and raises
   `NoraQuarantineExceptionsInvalid`. At start there is no last good list, so a bad file means
   no exceptions. `nora_docker_quarantine_exceptions_active` counts the unexpired entries.

@@ -144,13 +144,13 @@ groups:
         # quarantine_exceptions admitted a digest the quarantine holds (the listed
         # manifest or something it names). OFF 15 min after its last use; nora
         # creates each listed digest's series at 0 when it loads the file, so the
-        # first use is counted.
-        expr: sum by (digest) (increase(nora_docker_quarantine_exception_used_total[15m])) > 0
+        # first use is counted. `reason` is the entry's, which names the image.
+        expr: sum by (digest, reason) (increase(nora_docker_quarantine_exception_used_total[15m])) > 0
         for: 0m
         labels:
           severity: warning
         annotations:
-          summary: "NORA admitted held image {{ $labels.digest }} by a quarantine exception"
+          summary: "NORA admitted held image by a quarantine exception: {{ $labels.reason }} ({{ $labels.digest }})"
           description: >-
             The reason and expiry are in the `Quarantine: held digest admitted by a
             break-glass exception` log line. Remove the entry once the digest is past
