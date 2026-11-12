@@ -1,5 +1,5 @@
 ---
-source: nora-registry/src/registry/pypi.rs
+source: nora-registry/src/registry/pypi/spec_conformance_tests.rs
 expression: json
 ---
 {
