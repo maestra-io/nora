@@ -41,7 +41,7 @@ use crate::AppState;
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
@@ -697,24 +697,27 @@ async fn public_key(State(state): State<AppState>, Path(file): Path<String>) -> 
 
 async fn file(
     State(state): State<AppState>,
+    method: Method,
     headers: HeaderMap,
     Path((name, branch, repo, arch, file)): Path<(String, String, String, String, String)>,
 ) -> Response {
     let path = RepoPath::new(name, &[&branch, &repo, &arch]);
-    serve(&state, &headers, path, &file).await
+    serve(&state, &method, &headers, path, &file).await
 }
 
 async fn flat_file(
     State(state): State<AppState>,
+    method: Method,
     headers: HeaderMap,
     Path((name, arch, file)): Path<(String, String, String)>,
 ) -> Response {
     let path = RepoPath::new(name, &[&arch]);
-    serve(&state, &headers, path, &file).await
+    serve(&state, &method, &headers, path, &file).await
 }
 
 async fn serve(
     state: &AppState,
+    method: &Method,
     headers: &HeaderMap,
     path: Option<RepoPath>,
     file: &str,
@@ -728,7 +731,7 @@ async fn serve(
     if file == "APKINDEX.tar.gz" {
         index(state, &path, up).await
     } else if file.ends_with(".apk") && is_valid_token(file) {
-        package(state, headers, &path, up, file).await
+        package(state, *method == Method::GET, headers, &path, up, file).await
     } else {
         StatusCode::NOT_FOUND.into_response()
     }
@@ -838,8 +841,10 @@ async fn render(
     Ok((stale, Bytes::from(body)))
 }
 
+/// `stream`: a GET, which may stream a cold miss as it downloads.
 async fn package(
     state: &AppState,
+    stream: bool,
     headers: &HeaderMap,
     path: &RepoPath,
     up: &RepoProxyEntry,
@@ -925,22 +930,138 @@ async fn package(
             return resp;
         }
         let len = copy.len();
-        return package_response(len, copy.into_body(state, "apk", &key, false));
+        return package_response(Some(len), copy.into_body(state, "apk", &key, false));
     }
 
     let url = path.upstream_url(up, file);
-    let (data, fetched) = match crate::registry::proxy_fetch_artifact(
-        state,
-        &key,
-        "apk",
-        &url,
+    let record_miss = || {
+        state.metrics.record_download("apk");
+        state.metrics.record_cache_miss("apk");
+        state.activity.push(ActivityEntry::new(
+            ActionType::ProxyFetch,
+            label,
+            RegistryType::Apk,
+            "PROXY",
+        ));
+        state
+            .audit
+            .log(AuditEntry::new("proxy_fetch", "proxy", "", "apk", ""));
+    };
+    let (timeout, auth) = (
         state.config.apk.proxy_timeout,
         up.auth().map(UpstreamAuth::Basic),
-        BreakerScope::upstream(RegistryType::Apk, up.url()),
-    )
-    .await
-    {
-        Ok(fetched) => fetched,
+    );
+    let scope = BreakerScope::upstream(RegistryType::Apk, up.url());
+    // The index names only the control segment's hash, not the file's: a GET streams
+    // (R4-P03) once that segment checks out, unless a gate on the whole file's digest
+    // could still refuse it (an integrity pin, an enforcing quarantine).
+    let stream = stream
+        && !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce)
+        && !crate::curation::integrity_applies(
+            engine,
+            RegistryType::Apk,
+            &entry.name,
+            Some(&entry.version),
+        );
+    let served = if stream {
+        // The whole package is checked again before it is cached.
+        let verdict = {
+            let (state, entry, url, q_mode) =
+                (state.clone(), entry.clone(), url.clone(), q_mode.clone());
+            move |body: ProxyBody| async move {
+                let actual = control_prefix(&body)
+                    .await
+                    .and_then(|p| package_identity(&p))?;
+                if entry.identity() != Some(actual.as_str()) {
+                    return Err(format!(
+                        "control segment {actual}, the index names {:?}",
+                        entry.identity()
+                    ));
+                }
+                // Neither can refuse here (checked above): they count and record.
+                let digest = body.digest();
+                let engine = &state.curation().curation_engine;
+                if crate::curation::verify_integrity_by_hash(
+                    engine,
+                    RegistryType::Apk,
+                    &entry.name,
+                    Some(&entry.version),
+                    &digest,
+                )
+                .is_some()
+                {
+                    return Err("refused by curation".into());
+                }
+                let _ = crate::digest_quarantine::proxy_gate_digest(
+                    &state.digest_store,
+                    "apk",
+                    &digest,
+                    &q_mode,
+                    q_secs,
+                    &url,
+                    publish_date,
+                );
+                Ok(())
+            }
+        };
+        crate::registry::proxy_stream_artifact(
+            state,
+            &state.http_client,
+            &key,
+            "apk",
+            &url,
+            timeout,
+            auth,
+            scope,
+            verdict,
+        )
+        .await
+    } else {
+        crate::registry::proxy_fetch_artifact(state, &key, "apk", &url, timeout, auth, scope)
+            .await
+            .map(|(body, cache)| crate::registry::Served::Whole(body, cache))
+    };
+    let (data, fetched) = match served {
+        Ok(crate::registry::Served::Live(mut live)) => {
+            // Read on until the control segment is whole, then check it: a package
+            // off its identity is refused before its first byte goes out.
+            let mut head = Vec::new();
+            let mut next_try = 0;
+            loop {
+                let chunk = live.next().await;
+                let ended = match chunk {
+                    Some(Ok(chunk)) => {
+                        head.extend_from_slice(&chunk);
+                        false
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!(url = %url, error = %e, "apk: package fetch failed before its control segment");
+                        return StatusCode::BAD_GATEWAY.into_response();
+                    }
+                    None => true,
+                };
+                let ended = ended || head.len() >= MAX_CONTROL_PREFIX;
+                if !ended && head.len() < next_try {
+                    continue;
+                }
+                // ponytail: a partial segment fails to decode; retried on doubling
+                // lengths so a large one is not decoded once per chunk.
+                let prefix = &head[..head.len().min(MAX_CONTROL_PREFIX)];
+                let actual = package_identity(prefix);
+                if matches!((actual.as_deref(), entry.identity()), (Ok(a), Some(e)) if a == e) {
+                    break;
+                }
+                if ended {
+                    tracing::warn!(url = %url, expected = ?entry.identity(), actual = ?actual, "apk package does not match its index identity, refusing it");
+                    return StatusCode::BAD_GATEWAY.into_response();
+                }
+                next_try = head.len() * 2;
+            }
+            record_miss();
+            let len = live.len;
+            return package_response(len, live.into_body(Bytes::from(head), None, &key));
+        }
+        Ok(crate::registry::Served::Whole(data, fetched)) => (data, fetched),
         Err(e) => return proxy_error_response("apk", &url, &e),
     };
     // The signed index names the package's control-segment hash: a body without it
@@ -966,17 +1087,7 @@ async fn package(
     ) {
         return response;
     }
-    state.metrics.record_download("apk");
-    state.metrics.record_cache_miss("apk");
-    state.activity.push(ActivityEntry::new(
-        ActionType::ProxyFetch,
-        label,
-        RegistryType::Apk,
-        "PROXY",
-    ));
-    state
-        .audit
-        .log(AuditEntry::new("proxy_fetch", "proxy", "", "apk", ""));
+    record_miss();
     if fetched {
         crate::registry::spawn_cache_body(state, "apk", key.clone(), data.clone());
     }
@@ -993,7 +1104,7 @@ async fn package(
     }
     let len = data.len();
     match data.into_body(&key).await {
-        Ok(body) => package_response(len, body),
+        Ok(body) => package_response(Some(len), body),
         Err(e) => {
             tracing::warn!(key = %key, error = %e, "apk: spooled package unreadable");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -1020,8 +1131,10 @@ async fn control_prefix(data: &ProxyBody) -> Result<Vec<u8>, String> {
     }
 }
 
-fn package_response(len: u64, body: axum::body::Body) -> Response {
-    (
+/// `len`: the body's length, when known (a streamed package whose upstream declared
+/// none goes chunked).
+fn package_response(len: Option<u64>, body: axum::body::Body) -> Response {
+    let mut response = (
         StatusCode::OK,
         [
             (
@@ -1032,11 +1145,16 @@ fn package_response(len: u64, body: axum::body::Body) -> Response {
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=31536000, immutable"),
             ),
-            (header::CONTENT_LENGTH, HeaderValue::from(len)),
         ],
         body,
     )
-        .into_response()
+        .into_response();
+    if let Some(len) = len {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    }
+    response
 }
 
 #[cfg(test)]
@@ -1564,5 +1682,62 @@ mod integration_tests {
         assert_eq!(body_bytes(resp).await, expected.as_bytes());
         let resp = send(&ctx.app, Method::GET, "/apk/keys/other.rsa.pub", "").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// R4-P03: a cold package streams as soon as its control segment matches the index,
+    /// while the upstream still holds the rest of it, and is cached once whole.
+    #[tokio::test]
+    async fn a_cold_package_streams_once_its_control_segment_checks_out() {
+        use futures::StreamExt;
+        let up_keys = key_files("alpine-test.rsa.pub");
+        let own_keys = key_files("nora-test.rsa.pub");
+        let signer = upstream_signer(&up_keys, &own_keys);
+        // Incompressible, so the package is as large as its payload.
+        let mut x: u32 = 1;
+        let payload: Vec<u8> = (0..3 * 1024 * 1024)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x >> 24) as u8
+            })
+            .collect();
+        let (pkg, id) = package("big", &payload);
+        let entries = [super::tests::entry("big", "1.0-r0", now() - 30 * DAY, &id)];
+        let cut = 1024 * 1024;
+        let (server, gate, hits) = gated_body_upstream(
+            pkg[..cut].to_vec(),
+            pkg[cut..].to_vec(),
+            vec![(INDEX, upstream_index(&signer, &entries))],
+        )
+        .await;
+        let mut cfg_apk = config(&up_keys, &own_keys);
+        cfg_apk.proxies.insert(
+            "alpine".into(),
+            RepoProxyEntry::Simple(format!("{server}/alpine")),
+        );
+        let ctx = create_test_context_with_config(|cfg| cfg.apk = cfg_apk);
+        let holders = ctx.state.storage.holders();
+        let key = "apk/pkgs/alpine/v3.22/main/x86_64/big-1.0-r0.apk";
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/apk/alpine/v3.22/main/x86_64/big-1.0-r0.apk",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut frames = resp.into_body().into_data_stream();
+        // The gate is shut: these bytes went out before the upstream sent the rest.
+        let first = frames.next().await.unwrap().unwrap();
+        assert!(!first.is_empty() && first.len() < cut);
+        gate.send(true).unwrap();
+        let mut got = first.to_vec();
+        while let Some(frame) = frames.next().await {
+            got.extend_from_slice(&frame.unwrap());
+        }
+        assert!(got == pkg, "the streamed package is the package");
+        background_writes_done(&ctx.state.storage, holders).await;
+        assert!(ctx.state.storage.stat(key).await.is_some());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

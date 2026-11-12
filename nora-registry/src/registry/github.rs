@@ -35,8 +35,9 @@ use crate::registry::{circuit_open_response, proxy_error_response, ProxyError};
 use crate::registry_type::RegistryType;
 use crate::AppState;
 use axum::{
+    body::Bytes,
     extract::{Path, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
@@ -359,6 +360,7 @@ pub(crate) async fn fetch_record(
 
 async fn asset(
     State(state): State<AppState>,
+    method: Method,
     headers: HeaderMap,
     Path((owner, repo, tag, file)): Path<(String, String, String, String)>,
 ) -> Response {
@@ -439,6 +441,7 @@ async fn asset(
             upstream: &up,
             breaker_base: &cfg.download_url,
             quarantine: quarantine(&state, &state.config.curation.github),
+            stream: method == Method::GET,
         },
     )
     .await
@@ -460,6 +463,8 @@ pub(crate) struct Asset<'a> {
     pub upstream: &'a Upstream,
     pub breaker_base: &'a str,
     pub quarantine: (QuarantineMode, i64),
+    /// Stream a cold miss as it downloads (a GET); else the whole body is fetched first.
+    pub stream: bool,
 }
 
 /// Serve `a`: release age, a cached copy (integrity-checked) or a fetch checked against
@@ -528,30 +533,104 @@ pub(crate) async fn serve_asset(state: &AppState, headers: &HeaderMap, a: Asset<
             return resp;
         }
         let len = cached.len();
-        return asset_response(len, cached.into_body(state, reg, &a.key, false));
+        return asset_response(Some(len), cached.into_body(state, reg, &a.key, false));
     }
+
+    // A published digest is the one the file must have: curation and the quarantine
+    // decide on it before the fetch, so a GET streams the file as it downloads (R4-P03)
+    // and only the digest check waits for the end. Without one they need the body.
+    let curation_gate = |digest: &str| {
+        crate::curation::verify_integrity_by_hash(
+            engine,
+            a.registry,
+            a.name,
+            Some(a.version),
+            digest,
+        )
+    };
+    let quarantine_gate = |digest: &str| {
+        crate::digest_quarantine::proxy_gate_digest(
+            &state.digest_store,
+            reg,
+            digest,
+            &q_mode,
+            q_secs,
+            &a.url,
+            publish_date,
+        )
+    };
+    let expected = a.expected.as_deref().and_then(hex_sha256);
+    if let Some(expected) = &expected {
+        let digest = format!("sha256:{expected}");
+        if let Some(response) = curation_gate(&digest).or_else(|| quarantine_gate(&digest)) {
+            return response;
+        }
+    }
+    let record_miss = || {
+        state.metrics.record_download(reg);
+        state.metrics.record_cache_miss(reg);
+        state.activity.push(ActivityEntry::new(
+            ActionType::ProxyFetch,
+            a.label,
+            a.registry,
+            "PROXY",
+        ));
+        state
+            .audit
+            .log(AuditEntry::new("proxy_fetch", "proxy", "", reg, ""));
+    };
 
     let client = match client_for(state, a.upstream, &a.url) {
         Ok(client) => client,
         Err(status) => return status.into_response(),
     };
-    let (data, fetched) = match crate::registry::proxy_fetch_artifact_with(
-        state,
-        &client,
-        &a.key,
-        reg,
-        &a.url,
-        a.upstream.timeout,
-        None,
-        BreakerScope::upstream(a.registry, a.breaker_base),
-    )
-    .await
-    {
-        Ok(fetched) => fetched,
+    let scope = BreakerScope::upstream(a.registry, a.breaker_base);
+    let served = match expected.clone().filter(|_| a.stream) {
+        Some(want) => {
+            crate::registry::proxy_stream_artifact(
+                state,
+                &client,
+                &a.key,
+                reg,
+                &a.url,
+                a.upstream.timeout,
+                None,
+                scope,
+                move |body| {
+                    let sha256 = body.sha256();
+                    std::future::ready(if sha256 == want {
+                        Ok(())
+                    } else {
+                        Err(format!("asset sha256 {sha256}, published {want}"))
+                    })
+                },
+            )
+            .await
+        }
+        None => crate::registry::proxy_fetch_artifact_with(
+            state,
+            &client,
+            &a.key,
+            reg,
+            &a.url,
+            a.upstream.timeout,
+            None,
+            scope,
+        )
+        .await
+        .map(|(body, cache)| crate::registry::Served::Whole(body, cache)),
+    };
+    let (data, fetched) = match served {
+        Ok(crate::registry::Served::Live(live)) => {
+            record_miss();
+            let len = live.len;
+            return asset_response(len, live.into_body(Bytes::new(), expected, &a.key));
+        }
+        Ok(crate::registry::Served::Whole(data, fetched)) => (data, fetched),
         Err(e) => return proxy_error_response(reg, &a.url, &e),
     };
-    // The upstream publishes the file's digest: a body that does not match it
-    // (truncated, swapped) is neither served nor cached.
+    // A body that does not match the published digest (truncated, swapped) is neither
+    // served nor cached.
     let sha256 = data.sha256();
     if let Some(expected) = a.expected.as_deref() {
         if !sha256.eq_ignore_ascii_case(expected) {
@@ -560,51 +639,24 @@ pub(crate) async fn serve_asset(state: &AppState, headers: &HeaderMap, a: Asset<
         }
     }
     let digest = format!("sha256:{sha256}");
-    if let Some(response) = crate::curation::verify_integrity_by_hash(
-        engine,
-        a.registry,
-        a.name,
-        Some(a.version),
-        &digest,
-    ) {
-        return response;
+    if expected.is_none() {
+        if let Some(response) = curation_gate(&digest) {
+            return response;
+        }
     }
-    state.metrics.record_download(reg);
-    state.metrics.record_cache_miss(reg);
-    state.activity.push(ActivityEntry::new(
-        ActionType::ProxyFetch,
-        a.label,
-        a.registry,
-        "PROXY",
-    ));
-    state
-        .audit
-        .log(AuditEntry::new("proxy_fetch", "proxy", "", reg, ""));
+    record_miss();
     // Only the caller whose fetch ran caches; coalesced followers share its body.
     if fetched {
-        let (cache_state, cache_key, body) = (state.clone(), a.key.clone(), data.clone());
-        tokio::spawn(async move {
-            match body.cache(&cache_state, &cache_key, true).await {
-                Ok(true) => cache_state.repo_index.invalidate(reg),
-                Ok(false) => {}
-                Err(e) => crate::record_cache_write_error(reg, &cache_key, &e),
-            }
-        });
+        crate::registry::spawn_cache_body(state, reg, a.key.clone(), data.clone());
     }
-    if let Some(resp) = crate::digest_quarantine::proxy_gate_digest(
-        &state.digest_store,
-        reg,
-        &digest,
-        &q_mode,
-        q_secs,
-        &a.url,
-        publish_date,
-    ) {
-        return resp;
+    if expected.is_none() {
+        if let Some(resp) = quarantine_gate(&digest) {
+            return resp;
+        }
     }
     let len = data.len();
     match data.into_body(&a.key).await {
-        Ok(body) => asset_response(len, body),
+        Ok(body) => asset_response(Some(len), body),
         Err(e) => {
             tracing::warn!(key = %a.key, error = %e, "release proxy: spooled asset unreadable");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -612,8 +664,10 @@ pub(crate) async fn serve_asset(state: &AppState, headers: &HeaderMap, a: Asset<
     }
 }
 
-fn asset_response(len: u64, body: axum::body::Body) -> Response {
-    (
+/// `len`: the body's length, when known (a streamed asset whose upstream declared
+/// none goes chunked).
+fn asset_response(len: Option<u64>, body: axum::body::Body) -> Response {
+    let mut response = (
         StatusCode::OK,
         [
             (
@@ -624,11 +678,16 @@ fn asset_response(len: u64, body: axum::body::Body) -> Response {
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=31536000, immutable"),
             ),
-            (header::CONTENT_LENGTH, HeaderValue::from(len)),
         ],
         body,
     )
-        .into_response()
+        .into_response();
+    if let Some(len) = len {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    }
+    response
 }
 
 #[cfg(test)]
@@ -877,7 +936,20 @@ mod integration_tests {
             .await;
         let ctx = create_test_context_with_config(|cfg| configure(cfg, &server));
         let holders = ctx.state.storage.holders();
+        // A GET streams, so the mismatch found at the end breaks the body off (R4-P03); a
+        // HEAD fetches the whole asset first and answers 502.
         let resp = get(&ctx, "/github/o/r/releases/download/v1/a.bin").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .is_err());
+        let resp = send(
+            &ctx.app,
+            Method::HEAD,
+            "/github/o/r/releases/download/v1/a.bin",
+            "",
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         assert!(ctx

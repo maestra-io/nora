@@ -4199,7 +4199,7 @@ impl SpoolFile {
 ///
 /// `file` is positioned at byte `start` of the blob: a ranged response follows the
 /// spool from there. A spool that reports nothing for `stall` fails the read.
-fn spool_follower(
+pub(crate) fn spool_follower(
     file: tokio::fs::File,
     status: tokio::sync::watch::Receiver<SpoolStatus>,
     start: u64,
