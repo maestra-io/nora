@@ -1,5 +1,5 @@
 ---
-source: nora-registry/src/registry/npm.rs
+source: nora-registry/src/registry/npm/spec_conformance_tests.rs
 assertion_line: 985
 expression: tarball_urls
 ---
