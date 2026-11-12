@@ -5,17 +5,21 @@
 # 11.11.2026), so upstream's compose file cannot start. Chainguard's free images carry
 # the same server and client (the -dev variants have the shell the compose entrypoints
 # need). Everything is pinned by digest: a suite that gates releases must not change
-# under a `latest` tag.
+# under a `latest` tag. Every image comes through nora (packages.maestra.io: `cgr/` is
+# cgr.dev, `docker-hub/` Docker Hub), so CI takes them under the same curation as
+# packages; the job logs in with its OIDC token (maestra/ci/nora-docker-credentials.sh).
 services:
   rustfs:
-    image: cgr.dev/chainguard/minio:latest-dev@sha256:99d9c9437fc6cefa47ea66eb0fbccfaa521272f5885fbd0520e0334415b767f7
+    image: packages.maestra.io/cgr/chainguard/minio:latest-dev@sha256:99d9c9437fc6cefa47ea66eb0fbccfaa521272f5885fbd0520e0334415b767f7
   rustfs-init:
-    image: cgr.dev/chainguard/minio-client:latest-dev@sha256:11c116267e67aae889193021e0d7d5b7f611dc5ce688ae42b99f586dffd40316
+    image: packages.maestra.io/cgr/chainguard/minio-client:latest-dev@sha256:11c116267e67aae889193021e0d7d5b7f611dc5ce688ae42b99f586dffd40316
   seaweedfs-init:
-    image: cgr.dev/chainguard/minio-client:latest-dev@sha256:11c116267e67aae889193021e0d7d5b7f611dc5ce688ae42b99f586dffd40316
+    image: packages.maestra.io/cgr/chainguard/minio-client:latest-dev@sha256:11c116267e67aae889193021e0d7d5b7f611dc5ce688ae42b99f586dffd40316
   s3-tools:
-    image: cgr.dev/chainguard/minio-client:latest-dev@sha256:11c116267e67aae889193021e0d7d5b7f611dc5ce688ae42b99f586dffd40316
+    image: packages.maestra.io/cgr/chainguard/minio-client:latest-dev@sha256:11c116267e67aae889193021e0d7d5b7f611dc5ce688ae42b99f586dffd40316
   seaweedfs:
-    image: chrislusf/seaweedfs:latest@sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0
+    image: packages.maestra.io/docker-hub/chrislusf/seaweedfs:latest@sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0
+  garage:
+    image: packages.maestra.io/docker-hub/dxflrs/garage:v1.0.1@sha256:a5706cf1f3d7b349ac5133ec59ad8181b709270b75e5f2fa7b3e1a5c07d67137
   garage-init:
-    image: alpine:3.23@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2
+    image: packages.maestra.io/docker-hub/library/alpine:3.23@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2

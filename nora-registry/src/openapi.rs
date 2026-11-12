@@ -63,6 +63,13 @@ use crate::AppState;
         crate::openapi::prometheus_metrics,
         // Dashboard
         crate::openapi::dashboard_metrics,
+        crate::openapi::ui_stats,
+        crate::openapi::ui_repo_list,
+        crate::openapi::ui_repo_detail,
+        crate::openapi::ui_repo_search,
+        crate::openapi::ui_tokens_create,
+        crate::openapi::ui_tokens_list,
+        crate::openapi::ui_tokens_revoke,
         // Docker - Read
         crate::openapi::docker_version,
         crate::openapi::docker_catalog,
@@ -155,6 +162,8 @@ use crate::AppState;
             StorageHealth,
             UpstreamHealthSchema,
             DashboardResponse,
+            UiRepoInfo,
+            UiTokenForm,
             GlobalStats,
             RegistryCardStats,
             MountPoint,
@@ -326,6 +335,134 @@ pub async fn prometheus_metrics() {}
     )
 )]
 pub async fn dashboard_metrics() {}
+
+// -------------------- Web UI endpoints --------------------
+// What the UI's own pages read and post, behind the UI session (or a token) like the
+// pages themselves; the HTMX ones answer HTML fragments.
+
+/// One repository as the UI lists it (repo_index.rs `RepoInfo`).
+#[derive(Serialize, ToSchema)]
+pub struct UiRepoInfo {
+    /// Repository, package or file name
+    pub name: String,
+    /// Number of versions (tags for docker)
+    pub versions: usize,
+    /// Stored size in bytes
+    pub size: u64,
+    /// Last change, as the UI shows it
+    pub updated: String,
+    /// A root-level file in raw storage, not a directory
+    pub is_file: bool,
+}
+
+/// The form `POST /api/ui/tokens/create` reads (`application/x-www-form-urlencoded`).
+#[derive(Deserialize, ToSchema)]
+pub struct UiTokenForm {
+    /// What the token is for
+    pub description: String,
+    /// `read`, `write` or `admin`; not above the caller's own role
+    pub role: String,
+    /// Lifetime in days, capped by the caller's own credential
+    pub ttl_days: Option<u64>,
+    /// `setup` when posted from /ui/setup (with `Accept: application/json` the answer is JSON)
+    pub ui: Option<String>,
+}
+
+/// Repository count per registry
+///
+/// The number of repositories NORA holds for each registry, keyed by registry name
+/// (`docker`, `npm`, `pub`, ...), after the stale indexes were rebuilt.
+#[utoipa::path(
+    get,
+    path = "/api/ui/stats",
+    tag = "dashboard",
+    responses(
+        (status = 200, description = "Registry name -> repository count", body = std::collections::HashMap<String, usize>)
+    )
+)]
+pub async fn ui_stats() {}
+
+/// Repositories of a registry
+#[utoipa::path(
+    get,
+    path = "/api/ui/{registry_type}/list",
+    tag = "dashboard",
+    params(("registry_type" = String, Path, description = "Registry name, e.g. `docker`, `npm`, `maven`")),
+    responses(
+        (status = 200, description = "Every repository the registry holds; empty for an unknown registry", body = Vec<UiRepoInfo>)
+    )
+)]
+pub async fn ui_repo_list() {}
+
+/// Detail of one repository
+#[utoipa::path(
+    get,
+    path = "/api/ui/{registry_type}/{name}",
+    tag = "dashboard",
+    params(
+        ("registry_type" = String, Path, description = "`docker`, `npm` or `cargo`; any other answers `{}`"),
+        ("name" = String, Path, description = "Repository or package name")
+    ),
+    responses(
+        (status = 200, description = "Tags or versions with their sizes and dates, as the UI's detail page shows them", content_type = "application/json")
+    )
+)]
+pub async fn ui_repo_detail() {}
+
+/// Search the repositories of a registry
+#[utoipa::path(
+    get,
+    path = "/api/ui/{registry_type}/search",
+    tag = "dashboard",
+    params(
+        ("registry_type" = String, Path, description = "Registry name"),
+        ("q" = Option<String>, Query, description = "Case-insensitive substring of the name; empty lists all")
+    ),
+    responses(
+        (status = 200, description = "Table rows of the matching repositories (HTMX fragment)", content_type = "text/html")
+    )
+)]
+pub async fn ui_repo_search() {}
+
+/// Create a token from the UI
+#[utoipa::path(
+    post,
+    path = "/api/ui/tokens/create",
+    tag = "auth",
+    request_body(content = UiTokenForm, content_type = "application/x-www-form-urlencoded"),
+    responses(
+        (status = 200, description = "The token, once: an HTML fragment, or `{\"token\": ...}` for /ui/setup with `Accept: application/json`", content_type = "text/html"),
+        (status = 403, description = "Not an HTMX request, or the role or lifetime exceeds the caller's own"),
+        (status = 500, description = "The token store failed")
+    )
+)]
+pub async fn ui_tokens_create() {}
+
+/// List tokens in the UI
+#[utoipa::path(
+    get,
+    path = "/api/ui/tokens/list",
+    tag = "auth",
+    responses(
+        (status = 200, description = "The caller's tokens (an admin's: every token), as an HTML table fragment", content_type = "text/html")
+    )
+)]
+pub async fn ui_tokens_list() {}
+
+/// Revoke a token from the UI
+#[utoipa::path(
+    post,
+    path = "/api/ui/tokens/{file_id}/revoke",
+    tag = "auth",
+    params(("file_id" = String, Path, description = "The token's id, 16 hex characters")),
+    responses(
+        (status = 200, description = "The refreshed token list (HTML fragment)", content_type = "text/html"),
+        (status = 400, description = "Not a token id"),
+        (status = 403, description = "Not an HTMX request, or another user's token"),
+        (status = 404, description = "No such token")
+    )
+)]
+pub async fn ui_tokens_revoke() {}
 
 // -------------------- Docker Registry v2 - Read Operations --------------------
 
@@ -1623,21 +1760,10 @@ mod tests {
     }
 
     /// R4-T23, the other direction for the API: every `/api/` route the server mounts is in
-    /// the document, or is one of the UI's own endpoints (HTMX fragments and the JSON its
-    /// pages read, behind the UI session), listed here. A new `/api/` route fails this test
-    /// until it is documented or listed.
+    /// the document, the UI's own endpoints included. A new `/api/` route fails this test
+    /// until it is documented.
     #[test]
     fn every_api_route_is_documented() {
-        const UI_OWN: &[&str] = &[
-            "/api/ui/stats",
-            "/api/ui/tokens/create",
-            "/api/ui/tokens/list",
-            "/api/ui/tokens/{file_id}/revoke",
-            "/api/ui/{registry_type}/list",
-            "/api/ui/{registry_type}/search",
-            "/api/ui/{registry_type}/{name}",
-        ];
-
         /// The first argument of each `.route("/api/…", …)` outside `#[cfg(test)]`.
         #[derive(Default)]
         struct ApiRoutes(Vec<String>);
@@ -1695,7 +1821,10 @@ mod tests {
             .collect();
         undocumented.sort_unstable();
         undocumented.dedup();
-        assert_eq!(undocumented, UI_OWN, "routed under /api/, not documented");
+        assert!(
+            undocumented.is_empty(),
+            "routed under /api/, not documented: {undocumented:?}"
+        );
     }
 
     /// Swagger UI comes from the files in `ui/static/swagger-ui/`, embedded in the binary,
