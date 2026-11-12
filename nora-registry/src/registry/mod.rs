@@ -24,6 +24,8 @@ pub(crate) mod hf;
 mod maven;
 pub(crate) mod npm;
 pub(crate) mod nuget;
+#[cfg(any(feature = "rpm", feature = "deb"))]
+mod os_repo;
 pub(crate) mod pub_dart;
 pub(crate) mod pypi;
 pub(crate) mod range;
