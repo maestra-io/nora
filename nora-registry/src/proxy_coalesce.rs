@@ -203,6 +203,13 @@ where
         }
     } // map lock dropped here — before any `.await`
 
+    /// Holders of `key`'s slot (the map, its leader, each follower waiting on it); 0
+    /// when no flight runs. A test's barrier: it grows by one when a follower attaches.
+    #[cfg(test)]
+    pub(crate) fn slot_holders(&self, key: &str) -> usize {
+        self.map.lock().get(key).map_or(0, Arc::strong_count)
+    }
+
     pub async fn coalesced<F, Fut>(
         &self,
         key: &str,

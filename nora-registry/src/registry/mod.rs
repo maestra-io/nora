@@ -1626,15 +1626,6 @@ impl Drop for Seat {
     }
 }
 
-/// Requests waiting on the artifact flight of storage `key` right now.
-#[cfg(test)]
-pub(crate) fn flight_waiters(key: &str) -> usize {
-    FLIGHT_WAITERS
-        .lock()
-        .get(&format!("fetch:{key}"))
-        .map_or(0, |w| w.count.load(std::sync::atomic::Ordering::Acquire))
-}
-
 /// `fetch`, given up once nobody has waited on its flight for [`UNATTENDED_FILL_LIMIT`]
 /// in a row, or at once when [`UNATTENDED_FILLS_MAX`] other fills already run unattended.
 /// A retry that joins the flight makes it attended again.

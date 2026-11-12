@@ -1499,12 +1499,16 @@ mod integration_tests {
 
         let leader = send(&ctx.app, Method::GET, CHART, "").await;
         assert_eq!(leader.status(), StatusCode::OK);
+        // The leader's flight runs (its upstream is gated): a follower attaching to it
+        // adds one holder to its slot.
+        let flight = format!("fetch:{CHART_KEY}");
+        let alone = ctx.state.artifact_flights.slot_holders(&flight);
+        assert!(alone > 0);
         let follower = tokio::spawn({
             let app = ctx.app.clone();
             async move { send(&app, Method::GET, CHART, "").await }
         });
-        // The leader's fill and the follower.
-        while crate::registry::flight_waiters(CHART_KEY) < 2 {
+        while ctx.state.artifact_flights.slot_holders(&flight) <= alone {
             tokio::task::yield_now().await;
         }
         gate.send(true).unwrap();
