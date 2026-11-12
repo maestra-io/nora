@@ -2505,3 +2505,40 @@ mod tests {
         );
     }
 }
+
+/// The five directory pages, byte for byte, at the root and below it, in both languages, with a
+/// directory and a file entry whose names need escaping. Taken from the per-page renderers
+/// before they were merged into one (R5 pairs): any change to a page's markup fails here.
+#[cfg(test)]
+mod dir_page_snapshots {
+    use super::*;
+
+    type Render = fn(&str, &[RepoInfo], usize, Lang, bool) -> String;
+
+    #[test]
+    fn every_directory_page_keeps_its_markup() {
+        let entry = |name: &str, is_file| RepoInfo {
+            name: name.into(),
+            versions: 3,
+            size: 2048,
+            updated: "2026-11-12 10:00".into(),
+            is_file,
+        };
+        let entries = vec![entry("sub <dir>", false), entry("file&\"1\".tar.gz", true)];
+        let pages: [(&str, Render); 5] = [
+            ("raw", render_raw_dir),
+            ("maven", render_maven_dir),
+            ("go", render_go_dir),
+            ("ansible", render_ansible_dir),
+            ("cpan", render_cpan_dir),
+        ];
+        for (kind, render) in pages {
+            for (place, path) in [("root", ""), ("nested", "com/ex ample/h\"q")] {
+                for (lang_name, lang) in [("en", Lang::En), ("ru", Lang::Ru)] {
+                    let html = render(path, &entries, 7, lang, true);
+                    insta::assert_snapshot!(format!("dir_{kind}_{place}_{lang_name}"), html);
+                }
+            }
+        }
+    }
+}
