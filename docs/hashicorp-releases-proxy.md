@@ -42,8 +42,11 @@ grep linux_amd64.zip terraform_1.9.8_SHA256SUMS | sha256sum -c -
   record, cached under `hashicorp/meta/` for `metadata_ttl` (stale on upstream error):
   `timestamp_created` from `<api_url>/v1/releases/<product>/<version>` and the
   version's `<product>_<version>_SHA256SUMS`. A file the sums do not list is a 404 and
-  never fetched; a body that differs from its sum is a 502 and not cached; the
-  `SHA256SUMS` file is served as NORA read it. Files come only from `download_url`
+  never fetched. Curation and the quarantine decide on the listed sum before the fetch;
+  a cold file then streams to a GET client as it downloads, its last byte held until
+  the whole file matched its sum: a mismatch breaks the transfer off (the client sees a
+  failed download, never a complete one) and is not cached. A HEAD fetches the whole
+  file first (a mismatch is a 502). The `SHA256SUMS` file is served as NORA read it. Files come only from `download_url`
   through the SSRF guard, every redirect hop pinned to the download and API hosts,
   and are cached under `hashicorp/releases/<product>/<version>/`.
 - Package name = product, version = version. `min_release_age` by

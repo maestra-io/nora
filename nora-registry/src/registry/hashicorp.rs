@@ -16,11 +16,12 @@
 //! (`[curation.hashicorp]`, package = product, version = version) and, with
 //! `server.trust_upstream_dates`, the quarantine's first seen; the version's
 //! `{product}_{version}_SHA256SUMS` names every file and its sha256. A file it does not
-//! list is a 404 and never fetched, a body that differs from its sum is a 502, and the
-//! `SHA256SUMS` file itself is served as NORA read it. Files are fetched only from
-//! `download_url` through the SSRF guard (redirects pinned to the download and API
-//! hosts), cached under `hashicorp/releases/{product}/{version}/` and held by the
-//! first-seen digest quarantine. The shared machinery is in `registry/github.rs`.
+//! list is a 404 and never fetched; a GET of a cold file streams as it downloads, its last
+//! byte held until the whole body matched its sum (a mismatch breaks the transfer off, a
+//! HEAD fetches the whole file first and answers 502), and the `SHA256SUMS` file itself is
+//! served as NORA read it. Files are fetched only from `download_url` through the SSRF
+//! guard (redirects pinned to the download and API hosts), cached under
+//! `hashicorp/releases/{product}/{version}/` and held by the first-seen digest quarantine. The shared machinery is in `registry/github.rs`.
 
 use crate::registry::github::{
     fetch_record, hex_sha256, hosts_of, is_valid_asset, join_segments, load_record, quarantine,
@@ -31,7 +32,7 @@ use crate::registry_type::RegistryType;
 use crate::AppState;
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
@@ -101,6 +102,7 @@ fn hashicorp_upstream(state: &AppState) -> Upstream {
 
 async fn file(
     State(state): State<AppState>,
+    method: Method,
     headers: HeaderMap,
     Path((product, version, file)): Path<(String, String, String)>,
 ) -> Response {
@@ -169,8 +171,7 @@ async fn file(
             upstream: &up,
             breaker_base: &cfg.download_url,
             quarantine: quarantine(&state, &state.config.curation.hashicorp),
-            // Streaming is decided for the helm, apk and GitHub proxies only (R4-P03).
-            stream: false,
+            stream: method == Method::GET,
         },
     )
     .await
@@ -210,6 +211,7 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
     use crate::config::CurationMode;
+    use crate::digest_quarantine::QuarantineMode;
     use crate::test_helpers::*;
     use axum::http::{Method, StatusCode};
     use sha2::Digest;
@@ -281,12 +283,124 @@ mod integration_tests {
         }
     }
 
+    const ZIP_KEY: &str = "hashicorp/releases/terraform/1.9.8/terraform_1.9.8_linux_amd64.zip";
+
+    /// A GET streams, so a file off its sum breaks off at the end (R4-P03) and is not
+    /// cached; a HEAD fetches the whole file first and answers 502.
     #[tokio::test]
     async fn a_file_that_differs_from_its_sum_is_refused() {
         let server = hashicorp("2024-10-16T14:25:00.739Z", b"evil", b"zip").await;
         let ctx = create_test_context_with_config(|cfg| configure(cfg, &server));
+        let holders = ctx.state.storage.holders();
         let resp = send(&ctx.app, Method::GET, ZIP, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .is_err());
+        let resp = send(&ctx.app, Method::HEAD, ZIP, "").await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        background_writes_done(&ctx.state.storage, holders).await;
+        assert!(ctx.state.storage.stat(ZIP_KEY).await.is_none());
+    }
+
+    const MIB: usize = 1024 * 1024;
+
+    /// The API on `api`, the sums and the archive on a socket that sends the archive's
+    /// first MiB at once and the rest when the returned gate opens.
+    async fn gated(
+        api: &MockServer,
+        served: &[u8],
+        listed: &[u8],
+        extra: impl FnOnce(&mut crate::config::Config),
+    ) -> (
+        TestContext,
+        tokio::sync::watch::Sender<bool>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/releases/terraform/1.9.8"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"timestamp_created": "2024-10-16T14:25:00.739Z"}),
+            ))
+            .mount(api)
+            .await;
+        let sums = format!(
+            "{}  terraform_1.9.8_linux_amd64.zip\n",
+            hex::encode(sha2::Sha256::digest(listed))
+        );
+        let (files, gate, hits) = gated_body_upstream(
+            served[..MIB].to_vec(),
+            served[MIB..].to_vec(),
+            vec![(
+                "/terraform/1.9.8/terraform_1.9.8_SHA256SUMS",
+                sums.into_bytes(),
+            )],
+        )
+        .await;
+        let api_url = format!("{}/api", api.uri());
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.hashicorp.enabled = true;
+            cfg.hashicorp.api_url = api_url;
+            cfg.hashicorp.download_url = files;
+            cfg.hashicorp.allow_private_hosts = true;
+            extra(cfg);
+        });
+        (ctx, gate, hits)
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// R4-P03: a cold archive reaches the client while the upstream still holds the rest
+    /// of it, and is cached once whole. Before, nothing went out until the download ended.
+    #[tokio::test]
+    async fn a_cold_file_streams_before_the_upstream_finished_and_is_cached() {
+        use futures::StreamExt;
+        let api = MockServer::start().await;
+        let body = pattern(3 * MIB);
+        let (ctx, gate, hits) = gated(&api, &body, &body, |_| {}).await;
+        let holders = ctx.state.storage.holders();
+
+        let resp = send(&ctx.app, Method::GET, ZIP, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut frames = resp.into_body().into_data_stream();
+        // The gate is shut: these bytes went out before the upstream sent the rest.
+        let first = frames.next().await.unwrap().unwrap();
+        assert!(!first.is_empty() && first.len() < MIB);
+        assert!(ctx.state.storage.stat(ZIP_KEY).await.is_none());
+
+        gate.send(true).unwrap();
+        let mut got = first.to_vec();
+        while let Some(frame) = frames.next().await {
+            got.extend_from_slice(&frame.unwrap());
+        }
+        assert!(got == body, "the streamed file is the file");
+        background_writes_done(&ctx.state.storage, holders).await;
+        assert!(ctx.state.storage.stat(ZIP_KEY).await.is_some());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// R4-P03: the quarantine decides on the sum before the fetch, so a GET of a digest it
+    /// holds is refused without the archive being downloaded at all.
+    #[tokio::test]
+    async fn a_held_digest_is_refused_before_the_download() {
+        let api = MockServer::start().await;
+        let body = pattern(2 * MIB);
+        let (ctx, _gate, hits) = gated(&api, &body, &body, |cfg| {
+            cfg.curation.hashicorp.quarantine = Some(QuarantineMode::Enforce);
+            cfg.curation.hashicorp.quarantine_ttl = Some("3d".into());
+            // A release date does not seed the clock unless trusted.
+            cfg.server.trust_upstream_dates = false;
+        })
+        .await;
+        for _ in 0..2 {
+            let resp = send(&ctx.app, Method::GET, ZIP, "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            assert!(resp.headers().contains_key("x-nora-quarantine"));
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(ctx.state.storage.stat(ZIP_KEY).await.is_none());
     }
 
     #[tokio::test]
