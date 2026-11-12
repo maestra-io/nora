@@ -1519,6 +1519,37 @@ mod integration_tests {
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    /// R4-P03: a small chart is served whole from memory while other downloads hold the
+    /// whole spool budget, as before streaming, not refused with a 503.
+    #[tokio::test]
+    async fn a_small_chart_is_served_whole_while_the_spool_budget_is_busy() {
+        let body = pattern(64 * 1024);
+        let index = index_yaml(&[("1.0.0", OLD, "demo-1.0.0.tgz", &body)]);
+        let up = upstream(&index).await;
+        Mock::given(method("GET"))
+            .and(path("/repo/demo-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&up)
+            .await;
+        let entry = proxy(&up);
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.helm.enabled = true;
+            cfg.helm.proxies.insert("demo".into(), entry);
+            cfg.helm.allow_private_chart_hosts = true;
+            cfg.server.stream_threshold_mb = 1;
+            cfg.server.spool_max_mb = 2;
+        });
+        let _busy = ctx.state.spool.reserve(2 * MIB as u64).unwrap();
+        assert!(ctx.state.spool.reserve(1).is_err(), "the budget is held");
+        let holders = ctx.state.storage.holders();
+
+        let resp = send(&ctx.app, Method::GET, CHART, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_bytes(resp).await == body);
+        background_writes_done(&ctx.state.storage, holders).await;
+        assert!(ctx.state.storage.stat(CHART_KEY).await.is_some());
+    }
+
     /// Time to the first byte and to the end of a cold 64 MiB chart whose upstream sends
     /// 1 MiB every 20 ms, as a client on a socket sees it (the PR's numbers).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

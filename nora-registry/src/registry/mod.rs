@@ -1358,7 +1358,9 @@ fn artifact_cap(threshold: u64, cap: Option<u64>, buffered: u64) -> Option<u64> 
 /// budget with a running SHA-256, never holding more than one chunk of it. A body
 /// above `cap` is refused on its `Content-Length` before any of it is read, or as
 /// soon as the running count crosses the cap. With `live`, every non-empty body is
-/// spooled from its first chunk and each write is published to it as it lands.
+/// spooled from its first chunk and each write is published to it as it lands;
+/// one that fits in memory while the spool budget is busy is read whole instead
+/// (`live` is then never started).
 async fn read_or_spool(
     mut response: reqwest::Response,
     spool: &SpoolBudget,
@@ -1376,35 +1378,47 @@ async fn read_or_spool(
     );
     let over_cap = |len: u64| cap.is_some_and(|cap| len > cap);
     let too_large = || ProxyError::Spool(SpoolError::TooLarge(cap.unwrap_or_default()));
-    let in_memory = |len: u64| live.is_none() && (threshold == 0 || len <= threshold);
+    let fits = |len: u64| threshold == 0 || len <= threshold;
+    let mut live = live;
     let declared = response.content_length();
     if declared.is_some_and(over_cap) {
         return Err(too_large());
     }
-    // A body known to spill reserves its whole length before any of it is read.
-    let mut reservation = match declared.filter(|&n| !in_memory(n)) {
-        Some(n) => Some(spool.reserve(n).map_err(ProxyError::Spool)?),
-        None => None,
-    };
+    // A body that would spill (or stream) reserves its declared length before any of
+    // it is read. A live body that fits in memory falls back to the memory path when
+    // the spool budget is busy, rather than failing a small download.
+    let mut reservation = None;
+    if let Some(n) = declared.filter(|&n| live.is_some() || !fits(n)) {
+        match spool.reserve(n) {
+            Ok(r) => reservation = Some(r),
+            Err(_) if live.is_some() && fits(n) => live = None,
+            Err(e) => return Err(ProxyError::Spool(e)),
+        }
+    }
     // Buffer until the threshold, then spill.
     let mut head = Vec::with_capacity(declared.unwrap_or(0).min(threshold) as usize);
-    loop {
+    let mut reservation = loop {
         let Some(chunk) = next_chunk(&mut response, idle).await? else {
             return Ok(ProxyBody::Mem(Bytes::from(head)));
         };
         head.extend_from_slice(&chunk);
-        if over_cap(head.len() as u64) {
+        let n = head.len() as u64;
+        if over_cap(n) {
             return Err(too_large());
         }
-        if !in_memory(head.len() as u64) {
-            break;
+        if live.is_none() && fits(n) {
+            continue;
         }
-    }
-    let mut len = head.len() as u64;
-    let mut reservation = match reservation.take() {
-        Some(r) => r,
-        None => spool.reserve(len).map_err(ProxyError::Spool)?,
+        if let Some(r) = reservation.take() {
+            break r;
+        }
+        match spool.reserve(n) {
+            Ok(r) => break r,
+            Err(_) if live.is_some() && fits(n) => live = None,
+            Err(e) => return Err(ProxyError::Spool(e)),
+        }
     };
+    let mut len = head.len() as u64;
     let dir = spool.dir(PROXY_SPOOL_SUBDIR);
     let path = dir.join(uuid::Uuid::new_v4().to_string());
     let local = |e| ProxyError::Spool(SpoolError::io(&path)(e));
