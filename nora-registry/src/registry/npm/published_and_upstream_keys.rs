@@ -533,11 +533,15 @@ async fn an_old_copy_with_the_published_version_set_is_rebuilt() {
         .await
         .unwrap();
     let resp = send(&failing.app, Method::GET, "/npm/corp-lib", "").await;
+    let status = resp.status();
     let served = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
     assert!(
         !served.contains("evil-dep"),
         "the old copy is not taken for NORA's: {served}"
     );
+    // nor is the name proxied while it is unknown whether it is published here
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{served}");
+    assert_eq!(asked(&server, "corp-lib").await, 0);
 }
 
 /// Round 2 fixture (m06): a published name with capitals, as npm allowed before 2017.

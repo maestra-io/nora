@@ -129,7 +129,9 @@ async fn cached_tarballs(ctx: &TestContext) -> Vec<String> {
 async fn cached_tarballs_eventually(ctx: &TestContext) -> Vec<String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let cached = cached_tarballs(ctx).await;
+        // the tarball itself, not only its `.tgz.sha256` sidecar, which is written first
+        let mut cached = cached_tarballs(ctx).await;
+        cached.retain(|k| k.ends_with(".tgz"));
         if !cached.is_empty() || std::time::Instant::now() > deadline {
             return cached;
         }
