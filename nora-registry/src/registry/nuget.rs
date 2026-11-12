@@ -262,92 +262,7 @@ async fn search_query(
     Query(params): Query<SearchParams>,
     raw_query: axum::extract::RawQuery,
 ) -> Response {
-    let query = params.q.unwrap_or_default();
-    let skip = params.skip.unwrap_or(0);
-    let take = params.take.unwrap_or(20);
-    let prerelease = params.prerelease.unwrap_or(false);
-    let sem_ver_level = params.sem_ver_level;
-
-    // No upstream proxy configured → local search directly
-    if upstream_url(&state).is_none() {
-        let data = local_search_results(
-            &state,
-            &query,
-            skip,
-            take,
-            prerelease,
-            sem_ver_level.as_deref(),
-        )
-        .await;
-        return with_json(data);
-    }
-
-    // #68 namespace isolation: never forward a search term that matches an internal
-    // namespace upstream (dependency confusion) — serve local results only.
-    if crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Nuget,
-        &query,
-    ) {
-        let data = local_search_results(
-            &state,
-            &query,
-            skip,
-            take,
-            prerelease,
-            sem_ver_level.as_deref(),
-        )
-        .await;
-        return with_json(data);
-    }
-
-    // Try upstream with short timeout (UX-critical path)
-    let qs = raw_query.0.unwrap_or_default();
-    let url = format!("{}?{}", state.config.nuget.search_service, qs);
-
-    match proxy_fetch_text(
-        &state.http_client,
-        &url,
-        Duration::from_secs(SEARCH_TIMEOUT_SECS),
-        None, // search endpoint is public
-        None,
-        &state.circuit_breaker,
-        RegistryType::Nuget,
-    )
-    .await
-    {
-        Ok(text) => {
-            let base_url = nora_base_url(&state);
-            let upstream = rewrite_host(&state);
-            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
-            state.metrics.record_download("nuget");
-            state.metrics.record_cache_miss("nuget");
-            state.activity.push(ActivityEntry::new(
-                ActionType::ProxyFetch,
-                format!("search?{}", qs.chars().take(50).collect::<String>()),
-                crate::registry_type::RegistryType::Nuget,
-                "PROXY",
-            ));
-            with_json(filter_search_results(&state, rewritten).await)
-        }
-        Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
-        Err(_) => {
-            if !state.config.nuget.serve_stale {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
-            tracing::info!("NuGet search: upstream unavailable, using local index");
-            let data = local_search_results(
-                &state,
-                &query,
-                skip,
-                take,
-                prerelease,
-                sem_ver_level.as_deref(),
-            )
-            .await;
-            with_json_stale(data)
-        }
-    }
+    proxied_search(&state, params, raw_query, Search::Query).await
 }
 
 // ── Autocomplete (proxy to upstream SearchAutocompleteService) ─────────
@@ -357,52 +272,99 @@ async fn autocomplete_query(
     Query(params): Query<SearchParams>,
     raw_query: axum::extract::RawQuery,
 ) -> Response {
+    proxied_search(&state, params, raw_query, Search::Autocomplete).await
+}
+
+/// The two search services NuGet clients call: same flow, own upstream, local index
+/// and response filter.
+#[derive(Clone, Copy)]
+enum Search {
+    Query,
+    Autocomplete,
+}
+
+impl Search {
+    /// The activity-log and log name.
+    fn name(self) -> &'static str {
+        match self {
+            Search::Query => "search",
+            Search::Autocomplete => "autocomplete",
+        }
+    }
+
+    async fn local(
+        self,
+        state: &AppState,
+        query: &str,
+        skip: usize,
+        take: usize,
+        prerelease: bool,
+        sem_ver_level: Option<&str>,
+    ) -> Vec<u8> {
+        match self {
+            Search::Query => {
+                local_search_results(state, query, skip, take, prerelease, sem_ver_level).await
+            }
+            Search::Autocomplete => {
+                local_autocomplete_results(state, query, skip, take, prerelease, sem_ver_level)
+                    .await
+            }
+        }
+    }
+}
+
+/// Proxy a search to the upstream service with a short timeout (UX-critical path),
+/// local results when there is no upstream, for an internal-namespace term, and as
+/// the stale fallback (R4-T11: was two copies).
+async fn proxied_search(
+    state: &AppState,
+    params: SearchParams,
+    raw_query: axum::extract::RawQuery,
+    kind: Search,
+) -> Response {
     let query = params.q.unwrap_or_default();
     let skip = params.skip.unwrap_or(0);
     let take = params.take.unwrap_or(20);
     let prerelease = params.prerelease.unwrap_or(false);
     let sem_ver_level = params.sem_ver_level;
-
-    // No upstream proxy configured → local autocomplete from cache
-    if upstream_url(&state).is_none() {
-        let data = local_autocomplete_results(
-            &state,
+    let local = || {
+        kind.local(
+            state,
             &query,
             skip,
             take,
             prerelease,
             sem_ver_level.as_deref(),
         )
-        .await;
-        return with_json(data);
+    };
+
+    // No upstream proxy configured → local results directly
+    if upstream_url(state).is_none() {
+        return with_json(local().await);
     }
 
-    // #68 namespace isolation: don't forward an internal-namespace autocomplete term.
+    // #68 namespace isolation: never forward a term that matches an internal
+    // namespace upstream (dependency confusion) — serve local results only.
     if crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
         crate::curation::RegistryType::Nuget,
         &query,
     ) {
-        let data = local_autocomplete_results(
-            &state,
-            &query,
-            skip,
-            take,
-            prerelease,
-            sem_ver_level.as_deref(),
-        )
-        .await;
-        return with_json(data);
+        return with_json(local().await);
     }
 
     let qs = raw_query.0.unwrap_or_default();
-    let url = format!("{}?{}", state.config.nuget.autocomplete, qs);
+    let service = match kind {
+        Search::Query => &state.config.nuget.search_service,
+        Search::Autocomplete => &state.config.nuget.autocomplete,
+    };
+    let url = format!("{service}?{qs}");
 
     match proxy_fetch_text(
         &state.http_client,
         &url,
         Duration::from_secs(SEARCH_TIMEOUT_SECS),
-        None, // autocomplete endpoint is public
+        None, // the search services are public
         None,
         &state.circuit_breaker,
         RegistryType::Nuget,
@@ -410,21 +372,28 @@ async fn autocomplete_query(
     .await
     {
         Ok(text) => {
-            let base_url = nora_base_url(&state);
-            let upstream = rewrite_host(&state);
+            let base_url = nora_base_url(state);
+            let upstream = rewrite_host(state);
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
-                format!("autocomplete?{}", qs.chars().take(50).collect::<String>()),
+                format!(
+                    "{}?{}",
+                    kind.name(),
+                    qs.chars().take(50).collect::<String>()
+                ),
                 crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
-            // `?id=` asks for one package's versions (hosted IDs never get here).
-            match qs.split('&').find_map(|kv| kv.strip_prefix("id=")) {
-                Some(id) => with_json(filter_autocomplete_versions(&state, id, rewritten).await),
-                None => with_json(rewritten.into_bytes()),
+            match kind {
+                Search::Query => with_json(filter_search_results(state, rewritten).await),
+                // `?id=` asks for one package's versions (hosted IDs never get here).
+                Search::Autocomplete => match qs.split('&').find_map(|kv| kv.strip_prefix("id=")) {
+                    Some(id) => with_json(filter_autocomplete_versions(state, id, rewritten).await),
+                    None => with_json(rewritten.into_bytes()),
+                },
             }
         }
         Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
@@ -432,17 +401,15 @@ async fn autocomplete_query(
             if !state.config.nuget.serve_stale {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            tracing::info!("NuGet autocomplete: upstream unavailable, using local index");
-            let data = local_autocomplete_results(
-                &state,
-                &query,
-                skip,
-                take,
-                prerelease,
-                sem_ver_level.as_deref(),
-            )
-            .await;
-            with_json_stale(data)
+            match kind {
+                Search::Query => {
+                    tracing::info!("NuGet search: upstream unavailable, using local index")
+                }
+                Search::Autocomplete => {
+                    tracing::info!("NuGet autocomplete: upstream unavailable, using local index")
+                }
+            }
+            with_json_stale(local().await)
         }
     }
 }
