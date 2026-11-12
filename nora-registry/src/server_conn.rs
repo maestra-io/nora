@@ -34,7 +34,6 @@ use axum::Router;
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
 
 /// Limits on the server's client connections, from `[server]`.
 #[derive(Clone, Copy, Debug)]
@@ -60,13 +59,16 @@ impl ConnLimits {
 
 /// Serve the requests of one connection with `app` until the client closes it, a limit
 /// closes it, or `stop` turns true (then the requests in flight finish and it closes).
-pub(crate) async fn serve_connection(
-    mut stream: TcpStream,
+/// `stream` is the accepted socket; tests give an in-memory pipe.
+pub(crate) async fn serve_connection<S>(
+    mut stream: S,
     remote: SocketAddr,
     app: Router,
     limits: ConnLimits,
     stop: tokio::sync::watch::Receiver<bool>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let clock = Arc::new(HeadClock::new(tokio::time::Instant::now()));
     // CANCEL-SAFETY: on timeout the bytes read so far are dropped with the connection.
     let preface =
@@ -288,7 +290,7 @@ struct Preface {
 /// Read the first bytes of a connection until they are the HTTP/2 preface or cannot be
 /// (any HTTP/1 request differs from it by its second byte at the latest). `None` when the
 /// client closes first.
-async fn read_preface(stream: &mut TcpStream) -> io::Result<Option<Preface>> {
+async fn read_preface<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Option<Preface>> {
     use tokio::io::AsyncReadExt;
     let mut bytes = Vec::with_capacity(H2_PREFACE.len());
     let mut buf = [0u8; 24];
@@ -334,14 +336,14 @@ impl HeadClock {
 
 /// The connection's stream: first the bytes [`read_preface`] took, then the socket;
 /// counting the bytes read for [`HeadTimer`].
-struct CountingIo {
-    inner: TcpStream,
+struct CountingIo<S> {
+    inner: S,
     replay: Vec<u8>,
     replayed: usize,
     clock: Arc<HeadClock>,
 }
 
-impl AsyncRead for CountingIo {
+impl<S: AsyncRead + Unpin> AsyncRead for CountingIo<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -365,7 +367,7 @@ impl AsyncRead for CountingIo {
     }
 }
 
-impl AsyncWrite for CountingIo {
+impl<S: AsyncWrite + Unpin> AsyncWrite for CountingIo<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -404,6 +406,12 @@ struct HeadTimer {
 }
 
 impl hyper::rt::Timer for HeadTimer {
+    // hyper times each head from this: on tokio's clock like the deadlines here, so a test
+    // on a paused clock drives the whole timeout (outside tests it is `Instant::now()`).
+    fn now(&self) -> std::time::Instant {
+        tokio::time::Instant::now().into_std()
+    }
+
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn hyper::rt::Sleep>> {
         Box::pin(HeadSleep::fixed(tokio::time::Instant::now() + duration))
     }
