@@ -162,7 +162,10 @@ for ns_file in "$REPO_ROOT"/nora-registry/src/registry/*.rs; do
     [ "$ns_base" = "mod.rs" ] && continue
     ns_routes=$(awk '/pub fn routes\(\)/{flag=1} flag{print} flag&&/^}/{exit}' "$ns_file")
     if echo "$ns_routes" | grep -qE '\b(put|post|delete|any)\('; then
-        if grep -q 'enforce_namespace_scope' "$ns_file"; then
+        # maestra: rpm and deb run their writes through registry/os_repo.rs (R4-T11).
+        if grep -q 'enforce_namespace_scope' "$ns_file" \
+            || { grep -q 'os_repo::' "$ns_file" \
+                && grep -q 'enforce_namespace_scope' "$REPO_ROOT/nora-registry/src/registry/os_repo.rs"; }; then
             NS_COVERED=$((NS_COVERED + 1))
         else
             fail "registry/$ns_base mounts a write/any route but never calls enforce_namespace_scope (#583)"

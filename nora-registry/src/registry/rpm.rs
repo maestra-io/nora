@@ -16,16 +16,14 @@
 //! is unsigned — clients use `gpgcheck=0 repo_gpgcheck=0` (GPG signing is a
 //! separate roadmap item, #128).
 
-use crate::activity_log::{ActionType, ActivityEntry};
-use crate::audit::AuditEntry;
-use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
-use crate::config::UpstreamAuth;
-use crate::registry::{method_not_allowed, proxied_repo_conflict};
-use crate::validation::validate_storage_key;
+use super::os_repo::{self, OsRepo, Settings, META_DIR};
+use crate::auth::NamespaceAuthority;
+use crate::registry::method_not_allowed;
+use crate::registry_type::RegistryType;
 use crate::AppState;
 use axum::{
     extract::{Path, State},
-    http::{header, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
     Extension, Router,
@@ -52,9 +50,6 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-/// Sidecar prefix inside a repo. Not a valid RPM path component for clients
-/// (uploads to it are rejected), so it can never collide with package files.
-const META_DIR: &str = ".nora-meta";
 const REPODATA: &str = "repodata";
 
 fn package_key(repo: &str, path: &str) -> String {
@@ -684,6 +679,110 @@ pub(crate) async fn regenerate_repodata(
 // Handlers
 // ============================================================================
 
+/// The rpm side of the handlers shared with deb (registry/os_repo.rs).
+struct Rpm;
+
+impl OsRepo for Rpm {
+    const NAME: &'static str = "rpm";
+    const REGISTRY_TYPE: RegistryType = RegistryType::Rpm;
+    const INDEX: &'static str = "repodata";
+    const PUBKEY_PATH: &'static str = "repodata/repomd.xml.key";
+    type Record = PkgRecord;
+
+    fn settings(config: &crate::config::Config) -> Settings<'_> {
+        let c = &config.rpm;
+        Settings {
+            enabled: c.enabled,
+            max_file_size: c.max_file_size,
+            proxies: &c.proxies,
+            proxy_timeout: c.proxy_timeout,
+            metadata_ttl: c.metadata_ttl,
+        }
+    }
+    fn package_key(repo: &str, path: &str) -> String {
+        package_key(repo, path)
+    }
+    fn sidecar_key(repo: &str, path: &str) -> String {
+        sidecar_key(repo, path)
+    }
+    fn lock_key(repo: &str) -> String {
+        repomd_key(repo)
+    }
+    fn content_type(path: &str) -> &'static str {
+        content_type(path)
+    }
+    fn validate_package_path(repo: &str, path: &str) -> Result<(), &'static str> {
+        validate_package_path(repo, path)
+    }
+    fn is_package(lower: &str) -> bool {
+        lower.ends_with(".rpm") || lower.ends_with(".drpm")
+    }
+    fn is_stored_package(rest: &str) -> bool {
+        rest.to_ascii_lowercase().ends_with(".rpm") && !rest.starts_with(REPODATA)
+    }
+    // repomd.xml is rewritten in place on every publish — clients must
+    // revalidate it. Hashed repodata blobs and .rpm files are immutable.
+    fn revalidate(path: &str) -> bool {
+        path == format!("{REPODATA}/repomd.xml")
+    }
+    fn display(record: &PkgRecord) -> String {
+        format!(
+            "{}-{}-{}.{}",
+            record.name, record.version, record.release, record.arch
+        )
+    }
+    // The package is read fully once — header for the fields, whole body for
+    // the pkgid.
+    #[allow(clippy::result_large_err)] // the Err is the response returned at once
+    fn reindex_record(
+        state: &AppState,
+        repo: &str,
+        missing: &str,
+        body: &[u8],
+    ) -> Result<PkgRecord, Response> {
+        let md = match PackageMetadata::parse(&mut &body[..]) {
+            Ok(md) => md,
+            Err(e) => {
+                tracing::error!(error = %e, repo = %repo, pkg = %missing, "rpm reindex: not a valid RPM — refusing to index");
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("{missing} is not a valid RPM: {e}"),
+                )
+                    .into_response());
+            }
+        };
+        extract_record(
+            &md,
+            body,
+            missing,
+            now_secs(),
+            state.config.rpm.changelog_limit,
+        )
+        .map_err(|e| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("{missing}: RPM header missing required tags: {e}"),
+            )
+                .into_response()
+        })
+    }
+    fn regenerate<'a>(
+        storage: &'a crate::Storage,
+        signer: Option<&'a crate::signing::RepoSigner>,
+        repo: &'a str,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send + 'a {
+        regenerate_repodata(storage, signer, repo)
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[allow(clippy::result_large_err)] // the Err is the response returned at once
 async fn upload(
     State(state): State<AppState>,
     Path((repo, path)): Path<(String, String)>,
@@ -691,117 +790,28 @@ async fn upload(
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
     super::PublishBody(body): super::PublishBody,
 ) -> Response {
-    if !state.config.rpm.enabled {
-        return StatusCode::NOT_FOUND.into_response();
+    if let Err(response) = os_repo::write_preflight::<Rpm>(&state, &repo, &path) {
+        return response;
     }
-    if state.config.rpm.proxies.contains_key(&repo) {
-        return proxied_repo_conflict();
-    }
-    if let Err(msg) = validate_package_path(&repo, &path) {
-        return (StatusCode::BAD_REQUEST, msg).into_response();
-    }
-    // Enforce OIDC namespace_scope on the repository name (#583).
-    if enforce_namespace_scope(&authority, &repo).is_err() {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    if body.len() as u64 > state.config.rpm.max_file_size {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
-                "File too large. Max size: {} bytes",
-                state.config.rpm.max_file_size
-            ),
-        )
-            .into_response();
-    }
-
-    let md = match PackageMetadata::parse(&mut &body[..]) {
-        Ok(md) => md,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("Not a valid RPM: {e}")).into_response()
-        }
-    };
-    let file_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let record = match extract_record(
-        &md,
-        &body,
-        &path,
-        file_time,
-        state.config.rpm.changelog_limit,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            return (
+    let changelog_limit = state.config.rpm.changelog_limit;
+    os_repo::publish::<Rpm>(&state, &repo, &path, &authority, &user, &body, |body| {
+        let md = match PackageMetadata::parse(&mut &body[..]) {
+            Ok(md) => md,
+            Err(e) => {
+                return Err(
+                    (StatusCode::BAD_REQUEST, format!("Not a valid RPM: {e}")).into_response()
+                )
+            }
+        };
+        extract_record(&md, body, &path, now_secs(), changelog_limit).map_err(|e| {
+            (
                 StatusCode::BAD_REQUEST,
                 format!("RPM header missing required tags: {e}"),
             )
                 .into_response()
-        }
-    };
-    let sidecar = match serde_json::to_vec(&record) {
-        Ok(j) => j,
-        Err(e) => {
-            tracing::error!(error = %e, "rpm: failed to serialize package record");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
-    let key = package_key(&repo, &path);
-    if validate_storage_key(&key).is_err() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-
-    // Serialize publishes/deletes per repo: the repodata rebuild is a
-    // list-read-generate-write cycle over the whole repo (same TOCTOU
-    // rationale as the maven-metadata.xml lock).
-    let lock = state.publish_lock(&repomd_key(&repo));
-    let _guard = lock.lock().await;
-
-    if let Err(e) = state.storage.put(&key, &body).await {
-        tracing::error!(error = %e, key = %key, "rpm: failed to store package");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    if let Err(e) = state
-        .storage
-        .put(&sidecar_key(&repo, &path), &sidecar)
-        .await
-    {
-        tracing::error!(error = %e, key = %key, "rpm: failed to store metadata sidecar");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    if let Err(e) = regenerate_repodata(&state.storage, state.signer.as_deref(), &repo).await {
-        tracing::error!(repo = %repo, error = %e, "rpm: repodata regeneration failed");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Package stored but repodata regeneration failed",
-        )
-            .into_response();
-    }
-
-    let nevra = format!(
-        "{}-{}-{}.{}",
-        record.name, record.version, record.release, record.arch
-    );
-    state.metrics.record_upload("rpm");
-    state.audit.log(AuditEntry::new(
-        "push",
-        crate::auth::audit_actor(&user),
-        &nevra,
-        "rpm",
-        "",
-    ));
-    state.activity.push(ActivityEntry::new(
-        ActionType::Push,
-        format!("{repo}/{nevra}"),
-        crate::registry_type::RegistryType::Rpm,
-        "LOCAL",
-    ));
-    state.repo_index.invalidate("rpm");
-
-    StatusCode::CREATED.into_response()
+        })
+    })
+    .await
 }
 
 async fn download(
@@ -809,143 +819,14 @@ async fn download(
     headers: axum::http::HeaderMap,
     Path((repo, path)): Path<(String, String)>,
 ) -> Response {
-    if !state.config.rpm.enabled {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    // Pull-through repo: every path (including repodata/ and repomd.xml.key,
-    // which are server-generated only for hosted repos) proxies to the
-    // configured upstream. Packages are immutable; metadata is TTL-bounded.
-    if let Some(entry) = state.config.rpm.proxies.get(&repo) {
-        let key = package_key(&repo, &path);
-        if validate_storage_key(&key).is_err() || path.starts_with(META_DIR) {
-            return StatusCode::BAD_REQUEST.into_response();
-        }
-        let lower = path.to_ascii_lowercase();
-        let immutable = lower.ends_with(".rpm") || lower.ends_with(".drpm");
-        let url = format!("{}/{}", entry.url().trim_end_matches('/'), path);
-        return crate::registry::repo_proxy_download(
-            &state,
-            "rpm",
-            crate::registry_type::RegistryType::Rpm,
-            format!("{repo}/{path}"),
-            key,
-            url,
-            entry.auth().map(UpstreamAuth::Basic),
-            state.config.rpm.proxy_timeout,
-            state.config.rpm.metadata_ttl,
-            immutable,
-            content_type(&path),
-        )
-        .await;
-    }
-    if path == format!("{REPODATA}/repomd.xml.key") {
-        return match &state.signer {
-            Some(signer) => (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/pgp-keys")],
-                signer.public_key_armored().to_string(),
-            )
-                .into_response(),
-            None => StatusCode::NOT_FOUND.into_response(),
-        };
-    }
-    let key = package_key(&repo, &path);
-    if validate_storage_key(&key).is_err() || path.starts_with(META_DIR) {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-
-    // Range applies to package payloads only — repodata/ is regenerated on every
-    // publish, so a resumed range could splice two generations.
-    let is_package = {
-        let lower = path.to_ascii_lowercase();
-        lower.ends_with(".rpm") || lower.ends_with(".drpm")
-    };
-
-    // 206 Partial Content, or 416 when the client asks past the end, straight from
-    // the backend's ranged read — a resumed dnf download transfers only the bytes
-    // it is missing. A partial body cannot be rehashed, so this path skips the pin
-    // check `get_verified` does below and relies on the client's own checksum
-    // (primary.xml records one) — the docker #657 precedent.
-    if is_package {
-        if let Some(meta) = state.storage.stat(&key).await {
-            if let Some(response) = crate::registry::range::range_response(
-                &state.storage,
-                &[&key],
-                &headers,
-                meta.size,
-                content_type(&path),
-                &[],
-            )
-            .await
-            {
-                if response.status() == StatusCode::PARTIAL_CONTENT {
-                    state.metrics.record_download("rpm");
-                }
-                return response;
-            }
-        }
-    }
-
-    match state.storage.get_verified(&key).await {
-        Ok(outcome) => {
-            state.metrics.record_download("rpm");
-            state.activity.push(ActivityEntry::new(
-                ActionType::Pull,
-                format!("{repo}/{path}"),
-                crate::registry_type::RegistryType::Rpm,
-                "LOCAL",
-            ));
-            use nora_registry::verified::{verified_body, GateOutcome};
-            let data = match outcome {
-                GateOutcome::Verified(blob) => verified_body(blob),
-                GateOutcome::Unpinned(blob) => blob.into_inner(),
-            };
-            let mut builder = axum::http::Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, content_type(&path));
-            if is_package {
-                builder = builder.header(header::ACCEPT_RANGES, "bytes");
-            }
-            // repomd.xml is rewritten in place on every publish — clients must
-            // revalidate it. Hashed repodata blobs and .rpm files are immutable.
-            if path == format!("{REPODATA}/repomd.xml") {
-                builder = builder.header(header::CACHE_CONTROL, "no-cache");
-            }
-            builder
-                .body(axum::body::Body::from(data))
-                .expect("valid response")
-                .into_response()
-        }
-        Err(crate::storage::StorageError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, key = %key, "rpm: failed to read artifact");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
+    os_repo::download::<Rpm>(state, headers, repo, path).await
 }
 
 async fn check_exists(
     State(state): State<AppState>,
     Path((repo, path)): Path<(String, String)>,
 ) -> Response {
-    if !state.config.rpm.enabled {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let key = package_key(&repo, &path);
-    if validate_storage_key(&key).is_err() || path.starts_with(META_DIR) {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    match state.storage.stat(&key).await {
-        Some(meta) => (
-            StatusCode::OK,
-            [
-                (header::CONTENT_LENGTH, meta.size.to_string()),
-                (header::CONTENT_TYPE, content_type(&path).to_string()),
-            ],
-        )
-            .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
+    os_repo::check_exists::<Rpm>(state, repo, path).await
 }
 
 async fn delete_package(
@@ -954,208 +835,19 @@ async fn delete_package(
     Extension(authority): Extension<NamespaceAuthority>,
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
 ) -> Response {
-    if !state.config.rpm.enabled {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    if state.config.rpm.proxies.contains_key(&repo) {
-        return proxied_repo_conflict();
-    }
-    if let Err(msg) = validate_package_path(&repo, &path) {
-        return (StatusCode::BAD_REQUEST, msg).into_response();
-    }
-    if enforce_namespace_scope(&authority, &repo).is_err() {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    let key = package_key(&repo, &path);
-    if validate_storage_key(&key).is_err() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-
-    let lock = state.publish_lock(&repomd_key(&repo));
-    let _guard = lock.lock().await;
-
-    match state.storage.delete(&key).await {
-        Ok(()) => {}
-        Err(crate::storage::StorageError::NotFound) => {
-            return StatusCode::NOT_FOUND.into_response()
-        }
-        Err(e) => {
-            tracing::error!(error = %e, key = %key, "rpm: failed to delete package");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    }
-    if let Err(e) = state.storage.delete(&sidecar_key(&repo, &path)).await {
-        tracing::warn!(error = %e, key = %key, "rpm: failed to delete metadata sidecar");
-    }
-    if let Err(e) = regenerate_repodata(&state.storage, state.signer.as_deref(), &repo).await {
-        tracing::error!(repo = %repo, error = %e, "rpm: repodata regeneration failed");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Package deleted but repodata regeneration failed",
-        )
-            .into_response();
-    }
-
-    state.audit.log(AuditEntry::new(
-        "delete",
-        crate::auth::audit_actor(&user),
-        &path,
-        "rpm",
-        "",
-    ));
-    state.repo_index.invalidate("rpm");
-    StatusCode::NO_CONTENT.into_response()
+    os_repo::delete_package::<Rpm>(state, repo, path, authority, user).await
 }
 
-/// Reconcile a repository with what is actually in storage, then rebuild
-/// (and re-sign) its repodata. Heals out-of-band changes the publish path
-/// never saw: packages deleted directly from storage (their stale sidecars
-/// are dropped) and packages added directly to storage (parsed, sidecar
-/// created). Also the re-sign hook after a signing-key change. Runs under
-/// the repo publish lock, like every rebuild.
+/// Reconcile a repository with storage and rebuild (and re-sign) its
+/// repodata: see [`os_repo::reindex`].
 async fn reindex(
     State(state): State<AppState>,
     Path(repo): Path<String>,
     Extension(authority): Extension<NamespaceAuthority>,
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
 ) -> Response {
-    if !state.config.rpm.enabled {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    if repo.is_empty() || !repo.is_ascii() || repo.contains('/') || repo.starts_with('.') {
-        return (StatusCode::BAD_REQUEST, "Invalid repository name").into_response();
-    }
-    if state.config.rpm.proxies.contains_key(&repo) {
-        return proxied_repo_conflict();
-    }
-    if enforce_namespace_scope(&authority, &repo).is_err() {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-
-    let lock = state.publish_lock(&repomd_key(&repo));
-    let _guard = lock.lock().await;
-
-    let prefix = format!("rpm/{repo}/");
-    let keys = match state.storage.list(&prefix).await {
-        Ok(k) => k,
-        Err(e) => {
-            tracing::error!(error = %e, repo = %repo, "rpm reindex: list failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    if keys.is_empty() {
-        return (StatusCode::NOT_FOUND, "No such repository").into_response();
-    }
-
-    let meta_prefix = format!("rpm/{repo}/{META_DIR}/");
-    let mut packages: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut sidecars: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for key in &keys {
-        if let Some(rest) = key.strip_prefix(&meta_prefix) {
-            if let Some(pkg) = rest.strip_suffix(".json") {
-                sidecars.insert(pkg.to_string());
-            }
-        } else if let Some(rest) = key.strip_prefix(&prefix) {
-            if rest.to_ascii_lowercase().ends_with(".rpm") && !rest.starts_with(REPODATA) {
-                packages.insert(rest.to_string());
-            }
-        }
-    }
-
-    // Drop sidecars whose package is gone (deleted out-of-band).
-    let mut orphans_removed = 0usize;
-    for stale in sidecars.difference(&packages) {
-        match state.storage.delete(&sidecar_key(&repo, stale)).await {
-            Ok(()) => orphans_removed += 1,
-            Err(e) => {
-                tracing::error!(error = %e, repo = %repo, pkg = %stale, "rpm reindex: orphan sidecar delete failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        }
-    }
-
-    // Parse packages that have no sidecar (added out-of-band). The package is
-    // read fully once — header for the fields, whole body for the pkgid.
-    let mut sidecars_created = 0usize;
-    for missing in packages.difference(&sidecars) {
-        let body = match state.storage.get(&package_key(&repo, missing)).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!(error = %e, repo = %repo, pkg = %missing, "rpm reindex: package read failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-        let md = match PackageMetadata::parse(&mut &body[..]) {
-            Ok(md) => md,
-            Err(e) => {
-                tracing::error!(error = %e, repo = %repo, pkg = %missing, "rpm reindex: not a valid RPM — refusing to index");
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("{missing} is not a valid RPM: {e}"),
-                )
-                    .into_response();
-            }
-        };
-        let file_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let record = match extract_record(
-            &md,
-            &body,
-            missing,
-            file_time,
-            state.config.rpm.changelog_limit,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("{missing}: RPM header missing required tags: {e}"),
-                )
-                    .into_response()
-            }
-        };
-        let json = match serde_json::to_vec(&record) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::error!(error = %e, "rpm reindex: sidecar serialize failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-        if let Err(e) = state.storage.put(&sidecar_key(&repo, missing), &json).await {
-            tracing::error!(error = %e, repo = %repo, pkg = %missing, "rpm reindex: sidecar write failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        sidecars_created += 1;
-    }
-
-    if let Err(e) = regenerate_repodata(&state.storage, state.signer.as_deref(), &repo).await {
-        tracing::error!(repo = %repo, error = %e, "rpm reindex: repodata regeneration failed");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
-    state.audit.log(AuditEntry::new(
-        "reindex",
-        crate::auth::audit_actor(&user),
-        &repo,
-        "rpm",
-        "",
-    ));
-    state.repo_index.invalidate("rpm");
-
-    (
-        StatusCode::OK,
-        axum::Json(serde_json::json!({
-            "packages": packages.len(),
-            "sidecars_created": sidecars_created,
-            "orphans_removed": orphans_removed,
-            "signed": state.signer.is_some(),
-        })),
-    )
-        .into_response()
+    os_repo::reindex::<Rpm>(state, repo, authority, user).await
 }
-
 fn content_type(path: &str) -> &'static str {
     if path.ends_with(".rpm") {
         "application/x-rpm"
@@ -1979,6 +1671,32 @@ mod reindex_tests {
         std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&gz[..]), &mut out)
             .unwrap();
         out
+    }
+
+    /// Where the shared reindex (registry/os_repo.rs) parts with deb on purpose:
+    /// an `.rpm` under `repodata/` is server-owned, never a package to adopt — a
+    /// stray one there must not fail the reindex as "not a valid RPM".
+    #[tokio::test]
+    async fn test_reindex_skips_rpm_files_under_repodata() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/myrepo/aaa.rpm",
+            build_rpm("aaa"),
+        )
+        .await;
+        ctx.state
+            .storage
+            .put("rpm/myrepo/repodata/stray.rpm", b"not an rpm")
+            .await
+            .unwrap();
+
+        let resp = send(&ctx.app, Method::POST, "/rpm/myrepo/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(body["packages"], 1);
+        assert_eq!(body["sidecars_created"], 0);
     }
 
     /// Out-of-band deletion: the package vanishes from storage behind the
