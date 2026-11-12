@@ -4,14 +4,19 @@
 
 //! A connection whose request head does not arrive in time is closed, an idle keep-alive
 //! connection lives longer than that, and open connections are capped.
+//!
+//! The head timeouts are tested over an in-memory pipe on tokio's paused clock: no socket
+//! I/O is in flight when tokio moves the clock on, so each close is timed exactly. The
+//! listener and the HTTP/2 paths are tested over loopback sockets in real time.
 use super::{serve_with_drain, ConnLimits, ServeEnd};
 use axum::extract::ConnectInfo;
 use axum::routing::get;
 use axum::Router;
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 
 const HEAD: Duration = Duration::from_millis(300);
 const IDLE: Duration = Duration::from_millis(1500);
@@ -38,11 +43,41 @@ async fn start(max_connections: usize) -> TestServer {
     .await
 }
 
-async fn start_with(limits: ConnLimits) -> TestServer {
-    let app = Router::new().route("/ok", get(|| async { "ok" })).route(
+fn app() -> Router {
+    Router::new().route("/ok", get(|| async { "ok" })).route(
         "/peer",
         get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.ip().to_string() }),
-    );
+    )
+}
+
+/// One connection served over an in-memory pipe with `header_read_timeout` = `head`: the
+/// client end, and the stop signal (dropping it shuts the connection down).
+fn serve_in_memory(head: Duration) -> (tokio::io::DuplexStream, tokio::sync::watch::Sender<bool>) {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let limits = ConnLimits {
+        header_read_timeout: head,
+        keep_alive_timeout: IDLE,
+        max_connections: 1,
+    };
+    let remote = SocketAddr::from(([127, 0, 0, 1], 40000));
+    tokio::spawn(crate::server_conn::serve_connection(
+        server,
+        remote,
+        app(),
+        limits,
+        stopped,
+    ));
+    (client, stop)
+}
+
+/// Whether the server closed exactly `at` (to the clock's millisecond) on a paused clock.
+fn closed_at(closed: Option<Duration>, at: Duration) -> bool {
+    closed.is_some_and(|d| d >= at && d < at + Duration::from_millis(10))
+}
+
+async fn start_with(limits: ConnLimits) -> TestServer {
+    let app = app();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let task = tokio::spawn(serve_with_drain(
@@ -57,14 +92,14 @@ async fn start_with(limits: ConnLimits) -> TestServer {
 
 /// One response off a keep-alive connection: its head and its `content-length` body.
 /// A server that stalls mid-response fails the test after 5 s instead of hanging it.
-async fn read_response(stream: &mut TcpStream) -> String {
+async fn read_response(stream: &mut (impl AsyncRead + Unpin)) -> String {
     // CANCEL-SAFETY: on timeout the test fails; the half-read stream is not reused.
     tokio::time::timeout(Duration::from_secs(5), read_response_whole(stream))
         .await
         .expect("no whole response within 5 s")
 }
 
-async fn read_response_whole(stream: &mut TcpStream) -> String {
+async fn read_response_whole(stream: &mut (impl AsyncRead + Unpin)) -> String {
     let mut raw = Vec::new();
     let mut byte = [0u8; 1];
     while !raw.ends_with(b"\r\n\r\n") {
@@ -93,7 +128,7 @@ async fn read_response_whole(stream: &mut TcpStream) -> String {
 }
 
 /// How long until the server closes `stream`, if it does within `limit`.
-async fn closed_within(stream: &mut TcpStream, limit: Duration) -> Option<Duration> {
+async fn closed_within(stream: &mut (impl AsyncRead + Unpin), limit: Duration) -> Option<Duration> {
     let start = Instant::now();
     let mut buf = [0u8; 1024];
     loop {
@@ -108,19 +143,17 @@ async fn closed_within(stream: &mut TcpStream, limit: Duration) -> Option<Durati
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_head_that_never_completes_is_closed() {
-    let server = start(16).await;
-    let addr = server.addr;
-    let mut client = TcpStream::connect(addr).await.unwrap();
+    let (mut client, _stop) = serve_in_memory(HEAD);
     client
         .write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n")
         .await
         .unwrap();
     let closed = closed_within(&mut client, Duration::from_secs(5)).await;
     assert!(
-        closed.is_some_and(|d| d < HEAD * 4),
-        "an unfinished head holds the connection: {closed:?}"
+        closed_at(closed, HEAD),
+        "an unfinished head was closed after {closed:?}, header timeout {HEAD:?}"
     );
 }
 
@@ -139,17 +172,10 @@ async fn a_connection_that_sends_nothing_is_closed_at_the_header_timeout() {
 
 /// The first head's timeout runs from the accept: a client that waits before its first
 /// byte has that much less time for the rest.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_first_head_is_timed_from_the_accept() {
     let head = Duration::from_secs(1);
-    let server = start_with(ConnLimits {
-        header_read_timeout: head,
-        keep_alive_timeout: IDLE,
-        max_connections: 16,
-    })
-    .await;
-    let addr = server.addr;
-    let mut client = TcpStream::connect(addr).await.unwrap();
+    let (mut client, _stop) = serve_in_memory(head);
     let connected = Instant::now();
     tokio::time::sleep(Duration::from_millis(800)).await;
     client.write_all(b"GET /ok HTTP/1.1\r\n").await.unwrap();
@@ -157,17 +183,15 @@ async fn the_first_head_is_timed_from_the_accept() {
     let since_connect = connected.elapsed();
     assert!(closed.is_some(), "an unfinished head held the connection");
     assert!(
-        since_connect < head + Duration::from_millis(400),
-        "closed {since_connect:?} after the connect"
+        closed_at(Some(since_connect), head),
+        "closed {since_connect:?} after the connect, header timeout {head:?}"
     );
 }
 
 /// A slow client sending its head a byte at a time gains nothing by it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_head_sent_a_byte_at_a_time_is_closed_at_the_header_timeout() {
-    let server = start(16).await;
-    let addr = server.addr;
-    let mut client = TcpStream::connect(addr).await.unwrap();
+    let (mut client, _stop) = serve_in_memory(HEAD);
     let start = Instant::now();
     for byte in b"GET /ok HTTP/1.1\r\nHost: x\r\nX-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
         if client.write_all(&[*byte]).await.is_err() {
@@ -178,16 +202,18 @@ async fn a_head_sent_a_byte_at_a_time_is_closed_at_the_header_timeout() {
     let closed = closed_within(&mut client, Duration::from_secs(5)).await;
     let total = start.elapsed();
     assert!(closed.is_some(), "a trickled head holds the connection");
-    assert!(total < HEAD * 8, "closed after {total:?}");
+    // The close is seen at the header timeout, or at the next byte the client sends.
+    assert!(
+        total >= HEAD && total < HEAD + Duration::from_millis(60),
+        "closed after {total:?}"
+    );
 }
 
 /// The header timeout is not an idle timeout: a proxy reuses an idle connection after
 /// longer than that (traefik up to 90 s), and NORA must not close it first.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_idle_keep_alive_connection_outlives_the_header_timeout() {
-    let server = start(16).await;
-    let addr = server.addr;
-    let mut client = TcpStream::connect(addr).await.unwrap();
+    let (mut client, _stop) = serve_in_memory(HEAD);
     client.write_all(REQUEST).await.unwrap();
     assert!(read_response(&mut client).await.starts_with("HTTP/1.1 200"));
 
@@ -200,18 +226,16 @@ async fn an_idle_keep_alive_connection_outlives_the_header_timeout() {
 
     let closed = closed_within(&mut client, IDLE * 3).await;
     assert!(
-        closed.is_some_and(|d| d >= IDLE - HEAD),
-        "idle past the keep-alive timeout, closed after {closed:?}"
+        closed_at(closed, IDLE),
+        "idle closed after {closed:?}, keep-alive timeout {IDLE:?}"
     );
 }
 
 /// A later head on a keep-alive connection gets the header timeout from its first byte,
 /// not the idle allowance.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_later_head_is_timed_from_its_first_byte() {
-    let server = start(16).await;
-    let addr = server.addr;
-    let mut client = TcpStream::connect(addr).await.unwrap();
+    let (mut client, _stop) = serve_in_memory(HEAD);
     client.write_all(REQUEST).await.unwrap();
     assert!(read_response(&mut client).await.starts_with("HTTP/1.1 200"));
 
@@ -219,8 +243,8 @@ async fn a_later_head_is_timed_from_its_first_byte() {
     client.write_all(b"GET /ok HTTP/1.1\r\n").await.unwrap();
     let closed = closed_within(&mut client, IDLE * 3).await;
     assert!(
-        closed.is_some_and(|d| d < HEAD * 2),
-        "a started head got more than the header timeout: {closed:?}"
+        closed_at(closed, HEAD),
+        "a started head was closed after {closed:?}, header timeout {HEAD:?}"
     );
 }
 

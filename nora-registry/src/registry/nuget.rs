@@ -1689,15 +1689,17 @@ fn filter_registration(hidden: &HashSet<String>, body: &[u8]) -> Option<Vec<u8>>
 #[derive(Default)]
 pub(crate) struct HiddenMemo(parking_lot::Mutex<HashMap<(String, bool), HiddenEntry>>);
 
+/// On tokio's clock, so a test on a paused clock can expire an entry (outside tests it
+/// is `std::time::Instant`).
 struct HiddenEntry {
-    at: std::time::Instant,
+    at: tokio::time::Instant,
     curation: usize,
     hidden: Arc<HashSet<String>>,
     /// Every version the set was judged over: an expired entry still answers for a
     /// version list inside it.
     known: Arc<HashSet<String>>,
     /// When a background recompute of this expired entry started.
-    refreshing: Option<std::time::Instant>,
+    refreshing: Option<tokio::time::Instant>,
 }
 
 /// A background recompute older than this is taken as lost and started again.
@@ -1738,7 +1740,7 @@ async fn hidden_versions(
                 if e.refreshing
                     .is_none_or(|t| t.elapsed() > HIDDEN_REFRESH_STALL)
                 {
-                    e.refreshing = Some(std::time::Instant::now());
+                    e.refreshing = Some(tokio::time::Instant::now());
                     refresh_behind = true;
                 }
                 let hidden = e.hidden.clone();
@@ -1780,7 +1782,7 @@ fn remember_hidden(
         }
     }
     let entry = HiddenEntry {
-        at: std::time::Instant::now(),
+        at: tokio::time::Instant::now(),
         curation,
         hidden: hidden.clone(),
         known: Arc::new(known),

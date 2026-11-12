@@ -1613,7 +1613,10 @@ async fn test_q04_expired_hidden_memo_is_served_and_recomputed_behind() {
         serde_json::json!(["1.0.0"])
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // The memo entry expires on tokio's clock; storage and wiremock keep real time.
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_millis(1100)).await;
+    tokio::time::resume();
     let _ = ctx
         .state
         .storage
