@@ -16,7 +16,6 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::cache_ttl::is_within_ttl;
 use crate::config::UpstreamAuth;
 use crate::registry::{
     circuit_open_response, nora_base_url as nora_base_url_shared, proxy_fetch,
@@ -104,6 +103,19 @@ fn search_names(raw_query: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether the cached pub document at `key` may be served without asking upstream: written,
+/// or confirmed by a 304 revalidation (C56), within `metadata_ttl`. Every pub metadata
+/// endpoint reads its cache through this one rule.
+async fn cached_fresh(state: &AppState, key: &str) -> bool {
+    let ttl = state.config.pub_dart.metadata_ttl;
+    match state.storage.stat(key).await {
+        Some(meta) => {
+            crate::registry::fresh_within_ttl(&state.storage, key, meta.modified, ttl).await
+        }
+        None => false,
+    }
+}
+
 async fn search_packages(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> Response {
     let raw_query = raw_query.unwrap_or_default();
     // #68 namespace isolation: a search naming an internal namespace is never sent upstream (it
@@ -128,10 +140,8 @@ async fn search_packages(State(state): State<AppState>, RawQuery(raw_query): Raw
             Err(response) => return response,
         };
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&key).await {
-            if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
-                return pub_json_response(data.to_vec());
-            }
+        if cached_fresh(&state, &key).await {
+            return pub_json_response(data.to_vec());
         }
     }
 
@@ -217,11 +227,8 @@ async fn package_listing(
             Err(response) => return response,
         };
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&key).await {
-            let ttl = state.config.pub_dart.metadata_ttl;
-            if crate::registry::fresh_within_ttl(&state.storage, &key, meta.modified, ttl).await {
-                return pub_json_response(data.to_vec());
-            }
+        if cached_fresh(&state, &key).await {
+            return pub_json_response(data.to_vec());
         }
     }
 
@@ -350,10 +357,8 @@ async fn version_metadata(
             Err(response) => return response,
         };
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&key).await {
-            if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
-                return pub_json_response(data.to_vec());
-            }
+        if cached_fresh(&state, &key).await {
+            return pub_json_response(data.to_vec());
         }
     }
 
@@ -434,10 +439,8 @@ async fn package_advisories(
             Err(response) => return response,
         };
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&key).await {
-            if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
-                return pub_json_response(data.to_vec());
-            }
+        if cached_fresh(&state, &key).await {
+            return pub_json_response(data.to_vec());
         }
     }
 
@@ -2156,5 +2159,96 @@ mod unreadable_sidecar {
                 "upstream {status}"
             );
         }
+    }
+}
+
+/// R5 pairs: every pub metadata endpoint (search, package listing, version, advisories) reads
+/// its cache by one freshness rule: a document written, or confirmed by a 304 revalidation,
+/// within `metadata_ttl` is served without asking upstream; one neither written nor confirmed
+/// within it is asked for again.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod one_freshness_rule {
+    use crate::test_helpers::{create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use sha2::Digest;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// (request path, cache key) for each pub metadata endpoint.
+    fn endpoints() -> Vec<(String, String)> {
+        let search_key = format!(
+            "pub/search/{}.json",
+            hex::encode(sha2::Sha256::digest(b"q=http"))
+        );
+        vec![
+            ("/pub/api/packages?q=http".into(), search_key),
+            (
+                "/pub/api/packages/http".into(),
+                "pub/api/packages/http.json".into(),
+            ),
+            (
+                "/pub/api/packages/http/versions/1.0.0".into(),
+                "pub/api/packages/http/versions/1.0.0.json".into(),
+            ),
+            (
+                "/pub/api/packages/http/advisories".into(),
+                "pub/api/packages/http/advisories.json".into(),
+            ),
+        ]
+    }
+
+    async fn context() -> (MockServer, TestContext) {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pub_dart.enabled = true;
+            cfg.pub_dart.proxy = Some(uri);
+            cfg.pub_dart.metadata_ttl = 3600;
+            cfg.pub_dart.revalidate = true;
+        });
+        (upstream, ctx)
+    }
+
+    /// Store `key` as written two TTLs ago.
+    async fn put_old(ctx: &TestContext, key: &str) {
+        ctx.state.storage.put(key, b"{}").await.unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(ctx._tempdir.path().join(key))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_revalidated_document_is_fresh_on_every_endpoint() {
+        let (upstream, ctx) = context().await;
+        for (path, key) in endpoints() {
+            put_old(&ctx, &key).await;
+            crate::registry::mark_revalidated(&ctx.state.storage, "pub", &key).await;
+            let resp = send(&ctx.app, Method::GET, &path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        }
+        let asked = upstream.received_requests().await.unwrap();
+        assert!(asked.is_empty(), "asked upstream: {asked:?}");
+    }
+
+    #[tokio::test]
+    async fn an_old_unconfirmed_document_is_asked_again_on_every_endpoint() {
+        let (upstream, ctx) = context().await;
+        let endpoints = endpoints();
+        for (path, key) in &endpoints {
+            put_old(&ctx, key).await;
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        }
+        let asked = upstream.received_requests().await.unwrap();
+        assert_eq!(asked.len(), endpoints.len(), "asked upstream: {asked:?}");
     }
 }
