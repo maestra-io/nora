@@ -276,16 +276,18 @@ done
 # ── Check 5: concurrent test coverage ──
 # A test that publishes the same artifact from several tasks at once carries the marker
 # `lock-audit: concurrent-publish-test` in a comment. The marker is searched in the
-# format's own source file: a name or a comment that merely mentions concurrency does
-# not count, and neither does a test in another format's file.
+# format's own source files (`<format>*.rs` and its module directory `<format>/`): a name
+# or a comment that merely mentions concurrency does not count, and neither does a test
+# in another format's file. A format without one fails the audit.
 echo ""
 echo "--- Check 5: concurrent publish tests ---"
 
 for format in maven cargo npm pypi docker; do
-    if grep -qs "lock-audit: concurrent-publish-test" "$REGISTRY_DIR"/"$format"*.rs; then
+    if grep -qs "lock-audit: concurrent-publish-test" \
+        "$REGISTRY_DIR"/"$format"*.rs "$REGISTRY_DIR"/"$format"/*.rs; then
         green "$format has concurrent publish test"
     else
-        info "$format — no concurrent publish test found"
+        red "$format — no concurrent publish test found"
     fi
 done
 

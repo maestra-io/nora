@@ -112,6 +112,12 @@ cat > "$TMP/npm.rs" <<'RS'
 // concurrent publish of two versions is serialized by the lock
 async fn publish() {}
 RS
+mkdir -p "$TMP/pypi"
+cat > "$TMP/pypi/integration_tests.rs" <<'RS'
+// lock-audit: concurrent-publish-test
+#[tokio::test]
+async fn two_uploads_at_once() {}
+RS
 
 OUT="$(bash "$AUDIT" "$TMP" 2>&1)"
 
@@ -144,6 +150,8 @@ echo "=== lock-audit Check 5 self-test ==="
 expect_reported "cargo has concurrent publish test" "a marked test in the format's file is found"
 expect_reported "npm — no concurrent publish test found" "prose about concurrency without the marker is not a test"
 expect_reported "maven — no concurrent publish test found" "a format with no file has no test"
+expect_reported "pypi has concurrent publish test" "a marked test in the format's module directory is found"
+expect_reported "FAIL.* npm — no concurrent publish test found" "a format without a test fails the audit"
 
 # The audit must behave the same on whatever awk the machine has: gawk here, mawk on
 # Debian, Ubuntu and the CI images. A gawk-only construct aborts under mawk, and an
