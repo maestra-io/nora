@@ -1,5 +1,5 @@
 ---
-source: nora-registry/src/registry/docker.rs
+source: nora-registry/src/registry/docker/integration_tests.rs
 expression: pinned
 ---
 [
