@@ -36,7 +36,7 @@ use crate::AppState;
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
@@ -446,6 +446,7 @@ async fn index(State(state): State<AppState>, Path(repo): Path<String>) -> Respo
 
 async fn chart(
     State(state): State<AppState>,
+    method: Method,
     headers: HeaderMap,
     Path((repo, name, file)): Path<(String, String, String)>,
 ) -> Response {
@@ -556,7 +557,7 @@ async fn chart(
             return resp;
         }
         let len = cached.len();
-        return chart_response(len, cached.into_body(&state, "helm", &key, false));
+        return chart_response(Some(len), cached.into_body(&state, "helm", &key, false));
     }
 
     let entry = match entry {
@@ -603,29 +604,14 @@ async fn chart(
             }
         }
     };
-    let (data, fetched) = match crate::registry::proxy_fetch_artifact_with(
-        &state,
-        client,
-        &key,
-        "helm",
-        &url,
-        state.config.helm.proxy_timeout,
-        auth,
-        BreakerScope::upstream(RegistryType::Helm, up.url()),
-    )
-    .await
-    {
-        Ok(fetched) => fetched,
-        Err(e) => return proxy_error_response("helm", &url, &e),
-    };
-    // The index published the chart's digest: a body that does not match it (truncated,
-    // corrupted, swapped) is neither served nor cached.
-    let sha256 = data.sha256();
-    if !sha256.eq_ignore_ascii_case(expected) {
-        tracing::warn!(repo, chart = %name, version, url = %url, %expected, actual = %sha256, "Helm chart does not match the index digest, refusing it");
+    // The index publishes the digest the chart must have: curation and the quarantine
+    // decide on it before the fetch, so a GET can stream the chart as it downloads
+    // (R4-P03) and only the digest check waits for the end.
+    let Some(expected) = super::github::hex_sha256(expected) else {
+        tracing::warn!(repo, chart = %name, version, digest = %expected, "Helm index digest is not a sha256, refusing the chart");
         return StatusCode::BAD_GATEWAY.into_response();
-    }
-    let digest = format!("sha256:{sha256}");
+    };
+    let digest = format!("sha256:{expected}");
     if let Some(response) = crate::curation::verify_integrity_by_hash(
         engine,
         RegistryType::Helm,
@@ -634,28 +620,6 @@ async fn chart(
         &digest,
     ) {
         return response;
-    }
-    state.metrics.record_download("helm");
-    state.metrics.record_cache_miss("helm");
-    state.activity.push(ActivityEntry::new(
-        ActionType::ProxyFetch,
-        label,
-        RegistryType::Helm,
-        "PROXY",
-    ));
-    state
-        .audit
-        .log(AuditEntry::new("proxy_fetch", "proxy", "", "helm", ""));
-    // Only the caller whose fetch ran caches; coalesced followers share its body.
-    if fetched {
-        let (cache_state, cache_key, body) = (state.clone(), key.clone(), data.clone());
-        tokio::spawn(async move {
-            match body.cache(&cache_state, &cache_key, true).await {
-                Ok(true) => cache_state.repo_index.invalidate("helm"),
-                Ok(false) => {}
-                Err(e) => crate::record_cache_write_error("helm", &cache_key, &e),
-            }
-        });
     }
     if let Some(resp) = crate::digest_quarantine::proxy_gate_digest(
         &state.digest_store,
@@ -668,9 +632,73 @@ async fn chart(
     ) {
         return resp;
     }
+    let record_miss = || {
+        state.metrics.record_download("helm");
+        state.metrics.record_cache_miss("helm");
+        state.activity.push(ActivityEntry::new(
+            ActionType::ProxyFetch,
+            label,
+            RegistryType::Helm,
+            "PROXY",
+        ));
+        state
+            .audit
+            .log(AuditEntry::new("proxy_fetch", "proxy", "", "helm", ""));
+    };
+    let scope = BreakerScope::upstream(RegistryType::Helm, up.url());
+    let timeout = state.config.helm.proxy_timeout;
+    let served = if method == Method::GET {
+        let want = expected.clone();
+        crate::registry::proxy_stream_artifact(
+            &state,
+            client,
+            &key,
+            "helm",
+            &url,
+            timeout,
+            auth,
+            scope,
+            move |body| {
+                let sha256 = body.sha256();
+                std::future::ready(if sha256 == want {
+                    Ok(())
+                } else {
+                    Err(format!("chart sha256 {sha256}, the index digest is {want}"))
+                })
+            },
+        )
+        .await
+    } else {
+        crate::registry::proxy_fetch_artifact_with(
+            &state, client, &key, "helm", &url, timeout, auth, scope,
+        )
+        .await
+        .map(|(body, cache)| crate::registry::Served::Whole(body, cache))
+    };
+    let (data, fetched) = match served {
+        Ok(crate::registry::Served::Live(live)) => {
+            record_miss();
+            let len = live.len;
+            return chart_response(len, live.into_body(Bytes::new(), Some(expected), &key));
+        }
+        Ok(crate::registry::Served::Whole(data, fetched)) => (data, fetched),
+        Err(e) => return proxy_error_response("helm", &url, &e),
+    };
+    // A body that does not match the index digest (truncated, corrupted, swapped) is
+    // neither served nor cached.
+    let sha256 = data.sha256();
+    if sha256 != expected {
+        tracing::warn!(repo, chart = %name, version, url = %url, %expected, actual = %sha256, "Helm chart does not match the index digest, refusing it");
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    record_miss();
+    // Only the caller whose fetch ran caches; coalesced followers share its body.
+    if fetched {
+        crate::registry::spawn_cache_body(&state, "helm", key.clone(), data.clone());
+    }
     let len = data.len();
     match data.into_body(&key).await {
-        Ok(body) => chart_response(len, body),
+        Ok(body) => chart_response(Some(len), body),
         Err(e) => {
             tracing::warn!(key = %key, error = %e, "helm: spooled chart unreadable");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -678,8 +706,10 @@ async fn chart(
     }
 }
 
-fn chart_response(len: u64, body: axum::body::Body) -> Response {
-    (
+/// `len`: the body's length, when known (a streamed chart whose upstream declared
+/// none goes chunked).
+fn chart_response(len: Option<u64>, body: axum::body::Body) -> Response {
+    let mut response = (
         StatusCode::OK,
         [
             (
@@ -690,11 +720,16 @@ fn chart_response(len: u64, body: axum::body::Body) -> Response {
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=31536000, immutable"),
             ),
-            (header::CONTENT_LENGTH, HeaderValue::from(len)),
         ],
         body,
     )
-        .into_response()
+        .into_response();
+    if let Some(len) = len {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    }
+    response
 }
 
 #[cfg(test)]
@@ -1025,9 +1060,22 @@ mod integration_tests {
             cfg.helm.allow_private_chart_hosts = true;
         });
         let holders = ctx.state.storage.holders();
+        // A GET streams, so the mismatch found at the end breaks the body off (R4-P03); a
+        // HEAD fetches the whole chart first and answers 502.
         let resp = send(
             &ctx.app,
             Method::GET,
+            "/helm/demo/charts/demo/demo-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .is_err());
+        let resp = send(
+            &ctx.app,
+            Method::HEAD,
             "/helm/demo/charts/demo/demo-1.0.0.tgz",
             "",
         )
@@ -1339,5 +1387,191 @@ mod integration_tests {
             .as_object()
             .unwrap()
             .is_empty());
+    }
+
+    const CHART: &str = "/helm/demo/charts/demo/demo-1.0.0.tgz";
+    const CHART_KEY: &str = "helm/charts/demo/demo/demo-1.0.0.tgz";
+    const MIB: usize = 1024 * 1024;
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// A repo whose index names `url` for demo 1.0.0 with the digest of `published`.
+    async fn chart_at(url: &str, published: &[u8]) -> (MockServer, TestContext) {
+        let up = upstream(&index_yaml(&[("1.0.0", OLD, url, published)])).await;
+        let entry = proxy(&up);
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.helm.enabled = true;
+            cfg.helm.proxies.insert("demo".into(), entry);
+            // the chart host is a local socket
+            cfg.helm.allow_private_chart_hosts = true;
+        });
+        (up, ctx)
+    }
+
+    /// R4-P03: a cold chart reaches the client while the upstream still holds the rest of
+    /// it, and is cached once whole. Before, nothing went out until the download ended.
+    #[tokio::test]
+    async fn a_cold_chart_streams_before_the_upstream_finished_and_is_cached() {
+        use futures::StreamExt;
+        let body = pattern(3 * MIB);
+        let (files, gate, hits) =
+            gated_body_upstream(body[..MIB].to_vec(), body[MIB..].to_vec(), vec![]).await;
+        let (_up, ctx) = chart_at(&format!("{files}/demo-1.0.0.tgz"), &body).await;
+        let holders = ctx.state.storage.holders();
+
+        let resp = send(&ctx.app, Method::GET, CHART, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_LENGTH],
+            body.len().to_string().as_str()
+        );
+        let mut frames = resp.into_body().into_data_stream();
+        // The gate is shut: these bytes went out before the upstream sent the rest.
+        let first = frames.next().await.unwrap().unwrap();
+        assert!(!first.is_empty() && first.len() < MIB);
+        assert!(ctx.state.storage.stat(CHART_KEY).await.is_none());
+
+        gate.send(true).unwrap();
+        let mut got = first.to_vec();
+        while let Some(frame) = frames.next().await {
+            got.extend_from_slice(&frame.unwrap());
+        }
+        assert!(got == body, "the streamed chart is the chart");
+        background_writes_done(&ctx.state.storage, holders).await;
+        assert!(ctx.state.storage.stat(CHART_KEY).await.is_some());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// R4-P03: a streamed chart whose last byte differs from the index digest breaks off
+    /// on the wire (a client sees a failed transfer, never a clean 200) and is not cached.
+    /// A HEAD still fetches the whole chart first and answers 502.
+    #[tokio::test]
+    async fn a_streamed_chart_off_its_digest_breaks_off_and_is_not_cached() {
+        let published = pattern(3 * MIB);
+        let mut served = published.clone();
+        *served.last_mut().unwrap() ^= 1;
+        let (files, gate, _) =
+            gated_body_upstream(served[..MIB].to_vec(), served[MIB..].to_vec(), vec![]).await;
+        let (_up, ctx) = chart_at(&format!("{files}/demo-1.0.0.tgz"), &published).await;
+        // A real connection: what a client sees.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = ctx
+            .app
+            .clone()
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        // After the server's own hold on the store.
+        let holders = ctx.state.storage.holders();
+
+        let mut resp = reqwest::get(format!("http://{addr}{CHART}")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut got = resp.chunk().await.unwrap().unwrap().len();
+        gate.send(true).unwrap();
+        let broke = loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => got += chunk.len(),
+                Ok(None) => break false,
+                Err(_) => break true,
+            }
+        };
+        assert!(broke, "a chart off its digest ended as a clean response");
+        assert!(got < served.len(), "the client got the whole wrong chart");
+        drop(resp);
+        background_writes_done(&ctx.state.storage, holders).await;
+        assert!(ctx.state.storage.stat(CHART_KEY).await.is_none());
+
+        let resp = send(&ctx.app, Method::HEAD, CHART, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(ctx.state.storage.stat(CHART_KEY).await.is_none());
+    }
+
+    /// R4-P03: a request joining a streamed fill is served the whole chart from that
+    /// same download once it ends.
+    #[tokio::test]
+    async fn a_follower_of_a_streamed_fill_shares_its_download() {
+        let body = pattern(2 * MIB);
+        let (files, gate, hits) =
+            gated_body_upstream(body[..MIB].to_vec(), body[MIB..].to_vec(), vec![]).await;
+        let (_up, ctx) = chart_at(&format!("{files}/demo-1.0.0.tgz"), &body).await;
+
+        let leader = send(&ctx.app, Method::GET, CHART, "").await;
+        assert_eq!(leader.status(), StatusCode::OK);
+        let follower = tokio::spawn({
+            let app = ctx.app.clone();
+            async move { send(&app, Method::GET, CHART, "").await }
+        });
+        // The leader's fill and the follower.
+        while crate::registry::flight_waiters(CHART_KEY) < 2 {
+            tokio::task::yield_now().await;
+        }
+        gate.send(true).unwrap();
+        assert!(body_bytes(leader).await == body);
+        let follower = follower.await.unwrap();
+        assert_eq!(follower.status(), StatusCode::OK);
+        assert!(body_bytes(follower).await == body);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Time to the first byte and to the end of a cold 64 MiB chart whose upstream sends
+    /// 1 MiB every 20 ms, as a client on a socket sees it (the PR's numbers).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "measurement: cargo test -p nora-registry --bin nora measure_cold_chart_ttfb -- --ignored --nocapture"]
+    async fn measure_cold_chart_ttfb() {
+        use futures::StreamExt;
+        let body = std::sync::Arc::new(pattern(64 * MIB));
+        let files = {
+            let body = std::sync::Arc::clone(&body);
+            let app = axum::Router::new().route(
+                "/demo-1.0.0.tgz",
+                axum::routing::get(move || {
+                    let body = std::sync::Arc::clone(&body);
+                    async move {
+                        let len = body.len();
+                        let chunks = futures::stream::iter(0..len / MIB).then(move |i| {
+                            let body = std::sync::Arc::clone(&body);
+                            async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                Ok::<_, std::io::Error>(axum::body::Bytes::copy_from_slice(
+                                    &body[i * MIB..(i + 1) * MIB],
+                                ))
+                            }
+                        });
+                        axum::http::Response::builder()
+                            .header("content-length", len)
+                            .body(axum::body::Body::from_stream(chunks))
+                            .unwrap()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            format!("http://{addr}")
+        };
+        let (_up, ctx) = chart_at(&format!("{files}/demo-1.0.0.tgz"), &body).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = ctx
+            .app
+            .clone()
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let started = std::time::Instant::now();
+        let mut resp = reqwest::get(format!("http://{addr}{CHART}")).await.unwrap();
+        let headers = started.elapsed();
+        let mut got = resp.chunk().await.unwrap().unwrap().len();
+        let first = started.elapsed();
+        while let Some(chunk) = resp.chunk().await.unwrap() {
+            got += chunk.len();
+        }
+        assert_eq!(got, body.len());
+        println!(
+            "cold 64 MiB chart: headers {headers:?}, first byte {first:?}, last byte {:?}",
+            started.elapsed()
+        );
     }
 }

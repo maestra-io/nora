@@ -1486,6 +1486,61 @@ pub async fn put_written_days_ago(ctx: &TestContext, key: &str, body: &[u8], day
         .unwrap();
 }
 
+/// An upstream on a raw socket answering a request for a path in `files` 200 with that
+/// body, and any other 200 with `head` at once and `rest` only once `true` is sent on the
+/// returned gate (R4-P03 streaming tests: a body that cannot be complete before the test
+/// says so). `Content-Length` is declared. Counts the gated requests.
+pub async fn gated_body_upstream(
+    head: Vec<u8>,
+    rest: Vec<u8>,
+    files: Vec<(&str, Vec<u8>)>,
+) -> (String, tokio::sync::watch::Sender<bool>, Arc<AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (gate, open) = tokio::sync::watch::channel(false);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&hits);
+    let (head, rest) = (Arc::new(head), Arc::new(rest));
+    let files: Arc<HashMap<String, Vec<u8>>> =
+        Arc::new(files.into_iter().map(|(p, b)| (p.to_string(), b)).collect());
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let (mut open, seen) = (open.clone(), Arc::clone(&seen));
+            let (head, rest, files) = (Arc::clone(&head), Arc::clone(&rest), Arc::clone(&files));
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request.split(' ').nth(1).unwrap_or("");
+                if let Some(body) = files.get(path) {
+                    let status = format!(
+                        "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(status.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                    return;
+                }
+                seen.fetch_add(1, Ordering::SeqCst);
+                let status = format!(
+                    "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+                    head.len() + rest.len()
+                );
+                if sock.write_all(status.as_bytes()).await.is_err()
+                    || sock.write_all(&head).await.is_err()
+                {
+                    return;
+                }
+                if open.wait_for(|open| *open).await.is_ok() {
+                    let _ = sock.write_all(&rest).await;
+                }
+            });
+        }
+    });
+    (format!("http://{addr}"), gate, hits)
+}
+
 /// Wait until no more handles share `storage` than the `holders` it had before the requests
 /// under test ([`Storage::holders`]). A write those requests left running holds a clone of the
 /// store until it ends, so after this none of them can still land. Panics after 30 s.
