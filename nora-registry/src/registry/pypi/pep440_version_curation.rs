@@ -4,11 +4,24 @@
 
 use crate::test_helpers::{create_test_context_with_config, send};
 use axum::http::{Method, StatusCode};
-use wiremock::matchers::any;
+use wiremock::matchers::{any, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-async fn upstream() -> MockServer {
+/// An upstream whose `foo` index links every file of `files`; any other request gets
+/// the file body.
+async fn upstream(files: &[&str]) -> MockServer {
     let upstream = MockServer::start().await;
+    let links: String = files
+        .iter()
+        .map(|f| format!(r#"<a href="{}/files/{f}">{f}</a>"#, upstream.uri()))
+        .collect();
+    Mock::given(path("/foo/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!("<html><body>{links}</body></html>")),
+        )
+        .mount(&upstream)
+        .await;
     Mock::given(any())
         .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SDIST".to_vec()))
         .mount(&upstream)
@@ -24,7 +37,19 @@ fn write(dir: &tempfile::TempDir, file: &str, body: &str) -> String {
 
 #[tokio::test]
 async fn a_rule_holds_for_every_spelling_of_its_version() {
-    let upstream = upstream().await;
+    let blocked = [
+        "foo-1.0.post1.tar.gz",
+        "foo-1.0-1.tar.gz",
+        "foo-1.0.POST1.zip",
+        "foo-1.0.0.post1.tar.gz",
+        "foo-1.0.0.post01.tar.gz",
+        "foo-2.0.0.RC1-py3-none-any.whl",
+        "foo-2.0-rc-1.tar.gz",
+        "foo-2.0c1.tar.gz",
+        "foo-v2.0rc1.tar.gz",
+    ];
+    let admitted = ["foo-1.0.tar.gz", "foo-2.0.tar.gz", "foo-1.0.post2.tar.gz"];
+    let upstream = upstream(&[blocked.as_slice(), admitted.as_slice()].concat()).await;
     let dir = tempfile::tempdir().unwrap();
     let blocklist = write(
         &dir,
@@ -40,29 +65,21 @@ async fn a_rule_holds_for_every_spelling_of_its_version() {
         cfg.curation.mode = crate::config::CurationMode::Enforce;
         cfg.curation.blocklist_path = Some(blocklist);
     });
-    for file in [
-        "foo-1.0.post1.tar.gz",
-        "foo-1.0-1.tar.gz",
-        "foo-1.0.POST1.zip",
-        "foo-1.0.0.post1.tar.gz",
-        "foo-1.0.0.post01.tar.gz",
-        "foo-2.0.0.RC1-py3-none-any.whl",
-        "foo-2.0-rc-1.tar.gz",
-        "foo-2.0c1.tar.gz",
-        "foo-v2.0rc1.tar.gz",
-    ] {
+    for file in blocked {
         let resp = send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "").await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{file}");
     }
-    for file in ["foo-1.0.tar.gz", "foo-2.0.tar.gz", "foo-1.0.post2.tar.gz"] {
+    for file in admitted {
         let resp = send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "").await;
-        assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{file}");
+        assert_eq!(resp.status(), StatusCode::OK, "{file}");
     }
 }
 
 #[tokio::test]
 async fn an_allowlist_entry_admits_every_spelling_of_its_version() {
-    let upstream = upstream().await;
+    let admitted = ["foo-1.0.tar.gz", "foo-1.0.0.tar.gz", "foo-v1.0.zip"];
+    let blocked = ["foo-1.1.tar.gz", "foo-1.0.post1.tar.gz"];
+    let upstream = upstream(&[admitted.as_slice(), blocked.as_slice()].concat()).await;
     let dir = tempfile::tempdir().unwrap();
     let allowlist = write(
         &dir,
@@ -75,11 +92,11 @@ async fn an_allowlist_entry_admits_every_spelling_of_its_version() {
         cfg.curation.mode = crate::config::CurationMode::Enforce;
         cfg.curation.allowlist_path = Some(allowlist);
     });
-    for file in ["foo-1.0.tar.gz", "foo-1.0.0.tar.gz", "foo-v1.0.zip"] {
+    for file in admitted {
         let resp = send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "").await;
-        assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{file}");
+        assert_eq!(resp.status(), StatusCode::OK, "{file}");
     }
-    for file in ["foo-1.1.tar.gz", "foo-1.0.post1.tar.gz"] {
+    for file in blocked {
         let resp = send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "").await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{file}");
     }
