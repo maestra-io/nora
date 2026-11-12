@@ -4,11 +4,32 @@
 
 use crate::test_helpers::{create_test_context_with_config, send};
 use axum::http::{Method, StatusCode};
-use wiremock::matchers::any;
+use wiremock::matchers::{any, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// An upstream whose packument lists every version the tests ask for, each tarball `TGZ`:
+/// a permitted version is then served (200), so a positive control cannot pass on a 404.
 async fn upstream() -> MockServer {
     let upstream = MockServer::start().await;
+    let uri = upstream.uri();
+    let versions: serde_json::Map<String, serde_json::Value> = ["1.3.0", "1.3.1", "1.4.0", "1.5.0"]
+        .iter()
+        .map(|v| {
+            let tarball = format!("{uri}/left-pad/-/left-pad-{v}.tgz");
+            (
+                v.to_string(),
+                serde_json::json!({ "dist": { "tarball": tarball } }),
+            )
+        })
+        .collect();
+    Mock::given(path("/left-pad"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "name": "left-pad", "versions": versions })),
+        )
+        .with_priority(1)
+        .mount(&upstream)
+        .await;
     Mock::given(any())
         .respond_with(ResponseTemplate::new(200).set_body_bytes(b"TGZ".to_vec()))
         .mount(&upstream)
@@ -53,7 +74,7 @@ async fn a_rule_holds_however_it_spells_its_version() {
         "",
     )
     .await;
-    assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -78,7 +99,7 @@ async fn an_allowlist_entry_admits_its_version_however_spelled() {
         "",
     )
     .await;
-    assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::OK);
     let resp = send(
         &ctx.app,
         Method::GET,
