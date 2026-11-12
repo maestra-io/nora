@@ -398,3 +398,91 @@ async fn the_artifact_gauges_follow_the_store_without_a_read_of_the_ui() {
     tick_until(state, 3).await;
     assert_eq!(bytes_gauge(RegistryType::Rpm), 300);
 }
+
+/// The cleanup cycle holds retention, the hosted NuGet expiry and GC, in that order, each
+/// only when enabled; the retention pass it builds deletes what its rules make due.
+#[tokio::test]
+async fn the_cleanup_cycle_holds_the_enabled_passes_retention_first() {
+    let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+        c.retention.enabled = true;
+        c.retention.dry_run = false;
+        c.retention.rules = vec![config::RetentionRule {
+            registry: "go".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            include_tags: Vec::new(),
+            exclude_tags: Vec::new(),
+        }];
+        c.nuget.enabled = true;
+        c.gc.enabled = true;
+        c.gc.dry_run = true;
+    });
+    for ver in ["v1.0.0", "v2.0.0", "v3.0.0"] {
+        for ext in ["info", "mod", "zip"] {
+            let key = format!("go/github.com/user/repo/@v/{ver}.{ext}");
+            ctx.state.storage.put(&key, b"x").await.unwrap();
+        }
+    }
+    let passes = cleanup_passes(&ctx.state);
+    let names: Vec<_> = passes.iter().map(|p| p.name).collect();
+    assert_eq!(names, ["retention", "nuget-hosted-retention", "gc"]);
+    for pass in &passes {
+        (pass.run)().await;
+    }
+    let storage = &ctx.state.storage;
+    assert!(storage
+        .get("go/github.com/user/repo/@v/v1.0.0.zip")
+        .await
+        .is_err());
+    assert!(storage
+        .get("go/github.com/user/repo/@v/v3.0.0.zip")
+        .await
+        .is_ok());
+
+    let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+        c.retention.enabled = false;
+        c.nuget.enabled = false;
+        c.gc.enabled = false;
+    });
+    assert!(cleanup_passes(&ctx.state).is_empty());
+}
+
+/// Before the first request, the temp and spool files a dead instance left are removed;
+/// a fresh one (a transfer of a live instance) stays.
+#[tokio::test]
+async fn temp_files_of_a_dead_instance_are_cleared_at_start() {
+    let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+        c.docker.enabled = true;
+        c.raw.enabled = true;
+        c.hf.enabled = true;
+    });
+    let root = std::path::PathBuf::from(&ctx.state.config.storage.path);
+    let dirs = [
+        "tmp/docker-uploads",
+        "tmp/docker-proxy",
+        "tmp/raw-uploads",
+        "tmp/hf-proxy",
+        "tmp/proxy-spool",
+        "tmp/nuget-uploads",
+        "tmp/pypi-uploads",
+    ];
+    let day_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 60 * 60);
+    for dir in dirs {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+        std::fs::write(root.join(dir).join("fresh"), b"x").unwrap();
+        let stale = root.join(dir).join("stale");
+        std::fs::write(&stale, b"x").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(day_ago)
+            .unwrap();
+    }
+    clear_dead_instance_files(&ctx.state).await;
+    for dir in dirs {
+        assert!(!root.join(dir).join("stale").exists(), "{dir}/stale");
+        assert!(root.join(dir).join("fresh").exists(), "{dir}/fresh");
+    }
+}
