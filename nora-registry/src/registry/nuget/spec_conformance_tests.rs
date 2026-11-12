@@ -451,6 +451,13 @@ async fn test_semver1_hives_page_refs_and_leaves() {
         assert_eq!(status, StatusCode::OK, "{hive}");
         let doc = doc.unwrap();
         assert_eq!(doc["count"], 2, "{hive}: {doc}");
+        // `count` is the number of pages in `items`: the SemVer 2-only page is gone
+        assert_eq!(
+            doc["items"].as_array().map(Vec::len),
+            Some(2),
+            "{hive}: {doc}"
+        );
+        assert!(!doc.to_string().contains("6.0.0-rc.1"), "{hive}: {doc}");
         let r = &doc["items"][1];
         assert_eq!(r["count"], 1, "{hive}: {r}");
         assert_eq!(

@@ -52,7 +52,7 @@ async fn a_rule_holds_however_it_spells_its_version() {
     }
     for version in ["13.0.1", "2.0.0", "3.0.0.1"] {
         let resp = send(&ctx.app, Method::GET, &nupkg("evil.lib", version), "").await;
-        assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{version}");
+        assert_eq!(resp.status(), StatusCode::OK, "{version}");
     }
 }
 
@@ -83,7 +83,7 @@ async fn an_allowlist_entry_admits_its_version_however_spelled() {
             "",
         )
         .await;
-        assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{version}");
+        assert_eq!(resp.status(), StatusCode::OK, "{version}");
     }
     let resp = send(
         &ctx.app,
