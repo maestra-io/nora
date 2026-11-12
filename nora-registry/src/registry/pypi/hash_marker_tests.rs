@@ -310,14 +310,9 @@ async fn a_digest_the_store_cannot_read_is_not_left_out_of_the_index() {
     use crate::test_helpers::{outage_storage, ReadFault};
     let filename = "sidecar-1.0.tar.gz";
     let sha = digest(b"sdist");
-    for (fault, expected) in [
-        (ReadFault::Network, StatusCode::SERVICE_UNAVAILABLE),
-        (ReadFault::Tampered, StatusCode::INTERNAL_SERVER_ERROR),
-    ] {
-        let (storage, outage) = outage_storage();
-        let ctx = create_test_context_with_storage(storage);
-        let key = format!("pypi/sidecar/{filename}");
-        ctx.state.storage.put(&key, b"sdist").await.unwrap();
+    // A store with the file, its sidecar and a file without one.
+    async fn store(ctx: &crate::test_helpers::TestContext, key: &str, sha: &str) {
+        ctx.state.storage.put(key, b"sdist").await.unwrap();
         ctx.state
             .storage
             .put(&format!("{key}.sha256"), sha.as_bytes())
@@ -328,9 +323,24 @@ async fn a_digest_the_store_cannot_read_is_not_left_out_of_the_index() {
             .put("pypi/sidecar/bare-1.0.tar.gz", b"bare")
             .await
             .unwrap();
-        let body = html_index(&ctx, "sidecar").await;
-        assert!(body.contains(&format!("{filename}#sha256={sha}")), "{body}");
-        assert!(body.contains("bare-1.0.tar.gz"), "{body}");
+    }
+    let key = format!("pypi/sidecar/{filename}");
+    // Healthy: the sidecar's digest is listed, the bare file without one.
+    let (storage, _outage) = outage_storage();
+    let ctx = create_test_context_with_storage(storage);
+    store(&ctx, &key, &sha).await;
+    let body = html_index(&ctx, "sidecar").await;
+    assert!(body.contains(&format!("{filename}#sha256={sha}")), "{body}");
+    assert!(body.contains("bare-1.0.tar.gz"), "{body}");
+    // The fault is in place before the first index request: no earlier request queued
+    // the marker backfill that would let the index skip the sidecar.
+    for (fault, expected) in [
+        (ReadFault::Network, StatusCode::SERVICE_UNAVAILABLE),
+        (ReadFault::Tampered, StatusCode::INTERNAL_SERVER_ERROR),
+    ] {
+        let (storage, outage) = outage_storage();
+        let ctx = create_test_context_with_storage(storage);
+        store(&ctx, &key, &sha).await;
         outage.fault_reads_of(&format!("{key}.sha256"), fault);
         let resp = send_with_headers(
             &ctx.app,

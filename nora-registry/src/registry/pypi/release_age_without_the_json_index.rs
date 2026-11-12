@@ -6,7 +6,7 @@ use super::PEP691_JSON;
 use crate::digest_quarantine::QuarantineMode;
 use crate::test_helpers::TestContext;
 use crate::test_helpers::{
-    create_test_context_with_config, reload_curation, send, send_with_headers,
+    body_bytes, create_test_context_with_config, reload_curation, send, send_with_headers,
 };
 use axum::http::{Method, StatusCode};
 use wiremock::matchers::{header, method, path};
@@ -75,8 +75,15 @@ fn min_age(cfg: &mut crate::config::Config) {
     cfg.curation.min_release_age = Some("3d".to_string());
 }
 
-/// The index the client reads, then the download it makes from it.
-async fn index_then_download(ctx: &TestContext, accept: &str, file: &str) -> StatusCode {
+/// The index the client reads, then the download it makes from it. The index filter (the
+/// upstream's upload date) and the download gate (the quarantine's own clock as well) are
+/// separate paths, so whether the index lists `file` is asserted on its own.
+async fn index_then_download(
+    ctx: &TestContext,
+    accept: &str,
+    file: &str,
+    listed: bool,
+) -> StatusCode {
     let index = send_with_headers(
         &ctx.app,
         Method::GET,
@@ -86,6 +93,13 @@ async fn index_then_download(ctx: &TestContext, accept: &str, file: &str) -> Sta
     )
     .await;
     assert_eq!(index.status(), StatusCode::OK);
+    let listing = body_bytes(index).await;
+    let listing = String::from_utf8_lossy(&listing);
+    assert_eq!(
+        listing.contains(file),
+        listed,
+        "{accept}: {file} in {listing}"
+    );
     send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "")
         .await
         .status()
@@ -117,7 +131,7 @@ async fn an_html_client_is_held_like_a_json_client() {
         let up = upstream(&[("foo-1.0.tar.gz", Some("2019-01-01T00:00:00Z"))], true).await;
         let ctx = context(&up, false, min_age);
         assert_eq!(
-            index_then_download(&ctx, accept, "foo-1.0.tar.gz").await,
+            index_then_download(&ctx, accept, "foo-1.0.tar.gz", true).await,
             StatusCode::FORBIDDEN,
             "{accept}: a file NORA first saw just now is younger than 3d on its own clock"
         );
@@ -234,7 +248,7 @@ async fn an_html_client_gets_a_file_nora_listed_long_ago() {
     let ctx = context(&up, false, min_age);
     cached_listing(&ctx, r#"{"foo-1.0.tar.gz":"2019-01-01T00:00:00Z"}"#, 30).await;
     assert_eq!(
-        index_then_download(&ctx, PIP_HTML, "foo-1.0.tar.gz").await,
+        index_then_download(&ctx, PIP_HTML, "foo-1.0.tar.gz", true).await,
         StatusCode::OK
     );
 }
@@ -252,11 +266,11 @@ async fn an_html_client_gets_the_upstream_date_when_dates_are_trusted() {
     .await;
     let ctx = context(&up, true, min_age);
     assert_eq!(
-        index_then_download(&ctx, PIP_HTML, "foo-2.0.tar.gz").await,
+        index_then_download(&ctx, PIP_HTML, "foo-2.0.tar.gz", false).await,
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        index_then_download(&ctx, PIP_HTML, "foo-1.0.tar.gz").await,
+        index_then_download(&ctx, PIP_HTML, "foo-1.0.tar.gz", true).await,
         StatusCode::OK
     );
 }
@@ -281,7 +295,7 @@ async fn without_trusted_dates_a_cached_listing_does_not_date_the_quarantine() {
     cached_listing(&ctx, r#"{"foo-1.0.tar.gz":"2019-01-01T00:00:00Z"}"#, 30).await;
     for file in ["foo-2.0.tar.gz", "foo-1.0.tar.gz"] {
         assert_eq!(
-            index_then_download(&ctx, PIP_HTML, file).await,
+            index_then_download(&ctx, PIP_HTML, file, true).await,
             StatusCode::FORBIDDEN,
             "{file}: first fetched now, held for 7d whatever the listing's age"
         );
@@ -358,7 +372,7 @@ async fn with_trusted_dates_an_old_release_matures_in_the_quarantine() {
         cfg.curation.quarantine_ttl = Some("7d".to_string());
     });
     assert_eq!(
-        index_then_download(&ctx, PIP_HTML, "foo-1.0.tar.gz").await,
+        index_then_download(&ctx, PIP_HTML, "foo-1.0.tar.gz", true).await,
         StatusCode::OK
     );
 }
@@ -371,7 +385,7 @@ async fn an_upstream_without_dates_still_lists_the_file() {
         let up = upstream(&[("foo-1.0.tar.gz", None)], json).await;
         let ctx = context(&up, false, min_age);
         assert_eq!(
-            index_then_download(&ctx, PIP_HTML, "foo-1.0.tar.gz").await,
+            index_then_download(&ctx, PIP_HTML, "foo-1.0.tar.gz", true).await,
             StatusCode::FORBIDDEN,
             "json={json}"
         );
@@ -391,7 +405,7 @@ async fn a_listing_without_dates_does_not_hide_a_later_upstreams_date() {
         min_age(cfg);
     });
     assert_eq!(
-        index_then_download(&ctx, PIP_HTML, "foo-1.0.tar.gz").await,
+        index_then_download(&ctx, PIP_HTML, "foo-1.0.tar.gz", false).await,
         StatusCode::FORBIDDEN
     );
 }

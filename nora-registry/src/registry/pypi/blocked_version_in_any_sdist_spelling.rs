@@ -4,12 +4,29 @@
 
 use crate::test_helpers::{create_test_context_with_config, send};
 use axum::http::{Method, StatusCode};
-use wiremock::matchers::any;
+use wiremock::matchers::{any, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
 async fn a_blocked_version_is_refused_whatever_the_sdist_spelling() {
     let upstream = MockServer::start().await;
+    let links: String = [
+        "python_dateutil-2.8.2.tar.gz",
+        "python-dateutil-2.8.2.tar.gz",
+        "Python.Dateutil-2.8.2.zip",
+        "python_dateutil-2.8.2-py2.py3-none-any.whl",
+        "python-dateutil-2.8.1.tar.gz",
+    ]
+    .iter()
+    .map(|f| format!(r#"<a href="{}/files/{f}">{f}</a>"#, upstream.uri()))
+    .collect();
+    Mock::given(path("/python-dateutil/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!("<html><body>{links}</body></html>")),
+        )
+        .mount(&upstream)
+        .await;
     Mock::given(any())
         .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SDIST".to_vec()))
         .mount(&upstream)
@@ -42,7 +59,7 @@ async fn a_blocked_version_is_refused_whatever_the_sdist_spelling() {
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{file}");
     }
-    // Another version passes.
+    // Another version downloads.
     let resp = send(
         &ctx.app,
         Method::GET,
@@ -50,5 +67,5 @@ async fn a_blocked_version_is_refused_whatever_the_sdist_spelling() {
         "",
     )
     .await;
-    assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::OK);
 }
