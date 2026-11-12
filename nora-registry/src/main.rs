@@ -160,6 +160,9 @@ enum Commands {
         /// Dry run - show what would be migrated without copying
         #[arg(long, default_value = "false")]
         dry_run: bool,
+        /// Also delete destination keys the source does not have (with --dry-run: list them)
+        #[arg(long, default_value = "false")]
+        delete_extraneous: bool,
     },
     /// Pre-fetch dependencies through NORA proxy cache
     Mirror {
@@ -1248,7 +1251,12 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::Migrate { from, to, dry_run }) => {
+        Some(Commands::Migrate {
+            from,
+            to,
+            dry_run,
+            delete_extraneous,
+        }) => {
             let source = match from.as_str() {
                 "local" => Storage::new_local(&config.storage.path),
                 "s3" => Storage::new_s3(
@@ -1298,7 +1306,10 @@ async fn main() {
                 std::process::exit(1);
             }
 
-            let options = migrate::MigrateOptions { dry_run };
+            let options = migrate::MigrateOptions {
+                dry_run,
+                delete_extraneous,
+            };
 
             if let Err(e) = migrate::migrate(&source, &dest, options).await {
                 error!("Migration failed: {}", e);

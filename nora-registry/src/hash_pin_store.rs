@@ -53,6 +53,9 @@ pub struct HashPinStore {
     pins: RwLock<HashMap<String, String>>,
     log: Mutex<Log>,
     path: PathBuf,
+    /// Whether the start read every entry of the log. Until a start that does, a key without
+    /// a pin may be one whose pin was not read, and its reads fail closed ([`Self::loaded`]).
+    loaded: bool,
 }
 
 impl HashPinStore {
@@ -73,6 +76,7 @@ impl HashPinStore {
                 let mut line = Vec::new();
                 let mut bad = 0usize;
                 let mut torn = false;
+                let mut last_bad = false;
                 loop {
                     line.clear();
                     match reader.read_until(b'\n', &mut line) {
@@ -92,18 +96,28 @@ impl HashPinStore {
                     }
                     log.lines += 1;
                     torn = line.last() != Some(&b'\n');
+                    last_bad = false;
                     if line.iter().all(u8::is_ascii_whitespace) {
                         continue;
                     }
+                    last_bad = true;
                     match serde_json::from_slice::<PinEntry>(&line) {
                         Ok(entry) if entry.h.is_empty() => {
+                            last_bad = false;
                             pins.remove(&entry.k);
                         }
                         Ok(entry) => {
+                            last_bad = false;
                             pins.insert(entry.k, entry.h);
                         }
                         Err(_) => bad += 1,
                     }
+                }
+                // A last line cut by a crash mid-append is the one write that never finished,
+                // not a pin lost from the middle: the load is complete without it.
+                if torn && last_bad {
+                    warn!(path = %path.display(), "hash-pin log: its last line was cut short (a crash mid-append); it is dropped");
+                    bad -= 1;
                 }
                 if bad > 0 {
                     error!(
@@ -144,8 +158,18 @@ impl HashPinStore {
             }
         }
 
+        crate::metrics::HASH_PIN_LOG_INCOMPLETE.set(i64::from(!log.complete));
+        if !log.complete {
+            error!(
+                path = %path.display(),
+                "hash-pin log NOT fully loaded: reads of keys without a loaded pin are refused \
+                 (integrity violation) until a start loads the whole log; \
+                 nora_hash_pin_log_incomplete is 1"
+            );
+        }
         let store = Self {
             pins: RwLock::new(pins),
+            loaded: log.complete,
             log: Mutex::new(log),
             path,
         };
@@ -208,6 +232,12 @@ impl HashPinStore {
             self.compact_if_grown(&mut log);
         }
         Ok(())
+    }
+
+    /// Whether the start read the whole log: when false, a key without a pin is not known to
+    /// be unpinned, and a read of it must fail closed.
+    pub fn loaded(&self) -> bool {
+        self.loaded
     }
 
     /// Look up the stored SHA-256 hash for a key, if pinned.
@@ -495,6 +525,10 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let store = HashPinStore::new(&path);
+        assert!(
+            !store.loaded(),
+            "a pin may be missing: unpinned reads fail closed"
+        );
         assert_eq!(store.get("a"), Some(sha(b"a2")));
         assert_eq!(store.get("c"), Some(sha(b"c")), "a pin after the bad line");
         assert_eq!(std::fs::read(&path).unwrap(), bytes, "the log is untouched");
@@ -557,6 +591,10 @@ mod tests {
         std::fs::write(&path, format!("{}{{\"k\":\"torn", line("a", b"a"))).unwrap();
 
         let store = HashPinStore::new(&path);
+        assert!(
+            store.loaded(),
+            "the cut line is the unfinished write, no pin is missing"
+        );
         store.record_hash("b", &sha(b"b")).unwrap();
         drop(store);
         let store = HashPinStore::new(&path);

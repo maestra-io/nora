@@ -16,6 +16,9 @@ use tracing::{info, warn};
 pub struct MigrateOptions {
     /// If true, show what would be migrated without copying
     pub dry_run: bool,
+    /// Also delete the destination keys the source does not have (listed, not deleted, in a
+    /// dry run). Off by default: a catch-up run then keeps what the source deleted since.
+    pub delete_extraneous: bool,
 }
 
 /// Migration statistics
@@ -31,6 +34,8 @@ pub struct MigrateStats {
     pub gone: usize,
     /// Number of keys that failed to migrate
     pub failed: usize,
+    /// Destination keys the source does not have, deleted (or, in a dry run, to delete)
+    pub extraneous: usize,
     /// Total bytes transferred
     pub total_bytes: u64,
 }
@@ -94,6 +99,11 @@ pub async fn migrate(
 
     if keys.is_empty() {
         println!("No artifacts found in source storage.");
+        if options.delete_extraneous {
+            // A source that lists nothing is as likely a wrong path or bucket as an empty
+            // store: nothing is deleted from the destination on its word.
+            println!("Source is empty: --delete-extraneous deletes nothing.");
+        }
         return Ok(MigrateStats::default());
     }
 
@@ -192,11 +202,69 @@ pub async fn migrate(
         ));
     }
 
+    if options.delete_extraneous {
+        delete_extraneous(to, &keys, options.dry_run, &mut stats).await?;
+    }
+
     if options.dry_run {
         info!("Dry run complete. Re-run without --dry-run to perform actual migration.");
     }
 
     Ok(stats)
+}
+
+/// Delete from `to` the keys the source listing (`source_keys`) does not hold, over the same
+/// key space the copy reads: the visible keys and the npm internal prefixes. Token records are
+/// reconciled by `migrate` itself, and the other internal prefixes are not listed, so they stay.
+/// Runs only after a copy without failures. A dry run prints each key and deletes nothing.
+async fn delete_extraneous(
+    to: &Storage,
+    source_keys: &[String],
+    dry_run: bool,
+    stats: &mut MigrateStats,
+) -> Result<(), String> {
+    let source: std::collections::HashSet<&str> = source_keys.iter().map(String::as_str).collect();
+    let mut dest = to
+        .list("")
+        .await
+        .map_err(|e| format!("failed to list destination: {e}"))?;
+    for prefix in crate::registry::npm::INTERNAL_PREFIXES {
+        dest.extend(
+            to.list_internal(prefix)
+                .await
+                .map_err(|e| format!("failed to list destination: {e}"))?,
+        );
+    }
+    let mut failed = 0usize;
+    for key in dest.iter().filter(|k| !source.contains(k.as_str())) {
+        stats.extraneous += 1;
+        if dry_run {
+            println!("Would delete extraneous {key}");
+            continue;
+        }
+        match to.delete(key).await {
+            Ok(()) | Err(crate::storage::StorageError::NotFound) => {
+                println!("Deleted extraneous {key}");
+            }
+            Err(e) => {
+                warn!("Failed to delete extraneous {}: {}", key, e);
+                failed += 1;
+            }
+        }
+    }
+    println!(
+        "  Extraneous in the destination: {}{}",
+        stats.extraneous,
+        if dry_run { " (dry run, kept)" } else { "" }
+    );
+    if failed > 0 {
+        return Err(format!(
+            "{failed} of {} extraneous destination objects could not be deleted; run the \
+             migration again",
+            stats.extraneous
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -330,7 +398,10 @@ mod tests {
 
         let id = source.list_tokens("b").await[0].file_id.clone();
         source.revoke_token(&id).await.unwrap();
-        let dry = MigrateOptions { dry_run: true };
+        let dry = MigrateOptions {
+            dry_run: true,
+            ..Default::default()
+        };
         migrate(&src, &dst, dry).await.unwrap();
         assert!(TokenStore::new(dst.clone())
             .verify_token(&revoked)
@@ -375,9 +446,16 @@ mod tests {
         src.put("docker/app/manifests/latest.json", b"friday")
             .await
             .unwrap();
-        let dry = migrate(&src, &dst, MigrateOptions { dry_run: true })
-            .await
-            .unwrap();
+        let dry = migrate(
+            &src,
+            &dst,
+            MigrateOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(dry.migrated, 2, "a dry run reads no bytes to compare");
         let stats = migrate(&src, &dst, MigrateOptions::default())
             .await
@@ -408,6 +486,85 @@ mod tests {
         assert!(dst.get("test/good").await.is_ok(), "the rest is copied");
     }
 
+    /// `--delete-extraneous`: a key the source no longer has goes from the destination (npm
+    /// internal records too), a dry run only counts it, and the default keeps it. Token state
+    /// objects and an empty source delete nothing.
+    #[tokio::test]
+    async fn test_migrate_delete_extraneous() {
+        use crate::registry::npm::first_seen_key;
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+        let src = Storage::new_local(src_dir.path().to_str().unwrap());
+        let dst = Storage::new_local(dst_dir.path().to_str().unwrap());
+        src.put("test/kept", b"kept").await.unwrap();
+        let gone = ["test/gone", &first_seen_key("npm/gone/metadata.json")];
+        for key in gone {
+            dst.put(key, b"deleted in the source").await.unwrap();
+        }
+        let state = ".nora-tokens/legacy_imported.json";
+        dst.put(state, b"[]").await.unwrap();
+        let run = |dry_run, delete_extraneous| {
+            migrate(
+                &src,
+                &dst,
+                MigrateOptions {
+                    dry_run,
+                    delete_extraneous,
+                },
+            )
+        };
+
+        let default = run(false, false).await.unwrap();
+        assert_eq!(default.extraneous, 0);
+        let dry = run(true, true).await.unwrap();
+        assert_eq!(dry.extraneous, 2);
+        for key in gone {
+            assert!(
+                dst.stat(key).await.is_some(),
+                "{key}: the default and a dry run keep it"
+            );
+        }
+
+        let stats = run(false, true).await.unwrap();
+        assert_eq!(stats.extraneous, 2);
+        for key in gone {
+            assert!(dst.stat(key).await.is_none(), "{key}");
+        }
+        assert!(dst.get("test/kept").await.is_ok());
+        assert!(dst.stat(state).await.is_some());
+
+        let empty_dir = TempDir::new().unwrap();
+        let empty = Storage::new_local(empty_dir.path().to_str().unwrap());
+        let options = MigrateOptions {
+            dry_run: false,
+            delete_extraneous: true,
+        };
+        migrate(&empty, &dst, options).await.unwrap();
+        assert!(
+            dst.get("test/kept").await.is_ok(),
+            "an empty source deletes nothing"
+        );
+    }
+
+    /// `--delete-extraneous` after a copy that failed deletes nothing: the run is an error.
+    #[tokio::test]
+    async fn test_migrate_delete_extraneous_not_after_a_failed_copy() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+        let src = Storage::new_local(src_dir.path().to_str().unwrap());
+        let dst = Storage::new_local(dst_dir.path().to_str().unwrap());
+        src.put("test/tampered", b"body").await.unwrap();
+        std::fs::write(src_dir.path().join("test/tampered"), b"else").unwrap();
+        dst.put("test/gone", b"x").await.unwrap();
+        let options = MigrateOptions {
+            dry_run: false,
+            delete_extraneous: true,
+        };
+
+        assert!(migrate(&src, &dst, options).await.is_err());
+        assert!(dst.stat("test/gone").await.is_some());
+    }
+
     #[tokio::test]
     async fn test_migrate_dry_run() {
         let src_dir = TempDir::new().unwrap();
@@ -418,9 +575,16 @@ mod tests {
 
         src.put("test/file", b"data").await.unwrap();
 
-        let stats = migrate(&src, &dst, MigrateOptions { dry_run: true })
-            .await
-            .unwrap();
+        let stats = migrate(
+            &src,
+            &dst,
+            MigrateOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(stats.migrated, 1);
 
