@@ -428,29 +428,10 @@ async fn registration_index(
     if let Some(resp) = hosted::registration_index(&state, &id_lower).await {
         return resp;
     }
-
-    // Curation check. #733 serve-local: an internal-namespace package is operator-owned — skip
-    // curation and serve any local copy below; block the upstream branch separately.
-    let internal = crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Nuget,
-        &id_lower,
-    );
-    if !internal {
-        if let Some(response) = crate::curation::check_download(
-            &state.curation().curation_engine,
-            state.bypass_token().as_deref(),
-            &headers,
-            crate::curation::RegistryType::Nuget,
-            &id_lower,
-            crate::curation::RequestVersion::Unspecified,
-            None,
-        ) {
-            return response;
-        }
-    }
-
-    let storage_key = format!("nuget/registration/{}/index.json", id_lower);
+    let internal = match registration_gate(&state, &headers, &id_lower) {
+        Ok(internal) => internal,
+        Err(refusal) => return *refusal,
+    };
 
     // A hosted package's registration is built from its records; the upstream is not asked.
     match hosted_versions(&state.storage, &id_lower).await {
@@ -461,82 +442,22 @@ async fn registration_index(
         None => return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower)),
     }
 
-    let base_url = nora_base_url(&state);
-    let upstream = rewrite_host(&state);
-
-    // Read cache eagerly so stale data is available on upstream failure; the
-    // freshness check rides the same store round trip.
-    let ttl = state.config.nuget.metadata_ttl;
-    let (read, validated_at) = tokio::join!(
-        state.storage.get(&storage_key),
-        crate::registry::stored_validated_at(&state.storage, &storage_key)
-    );
-    let fresh = validated_at.is_some_and(|t| crate::cache_ttl::is_within_ttl(t, ttl));
-    let (cached_data, read_failure) = crate::registry::cached_read(read);
-
-    // TTL cache — rewrite URLs on read (cache may contain pre-fix entries)
-    if let Some(ref data) = cached_data {
-        if fresh {
-            state.metrics.record_download("nuget");
-            state.metrics.record_cache_hit("nuget");
-            return registration_response(data.clone(), &upstream, &base_url).await;
-        }
-    }
-
-    // #733: an internal-namespace package — serve any (stale) local registration, else block; never proxy.
-    if internal {
-        if let Some(ref data) = cached_data {
-            state.metrics.record_download("nuget");
-            state.metrics.record_cache_hit("nuget");
-            return registration_response(data.clone(), &upstream, &base_url).await;
-        }
-        if let Some(e) = &read_failure {
-            return crate::registry::local_copy_unreadable("nuget", &storage_key, e);
-        }
-        return crate::curation::check_namespace_isolation(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Nuget,
-            &id_lower,
-        )
-        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
-    }
-
-    // No upstream when the operator switched it off: what is stored is all there is.
-    if upstream_url(&state).is_none() {
-        return match cached_data {
-            Some(data) => registration_response(data, &upstream, &base_url).await,
-            None => StatusCode::NOT_FOUND.into_response(),
-        };
-    }
-    let url = format!(
-        "{}/v3/registration5-gz-semver2/{}/index.json",
-        upstream.trim_end_matches('/'),
-        id_lower
-    );
-
-    if stale_while_revalidate(&state, validated_at) {
-        if let Some(ref data) = cached_data {
-            refresh_in_background(&state, &storage_key, &url);
-            state.metrics.record_download("nuget");
-            state.metrics.record_cache_hit("nuget");
-            return mark_stale(registration_response(data.clone(), &upstream, &base_url).await);
-        }
-    }
-    let rewrite = Some((upstream.as_str(), base_url.as_str()));
-    match refresh_metadata(&state, &storage_key, &url, Some(id_lower.clone())).await {
-        Ok(raw) => registration_response(raw, &upstream, &base_url).await,
-        Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::debug!(error = ?e, "NuGet registration error");
-            serve_stale_or_error(&state, cached_data, "registration_index", rewrite, &e)
-        }
-    }
+    serve_proxied_registration(
+        &state,
+        internal,
+        &id_lower,
+        format!("{}/index.json", id_lower),
+        id_lower.clone(),
+        "registration_index",
+    )
+    .await
 }
 
 // ── Registration page (paginated version ranges) ────────────────────────
 
 async fn registration_page(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path((id, lower, upper_raw)): Path<(String, String, String)>,
 ) -> Response {
     let id_lower = id.to_lowercase();
@@ -553,6 +474,11 @@ async fn registration_page(
     if let Some(resp) = hosted::registration_page(&state, &id_lower, &lower, &upper).await {
         return resp;
     }
+    // A page is curated as its index is: a package the index refuses has no page either.
+    let internal = match registration_gate(&state, &headers, &id_lower) {
+        Ok(internal) => internal,
+        Err(refusal) => return *refusal,
+    };
 
     // A hosted package's registration lists every version inline: it has no pages, and the
     // upstream is not asked for one.
@@ -562,12 +488,61 @@ async fn registration_page(
         None => return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower)),
     }
 
-    let base_url = nora_base_url(&state);
-    let upstream = rewrite_host(&state);
-    let storage_key = format!(
-        "nuget/registration/{}/page/{}/{}.json",
-        id_lower, lower, upper
-    );
+    serve_proxied_registration(
+        &state,
+        internal,
+        &id_lower,
+        format!("{}/page/{}/{}.json", id_lower, lower, upper),
+        format!("{}/page/{}/{}", id_lower, lower, upper),
+        "registration_page",
+    )
+    .await
+}
+
+/// The curation decision for a proxied registration document, its index and its pages alike.
+/// `Ok(true)` names an internal-namespace package (#733 serve-local): operator-owned, so it is
+/// not curated, and [`serve_proxied_registration`] never proxies it.
+fn registration_gate(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    id_lower: &str,
+) -> Result<bool, Box<Response>> {
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Nuget,
+        id_lower,
+    ) {
+        return Ok(true);
+    }
+    match crate::curation::check_download(
+        &state.curation().curation_engine,
+        state.bypass_token().as_deref(),
+        headers,
+        crate::curation::RegistryType::Nuget,
+        id_lower,
+        crate::curation::RequestVersion::Unspecified,
+        None,
+    ) {
+        Some(refusal) => Err(Box::new(refusal)),
+        None => Ok(false),
+    }
+}
+
+/// A proxied registration document (`rel` under the registration hive: an index or a page),
+/// TTL cached, revalidated conditionally (C56) and single-flight (C48), with URLs rewritten on
+/// read (the cache may hold pre-fix entries). An `internal` package is answered from its local
+/// copy or refused, never fetched (#68 dependency confusion).
+async fn serve_proxied_registration(
+    state: &AppState,
+    internal: bool,
+    id_lower: &str,
+    rel: String,
+    activity: String,
+    label: &'static str,
+) -> Response {
+    let base_url = nora_base_url(state);
+    let upstream = rewrite_host(state);
+    let storage_key = format!("nuget/registration/{}", rel);
 
     // Read cache eagerly so stale data is available on upstream failure; the
     // freshness check rides the same store round trip.
@@ -579,7 +554,7 @@ async fn registration_page(
     let fresh = validated_at.is_some_and(|t| crate::cache_ttl::is_within_ttl(t, ttl));
     let (cached_data, read_failure) = crate::registry::cached_read(read);
 
-    // TTL cache (a 304 revalidation keeps a page fresh without re-uploading it, C56)
+    // TTL cache (a 304 revalidation keeps a document fresh without re-uploading it, C56)
     if let Some(ref data) = cached_data {
         if fresh {
             state.metrics.record_download("nuget");
@@ -588,14 +563,8 @@ async fn registration_page(
         }
     }
 
-    // #68 namespace isolation: an internal-namespace package's registration must
-    // never be fetched upstream (dependency confusion). Serve any local copy
-    // (hosted/cached; the fresh path returned above), else block — never proxy.
-    if crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Nuget,
-        &id_lower,
-    ) {
+    // #733: an internal-namespace package — serve any (stale) local copy, else block; never proxy.
+    if internal {
         if let Some(ref data) = cached_data {
             state.metrics.record_download("nuget");
             state.metrics.record_cache_hit("nuget");
@@ -607,43 +576,39 @@ async fn registration_page(
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Nuget,
-            &id_lower,
+            id_lower,
         )
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     // No upstream when the operator switched it off: what is stored is all there is.
-    if upstream_url(&state).is_none() {
+    if upstream_url(state).is_none() {
         return match cached_data {
             Some(data) => registration_response(data, &upstream, &base_url).await,
             None => StatusCode::NOT_FOUND.into_response(),
         };
     }
     let url = format!(
-        "{}/v3/registration5-gz-semver2/{}/page/{}/{}.json",
+        "{}/v3/registration5-gz-semver2/{}",
         upstream.trim_end_matches('/'),
-        id_lower,
-        lower,
-        upper
+        rel
     );
 
-    // Single-flight (C48) and conditional revalidation (C56), as the index.
-    let activity = Some(format!("{}/page/{}/{}", id_lower, lower, upper));
-    if stale_while_revalidate(&state, validated_at) {
+    if stale_while_revalidate(state, validated_at) {
         if let Some(ref data) = cached_data {
-            refresh_in_background(&state, &storage_key, &url);
+            refresh_in_background(state, &storage_key, &url);
             state.metrics.record_download("nuget");
             state.metrics.record_cache_hit("nuget");
             return mark_stale(registration_response(data.clone(), &upstream, &base_url).await);
         }
     }
-    match refresh_metadata(&state, &storage_key, &url, activity).await {
+    match refresh_metadata(state, &storage_key, &url, Some(activity)).await {
         Ok(raw) => registration_response(raw, &upstream, &base_url).await,
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::debug!(error = ?e, "NuGet registration page error");
+            tracing::debug!(error = ?e, label, "NuGet registration error");
             let rewrite = Some((upstream.as_str(), base_url.as_str()));
-            serve_stale_or_error(&state, cached_data, "registration_page", rewrite, &e)
+            serve_stale_or_error(state, cached_data, label, rewrite, &e)
         }
     }
 }
@@ -1998,10 +1963,11 @@ async fn registration_index_filtered(
 
 async fn registration_page_filtered(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path((id, lower, upper)): Path<(String, String, String)>,
 ) -> Response {
     let id_lower = id.to_lowercase();
-    let resp = registration_page(State(state.clone()), Path((id, lower, upper))).await;
+    let resp = registration_page(State(state.clone()), headers, Path((id, lower, upper))).await;
     if resp.status() != StatusCode::OK || !filters_metadata(&state, &id_lower).await {
         return resp;
     }
@@ -2028,9 +1994,10 @@ async fn registration_index_semver1(
 
 async fn registration_page_semver1(
     state: State<AppState>,
+    headers: axum::http::HeaderMap,
     path: Path<(String, String, String)>,
 ) -> Response {
-    semver1_page(state, path, HIVE_SEMVER1).await
+    semver1_page(state, headers, path, HIVE_SEMVER1).await
 }
 
 async fn registration_index_gz_semver1(
@@ -2043,9 +2010,10 @@ async fn registration_index_gz_semver1(
 
 async fn registration_page_gz_semver1(
     state: State<AppState>,
+    headers: axum::http::HeaderMap,
     path: Path<(String, String, String)>,
 ) -> Response {
-    semver1_page(state, path, HIVE_GZ_SEMVER1).await
+    semver1_page(state, headers, path, HIVE_GZ_SEMVER1).await
 }
 
 /// `f` on the blocking pool when `big` (a registration document past
@@ -2126,10 +2094,11 @@ async fn hive_response(
 
 async fn semver1_page(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     path: Path<(String, String, String)>,
     hive: &'static str,
 ) -> Response {
-    let resp = registration_page_filtered(State(state), path).await;
+    let resp = registration_page_filtered(State(state), headers, path).await;
     let (parts, mut doc, big) = match registration_json(resp).await {
         Ok(ok) => ok,
         Err(resp) => return resp,
@@ -2148,7 +2117,8 @@ async fn semver1_index(
     Path(id): Path<String>,
     hive: &'static str,
 ) -> Response {
-    let resp = registration_index_filtered(State(state.clone()), headers, Path(id.clone())).await;
+    let resp =
+        registration_index_filtered(State(state.clone()), headers.clone(), Path(id.clone())).await;
     let (parts, mut doc, big) = match registration_json(resp).await {
         Ok(ok) => ok,
         Err(resp) => return resp,
@@ -2158,7 +2128,7 @@ async fn semver1_index(
         let summaries = futures::future::join_all(
             items
                 .iter()
-                .map(|page| semver1_page_summary(&state, &id, page)),
+                .map(|page| semver1_page_summary(&state, &headers, &id, page)),
         )
         .await;
         let mut keep = Vec::with_capacity(items.len());
@@ -2194,6 +2164,7 @@ fn page_ref(page: &serde_json::Value) -> Option<(String, String)> {
 /// `None` for an inlined page, or when the page cannot be read (the entry stays as is).
 async fn semver1_page_summary(
     state: &AppState,
+    headers: &axum::http::HeaderMap,
     id: &str,
     page: &serde_json::Value,
 ) -> Option<(usize, Option<(String, String)>)> {
@@ -2201,9 +2172,12 @@ async fn semver1_page_summary(
         return None;
     }
     let (lower, upper) = page_ref(page)?;
-    let resp =
-        registration_page_filtered(State(state.clone()), Path((id.to_string(), lower, upper)))
-            .await;
+    let resp = registration_page_filtered(
+        State(state.clone()),
+        headers.clone(),
+        Path((id.to_string(), lower, upper)),
+    )
+    .await;
     let (_, mut doc, _) = registration_json(resp).await.ok()?;
     semver1_registration(&mut doc);
     let leaves = doc.get("items")?.as_array()?;
@@ -2299,9 +2273,18 @@ async fn registration_leaf(
     }
     let index = match hive {
         HIVE_SEMVER2 => {
-            registration_index_filtered(State(state.clone()), headers, Path(id.clone())).await
+            registration_index_filtered(State(state.clone()), headers.clone(), Path(id.clone()))
+                .await
         }
-        _ => semver1_index(State(state.clone()), headers, Path(id.clone()), hive).await,
+        _ => {
+            semver1_index(
+                State(state.clone()),
+                headers.clone(),
+                Path(id.clone()),
+                hive,
+            )
+            .await
+        }
     };
     let (_, doc, _) = match registration_json(index).await {
         Ok(ok) => ok,
@@ -2324,8 +2307,10 @@ async fn registration_leaf(
             };
             let path = Path((id.clone(), lower, upper));
             let resp = match hive {
-                HIVE_SEMVER2 => registration_page_filtered(State(state.clone()), path).await,
-                _ => semver1_page(State(state.clone()), path, hive).await,
+                HIVE_SEMVER2 => {
+                    registration_page_filtered(State(state.clone()), headers.clone(), path).await
+                }
+                _ => semver1_page(State(state.clone()), headers.clone(), path, hive).await,
             };
             if let Ok((_, page, _)) = registration_json(resp).await {
                 found = find_leaf(
