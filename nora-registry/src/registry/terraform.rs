@@ -234,6 +234,26 @@ fn tf_isolation_refusal(state: &AppState, identity: &str) -> Response {
 }
 
 // ── Service discovery ──────────────────────────────────────────────────
+/// What an internal-namespace request gets once no fresh copy answered it (#68, #733):
+/// never the upstream. The stored JSON (`cached`, the metadata endpoints), else a
+/// refusal; a copy the store could not read is unavailable, not absent.
+fn internal_answer(
+    state: &AppState,
+    cached: Option<&[u8]>,
+    read_failure: Option<&crate::storage::StorageError>,
+    key: &str,
+    identity: &str,
+) -> Response {
+    if let Some(data) = cached {
+        state.metrics.record_download("terraform");
+        state.metrics.record_cache_hit("terraform");
+        return with_json(data.to_vec());
+    }
+    if let Some(e) = read_failure {
+        return crate::registry::local_copy_unreadable("terraform", key, e);
+    }
+    tf_isolation_refusal(state, identity)
+}
 
 async fn service_discovery(State(state): State<AppState>) -> Response {
     let base = nora_base_url(&state);
@@ -294,15 +314,13 @@ async fn provider_versions(
     // never be fetched upstream (dependency confusion). Serve any local copy (fresh
     // path returned above), else block — never proxy.
     if internal {
-        if let Some(ref data) = cached_data {
-            state.metrics.record_download("terraform");
-            state.metrics.record_cache_hit("terraform");
-            return with_json(data.to_vec());
-        }
-        if let Some(e) = &read_failure {
-            return crate::registry::local_copy_unreadable("terraform", &storage_key, e);
-        }
-        return tf_isolation_refusal(&state, &provider);
+        return internal_answer(
+            &state,
+            cached_data.as_deref(),
+            read_failure.as_ref(),
+            &storage_key,
+            &provider,
+        );
     }
 
     // No upstream when the operator switched it off: what is stored is all there is.
@@ -412,15 +430,13 @@ async fn provider_download_meta(
 
     // #733: an internal-namespace provider — serve any (stale) local copy, else block; never proxy.
     if internal {
-        if let Some(ref data) = cached_data {
-            state.metrics.record_download("terraform");
-            state.metrics.record_cache_hit("terraform");
-            return with_json(data.to_vec());
-        }
-        if let Some(e) = &read_failure {
-            return crate::registry::local_copy_unreadable("terraform", &storage_key, e);
-        }
-        return tf_isolation_refusal(&state, &provider);
+        return internal_answer(
+            &state,
+            cached_data.as_deref(),
+            read_failure.as_ref(),
+            &storage_key,
+            &provider,
+        );
     }
 
     // No upstream when the operator switched it off: what is stored is all there is.
@@ -576,10 +592,7 @@ async fn provider_download_binary(
     // #733: an internal provider's file that is not cached is refused, whatever URL metadata
     // cached before the namespace became internal names.
     if internal {
-        if let Some(e) = &read_failure {
-            return crate::registry::local_copy_unreadable("terraform", &storage_key, e);
-        }
-        return tf_isolation_refusal(&state, &provider);
+        return internal_answer(&state, None, read_failure.as_ref(), &storage_key, &provider);
     }
 
     // No upstream when the operator switched it off: a provider file not stored is not fetched
@@ -693,15 +706,13 @@ async fn module_versions(
     // be fetched upstream (dependency confusion). Serve any local copy (fresh path
     // returned above), else block — never proxy.
     if internal {
-        if let Some(ref data) = cached_data {
-            state.metrics.record_download("terraform");
-            state.metrics.record_cache_hit("terraform");
-            return with_json(data.to_vec());
-        }
-        if let Some(e) = &read_failure {
-            return crate::registry::local_copy_unreadable("terraform", &storage_key, e);
-        }
-        return tf_isolation_refusal(&state, &module);
+        return internal_answer(
+            &state,
+            cached_data.as_deref(),
+            read_failure.as_ref(),
+            &storage_key,
+            &module,
+        );
     }
 
     // No upstream when the operator switched it off: what is stored is all there is.
@@ -804,10 +815,13 @@ async fn module_download(
     }
 
     if internal {
-        if let Some(e) = &read_failure {
-            return crate::registry::local_copy_unreadable("terraform", &source_url_key, e);
-        }
-        return tf_isolation_refusal(&state, &module);
+        return internal_answer(
+            &state,
+            None,
+            read_failure.as_ref(),
+            &source_url_key,
+            &module,
+        );
     }
 
     // No upstream when the operator switched it off.
@@ -959,10 +973,7 @@ async fn module_source_download(
     }
 
     if internal {
-        if let Some(e) = &read_failure {
-            return crate::registry::local_copy_unreadable("terraform", &storage_key, e);
-        }
-        return tf_isolation_refusal(&state, &module);
+        return internal_answer(&state, None, read_failure.as_ref(), &storage_key, &module);
     }
     // With the upstream switched off, a source URL stored while it was on is not followed: the
     // archive is served from storage or not at all.
