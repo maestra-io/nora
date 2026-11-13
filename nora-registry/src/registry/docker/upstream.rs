@@ -1257,7 +1257,7 @@ pub(crate) async fn fetch_tags_from_upstream(
     };
     let mut tags = Vec::new();
     let mut read = 0;
-    for _ in 0..MAX_UPSTREAM_TAGS_PAGES {
+    for page in 0..MAX_UPSTREAM_TAGS_PAGES {
         let source = BlobSource {
             client: client.clone(),
             upstream_url: upstream_url.to_string(),
@@ -1288,6 +1288,10 @@ pub(crate) async fn fetch_tags_from_upstream(
         if !response.status().is_success() {
             if (400..500).contains(&status) {
                 cb.record_alive(&cb_key, probe);
+                // A later page that is gone: the repository exists, the listing failed.
+                if page > 0 {
+                    return Err(ProxyError::Upstream(502));
+                }
             } else {
                 cb.record_failure(&cb_key, probe);
             }

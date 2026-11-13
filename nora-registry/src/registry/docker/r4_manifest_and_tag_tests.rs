@@ -746,3 +746,55 @@ async fn tags_list_keeps_answers_per_upstream_entry() {
         assert_eq!(json["tags"], serde_json::json!([tag]), "{prefix}");
     }
 }
+
+/// R4-R09 (review): a repository NORA holds only by digest has no local tag to fall back on,
+/// so a failed upstream is the 502, not an empty list; a later page that is gone fails the
+/// listing rather than making the repository unknown.
+#[tokio::test]
+async fn tags_list_failure_without_a_local_tag_is_a_502() {
+    use wiremock::matchers::{query_param, query_param_is_missing};
+    let hub = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/digest-only/tags/list"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&hub)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/paged/tags/list"))
+        .and(query_param_is_missing("last"))
+        .respond_with(
+            tag_page(&["a"])
+                .insert_header("Link", r#"</v2/team/paged/tags/list?last=a>; rel="next""#),
+        )
+        .mount(&hub)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/paged/tags/list"))
+        .and(query_param("last", "a"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&hub)
+        .await;
+    let url = hub.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.docker.upstreams = vec![upstream(url, "hub")];
+    });
+    let digest = digest_of(&manifest());
+    cache_proxied_tag(&ctx, "hub", "team/digest-only", &digest).await;
+    for repo in ["team/digest-only", "team/paged"] {
+        let (status, _, json) = tags(&ctx, &format!("/v2/{repo}/tags/list")).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{repo}");
+        assert_eq!(json["errors"][0]["code"], "UNAVAILABLE", "{repo}");
+    }
+}
+
+/// R4-R09 (review): past the byte cap the oldest kept answers go, as many as the new one needs.
+#[test]
+fn upstream_tags_cache_evicts_the_oldest_past_its_cap() {
+    let cache = super::UpstreamTags::default();
+    let big = || vec!["x".repeat(super::UPSTREAM_TAGS_CACHE_BYTES / 3)];
+    for key in ["a", "b", "c"] {
+        cache.put(key.into(), big());
+    }
+    assert!(cache.get("a").is_none());
+    assert!(cache.get("b").is_some() && cache.get("c").is_some());
+}

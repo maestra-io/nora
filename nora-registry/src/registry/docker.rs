@@ -3848,12 +3848,13 @@ async fn list_tags(
             Err(miss) => upstream_failed = Some(miss),
         }
     }
+    // No local tag to fall back on (a repository held only by digest or blob has none): the
+    // upstream's failure, not an empty list or "unknown".
+    if let Some(miss) = upstream_failed.filter(|_| tags.is_empty()) {
+        return docker_miss_response(&miss, Missed::Tags { name: &name });
+    }
     if !known {
-        return match upstream_failed {
-            // No local tags to fall back on: the upstream's failure, not "unknown".
-            Some(miss) => docker_miss_response(&miss, Missed::Tags { name: &name }),
-            None => name_unknown_response(&name),
-        };
+        return name_unknown_response(&name);
     }
     if let Some(last) = params.get("last") {
         tags.retain(|t| t.as_str() > last.as_str());
@@ -3999,18 +4000,21 @@ impl UpstreamTags {
         if let Some((_, _, old)) = inner.entries.remove(&key) {
             inner.bytes -= old;
         }
-        while inner.bytes + size > UPSTREAM_TAGS_CACHE_BYTES {
-            // ponytail: O(n) scan for the oldest entry; an LRU if many repositories are listed.
-            let Some(oldest) = inner
+        if inner.bytes + size > UPSTREAM_TAGS_CACHE_BYTES {
+            // Oldest first, ordered once per insertion.
+            let mut by_age: Vec<(u64, String)> = inner
                 .entries
                 .iter()
-                .min_by_key(|(_, (fetched, _, _))| *fetched)
-                .map(|(k, _)| k.clone())
-            else {
-                break;
-            };
-            if let Some((_, _, freed)) = inner.entries.remove(&oldest) {
-                inner.bytes -= freed;
+                .map(|(k, (fetched, _, _))| (*fetched, k.clone()))
+                .collect();
+            by_age.sort_unstable();
+            for (_, oldest) in by_age {
+                if inner.bytes + size <= UPSTREAM_TAGS_CACHE_BYTES {
+                    break;
+                }
+                if let Some((_, _, freed)) = inner.entries.remove(&oldest) {
+                    inner.bytes -= freed;
+                }
             }
         }
         inner.bytes += size;
