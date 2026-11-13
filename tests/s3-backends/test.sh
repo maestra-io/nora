@@ -164,7 +164,7 @@ test_backend() {
     # 9. Reindex after direct S3 upload
     # Upload a file directly to S3 (bypassing NORA API), then verify
     # that POST /raw/-/reindex makes it appear in the index listing.
-    # Note: NORA encodes @ → _at_ in S3 keys (SeaweedFS compat), so we
+    # Note: NORA encodes @ → %40 in S3 keys (SeaweedFS compat), so we
     # use a plain path without @ for this test.
     local reindex_key="raw/s3-direct/reindex-test.txt"
     local reindex_data="direct-upload-$(date +%s)"

@@ -291,20 +291,9 @@ pub struct ObjectStorage {
 const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl ObjectStorage {
-    /// One GET of `path` (or, when absent, the legacy `_at_` key of pre-#534 data) with
-    /// its whole body, each chunk within GET_BODY_IDLE.
-    async fn get_whole(
-        &self,
-        path: &Path,
-        legacy_path: Option<&Path>,
-    ) -> object_store::Result<(Bytes, Option<String>)> {
-        let result = match bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get(path)).await {
-            Err(object_store::Error::NotFound { .. }) if legacy_path.is_some() => {
-                let legacy = legacy_path.expect("checked");
-                bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get(legacy)).await?
-            }
-            other => other?,
-        };
+    /// One GET of `path` with its whole body, each chunk within GET_BODY_IDLE.
+    async fn get_whole(&self, path: &Path) -> object_store::Result<(Bytes, Option<String>)> {
+        let result = bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get(path)).await?;
         let pin = read_pin(&result.attributes);
         let size = result.meta.size;
         // One buffer of the object's size (no second copy), or the chunk itself when the
@@ -520,12 +509,6 @@ fn encode_object_key(key: &str) -> String {
     key.replace('@', "%40")
 }
 
-/// Legacy encoding: `@` → `_at_` (used before #534).
-/// Only needed for fallback reads of pre-migration data.
-fn encode_object_key_legacy(key: &str) -> String {
-    key.replace('@', "_at_")
-}
-
 /// Decode S3 keys back to original form.
 ///
 /// `encode_object_key` maps `@` -> `%40`, but `object_store::path::Path` percent-
@@ -540,9 +523,9 @@ fn encode_object_key_legacy(key: &str) -> String {
 /// The same round trip broke every other byte `Path` encodes: a listed `raw/a~b` came
 /// back as `raw/a%7Eb` and 404'd on re-read.
 ///
-/// Legacy `_at_` keys from pre-#534 data are still NOT decoded here — they are
-/// handled by fallback reads in `get()`/`stat()`, avoiding the roundtrip collision
-/// where a literal `_at_` (e.g. `cargo/look_at_this/`) would be wrongly decoded.
+/// `_at_` (the pre-#534 encoding of `@`) is NOT decoded here: a literal `_at_` (e.g.
+/// `cargo/look_at_this/`) would be wrongly decoded. Keys under that encoding are not
+/// read either (none were left in the prod bucket, R4-P11).
 fn decode_object_key(key: &str) -> String {
     // Every `%` in a stored location was written by `Path` itself (it encodes `%` as
     // `%25`), so one full percent-decode is the exact inverse of `Path`'s encoding of its
@@ -637,13 +620,10 @@ impl StorageBackend for ObjectStorage {
     async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
-        let legacy_path = key
-            .contains('@')
-            .then(|| Path::from(encode_object_key_legacy(key)));
         // BODY_OP_TIMEOUT bounds every attempt and all of them together.
         bounded(
             BODY_OP_TIMEOUT,
-            retry_stalled_body(|| self.get_whole(&path, legacy_path.as_ref())),
+            retry_stalled_body(|| self.get_whole(&path)),
         )
         .await
         .map_err(map_err)
@@ -655,46 +635,21 @@ impl StorageBackend for ObjectStorage {
             ..Default::default()
         };
         let path = Path::from(encode_object_key(key));
-        let result =
-            match bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get_opts(&path, head()))
-                .await
-            {
-                Ok(r) => r,
-                // Only an absent object is looked up again: a timeout or a 5xx of the store
-                // says nothing about where the object is, and would double the wait.
-                Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
-                    // Fallback: try legacy _at_ encoding for pre-#534 data.
-                    let legacy_path = Path::from(encode_object_key_legacy(key));
-                    bounded_edge_retry(METADATA_OP_TIMEOUT, || {
-                        self.store.get_opts(&legacy_path, head())
-                    })
-                    .await
-                    .ok()?
-                }
-                Err(_) => return None,
-            };
+        let result = bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get_opts(&path, head()))
+            .await
+            .ok()?;
         read_pin(&result.attributes)
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
         // An object store answers a delete of an absent object with success. The local backend
         // answers NotFound, and callers rely on it: to fall back to a second copy, or to answer
-        // 404. So the object is looked up first, under the legacy `_at_` encoding too, as `get`
-        // and `stat` do, and an absent one is NotFound here as well.
+        // 404. So the object is looked up first, and an absent one is NotFound here as well.
         let path = Path::from(encode_object_key(key));
-        let target = match bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.head(&path)).await
-        {
-            Ok(_) => path,
-            Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
-                let legacy = Path::from(encode_object_key_legacy(key));
-                bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.head(&legacy))
-                    .await
-                    .map_err(map_err)?;
-                legacy
-            }
-            Err(e) => return Err(map_err(e)),
-        };
-        bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.delete(&target))
+        bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.head(&path))
+            .await
+            .map_err(map_err)?;
+        bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.delete(&path))
             .await
             .map_err(map_err)?;
         Ok(())
@@ -759,18 +714,9 @@ impl StorageBackend for ObjectStorage {
     async fn stat(&self, key: &str) -> Option<FileMeta> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
-        let meta = match bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.head(&path)).await {
-            Ok(m) => m,
-            Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
-                // Fallback: try legacy _at_ encoding for pre-#534 data. Only for an absent
-                // object, as in `pin`.
-                let legacy_path = Path::from(encode_object_key_legacy(key));
-                bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.head(&legacy_path))
-                    .await
-                    .ok()?
-            }
-            Err(_) => return None,
-        };
+        let meta = bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.head(&path))
+            .await
+            .ok()?;
 
         let modified = meta.last_modified.timestamp().try_into().unwrap_or(0u64);
 
@@ -924,16 +870,9 @@ impl StorageBackend for ObjectStorage {
     ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
-        let result = match bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get(&path)).await {
-            Ok(r) => r,
-            Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
-                let legacy_path = Path::from(encode_object_key_legacy(key));
-                bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get(&legacy_path))
-                    .await
-                    .map_err(map_err)?
-            }
-            Err(e) => return Err(map_err(e)),
-        };
+        let result = bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get(&path))
+            .await
+            .map_err(map_err)?;
         let size = result.meta.size;
         let pin = read_pin(&result.attributes);
         let stream =
@@ -953,22 +892,11 @@ impl StorageBackend for ObjectStorage {
             ..Default::default()
         };
         let path = Path::from(encode_object_key(key));
-        let result = match bounded_edge_retry(METADATA_OP_TIMEOUT, || {
+        let result = bounded_edge_retry(METADATA_OP_TIMEOUT, || {
             self.store.get_opts(&path, make_opts())
         })
         .await
-        {
-            Ok(r) => r,
-            Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
-                let legacy_path = Path::from(encode_object_key_legacy(key));
-                bounded_edge_retry(METADATA_OP_TIMEOUT, || {
-                    self.store.get_opts(&legacy_path, make_opts())
-                })
-                .await
-                .map_err(map_err)?
-            }
-            Err(e) => return Err(map_err(e)),
-        };
+        .map_err(map_err)?;
         let size = result.meta.size;
         // The ranged GET answers with the object's attributes: the pin of the version read.
         let pin = read_pin(&result.attributes);
@@ -1020,8 +948,8 @@ mod tests {
     }
 
     /// A delete answers as the local backend does: an absent object is NotFound, a present one
-    /// goes, and one written under the pre-#534 `_at_` encoding goes too. An object store
-    /// answers a delete of an absent object with success, which callers took for "deleted".
+    /// goes. An object store answers a delete of an absent object with success, which callers
+    /// took for "deleted".
     #[tokio::test]
     async fn a_delete_answers_not_found_for_an_absent_object_as_local_does() {
         let object = ObjectStorage::in_memory();
@@ -1053,29 +981,41 @@ mod tests {
                 "{name}: a second delete"
             );
         }
-        // An object under the legacy encoding, as a pre-#534 store holds it.
-        let key = "npm/@scope/pkg/metadata.json";
-        object
-            .store()
-            .put(
-                &Path::from(encode_object_key_legacy(key)),
-                object_store::PutPayload::from_static(b"{}"),
-            )
-            .await
-            .unwrap();
-        assert!(
-            object.stat(key).await.is_some(),
-            "readable under the legacy encoding"
-        );
-        object.delete(key).await.unwrap();
-        assert!(
-            object.stat(key).await.is_none(),
-            "deleted under the legacy encoding"
-        );
     }
 
-    /// R4-P11: the legacy `_at_` lookup follows an absent object only. A store that does not
-    /// answer is not asked a second time under the other name, which doubled the wait.
+    /// R4-P11: a key with `@` is looked up under its `%40` encoding only. The pre-#534 `_at_`
+    /// key is not a second name for it (the prod bucket held none, 13.11.2026), so an object
+    /// left there is neither read nor deleted through the `@` key.
+    #[tokio::test]
+    async fn a_key_with_at_is_not_read_under_the_pre_534_encoding() {
+        let object = ObjectStorage::in_memory();
+        let key = "npm/@scope/pkg/metadata.json";
+        let old = Path::from("npm/_at_scope/pkg/metadata.json");
+        object
+            .store()
+            .put(&old, object_store::PutPayload::from_static(b"{}"))
+            .await
+            .unwrap();
+        assert!(object.stat(key).await.is_none(), "stat");
+        assert!(object.pin(key).await.is_none(), "pin");
+        assert!(matches!(object.get(key).await, Err(StorageError::NotFound)));
+        assert!(matches!(
+            object.get_reader(key).await,
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            object.get_range(key, 0, 1).await,
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            object.delete(key).await,
+            Err(StorageError::NotFound)
+        ));
+        assert!(object.store().head(&old).await.is_ok(), "left in place");
+    }
+
+    /// R4-P11: a store that does not answer is asked once, not a second time under another
+    /// name, which doubled the wait.
     #[tokio::test(start_paused = true)]
     async fn a_store_that_does_not_answer_is_not_asked_again_under_the_legacy_key() {
         use object_store::throttle::{ThrottleConfig, ThrottledStore};
@@ -1493,7 +1433,6 @@ mod tests {
     #[test]
     fn test_decode_object_key_legacy_not_decoded() {
         // Legacy _at_ keys are NOT decoded by decode_object_key (avoids #534 collision).
-        // They are handled by fallback reads in get()/stat() instead.
         assert_eq!(decode_object_key("npm/_at_scope/pkg"), "npm/_at_scope/pkg");
         assert_eq!(
             decode_object_key("npm/_at_babel/core/metadata.json"),
@@ -1534,19 +1473,6 @@ mod tests {
     fn test_encode_no_at() {
         let key = "npm/chalk/metadata.json";
         assert_eq!(encode_object_key(key), key);
-    }
-
-    #[test]
-    fn test_legacy_encode_for_fallback() {
-        assert_eq!(
-            encode_object_key_legacy("npm/@scope/pkg"),
-            "npm/_at_scope/pkg"
-        );
-        // Key without @ is unchanged in both schemes
-        assert_eq!(
-            encode_object_key_legacy("npm/chalk/metadata.json"),
-            "npm/chalk/metadata.json"
-        );
     }
 
     fn over(store: impl ObjectStore) -> ObjectStorage {
