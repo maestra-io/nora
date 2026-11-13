@@ -1303,7 +1303,7 @@ pub(crate) async fn fetch_tags_from_upstream(
             .iter()
             .filter_map(|v| v.to_str().ok())
             .flat_map(|v| v.split(','))
-            .find(|link| link.contains("rel=\"next\"") || link.contains("rel=next"))
+            .find(|link| link_rel_is_next(link))
             .and_then(|link| link.split_once('<')?.1.split_once('>').map(|(u, _)| u))
             // Relative to the page that carries it, which a redirect may have moved.
             .map(|link| response.url().join(link));
@@ -1360,6 +1360,24 @@ pub(crate) async fn fetch_tags_from_upstream(
     tracing::warn!(upstream = %upstream_url, name, pages = MAX_UPSTREAM_TAGS_PAGES, "upstream tag list has more pages than NORA follows");
     cb.record_alive(&cb_key, probe);
     Err(ProxyError::Upstream(502))
+}
+
+/// Whether one `Link` value (`<uri>; rel="next alternate"; …`) names a `next` relation:
+/// `rel` is a space-separated list of relation types (RFC 8288).
+pub(super) fn link_rel_is_next(link: &str) -> bool {
+    link.split(';').skip(1).any(|param| {
+        param
+            .trim()
+            .split_once('=')
+            .filter(|(key, _)| key.trim().eq_ignore_ascii_case("rel"))
+            .is_some_and(|(_, value)| {
+                value
+                    .trim()
+                    .trim_matches('"')
+                    .split_ascii_whitespace()
+                    .any(|rel| rel.eq_ignore_ascii_case("next"))
+            })
+    })
 }
 
 /// The media types a manifest is served with.

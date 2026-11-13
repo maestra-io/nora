@@ -834,3 +834,22 @@ async fn tags_list_forgets_a_repository_gone_upstream() {
         assert_eq!(status, want);
     }
 }
+
+/// R4-R09 (review): `rel` is a list of relation types (RFC 8288), quoted or not.
+#[test]
+fn a_next_link_is_found_among_other_relations() {
+    use super::upstream::link_rel_is_next;
+    for (link, next) in [
+        (r#"</v2/x/tags/list?last=a>; rel="next""#, true),
+        ("</v2/x/tags/list?last=a>; rel=next", true),
+        (r#"</v2/x/tags/list?last=a>; rel="next alternate""#, true),
+        (
+            r#"</v2/x/tags/list?last=a>; type="x"; REL="alternate next""#,
+            true,
+        ),
+        (r#"</v2/x/tags/list?last=a>; rel="prev""#, false),
+        (r#"</v2/x/next>; rel="nextish""#, false),
+    ] {
+        assert_eq!(link_rel_is_next(link), next, "{link}");
+    }
+}
