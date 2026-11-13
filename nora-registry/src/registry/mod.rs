@@ -1470,8 +1470,8 @@ const ARTIFACT_FOLLOWER_BUDGET: Duration = Duration::from_secs(30 * 60);
 /// buffered, within the spool budget; concurrent misses on one key share one
 /// upstream fetch and one body (the same spool file). `timeout_secs` bounds the
 /// response headers of each attempt and every stall of the body, not the whole
-/// download. The flag is true for the caller whose own fetch ran — the only one
-/// that should cache it.
+/// download. The [`CacheDuty`] is owed to the caller whose own fetch ran — the only one
+/// that should cache it — and is settled once its gates ran.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn proxy_fetch_artifact(
     state: &AppState,
@@ -1481,7 +1481,7 @@ pub(crate) async fn proxy_fetch_artifact(
     timeout_secs: u64,
     auth: Option<UpstreamAuth<'_>>,
     scope: impl Into<BreakerScope<'_>>,
-) -> Result<(ProxyBody, bool), ProxyError> {
+) -> Result<(ProxyBody, CacheDuty), ProxyError> {
     proxy_fetch_artifact_with(
         state,
         &state.http_client,
@@ -1674,6 +1674,87 @@ async fn while_attended<T>(
     }
 }
 
+/// Whether the request that got a cold-miss body caches it, and until it decides
+/// ([`Self::settle`]) the body's claim on its flight: dropped undecided (the request
+/// went away while its gates ran), the body goes to the next request for the key, as
+/// the fill of a request that left mid-download does.
+pub(crate) struct CacheDuty {
+    owed: bool,
+    handoff: Option<Handoff>,
+}
+
+/// What an undecided [`CacheDuty`] gives back when dropped.
+enum Handoff {
+    /// This request's own fill: the flight stays for [`ORPHAN_FILL_HOLD`], the body
+    /// offered (`orphaned` set) unless that happened when it was published.
+    Own {
+        lease: crate::proxy_coalesce::Lease<ArtifactFill, ProxyError>,
+        orphaned: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        body: ProxyBody,
+    },
+    /// An orphaned fill this request took: offered again.
+    Taken(std::sync::Arc<std::sync::atomic::AtomicBool>),
+}
+
+impl CacheDuty {
+    /// A body this request alone holds: it caches it, nobody else can.
+    pub(crate) fn owed() -> Self {
+        Self::plain(true)
+    }
+
+    fn plain(owed: bool) -> Self {
+        CacheDuty {
+            owed,
+            handoff: None,
+        }
+    }
+
+    /// The decision: whether this request caches the body. Called once its gates have
+    /// run (refused or not), so the body is never offered to another request after it.
+    pub(crate) fn settle(mut self) -> bool {
+        self.handoff = None;
+        self.owed
+    }
+}
+
+impl std::fmt::Debug for CacheDuty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheDuty")
+            .field("owed", &self.owed)
+            .field("handoff", &self.handoff.is_some())
+            .finish()
+    }
+}
+
+impl Drop for CacheDuty {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        match self.handoff.take() {
+            None => {}
+            Some(Handoff::Taken(flag)) => flag.store(true, Ordering::Release),
+            Some(Handoff::Own {
+                lease,
+                orphaned,
+                body,
+            }) => {
+                let Some(room) = OrphanMem::reserve(&body) else {
+                    return; // No room to keep it in memory: the flight ends.
+                };
+                let Ok(rt) = tokio::runtime::Handle::try_current() else {
+                    return;
+                };
+                if let Some(flag) = orphaned {
+                    flag.store(true, Ordering::Release);
+                }
+                rt.spawn(async move {
+                    tokio::time::sleep(ORPHAN_FILL_HOLD).await;
+                    drop((lease, room));
+                });
+            }
+        }
+    }
+}
+
 /// What a cold-miss artifact flight shares: the body, and whether it still has to be
 /// cached by whoever takes it (the request that led the fill went away).
 #[derive(Clone)]
@@ -1691,10 +1772,10 @@ enum Fetched {
 
 /// What [`fill_detached`] gives its caller.
 enum Filled {
-    /// This caller's own fetch ran.
-    Own(Fetched),
-    /// Another request's fill; the flag is true when this caller must cache it.
-    Shared(ProxyBody, bool),
+    /// This caller's own fetch ran; the duty is owed for a body.
+    Own(Fetched, CacheDuty),
+    /// Another request's fill, owed when this caller must cache it.
+    Shared(ProxyBody, CacheDuty),
 }
 
 /// The upstream request of an artifact fetch as a future that owns everything it
@@ -1759,7 +1840,8 @@ fn owned_artifact_fetch(
 /// byte, NuGet after 100 s) no longer cancels the fetch and discards the bytes already
 /// spooled. Its retry joins the same flight; when the fill ends with nobody waiting, the
 /// body is kept for [`ORPHAN_FILL_HOLD`] and the first request to ask for it takes it,
-/// runs its own gates, and caches it. `Err(None)`: the leader had nothing to share (a
+/// runs its own gates, and caches it. So is a body whose request got it and went away
+/// before settling its [`CacheDuty`]. `Err(None)`: the leader had nothing to share (a
 /// redirect), ask again.
 async fn fill_detached(
     state: &AppState,
@@ -1817,53 +1899,43 @@ async fn fill_detached(
                 shared
             })
             .await;
-        // Room to keep the body this task fetched, should its request be gone.
-        let kept = match &own {
-            Some(Ok(Fetched::Body(body))) => OrphanMem::reserve(body),
-            _ => None,
-        };
-        let (answer, lease, took_over) = match (own, shared) {
-            (Some(result), shared) => (
-                result.map(Filled::Own).map_err(Some),
-                shared.ok().and_then(|(_, lease)| lease),
-                None,
-            ),
+        let answer = match (own, shared) {
+            (Some(Ok(Fetched::Body(body))), shared) => {
+                // The flight lives on with the body until the request settles its duty.
+                let handoff = shared
+                    .ok()
+                    .and_then(|(_, lease)| lease)
+                    .map(|lease| Handoff::Own {
+                        lease,
+                        // Offered at publish already, and maybe taken since: never twice.
+                        orphaned: (!offered).then_some(orphaned),
+                        body: body.clone(),
+                    });
+                Ok(Filled::Own(
+                    Fetched::Body(body),
+                    CacheDuty {
+                        owed: true,
+                        handoff,
+                    },
+                ))
+            }
+            (Some(result), _) => result
+                .map(|fetched| Filled::Own(fetched, CacheDuty::owed()))
+                .map_err(Some),
             // A follower: the leader's body, or the leader's own failure (R4-P08).
             (None, Ok((fill, _))) => {
                 let take = fill.orphaned.swap(false, Ordering::AcqRel);
-                (
-                    Ok(Filled::Shared(fill.body, take)),
-                    None,
-                    take.then_some(fill.orphaned),
-                )
+                let duty = CacheDuty {
+                    owed: take,
+                    handoff: take.then_some(Handoff::Taken(fill.orphaned)),
+                };
+                Ok(Filled::Shared(fill.body, duty))
             }
-            (None, Err(e)) => (Err(e), None, None),
+            (None, Err(e)) => Err(e),
         };
-        if !tx.is_closed() {
-            // The request gets its answer and caches the body; the flight ends with
-            // the fetch, as before.
-            drop(lease);
-            if tx.send(answer).is_err() {
-                // It left in this very moment: offer a body it had taken over again.
-                if let Some(flag) = took_over {
-                    flag.store(true, Ordering::Release);
-                }
-            }
-            return;
-        }
-        // The request went away. A body it was to cache is offered to the next one.
-        if let Some(flag) = took_over {
-            flag.store(true, Ordering::Release);
-        }
-        let Some((lease, _room)) = lease.zip(kept) else {
-            return; // Nothing fetched to keep, or no room to keep it in memory.
-        };
-        // Offered at publish already, and maybe taken since: never offered twice.
-        if !offered {
-            orphaned.store(true, Ordering::Release);
-        }
-        tokio::time::sleep(ORPHAN_FILL_HOLD).await;
-        drop(lease);
+        // A request that went away (now, or before the fill ended) drops the answer here,
+        // and with it the duty: its body goes to the next request for the key.
+        let _ = tx.send(answer);
     };
     tokio::spawn(async move {
         if let Err(panic) = std::panic::AssertUnwindSafe(task).catch_unwind().await {
@@ -1891,7 +1963,7 @@ pub(crate) async fn proxy_fetch_artifact_with(
     timeout_secs: u64,
     auth: Option<UpstreamAuth<'_>>,
     scope: impl Into<BreakerScope<'_>>,
-) -> Result<(ProxyBody, bool), ProxyError> {
+) -> Result<(ProxyBody, CacheDuty), ProxyError> {
     let fetch = owned_artifact_fetch(
         state,
         client,
@@ -1913,19 +1985,19 @@ async fn run_artifact_fill(
     registry: &'static str,
     timeout_secs: u64,
     fetch: impl std::future::Future<Output = Result<Fetched, ProxyError>> + Send + 'static,
-) -> Result<(ProxyBody, bool), ProxyError> {
-    let body_of = |fetched| match fetched {
-        Fetched::Body(body) => Ok((body, true)),
+) -> Result<(ProxyBody, CacheDuty), ProxyError> {
+    let body_of = |fetched, duty| match fetched {
+        Fetched::Body(body) => Ok((body, duty)),
         // Unreachable: without `redirects` a redirect is an `Upstream` error.
         Fetched::Redirect(_) => Err(ProxyError::Network("unexpected redirect".into())),
     };
     if !state.config.server.proxy_coalesce {
-        return fetch.await.and_then(body_of);
+        return body_of(fetch.await?, CacheDuty::owed());
     }
     let budget = crate::proxy_coalesce::follower_budget(timeout_secs).max(ARTIFACT_FOLLOWER_BUDGET);
     match fill_detached(state, key, registry, budget, fetch).await {
-        Ok(Filled::Own(fetched)) => body_of(fetched),
-        Ok(Filled::Shared(body, cache)) => Ok((body, cache)),
+        Ok(Filled::Own(fetched, duty)) => body_of(fetched, duty),
+        Ok(Filled::Shared(body, duty)) => Ok((body, duty)),
         Err(e) => {
             Err(e.unwrap_or_else(|| ProxyError::Network("coalesced fetch returned nothing".into())))
         }
@@ -2030,7 +2102,7 @@ pub(crate) enum Served {
     Live(LiveFill),
     /// The whole body, as [`proxy_fetch_artifact_with`] gives it (a follower of another
     /// request's fill, a body that ended at once, or streaming off).
-    Whole(ProxyBody, bool),
+    Whole(ProxyBody, CacheDuty),
 }
 
 /// [`proxy_fetch_artifact_with`] that answers as soon as the first chunk is spooled
@@ -2069,7 +2141,7 @@ where
             scope,
         )
         .await
-        .map(|(body, cache)| Served::Whole(body, cache));
+        .map(|(body, duty)| Served::Whole(body, duty));
     }
     let (start_tx, start_rx) = tokio::sync::oneshot::channel();
     let shared = std::sync::Arc::new(LiveShared {
@@ -2099,16 +2171,19 @@ where
             return;
         }
         let done = match result {
-            Ok((body, cache)) => match verdict(body.clone()).await {
+            // A response dropped while the verdict runs drops `duty` undecided: the body
+            // goes to the next request.
+            Ok((body, duty)) => match verdict(body.clone()).await {
                 // Cached before the verdict releases the last byte: a client that got
                 // the whole body never races the cache write.
                 Ok(()) => {
-                    if cache {
+                    if duty.settle() {
                         spawn_cache_body(&state, registry, key, body);
                     }
                     Ok(())
                 }
                 Err(why) => {
+                    duty.settle();
                     tracing::warn!(registry, key = %key, reason = %why, "streamed artifact refused at its end, not cached");
                     Err(why)
                 }
@@ -2130,7 +2205,7 @@ where
         }
         // The fill never streamed: its whole result.
         Err(_) => match whole_rx.await {
-            Ok(result) => result.map(|(body, cache)| Served::Whole(body, cache)),
+            Ok(result) => result.map(|(body, duty)| Served::Whole(body, duty)),
             Err(_) => Err(ProxyError::Network(
                 "artifact fill ended without an answer".into(),
             )),
@@ -2140,8 +2215,8 @@ where
 
 /// What one request of a redirect chain an artifact fetch walks itself gave.
 pub(crate) enum ArtifactHop {
-    /// The body, as [`proxy_fetch_artifact_with`] gives it, and whether this caller fetched it.
-    Body(ProxyBody, bool),
+    /// The body and its [`CacheDuty`], as [`proxy_fetch_artifact_with`] gives them.
+    Body(ProxyBody, CacheDuty),
     /// A redirect the no-redirect client handed back unfollowed: the caller decides on the hop.
     Redirect(reqwest::Url),
 }
@@ -2163,20 +2238,20 @@ pub(crate) async fn proxy_fetch_artifact_hop(
 ) -> Result<ArtifactHop, ProxyError> {
     let scope = scope.into();
     let fetch = || owned_artifact_fetch(state, client, url, timeout_secs, auth, scope, true, None);
-    let hop = |fetched: Fetched, own: bool| match fetched {
-        Fetched::Body(body) => ArtifactHop::Body(body, own),
+    let hop = |fetched: Fetched, duty: CacheDuty| match fetched {
+        Fetched::Body(body) => ArtifactHop::Body(body, duty),
         Fetched::Redirect(next) => ArtifactHop::Redirect(next),
     };
     if !state.config.server.proxy_coalesce {
-        return fetch()?.await.map(|f| hop(f, true));
+        return fetch()?.await.map(|f| hop(f, CacheDuty::owed()));
     }
     let budget = crate::proxy_coalesce::follower_budget(timeout_secs).max(ARTIFACT_FOLLOWER_BUDGET);
     match fill_detached(state, key, registry, budget, fetch()?).await {
-        Ok(Filled::Own(fetched)) => Ok(hop(fetched, true)),
-        Ok(Filled::Shared(body, cache)) => Ok(ArtifactHop::Body(body, cache)),
+        Ok(Filled::Own(fetched, duty)) => Ok(hop(fetched, duty)),
+        Ok(Filled::Shared(body, duty)) => Ok(ArtifactHop::Body(body, duty)),
         // The leader's failure is the flight's (R4-P08); its redirect is not ours.
         Err(Some(e)) => Err(e),
-        Err(None) => fetch()?.await.map(|f| hop(f, true)),
+        Err(None) => fetch()?.await.map(|f| hop(f, CacheDuty::owed())),
     }
 }
 
@@ -3938,7 +4013,10 @@ mod tests {
         release.notify_waiters();
         let (body, cache) = retry.await.unwrap().unwrap();
         assert_eq!(mem(&body), b"helloworld");
-        assert!(cache, "the retry caches the fill its first attempt started");
+        assert!(
+            cache.settle(),
+            "the retry caches the fill its first attempt started"
+        );
         assert_eq!(
             hits.load(Ordering::SeqCst),
             1,
@@ -3948,7 +4026,7 @@ mod tests {
         // The fill is still held for late retries, but its caching duty is taken.
         let (again, cache) = fetch_artifact(&state, "npm/x", &url, 5).await.unwrap();
         assert_eq!(mem(&again), b"helloworld");
-        assert!(!cache, "only one request caches an orphaned fill");
+        assert!(!cache.settle(), "only one request caches an orphaned fill");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
@@ -3974,8 +4052,115 @@ mod tests {
         // Whether the retry lands before or after the fill ends, it is served by it.
         let (body, cache) = fetch_artifact(&state, "npm/y", &url, 5).await.unwrap();
         assert_eq!(mem(&body), b"helloworld");
-        assert!(cache);
+        assert!(cache.settle());
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A request that got its own fill and went away before deciding to cache it (the
+    /// client left while its gates ran) hands the fill to the next request for the key,
+    /// as a fill whose client left mid-download is: one upstream request in all.
+    #[tokio::test]
+    async fn fill_dropped_before_its_cache_decision_goes_to_the_next_request() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"artifact".to_vec()))
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context();
+        let state = ctx.state.clone();
+        let url = upstream.uri();
+
+        let (got_tx, got_rx) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn({
+            let (state, url) = (state.clone(), url.clone());
+            async move {
+                let fill = fetch_artifact(&state, "npm/handoff", &url, 5).await;
+                let _ = got_tx.send(());
+                // Its gates: the client leaves before they end.
+                std::future::pending::<()>().await;
+                drop(fill);
+            }
+        });
+        got_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let (body, duty) = fetch_artifact(&state, "npm/handoff", &url, 5)
+            .await
+            .unwrap();
+        assert_eq!(mem(&body), b"artifact");
+        assert!(duty.settle(), "the next request caches the fill");
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// A body refused by its request's gates is not handed on: the next cold miss asks
+    /// upstream again, so a corrupt download is not served to retries.
+    #[tokio::test]
+    async fn refused_fill_is_not_handed_on() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"artifact".to_vec()))
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context();
+        let url = upstream.uri();
+        for n in 1..=2 {
+            let (_, duty) = fetch_artifact(&ctx.state, "npm/refused", &url, 5)
+                .await
+                .unwrap();
+            duty.settle(); // Refused, so not cached.
+            assert_eq!(upstream.received_requests().await.unwrap().len(), n);
+        }
+    }
+
+    /// A streamed cold miss whose response is dropped while the verdict on the whole
+    /// body runs hands the body to the next request: one upstream request in all.
+    #[tokio::test]
+    async fn stream_dropped_during_its_verdict_hands_the_body_on() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7u8; 2 * MIB as usize]))
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.server.stream_threshold_mb = 1;
+        });
+        let state = &ctx.state;
+        let url = upstream.uri();
+        let (judging_tx, judging) = tokio::sync::oneshot::channel();
+        let served = proxy_stream_artifact(
+            state,
+            &state.http_client,
+            "npm/streamed",
+            "npm",
+            &url,
+            5,
+            None,
+            RegistryType::Npm,
+            move |_| async move {
+                let _ = judging_tx.send(());
+                std::future::pending::<Result<(), String>>().await
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(served, Served::Live(_)));
+        judging.await.unwrap();
+        drop(served); // The client leaves while the verdict runs.
+        tokio::task::yield_now().await; // The aborted task drops its duty.
+
+        let (body, duty) = fetch_artifact(state, "npm/streamed", &url, 5)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), 2 * MIB);
+        assert!(duty.settle(), "the next request caches the body");
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     }
 
     /// A request that stays gets its own fetch and caches it, and the flight ends with
@@ -3997,7 +4182,7 @@ mod tests {
                 }
             };
             assert_eq!(mem(&body), b"helloworld");
-            assert!(cache);
+            assert!(cache.settle());
             assert_eq!(hits.load(Ordering::SeqCst), n);
         }
     }
@@ -4007,7 +4192,7 @@ mod tests {
         key: &str,
         url: &str,
         timeout_secs: u64,
-    ) -> Result<(ProxyBody, bool), ProxyError> {
+    ) -> Result<(ProxyBody, CacheDuty), ProxyError> {
         proxy_fetch_artifact(
             state,
             key,
@@ -4114,7 +4299,8 @@ mod tests {
         let state = &ctx.state;
         let a = format!("{}/a", upstream.uri());
         let b = format!("{}/b", upstream.uri());
-        let (held, _) = fetch_artifact(state, "npm/a", &a, 5).await.unwrap();
+        let (held, duty) = fetch_artifact(state, "npm/a", &a, 5).await.unwrap();
+        duty.settle();
         assert!(matches!(held, ProxyBody::File(_)));
         let err = fetch_artifact(state, "npm/b", &b, 5).await.unwrap_err();
         assert!(
@@ -4332,7 +4518,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(fetched);
+        assert!(fetched.settle());
         let ProxyBody::File(spool) = &body else {
             panic!("a body above the threshold must be spooled, got {body:?}");
         };

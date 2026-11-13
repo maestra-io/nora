@@ -14,7 +14,7 @@ use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::circuit_breaker::BreakerScope;
 use crate::config::UpstreamAuth;
 use crate::registry::{
-    method_not_allowed, proxy_fetch, proxy_fetch_artifact, ProxyBody, UpstreamMiss,
+    method_not_allowed, proxy_fetch, proxy_fetch_artifact, CacheDuty, ProxyBody, UpstreamMiss,
 };
 use crate::registry_type::RegistryType;
 use crate::storage::StorageError;
@@ -860,7 +860,7 @@ async fn download(
                 scope,
             )
             .await
-            .map(|data| (ProxyBody::Mem(Bytes::from(data)), true))
+            .map(|data| (ProxyBody::Mem(Bytes::from(data)), CacheDuty::owed()))
         } else {
             proxy_fetch_artifact(
                 &state,
@@ -875,6 +875,7 @@ async fn download(
         };
         match fetched {
             Ok((data, fetched)) => {
+                let fetched = fetched.settle();
                 let engine = &state.curation().curation_engine;
                 let quarantine_on =
                     !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off);
