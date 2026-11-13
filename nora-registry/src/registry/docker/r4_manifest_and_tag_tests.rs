@@ -657,3 +657,38 @@ async fn tags_list_keeps_answers_per_route() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(json["errors"][0]["code"], "NAME_UNKNOWN");
 }
+
+/// R4-R09 (review): a relative next page is resolved against the page that carried it, which a
+/// same-origin redirect may have moved.
+#[tokio::test]
+async fn tags_list_resolves_the_next_page_against_the_redirected_page() {
+    use wiremock::matchers::{query_param, query_param_is_missing};
+    let hub = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/app/tags/list"))
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "Location",
+            format!("{}/registry/v2/team/app/tags/list", hub.uri()),
+        ))
+        .mount(&hub)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/registry/v2/team/app/tags/list"))
+        .and(query_param_is_missing("last"))
+        .respond_with(tag_page(&["a"]).insert_header("Link", r#"<?last=a>; rel="next""#))
+        .mount(&hub)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/registry/v2/team/app/tags/list"))
+        .and(query_param("last", "a"))
+        .respond_with(tag_page(&["b"]))
+        .mount(&hub)
+        .await;
+    let url = hub.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.docker.upstreams = vec![upstream(url, "hub")];
+    });
+    let (status, _, json) = tags(&ctx, "/v2/team/app/tags/list").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["tags"], serde_json::json!(["a", "b"]));
+}

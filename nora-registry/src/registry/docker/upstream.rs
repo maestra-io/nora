@@ -1299,7 +1299,8 @@ pub(crate) async fn fetch_tags_from_upstream(
             .flat_map(|v| v.split(','))
             .find(|link| link.contains("rel=\"next\"") || link.contains("rel=next"))
             .and_then(|link| link.split_once('<')?.1.split_once('>').map(|(u, _)| u))
-            .map(|link| url.join(link));
+            // Relative to the page that carries it, which a redirect may have moved.
+            .map(|link| response.url().join(link));
         let mut body = Vec::new();
         let read_body = async {
             while let Some(chunk) = response.chunk().await? {
