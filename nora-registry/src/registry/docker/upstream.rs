@@ -1302,9 +1302,7 @@ pub(crate) async fn fetch_tags_from_upstream(
             .get_all(reqwest::header::LINK)
             .iter()
             .filter_map(|v| v.to_str().ok())
-            .flat_map(|v| v.split(','))
-            .find(|link| link_rel_is_next(link))
-            .and_then(|link| link.split_once('<')?.1.split_once('>').map(|(u, _)| u))
+            .find_map(next_link_target)
             // Relative to the page that carries it, which a redirect may have moved.
             .map(|link| response.url().join(link));
         let mut body = Vec::new();
@@ -1362,22 +1360,54 @@ pub(crate) async fn fetch_tags_from_upstream(
     Err(ProxyError::Upstream(502))
 }
 
-/// Whether one `Link` value (`<uri>; rel="next alternate"; …`) names a `next` relation:
-/// `rel` is a space-separated list of relation types (RFC 8288).
-pub(super) fn link_rel_is_next(link: &str) -> bool {
-    link.split(';').skip(1).any(|param| {
-        param
-            .trim()
-            .split_once('=')
-            .filter(|(key, _)| key.trim().eq_ignore_ascii_case("rel"))
-            .is_some_and(|(_, value)| {
-                value
-                    .trim()
-                    .trim_matches('"')
-                    .split_ascii_whitespace()
-                    .any(|rel| rel.eq_ignore_ascii_case("next"))
+/// The target of the `next` link in a `Link` header value, if any (RFC 8288): links are
+/// separated by commas and parameters by semicolons, neither inside `<…>` or a quoted string,
+/// and `rel` is a space-separated list of relation types (`rel="next alternate"`).
+pub(super) fn next_link_target(value: &str) -> Option<&str> {
+    split_outside(value, ',').into_iter().find_map(|link| {
+        let mut parts = split_outside(link, ';').into_iter();
+        let target = parts.next()?.trim().strip_prefix('<')?.strip_suffix('>')?;
+        let is_next = parts.any(|param| {
+            param.split_once('=').is_some_and(|(key, value)| {
+                key.trim().eq_ignore_ascii_case("rel")
+                    && value
+                        .trim()
+                        .trim_matches('"')
+                        .split_ascii_whitespace()
+                        .any(|rel| rel.eq_ignore_ascii_case("next"))
             })
+        });
+        is_next.then_some(target)
     })
+}
+
+/// `s` split at `sep` where it stands outside `<…>` and outside a quoted string.
+fn split_outside(s: &str, sep: char) -> Vec<&str> {
+    let (mut parts, mut start) = (Vec::new(), 0);
+    let (mut angle, mut quoted, mut escaped) = (false, false, false);
+    for (i, c) in s.char_indices() {
+        if quoted {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => quoted = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' if !angle => quoted = true,
+            '<' => angle = true,
+            '>' => angle = false,
+            c if c == sep && !angle => {
+                parts.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 /// The media types a manifest is served with.

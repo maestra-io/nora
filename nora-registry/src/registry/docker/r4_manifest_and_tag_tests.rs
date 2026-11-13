@@ -835,21 +835,33 @@ async fn tags_list_forgets_a_repository_gone_upstream() {
     }
 }
 
-/// R4-R09 (review): `rel` is a list of relation types (RFC 8288), quoted or not.
+/// R4-R09 (review): the next link of a `Link` header (RFC 8288): `rel` is a list of relation
+/// types, quoted or not, and a comma or semicolon inside a quoted parameter or the target does
+/// not split it.
 #[test]
-fn a_next_link_is_found_among_other_relations() {
-    use super::upstream::link_rel_is_next;
-    for (link, next) in [
-        (r#"</v2/x/tags/list?last=a>; rel="next""#, true),
-        ("</v2/x/tags/list?last=a>; rel=next", true),
-        (r#"</v2/x/tags/list?last=a>; rel="next alternate""#, true),
+fn the_next_link_is_found_in_a_link_header() {
+    use super::upstream::next_link_target;
+    let next = Some("/v2/x/tags/list?last=a");
+    for (header, want) in [
+        (r#"</v2/x/tags/list?last=a>; rel="next""#, next),
+        ("</v2/x/tags/list?last=a>; rel=next", next),
+        (r#"</v2/x/tags/list?last=a>; rel="next alternate""#, next),
         (
             r#"</v2/x/tags/list?last=a>; type="x"; REL="alternate next""#,
-            true,
+            next,
         ),
-        (r#"</v2/x/tags/list?last=a>; rel="prev""#, false),
-        (r#"</v2/x/next>; rel="nextish""#, false),
+        (
+            r#"</v2/x/tags/list?last=a>; title="a,b; c"; rel="next""#,
+            next,
+        ),
+        (
+            r#"</prev>; rel="prev", </v2/x/tags/list?last=a>; rel="next""#,
+            next,
+        ),
+        (r#"</v2/x;a,b>; rel="next""#, Some("/v2/x;a,b")),
+        (r#"</v2/x/tags/list?last=a>; rel="prev""#, None),
+        (r#"</v2/x/next>; rel="nextish""#, None),
     ] {
-        assert_eq!(link_rel_is_next(link), next, "{link}");
+        assert_eq!(next_link_target(header), want, "{header}");
     }
 }
