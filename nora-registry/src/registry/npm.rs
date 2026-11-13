@@ -3173,7 +3173,8 @@ fn publish_tarballs(
 
 /// Whether `name` is a package name as npm writes one: `name` or `@scope/name`, of URL-safe
 /// characters, 214 at most, no part starting with `.` and an unscoped name not with `_`
-/// either. Upper case passes, as npm's rule for names published before it required lower case.
+/// either. Upper case passes, as npm's rule for names published before it required lower case;
+/// `handle_publish` refuses it for a new package.
 fn is_package_name(name: &str) -> bool {
     let part = |p: &str| {
         !p.is_empty()
@@ -3227,6 +3228,18 @@ async fn handle_publish(
     // Enforce OIDC namespace_scope on the package coordinate (#583).
     if enforce_namespace_scope(&authority, &package_name).is_err() {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    // npm's rule for new names (validate-npm-package-name `validForNewPackages`): no upper
+    // case. A package already published here, or one the operator imports, keeps its name.
+    if package_name.bytes().any(|b| b.is_ascii_uppercase())
+        && !state.config.npm.import_embedded.contains(&package_name)
+        && !has_local_versions(&state.storage, &package_name).await
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "name can no longer contain capital letters",
+        )
+            .into_response();
     }
 
     let payload: serde_json::Value = match serde_json::from_slice(&body) {
