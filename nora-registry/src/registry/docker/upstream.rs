@@ -1236,11 +1236,6 @@ pub(crate) async fn fetch_tags_from_upstream(
     basic_auth: Option<&str>,
     cb: &CircuitBreakerRegistry,
 ) -> Result<Vec<String>, ProxyError> {
-    #[derive(Deserialize)]
-    struct TagList {
-        // registry:2 answers `null` for a repository without tags
-        tags: Option<Vec<String>>,
-    }
     let cb_key = upstream_key(
         crate::registry_type::RegistryType::Docker.as_str(),
         upstream_url,
@@ -1334,8 +1329,20 @@ pub(crate) async fn fetch_tags_from_upstream(
                 )));
             }
         }
-        match serde_json::from_slice::<TagList>(&body) {
-            Ok(page) => tags.extend(page.tags.unwrap_or_default()),
+        // `tags` must be there; registry:2 answers `null` for a repository without tags.
+        let page = match serde_json::from_slice::<Value>(&body) {
+            Ok(Value::Object(mut page)) => match page.remove("tags") {
+                Some(Value::Null) => Ok(Vec::new()),
+                Some(list) => {
+                    serde_json::from_value::<Vec<String>>(list).map_err(|e| e.to_string())
+                }
+                None => Err("no tags member".to_string()),
+            },
+            Ok(_) => Err("not a JSON object".to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        match page {
+            Ok(page) => tags.extend(page),
             Err(e) => {
                 tracing::warn!(upstream = %upstream_url, name, error = %e, "upstream tag list is not a tag list");
                 cb.record_alive(&cb_key, probe);

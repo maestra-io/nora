@@ -865,3 +865,33 @@ fn the_next_link_is_found_in_a_link_header() {
         assert_eq!(next_link_target(header), want, "{header}");
     }
 }
+
+/// R4-R09 (review): a 200 without a `tags` member is not a tag list: the listing fails (502),
+/// it is not an empty list; an explicit `null` (registry:2) is one.
+#[tokio::test]
+async fn tags_list_needs_the_tags_member_of_the_upstream() {
+    let hub = MockServer::start().await;
+    for (repo, body) in [
+        ("team/empty-object", serde_json::json!({})),
+        (
+            "team/null-tags",
+            serde_json::json!({"name": "x", "tags": null}),
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{repo}/tags/list")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&hub)
+            .await;
+    }
+    let url = hub.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.docker.upstreams = vec![upstream(url, "hub")];
+    });
+    let (status, _, json) = tags(&ctx, "/v2/team/empty-object/tags/list").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(json["errors"][0]["code"], "UNAVAILABLE");
+    let (status, _, json) = tags(&ctx, "/v2/team/null-tags/tags/list").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["tags"], serde_json::json!([]));
+}
