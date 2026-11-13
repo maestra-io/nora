@@ -1143,6 +1143,7 @@ async fn flatcontainer_download(
     .await
     {
         Ok((body, fetched)) => {
+            let fetched = fetched.settle();
             // The allowlist's pinned integrity holds on the first download too, before anything is cached:
             // the cache-hit branch checks the same rule.
             if nupkg {

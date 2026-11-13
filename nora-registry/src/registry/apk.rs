@@ -1022,7 +1022,7 @@ async fn package(
             .await
             .map(|(body, cache)| crate::registry::Served::Whole(body, cache))
     };
-    let (data, fetched) = match served {
+    let (data, duty) = match served {
         Ok(crate::registry::Served::Live(mut live)) => {
             // Read on until the control segment is whole, then check it: a package
             // off its identity is refused before its first byte goes out.
@@ -1062,7 +1062,7 @@ async fn package(
             let len = live.len;
             return package_response(len, live.into_body(Bytes::from(head), None, &key));
         }
-        Ok(crate::registry::Served::Whole(data, fetched)) => (data, fetched),
+        Ok(crate::registry::Served::Whole(data, duty)) => (data, duty),
         Err(e) => return proxy_error_response("apk", &url, &e),
     };
     // The signed index names the package's control-segment hash: a body without it
@@ -1071,6 +1071,9 @@ async fn package(
         Ok(prefix) => package_identity(&prefix),
         Err(e) => Err(e),
     };
+    // Decided here, with the last await before the gates: a request that left while the
+    // control segment was read hands the body to the next one.
+    let fetched = duty.settle();
     match (&actual, entry.identity()) {
         (Ok(actual), Some(expected)) if actual == expected => {}
         _ => {

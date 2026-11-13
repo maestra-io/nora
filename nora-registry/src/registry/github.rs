@@ -630,7 +630,7 @@ pub(crate) async fn serve_asset(state: &AppState, headers: &HeaderMap, a: Asset<
             let len = live.len;
             return asset_response(len, live.into_body(Bytes::new(), expected, &a.key));
         }
-        Ok(crate::registry::Served::Whole(data, fetched)) => (data, fetched),
+        Ok(crate::registry::Served::Whole(data, duty)) => (data, duty.settle()),
         Err(e) => return proxy_error_response(reg, &a.url, &e),
     };
     // A body that does not match the published digest (truncated, swapped) is neither

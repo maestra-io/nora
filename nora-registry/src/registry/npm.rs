@@ -11,8 +11,8 @@ use crate::registry::{
     cache_read, circuit_open_response, method_not_allowed, nora_base_url, proxy_error_response,
     proxy_fetch, proxy_fetch_artifact_hop, proxy_fetch_bytes, proxy_fetch_conditional,
     proxy_fetch_shared, proxy_forward_post, read_cached_artifact_pinned, read_validators,
-    validators_key, write_validators, ArtifactHop, CachedArtifact, ProxyBody, ProxyError,
-    Revalidation, Validators,
+    validators_key, write_validators, ArtifactHop, CacheDuty, CachedArtifact, ProxyBody,
+    ProxyError, Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::AppState;
@@ -1036,10 +1036,11 @@ async fn handle_request(
                     q_secs,
                     publish_date,
                 };
-                let origin = fetched.then(|| origin_of(proxy_url));
+                let origin = fetched.settle().then(|| origin_of(proxy_url));
                 return serve_spooled_tarball(&state, &key, &url, spooled, origin, gates).await;
             }
             Ok((ProxyBody::Mem(data), fetched)) => {
+                let fetched = fetched.settle();
                 // The allowlist's pinned integrity holds on the first download too, before
                 // anything is cached: a blocked body is neither served nor cached.
                 if let Some(response) = crate::curation::verify_integrity(
@@ -1132,7 +1133,7 @@ async fn fetch_upstream_tarball(
     path: &str,
     key: &str,
     ask: Option<&TarballAsk<'_>>,
-) -> (String, Result<(ProxyBody, bool), ProxyError>) {
+) -> (String, Result<(ProxyBody, CacheDuty), ProxyError>) {
     let at_upstream = format!("{}/{}", upstream.trim_end_matches('/'), path);
     let Some(ask) = ask else {
         return (at_upstream, Err(ProxyError::NotFound));
@@ -1225,6 +1226,9 @@ async fn fetch_upstream_tarball(
                 "upstream tarball does not match the integrity its packument gives, refusing it"
             );
             let refused = "tarball does not match the integrity its packument gives";
+            if let Ok((_, duty)) = fetched {
+                duty.settle(); // Refused: not handed to the next request.
+            }
             return (named, Err(ProxyError::Network(refused.to_string())));
         }
     }
@@ -1257,7 +1261,7 @@ async fn fetch_following(
     mut auth: Option<crate::config::UpstreamAuth<'_>>,
     nora_npm_base: &str,
     key: &str,
-) -> Result<(ProxyBody, bool), ProxyError> {
+) -> Result<(ProxyBody, CacheDuty), ProxyError> {
     let origin = reqwest::Url::parse(asked)
         .map_err(|e| ProxyError::Network(format!("tarball URL not readable: {e}")))?;
     let deadline = std::time::Instant::now() + Duration::from_secs(state.config.npm.proxy_timeout);

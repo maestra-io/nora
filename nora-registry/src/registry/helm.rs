@@ -683,7 +683,7 @@ async fn chart(
             let len = live.len;
             return chart_response(len, live.into_body(Bytes::new(), Some(expected), &key));
         }
-        Ok(crate::registry::Served::Whole(data, fetched)) => (data, fetched),
+        Ok(crate::registry::Served::Whole(data, duty)) => (data, duty.settle()),
         Err(e) => return proxy_error_response("helm", &url, &e),
     };
     // A body that does not match the index digest (truncated, corrupted, swapped) is

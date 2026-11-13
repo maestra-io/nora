@@ -894,6 +894,7 @@ async fn download_file(
         .await
         {
             Ok((data, fetched)) => {
+                let fetched = fetched.settle();
                 // Hashed once (a spooled body already carries it).
                 let sha256 = data.sha256();
                 // The index published this file's digest: a body that does not match
