@@ -534,7 +534,9 @@ async fn download_tarball(
                 q_secs,
                 &url,
                 publish_date,
-            ) {
+            )
+            .await
+            {
                 return resp;
             }
             with_binary(bytes)

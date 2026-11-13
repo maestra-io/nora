@@ -731,6 +731,44 @@ fn quarantine_forbidden(
         .into_response()
 }
 
+/// Whether the quarantine can judge `digest` now: under enforce, a digest with no record
+/// waits for a running ledger load ([`crate::digest_quarantine::ledger_ready`]). A digest a
+/// break-glass exception covers never waits: it is admitted either way.
+async fn quarantine_ledger_ready(state: &AppState, digest: &str) -> bool {
+    let (q_mode, q_secs) = resolve_quarantine(state);
+    state.quarantine_exceptions.covering(digest).is_some()
+        || crate::digest_quarantine::ledger_ready(
+            &state.digest_store,
+            "docker",
+            digest,
+            &q_mode,
+            None,
+            q_secs,
+        )
+        .await
+}
+
+/// 503 `UNAVAILABLE` for a digest the quarantine could not judge before the ledger load
+/// ended: not a 403, which Docker treats as final, and not the artifact.
+fn quarantine_ledger_loading(digest: &str) -> Response {
+    tracing::warn!(digest = %digest, "Quarantine: ledger still loading, answered 503");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(
+            header::RETRY_AFTER,
+            crate::digest_quarantine::LOAD_RETRY_AFTER_SECS.to_string(),
+        )],
+        Json(json!({
+            "errors": [{
+                "code": "UNAVAILABLE",
+                "message": "the quarantine ledger is still loading after a restart: retry shortly",
+                "detail": { "digest": digest }
+            }]
+        })),
+    )
+        .into_response()
+}
+
 /// The quarantine verdict on a served (200) manifest, in the headers the 403 carries, so a
 /// client can read it under `observe` too (fluxcd `scripts/nora-image-check.py`):
 /// `x-nora-quarantine: pending` plus `x-nora-quarantine-until` (unix seconds) while the
@@ -957,10 +995,17 @@ fn quarantine_excepted(state: &AppState, digest: &str, manifest: Option<&[u8]>) 
 /// this mirror has never seen is treated as freshly quarantined for the decision, and is
 /// recorded by [`quarantine_record_verified`] only once its fetch has verified — a fetch
 /// that fails must not leave a first-seen timestamp behind for the real blob to inherit.
-fn quarantine_proxy_fetch_gate(state: &AppState, digest: &str, upstream: &str) -> Option<Response> {
+async fn quarantine_proxy_fetch_gate(
+    state: &AppState,
+    digest: &str,
+    upstream: &str,
+) -> Option<Response> {
     let (q_mode, q_secs) = resolve_quarantine(state);
     if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
         return None;
+    }
+    if !quarantine_ledger_ready(state, digest).await {
+        return Some(quarantine_ledger_loading(digest));
     }
     let status = match state.digest_store.check("docker", digest, q_secs) {
         crate::digest_quarantine::QuarantineStatus::New => {
@@ -2657,6 +2702,9 @@ async fn try_fetch_and_cache(
                 let (q_mode, q_secs) = resolve_quarantine(state);
                 let mut keep_tag_copy = false;
                 if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+                    if !quarantine_ledger_ready(state, &digest).await {
+                        return Some(quarantine_ledger_loading(&digest));
+                    }
                     let seen = state.digest_store.check("docker", &digest, q_secs);
                     let first_sight =
                         matches!(seen, crate::digest_quarantine::QuarantineStatus::New);

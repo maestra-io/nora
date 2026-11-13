@@ -548,7 +548,7 @@ pub(crate) async fn serve_asset(state: &AppState, headers: &HeaderMap, a: Asset<
             digest,
         )
     };
-    let quarantine_gate = |digest: &str| {
+    let quarantine_gate = async |digest: &str| {
         crate::digest_quarantine::proxy_gate_digest(
             &state.digest_store,
             reg,
@@ -558,11 +558,15 @@ pub(crate) async fn serve_asset(state: &AppState, headers: &HeaderMap, a: Asset<
             &a.url,
             publish_date,
         )
+        .await
     };
     let expected = a.expected.as_deref().and_then(hex_sha256);
     if let Some(expected) = &expected {
         let digest = format!("sha256:{expected}");
-        if let Some(response) = curation_gate(&digest).or_else(|| quarantine_gate(&digest)) {
+        if let Some(response) = curation_gate(&digest) {
+            return response;
+        }
+        if let Some(response) = quarantine_gate(&digest).await {
             return response;
         }
     }
@@ -650,7 +654,7 @@ pub(crate) async fn serve_asset(state: &AppState, headers: &HeaderMap, a: Asset<
         crate::registry::spawn_cache_body(state, reg, a.key.clone(), data.clone());
     }
     if expected.is_none() {
-        if let Some(resp) = quarantine_gate(&digest) {
+        if let Some(resp) = quarantine_gate(&digest).await {
             return resp;
         }
     }

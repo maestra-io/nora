@@ -653,7 +653,9 @@ async fn provider_download_binary(
                 q_secs,
                 &url,
                 publish_date,
-            ) {
+            )
+            .await
+            {
                 return resp;
             }
             with_binary(bytes)
@@ -1058,7 +1060,9 @@ async fn module_source_download(
                 &q_mode,
                 q_secs,
                 &upstream_url,
-            ) {
+            )
+            .await
+            {
                 return resp;
             }
             with_binary(bytes)

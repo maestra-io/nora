@@ -6953,6 +6953,69 @@ mod trust_upstream_dates {
         ));
     }
 
+    /// A blob fetched while the ledger loads, with no record in memory yet, may be one the
+    /// ledger holds as mature (an uncached layer of an old image): the gate waits for the
+    /// load, and past the bound answers 503 with Retry-After, never the 403 Docker treats as
+    /// final. Once the load ends in time, the ledger's date admits it.
+    #[tokio::test(start_paused = true)]
+    async fn a_blob_fetched_while_the_ledger_loads_waits_for_it() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("3d".to_string());
+        });
+        let bound = std::time::Duration::from_secs(30);
+        let load = ctx.state.digest_store.begin_load(bound);
+        let blob = sha(b"layer of an old image");
+        let gate = || {
+            let (state, blob) = (ctx.state.clone(), blob.clone());
+            async move {
+                super::super::quarantine_proxy_fetch_gate(&state, &blob, "up")
+                    .await
+                    .map(|r| (r.status(), r.headers().contains_key(header::RETRY_AFTER)))
+            }
+        };
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(gate().await, Some((StatusCode::SERVICE_UNAVAILABLE, true)));
+        assert!(started.elapsed() >= bound, "waited the whole bound");
+        assert!(matches!(
+            ctx.state.digest_store.check("docker", &blob, 3 * 86400),
+            QuarantineStatus::New
+        ));
+
+        let pending = tokio::spawn(gate());
+        tokio::time::sleep(bound / 2).await;
+        assert!(!pending.is_finished(), "waits for the load");
+        ctx.state
+            .digest_store
+            .record("docker", &blob, "x", Some(days_ago(30)));
+        load.cancel();
+        assert_eq!(pending.await.unwrap(), None, "the ledger's date admits it");
+    }
+
+    /// The manifest path the same: 503 with Retry-After while the ledger cannot judge the
+    /// digest (here a load that is given no time), judged by the ledger once it ends.
+    #[tokio::test]
+    async fn a_manifest_fetched_while_the_ledger_loads_is_a_503() {
+        let (server, image, _) = upstream_with_image().await;
+        let ctx = context(&server, false, QuarantineMode::Enforce);
+        let load = ctx.state.digest_store.begin_load(std::time::Duration::ZERO);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/demo/manifests/v1",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
+        ctx.state
+            .digest_store
+            .record("docker", &sha(&image), "x", Some(days_ago(30)));
+        load.cancel();
+        assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::OK);
+    }
+
     /// Off by default.
     #[tokio::test]
     async fn no_lookup_without_trust() {

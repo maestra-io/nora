@@ -777,7 +777,9 @@ async fn file_download(state: &AppState, headers: &HeaderMap, file: FileRef<'_>)
                     state.config.server.trust_upstream_dates,
                     publish_date,
                 ),
-            ) {
+            )
+            .await
+            {
                 return resp;
             }
             with_binary(bytes)

@@ -629,7 +629,9 @@ async fn chart(
         q_secs,
         &url,
         publish_date,
-    ) {
+    )
+    .await
+    {
         return resp;
     }
     let record_miss = || {

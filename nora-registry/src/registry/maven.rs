@@ -956,7 +956,9 @@ async fn download(
                         q_secs,
                         &url,
                         publish_date,
-                    ) {
+                    )
+                    .await
+                    {
                         return resp;
                     }
                 }

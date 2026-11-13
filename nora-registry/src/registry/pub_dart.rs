@@ -758,7 +758,9 @@ async fn download_archive(
                     state.config.server.trust_upstream_dates,
                     publish_date,
                 ),
-            ) {
+            )
+            .await
+            {
                 return resp;
             }
             archive_response(data)
