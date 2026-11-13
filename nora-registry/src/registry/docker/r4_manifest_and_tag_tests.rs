@@ -798,3 +798,39 @@ fn upstream_tags_cache_evicts_the_oldest_past_its_cap() {
     assert!(cache.get("a").is_none());
     assert!(cache.get("b").is_some() && cache.get("c").is_some());
 }
+
+/// R4-R09 (review): a repository the upstreams no longer have drops the kept answer, so a
+/// later failure is the failure, not the old tags served stale.
+#[tokio::test]
+async fn tags_list_forgets_a_repository_gone_upstream() {
+    let hub = MockServer::start().await;
+    for status in [200, 404] {
+        let answer = if status == 200 {
+            tag_page(&["v1"])
+        } else {
+            ResponseTemplate::new(404)
+        };
+        Mock::given(method("GET"))
+            .respond_with(answer)
+            .up_to_n_times(1)
+            .mount(&hub)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&hub)
+        .await;
+    let url = hub.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.docker.upstreams = vec![upstream(url, "hub")];
+    });
+    let uri = "/v2/team/app/tags/list";
+    for want in [
+        StatusCode::OK,
+        StatusCode::NOT_FOUND,
+        StatusCode::BAD_GATEWAY,
+    ] {
+        let (status, _, _) = tags(&ctx, uri).await;
+        assert_eq!(status, want);
+    }
+}

@@ -3952,6 +3952,8 @@ async fn upstream_tags(
         }
     }
     if all_absent {
+        // Gone upstream: a later failure must not serve the old answer stale.
+        state.docker_upstream_tags.remove(&key);
         return Ok(None);
     }
     match cached {
@@ -3989,6 +3991,13 @@ impl UpstreamTags {
             .entries
             .get(key)
             .map(|(fetched, tags, _)| (*fetched, tags.clone()))
+    }
+
+    fn remove(&self, key: &str) {
+        let mut inner = self.0.lock();
+        if let Some((_, _, freed)) = inner.entries.remove(key) {
+            inner.bytes -= freed;
+        }
     }
 
     fn put(&self, key: String, tags: Vec<String>) {
