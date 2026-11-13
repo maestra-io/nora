@@ -56,7 +56,16 @@ impl DockerAuth {
         www_authenticate: Option<&str>,
         basic_auth: Option<&str>,
     ) -> Result<String, TokenError> {
-        let cache_key = format!("{}:{}", registry_url, name);
+        // A token is the credential's that fetched it: two upstream entries on one url with
+        // different credentials (or none) do not share it.
+        let cache_key = match basic_auth {
+            Some(credentials) => {
+                use sha2::Digest as _;
+                let id = hex::encode(sha2::Sha256::digest(credentials.as_bytes()));
+                format!("{registry_url}:{name}#{}", &id[..16])
+            }
+            None => format!("{registry_url}:{name}"),
+        };
 
         // Check cache first
         {
@@ -309,6 +318,49 @@ mod tests {
                 }
                 None => assert!(!cached, "expires_in {expires_in} must be cached"),
             }
+        }
+    }
+
+    /// R4-R09 (review): a token is cached per credential: an entry without credentials, or
+    /// with others, on the same registry and repository fetches its own.
+    #[tokio::test]
+    async fn test_get_token_is_cached_per_credential() {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        for (user, token) in [("a", "tok-a"), ("b", "tok-b")] {
+            Mock::given(method("GET"))
+                .and(header(
+                    "authorization",
+                    basic_auth_header(&format!("{user}:x")).as_str(),
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"token": token, "expires_in": 300})),
+                )
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "anonymous", "expires_in": 300})),
+            )
+            .mount(&server)
+            .await;
+        let auth = DockerAuth::default();
+        let challenge = format!(r#"Bearer realm="{}/token",service="s""#, server.uri());
+        for (credentials, want) in [
+            (Some("a:x"), "tok-a"),
+            (Some("b:x"), "tok-b"),
+            (None, "anonymous"),
+            (Some("a:x"), "tok-a"),
+        ] {
+            let token = auth
+                .get_token("https://r.example", "lib/x", Some(&challenge), credentials)
+                .await;
+            assert_eq!(token.as_deref().ok(), Some(want), "{credentials:?}");
         }
     }
 

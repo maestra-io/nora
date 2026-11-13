@@ -1217,6 +1217,206 @@ pub async fn fetch_manifest_from_upstream(
     Ok((bytes, content_type))
 }
 
+/// Bytes of one repository's tag list read from an upstream, over all its pages.
+const MAX_UPSTREAM_TAGS_BYTES: usize = 8 << 20;
+/// Pages of a tag list followed through `Link: rel="next"`.
+const MAX_UPSTREAM_TAGS_PAGES: usize = 100;
+
+/// Fetch a repository's tags from an upstream Docker registry (R4-R09), every page of them:
+/// a registry may page `tags/list` without being asked (`Link: <…>; rel="next"`). The 401
+/// challenge is answered as for a blob. A next page off the upstream's origin is not followed:
+/// the request would carry NORA's credential there. `client` must not follow a redirect off it
+/// either (`http_client_same_origin`).
+pub(crate) async fn fetch_tags_from_upstream(
+    client: &reqwest::Client,
+    upstream_url: &str,
+    name: &str,
+    docker_auth: &DockerAuth,
+    timeout: u64,
+    basic_auth: Option<&str>,
+    cb: &CircuitBreakerRegistry,
+) -> Result<Vec<String>, ProxyError> {
+    let cb_key = upstream_key(
+        crate::registry_type::RegistryType::Docker.as_str(),
+        upstream_url,
+    );
+    let probe = cb.check(&cb_key)?;
+    let first = format!(
+        "{}/v2/{}/tags/list",
+        upstream_url.trim_end_matches('/'),
+        name
+    );
+    let Ok(mut url) = reqwest::Url::parse(&first) else {
+        cb.record_alive(&cb_key, probe);
+        return Err(ProxyError::Network(format!("invalid upstream url {first}")));
+    };
+    let mut tags = Vec::new();
+    let mut read = 0;
+    for page in 0..MAX_UPSTREAM_TAGS_PAGES {
+        let source = BlobSource {
+            client: client.clone(),
+            upstream_url: upstream_url.to_string(),
+            name: name.to_string(),
+            url: url.to_string(),
+            docker_auth: docker_auth.clone(),
+            basic_auth: basic_auth.map(String::from),
+            timeout,
+        };
+        let mut response = match source.send(None).await {
+            Ok(response) => response,
+            Err(BlobRequestError::Network(reason)) => {
+                cb.record_failure(&cb_key, probe);
+                return Err(ProxyError::Network(reason));
+            }
+            Err(e @ BlobRequestError::Token(_)) => {
+                cb.record_alive(&cb_key, probe);
+                return Err(source.proxy_error(e));
+            }
+        };
+        let status = response.status().as_u16();
+        if status == 429 {
+            cb.record_failure(&cb_key, probe);
+            return Err(crate::registry::upstream_4xx(status, response.headers()));
+        }
+        // A 401 the token did not lift is "not found", as for a manifest: Docker Hub answers a
+        // repository that does not exist that way (#1196), and `library/<name>` is asked next.
+        if !response.status().is_success() {
+            if (400..500).contains(&status) {
+                cb.record_alive(&cb_key, probe);
+                // A later page that is gone: the repository exists, the listing failed.
+                if page > 0 {
+                    return Err(ProxyError::Upstream(502));
+                }
+            } else {
+                cb.record_failure(&cb_key, probe);
+            }
+            return Err(ProxyError::Upstream(status));
+        }
+        let next = response
+            .headers()
+            .get_all(reqwest::header::LINK)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find_map(next_link_target)
+            // Relative to the page that carries it, which a redirect may have moved.
+            .map(|link| response.url().join(link));
+        let mut body = Vec::new();
+        let read_body = async {
+            while let Some(chunk) = response.chunk().await? {
+                read += chunk.len();
+                if read > MAX_UPSTREAM_TAGS_BYTES {
+                    return Ok(false);
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok::<_, reqwest::Error>(true)
+        };
+        match tokio::time::timeout(Duration::from_secs(timeout), read_body).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
+                tracing::warn!(upstream = %upstream_url, name, cap = MAX_UPSTREAM_TAGS_BYTES, "upstream tag list exceeds the size cap");
+                cb.record_alive(&cb_key, probe);
+                return Err(ProxyError::Upstream(502));
+            }
+            Ok(Err(e)) => {
+                cb.record_failure(&cb_key, probe);
+                return Err(ProxyError::Network(e.to_string()));
+            }
+            Err(_) => {
+                cb.record_failure(&cb_key, probe);
+                return Err(ProxyError::Network(format!(
+                    "tag list not read within {timeout}s"
+                )));
+            }
+        }
+        // `tags` must be there; registry:2 answers `null` for a repository without tags.
+        let page = match serde_json::from_slice::<Value>(&body) {
+            Ok(Value::Object(mut page)) => match page.remove("tags") {
+                Some(Value::Null) => Ok(Vec::new()),
+                Some(list) => {
+                    serde_json::from_value::<Vec<String>>(list).map_err(|e| e.to_string())
+                }
+                None => Err("no tags member".to_string()),
+            },
+            Ok(_) => Err("not a JSON object".to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        match page {
+            Ok(page) => tags.extend(page),
+            Err(e) => {
+                tracing::warn!(upstream = %upstream_url, name, error = %e, "upstream tag list is not a tag list");
+                cb.record_alive(&cb_key, probe);
+                return Err(ProxyError::Upstream(502));
+            }
+        }
+        match next {
+            None => {
+                cb.record_success(&cb_key, probe);
+                return Ok(tags);
+            }
+            Some(Ok(next)) if next.origin() == url.origin() && next != url => url = next,
+            Some(_) => {
+                tracing::warn!(upstream = %upstream_url, name, "upstream tag list names a next page NORA does not follow");
+                cb.record_alive(&cb_key, probe);
+                return Err(ProxyError::Upstream(502));
+            }
+        }
+    }
+    tracing::warn!(upstream = %upstream_url, name, pages = MAX_UPSTREAM_TAGS_PAGES, "upstream tag list has more pages than NORA follows");
+    cb.record_alive(&cb_key, probe);
+    Err(ProxyError::Upstream(502))
+}
+
+/// The target of the `next` link in a `Link` header value, if any (RFC 8288): links are
+/// separated by commas and parameters by semicolons, neither inside `<…>` or a quoted string,
+/// and `rel` is a space-separated list of relation types (`rel="next alternate"`).
+pub(super) fn next_link_target(value: &str) -> Option<&str> {
+    split_outside(value, ',').into_iter().find_map(|link| {
+        let mut parts = split_outside(link, ';').into_iter();
+        let target = parts.next()?.trim().strip_prefix('<')?.strip_suffix('>')?;
+        let is_next = parts.any(|param| {
+            param.split_once('=').is_some_and(|(key, value)| {
+                key.trim().eq_ignore_ascii_case("rel")
+                    && value
+                        .trim()
+                        .trim_matches('"')
+                        .split_ascii_whitespace()
+                        .any(|rel| rel.eq_ignore_ascii_case("next"))
+            })
+        });
+        is_next.then_some(target)
+    })
+}
+
+/// `s` split at `sep` where it stands outside `<…>` and outside a quoted string.
+fn split_outside(s: &str, sep: char) -> Vec<&str> {
+    let (mut parts, mut start) = (Vec::new(), 0);
+    let (mut angle, mut quoted, mut escaped) = (false, false, false);
+    for (i, c) in s.char_indices() {
+        if quoted {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => quoted = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' if !angle => quoted = true,
+            '<' => angle = true,
+            '>' => angle = false,
+            c if c == sep && !angle => {
+                parts.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
 /// The media types a manifest is served with.
 const MANIFEST_MEDIA_TYPES: [&str; 6] = [
     "application/vnd.docker.distribution.manifest.v2+json",

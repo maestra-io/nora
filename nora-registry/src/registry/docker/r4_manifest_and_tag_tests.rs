@@ -377,3 +377,521 @@ async fn tags_list_of_an_unknown_repository_is_name_unknown() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["tags"], serde_json::json!([]));
 }
+
+/// A proxied tag NORA holds: the manifest under the upstream's namespace, as a pull caches it.
+async fn cache_proxied_tag(ctx: &TestContext, ns: &str, repo: &str, tag: &str) {
+    ctx.state
+        .storage
+        .put(
+            &format!("docker/{ns}/{repo}/manifests/{tag}.json"),
+            &manifest(),
+        )
+        .await
+        .unwrap();
+}
+
+fn tag_page(tags: &[&str]) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({"name": "x", "tags": tags}))
+}
+
+/// R4-R09: a proxied repository lists the upstream's tags (every page the upstream sends)
+/// with the ones NORA holds, sorted, and pages the union with `n`, `last` and Link as a
+/// local list.
+#[tokio::test]
+async fn tags_list_of_a_proxied_repository_merges_the_upstream() {
+    use wiremock::matchers::{query_param, query_param_is_missing};
+    let hub = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/app/tags/list"))
+        .and(query_param_is_missing("last"))
+        .respond_with(
+            tag_page(&["d", "b"])
+                .insert_header("Link", r#"</v2/team/app/tags/list?last=d&n=2>; rel="next""#),
+        )
+        .expect(3)
+        .mount(&hub)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/app/tags/list"))
+        .and(query_param("last", "d"))
+        .respond_with(tag_page(&["e"]))
+        .expect(3)
+        .mount(&hub)
+        .await;
+    let url = hub.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.docker.upstreams = vec![upstream(url, "hub")];
+    });
+    cache_proxied_tag(&ctx, "hub", "team/app", "a").await;
+    cache_proxied_tag(&ctx, "hub", "team/app", "b").await;
+
+    let (status, link, json) = tags(&ctx, "/v2/team/app/tags/list").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(link, None);
+    assert_eq!(json["tags"], serde_json::json!(["a", "b", "d", "e"]));
+
+    let (_, link, json) = tags(&ctx, "/v2/team/app/tags/list?n=2").await;
+    assert_eq!(json["tags"], serde_json::json!(["a", "b"]));
+    assert_eq!(
+        link.as_deref(),
+        Some(r#"</v2/team/app/tags/list?n=2&last=b>; rel="next""#)
+    );
+    let (_, link, json) = tags(&ctx, "/v2/team/app/tags/list?n=2&last=b").await;
+    assert_eq!(json["tags"], serde_json::json!(["d", "e"]));
+    assert_eq!(link, None);
+}
+
+/// R4-R09: a repository something was pushed to is NORA's own and its tags are local, unless a
+/// prefix routes the name to an upstream; a single-segment name is asked as `library/<name>`.
+#[tokio::test]
+async fn tags_list_asks_the_upstream_only_for_a_proxied_repository() {
+    let (hub, mirror) = (MockServer::start().await, MockServer::start().await);
+    Mock::given(method("GET"))
+        .and(path("/v2/team/app/tags/list"))
+        .respond_with(tag_page(&["hub"]))
+        .expect(0)
+        .mount(&hub)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/app/tags/list"))
+        .respond_with(tag_page(&["upstream"]))
+        .expect(1)
+        .mount(&mirror)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/library/alpine/tags/list"))
+        .respond_with(tag_page(&["3.20"]))
+        .expect(1)
+        .mount(&hub)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/alpine/tags/list"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&hub)
+        .await;
+    let (url, mirror_url) = (hub.uri(), mirror.uri());
+    let ctx = create_test_context_with_config(move |cfg| {
+        let mut routed = upstream(mirror_url, "mirror");
+        routed.prefix = Some("mirror".into());
+        cfg.docker.upstreams = vec![upstream(url, "hub"), routed];
+    });
+    assert_eq!(push(&ctx, "team/app", "v1").await, StatusCode::CREATED);
+
+    let (status, _, json) = tags(&ctx, "/v2/team/app/tags/list").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["tags"], serde_json::json!(["v1"]));
+
+    let (status, _, json) = tags(&ctx, "/v2/mirror/team/app/tags/list").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["tags"], serde_json::json!(["upstream", "v1"]));
+
+    let (status, _, json) = tags(&ctx, "/v2/alpine/tags/list").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["tags"], serde_json::json!(["3.20"]));
+}
+
+/// R4-R09: an upstream that fails leaves the local tags; with none, the answer is the
+/// upstream's failure (502 UNAVAILABLE), not 404. An upstream that has no such repository
+/// is 404 NAME_UNKNOWN, as a local miss. A next page off the upstream's origin is not
+/// followed: NORA's credential would go there.
+#[tokio::test]
+async fn tags_list_when_the_upstream_fails() {
+    let hub = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/down/tags/list"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&hub)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/cached/tags/list"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&hub)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/elsewhere/tags/list"))
+        .respond_with(tag_page(&["a"]).insert_header(
+            "Link",
+            r#"<http://other.example/v2/team/elsewhere/tags/list?last=a>; rel="next""#,
+        ))
+        .mount(&hub)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&hub)
+        .await;
+    let url = hub.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.docker.upstreams = vec![upstream(url, "hub")];
+    });
+    cache_proxied_tag(&ctx, "hub", "team/cached", "1.0").await;
+
+    let (status, _, json) = tags(&ctx, "/v2/team/cached/tags/list").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["tags"], serde_json::json!(["1.0"]));
+
+    for repo in ["team/down", "team/elsewhere"] {
+        let (status, _, json) = tags(&ctx, &format!("/v2/{repo}/tags/list")).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{repo}");
+        assert_eq!(json["errors"][0]["code"], "UNAVAILABLE", "{repo}");
+    }
+
+    let (status, _, json) = tags(&ctx, "/v2/team/typo/tags/list").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["errors"][0]["code"], "NAME_UNKNOWN");
+}
+
+/// R4-R09: the upstream's answer is kept. With the default `metadata_ttl` every list asks
+/// again and a failed ask serves the kept answer (`serve_stale`); within a positive
+/// `metadata_ttl` the kept answer is served without asking.
+#[tokio::test]
+async fn tags_list_keeps_the_upstream_answer() {
+    for ttl in [-1, 300] {
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/team/app/tags/list"))
+            .respond_with(tag_page(&["1.0"]))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&hub)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(if ttl > 0 { 0 } else { 1 })
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![upstream(url, "hub")];
+            cfg.docker.metadata_ttl = ttl;
+        });
+        for _ in 0..2 {
+            let (status, _, json) = tags(&ctx, "/v2/team/app/tags/list").await;
+            assert_eq!(status, StatusCode::OK, "ttl {ttl}");
+            assert_eq!(json["tags"], serde_json::json!(["1.0"]), "ttl {ttl}");
+        }
+        hub.verify().await;
+    }
+}
+
+/// R4-R09 (review): a redirect off the upstream's origin is not followed, as a next page off
+/// it is not.
+#[tokio::test]
+async fn tags_list_does_not_follow_a_redirect_off_the_upstream_origin() {
+    let (hub, other) = (MockServer::start().await, MockServer::start().await);
+    Mock::given(method("GET"))
+        .respond_with(tag_page(&["elsewhere"]))
+        .expect(0)
+        .mount(&other)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/app/tags/list"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/v2/team/app/tags/list", other.uri())),
+        )
+        .mount(&hub)
+        .await;
+    let url = hub.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.docker.upstreams = vec![upstream(url, "hub")];
+    });
+    let (status, _, _) = tags(&ctx, "/v2/team/app/tags/list").await;
+    assert_ne!(status, StatusCode::OK);
+}
+
+/// R4-R09 (review): one upstream without the repository and another failing is not "no such
+/// repository": the kept answer is served stale.
+#[tokio::test]
+async fn tags_list_serves_stale_when_one_upstream_misses_and_another_fails() {
+    let (first, second) = (MockServer::start().await, MockServer::start().await);
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&first)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(tag_page(&["1.0"]))
+        .up_to_n_times(1)
+        .mount(&second)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&second)
+        .await;
+    let (a, b) = (first.uri(), second.uri());
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.docker.upstreams = vec![upstream(a, "first"), upstream(b, "second")];
+    });
+    for _ in 0..2 {
+        let (status, _, json) = tags(&ctx, "/v2/team/app/tags/list").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["tags"], serde_json::json!(["1.0"]));
+    }
+}
+
+/// R4-R09 (review): the kept answer is per route. The chain's answer from its second upstream
+/// is not the answer of a prefix route to the first upstream alone, though both store under
+/// the first upstream's namespace.
+#[tokio::test]
+async fn tags_list_keeps_answers_per_route() {
+    let (first, second) = (MockServer::start().await, MockServer::start().await);
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&first)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(tag_page(&["from-second"]))
+        .mount(&second)
+        .await;
+    let (a, b) = (first.uri(), second.uri());
+    let ctx = create_test_context_with_config(move |cfg| {
+        let mut routed = upstream(a, "first");
+        routed.prefix = Some("p".into());
+        cfg.docker.upstreams = vec![routed, upstream(b, "second")];
+        cfg.docker.metadata_ttl = 300;
+    });
+    let (status, _, json) = tags(&ctx, "/v2/team/app/tags/list").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["tags"], serde_json::json!(["from-second"]));
+    let (status, _, json) = tags(&ctx, "/v2/p/team/app/tags/list").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["errors"][0]["code"], "NAME_UNKNOWN");
+}
+
+/// R4-R09 (review): a relative next page is resolved against the page that carried it, which a
+/// same-origin redirect may have moved.
+#[tokio::test]
+async fn tags_list_resolves_the_next_page_against_the_redirected_page() {
+    use wiremock::matchers::{query_param, query_param_is_missing};
+    let hub = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/app/tags/list"))
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "Location",
+            format!("{}/registry/v2/team/app/tags/list", hub.uri()),
+        ))
+        .mount(&hub)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/registry/v2/team/app/tags/list"))
+        .and(query_param_is_missing("last"))
+        .respond_with(tag_page(&["a"]).insert_header("Link", r#"<?last=a>; rel="next""#))
+        .mount(&hub)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/registry/v2/team/app/tags/list"))
+        .and(query_param("last", "a"))
+        .respond_with(tag_page(&["b"]))
+        .mount(&hub)
+        .await;
+    let url = hub.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.docker.upstreams = vec![upstream(url, "hub")];
+    });
+    let (status, _, json) = tags(&ctx, "/v2/team/app/tags/list").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["tags"], serde_json::json!(["a", "b"]));
+}
+
+/// R4-R09 (review): one upstream without the repository and another failing, with nothing kept,
+/// is the failure (502), not NAME_UNKNOWN: the repository may be on the failing one.
+#[tokio::test]
+async fn tags_list_with_one_upstream_missing_and_another_failing_is_a_502() {
+    let (first, second) = (MockServer::start().await, MockServer::start().await);
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&first)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&second)
+        .await;
+    let (a, b) = (first.uri(), second.uri());
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.docker.upstreams = vec![upstream(a, "first"), upstream(b, "second")];
+    });
+    let (status, _, json) = tags(&ctx, "/v2/team/app/tags/list").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(json["errors"][0]["code"], "UNAVAILABLE");
+}
+
+/// R4-R09 (review): the kept answer is per upstream entry: two entries on one url with
+/// different credentials do not share it.
+#[tokio::test]
+async fn tags_list_keeps_answers_per_upstream_entry() {
+    use wiremock::matchers::header;
+    let hub = MockServer::start().await;
+    for (user, tag) in [("a", "seen-by-a"), ("b", "seen-by-b")] {
+        let basic = crate::config::basic_auth_header(&format!("{user}:x"));
+        Mock::given(method("GET"))
+            .and(header("authorization", basic.as_str()))
+            .respond_with(tag_page(&[tag]))
+            .mount(&hub)
+            .await;
+    }
+    let url = hub.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        let entry = |prefix: &str, user: &str| {
+            let mut u = upstream(url.clone(), "hub");
+            u.prefix = Some(prefix.into());
+            u.auth = Some(format!("{user}:x").into());
+            u
+        };
+        cfg.docker.upstreams = vec![entry("pa", "a"), entry("pb", "b")];
+        cfg.docker.metadata_ttl = 300;
+    });
+    for (prefix, tag) in [("pa", "seen-by-a"), ("pb", "seen-by-b")] {
+        let (status, _, json) = tags(&ctx, &format!("/v2/{prefix}/team/app/tags/list")).await;
+        assert_eq!(status, StatusCode::OK, "{prefix}");
+        assert_eq!(json["tags"], serde_json::json!([tag]), "{prefix}");
+    }
+}
+
+/// R4-R09 (review): a repository NORA holds only by digest has no local tag to fall back on,
+/// so a failed upstream is the 502, not an empty list; a later page that is gone fails the
+/// listing rather than making the repository unknown.
+#[tokio::test]
+async fn tags_list_failure_without_a_local_tag_is_a_502() {
+    use wiremock::matchers::{query_param, query_param_is_missing};
+    let hub = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/digest-only/tags/list"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&hub)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/paged/tags/list"))
+        .and(query_param_is_missing("last"))
+        .respond_with(
+            tag_page(&["a"])
+                .insert_header("Link", r#"</v2/team/paged/tags/list?last=a>; rel="next""#),
+        )
+        .mount(&hub)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/paged/tags/list"))
+        .and(query_param("last", "a"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&hub)
+        .await;
+    let url = hub.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.docker.upstreams = vec![upstream(url, "hub")];
+    });
+    let digest = digest_of(&manifest());
+    cache_proxied_tag(&ctx, "hub", "team/digest-only", &digest).await;
+    for repo in ["team/digest-only", "team/paged"] {
+        let (status, _, json) = tags(&ctx, &format!("/v2/{repo}/tags/list")).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{repo}");
+        assert_eq!(json["errors"][0]["code"], "UNAVAILABLE", "{repo}");
+    }
+}
+
+/// R4-R09 (review): past the byte cap the oldest kept answers go, as many as the new one needs.
+#[test]
+fn upstream_tags_cache_evicts_the_oldest_past_its_cap() {
+    let cache = super::UpstreamTags::default();
+    let big = || vec!["x".repeat(super::UPSTREAM_TAGS_CACHE_BYTES / 3)];
+    for key in ["a", "b", "c"] {
+        cache.put(key.into(), big());
+    }
+    assert!(cache.get("a").is_none());
+    assert!(cache.get("b").is_some() && cache.get("c").is_some());
+}
+
+/// R4-R09 (review): a repository the upstreams no longer have drops the kept answer, so a
+/// later failure is the failure, not the old tags served stale.
+#[tokio::test]
+async fn tags_list_forgets_a_repository_gone_upstream() {
+    let hub = MockServer::start().await;
+    for status in [200, 404] {
+        let answer = if status == 200 {
+            tag_page(&["v1"])
+        } else {
+            ResponseTemplate::new(404)
+        };
+        Mock::given(method("GET"))
+            .respond_with(answer)
+            .up_to_n_times(1)
+            .mount(&hub)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&hub)
+        .await;
+    let url = hub.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.docker.upstreams = vec![upstream(url, "hub")];
+    });
+    let uri = "/v2/team/app/tags/list";
+    for want in [
+        StatusCode::OK,
+        StatusCode::NOT_FOUND,
+        StatusCode::BAD_GATEWAY,
+    ] {
+        let (status, _, _) = tags(&ctx, uri).await;
+        assert_eq!(status, want);
+    }
+}
+
+/// R4-R09 (review): the next link of a `Link` header (RFC 8288): `rel` is a list of relation
+/// types, quoted or not, and a comma or semicolon inside a quoted parameter or the target does
+/// not split it.
+#[test]
+fn the_next_link_is_found_in_a_link_header() {
+    use super::upstream::next_link_target;
+    let next = Some("/v2/x/tags/list?last=a");
+    for (header, want) in [
+        (r#"</v2/x/tags/list?last=a>; rel="next""#, next),
+        ("</v2/x/tags/list?last=a>; rel=next", next),
+        (r#"</v2/x/tags/list?last=a>; rel="next alternate""#, next),
+        (
+            r#"</v2/x/tags/list?last=a>; type="x"; REL="alternate next""#,
+            next,
+        ),
+        (
+            r#"</v2/x/tags/list?last=a>; title="a,b; c"; rel="next""#,
+            next,
+        ),
+        (
+            r#"</prev>; rel="prev", </v2/x/tags/list?last=a>; rel="next""#,
+            next,
+        ),
+        (r#"</v2/x;a,b>; rel="next""#, Some("/v2/x;a,b")),
+        (r#"</v2/x/tags/list?last=a>; rel="prev""#, None),
+        (r#"</v2/x/next>; rel="nextish""#, None),
+    ] {
+        assert_eq!(next_link_target(header), want, "{header}");
+    }
+}
+
+/// R4-R09 (review): a 200 without a `tags` member is not a tag list: the listing fails (502),
+/// it is not an empty list; an explicit `null` (registry:2) is one.
+#[tokio::test]
+async fn tags_list_needs_the_tags_member_of_the_upstream() {
+    let hub = MockServer::start().await;
+    for (repo, body) in [
+        ("team/empty-object", serde_json::json!({})),
+        (
+            "team/null-tags",
+            serde_json::json!({"name": "x", "tags": null}),
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{repo}/tags/list")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&hub)
+            .await;
+    }
+    let url = hub.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.docker.upstreams = vec![upstream(url, "hub")];
+    });
+    let (status, _, json) = tags(&ctx, "/v2/team/empty-object/tags/list").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(json["errors"][0]["code"], "UNAVAILABLE");
+    let (status, _, json) = tags(&ctx, "/v2/team/null-tags/tags/list").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["tags"], serde_json::json!([]));
+}

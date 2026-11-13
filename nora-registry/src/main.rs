@@ -505,6 +505,8 @@ pub struct AppState {
     pub(crate) blob_flights: proxy_coalesce::InflightMap<registry::docker::SpoolShare>,
     /// Renders of proxied npm packuments, shared by concurrent and repeated requests.
     pub(crate) packument_memo: Arc<packument_memo::PackumentMemo>,
+    /// Upstream answers to Docker `tags/list` (R4-R09), in-memory.
+    pub(crate) docker_upstream_tags: Arc<registry::docker::UpstreamTags>,
     pub digest_store: Arc<digest_quarantine::DigestStore>,
     /// Break-glass exceptions to the docker quarantine, re-read from `[docker] quarantine_exceptions`.
     pub quarantine_exceptions: Arc<quarantine_exceptions::QuarantineExceptions>,
@@ -2172,6 +2174,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         artifact_flights: proxy_coalesce::InflightMap::new(),
         blob_flights: proxy_coalesce::InflightMap::new(),
         packument_memo: Arc::default(),
+        docker_upstream_tags: Arc::default(),
         digest_store,
         quarantine_exceptions: Default::default(),
         signer,

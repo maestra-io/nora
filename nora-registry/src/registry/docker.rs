@@ -142,6 +142,12 @@ impl Canonical {
         }
     }
 
+    /// Whether a prefix, `namespaces` or a registry host picked the upstream: the name is that
+    /// upstream's pull-through, whatever NORA holds of it.
+    fn routed(&self) -> bool {
+        matches!(self.route, Route::Upstream(_))
+    }
+
     /// Return a 403 response if this request was denied by `default_action = "deny"`.
     pub fn denied_response(&self) -> Option<axum::response::Response> {
         if self.denied {
@@ -182,7 +188,8 @@ impl Canonical {
 /// 3. Hostname detection — first segment contains a dot (FQDN like `docker.io`): the
 ///    upstream that serves the host ([`crate::config::DockerUpstream::serves_host`]); Docker Hub without an
 ///    upstream of its own is the fallback chain, as a bare name is; any other host has no
-///    upstream, and the name is answered from local storage only (#1195)
+///    upstream, and the name is answered from local storage only (#1195); a write to it is
+///    refused ([`write_gate`])
 /// 4. Fallback — if `default_action = deny`, mark as denied; otherwise use
 ///    the first upstream that owns no namespaces
 pub(crate) fn canonicalize(
@@ -847,6 +854,7 @@ fn manifest_unknown_response(name: &str, reference: &str) -> Response {
 enum Missed<'a> {
     Manifest { name: &'a str, reference: &'a str },
     Blob { name: &'a str, digest: &'a str },
+    Tags { name: &'a str },
 }
 
 /// The answer to a Docker miss once every upstream was asked ([`UpstreamMiss::response`] decides
@@ -858,6 +866,7 @@ fn docker_miss_response(miss: &UpstreamMiss, missed: Missed<'_>) -> Response {
     let path = match missed {
         Missed::Manifest { name, reference } => format!("{name}:{reference}"),
         Missed::Blob { name, digest } => format!("{name}@{digest}"),
+        Missed::Tags { name } => format!("{name}/tags/list"),
     };
     let response = miss.response("docker", &path);
     let status = response.status();
@@ -871,6 +880,7 @@ fn docker_miss_response(miss: &UpstreamMiss, missed: Missed<'_>) -> Response {
         return match missed {
             Missed::Manifest { name, reference } => manifest_unknown_response(name, reference),
             Missed::Blob { digest, .. } => blob_unknown_response(digest),
+            Missed::Tags { name } => name_unknown_response(name),
         };
     } else if miss.open_key().is_some() {
         // miss.response logged the breaker key; the body never names the upstream's URL.
@@ -893,6 +903,19 @@ fn docker_miss_response(miss: &UpstreamMiss, missed: Missed<'_>) -> Response {
         "errors": [{ "code": code, "message": message, "detail": detail }]
     }));
     (parts, body).into_response()
+}
+
+/// Build a 404 `NAME_UNKNOWN` response: a repository neither NORA nor an upstream holds.
+fn name_unknown_response(name: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"errors": [{
+            "code": "NAME_UNKNOWN",
+            "message": "repository name not known to registry",
+            "detail": { "name": name }
+        }]})),
+    )
+        .into_response()
 }
 
 /// Build a 404 `BLOB_UNKNOWN` response per the OCI Distribution Spec.
@@ -1464,7 +1487,10 @@ async fn docker_v2_dispatch(
 ///   prefix or registry host routing strips does not reach the repository behind it
 ///   (`harbor.corp/payments/api` is stored as `payments/api`);
 /// - a name under an upstream's storage namespace is refused: its keys are that upstream's
-///   proxy cache (`docker/<namespace>/…`), which a push would overwrite.
+///   proxy cache (`docker/<namespace>/…`), which a push would overwrite;
+/// - a name behind a registry host no upstream serves is refused: routing drops the host, so
+///   `ghcr.io/team/app` would land in `team/app`, where a pull without the host finds it
+///   (R4-R11).
 ///
 /// `None` lets the write through.
 fn write_gate(
@@ -1490,6 +1516,11 @@ fn write_gate(
         )
             .into_response()
     };
+    if let Route::UnknownHost(host) = &c.route {
+        return Some(refused(&format!(
+            "NORA serves no registry at {host}: push the name without the host"
+        )));
+    }
     let reserved = state.config.docker.upstreams.iter().any(|u| {
         c.name
             .strip_prefix(u.resolved_namespace().as_str())
@@ -3736,9 +3767,13 @@ async fn put_manifest(
 }
 
 /// `GET /v2/<name>/tags/list[?n=<int>][&last=<tag>]`: the tags NORA holds for the repository
-/// (pushed, or cached by a pull), in ASCII order. `last` starts after that tag, `n` caps the
-/// page and a `Link: …; rel="next"` header names the next one. A repository NORA holds
-/// nothing of is 404 `NAME_UNKNOWN`.
+/// (pushed, or cached by a pull), with the upstream's for a proxied repository (R4-R09), in
+/// ASCII order. `last` starts after that tag, `n` caps the page and a `Link: …; rel="next"`
+/// header names the next one. A repository neither holds is 404 `NAME_UNKNOWN`.
+///
+/// A repository is proxied when a prefix, `namespaces` or a registry host routes it to an
+/// upstream, or when nothing has been pushed to it; an internal-namespace name never is. An
+/// upstream that fails leaves the local tags, or the miss's 502/503 when there are none.
 async fn list_tags(
     State(state): State<AppState>,
     Path(raw_name): Path<String>,
@@ -3748,6 +3783,8 @@ async fn list_tags(
     if let Some(r) = c.denied_response() {
         return r;
     }
+    let upstreams = c.upstreams_to_try(&state.config.docker.upstreams);
+    let routed = c.routed();
     let ns = c.namespace;
     let name = c.name;
     if let Err(e) = validate_docker_name(&name) {
@@ -3768,7 +3805,7 @@ async fn list_tags(
         }
         None => None,
     };
-    let (mut tags, mut known) = match repository_tags(&state, ns.as_deref(), &name).await {
+    let (mut tags, mut known, hosted) = match repository_tags(&state, ns.as_deref(), &name).await {
         Ok(found) => found,
         Err(e) => {
             tracing::error!(error = ?e, "docker: failed to list manifests for tags");
@@ -3792,16 +3829,32 @@ async fn list_tags(
             }
         }
     }
+    // A proxied repository: the upstream's tags with NORA's own (R4-R09).
+    let internal = crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Docker,
+        &name,
+    );
+    let mut upstream_failed = None;
+    if !upstreams.is_empty() && !internal && (routed || !hosted) {
+        match upstream_tags(&state, &upstreams, ns.as_deref(), &name).await {
+            Ok(Some(upstream)) => {
+                tags.extend(upstream);
+                tags.sort();
+                tags.dedup();
+                known = true;
+            }
+            Ok(None) => {}
+            Err(miss) => upstream_failed = Some(miss),
+        }
+    }
+    // No local tag to fall back on (a repository held only by digest or blob has none): the
+    // upstream's failure, not an empty list or "unknown".
+    if let Some(miss) = upstream_failed.filter(|_| tags.is_empty()) {
+        return docker_miss_response(&miss, Missed::Tags { name: &name });
+    }
     if !known {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"errors": [{
-                "code": "NAME_UNKNOWN",
-                "message": "repository name not known to registry",
-                "detail": { "name": name }
-            }]})),
-        )
-            .into_response();
+        return name_unknown_response(&name);
     }
     if let Some(last) = params.get("last") {
         tags.retain(|t| t.as_str() > last.as_str());
@@ -3825,6 +3878,159 @@ async fn list_tags(
         response.headers_mut().insert(header::LINK, link);
     }
     response
+}
+
+/// The upstream's tags of a proxied repository: `Ok(None)` when every upstream asked said it has
+/// no such repository, `Err` with the miss when none answered. Single-segment names are asked
+/// again as `library/<name>`, as a manifest is. The answer is kept per repository: reused within
+/// a positive `metadata_ttl`, as a proxied tag is, and served stale under `serve_stale` when an
+/// upstream failed and none answered. It is keyed by the upstream entries asked too: a name the
+/// chain answered from a later upstream is not the answer of a route to the first one alone,
+/// nor one entry's answer (its credential) another's on the same url. An upstream that failed
+/// makes the miss a failure (502/503), never "no such repository".
+async fn upstream_tags(
+    state: &AppState,
+    upstreams: &[&crate::config::DockerUpstream],
+    ns: Option<&str>,
+    name: &str,
+) -> Result<Option<Vec<String>>, UpstreamMiss> {
+    let entries: Vec<Option<usize>> = upstreams
+        .iter()
+        .map(|u| {
+            state
+                .config
+                .docker
+                .upstreams
+                .iter()
+                .position(|c| std::ptr::eq(c, *u))
+        })
+        .collect();
+    let key = format!("{entries:?} {}/{name}", ns.unwrap_or_default());
+    let cached = state.docker_upstream_tags.get(&key);
+    if let Some((fetched, tags)) = &cached {
+        if crate::cache_ttl::mutable_ref_fresh(
+            true,
+            state.config.docker.metadata_ttl,
+            Some(*fetched),
+        ) {
+            return Ok(Some(tags.to_vec()));
+        }
+    }
+    let mut asked_as = vec![name.to_string()];
+    if !name.contains('/') {
+        asked_as.push(format!("library/{name}"));
+    }
+    // The answers other than "no such repository": one leaves the repository unknown.
+    let mut failures = UpstreamMiss::default();
+    let mut all_absent = true;
+    for upstream_name in &asked_as {
+        for upstream in upstreams {
+            // Redirects stay on the upstream's origin, as its next pages do.
+            match fetch_tags_from_upstream(
+                &state.http_client_same_origin,
+                &upstream.url,
+                upstream_name,
+                &state.docker_auth,
+                state.config.docker.proxy_timeout,
+                expose_opt(&upstream.auth),
+                &state.circuit_breaker,
+            )
+            .await
+            {
+                Ok(tags) => {
+                    state.docker_upstream_tags.put(key, tags.clone());
+                    return Ok(Some(tags));
+                }
+                Err(e) if UpstreamMiss::of(&e).status() == StatusCode::NOT_FOUND => {
+                    tracing::debug!(upstream = %upstream.url, name = %upstream_name, "upstream has no such repository");
+                }
+                Err(e) => {
+                    all_absent = false;
+                    failures.record_from(&upstream.url, &e);
+                }
+            }
+        }
+    }
+    if all_absent {
+        // Gone upstream: a later failure must not serve the old answer stale.
+        state.docker_upstream_tags.remove(&key);
+        return Ok(None);
+    }
+    match cached {
+        Some((_, tags)) if state.config.docker.serve_stale => {
+            tracing::warn!(
+                registry = "docker",
+                name,
+                "upstream failed, serving its stale tag list"
+            );
+            Ok(Some(tags.to_vec()))
+        }
+        _ => Err(failures),
+    }
+}
+
+/// Bytes of upstream tag lists [`UpstreamTags`] keeps at once.
+const UPSTREAM_TAGS_CACHE_BYTES: usize = 32 << 20;
+
+/// Upstream answers to `tags/list` by repository, with when they were fetched (Unix seconds).
+/// In-memory and rebuildable: empty after a restart.
+#[derive(Default)]
+pub(crate) struct UpstreamTags(parking_lot::Mutex<UpstreamTagsInner>);
+
+#[derive(Default)]
+struct UpstreamTagsInner {
+    /// Repository → (fetched at, tags, bytes counted for the entry).
+    entries: HashMap<String, (u64, Arc<[String]>, usize)>,
+    bytes: usize,
+}
+
+impl UpstreamTags {
+    fn get(&self, key: &str) -> Option<(u64, Arc<[String]>)> {
+        let inner = self.0.lock();
+        inner
+            .entries
+            .get(key)
+            .map(|(fetched, tags, _)| (*fetched, tags.clone()))
+    }
+
+    fn remove(&self, key: &str) {
+        let mut inner = self.0.lock();
+        if let Some((_, _, freed)) = inner.entries.remove(key) {
+            inner.bytes -= freed;
+        }
+    }
+
+    fn put(&self, key: String, tags: Vec<String>) {
+        let size = key.len() + tags.iter().map(|t| t.len() + 24).sum::<usize>();
+        if size > UPSTREAM_TAGS_CACHE_BYTES {
+            return;
+        }
+        let mut inner = self.0.lock();
+        if let Some((_, _, old)) = inner.entries.remove(&key) {
+            inner.bytes -= old;
+        }
+        if inner.bytes + size > UPSTREAM_TAGS_CACHE_BYTES {
+            // Oldest first, ordered once per insertion.
+            let mut by_age: Vec<(u64, String)> = inner
+                .entries
+                .iter()
+                .map(|(k, (fetched, _, _))| (*fetched, k.clone()))
+                .collect();
+            by_age.sort_unstable();
+            for (_, oldest) in by_age {
+                if inner.bytes + size <= UPSTREAM_TAGS_CACHE_BYTES {
+                    break;
+                }
+                if let Some((_, _, freed)) = inner.entries.remove(&oldest) {
+                    inner.bytes -= freed;
+                }
+            }
+        }
+        inner.bytes += size;
+        inner
+            .entries
+            .insert(key, (crate::cache_ttl::now_unix(), tags.into(), size));
+    }
 }
 
 // ============================================================================
@@ -3965,19 +4171,22 @@ async fn delete_proxied_tag(state: &AppState, ns: &str, name: &str, reference: &
 }
 
 /// The tags of a repository, sorted and distinct: the tag files under its namespaced and bare
-/// manifest prefixes (digest copies and sidecars are not tags), and whether the repository
-/// holds any manifest file at all. Err when either listing fails: a partial list is not the
-/// list.
+/// manifest prefixes (digest copies and sidecars are not tags), whether the repository holds
+/// any manifest file at all, and whether it holds one under the bare prefix, where pushes go.
+/// Err when either listing fails: a partial list is not the list.
 async fn repository_tags(
     state: &AppState,
     ns: Option<&str>,
     name: &str,
-) -> crate::storage::Result<(Vec<String>, bool)> {
+) -> crate::storage::Result<(Vec<String>, bool, bool)> {
     let prefix = manifest_prefix(ns, name);
     let legacy_prefix = manifest_prefix(None, name);
     let mut keys = state.storage.list(&prefix).await?;
+    let mut hosted = prefix == legacy_prefix && !keys.is_empty();
     if prefix != legacy_prefix {
-        keys.extend(state.storage.list(&legacy_prefix).await?);
+        let bare = state.storage.list(&legacy_prefix).await?;
+        hosted = !bare.is_empty();
+        keys.extend(bare);
     }
     let mut tags: Vec<String> = keys
         .iter()
@@ -3990,7 +4199,7 @@ async fn repository_tags(
         .collect();
     tags.sort();
     tags.dedup();
-    Ok((tags, !keys.is_empty()))
+    Ok((tags, !keys.is_empty(), hosted))
 }
 
 /// The tags of a repository that answer with the manifest `digest`, each resolved as a read

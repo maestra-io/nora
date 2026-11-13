@@ -463,6 +463,7 @@ fn build_context_full(
         artifact_flights: crate::proxy_coalesce::InflightMap::new(),
         blob_flights: crate::proxy_coalesce::InflightMap::new(),
         packument_memo: Arc::default(),
+        docker_upstream_tags: Arc::default(),
         digest_store: Arc::new(crate::digest_quarantine::DigestStore::empty(
             storage.clone(),
         )),

@@ -204,6 +204,7 @@ fn create_oidc_test_context_with(
         spool: ctx.state.spool.clone(),
         blob_flights: crate::proxy_coalesce::InflightMap::new(),
         packument_memo: Arc::default(),
+        docker_upstream_tags: Arc::default(),
         digest_store: ctx.state.digest_store.clone(),
         quarantine_exceptions: ctx.state.quarantine_exceptions.clone(),
         signer: ctx.state.signer.clone(),
