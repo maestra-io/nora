@@ -6993,6 +6993,38 @@ mod trust_upstream_dates {
         assert_eq!(pending.await.unwrap(), None, "the ledger's date admits it");
     }
 
+    /// A load that ended without the whole ledger: a blob with no record in memory is judged
+    /// by its own entry object, read from storage, not held as new.
+    #[tokio::test(start_paused = true)]
+    async fn a_blob_of_an_incomplete_ledger_is_judged_by_its_entry() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("3d".to_string());
+        });
+        let blob = sha(b"layer of an old image");
+        let entry = serde_json::json!({
+            "registry": "docker", "digest": blob, "first_seen": days_ago(30), "upstream": "up"
+        });
+        ctx.state
+            .storage
+            .put(
+                &format!(".nora-quarantine/docker/{blob}"),
+                entry.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        ctx.state.digest_store.set_loaded(false);
+        assert!(
+            super::super::quarantine_proxy_fetch_gate(&ctx.state, &blob, "up")
+                .await
+                .is_none(),
+            "the stored date admits it"
+        );
+        let unseen = sha(b"a layer nobody saw");
+        let held = super::super::quarantine_proxy_fetch_gate(&ctx.state, &unseen, "up").await;
+        assert_eq!(held.map(|r| r.status()), Some(StatusCode::FORBIDDEN));
+    }
+
     /// The manifest path the same: 503 with Retry-After while the ledger cannot judge the
     /// digest (here a load that is given no time), judged by the ledger once it ends.
     #[tokio::test]

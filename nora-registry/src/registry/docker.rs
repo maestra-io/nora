@@ -761,7 +761,7 @@ fn quarantine_ledger_loading(digest: &str) -> Response {
         Json(json!({
             "errors": [{
                 "code": "UNAVAILABLE",
-                "message": "the quarantine ledger is still loading after a restart: retry shortly",
+                "message": "the quarantine ledger is still loading after a restart, or the store did not answer: retry shortly",
                 "detail": { "digest": digest }
             }]
         })),

@@ -116,6 +116,9 @@ pub struct DigestEntry {
     /// Upstream that provided the content (e.g. "registry-1.docker.io"), any userinfo in its
     /// URL masked as in the log, by its type.
     pub upstream: RecordedUrl,
+    /// [`WRITTEN`] entries only: when the source store wrote the copied bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written: Option<i64>,
 }
 
 // ============================================================================
@@ -181,7 +184,11 @@ fn map_key(registry: &str, digest: &str) -> String {
 }
 
 fn entry_key(entry: &DigestEntry) -> String {
-    format!("{ENTRY_PREFIX}{}/{}", entry.registry, entry.digest)
+    object_key(&entry.registry, &entry.digest)
+}
+
+fn object_key(registry: &str, digest: &str) -> String {
+    format!("{ENTRY_PREFIX}{registry}/{digest}")
 }
 
 /// An entry moved back by [`DigestStore::backdate`]: `<entry key>.dated`, the moved entry.
@@ -292,6 +299,15 @@ impl DigestStore {
         tokio::time::timeout(wait, done.cancelled()).await.is_ok()
     }
 
+    /// Read `digest`'s own entry object (one GET) and keep it in memory when found, for a
+    /// ledger that is not in memory whole. `Err` when the store could not answer.
+    async fn read_through(&self, registry: &str, digest: &str) -> Result<(), StorageError> {
+        if let Some(stored) = fetch_entry(&self.storage, &object_key(registry, digest)).await? {
+            adopt(&self.entries, stored);
+        }
+        Ok(())
+    }
+
     /// Record a proxy-fetched digest. Returns the entry (existing or new).
     ///
     /// Idempotent: if the digest already exists, the original entry is returned.
@@ -330,6 +346,7 @@ impl DigestStore {
             digest: digest.to_string(),
             first_seen: first_seen.unwrap_or_else(|| Utc::now().timestamp()),
             upstream: RecordedUrl::new(upstream),
+            written: None,
         };
 
         entries.insert(key, entry.clone());
@@ -397,13 +414,7 @@ impl DigestStore {
                 Ok(false) => {
                     if let Some(stored) = read_entry(&storage, &key).await {
                         // A date moved back meanwhile stays: the earlier one wins.
-                        entries
-                            .write()
-                            .entry(map_key(&stored.registry, &stored.digest))
-                            .and_modify(|live| {
-                                live.first_seen = live.first_seen.min(stored.first_seen)
-                            })
-                            .or_insert(stored);
+                        adopt(&entries, stored);
                     }
                 }
                 Err(e) => error!(
@@ -445,12 +456,16 @@ impl DigestStore {
 
     /// Number of tracked digests.
     pub fn len(&self) -> usize {
-        self.entries.read().len()
+        self.entries
+            .read()
+            .values()
+            .filter(|entry| entry.registry != WRITTEN)
+            .count()
     }
 
     /// Whether the store is empty.
     pub fn is_empty(&self) -> bool {
-        self.entries.read().is_empty()
+        self.len() == 0
     }
 }
 
@@ -658,6 +673,10 @@ pub async fn cache_gate_digest(
 /// ([`LOAD_RETRY_AFTER_SECS`]), never a 403 for a digest it could not judge, never the
 /// artifact. `first_seen` is the date the gate would record (a trusted or write-time date):
 /// one already past the TTL is served without the ledger. Observe and off never wait.
+///
+/// A load that ended without the whole ledger (a failed listing, an unreadable entry) says
+/// nothing about a digest with no record: its own entry object is read then, one GET, and
+/// kept. Missing, the digest is new as before; a store that cannot answer is a 503 as well.
 pub async fn ledger_ready(
     store: &DigestStore,
     registry: &str,
@@ -666,10 +685,27 @@ pub async fn ledger_ready(
     first_seen: Option<i64>,
     quarantine_secs: i64,
 ) -> bool {
-    !matches!(mode, QuarantineMode::Enforce)
+    let unknown = || matches!(store.check(registry, digest, 0), QuarantineStatus::New);
+    if !matches!(mode, QuarantineMode::Enforce)
         || first_seen.is_some_and(|at| Utc::now().timestamp() - at >= quarantine_secs)
-        || !matches!(store.check(registry, digest, 0), QuarantineStatus::New)
-        || store.wait_for_load().await
+        || !unknown()
+    {
+        return true;
+    }
+    if !store.wait_for_load().await {
+        return false;
+    }
+    if store.loaded() || !unknown() {
+        return true;
+    }
+    match store.read_through(registry, digest).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(registry = %registry, digest = %digest, error = %e,
+                "quarantine: ledger incomplete and the digest's entry unreadable, answered 503");
+            false
+        }
+    }
 }
 
 /// [`cache_gate_digest`] for a cached body held whole: hashes `bytes`.
@@ -720,8 +756,107 @@ pub async fn cached_first_seen(
     if !matches!(store.check(registry, digest, 0), QuarantineStatus::New) {
         return None;
     }
-    let written = i64::try_from(storage.stat(key).await?.modified).ok()?;
+    let mut written = i64::try_from(storage.stat(key).await?.modified).ok()?;
+    // A copy `nora restore` or `nora migrate` made is written now: the source's time stands.
+    let carried = store
+        .entries
+        .read()
+        .get(&map_key(WRITTEN, digest))
+        .and_then(|entry| entry.written);
+    if let Some(at) = carried {
+        written = written.min(at);
+    }
     (written < Utc::now().timestamp() - PRUNE_TTL_SECS).then_some(written)
+}
+
+/// Pseudo-registry of the write times `nora restore` and `nora migrate` carry: one entry per
+/// digest of a copied object, `written` when the source store wrote it, `first_seen` the
+/// copy. The copy's own write time is the copy's, so [`cached_first_seen`] would date a
+/// digest the ledger forgot from the copy and hold it again; the carried time stands in until
+/// the copy's own is past the prune line too, when the entry is pruned with it.
+const WRITTEN: &str = "written";
+
+/// Whether `key` is a [`WRITTEN`] entry: the copy writes its own ([`CarriedWrites`]).
+pub(crate) fn is_written_key(key: &str) -> bool {
+    key.strip_prefix(ENTRY_PREFIX)
+        .and_then(|rest| rest.strip_prefix(WRITTEN))
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The write times of the objects a restore or migrate copies, by digest, earliest first.
+#[derive(Default)]
+pub(crate) struct CarriedWrites(HashMap<String, i64>);
+
+impl CarriedWrites {
+    /// An object holding `data` that the source store wrote at `written` (unix seconds).
+    pub(crate) fn object(&mut self, data: &[u8], written: i64) {
+        use sha2::Digest;
+        self.note(
+            format!("sha256:{}", hex::encode(sha2::Sha256::digest(data))),
+            written,
+        );
+    }
+
+    /// A [`WRITTEN`] entry the source carries from an earlier copy, at `key`. `false` when
+    /// `key` is not one; an unparsable one is dropped.
+    pub(crate) fn carried(&mut self, key: &str, data: &[u8]) -> bool {
+        if !is_written_key(key) {
+            return false;
+        }
+        if let Ok(DigestEntry {
+            digest,
+            written: Some(at),
+            ..
+        }) = serde_json::from_slice(data)
+        {
+            self.note(digest, at);
+        }
+        true
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn note(&mut self, digest: String, at: i64) {
+        self.0
+            .entry(digest)
+            .and_modify(|w| *w = (*w).min(at))
+            .or_insert(at);
+    }
+
+    /// Write one [`WRITTEN`] entry per digest into `storage`, `first_seen` now. Returns how
+    /// many writes failed.
+    pub(crate) async fn write(self, storage: &Storage) -> usize {
+        let now = Utc::now().timestamp();
+        let todo = self.0.into_iter().filter(|(_, at)| *at < now);
+        futures::stream::iter(todo)
+            .map(|(digest, at)| async move {
+                let entry = DigestEntry {
+                    registry: WRITTEN.into(),
+                    digest,
+                    first_seen: now,
+                    upstream: RecordedUrl::new("carried"),
+                    written: Some(at),
+                };
+                let key = entry_key(&entry);
+                let Some(body) = entry_body(&entry) else {
+                    return 1;
+                };
+                match storage.put_bytes(&key, body).await {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        error!(key = %key, error = %e, "Failed to write a carried write time");
+                        1
+                    }
+                }
+            })
+            .buffer_unordered(LOAD_CONCURRENCY)
+            .collect::<Vec<usize>>()
+            .await
+            .into_iter()
+            .sum()
+    }
 }
 
 /// A token already cancelled: no load runs.
@@ -741,7 +876,7 @@ fn ledger_loading(registry: &str, digest: &str) -> Response {
     );
     let body = serde_json::json!({
         "error": "quarantine_loading",
-        "message": "the quarantine ledger is still loading after a restart: retry shortly",
+        "message": "the quarantine ledger is still loading after a restart, or the store did not answer: retry shortly",
         "detail": { "registry": registry, "digest": digest },
     });
     (
@@ -812,22 +947,32 @@ fn entry_body(entry: &DigestEntry) -> Option<Bytes> {
     serde_json::to_vec(entry).ok().map(Bytes::from)
 }
 
+/// One per-entry object: `Ok(None)` when missing or unparsable, `Err` when storage failed.
+async fn fetch_entry(storage: &Storage, key: &str) -> Result<Option<DigestEntry>, StorageError> {
+    match storage.get(key).await {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)
+            .map_err(|e| warn!(key = %key, error = %e, "Skipping unparsable quarantine entry"))
+            .ok()),
+        Err(StorageError::NotFound) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// One per-entry object; `None` when missing or unreadable.
 async fn read_entry(storage: &Storage, key: &str) -> Option<DigestEntry> {
-    match storage.get(key).await {
-        Ok(bytes) => match serde_json::from_slice(&bytes) {
-            Ok(entry) => Some(entry),
-            Err(e) => {
-                warn!(key = %key, error = %e, "Skipping unparsable quarantine entry");
-                None
-            }
-        },
-        Err(StorageError::NotFound) => None,
-        Err(e) => {
-            warn!(key = %key, error = %e, "Skipping unreadable quarantine entry");
-            None
-        }
-    }
+    fetch_entry(storage, key).await.unwrap_or_else(|e| {
+        warn!(key = %key, error = %e, "Skipping unreadable quarantine entry");
+        None
+    })
+}
+
+/// Take a stored entry into the live map; a date already earlier in memory stays.
+fn adopt(entries: &RwLock<HashMap<String, DigestEntry>>, stored: DigestEntry) {
+    entries
+        .write()
+        .entry(map_key(&stored.registry, &stored.digest))
+        .and_modify(|live| live.first_seen = live.first_seen.min(stored.first_seen))
+        .or_insert(stored);
 }
 
 /// Every per-entry object key; `None` (logged) when the listing fails.
@@ -1154,6 +1299,7 @@ mod tests {
             digest: digest.into(),
             first_seen,
             upstream: "up".into(),
+            written: None,
         }
     }
 
@@ -1430,12 +1576,14 @@ mod tests {
                 digest: "sha256:aaa".into(),
                 first_seen: now,
                 upstream: "upstream1".into(),
+                written: None,
             },
             DigestEntry {
                 registry: "docker".into(),
                 digest: "sha256:bbb".into(),
                 first_seen: now,
                 upstream: "upstream2".into(),
+                written: None,
             },
         ];
         {
@@ -1770,6 +1918,83 @@ mod tests {
         );
     }
 
+    /// A load that ended without the whole ledger leaves digests with no record in memory
+    /// that the ledger holds. An enforcing gate reads that digest's own entry, once: found,
+    /// its date decides and stays in memory; missing, the digest is new as before; a store
+    /// that cannot answer is a 503 with Retry-After, never a 403 and never the artifact.
+    /// Observe reads nothing.
+    #[tokio::test(start_paused = true)]
+    async fn an_incomplete_ledger_reads_the_digest_entry() {
+        let (st, ops) = crate::test_helpers::op_counting_storage();
+        let old = Utc::now().timestamp() - 30 * 86400;
+        let mut known = entry("sha256:known", old);
+        known.registry = "nuget".into();
+        st.put(&entry_key(&known), &entry_body(&known).unwrap())
+            .await
+            .unwrap();
+        let store = DigestStore::empty(st.clone());
+        store.set_loaded(false);
+        let ttl = 14 * 86400;
+        let gate = |mode: QuarantineMode, digest: &'static str| {
+            let store = &store;
+            async move { proxy_gate_digest(store, "nuget", digest, &mode, ttl, "up", None).await }
+        };
+        let key = ".nora-quarantine/nuget/sha256:known";
+
+        ops.reset();
+        assert!(gate(QuarantineMode::Observe, "sha256:known")
+            .await
+            .is_none());
+        assert_eq!(ops.calls("get", key), 0, "observe reads nothing");
+        store.entries.write().clear();
+
+        assert!(
+            gate(QuarantineMode::Enforce, "sha256:known")
+                .await
+                .is_none(),
+            "the stored date serves it"
+        );
+        assert_eq!(
+            store.check("nuget", "sha256:known", ttl),
+            QuarantineStatus::Mature
+        );
+        assert!(gate(QuarantineMode::Enforce, "sha256:known")
+            .await
+            .is_none());
+        assert_eq!(ops.calls("get", key), 1, "read once, then from memory");
+
+        let resp = gate(QuarantineMode::Enforce, "sha256:unseen")
+            .await
+            .expect("no entry: held as before");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The same read on a store that does not answer: 503 with Retry-After, nothing recorded.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_entry_of_an_incomplete_ledger_is_a_503() {
+        let (st, outage) = crate::test_helpers::outage_storage();
+        let store = DigestStore::empty(st);
+        store.set_loaded(false);
+        outage.fail_reads_of("sha256:broken");
+        let resp = proxy_gate_digest(
+            &store,
+            "nuget",
+            "sha256:broken",
+            &QuarantineMode::Enforce,
+            14 * 86400,
+            "up",
+            None,
+        )
+        .await
+        .expect("never served unchecked");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()[header::RETRY_AFTER],
+            LOAD_RETRY_AFTER_SECS.to_string()
+        );
+        assert!(store.is_empty(), "a 503 records nothing");
+    }
+
     /// A background load signals its end, so a waiting cache hit is released.
     #[tokio::test]
     async fn a_background_load_releases_the_cache_gate_when_it_ends() {
@@ -2034,6 +2259,7 @@ mod tests {
             digest: "sha256:abc".to_string(),
             first_seen: 1700000000,
             upstream: "registry-1.docker.io".into(),
+            written: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"registry\":\"docker\""));
