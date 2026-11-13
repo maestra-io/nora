@@ -134,3 +134,32 @@ async fn a_write_under_an_upstream_cache_namespace_is_refused() {
         assert_eq!(status, StatusCode::ACCEPTED, "{path}");
     }
 }
+
+/// R4-R11: a write behind a registry host no upstream serves is refused. Routing drops the
+/// host, so `quay.io/team/app` would land in `team/app`. A host an upstream serves, and Docker
+/// Hub's, still route the write.
+#[tokio::test]
+async fn a_write_behind_an_unserved_registry_host_is_refused() {
+    let ctx = ctx(vec![upstream("ghcr.io", Some("ghcr"))]);
+    let open = || NamespaceAuthority::Unrestricted;
+    let blob = format!("quay.io/team/app/blobs/{CFG}");
+    for (method, path) in [
+        (Method::POST, "quay.io/team/app/blobs/uploads/"),
+        (Method::PUT, "quay.io/team/app/manifests/v1"),
+        (Method::DELETE, "quay.io/team/app/manifests/v1"),
+        (Method::DELETE, blob.as_str()),
+    ] {
+        let (status, code) = call(&ctx, open(), method.clone(), path, manifest()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}");
+        assert_eq!(code, "NAME_INVALID", "{method} {path}");
+    }
+    assert_eq!(stored(&ctx).await, Vec::<String>::new());
+    for path in [
+        "ghcr.io/team/app/blobs/uploads/",
+        "docker.io/team/app/blobs/uploads/",
+        "team/app/blobs/uploads/",
+    ] {
+        let (status, _) = call(&ctx, open(), Method::POST, path, Vec::new()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{path}");
+    }
+}

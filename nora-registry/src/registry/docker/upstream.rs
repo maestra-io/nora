@@ -1217,6 +1217,143 @@ pub async fn fetch_manifest_from_upstream(
     Ok((bytes, content_type))
 }
 
+/// Bytes of one repository's tag list read from an upstream, over all its pages.
+const MAX_UPSTREAM_TAGS_BYTES: usize = 8 << 20;
+/// Pages of a tag list followed through `Link: rel="next"`.
+const MAX_UPSTREAM_TAGS_PAGES: usize = 100;
+
+/// Fetch a repository's tags from an upstream Docker registry (R4-R09), every page of them:
+/// a registry may page `tags/list` without being asked (`Link: <…>; rel="next"`). The 401
+/// challenge is answered as for a blob. A next page off the upstream's origin is not followed:
+/// the request would carry NORA's credential there.
+pub(crate) async fn fetch_tags_from_upstream(
+    client: &reqwest::Client,
+    upstream_url: &str,
+    name: &str,
+    docker_auth: &DockerAuth,
+    timeout: u64,
+    basic_auth: Option<&str>,
+    cb: &CircuitBreakerRegistry,
+) -> Result<Vec<String>, ProxyError> {
+    #[derive(Deserialize)]
+    struct TagList {
+        // registry:2 answers `null` for a repository without tags
+        tags: Option<Vec<String>>,
+    }
+    let cb_key = upstream_key(
+        crate::registry_type::RegistryType::Docker.as_str(),
+        upstream_url,
+    );
+    let probe = cb.check(&cb_key)?;
+    let first = format!(
+        "{}/v2/{}/tags/list",
+        upstream_url.trim_end_matches('/'),
+        name
+    );
+    let Ok(mut url) = reqwest::Url::parse(&first) else {
+        cb.record_alive(&cb_key, probe);
+        return Err(ProxyError::Network(format!("invalid upstream url {first}")));
+    };
+    let mut tags = Vec::new();
+    let mut read = 0;
+    for _ in 0..MAX_UPSTREAM_TAGS_PAGES {
+        let source = BlobSource {
+            client: client.clone(),
+            upstream_url: upstream_url.to_string(),
+            name: name.to_string(),
+            url: url.to_string(),
+            docker_auth: docker_auth.clone(),
+            basic_auth: basic_auth.map(String::from),
+            timeout,
+        };
+        let mut response = match source.send(None).await {
+            Ok(response) => response,
+            Err(BlobRequestError::Network(reason)) => {
+                cb.record_failure(&cb_key, probe);
+                return Err(ProxyError::Network(reason));
+            }
+            Err(e @ BlobRequestError::Token(_)) => {
+                cb.record_alive(&cb_key, probe);
+                return Err(source.proxy_error(e));
+            }
+        };
+        let status = response.status().as_u16();
+        if status == 429 {
+            cb.record_failure(&cb_key, probe);
+            return Err(crate::registry::upstream_4xx(status, response.headers()));
+        }
+        if !response.status().is_success() {
+            if (400..500).contains(&status) {
+                cb.record_alive(&cb_key, probe);
+            } else {
+                cb.record_failure(&cb_key, probe);
+            }
+            return Err(ProxyError::Upstream(status));
+        }
+        let next = response
+            .headers()
+            .get_all(reqwest::header::LINK)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .find(|link| link.contains("rel=\"next\"") || link.contains("rel=next"))
+            .and_then(|link| link.split_once('<')?.1.split_once('>').map(|(u, _)| u))
+            .map(|link| url.join(link));
+        let mut body = Vec::new();
+        let read_body = async {
+            while let Some(chunk) = response.chunk().await? {
+                read += chunk.len();
+                if read > MAX_UPSTREAM_TAGS_BYTES {
+                    return Ok(false);
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok::<_, reqwest::Error>(true)
+        };
+        match tokio::time::timeout(Duration::from_secs(timeout), read_body).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
+                tracing::warn!(upstream = %upstream_url, name, cap = MAX_UPSTREAM_TAGS_BYTES, "upstream tag list exceeds the size cap");
+                cb.record_alive(&cb_key, probe);
+                return Err(ProxyError::Upstream(502));
+            }
+            Ok(Err(e)) => {
+                cb.record_failure(&cb_key, probe);
+                return Err(ProxyError::Network(e.to_string()));
+            }
+            Err(_) => {
+                cb.record_failure(&cb_key, probe);
+                return Err(ProxyError::Network(format!(
+                    "tag list not read within {timeout}s"
+                )));
+            }
+        }
+        match serde_json::from_slice::<TagList>(&body) {
+            Ok(page) => tags.extend(page.tags.unwrap_or_default()),
+            Err(e) => {
+                tracing::warn!(upstream = %upstream_url, name, error = %e, "upstream tag list is not a tag list");
+                cb.record_alive(&cb_key, probe);
+                return Err(ProxyError::Upstream(502));
+            }
+        }
+        match next {
+            None => {
+                cb.record_success(&cb_key, probe);
+                return Ok(tags);
+            }
+            Some(Ok(next)) if next.origin() == url.origin() && next != url => url = next,
+            Some(_) => {
+                tracing::warn!(upstream = %upstream_url, name, "upstream tag list names a next page NORA does not follow");
+                cb.record_alive(&cb_key, probe);
+                return Err(ProxyError::Upstream(502));
+            }
+        }
+    }
+    tracing::warn!(upstream = %upstream_url, name, pages = MAX_UPSTREAM_TAGS_PAGES, "upstream tag list has more pages than NORA follows");
+    cb.record_alive(&cb_key, probe);
+    Err(ProxyError::Upstream(502))
+}
+
 /// The media types a manifest is served with.
 const MANIFEST_MEDIA_TYPES: [&str; 6] = [
     "application/vnd.docker.distribution.manifest.v2+json",

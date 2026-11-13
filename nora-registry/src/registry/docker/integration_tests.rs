@@ -666,7 +666,7 @@ async fn a_hosted_image_under_a_bound_namespace_is_served_locally() {
 /// #1195: a name behind a registry host no upstream serves is not answered by another
 /// registry. Docker Hub here holds every name — whoever registered `library/alpine` and
 /// `project1/service1` there — and is asked for none of them under `quay.io/…`, nor is its
-/// cached copy served under that host; an image pushed to NORA under the host is still served.
+/// cached copy served under that host; a push under the host is refused (R4-R11).
 #[tokio::test]
 async fn a_name_behind_an_unknown_registry_host_is_not_answered_by_another_registry() {
     use crate::config::DockerUpstream;
@@ -762,7 +762,8 @@ async fn a_name_behind_an_unknown_registry_host_is_not_answered_by_another_regis
         String::from_utf8_lossy(&tags)
     );
 
-    // Pushed under the host, an image is NORA's own and is served.
+    // A push under the host is refused (R4-R11): routing drops the host, so it would land in
+    // `myteam/app`. Before R4-R11 this test asserted the push was stored and served.
     let manifest = serde_json::to_vec(&serde_json::json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
@@ -782,7 +783,9 @@ async fn a_name_behind_an_unknown_registry_host_is_not_answered_by_another_regis
         Body::from(manifest.clone()),
     )
     .await;
-    assert_eq!(put.status(), StatusCode::CREATED);
+    assert_eq!(put.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes(put).await).unwrap();
+    assert_eq!(body["errors"][0]["code"], "NAME_INVALID");
     let resp = send(
         &ctx.app,
         Method::GET,
@@ -790,8 +793,7 @@ async fn a_name_behind_an_unknown_registry_host_is_not_answered_by_another_regis
         Body::empty(),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_bytes(resp).await.as_ref(), manifest.as_slice());
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     let asked: Vec<String> = hub.received_requests().await.unwrap()[asked_before..]
         .iter()
