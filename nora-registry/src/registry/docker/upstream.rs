@@ -1283,6 +1283,8 @@ pub(crate) async fn fetch_tags_from_upstream(
             cb.record_failure(&cb_key, probe);
             return Err(crate::registry::upstream_4xx(status, response.headers()));
         }
+        // A 401 the token did not lift is "not found", as for a manifest: Docker Hub answers a
+        // repository that does not exist that way (#1196), and `library/<name>` is asked next.
         if !response.status().is_success() {
             if (400..500).contains(&status) {
                 cb.record_alive(&cb_key, probe);

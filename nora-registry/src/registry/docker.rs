@@ -3883,16 +3883,28 @@ async fn list_tags(
 /// no such repository, `Err` with the miss when none answered. Single-segment names are asked
 /// again as `library/<name>`, as a manifest is. The answer is kept per repository: reused within
 /// a positive `metadata_ttl`, as a proxied tag is, and served stale under `serve_stale` when an
-/// upstream failed and none answered. It is keyed by the upstreams asked too: a name the chain
-/// answered from a later upstream is not the answer of a route to the first one alone.
+/// upstream failed and none answered. It is keyed by the upstream entries asked too: a name the
+/// chain answered from a later upstream is not the answer of a route to the first one alone,
+/// nor one entry's answer (its credential) another's on the same url. An upstream that failed
+/// makes the miss a failure (502/503), never "no such repository".
 async fn upstream_tags(
     state: &AppState,
     upstreams: &[&crate::config::DockerUpstream],
     ns: Option<&str>,
     name: &str,
 ) -> Result<Option<Vec<String>>, UpstreamMiss> {
-    let asked: Vec<&str> = upstreams.iter().map(|u| u.url.as_str()).collect();
-    let key = format!("{} {}/{name}", asked.join(","), ns.unwrap_or_default());
+    let entries: Vec<Option<usize>> = upstreams
+        .iter()
+        .map(|u| {
+            state
+                .config
+                .docker
+                .upstreams
+                .iter()
+                .position(|c| std::ptr::eq(c, *u))
+        })
+        .collect();
+    let key = format!("{entries:?} {}/{name}", ns.unwrap_or_default());
     let cached = state.docker_upstream_tags.get(&key);
     if let Some((fetched, tags)) = &cached {
         if crate::cache_ttl::mutable_ref_fresh(
@@ -3907,11 +3919,11 @@ async fn upstream_tags(
     if !name.contains('/') {
         asked_as.push(format!("library/{name}"));
     }
-    let mut misses: Vec<UpstreamMiss> = upstreams.iter().map(|_| UpstreamMiss::default()).collect();
-    // Whether every answer was "no such repository": one failure leaves it unknown.
+    // The answers other than "no such repository": one leaves the repository unknown.
+    let mut failures = UpstreamMiss::default();
     let mut all_absent = true;
     for upstream_name in &asked_as {
-        for (upstream, miss) in upstreams.iter().zip(misses.iter_mut()) {
+        for upstream in upstreams {
             // Redirects stay on the upstream's origin, as its next pages do.
             match fetch_tags_from_upstream(
                 &state.http_client_same_origin,
@@ -3928,16 +3940,15 @@ async fn upstream_tags(
                     state.docker_upstream_tags.put(key, tags.clone());
                     return Ok(Some(tags));
                 }
+                Err(e) if UpstreamMiss::of(&e).status() == StatusCode::NOT_FOUND => {
+                    tracing::debug!(upstream = %upstream.url, name = %upstream_name, "upstream has no such repository");
+                }
                 Err(e) => {
-                    all_absent &= UpstreamMiss::of(&e).status() == StatusCode::NOT_FOUND;
-                    miss.record_from(&upstream.url, &e);
+                    all_absent = false;
+                    failures.record_from(&upstream.url, &e);
                 }
             }
         }
-    }
-    let mut miss = UpstreamMiss::default();
-    for asked in &misses {
-        miss.record_upstream(asked);
     }
     if all_absent {
         return Ok(None);
@@ -3951,7 +3962,7 @@ async fn upstream_tags(
             );
             Ok(Some(tags.to_vec()))
         }
-        _ => Err(miss),
+        _ => Err(failures),
     }
 }
 

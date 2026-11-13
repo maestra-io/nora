@@ -692,3 +692,57 @@ async fn tags_list_resolves_the_next_page_against_the_redirected_page() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["tags"], serde_json::json!(["a", "b"]));
 }
+
+/// R4-R09 (review): one upstream without the repository and another failing, with nothing kept,
+/// is the failure (502), not NAME_UNKNOWN: the repository may be on the failing one.
+#[tokio::test]
+async fn tags_list_with_one_upstream_missing_and_another_failing_is_a_502() {
+    let (first, second) = (MockServer::start().await, MockServer::start().await);
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&first)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&second)
+        .await;
+    let (a, b) = (first.uri(), second.uri());
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.docker.upstreams = vec![upstream(a, "first"), upstream(b, "second")];
+    });
+    let (status, _, json) = tags(&ctx, "/v2/team/app/tags/list").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(json["errors"][0]["code"], "UNAVAILABLE");
+}
+
+/// R4-R09 (review): the kept answer is per upstream entry: two entries on one url with
+/// different credentials do not share it.
+#[tokio::test]
+async fn tags_list_keeps_answers_per_upstream_entry() {
+    use wiremock::matchers::header;
+    let hub = MockServer::start().await;
+    for (user, tag) in [("a", "seen-by-a"), ("b", "seen-by-b")] {
+        let basic = crate::config::basic_auth_header(&format!("{user}:x"));
+        Mock::given(method("GET"))
+            .and(header("authorization", basic.as_str()))
+            .respond_with(tag_page(&[tag]))
+            .mount(&hub)
+            .await;
+    }
+    let url = hub.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        let entry = |prefix: &str, user: &str| {
+            let mut u = upstream(url.clone(), "hub");
+            u.prefix = Some(prefix.into());
+            u.auth = Some(format!("{user}:x").into());
+            u
+        };
+        cfg.docker.upstreams = vec![entry("pa", "a"), entry("pb", "b")];
+        cfg.docker.metadata_ttl = 300;
+    });
+    for (prefix, tag) in [("pa", "seen-by-a"), ("pb", "seen-by-b")] {
+        let (status, _, json) = tags(&ctx, &format!("/v2/{prefix}/team/app/tags/list")).await;
+        assert_eq!(status, StatusCode::OK, "{prefix}");
+        assert_eq!(json["tags"], serde_json::json!([tag]), "{prefix}");
+    }
+}
