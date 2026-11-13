@@ -2614,13 +2614,15 @@ async fn concurrent_uploads_of_one_file_store_it_once() {
 }
 
 /// Uploads of different files of one project at once: the project's `requires-python`
-/// record, read and rewritten by each, keeps every file's entry.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// record, read and rewritten by each, keeps every file's entry. The other uploads run while
+/// the first is held between its read of the record and its write.
+#[tokio::test(start_paused = true)]
 async fn concurrent_uploads_keep_every_requires_python_entry() {
-    let ctx = create_test_context();
-    let uploads = (0..12).map(|i| {
+    let (storage, ops) = crate::test_helpers::op_counting_storage();
+    let ctx = crate::test_helpers::create_test_context_with_storage(storage);
+    let upload = |i: usize| {
         let app = ctx.app.clone();
-        tokio::spawn(async move {
+        async move {
             let content = format!("sdist-{i}").into_bytes();
             let version = format!("1.{i}");
             twine_upload(
@@ -2636,10 +2638,17 @@ async fn concurrent_uploads_keep_every_requires_python_entry() {
             )
             .await
             .status()
-        })
-    });
-    for u in futures::future::join_all(uploads).await {
-        assert_eq!(u.unwrap(), StatusCode::OK);
+        }
+    };
+    let statuses = crate::test_helpers::overtake_held_put(
+        &ops,
+        "pypi/many/requires-python.json",
+        upload(0),
+        (1..12).map(upload).collect(),
+    )
+    .await;
+    for status in statuses {
+        assert_eq!(status, StatusCode::OK);
     }
     let record = ctx
         .state

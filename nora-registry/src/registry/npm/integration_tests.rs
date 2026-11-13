@@ -1664,18 +1664,41 @@ async fn publish_refuses_upper_case_in_a_new_name_only() {
 }
 
 /// R4-T05: concurrent publishes of different versions serialize on the package's
-/// publish lock: the packument lists every one of them.
+/// publish lock: the packument lists every one of them. The other publishes run while the
+/// first is held between its listing of the versions and its packument write.
 // lock-audit: concurrent-publish-test
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn concurrent_publishes_keep_every_version() {
-    let ctx = create_test_context();
-    let publishes = (0..16).map(|i| {
+    let (storage, ops) = crate::test_helpers::op_counting_storage();
+    let ctx = crate::test_helpers::create_test_context_with_storage(storage);
+    let publish_one = |i: usize| {
         let app = ctx.app.clone();
-        tokio::spawn(async move { publish(&app, "race", &format!("1.0.{i}")).await })
-    });
-    for p in futures::future::join_all(publishes).await {
-        assert_eq!(p.unwrap(), StatusCode::CREATED);
+        async move { publish(&app, "race", &format!("1.0.{i}")).await }
+    };
+    let statuses = crate::test_helpers::overtake_held_put(
+        &ops,
+        "npm/race/metadata.json",
+        publish_one(0),
+        (1..16).map(publish_one).collect(),
+    )
+    .await;
+    for status in statuses {
+        assert_eq!(status, StatusCode::CREATED);
     }
+    // The stored packument first: a read rebuilds a stale one from the per-version keys, so
+    // the read alone passes without the lock.
+    let stored = ctx
+        .state
+        .storage
+        .get("npm/race/metadata.json")
+        .await
+        .unwrap();
+    let stored: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+    assert_eq!(
+        stored["versions"].as_object().unwrap().len(),
+        16,
+        "{stored}"
+    );
     let doc = packument(&ctx.app, "race").await;
     assert_eq!(doc["versions"].as_object().unwrap().len(), 16);
 }

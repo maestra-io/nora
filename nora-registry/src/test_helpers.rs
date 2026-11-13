@@ -598,6 +598,10 @@ pub struct OpCounts {
     stalled_lists: tokio::sync::watch::Sender<Option<String>>,
     /// Gets of this key park (see [`stall_gets`](Self::stall_gets)).
     stalled_gets: tokio::sync::watch::Sender<Option<String>>,
+    /// The next put of this key parks (see [`hold_next_put`](Self::hold_next_put)).
+    held_put: std::sync::Mutex<Option<String>>,
+    put_parked: tokio::sync::Notify,
+    put_released: tokio::sync::Notify,
 }
 
 impl OpCounts {
@@ -634,6 +638,33 @@ impl OpCounts {
     /// with `None`: a slow read of a big object, so concurrent callers overlap in it.
     pub fn stall_gets(&self, key: Option<&str>) {
         self.stalled_gets.send_replace(key.map(str::to_string));
+    }
+
+    /// Make the next put of exactly `key` (one put only) park before it writes, until
+    /// [`release_put`](Self::release_put): its writer has read and computed, not yet stored.
+    pub fn hold_next_put(&self, key: &str) {
+        *self.held_put.lock().unwrap() = Some(key.to_string());
+    }
+
+    /// Returns once the put held by [`hold_next_put`](Self::hold_next_put) has parked.
+    pub async fn put_parked(&self) {
+        self.put_parked.notified().await;
+    }
+
+    /// Let the held put write.
+    pub fn release_put(&self) {
+        self.put_released.notify_one();
+    }
+
+    async fn park_if_held(&self, key: &str) {
+        let held = {
+            let mut held = self.held_put.lock().unwrap();
+            held.as_deref() == Some(key) && held.take().is_some()
+        };
+        if held {
+            self.put_parked.notify_one();
+            self.put_released.notified().await;
+        }
     }
 
     async fn wait_get_unstalled(&self, key: &str) {
@@ -720,11 +751,40 @@ pub fn op_counting_storage() -> (Storage, Arc<OpCounts>) {
     (Storage::from_backend(Arc::new(backend)), counts)
 }
 
+/// Forces the lost update of a read-modify-write of `key`, every run: `first` runs until its
+/// put of `key` parks (it has read and computed), then each of `rest` runs until it is done or
+/// blocked, then `first` stores. Unless a lock spans the cycle, `rest`'s writes land between
+/// `first`'s read and its write, and `first` overwrites them. Returns the outputs, `first`'s
+/// leading. Needs `start_paused`: the clock moves only once every task waits.
+pub async fn overtake_held_put<F>(
+    ops: &OpCounts,
+    key: &str,
+    first: F,
+    rest: Vec<F>,
+) -> Vec<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    ops.hold_next_put(key);
+    let first = tokio::spawn(first);
+    ops.put_parked().await;
+    let rest: Vec<_> = rest.into_iter().map(tokio::spawn).collect();
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    ops.release_put();
+    let mut outputs = vec![first.await.unwrap()];
+    for task in rest {
+        outputs.push(task.await.unwrap());
+    }
+    outputs
+}
+
 #[async_trait::async_trait]
 impl crate::storage::StorageBackend for OpCountingBackend {
     async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
         self.counts.hit("put", key);
         self.counts.put_refused(key)?;
+        self.counts.park_if_held(key).await;
         self.inner.put(key, data, sha256).await
     }
 
@@ -736,6 +796,7 @@ impl crate::storage::StorageBackend for OpCountingBackend {
     ) -> crate::storage::Result<bool> {
         self.counts.hit("put", key);
         self.counts.put_refused(key)?;
+        self.counts.park_if_held(key).await;
         self.inner.put_if_absent(key, data, sha256).await
     }
 
