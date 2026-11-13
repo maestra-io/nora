@@ -1225,7 +1225,8 @@ const MAX_UPSTREAM_TAGS_PAGES: usize = 100;
 /// Fetch a repository's tags from an upstream Docker registry (R4-R09), every page of them:
 /// a registry may page `tags/list` without being asked (`Link: <…>; rel="next"`). The 401
 /// challenge is answered as for a blob. A next page off the upstream's origin is not followed:
-/// the request would carry NORA's credential there.
+/// the request would carry NORA's credential there. `client` must not follow a redirect off it
+/// either (`http_client_same_origin`).
 pub(crate) async fn fetch_tags_from_upstream(
     client: &reqwest::Client,
     upstream_url: &str,

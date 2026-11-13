@@ -573,3 +573,87 @@ async fn tags_list_keeps_the_upstream_answer() {
         hub.verify().await;
     }
 }
+
+/// R4-R09 (review): a redirect off the upstream's origin is not followed, as a next page off
+/// it is not.
+#[tokio::test]
+async fn tags_list_does_not_follow_a_redirect_off_the_upstream_origin() {
+    let (hub, other) = (MockServer::start().await, MockServer::start().await);
+    Mock::given(method("GET"))
+        .respond_with(tag_page(&["elsewhere"]))
+        .expect(0)
+        .mount(&other)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/app/tags/list"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/v2/team/app/tags/list", other.uri())),
+        )
+        .mount(&hub)
+        .await;
+    let url = hub.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.docker.upstreams = vec![upstream(url, "hub")];
+    });
+    let (status, _, _) = tags(&ctx, "/v2/team/app/tags/list").await;
+    assert_ne!(status, StatusCode::OK);
+}
+
+/// R4-R09 (review): one upstream without the repository and another failing is not "no such
+/// repository": the kept answer is served stale.
+#[tokio::test]
+async fn tags_list_serves_stale_when_one_upstream_misses_and_another_fails() {
+    let (first, second) = (MockServer::start().await, MockServer::start().await);
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&first)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(tag_page(&["1.0"]))
+        .up_to_n_times(1)
+        .mount(&second)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&second)
+        .await;
+    let (a, b) = (first.uri(), second.uri());
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.docker.upstreams = vec![upstream(a, "first"), upstream(b, "second")];
+    });
+    for _ in 0..2 {
+        let (status, _, json) = tags(&ctx, "/v2/team/app/tags/list").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["tags"], serde_json::json!(["1.0"]));
+    }
+}
+
+/// R4-R09 (review): the kept answer is per route. The chain's answer from its second upstream
+/// is not the answer of a prefix route to the first upstream alone, though both store under
+/// the first upstream's namespace.
+#[tokio::test]
+async fn tags_list_keeps_answers_per_route() {
+    let (first, second) = (MockServer::start().await, MockServer::start().await);
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&first)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(tag_page(&["from-second"]))
+        .mount(&second)
+        .await;
+    let (a, b) = (first.uri(), second.uri());
+    let ctx = create_test_context_with_config(move |cfg| {
+        let mut routed = upstream(a, "first");
+        routed.prefix = Some("p".into());
+        cfg.docker.upstreams = vec![routed, upstream(b, "second")];
+        cfg.docker.metadata_ttl = 300;
+    });
+    let (status, _, json) = tags(&ctx, "/v2/team/app/tags/list").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["tags"], serde_json::json!(["from-second"]));
+    let (status, _, json) = tags(&ctx, "/v2/p/team/app/tags/list").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["errors"][0]["code"], "NAME_UNKNOWN");
+}

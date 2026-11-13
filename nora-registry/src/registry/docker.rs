@@ -3882,15 +3882,17 @@ async fn list_tags(
 /// The upstream's tags of a proxied repository: `Ok(None)` when every upstream asked said it has
 /// no such repository, `Err` with the miss when none answered. Single-segment names are asked
 /// again as `library/<name>`, as a manifest is. The answer is kept per repository: reused within
-/// a positive `metadata_ttl`, as a proxied tag is, and served stale under `serve_stale` when
-/// every upstream fails.
+/// a positive `metadata_ttl`, as a proxied tag is, and served stale under `serve_stale` when an
+/// upstream failed and none answered. It is keyed by the upstreams asked too: a name the chain
+/// answered from a later upstream is not the answer of a route to the first one alone.
 async fn upstream_tags(
     state: &AppState,
     upstreams: &[&crate::config::DockerUpstream],
     ns: Option<&str>,
     name: &str,
 ) -> Result<Option<Vec<String>>, UpstreamMiss> {
-    let key = format!("{}/{name}", ns.unwrap_or_default());
+    let asked: Vec<&str> = upstreams.iter().map(|u| u.url.as_str()).collect();
+    let key = format!("{} {}/{name}", asked.join(","), ns.unwrap_or_default());
     let cached = state.docker_upstream_tags.get(&key);
     if let Some((fetched, tags)) = &cached {
         if crate::cache_ttl::mutable_ref_fresh(
@@ -3906,10 +3908,13 @@ async fn upstream_tags(
         asked_as.push(format!("library/{name}"));
     }
     let mut misses: Vec<UpstreamMiss> = upstreams.iter().map(|_| UpstreamMiss::default()).collect();
+    // Whether every answer was "no such repository": one failure leaves it unknown.
+    let mut all_absent = true;
     for upstream_name in &asked_as {
         for (upstream, miss) in upstreams.iter().zip(misses.iter_mut()) {
+            // Redirects stay on the upstream's origin, as its next pages do.
             match fetch_tags_from_upstream(
-                &state.http_client,
+                &state.http_client_same_origin,
                 &upstream.url,
                 upstream_name,
                 &state.docker_auth,
@@ -3923,7 +3928,10 @@ async fn upstream_tags(
                     state.docker_upstream_tags.put(key, tags.clone());
                     return Ok(Some(tags));
                 }
-                Err(e) => miss.record_from(&upstream.url, &e),
+                Err(e) => {
+                    all_absent &= UpstreamMiss::of(&e).status() == StatusCode::NOT_FOUND;
+                    miss.record_from(&upstream.url, &e);
+                }
             }
         }
     }
@@ -3931,7 +3939,7 @@ async fn upstream_tags(
     for asked in &misses {
         miss.record_upstream(asked);
     }
-    if miss.status() == StatusCode::NOT_FOUND {
+    if all_absent {
         return Ok(None);
     }
     match cached {
