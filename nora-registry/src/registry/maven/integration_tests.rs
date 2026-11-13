@@ -1199,21 +1199,30 @@ async fn a_release_upload_under_an_empty_segment_never_overwrites() {
 }
 
 /// Deploys of different versions of one artifact at once serialize on its metadata lock:
-/// `maven-metadata.xml`, rebuilt from a listing on every deploy, names every version.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// `maven-metadata.xml`, rebuilt from a listing on every deploy, names every version. The
+/// other deploys run while the first is held between its listing and its metadata write.
+#[tokio::test(start_paused = true)]
 async fn concurrent_deploys_keep_every_version_in_the_metadata() {
-    let ctx = create_test_context();
-    let deploys = (0..16).map(|i| {
+    let (storage, ops) = crate::test_helpers::op_counting_storage();
+    let ctx = crate::test_helpers::create_test_context_with_storage(storage);
+    let deploy = |i: usize| {
         let app = ctx.app.clone();
-        tokio::spawn(async move {
+        async move {
             let uri = format!("/maven2/com/example/race/1.0.{i}/race-1.0.{i}.jar");
             send(&app, Method::PUT, &uri, Body::from(format!("v{i}")))
                 .await
                 .status()
-        })
-    });
-    for d in futures::future::join_all(deploys).await {
-        assert_eq!(d.unwrap(), StatusCode::CREATED);
+        }
+    };
+    let statuses = crate::test_helpers::overtake_held_put(
+        &ops,
+        "maven/com/example/race/maven-metadata.xml",
+        deploy(0),
+        (1..16).map(deploy).collect(),
+    )
+    .await;
+    for status in statuses {
+        assert_eq!(status, StatusCode::CREATED);
     }
     let resp = send(
         &ctx.app,
