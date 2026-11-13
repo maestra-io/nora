@@ -38,6 +38,11 @@ pub struct BackupMetadata {
     /// Objects the backup could not read and does not hold. Absent in older archives.
     #[serde(default)]
     pub failed_count: usize,
+    /// Each artifact's tar mtime is when the store wrote it, not the backup time: a restore
+    /// carries it for the quarantine ([`digest_quarantine::CarriedWrites`]). Absent in older
+    /// archives, whose mtimes say nothing.
+    #[serde(default)]
+    pub write_times: bool,
 }
 
 /// Archive prefix of node-local state in archives from before it moved to storage.
@@ -68,10 +73,17 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
 
     // List all keys
     println!("Scanning storage...");
-    let mut keys = storage
-        .list("")
+    let listed = storage
+        .list_with_meta("")
         .await
         .map_err(|e| format!("storage list failed: {}", e))?;
+    // When the store wrote each artifact: the quarantine dates a copy it no longer has a
+    // record of by it, and a restore writes every object anew.
+    let written: std::collections::HashMap<String, u64> = listed
+        .iter()
+        .map(|(key, meta)| (key.clone(), meta.modified))
+        .collect();
+    let mut keys: Vec<String> = listed.into_iter().map(|(key, _)| key).collect();
     // npm cache provenance (#1055) and first-seen times sit under internal prefixes that
     // list() hides. Without them a restored owned scope is not trusted — refetched from
     // its owner, and served by no one while that owner is down — and every npm release
@@ -152,12 +164,12 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
         let mut header = Header::new_gnu();
         header.set_size(data.len() as u64);
         header.set_mode(0o644);
-        header.set_mtime(
+        header.set_mtime(written.get(key).copied().unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_secs(),
-        );
+                .as_secs()
+        }));
         header.set_cksum();
 
         // Add to archive
@@ -178,6 +190,7 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
         total_bytes,
         storage_backend: storage.backend_name().to_string(),
         failed_count,
+        write_times: true,
     };
 
     let metadata_json = serde_json::to_vec_pretty(&metadata)
@@ -331,6 +344,8 @@ pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreSt
     let mut artifact_count = 0;
     let mut local_files = 0;
     let mut quarantine_restored = false;
+    let write_times = metadata.as_ref().is_some_and(|m| m.write_times);
+    let mut writes = digest_quarantine::CarriedWrites::default();
 
     // Second pass: restore files
     for entry in archive
@@ -378,6 +393,20 @@ pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreSt
             pb.inc(1);
             continue;
         }
+        if writes.carried(&path, &data) {
+            pb.inc(1);
+            continue;
+        }
+        if write_times && !path.starts_with(".nora-") {
+            if let Some(at) = entry
+                .header()
+                .mtime()
+                .ok()
+                .and_then(|t| i64::try_from(t).ok())
+            {
+                writes.object(&data, at);
+            }
+        }
         quarantine_restored |= path.starts_with(digest_quarantine::ENTRY_PREFIX);
 
         // Put to storage
@@ -389,6 +418,15 @@ pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreSt
         total_bytes += data.len() as u64;
         artifact_count += 1;
         pb.inc(1);
+    }
+
+    // Each artifact was written now: the quarantine keeps the time the archive carries.
+    if !writes.is_empty() {
+        let failed = writes.write(storage).await;
+        if failed > 0 {
+            return Err(format!("Failed to restore {failed} artifact write times"));
+        }
+        quarantine_restored = true;
     }
 
     // The snapshot would shadow the entries just overwritten: the next start reads
@@ -435,6 +473,7 @@ mod tests {
             total_bytes: 1024000,
             storage_backend: "local".to_string(),
             failed_count: 0,
+            write_times: false,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"version\":\"0.3.0\""));
@@ -467,6 +506,7 @@ mod tests {
             total_bytes: 999999,
             storage_backend: "local".to_string(),
             failed_count: 0,
+            write_times: false,
         };
         let json = serde_json::to_value(&meta).unwrap();
         let restored: BackupMetadata = serde_json::from_value(json).unwrap();
@@ -768,6 +808,95 @@ mod tests {
             ledger.check("docker", "sha256:aa", 86400),
             QuarantineStatus::Mature,
             "the backup's original first-seen wins"
+        );
+    }
+
+    /// Write `key` and move its write time `days` back.
+    async fn written_days_ago(root: &Path, storage: &Storage, key: &str, days: u64) {
+        storage.put(key, b"package").await.unwrap();
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86400);
+        File::options()
+            .write(true)
+            .open(root.join(key))
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+    }
+
+    /// Whether an enforcing quarantine holds the cache hit on `key`, by the ledger `storage`
+    /// loads at a start.
+    async fn held_after_start(storage: &Storage, key: &str) -> bool {
+        use crate::digest_quarantine::{cache_gate_dated, DigestStore, QuarantineMode};
+        let store = DigestStore::load(storage.clone(), "/nonexistent").await;
+        let data = storage.get(key).await.unwrap();
+        cache_gate_dated(
+            &store,
+            storage,
+            key,
+            "nuget",
+            &data,
+            &QuarantineMode::Enforce,
+            14 * 86400,
+            None,
+        )
+        .await
+        .is_some()
+    }
+
+    /// A copy the ledger forgot (cached more than 90 days ago) is dated by when the store
+    /// wrote it. A restore writes it now: the archive carries the original time, so the
+    /// restored copy is not held for a new TTL. An archive without write times restores as
+    /// before.
+    #[tokio::test]
+    async fn a_restored_copy_keeps_its_write_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        let storage = Storage::new_local(root.to_str().unwrap());
+        let key = "nuget/old/old.1.0.0.nupkg";
+        written_days_ago(&root, &storage, key, 100).await;
+        assert!(!held_after_start(&storage, key).await);
+
+        let backup_file = dir.path().join("backup.tar.gz");
+        create_backup(&storage, &backup_file).await.unwrap();
+        let restored = Storage::new_local(dir.path().join("restored").to_str().unwrap());
+        restore_backup(&restored, &backup_file).await.unwrap();
+        assert!(
+            !held_after_start(&restored, key).await,
+            "the restored copy is not held again"
+        );
+        assert!(
+            !held_after_start(&restored, key).await,
+            "nor after the next start"
+        );
+
+        // The same archive as an older release wrote it: no write times.
+        let old = dir.path().join("old.tar.gz");
+        {
+            let mut archive = Archive::new(GzDecoder::new(File::open(&backup_file).unwrap()));
+            let gz = GzEncoder::new(File::create(&old).unwrap(), Compression::default());
+            let mut tar = tar::Builder::new(gz);
+            for entry in archive.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                let path = entry.path().unwrap().to_string_lossy().into_owned();
+                let mut data = Vec::new();
+                entry.read_to_end(&mut data).unwrap();
+                if path == "metadata.json" {
+                    let mut meta: serde_json::Value = serde_json::from_slice(&data).unwrap();
+                    meta.as_object_mut().unwrap().remove("write_times");
+                    data = serde_json::to_vec(&meta).unwrap();
+                }
+                let mut header = entry.header().clone();
+                header.set_size(data.len() as u64);
+                header.set_cksum();
+                tar.append_data(&mut header, &path, &data[..]).unwrap();
+            }
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let fresh = Storage::new_local(dir.path().join("fresh").to_str().unwrap());
+        restore_backup(&fresh, &old).await.unwrap();
+        assert!(
+            held_after_start(&fresh, key).await,
+            "an older archive restores as before"
         );
     }
 

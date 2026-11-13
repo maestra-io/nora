@@ -58,10 +58,18 @@ pub async fn migrate(
 
     // List all keys from source
     println!("Scanning source storage...");
-    let mut keys = from
-        .list("")
+    let listed = from
+        .list_with_meta("")
         .await
         .map_err(|e| format!("failed to list source: {e}"))?;
+    // When the source wrote each artifact: the destination writes it now, and the quarantine
+    // dates a copy it no longer has a record of by that time.
+    let written: std::collections::HashMap<String, u64> = listed
+        .iter()
+        .map(|(key, meta)| (key.clone(), meta.modified))
+        .collect();
+    let mut writes = crate::digest_quarantine::CarriedWrites::default();
+    let mut keys: Vec<String> = listed.into_iter().map(|(key, _)| key).collect();
     // npm cache provenance (#1055) and first-seen times sit under internal prefixes that
     // list() hides; without them the destination refetches every owned-scope object from
     // its owner, and every npm release age starts over. API tokens (Maestra) too.
@@ -155,12 +163,17 @@ pub async fn migrate(
             {
                 stats.skipped += 1;
             }
+            // A write time an earlier copy carried: written below, merged with this run's.
+            Ok(data) if writes.carried(key, &data) => stats.migrated += 1,
             Ok(data) => {
                 // Write to destination
                 match to.put(key, &data).await {
                     Ok(()) => {
                         stats.migrated += 1;
                         stats.total_bytes += data.len() as u64;
+                        if let Some(at) = written.get(key).and_then(|t| i64::try_from(*t).ok()) {
+                            writes.object(&data, at);
+                        }
                     }
                     Err(e) => {
                         warn!("Failed to write {}: {}", key, e);
@@ -183,6 +196,8 @@ pub async fn migrate(
     }
 
     pb.finish_with_message("Migration complete");
+    // Each copied artifact was written now: the quarantine keeps the source's time.
+    stats.failed += writes.write(to).await;
 
     println!();
     println!("Migration summary:");
@@ -236,7 +251,11 @@ async fn delete_extraneous(
         );
     }
     let mut failed = 0usize;
-    for key in dest.iter().filter(|k| !source.contains(k.as_str())) {
+    // The carried write times are the copy's own, written by `migrate` itself.
+    for key in dest
+        .iter()
+        .filter(|k| !source.contains(k.as_str()) && !crate::digest_quarantine::is_written_key(k))
+    {
         stats.extraneous += 1;
         if dry_run {
             println!("Would delete extraneous {key}");
@@ -415,6 +434,59 @@ mod tests {
         assert!(target.verify_token(&kept).await.is_ok());
         assert!(target.verify_token(&revoked).await.is_err());
         assert!(dst.stat(state).await.is_some());
+    }
+
+    /// A copy the ledger forgot (cached more than 90 days ago) is dated by when the store
+    /// wrote it, and a migration writes it now: the source's time goes with it, over a
+    /// second migration too, and `--delete-extraneous` keeps it. Without it the copy would be
+    /// held for a new TTL in the destination.
+    #[tokio::test]
+    async fn test_migrate_carries_write_times() {
+        use crate::digest_quarantine::{cache_gate_dated, DigestStore, QuarantineMode};
+        let held = |storage: Storage| async move {
+            let key = "nuget/old/old.1.0.0.nupkg";
+            let store = DigestStore::load(storage.clone(), "/nonexistent").await;
+            let data = storage.get(key).await.unwrap();
+            let mode = QuarantineMode::Enforce;
+            cache_gate_dated(
+                &store,
+                &storage,
+                key,
+                "nuget",
+                &data,
+                &mode,
+                14 * 86400,
+                None,
+            )
+            .await
+            .is_some()
+        };
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        let stores: Vec<Storage> = dirs
+            .iter()
+            .map(|d| Storage::new_local(d.path().to_str().unwrap()))
+            .collect();
+        stores[0]
+            .put("nuget/old/old.1.0.0.nupkg", b"package")
+            .await
+            .unwrap();
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
+        std::fs::File::options()
+            .write(true)
+            .open(dirs[0].path().join("nuget/old/old.1.0.0.nupkg"))
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+        assert!(!held(stores[0].clone()).await);
+
+        let options = || MigrateOptions {
+            delete_extraneous: true,
+            ..Default::default()
+        };
+        migrate(&stores[0], &stores[1], options()).await.unwrap();
+        assert!(!held(stores[1].clone()).await, "not held after a migration");
+        migrate(&stores[1], &stores[2], options()).await.unwrap();
+        assert!(!held(stores[2].clone()).await, "nor after a second one");
     }
 
     /// R4-C10: a key the destination already has is skipped only when it holds the same
