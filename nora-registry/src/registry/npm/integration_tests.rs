@@ -1633,6 +1633,36 @@ async fn publish_refuses_a_path_that_is_not_a_package_name() {
     );
 }
 
+/// npm refuses upper case in a new package name (validate-npm-package-name
+/// `validForNewPackages`), so does NORA; a package already published here keeps its name.
+#[tokio::test]
+async fn publish_refuses_upper_case_in_a_new_name_only() {
+    let ctx = create_test_context();
+    for name in ["MyPkg", "@Scope/foo", "@scope/Foo"] {
+        assert_eq!(
+            publish(&ctx.app, name, "1.0.0").await,
+            StatusCode::BAD_REQUEST,
+            "{name}"
+        );
+    }
+    assert!(ctx.state.storage.list("npm/").await.unwrap().is_empty());
+
+    // Published before the rule: its version key is there.
+    let doc = serde_json::json!({ "name": "Legacy", "version": "1.0.0", "dist": {} });
+    ctx.state
+        .storage
+        .put(
+            "npm/Legacy/versions/1.0.0.json",
+            &serde_json::to_vec(&doc).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        publish(&ctx.app, "Legacy", "1.1.0").await,
+        StatusCode::CREATED
+    );
+}
+
 /// R4-T05: concurrent publishes of different versions serialize on the package's
 /// publish lock: the packument lists every one of them.
 // lock-audit: concurrent-publish-test
