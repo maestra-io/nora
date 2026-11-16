@@ -18,6 +18,12 @@ upstream_keyring_dir = "/etc/nora/deb-keyrings"   # *.gpg / *.pgp keyrings or *.
 architectures = ["amd64", "arm64"]                # binary indexes built (default)
 metadata_ttl = 300                                 # seconds a built suite is reused
 
+[deb.upstream_keyrings]   # per repository: keyring file or directory (else upstream_keyring_dir)
+debian = "/etc/nora/deb-keyrings/debian-archive-keyring.pgp"
+debian-security = "/etc/nora/deb-keyrings/debian-archive-keyring.pgp"
+ubuntu = "/etc/nora/deb-keyrings/ubuntu-archive-keyring.gpg"
+ubuntu-ports = "/etc/nora/deb-keyrings/ubuntu-archive-keyring.gpg"
+
 [deb.proxies]
 debian = "https://deb.debian.org/debian"
 debian-security = "https://deb.debian.org/debian-security"
@@ -37,7 +43,14 @@ non-empty `architectures`, or NORA does not start. Without it the proxies stay v
 (upstream indexes and signatures passed through).
 
 Upstream keys: `/usr/share/keyrings/debian-archive-keyring.pgp` of a Debian image and
-`/usr/share/keyrings/ubuntu-archive-keyring.gpg` of an Ubuntu image. Signing key: any
+`/usr/share/keyrings/ubuntu-archive-keyring.gpg` of an Ubuntu image. A repository listed in
+`deb.upstream_keyrings` verifies only with its own keyring (a file or a directory); the
+others share `upstream_keyring_dir`, and NORA warns at startup when more than one
+repository does. Each keyring must load, and each `upstream_keyrings` entry must name a
+`[deb.proxies]` repository, or NORA does not start. A key is used as gpgv would use it: a
+key with a valid revocation self-signature is left out (logged), a subkey signs only with a
+valid binding that carries the sign flag (and its back-signature), and the primary key only
+when its newest self-signature has the sign flag or no key flags at all. Signing key: any
 armored Ed25519 secret key without a passphrase (`gpg --quick-gen-key 'NORA apt' ed25519
 sign never`, then `gpg --export-secret-keys --armor`).
 
@@ -86,8 +99,10 @@ index), and checks its holds again, under the lock of the held-version map, agai
 ledgers written while it ran. Once a suite is published, another index's hold of a file it
 serves is dropped.
 
-1. `dists/<suite>/InRelease` is fetched under `metadata_ttl` and refused unless a key of
-   `upstream_keyring_dir` signed it. Each `<component>/binary-<arch>/Packages` it lists
+1. `dists/<suite>/InRelease` is fetched under `metadata_ttl` and refused unless one of
+   its signatures is unexpired and was made by an unexpired signing key of the
+   repository's keyring, and unless its `Suite` or `Codename` is the requested suite
+   (apt's own rule). A refused refresh keeps the last good build served. Each `<component>/binary-<arch>/Packages` it lists
    (gz, else xz, else plain; `by-hash` when the upstream offers it) is fetched and refused
    on a SHA-256 other than the Release's. An index the Release lists but the mirror does
    not host (Ubuntu's archive and ports list every architecture) is left out.

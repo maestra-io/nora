@@ -1678,18 +1678,40 @@ impl Config {
                 errors.push(e);
             }
         }
-        // maestra: a filtered apt proxy verifies the upstream InRelease with
-        // deb.upstream_keyring_dir and signs its own with the [signing] key.
+        // maestra: a filtered apt proxy verifies the upstream InRelease with its
+        // deb.upstream_keyrings entry (else deb.upstream_keyring_dir) and signs its own
+        // with the [signing] key.
         #[cfg(feature = "deb")]
         if self.deb.enabled
             && !self.deb.proxies.is_empty()
             && self.curation.deb.min_release_age.is_some()
         {
-            if let Err(e) =
-                crate::registry::deb_proxy::check_keyring(&self.deb.upstream_keyring_dir)
-            {
-                errors.push(format!(
-                    "curation.deb.min_release_age filters the [deb.proxies] repositories, which needs the upstream archive keys: {e}"
+            let shared: Vec<&String> = (self.deb.proxies.keys())
+                .filter(|r| !self.deb.upstream_keyrings.contains_key(*r))
+                .collect();
+            let mut keyrings: Vec<&str> = (self.deb.upstream_keyrings.values())
+                .map(String::as_str)
+                .collect();
+            if !shared.is_empty() {
+                keyrings.push(&self.deb.upstream_keyring_dir);
+            }
+            for keyring in keyrings {
+                if let Err(e) = crate::registry::deb_proxy::check_keyring(keyring) {
+                    errors.push(format!(
+                        "curation.deb.min_release_age filters the [deb.proxies] repositories, which needs the upstream archive keys: {e}"
+                    ));
+                }
+            }
+            for repo in self.deb.upstream_keyrings.keys() {
+                if !self.deb.proxies.contains_key(repo) {
+                    errors.push(format!(
+                        "deb.upstream_keyrings.{repo} names no [deb.proxies] repository"
+                    ));
+                }
+            }
+            if shared.len() > 1 {
+                warnings.push(format!(
+                    "deb proxies {shared:?} verify with every key of deb.upstream_keyring_dir: set deb.upstream_keyrings so each repository accepts only its own archive keys"
                 ));
             }
             if !self.signing.enabled

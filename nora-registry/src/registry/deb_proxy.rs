@@ -15,8 +15,9 @@
 //! NORA's storage). An index NORA sees for the first time dates everything it lists as
 //! "before NORA" (0): a hold switched on later never hides a whole distribution.
 //!
-//! The upstream `InRelease` must verify with a key of `deb.upstream_keyring_dir`; each
-//! `Packages` file is fetched as that Release names it and refused on another SHA-256.
+//! The upstream `InRelease` must carry an unexpired signature by an unexpired, unrevoked
+//! signing key of the repository's keyring (`deb.upstream_keyrings`, else
+//! `deb.upstream_keyring_dir`) and name the requested suite; each `Packages` file is fetched as that Release names it and refused on another SHA-256.
 //! On serve, a package keeps its listed versions older than `min_release_age`; when
 //! every listed version is younger, the newest older version the upstream has dropped
 //! and NORA has cached stands in (Debian/Ubuntu suites list one version per package);
@@ -33,7 +34,9 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
-use pgp::composed::{CleartextSignedMessage, Deserializable, SignedPublicKey};
+use pgp::composed::{CleartextSignedMessage, Deserializable, SignedPublicKey, SignedPublicSubKey};
+use pgp::packet::{PublicKey, Signature, SignatureType, SubpacketData};
+use pgp::types::{KeyDetails, Tag, Timestamp};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -64,33 +67,122 @@ pub(crate) fn active(config: &crate::config::Config) -> bool {
 
 type Keyring = Arc<Vec<SignedPublicKey>>;
 
-/// Every public key in the files of `dir` (`*.gpg`, `*.pgp`, `*.asc`; binary keyrings
-/// or armored).
-fn load_keyring(dir: &str) -> Result<Vec<SignedPublicKey>, String> {
-    if dir.is_empty() {
+/// Every usable public key (see `usable_key`) in the keyring file `path`, or in the
+/// files of the directory `path` (`*.gpg`, `*.pgp`, `*.asc`; binary keyrings or armored).
+fn load_keyring(path: &str) -> Result<Vec<SignedPublicKey>, String> {
+    if path.is_empty() {
         return Err("deb.upstream_keyring_dir is not set".into());
     }
-    let mut keys = Vec::new();
-    let entries =
-        std::fs::read_dir(dir).map_err(|e| format!("deb.upstream_keyring_dir {dir}: {e}"))?;
-    let mut paths: Vec<_> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    let meta = std::fs::metadata(path).map_err(|e| format!("deb keyring {path}: {e}"))?;
+    let mut paths = if meta.is_dir() {
+        let entries = std::fs::read_dir(path).map_err(|e| format!("deb keyring {path}: {e}"))?;
+        entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                matches!(ext, "gpg" | "pgp" | "asc")
+            })
+            .collect()
+    } else {
+        vec![std::path::PathBuf::from(path)]
+    };
     paths.sort();
+    let mut keys = Vec::new();
     for path in paths {
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !matches!(ext, "gpg" | "pgp" | "asc") {
-            continue;
-        }
         let data = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let (iter, _) = SignedPublicKey::from_reader_many(std::io::Cursor::new(data))
             .map_err(|e| format!("{}: {e}", path.display()))?;
         for key in iter {
-            keys.push(key.map_err(|e| format!("{}: {e}", path.display()))?);
+            let key = key.map_err(|e| format!("{}: {e}", path.display()))?;
+            let fingerprint = key.fingerprint().to_string();
+            match usable_key(key) {
+                Ok(key) => keys.push(key),
+                Err(why) => tracing::warn!(
+                    file = %path.display(),
+                    fingerprint,
+                    why,
+                    "deb proxy: upstream key left out of the keyring"
+                ),
+            }
         }
     }
     if keys.is_empty() {
-        return Err(format!("deb.upstream_keyring_dir {dir}: no keys"));
+        return Err(format!("deb keyring {path}: no keys"));
     }
     Ok(keys)
+}
+
+/// `key` with only its signing subkeys, as gpgv/apt would use it: refused when a
+/// revocation self-signature verifies, or when neither the primary key nor a subkey
+/// may sign. Expiry depends on the time and is checked in `verify_inrelease`.
+fn usable_key(mut key: SignedPublicKey) -> Result<SignedPublicKey, &'static str> {
+    let primary = key.primary_key.clone();
+    if key
+        .details
+        .revocation_signatures
+        .iter()
+        .any(|s| s.verify_key(&primary).is_ok())
+    {
+        return Err("revoked");
+    }
+    key.public_subkeys
+        .retain(|sub| subkey_binding(&primary, sub).is_some());
+    if key.public_subkeys.is_empty() && !self_signature(&key).is_some_and(may_sign) {
+        return Err("neither the key nor a subkey may sign");
+    }
+    Ok(key)
+}
+
+/// The newest valid self-signature of the primary key (user-id certification or
+/// direct-key signature). Third-party certifications are skipped, never failed on.
+fn self_signature(key: &SignedPublicKey) -> Option<&Signature> {
+    let primary = &key.primary_key;
+    let certs = key.details.users.iter().flat_map(|u| {
+        u.signatures.iter().filter(move |s| {
+            s.typ() != Some(SignatureType::CertRevocation)
+                && s.verify_certification(primary, Tag::UserId, &u.id).is_ok()
+        })
+    });
+    let direct = (key.details.direct_signatures.iter()).filter(|s| s.verify_key(primary).is_ok());
+    certs.chain(direct).max_by_key(|s| s.created())
+}
+
+/// The newest valid binding of a signing subkey (sign flag and a valid back-signature),
+/// or none when a subkey revocation verifies.
+fn subkey_binding<'a>(primary: &PublicKey, sub: &'a SignedPublicSubKey) -> Option<&'a Signature> {
+    let valid: Vec<_> = (sub.signatures.iter())
+        .filter(|s| s.verify_subkey_binding(primary, &sub.key).is_ok())
+        .collect();
+    if valid
+        .iter()
+        .any(|s| s.typ() == Some(SignatureType::SubkeyRevocation))
+    {
+        return None;
+    }
+    valid.into_iter().max_by_key(|s| s.created()).filter(|s| {
+        s.key_flags().sign()
+            && s.embedded_signature()
+                .is_some_and(|b| b.verify_primary_key_binding(&sub.key, primary).is_ok())
+    })
+}
+
+/// Whether a self-signature lets the primary key sign: the sign flag, or (as gpg) no
+/// key-flags subpacket at all.
+fn may_sign(sig: &Signature) -> bool {
+    let flagged = sig.config().is_some_and(|c| {
+        c.hashed_subpackets()
+            .any(|p| matches!(p.data, SubpacketData::KeyFlags(_)))
+    });
+    !flagged || sig.key_flags().sign()
+}
+
+/// Whether `validity` (zero or none: forever) after `created` has passed at `now`. A
+/// signature without a creation time counts as expired.
+fn expired(created: Option<Timestamp>, validity: Option<pgp::types::Duration>, now: u64) -> bool {
+    let Some(created) = created else { return true };
+    validity.is_some_and(|v| {
+        v.as_secs() > 0 && u64::from(created.as_secs()) + u64::from(v.as_secs()) <= now
+    })
 }
 
 fn keyring(dir: &str) -> Result<Keyring, String> {
@@ -111,19 +203,41 @@ pub(crate) fn check_keyring(dir: &str) -> Result<(), String> {
     load_keyring(dir).map(|_| ())
 }
 
-/// The text of a clearsigned `InRelease` that a key of `keys` (primary or subkey)
-/// signed, with LF line ends.
+/// The text of a clearsigned `InRelease`, with LF line ends, when one of its signatures
+/// is unexpired and verifies with a key of `keys` that may sign and is unexpired: the
+/// primary key per its newest self-signature, a subkey per its newest binding.
 fn verify_inrelease(body: &[u8], keys: &[SignedPublicKey]) -> Result<String, String> {
     let text = std::str::from_utf8(body).map_err(|_| "InRelease is not UTF-8".to_string())?;
     let (msg, _) =
         CleartextSignedMessage::from_string(text).map_err(|e| format!("InRelease: {e}"))?;
-    let ok = keys
-        .iter()
-        .any(|k| msg.verify(k).is_ok() || k.public_subkeys.iter().any(|s| msg.verify(s).is_ok()));
+    let signed = msg.signed_text();
+    let now = crate::cache_ttl::now_unix();
+    let data = signed.as_bytes();
+    let ok = msg.signatures().iter().any(|sig| {
+        !expired(sig.created(), sig.signature_expiration_time(), now)
+            && keys.iter().any(|k| {
+                let by_primary = sig.verify(&k.primary_key, data).is_ok()
+                    && self_signature(k).is_some_and(|s| {
+                        let created = Some(k.primary_key.created_at());
+                        may_sign(s) && !expired(created, s.key_expiration_time(), now)
+                    });
+                by_primary
+                    || k.public_subkeys.iter().any(|sub| {
+                        sig.verify(&sub.key, data).is_ok()
+                            && subkey_binding(&k.primary_key, sub).is_some_and(|b| {
+                                let created = Some(sub.key.created_at());
+                                !expired(created, b.key_expiration_time(), now)
+                            })
+                    })
+            })
+    });
     if !ok {
-        return Err("InRelease signature does not verify with deb.upstream_keyring_dir".into());
+        return Err(
+            "InRelease has no unexpired signature by an unexpired signing key of the keyring"
+                .into(),
+        );
     }
-    Ok(msg.signed_text().replace("\r\n", "\n"))
+    Ok(signed.replace("\r\n", "\n"))
 }
 
 // ── Release / Packages ────────────────────────────────────────────────────────
@@ -668,7 +782,7 @@ async fn build_suite(
         .signer
         .clone()
         .ok_or_else(|| BuildError::Internal("no [signing] key".into()))?;
-    let keys = keyring(&state.config.deb.upstream_keyring_dir).map_err(BuildError::Internal)?;
+    let keys = keyring(state.config.deb.keyring_for(repo)).map_err(BuildError::Internal)?;
     let body = fetch(
         state,
         up,
@@ -693,6 +807,14 @@ async fn build_suite(
         .map_err(|e| BuildError::Internal(e.to_string()))?
         .map_err(BuildError::Refused)?;
     let rel = parse_release(&text);
+    // apt's own rule: a signed Release of another suite is not this suite.
+    if rel.field("Suite") != Some(suite) && rel.field("Codename") != Some(suite) {
+        return Err(BuildError::Refused(format!(
+            "{suite}: the upstream Release is for Suite {:?} / Codename {:?}",
+            rel.field("Suite"),
+            rel.field("Codename")
+        )));
+    }
     let by_hash = rel
         .field("Acquire-By-Hash")
         .is_some_and(|v| v.eq_ignore_ascii_case("yes"));
@@ -1443,6 +1565,19 @@ mod integration_tests {
         comps: &[(&str, &[(&str, &str)])],
         delay: std::time::Duration,
     ) {
+        let names = format!("Suite: {suite}\nCodename: bookworm\n");
+        mount_release(server, key, suite, &names, comps, delay).await;
+    }
+
+    /// `mount_suite_comps` whose Release carries the `Suite`/`Codename` lines `names`.
+    async fn mount_release(
+        server: &MockServer,
+        key: &SignedSecretKey,
+        suite: &str,
+        names: &str,
+        comps: &[(&str, &[(&str, &str)])],
+        delay: std::time::Duration,
+    ) {
         let mut sums = String::new();
         let mut files = Vec::new();
         for (comp, stanzas) in comps {
@@ -1459,10 +1594,10 @@ mod integration_tests {
                 packages,
             ));
         }
-        let names: Vec<&str> = comps.iter().map(|(c, _)| *c).collect();
+        let comp_names: Vec<&str> = comps.iter().map(|(c, _)| *c).collect();
         let release = format!(
-            "Origin: Test\nSuite: stable\nCodename: bookworm\nDate: Tue, 03 Nov 2026 00:00:00 UTC\nArchitectures: amd64 i386\nComponents: {}\nSigned-By: ABCDEF\nSHA256:\n{sums}",
-            names.join(" "),
+            "Origin: Test\n{names}Date: Tue, 03 Nov 2026 00:00:00 UTC\nArchitectures: amd64 i386\nComponents: {}\nSigned-By: ABCDEF\nSHA256:\n{sums}",
+            comp_names.join(" "),
         );
         let signed =
             CleartextSignedMessage::sign(rand::thread_rng(), &release, &**key, &Password::empty())
@@ -1934,5 +2069,448 @@ mod integration_tests {
         crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
         let (_, pkgs) = served(&ctx).await;
         assert_eq!(pkgs, [("a".into(), "2".into())]);
+    }
+
+    // ── Upstream key policy (audit A050) and repository/suite binding (audit A051) ──
+
+    /// `text` clearsigned by `key`, created at `created`, with extra hashed subpackets.
+    fn sign_at(
+        text: &str,
+        key: &impl pgp::types::SigningKey,
+        created: pgp::types::Timestamp,
+        extra: Vec<pgp::packet::Subpacket>,
+    ) -> CleartextSignedMessage {
+        use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
+        let mut config =
+            SignatureConfig::from_key(rand::thread_rng(), key, SignatureType::Text).unwrap();
+        config.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(created)).unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(key.fingerprint())).unwrap(),
+        ];
+        config.hashed_subpackets.extend(extra);
+        CleartextSignedMessage::new(text, config, key, &Password::empty()).unwrap()
+    }
+
+    fn armored(msg: &CleartextSignedMessage) -> String {
+        msg.to_armored_string(ArmorOptions::default()).unwrap()
+    }
+
+    /// A keyring directory holding `keys`, one file each.
+    fn keyring_dir(keys: &[&SignedPublicKey]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (i, k) in keys.iter().enumerate() {
+            let text = k.to_armored_string(ArmorOptions::default()).unwrap();
+            std::fs::write(dir.path().join(format!("{i}.asc")), text).unwrap();
+        }
+        dir
+    }
+
+    fn load(dir: &tempfile::TempDir) -> Result<Vec<SignedPublicKey>, String> {
+        super::load_keyring(dir.path().to_str().unwrap())
+    }
+
+    /// The public half of `key` with a key revocation self-signature.
+    fn revoked(key: &SignedSecretKey) -> SignedPublicKey {
+        use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
+        use pgp::types::{KeyDetails, Timestamp};
+        let mut public = key.to_public_key();
+        let mut cfg =
+            SignatureConfig::from_key(rand::thread_rng(), &**key, SignatureType::KeyRevocation)
+                .unwrap();
+        cfg.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::now())).unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(key.fingerprint())).unwrap(),
+        ];
+        let rev = cfg
+            .sign_key(&**key, &Password::empty(), key.primary_key.public_key())
+            .unwrap();
+        public.details.revocation_signatures.push(rev);
+        public
+    }
+
+    /// A signing key created two years ago whose only self-certification grants one day,
+    /// and its public half.
+    fn expired_key() -> (SignedSecretKey, SignedPublicKey) {
+        use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
+        use pgp::types::{Duration, KeyDetails, Tag, Timestamp};
+        let born = Timestamp::from_secs(Timestamp::now().as_secs() - 730 * 86_400);
+        let key = SecretKeyParamsBuilder::default()
+            .key_type(KeyType::Ed25519Legacy)
+            .can_sign(true)
+            .created_at(born)
+            .primary_user_id("Expired Archive".into())
+            .build()
+            .unwrap()
+            .generate(rand::thread_rng())
+            .unwrap();
+        let mut public = key.to_public_key();
+        let uid = public.details.users[0].id.clone();
+        let mut cfg =
+            SignatureConfig::from_key(rand::thread_rng(), &*key, SignatureType::CertPositive)
+                .unwrap();
+        cfg.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(born)).unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(key.fingerprint())).unwrap(),
+            Subpacket::regular(SubpacketData::KeyExpirationTime(Duration::from_secs(
+                86_400,
+            )))
+            .unwrap(),
+        ];
+        let cert = cfg
+            .sign_certification(
+                &*key,
+                key.primary_key.public_key(),
+                &Password::empty(),
+                Tag::UserId,
+                &uid,
+            )
+            .unwrap();
+        public.details.users[0].signatures = vec![cert];
+        (key, public)
+    }
+
+    #[test]
+    fn only_an_unexpired_signature_by_a_valid_signing_key_verifies() {
+        use pgp::composed::SubkeyParamsBuilder;
+        use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
+        use pgp::types::{Duration, Tag, Timestamp};
+        let text = "Origin: Test\nSuite: stable\n";
+        let now = Timestamp::now();
+        let verify = |msg: &CleartextSignedMessage, keys: &[SignedPublicKey]| {
+            super::verify_inrelease(armored(msg).as_bytes(), keys)
+        };
+
+        let (key, keydir) = upstream_key();
+        let keys = load(&keydir).unwrap();
+        let good = sign_at(text, &*key, now, vec![]);
+        assert_eq!(verify(&good, &keys).unwrap(), text, "control");
+
+        // An expired signature, alone and beside a valid one.
+        let ten_days_ago = Timestamp::from_secs(now.as_secs() - 10 * 86_400);
+        let one_day = Subpacket::regular(SubpacketData::SignatureExpirationTime(
+            Duration::from_secs(86_400),
+        ))
+        .unwrap();
+        let stale = sign_at(text, &*key, ten_days_ago, vec![one_day]);
+        assert!(verify(&stale, &keys).is_err(), "expired signature");
+
+        // Several signatures: one unexpired signature by a valid key is enough.
+        let (expired, expired_pub) = expired_key();
+        let by_expired = sign_at(text, &*expired, now, vec![]);
+        let both = CleartextSignedMessage::new_many(text, |_| {
+            Ok(vec![
+                by_expired.signatures()[0].clone(),
+                good.signatures()[0].clone(),
+            ])
+        })
+        .unwrap();
+        let mut with_expired = keys.clone();
+        with_expired.extend(load(&keyring_dir(&[&expired_pub])).unwrap());
+        assert!(verify(&both, &with_expired).is_ok(), "one valid signer");
+
+        // A key past its expiry.
+        assert!(verify(&by_expired, &with_expired).is_err(), "expired key");
+
+        // A revoked key is left out of the keyring; alone it leaves no key.
+        let (rkey, _) = upstream_key();
+        let rdir = keyring_dir(&[&revoked(&rkey), &key.to_public_key()]);
+        let rkeys = load(&rdir).unwrap();
+        assert_eq!(rkeys.len(), 1);
+        assert!(
+            verify(&sign_at(text, &*rkey, now, vec![]), &rkeys).is_err(),
+            "revoked key"
+        );
+        let err = load(&keyring_dir(&[&revoked(&rkey)])).unwrap_err();
+        assert!(err.ends_with("no keys"), "{err}");
+
+        // A subkey whose only flag is authentication does not sign for the key.
+        let with_sub = SecretKeyParamsBuilder::default()
+            .key_type(KeyType::Ed25519Legacy)
+            .can_sign(true)
+            .primary_user_id("Sub Archive".into())
+            .subkey(
+                SubkeyParamsBuilder::default()
+                    .key_type(KeyType::Ed25519Legacy)
+                    .can_authenticate(true)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap()
+            .generate(rand::thread_rng())
+            .unwrap();
+        let skeys = load(&keyring_dir(&[&with_sub.to_public_key()])).unwrap();
+        assert!(skeys[0].public_subkeys.is_empty());
+        let by_sub = sign_at(text, &with_sub.secret_subkeys[0].key, now, vec![]);
+        assert!(
+            verify(&by_sub, &skeys).is_err(),
+            "authentication-only subkey"
+        );
+
+        // A third-party certification of the user id does not drop the key.
+        let (other, _) = upstream_key();
+        let mut certified = key.to_public_key();
+        let uid = certified.details.users[0].id.clone();
+        let cert =
+            SignatureConfig::from_key(rand::thread_rng(), &*other, SignatureType::CertGeneric)
+                .unwrap()
+                .sign_certification_third_party(
+                    &*other,
+                    &Password::empty(),
+                    &certified.primary_key,
+                    Tag::UserId,
+                    &uid,
+                )
+                .unwrap();
+        certified.details.users[0].signatures.push(cert);
+        assert!(
+            certified.verify_bindings().is_err(),
+            "a whole-key check would drop it"
+        );
+        let ckeys = load(&keyring_dir(&[&certified])).unwrap();
+        assert!(verify(&good, &ckeys).is_ok(), "third-party certification");
+    }
+
+    #[test]
+    fn a_signing_subkey_verifies_and_a_flagless_primary_signs() {
+        use pgp::composed::SubkeyParamsBuilder;
+        use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
+        use pgp::types::{KeyDetails, Tag, Timestamp};
+        let text = "Origin: Test\nSuite: stable\n";
+        let key = SecretKeyParamsBuilder::default()
+            .key_type(KeyType::Ed25519Legacy)
+            .can_sign(false)
+            .can_certify(true)
+            .primary_user_id("Archive".into())
+            .subkey(
+                SubkeyParamsBuilder::default()
+                    .key_type(KeyType::Ed25519Legacy)
+                    .can_sign(true)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap()
+            .generate(rand::thread_rng())
+            .unwrap();
+        let keys = load(&keyring_dir(&[&key.to_public_key()])).unwrap();
+        let by_sub = sign_at(text, &key.secret_subkeys[0].key, Timestamp::now(), vec![]);
+        assert!(super::verify_inrelease(armored(&by_sub).as_bytes(), &keys).is_ok());
+        let by_primary = sign_at(text, &*key, Timestamp::now(), vec![]);
+        assert!(
+            super::verify_inrelease(armored(&by_primary).as_bytes(), &keys).is_err(),
+            "certify-only primary"
+        );
+        // Without its signing subkey nothing of the key may sign: no key is left.
+        let mut bare = key.to_public_key();
+        bare.public_subkeys.clear();
+        let err = load(&keyring_dir(&[&bare])).unwrap_err();
+        assert!(err.ends_with("no keys"), "{err}");
+
+        // The same primary with a self-certification that carries no key flags signs.
+        let mut flagless = key.to_public_key();
+        flagless.public_subkeys.clear();
+        let uid = flagless.details.users[0].id.clone();
+        let mut cfg =
+            SignatureConfig::from_key(rand::thread_rng(), &*key, SignatureType::CertPositive)
+                .unwrap();
+        cfg.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::now())).unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(key.fingerprint())).unwrap(),
+        ];
+        let cert = cfg
+            .sign_certification(
+                &*key,
+                key.primary_key.public_key(),
+                &Password::empty(),
+                Tag::UserId,
+                &uid,
+            )
+            .unwrap();
+        flagless.details.users[0].signatures = vec![cert];
+        let keys = load(&keyring_dir(&[&flagless])).unwrap();
+        assert!(super::verify_inrelease(armored(&by_primary).as_bytes(), &keys).is_ok());
+    }
+
+    /// A filtered proxy context: `repos` (name, upstream), the shared keyring directory
+    /// `dir` and the per-repository `keyrings`.
+    fn keyring_ctx(
+        repos: &[(&str, String)],
+        dir: &str,
+        keyrings: &[(&str, String)],
+    ) -> TestContext {
+        let (repos, dir, keyrings) = (repos.to_vec(), dir.to_string(), keyrings.to_vec());
+        let repos: Vec<(String, String)> =
+            repos.into_iter().map(|(r, u)| (r.to_string(), u)).collect();
+        let keyrings: Vec<(String, String)> = keyrings
+            .into_iter()
+            .map(|(r, k)| (r.to_string(), k))
+            .collect();
+        create_test_context_with_config(move |cfg| {
+            cfg.deb.enabled = true;
+            cfg.deb.metadata_ttl = 0;
+            cfg.deb.upstream_keyring_dir = dir;
+            for (repo, uri) in repos {
+                cfg.deb.proxies.insert(repo, RepoProxyEntry::Simple(uri));
+            }
+            cfg.deb.upstream_keyrings.extend(keyrings);
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.deb.min_release_age = Some("0d".into());
+        })
+    }
+
+    async fn status(ctx: &TestContext, uri: &str) -> StatusCode {
+        send(&ctx.app, Method::GET, uri, "").await.status()
+    }
+
+    #[tokio::test]
+    async fn an_inrelease_signed_only_by_a_revoked_key_is_refused() {
+        let (key, keydir) = upstream_key();
+        let (rkey, _) = upstream_key();
+        std::fs::write(
+            keydir.path().join("revoked.asc"),
+            revoked(&rkey)
+                .to_armored_string(ArmorOptions::default())
+                .unwrap(),
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        publish(&server, &rkey, &[("openssl", "9.9")]).await;
+        let dir = keydir.path().to_str().unwrap();
+        let ctx = keyring_ctx(&[("debian", server.uri())], dir, &[]);
+        let uri = "/deb/debian/dists/bookworm/InRelease";
+        assert_eq!(status(&ctx, uri).await, StatusCode::BAD_GATEWAY);
+        publish(&server, &key, &[("openssl", "9.8")]).await;
+        assert_eq!(status(&ctx, uri).await, StatusCode::OK, "control");
+    }
+
+    #[tokio::test]
+    async fn a_release_of_another_suite_is_refused() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        let z = std::time::Duration::ZERO;
+        let old: &[(&str, &[(&str, &str)])] = &[("main", &[("openssl", "1.1.1n")])];
+        let other = "Suite: oldoldstable\nCodename: buster\n";
+        mount_release(&server, &key, "bookworm", other, old, z).await;
+        let ctx = keyring_ctx(
+            &[("debian", server.uri())],
+            keydir.path().to_str().unwrap(),
+            &[],
+        );
+        let uri = "/deb/debian/dists/bookworm/InRelease";
+        assert_eq!(
+            status(&ctx, uri).await,
+            StatusCode::BAD_GATEWAY,
+            "first build"
+        );
+
+        // Matched by Suite or by Codename.
+        publish(&server, &key, &[("openssl", "3.0")]).await;
+        assert_eq!(served(&ctx).await.1, [("openssl".into(), "3.0".into())]);
+        server.reset().await;
+        let by_suite: &[(&str, &[(&str, &str)])] = &[("main", &[("openssl", "3.1")])];
+        let names = "Suite: bookworm\nCodename: other\n";
+        mount_release(&server, &key, "bookworm", names, by_suite, z).await;
+        assert_eq!(served(&ctx).await.1, [("openssl".into(), "3.1".into())]);
+
+        // A replayed Release of another suite: the last good build stays served.
+        server.reset().await;
+        mount_release(&server, &key, "bookworm", other, old, z).await;
+        assert_eq!(served(&ctx).await.1, [("openssl".into(), "3.1".into())]);
+    }
+
+    #[tokio::test]
+    async fn a_repository_verifies_only_with_its_own_keyring() {
+        let (debian_key, _) = upstream_key();
+        let (vendor_key, _) = upstream_key();
+        let files = tempfile::tempdir().unwrap();
+        let file = |name: &str, key: &SignedSecretKey| {
+            let at = files.path().join(name);
+            let text = key
+                .to_public_key()
+                .to_armored_string(ArmorOptions::default())
+                .unwrap();
+            std::fs::write(&at, text).unwrap();
+            at.to_str().unwrap().to_string()
+        };
+        let (debian_ring, vendor_ring) = (
+            file("debian.asc", &debian_key),
+            file("vendor.pgp", &vendor_key),
+        );
+        let (debian_up, vendor_up) = (MockServer::start().await, MockServer::start().await);
+        publish(&debian_up, &vendor_key, &[("openssl", "9.9")]).await;
+        publish(&vendor_up, &vendor_key, &[("tool", "1")]).await;
+        let ctx = keyring_ctx(
+            &[("debian", debian_up.uri()), ("vendor", vendor_up.uri())],
+            "",
+            &[("debian", debian_ring), ("vendor", vendor_ring)],
+        );
+        let at = |repo: &str| format!("/deb/{repo}/dists/bookworm/InRelease");
+        assert_eq!(
+            status(&ctx, &at("debian")).await,
+            StatusCode::BAD_GATEWAY,
+            "vendor's key"
+        );
+        assert_eq!(status(&ctx, &at("vendor")).await, StatusCode::OK);
+        publish(&debian_up, &debian_key, &[("openssl", "3.0")]).await;
+        assert_eq!(status(&ctx, &at("debian")).await, StatusCode::OK, "own key");
+    }
+
+    #[test]
+    fn upstream_keyrings_must_load_and_name_a_proxy() {
+        let (_, keydir) = upstream_key();
+        let dir = keydir.path().to_str().unwrap().to_string();
+        let base = || {
+            let mut cfg = crate::config::Config::default();
+            cfg.deb.enabled = true;
+            cfg.curation.deb.min_release_age = Some("0d".into());
+            for repo in ["debian", "ubuntu"] {
+                let entry = RepoProxyEntry::Simple("https://deb.example".into());
+                cfg.deb.proxies.insert(repo.into(), entry);
+            }
+            cfg
+        };
+        let keyring_errors = |cfg: &crate::config::Config| {
+            let (warnings, errors) = cfg.validate_with_config_path(None);
+            let errors: Vec<String> = errors
+                .into_iter()
+                .filter(|e| e.contains("keyring") || e.contains("upstream_keyrings"))
+                .collect();
+            (warnings, errors)
+        };
+
+        let mut shared = base();
+        shared.deb.upstream_keyring_dir = dir.clone();
+        let (warnings, errors) = keyring_errors(&shared);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("deb.upstream_keyrings")),
+            "{warnings:?}"
+        );
+
+        // Every proxy on its own keyring: the shared directory is not needed.
+        let mut own = base();
+        for repo in ["debian", "ubuntu"] {
+            own.deb.upstream_keyrings.insert(repo.into(), dir.clone());
+        }
+        let (warnings, errors) = keyring_errors(&own);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            !warnings.iter().any(|w| w.contains("deb.upstream_keyrings")),
+            "{warnings:?}"
+        );
+
+        own.deb
+            .upstream_keyrings
+            .insert("vendor".into(), dir.clone());
+        own.deb
+            .upstream_keyrings
+            .insert("ubuntu".into(), format!("{dir}/missing.gpg"));
+        let (_, errors) = keyring_errors(&own);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("deb.upstream_keyrings.vendor")));
+        assert!(errors.iter().any(|e| e.contains("missing.gpg")));
     }
 }
