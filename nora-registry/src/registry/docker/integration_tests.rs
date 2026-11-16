@@ -29,6 +29,7 @@ async fn test_docker_namespace_scope_enforced() {
         Method::POST,
         Path("other/app/blobs/uploads/".to_string()),
         Extension(scoped.clone()),
+        None,
         "/v2/other/app/blobs/uploads/".parse::<Uri>().unwrap(),
         axum::http::HeaderMap::new(),
         Body::empty(),
@@ -42,6 +43,7 @@ async fn test_docker_namespace_scope_enforced() {
         Method::POST,
         Path("myorg/app/blobs/uploads/".to_string()),
         Extension(scoped.clone()),
+        None,
         "/v2/myorg/app/blobs/uploads/".parse::<Uri>().unwrap(),
         axum::http::HeaderMap::new(),
         Body::empty(),
@@ -55,6 +57,7 @@ async fn test_docker_namespace_scope_enforced() {
         Method::GET,
         Path("other/app/manifests/latest".to_string()),
         Extension(scoped.clone()),
+        None,
         "/v2/other/app/manifests/latest".parse::<Uri>().unwrap(),
         axum::http::HeaderMap::new(),
         Body::empty(),
@@ -587,7 +590,9 @@ async fn a_bound_namespace_is_fetched_whole_and_cached_under_its_owner() {
 }
 
 /// #1188: an image pushed to NORA under a name a private registry owns stays NORA's: it is
-/// served from local storage and the owner is not asked.
+/// served from local storage and the owner is not asked. The push needs the name in
+/// `curation.internal_namespaces` (A011); an image left from before keeps being served once
+/// the name is no longer listed, while a new push to it is refused.
 #[tokio::test]
 async fn a_hosted_image_under_a_bound_namespace_is_served_locally() {
     use crate::config::DockerUpstream;
@@ -611,6 +616,7 @@ async fn a_hosted_image_under_a_bound_namespace_is_served_locally() {
             trust_upstream_dates: false,
             date_token_file: None,
         }];
+        cfg.curation.internal_namespaces = vec!["team-a/*".to_string()];
     });
     let manifest = serde_json::to_vec(&serde_json::json!({
         "schemaVersion": 2,
@@ -632,6 +638,17 @@ async fn a_hosted_image_under_a_bound_namespace_is_served_locally() {
     )
     .await;
     assert_eq!(put.status(), StatusCode::CREATED);
+    // Off the list, the name is the owner's pull-through again: reads below are not skipped
+    // past the owner by the internal-namespace rule, and a push is refused.
+    crate::test_helpers::reload_curation(&ctx, |cfg| cfg.curation.internal_namespaces.clear());
+    let put = send(
+        &ctx.app,
+        Method::PUT,
+        "/v2/team-a/hosted/manifests/v2",
+        Body::from(manifest.clone()),
+    )
+    .await;
+    assert_eq!(put.status(), StatusCode::FORBIDDEN);
 
     for m in [Method::GET, Method::HEAD] {
         let resp = send(
@@ -2452,6 +2469,7 @@ async fn row5_a_delete_that_cannot_read_the_push_record_removes_nothing() {
                 Method::DELETE,
                 Path("corp/app/manifests/1.0".to_string()),
                 Extension(crate::auth::NamespaceAuthority::Unrestricted),
+                None,
                 "/v2/corp/app/manifests/1.0".parse::<Uri>().unwrap(),
                 axum::http::HeaderMap::new(),
                 Body::empty(),
@@ -2515,6 +2533,7 @@ async fn row5_a_delete_by_digest_that_cannot_read_a_tag_removes_nothing() {
                 Method::DELETE,
                 Path(path.clone()),
                 Extension(crate::auth::NamespaceAuthority::Unrestricted),
+                None,
                 format!("/v2/{path}").parse::<Uri>().unwrap(),
                 axum::http::HeaderMap::new(),
                 Body::empty(),
@@ -4100,6 +4119,192 @@ async fn test_docker_mount_invalid_source_repo_falls_back_to_upload() {
         "an invalid source repository must degrade to an upload session, not 4xx"
     );
     assert!(resp.headers().contains_key("docker-upload-uuid"));
+}
+
+/// A056: a mount reads its source as a GET does. A blob curation refuses to serve from the
+/// source name is not copied out of it: the mount degrades to an upload session (202) and the
+/// destination holds nothing.
+#[tokio::test]
+async fn mount_from_curation_refused_source_falls_back_to_upload() {
+    let (_dir, blocklist) = crate::test_helpers::blocklist_file("docker", "evil/img");
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.curation.mode = crate::config::CurationMode::Enforce;
+        cfg.curation.blocklist_path = Some(blocklist);
+    });
+    let blob = b"layer of a blocklisted image";
+    let d = format!("sha256:{}", hex::encode(sha2::Sha256::digest(blob)));
+    for src in ["evil/img", "good/img"] {
+        ctx.state
+            .storage
+            .put(&format!("docker/{src}/blobs/{d}"), blob)
+            .await
+            .unwrap();
+    }
+    let get = |uri: String| {
+        let app = ctx.app.clone();
+        async move { send(&app, Method::GET, &uri, Body::empty()).await }
+    };
+    assert_eq!(
+        get(format!("/v2/evil/img/blobs/{d}")).await.status(),
+        StatusCode::FORBIDDEN,
+        "premise: curation refuses the source blob on GET"
+    );
+
+    let mount = format!("/v2/mine/app/blobs/uploads/?mount={d}&from=evil/img");
+    let resp = send(&ctx.app, Method::POST, &mount, Body::empty()).await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert!(resp.headers().contains_key("docker-upload-uuid"));
+    let dst = format!("docker/mine/app/blobs/{d}");
+    assert!(ctx.state.storage.stat(&dst).await.is_none());
+    assert_eq!(
+        get(format!("/v2/mine/app/blobs/{d}")).await.status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // The same bytes under a name curation serves still mount.
+    let mount = format!("/v2/mine/app/blobs/uploads/?mount={d}&from=good/img");
+    let resp = send(&ctx.app, Method::POST, &mount, Body::empty()).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+/// A056: an allowlist that does not list the source refuses its GET, so a mount from it into
+/// an internal-namespace destination (whose own reads skip curation) copies nothing either.
+#[tokio::test]
+async fn mount_from_a_source_off_the_allowlist_copies_nothing() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let allowlist = dir.path().join("allowlist.json");
+    std::fs::write(
+        &allowlist,
+        r#"{"version": 1, "entries": [{"registry": "docker", "name": "ok/img", "version": "1.0"}]}"#,
+    )
+    .unwrap();
+    let allowlist = allowlist.to_string_lossy().into_owned();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.curation.mode = crate::config::CurationMode::Enforce;
+        cfg.curation.allowlist_path = Some(allowlist);
+        cfg.curation.internal_namespaces = vec!["corp.*".to_string()];
+    });
+    let blob = b"layer of an image not on the allowlist";
+    let d = format!("sha256:{}", hex::encode(sha2::Sha256::digest(blob)));
+    ctx.state
+        .storage
+        .put(&format!("docker/other/img/blobs/{d}"), blob)
+        .await
+        .unwrap();
+
+    let mount = format!("/v2/corp.app/blobs/uploads/?mount={d}&from=other/img");
+    let resp = send(&ctx.app, Method::POST, &mount, Body::empty()).await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let dst = format!("docker/corp.app/blobs/{d}");
+    assert!(ctx.state.storage.stat(&dst).await.is_none());
+}
+
+/// A052: every docker write is audited under the principal that made it — blob push, mount,
+/// manifest push, manifest delete and blob delete — so the log says which credential replaced
+/// a tag.
+#[tokio::test]
+async fn docker_writes_are_audited_under_their_principal() {
+    use crate::test_helpers::send_with_headers;
+    let ctx = crate::test_helpers::create_test_context_with_auth_and_config(
+        &[("carol", "pw"), ("dave", "pw")],
+        |cfg| cfg.audit.mode = crate::audit::AuditMode::File,
+    );
+    // base64("carol:pw"), base64("dave:pw")
+    let carol = || vec![("authorization", "Basic Y2Fyb2w6cHc=")];
+    let dave = || vec![("authorization", "Basic ZGF2ZTpwdw==")];
+
+    let config = br#"{"architecture":"amd64","os":"linux"}"#;
+    let cfg = format!("sha256:{}", hex::encode(sha2::Sha256::digest(config)));
+    let manifest = |label: &str| {
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "size": config.len(),
+                "digest": cfg
+            },
+            "layers": [],
+            "annotations": { "label": label }
+        }))
+        .unwrap()
+    };
+    let ct = ("content-type", "application/vnd.oci.image.manifest.v1+json");
+    let step =
+        |method: Method, uri: String, who: Vec<(&'static str, &'static str)>, body: Vec<u8>| {
+            let app = ctx.app.clone();
+            async move {
+                let mut headers = who;
+                headers.push(ct);
+                send_with_headers(&app, method, &uri, headers, body)
+                    .await
+                    .status()
+            }
+        };
+
+    let push_blob = format!("/v2/team/app/blobs/uploads/?digest={cfg}");
+    assert_eq!(
+        step(Method::POST, push_blob, carol(), config.to_vec()).await,
+        StatusCode::CREATED
+    );
+    let mount = format!("/v2/other/app/blobs/uploads/?mount={cfg}&from=team/app");
+    assert_eq!(
+        step(Method::POST, mount, carol(), Vec::new()).await,
+        StatusCode::CREATED
+    );
+    let tag = "/v2/team/app/manifests/v1".to_string();
+    assert_eq!(
+        step(Method::PUT, tag.clone(), carol(), manifest("carol")).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        step(Method::PUT, tag.clone(), dave(), manifest("dave")).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        step(Method::DELETE, tag, dave(), Vec::new()).await,
+        StatusCode::ACCEPTED
+    );
+    let stray = format!("sha256:{}", "c".repeat(64));
+    ctx.state
+        .storage
+        .put(&format!("docker/team/app/blobs/{stray}"), b"stray")
+        .await
+        .unwrap();
+    let delete_blob = format!("/v2/team/app/blobs/{stray}");
+    assert_eq!(
+        step(Method::DELETE, delete_blob, dave(), Vec::new()).await,
+        StatusCode::ACCEPTED
+    );
+
+    let path = ctx.state.audit.path().clone();
+    ctx.state.audit.shutdown().await;
+    let written: Vec<(String, String, String)> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|e| e["registry"] == "docker")
+        .map(|e| {
+            let field = |k: &str| e[k].as_str().unwrap_or_default().to_string();
+            (field("action"), field("actor"), field("detail"))
+        })
+        .collect();
+    let actors: Vec<(&str, &str, &str)> = written
+        .iter()
+        .map(|(a, who, what)| (a.as_str(), who.as_str(), what.as_str()))
+        .collect();
+    assert_eq!(
+        actors,
+        [
+            ("push", "carol", "blob"),
+            ("mount", "carol", "blob"),
+            ("push", "carol", "manifest"),
+            ("push", "dave", "manifest"),
+            ("delete", "dave", "manifest"),
+            ("delete", "dave", "blob"),
+        ],
+        "{written:?}"
+    );
 }
 
 #[tokio::test]
@@ -7275,6 +7480,7 @@ async fn get_manifest_via_dispatch(
         Method::GET,
         Path(path.to_string()),
         Extension(crate::auth::NamespaceAuthority::Unrestricted),
+        None,
         format!("/v2/{path}").parse::<Uri>().unwrap(),
         axum::http::HeaderMap::new(),
         Body::empty(),

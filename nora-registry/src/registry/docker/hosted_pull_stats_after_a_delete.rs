@@ -47,6 +47,7 @@ async fn push_v1(state: &crate::AppState) {
         State(state.clone()),
         Path(("race-img".to_string(), "v1".to_string())),
         body,
+        "test",
     )
     .await;
     assert_eq!(r.status(), StatusCode::CREATED);
@@ -62,6 +63,7 @@ async fn a_pull_stats_task_after_the_delete_leaves_no_metadata() {
     let del = super::delete_manifest(
         State(state.clone()),
         Path(("race-img".to_string(), "v1".to_string())),
+        "test",
     )
     .await;
     assert_eq!(del.status(), StatusCode::ACCEPTED);

@@ -3,7 +3,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
+use crate::auth::{enforce_namespace_scope, AuthenticatedUser, NamespaceAuthority};
 use crate::circuit_breaker::{upstream_key, CircuitBreakerRegistry, ProbeToken};
 use crate::config::basic_auth_header;
 use crate::proxy_coalesce::Flight;
@@ -1269,15 +1269,20 @@ pub fn routes() -> Router<AppState> {
 /// Unified dispatcher for all Docker v2 image endpoints.
 /// Parses the image name (arbitrary depth) and operation from the wildcard path,
 /// then delegates to the appropriate handler with correct method routing.
+// Each argument is an axum extractor of the request.
+#[allow(clippy::too_many_arguments)]
 async fn docker_v2_dispatch(
     state: State<AppState>,
     method: Method,
     Path(wildcard): Path<String>,
     Extension(authority): Extension<NamespaceAuthority>,
+    user: Option<Extension<AuthenticatedUser>>,
     uri: Uri,
     headers: axum::http::HeaderMap,
     body: Body,
 ) -> Response {
+    // The principal every write is audited under (A052).
+    let actor = crate::auth::audit_actor(&user);
     let rest = wildcard.trim_start_matches('/');
     if rest.is_empty() {
         return StatusCode::NOT_FOUND.into_response();
@@ -1335,12 +1340,13 @@ async fn docker_v2_dispatch(
                             &headers,
                             true,
                             body,
+                            actor,
                         )
                         .await
                     } else if let (Some(digest), Some(from)) =
                         (params.get("mount"), params.get("from"))
                     {
-                        mount_blob(state, name, from, digest).await
+                        mount_blob(state, &headers, name, from, digest, actor).await
                     } else {
                         start_upload(state, Path(name.to_string())).await
                     }
@@ -1368,6 +1374,7 @@ async fn docker_v2_dispatch(
                         &headers,
                         false,
                         body,
+                        actor,
                     )
                     .await
                 }
@@ -1405,7 +1412,7 @@ async fn docker_v2_dispatch(
                 download_blob(state, headers, Path((name.to_string(), digest.to_string()))).await
             }
             Method::DELETE => {
-                delete_blob(state, Path((name.to_string(), digest.to_string()))).await
+                delete_blob(state, Path((name.to_string(), digest.to_string())), actor).await
             }
             _ => method_not_allowed("GET, HEAD, DELETE"),
         };
@@ -1444,14 +1451,24 @@ async fn docker_v2_dispatch(
                 Ok(b) => match manifest_media_type_mismatch(&headers, &b) {
                     Some(reason) => manifest_invalid_response(reason),
                     None => {
-                        put_manifest(state, Path((name.to_string(), reference.to_string())), b)
-                            .await
+                        put_manifest(
+                            state,
+                            Path((name.to_string(), reference.to_string())),
+                            b,
+                            actor,
+                        )
+                        .await
                     }
                 },
                 Err(_) => (StatusCode::PAYLOAD_TOO_LARGE, "Manifest too large").into_response(),
             },
             Method::DELETE => {
-                delete_manifest(state, Path((name.to_string(), reference.to_string()))).await
+                delete_manifest(
+                    state,
+                    Path((name.to_string(), reference.to_string())),
+                    actor,
+                )
+                .await
             }
             _ => method_not_allowed("GET, HEAD, PUT, DELETE"),
         };
@@ -1490,7 +1507,10 @@ async fn docker_v2_dispatch(
 ///   proxy cache (`docker/<namespace>/…`), which a push would overwrite;
 /// - a name behind a registry host no upstream serves is refused: routing drops the host, so
 ///   `ghcr.io/team/app` would land in `team/app`, where a pull without the host finds it
-///   (R4-R11).
+///   (R4-R11);
+/// - a name a prefix, `namespaces` or a served registry host routes is refused (403 DENIED)
+///   unless `curation.internal_namespaces` lists it: it is the upstream's pull-through, so a
+///   write would replace what every puller gets for the upstream's name (A011).
 ///
 /// `None` lets the write through.
 fn write_gate(
@@ -1526,7 +1546,34 @@ fn write_gate(
             .strip_prefix(u.resolved_namespace().as_str())
             .is_some_and(|rest| rest.starts_with('/'))
     });
-    reserved.then(|| refused("the name is under an upstream's cache namespace"))
+    if reserved {
+        return Some(refused("the name is under an upstream's cache namespace"));
+    }
+    // A name a prefix, `namespaces` or a served host routes is that upstream's pull-through:
+    // only `curation.internal_namespaces` opts one into local writes (A011).
+    let internal = || {
+        crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Docker,
+            &c.name,
+        )
+    };
+    (c.routed() && !internal()).then(|| {
+        let message =
+            "the name is an upstream's pull-through; it changes only when the upstream changes it";
+        tracing::warn!(name = %raw_name, canonical = %c.name, reason = message, "Docker write refused");
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "errors": [{
+                    "code": "DENIED",
+                    "message": message,
+                    "detail": { "name": raw_name }
+                }]
+            })),
+        )
+            .into_response()
+    })
 }
 
 fn parse_query_string(query: Option<&str>) -> HashMap<String, String> {
@@ -1990,7 +2037,14 @@ fn blob_created(name: &str, digest: &str) -> Response {
 /// storage failure, a digest still held by quarantine — degrades to a normal
 /// upload session (202) instead of an error, as the OCI distribution spec
 /// requires: the client then pushes the blob itself.
-async fn mount_blob(state: State<AppState>, raw_name: &str, from: &str, digest: &str) -> Response {
+async fn mount_blob(
+    state: State<AppState>,
+    headers: &axum::http::HeaderMap,
+    raw_name: &str,
+    from: &str,
+    digest: &str,
+    actor: &str,
+) -> Response {
     let c = canonicalize(raw_name, &state.config.docker);
     if let Some(r) = c.denied_response() {
         return r;
@@ -2011,6 +2065,11 @@ async fn mount_blob(state: State<AppState>, raw_name: &str, from: &str, digest: 
     // on `name` was already enforced there.
     let c_from = canonicalize(from, &state.config.docker);
     if c_from.denied || validate_docker_name(&c_from.name).is_err() {
+        return start_upload(state, Path(raw_name.to_string())).await;
+    }
+    // The source is read as a GET of it would be: a blob curation refuses to serve from
+    // `from` is not copied out of it (A056).
+    if let (_, Some(_)) = blob_curation_gate(&state, headers, &c_from.name, digest) {
         return start_upload(state, Path(raw_name.to_string())).await;
     }
 
@@ -2050,7 +2109,7 @@ async fn mount_blob(state: State<AppState>, raw_name: &str, from: &str, digest: 
 
     state.audit.log(AuditEntry::new(
         "mount",
-        "api",
+        actor,
         &format!("{}@{}", name, digest),
         "docker",
         "blob",
@@ -2436,6 +2495,7 @@ async fn upload_blob(
     // session was opened. A PUT always closes a session.
     monolithic: bool,
     body: Body,
+    actor: &str,
 ) -> Response {
     let c = canonicalize(&name, &state.config.docker);
     if let Some(r) = c.denied_response() {
@@ -2625,7 +2685,7 @@ async fn upload_blob(
             state.metrics.record_upload("docker");
             state.audit.log(AuditEntry::new(
                 "push",
-                "api",
+                actor,
                 &format!("{}@{}", name, digest),
                 "docker",
                 "blob",
@@ -3625,6 +3685,7 @@ async fn put_manifest(
     State(state): State<AppState>,
     Path((name, reference)): Path<(String, String)>,
     body: Bytes,
+    actor: &str,
 ) -> Response {
     let c = canonicalize(&name, &state.config.docker);
     if let Some(r) = c.denied_response() {
@@ -3733,6 +3794,8 @@ async fn put_manifest(
 
     // A push takes its tag back from the upstream: the proxied copy of this tag goes, with its
     // metadata (this handler holds the manifest lock; the metadata lock is taken after it).
+    // Only a fallback-chain name gets here with a namespace: `write_gate` refuses a routed
+    // name unless it is internal (A011).
     if let Some(ns) = ns.as_deref() {
         if manifest_key(Some(ns), &name, &reference) != key {
             delete_proxied_tag(&state, ns, &name, &reference).await;
@@ -3748,7 +3811,7 @@ async fn put_manifest(
     ));
     state.audit.log(AuditEntry::new(
         "push",
-        "api",
+        actor,
         &format!("{}:{}", name, reference),
         "docker",
         "manifest",
@@ -4264,6 +4327,7 @@ async fn delete_tags_for_digest(
 async fn delete_manifest(
     State(state): State<AppState>,
     Path((name, reference)): Path<(String, String)>,
+    actor: &str,
 ) -> Response {
     let c = canonicalize(&name, &state.config.docker);
     if let Some(r) = c.denied_response() {
@@ -4338,7 +4402,7 @@ async fn delete_manifest(
         Ok(()) => {
             state.audit.log(AuditEntry::new(
                 "delete",
-                "api",
+                actor,
                 &format!("{}:{}", name, reference),
                 "docker",
                 "manifest",
@@ -4358,6 +4422,7 @@ async fn delete_manifest(
 async fn delete_blob(
     State(state): State<AppState>,
     Path((name, digest)): Path<(String, String)>,
+    actor: &str,
 ) -> Response {
     let c = canonicalize(&name, &state.config.docker);
     if let Some(r) = c.denied_response() {
@@ -4407,7 +4472,7 @@ async fn delete_blob(
         Ok(()) => {
             state.audit.log(AuditEntry::new(
                 "delete",
-                "api",
+                actor,
                 &format!("{}@{}", name, &digest[..19.min(digest.len())]),
                 "docker",
                 "blob",

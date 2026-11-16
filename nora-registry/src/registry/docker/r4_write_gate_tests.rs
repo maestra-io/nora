@@ -44,8 +44,10 @@ async fn call(
     let resp = super::docker_v2_dispatch(
         State(ctx.state.clone()),
         method,
-        Path(path.to_string()),
+        // The wildcard is the path; a query (`?mount=…`) reaches the handler through the URI.
+        Path(path.split('?').next().unwrap_or_default().to_string()),
         Extension(authority),
+        None,
         format!("/v2/{path}").parse::<Uri>().unwrap(),
         axum::http::HeaderMap::new(),
         Body::from(body),
@@ -96,13 +98,14 @@ async fn the_scope_is_checked_on_the_name_the_write_lands_in() {
     }
     assert_eq!(stored(&ctx).await, Vec::<String>::new());
 
-    // The scope of the repository itself lets the same push through.
+    // The scope of the repository itself lets a push to it through. Pushed under the prefix,
+    // the same name is the upstream's pull-through, refused whatever the scope (A011).
     ctx.state
         .storage
         .put(&format!("docker/payments/api/blobs/{CFG}"), b"x")
         .await
         .unwrap();
-    let path = "ghcr/payments/api/manifests/latest";
+    let path = "payments/api/manifests/latest";
     let (status, _) = call(&ctx, scoped("payments/*"), Method::PUT, path, manifest()).await;
     assert_eq!(status, StatusCode::CREATED);
     assert!(ctx
@@ -136,8 +139,9 @@ async fn a_write_under_an_upstream_cache_namespace_is_refused() {
 }
 
 /// R4-R11: a write behind a registry host no upstream serves is refused. Routing drops the
-/// host, so `quay.io/team/app` would land in `team/app`. A host an upstream serves, and Docker
-/// Hub's, still route the write.
+/// host, so `quay.io/team/app` would land in `team/app`. Docker Hub's host without an upstream
+/// of its own is the fallback chain, as a bare name is, and takes the write; a host an
+/// upstream serves is that upstream's pull-through (A011).
 #[tokio::test]
 async fn a_write_behind_an_unserved_registry_host_is_refused() {
     let ctx = ctx(vec![upstream("ghcr.io", Some("ghcr"))]);
@@ -155,11 +159,73 @@ async fn a_write_behind_an_unserved_registry_host_is_refused() {
     }
     assert_eq!(stored(&ctx).await, Vec::<String>::new());
     for path in [
-        "ghcr.io/team/app/blobs/uploads/",
         "docker.io/team/app/blobs/uploads/",
         "team/app/blobs/uploads/",
     ] {
         let (status, _) = call(&ctx, open(), Method::POST, path, Vec::new()).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{path}");
     }
+    let path = "ghcr.io/team/app/blobs/uploads/";
+    let (status, code) = call(&ctx, open(), Method::POST, path, Vec::new()).await;
+    assert_eq!((status, code.as_str()), (StatusCode::FORBIDDEN, "DENIED"));
+}
+
+/// A011: a name a prefix, `namespaces` or a served registry host routes is the upstream's
+/// pull-through. No write lands on it — push, upload, mount or delete, with any scope — so the
+/// upstream's tag stays what every puller gets. `curation.internal_namespaces` opts a name in.
+#[tokio::test]
+async fn a_write_to_an_upstream_routed_name_is_refused() {
+    let mut bound = upstream("harbor.corp", None);
+    bound.namespaces = vec!["corp".into()];
+    let ctx = ctx(vec![upstream("ghcr.io", Some("ghcr")), bound]);
+    ctx.state
+        .storage
+        .put(&format!("docker/ghcr.io/payments/api/blobs/{CFG}"), b"x")
+        .await
+        .unwrap();
+    let before = stored(&ctx).await;
+    let blob = format!("ghcr/payments/api/blobs/{CFG}");
+    let mount = format!("ghcr/payments/api/blobs/uploads/?mount={CFG}&from=team/app");
+    for (method, path) in [
+        (Method::POST, "ghcr/payments/api/blobs/uploads/"),
+        (Method::POST, mount.as_str()),
+        (Method::PUT, "ghcr/payments/api/manifests/latest"),
+        (Method::DELETE, "ghcr/payments/api/manifests/latest"),
+        (Method::DELETE, blob.as_str()),
+        (Method::POST, "ghcr.io/team/app/blobs/uploads/"),
+        (Method::PUT, "corp/app/manifests/v1"),
+    ] {
+        let (status, code) = call(
+            &ctx,
+            NamespaceAuthority::Unrestricted,
+            method.clone(),
+            path,
+            manifest(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+        assert_eq!(code, "DENIED", "{method} {path}");
+    }
+    assert_eq!(stored(&ctx).await, before, "nothing written or deleted");
+
+    // Listed in `curation.internal_namespaces`, the routed name is the operator's to push.
+    let ctx = create_test_context_with_config(|cfg| {
+        cfg.docker.upstreams = vec![upstream("ghcr.io", Some("ghcr"))];
+        cfg.curation.internal_namespaces = vec!["payments/*".into()];
+    });
+    ctx.state
+        .storage
+        .put(&format!("docker/payments/api/blobs/{CFG}"), b"x")
+        .await
+        .unwrap();
+    let path = "ghcr/payments/api/manifests/latest";
+    let (status, _) = call(
+        &ctx,
+        NamespaceAuthority::Unrestricted,
+        Method::PUT,
+        path,
+        manifest(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
 }

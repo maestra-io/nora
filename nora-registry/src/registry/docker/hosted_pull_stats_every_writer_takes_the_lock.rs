@@ -172,9 +172,14 @@ async fn fx(local: bool, held_key: impl Fn(&str) -> String) -> Fx {
 }
 
 async fn push(state: crate::AppState, tag: String, body: Bytes) -> StatusCode {
-    super::put_manifest(State(state), Path(("race-img".to_string(), tag)), body)
-        .await
-        .status()
+    super::put_manifest(
+        State(state),
+        Path(("race-img".to_string(), tag)),
+        body,
+        "test",
+    )
+    .await
+    .status()
 }
 
 async fn pull(state: &crate::AppState, reference: &str) {
@@ -232,6 +237,7 @@ async fn delete_during_pull(f: &Fx, pull_ref: &str, delete_ref: &str) {
     let del = super::delete_manifest(
         State(f.state.clone()),
         Path(("race-img".to_string(), delete_ref.to_string())),
+        "test",
     )
     .await;
     assert_eq!(del.status(), StatusCode::ACCEPTED);
@@ -336,6 +342,7 @@ async fn a_delete_holds_the_lock_until_the_metadata_is_gone() {
     let del = tokio::spawn(super::delete_manifest(
         State(f.state.clone()),
         Path(("race-img".to_string(), "v1".to_string())),
+        "test",
     ));
     reached(&f.held.del_reached, "metadata delete not reached").await;
     // V3: a pull recorded now; its flush races the in-flight delete. The flush
