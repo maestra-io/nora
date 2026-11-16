@@ -1441,6 +1441,7 @@ fn a_typo_in_any_table_is_listed() {
             "apk.proxies",
             "circuit_breaker.overrides",
             "deb.proxies",
+            "deb.upstream_keyrings",
             "helm.proxies",
             "rpm.proxies"
         ],

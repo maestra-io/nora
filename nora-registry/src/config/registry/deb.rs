@@ -33,6 +33,11 @@ pub struct DebConfig {
     /// `*.asc`); a filtered proxy refuses an upstream `InRelease` none of them signed.
     #[serde(default)]
     pub upstream_keyring_dir: String,
+    /// maestra: per-repository archive keys, repo of `proxies` → keyring file or
+    /// directory. A repo listed here verifies only with its own keys; one not listed
+    /// falls back to `upstream_keyring_dir`.
+    #[serde(default)]
+    pub upstream_keyrings: BTreeMap<String, String>,
 }
 
 fn default_deb_architectures() -> Vec<String> {
@@ -53,11 +58,19 @@ impl Default for DebConfig {
             metadata_ttl: 300,
             architectures: default_deb_architectures(),
             upstream_keyring_dir: String::new(),
+            upstream_keyrings: BTreeMap::new(),
         }
     }
 }
 
 impl DebConfig {
+    /// The keyring a filtered proxy `repo` verifies its upstream `InRelease` with.
+    pub fn keyring_for(&self, repo: &str) -> &str {
+        self.upstream_keyrings
+            .get(repo)
+            .map_or(&self.upstream_keyring_dir, |k| k)
+    }
+
     pub(in crate::config) fn apply_env_overrides(&mut self) {
         if let Ok(val) = env::var("NORA_DEB_ENABLED") {
             self.enabled = val.to_lowercase() == "true" || val == "1";
