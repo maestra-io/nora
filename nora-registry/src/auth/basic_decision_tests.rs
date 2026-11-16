@@ -84,6 +84,10 @@ fn malformed(message: &'static str) -> BasicDecision {
     }
 }
 
+fn no_password() -> BasicDecision {
+    malformed("Invalid username or password")
+}
+
 fn unavailable() -> BasicDecision {
     BasicDecision::ServiceUnavailable("torn token file".into())
 }
@@ -191,7 +195,11 @@ fn rows() -> Vec<Row> {
         row(TokensOnly, "docker:nra_expired", GET, wrong(), true),
         row(TokensOnly, "docker:secret", GET, wrong(), true),
         row(TokensOnly, "alice:secret", GET, wrong(), true),
-        row(TokensOnly, "docker:", GET, wrong(), true),
+        // No password: the challenge round of a client that sends the password only
+        // after a 401 (uv keyring, .NET SDK). Refused uncounted, store not read.
+        row(TokensOnly, "docker:", GET, no_password(), false),
+        row(Both, "alice:", GET, no_password(), false),
+        row(HtpasswdOnly, ":", PUT, no_password(), false),
         // A store failure is an outage: 503 before any role gate, uncounted.
         row(TokensOnly, "docker:nra_broken", GET, unavailable(), true),
         row(TokensOnly, "docker:nra_broken", PUT, unavailable(), true).admin(),
@@ -449,7 +457,7 @@ fn the_lockout_counts_change_only_by_the_rule() {
 #[test]
 fn basic_auth_decision_table() {
     let rows = rows();
-    assert_eq!(rows.len(), 99);
+    assert_eq!(rows.len(), 101);
     for (i, row) in rows.iter().enumerate() {
         let (got, read) = decide(row.setup, &row.encoded, &row.method, row.is_admin);
         let credentials = STANDARD
