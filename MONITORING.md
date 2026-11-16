@@ -30,7 +30,7 @@ Import `dist/grafana-dashboard.json` into Grafana (Dashboards > Import > Upload 
 |--------|------|--------|-------------|
 | `nora_cache_requests_total` | counter | registry, result | Cache lookups (`result`: hit / miss) |
 | `nora_cache_write_errors_total` | counter | registry, operation | Background cache writes that failed: the response was served, nothing was cached |
-| `nora_spool_failures_total` | counter | registry, reason | Transfers the disk spool refused or lost (`reason`: `busy` 503, `too_large` 507, `no_space` 507, `io` 500); never upstream's fault |
+| `nora_spool_failures_total` | counter | registry, reason | Transfers the disk spool refused or lost (`reason`: `busy` 503, `too_large` 507, `no_space` 507, `io` 500; `publish_busy` 503 = a buffered publish body over `server.publish_inflight_mb`); never upstream's fault |
 
 ### Upstream Proxy
 

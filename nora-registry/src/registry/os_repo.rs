@@ -252,13 +252,15 @@ pub(super) async fn check_exists<F: OsRepo>(
     }
 }
 
-/// The checks a publish or delete runs before anything format-specific: the
-/// registry is on, the repo is hosted, the path is valid.
+/// The checks a publish or delete runs before anything format-specific, and before a
+/// publish body is read (A072): the registry is on, the repo is hosted, the path is
+/// valid, the caller's namespace scope covers the repo (#583).
 #[allow(clippy::result_large_err)] // the Err is the response returned at once
 pub(super) fn write_preflight<F: OsRepo>(
     state: &AppState,
     repo: &str,
     path: &str,
+    authority: &NamespaceAuthority,
 ) -> Result<(), Response> {
     let settings = F::settings(&state.config);
     if !settings.enabled {
@@ -278,6 +280,9 @@ pub(super) fn write_preflight<F: OsRepo>(
     if let Err(msg) = F::validate_package_path(repo, path) {
         return Err((StatusCode::BAD_REQUEST, msg).into_response());
     }
+    if enforce_namespace_scope(authority, repo).is_err() {
+        return Err(StatusCode::FORBIDDEN.into_response());
+    }
     Ok(())
 }
 
@@ -286,21 +291,16 @@ pub(super) fn has_control(s: &str) -> bool {
     s.bytes().any(|b| b.is_ascii_control())
 }
 
-/// PUT after [`write_preflight`] and the format's own query checks: namespace
-/// scope, size cap, parse, then package + sidecar + index rebuild under the lock.
+/// PUT after [`write_preflight`] and the format's own query checks: size cap, parse,
+/// then package + sidecar + index rebuild under the lock.
 pub(super) async fn publish<F: OsRepo>(
     state: &AppState,
     repo: &str,
     path: &str,
-    authority: &NamespaceAuthority,
     user: &Option<Extension<AuthenticatedUser>>,
     body: &[u8],
     parse: impl FnOnce(&[u8]) -> Result<F::Record, Response>,
 ) -> Response {
-    // Enforce OIDC namespace_scope on the repository name (#583).
-    if enforce_namespace_scope(authority, repo).is_err() {
-        return StatusCode::FORBIDDEN.into_response();
-    }
     let max_file_size = F::settings(&state.config).max_file_size;
     if body.len() as u64 > max_file_size {
         return (
@@ -382,11 +382,8 @@ pub(super) async fn delete_package<F: OsRepo>(
     authority: NamespaceAuthority,
     user: Option<Extension<AuthenticatedUser>>,
 ) -> Response {
-    if let Err(response) = write_preflight::<F>(&state, &repo, &path) {
+    if let Err(response) = write_preflight::<F>(&state, &repo, &path, &authority) {
         return response;
-    }
-    if enforce_namespace_scope(&authority, &repo).is_err() {
-        return StatusCode::FORBIDDEN.into_response();
     }
     let key = F::package_key(&repo, &path);
     if validate_storage_key(&key).is_err() {

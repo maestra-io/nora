@@ -3225,9 +3225,19 @@ async fn handle_publish(
     Path(path): Path<String>,
     Extension(authority): Extension<NamespaceAuthority>,
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
-    super::PublishBody(body): super::PublishBody,
+    body: axum::body::Body,
 ) -> Response {
+    // `npm login` / `npm adduser` (CouchDB user document): NORA has no user database. The
+    // route is open to anonymous callers, so it is refused before any of the body is read.
+    if path.starts_with("-/user/") {
+        return audit_refused(StatusCode::METHOD_NOT_ALLOWED, NPM_LOGIN_UNSUPPORTED);
+    }
+    let read = |body| super::PublishBody::read(&state, "npm", body);
     if let Some(rest) = path.strip_prefix("-/package/") {
+        let body = match read(body).await {
+            Ok(body) => body.0,
+            Err(response) => return response,
+        };
         // `npm dist-tag add`: the body is the version, as a JSON string.
         let Ok(version) = serde_json::from_slice::<String>(&body) else {
             return (
@@ -3238,11 +3248,11 @@ async fn handle_publish(
         };
         return set_dist_tag(&state, &authority, &user, rest, Some(&version)).await;
     }
-    // `npm login` / `npm adduser` (CouchDB user document): NORA has no user database.
-    if path.starts_with("-/user/") {
-        return audit_refused(StatusCode::METHOD_NOT_ALLOWED, NPM_LOGIN_UNSUPPORTED);
-    }
     if let Some((name, _rev)) = path.rsplit_once("/-rev/") {
+        let body = match read(body).await {
+            Ok(body) => body.0,
+            Err(response) => return response,
+        };
         return unpublish_put(&state, &authority, &user, name, &body).await;
     }
     let package_name = path;
@@ -3256,6 +3266,11 @@ async fn handle_publish(
     if enforce_namespace_scope(&authority, &package_name).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
+    // The body is read only for a caller the name in the URL lets in (A072).
+    let body = match read(body).await {
+        Ok(body) => body.0,
+        Err(response) => return response,
+    };
     // npm's rule for new names (validate-npm-package-name `validForNewPackages`): no upper
     // case. A package already published here, or one the operator imports, keeps its name.
     if package_name.bytes().any(|b| b.is_ascii_uppercase())

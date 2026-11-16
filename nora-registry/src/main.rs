@@ -503,6 +503,8 @@ pub struct AppState {
         proxy_coalesce::InflightMap<registry::ArtifactFill, registry::ProxyError>,
     /// Disk spool directory and byte budget (proxied artifacts, NuGet pushes, PyPI uploads).
     pub(crate) spool: Arc<registry::SpoolBudget>,
+    /// In-memory budget of buffered publish bodies (`server.publish_inflight_mb`).
+    pub(crate) publish_budget: registry::PublishBudget,
     /// Docker blob fills in flight, shared by every request for the blob (#1003).
     pub(crate) blob_flights: proxy_coalesce::InflightMap<registry::docker::SpoolShare>,
     /// Renders of proxied npm packuments, shared by concurrent and repeated requests.
@@ -2265,6 +2267,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     let state = AppState {
         storage,
         spool: Arc::new(registry::SpoolBudget::new(&config)),
+        publish_budget: registry::publish_budget(&config),
         config: Arc::new(config),
         enabled_registries,
         start_time,

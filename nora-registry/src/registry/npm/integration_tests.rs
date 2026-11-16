@@ -28,7 +28,7 @@ async fn test_npm_namespace_scope_enforced() {
         Path("@other/pkg".to_string()),
         Extension(scoped.clone()),
         None,
-        crate::registry::PublishBody(Bytes::from_static(b"{}")),
+        axum::body::Body::from(Bytes::from_static(b"{}")),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -39,7 +39,7 @@ async fn test_npm_namespace_scope_enforced() {
         Path("@myorg/pkg".to_string()),
         Extension(scoped),
         None,
-        crate::registry::PublishBody(Bytes::from_static(b"{}")),
+        axum::body::Body::from(Bytes::from_static(b"{}")),
     )
     .await;
     assert_ne!(resp.status(), StatusCode::FORBIDDEN);
@@ -348,7 +348,7 @@ async fn test_npm_publish_scoped_with_prefixed_attachment() {
         Path("@scope/mypkg".to_string()),
         Extension(NamespaceAuthority::Unrestricted),
         None,
-        crate::registry::PublishBody(Bytes::from(body_bytes)),
+        axum::body::Body::from(Bytes::from(body_bytes)),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -2597,6 +2597,42 @@ async fn npm_login_points_at_token_setup() {
     let error = body_json(resp).await["error"].as_str().unwrap().to_string();
     assert!(error.contains("_authToken"), "{error}");
     assert!(ctx.state.storage.list("npm/").await.unwrap().is_empty());
+}
+
+/// A073: the anonymous `npm login` PUT is answered 405 before any of its body is read; a
+/// gated publish is refused 401 the same way.
+#[tokio::test]
+async fn npm_login_is_refused_before_its_body_is_read() {
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+    for (uri, status) in [
+        (
+            "/npm/-/user/org.couchdb.user:x",
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        ("/npm/somepkg", StatusCode::UNAUTHORIZED),
+    ] {
+        let pulled = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = pulled.clone();
+        let chunk = futures::stream::once(async move {
+            counter.fetch_add(64 * 1024, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'a'; 64 * 1024]))
+        });
+        let body = Body::from_stream(chunk.chain(futures::stream::pending()));
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            send(&ctx.app, Method::PUT, uri, body),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{uri}: answered without the body"));
+        assert_eq!(resp.status(), status, "{uri}");
+        assert_eq!(pulled.load(Ordering::SeqCst), 0, "{uri}");
+        if status == StatusCode::METHOD_NOT_ALLOWED {
+            let error = body_json(resp).await["error"].as_str().unwrap().to_string();
+            assert!(error.contains("_authToken"), "{error}");
+        }
+    }
 }
 
 async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {

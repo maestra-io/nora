@@ -86,6 +86,12 @@ pub struct ServerConfig {
     /// caps. Default 512.
     #[serde(default = "default_publish_body_limit_mb")]
     pub publish_body_limit_mb: usize,
+    /// MB all buffered publish bodies (see `publish_body_limit_mb`) may hold in memory at
+    /// once. A publish that would pass it is refused with 503 + `Retry-After` as its body
+    /// arrives (counted as `publish_busy` in `nora_spool_failures_total`); a body bigger
+    /// than the whole budget is a 413. Default 2048; 0 = no budget.
+    #[serde(default = "default_publish_inflight_mb")]
+    pub publish_inflight_mb: u64,
     /// Proxied NuGet/npm/PyPI/Maven artifacts larger than this many MB are never held in
     /// memory whole: a cold miss is spooled to a temp file under `spool_dir`
     /// and served from it, a cache hit is streamed from storage with its digest
@@ -177,6 +183,10 @@ pub(super) fn default_publish_body_limit_mb() -> usize {
     512
 }
 
+pub(super) fn default_publish_inflight_mb() -> u64 {
+    2048
+}
+
 pub(super) fn default_stream_threshold_mb() -> u64 {
     16
 }
@@ -222,6 +232,7 @@ impl Default for ServerConfig {
             allow_private_upstreams: false,
             internal_port: None,
             publish_body_limit_mb: default_publish_body_limit_mb(),
+            publish_inflight_mb: default_publish_inflight_mb(),
             stream_threshold_mb: default_stream_threshold_mb(),
             spool_dir: None,
             spool_max_mb: default_spool_max_mb(),
@@ -413,6 +424,13 @@ impl ServerConfig {
                 &mut self.publish_body_limit_mb,
             );
         }
+        if let Ok(val) = env::var("NORA_PUBLISH_INFLIGHT_MB") {
+            super::parse_env_warn(
+                "NORA_PUBLISH_INFLIGHT_MB",
+                &val,
+                &mut self.publish_inflight_mb,
+            );
+        }
         if let Ok(val) = env::var("NORA_MAINTENANCE_STALL_SECS") {
             super::parse_env_warn(
                 "NORA_MAINTENANCE_STALL_SECS",
@@ -509,6 +527,12 @@ mod tests {
         assert_eq!(config.publish_body_limit(), 64 * 1024 * 1024);
         config.body_limit_mb = 8;
         assert_eq!(config.publish_body_limit(), 8 * 1024 * 1024);
+        // A072: the in-flight budget of all buffered publish bodies.
+        assert_eq!(ServerConfig::default().publish_inflight_mb, 2048);
+        std::env::set_var("NORA_PUBLISH_INFLIGHT_MB", "0");
+        config.apply_env_overrides();
+        std::env::remove_var("NORA_PUBLISH_INFLIGHT_MB");
+        assert_eq!(config.publish_inflight_mb, 0);
     }
 
     #[test]

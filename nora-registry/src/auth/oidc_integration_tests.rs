@@ -203,6 +203,7 @@ fn create_oidc_test_context_with(
         proxy_coalesce: crate::proxy_coalesce::InflightMap::new(),
         artifact_flights: crate::proxy_coalesce::InflightMap::new(),
         spool: ctx.state.spool.clone(),
+        publish_budget: ctx.state.publish_budget.clone(),
         blob_flights: crate::proxy_coalesce::InflightMap::new(),
         packument_memo: Arc::default(),
         docker_upstream_tags: Arc::default(),

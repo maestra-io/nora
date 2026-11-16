@@ -788,13 +788,17 @@ async fn upload(
     Path((repo, path)): Path<(String, String)>,
     Extension(authority): Extension<NamespaceAuthority>,
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
-    super::PublishBody(body): super::PublishBody,
+    body: axum::body::Body,
 ) -> Response {
-    if let Err(response) = os_repo::write_preflight::<Rpm>(&state, &repo, &path) {
+    if let Err(response) = os_repo::write_preflight::<Rpm>(&state, &repo, &path, &authority) {
         return response;
     }
+    let body = match super::PublishBody::read(&state, "rpm", body).await {
+        Ok(body) => body.0,
+        Err(response) => return response,
+    };
     let changelog_limit = state.config.rpm.changelog_limit;
-    os_repo::publish::<Rpm>(&state, &repo, &path, &authority, &user, &body, |body| {
+    os_repo::publish::<Rpm>(&state, &repo, &path, &user, &body, |body| {
         let md = match PackageMetadata::parse(&mut &body[..]) {
             Ok(md) => md,
             Err(e) => {
@@ -1384,7 +1388,7 @@ mod integration_tests {
             axum::extract::Path(("otherrepo".to_string(), "x.rpm".to_string())),
             axum::Extension(scoped(ScopeEnforcement::Enforce)),
             None,
-            crate::registry::PublishBody(axum::body::Bytes::from(build_test_rpm("x", "1.0"))),
+            axum::body::Body::from(axum::body::Bytes::from(build_test_rpm("x", "1.0"))),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1396,7 +1400,7 @@ mod integration_tests {
             axum::extract::Path(("myrepo".to_string(), "x.rpm".to_string())),
             axum::Extension(scoped(ScopeEnforcement::Enforce)),
             None,
-            crate::registry::PublishBody(axum::body::Bytes::from(build_test_rpm("x", "1.0"))),
+            axum::body::Body::from(axum::body::Bytes::from(build_test_rpm("x", "1.0"))),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CREATED);
