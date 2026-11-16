@@ -28,7 +28,7 @@ async fn test_maven_namespace_scope_enforced() {
         Path("com/other/lib/1.0/lib-1.0.jar".to_string()),
         Extension(scoped.clone()),
         None,
-        crate::registry::PublishBody(Bytes::from_static(b"x")),
+        axum::body::Body::from(Bytes::from_static(b"x")),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -39,7 +39,7 @@ async fn test_maven_namespace_scope_enforced() {
         Path("foo".to_string()),
         Extension(scoped.clone()),
         None,
-        crate::registry::PublishBody(Bytes::from_static(b"x")),
+        axum::body::Body::from(Bytes::from_static(b"x")),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -50,7 +50,7 @@ async fn test_maven_namespace_scope_enforced() {
         Path("com/myorg/lib/1.0/lib-1.0.jar".to_string()),
         Extension(scoped),
         None,
-        crate::registry::PublishBody(Bytes::from_static(b"x")),
+        axum::body::Body::from(Bytes::from_static(b"x")),
     )
     .await;
     assert_ne!(resp.status(), StatusCode::FORBIDDEN);

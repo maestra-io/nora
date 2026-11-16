@@ -1117,7 +1117,7 @@ async fn upload(
     Path(path): Path<String>,
     Extension(authority): Extension<NamespaceAuthority>,
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
-    super::PublishBody(body): super::PublishBody,
+    body: axum::body::Body,
 ) -> Response {
     if !path.is_ascii() || path.contains("..") || path.contains('\0') || path.starts_with('/') {
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
@@ -1142,6 +1142,11 @@ async fn upload(
     if enforce_namespace_scope(&authority, &maven_namespace).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
+    // The body is read only for a caller the coordinate in the URL lets in (A072).
+    let body = match super::PublishBody::read(&state, "maven", body).await {
+        Ok(body) => body.0,
+        Err(response) => return response,
+    };
 
     let key = storage_key(&path);
 

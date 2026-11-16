@@ -176,6 +176,7 @@ fn build_context_full(
             max_connections: 4096,
             maintenance_stall_secs: 300,
             publish_body_limit_mb: 512,
+            publish_inflight_mb: 2048,
             stream_threshold_mb: 16,
             spool_dir: None,
             spool_max_mb: 4096,
@@ -441,6 +442,7 @@ fn build_context_full(
     let state = AppState {
         storage: storage.clone(),
         spool: Arc::new(crate::registry::SpoolBudget::new(&config)),
+        publish_budget: crate::registry::publish_budget(&config),
         config: Arc::new(config),
         enabled_registries: enabled_registries.clone(),
         start_time: Instant::now(),

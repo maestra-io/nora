@@ -103,22 +103,139 @@ use std::time::{Duration, Instant};
 /// The body of a publish handler that needs it whole in memory (npm, Maven, Cargo,
 /// deb, rpm), capped at `server.publish_body_limit_mb` instead of the global
 /// `body_limit_mb` that streamed Docker uploads need. A bigger body is a 413 as soon
-/// as the cap is crossed, before it is buffered whole.
+/// as the cap is crossed, before it is buffered whole. All of them together hold at most
+/// `server.publish_inflight_mb` (A072): one that would pass it is a 503 as its body
+/// arrives, and one that sends nothing for [`PUBLISH_BODY_IDLE`] is a 408.
 pub(crate) struct PublishBody(pub Bytes);
+
+/// In-memory budget of the buffered publish bodies, one permit per MiB; `None` = none.
+pub(crate) type PublishBudget = Option<std::sync::Arc<tokio::sync::Semaphore>>;
+
+pub(crate) fn publish_budget(config: &crate::config::Config) -> PublishBudget {
+    let mib = config
+        .server
+        .publish_inflight_mb
+        .min(tokio::sync::Semaphore::MAX_PERMITS as u64);
+    (mib > 0).then(|| std::sync::Arc::new(tokio::sync::Semaphore::new(mib as usize)))
+}
+
+/// How long a publish body may send nothing before the publish is refused.
+const PUBLISH_BODY_IDLE: Duration = Duration::from_secs(60);
+
+/// A buffered publish body and its budget permits, returned when its last clone drops.
+struct BudgetedBody {
+    bytes: Vec<u8>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for BudgetedBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl PublishBody {
+    /// Read `body` whole under the publish cap and the in-flight budget. Handlers that
+    /// decide on the URL first (namespace scope) take the raw body and call this after.
+    pub(crate) async fn read(
+        state: &AppState,
+        registry: &str,
+        body: Body,
+    ) -> Result<Self, Response> {
+        let server = &state.config.server;
+        let mut cap = server.publish_body_limit();
+        if server.publish_inflight_mb > 0 {
+            // A body bigger than the whole budget could never pass: a 413, not a 503.
+            cap = cap.min((server.publish_inflight_mb as usize).saturating_mul(MIB as usize));
+        }
+        let too_large = || {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Publish body too large. Max size: {cap} bytes"),
+            )
+                .into_response()
+        };
+        let mut stream = body.into_data_stream();
+        let mut buf = Vec::new();
+        let mut held: Option<tokio::sync::OwnedSemaphorePermit> = None;
+        loop {
+            let chunk = match tokio::time::timeout(PUBLISH_BODY_IDLE, stream.next()).await {
+                Err(_) => {
+                    return Err(
+                        (StatusCode::REQUEST_TIMEOUT, "Publish body stalled").into_response()
+                    )
+                }
+                Ok(None) => break,
+                // As before: a body the length limit or the client cut short is refused.
+                Ok(Some(Err(_))) => return Err(too_large()),
+                Ok(Some(Ok(chunk))) => chunk,
+            };
+            let len = buf.len() + chunk.len();
+            if len > cap {
+                return Err(too_large());
+            }
+            if len > buf.capacity() {
+                // The permits cover the allocation, not only the bytes in it: grow by doubling
+                // within the cap, or to exactly what is needed when the budget is short.
+                let doubled = len.max(buf.capacity() * 2).min(cap);
+                let mut target = doubled;
+                if let Some(permits) = &state.publish_budget {
+                    let have = held.as_ref().map_or(0, |p| p.num_permits());
+                    let acquire = |bytes: usize| {
+                        let need = (bytes as u64).div_ceil(MIB) as usize;
+                        std::sync::Arc::clone(permits)
+                            .try_acquire_many_owned(need.saturating_sub(have) as u32)
+                    };
+                    let more = match acquire(doubled) {
+                        Ok(more) => more,
+                        Err(_) => {
+                            target = len;
+                            let Ok(more) = acquire(len) else {
+                                tracing::warn!(
+                                    registry,
+                                    "publish refused: in-flight body budget full"
+                                );
+                                crate::metrics::SPOOL_FAILURES
+                                    .with_label_values(&[registry, "publish_busy"])
+                                    .inc();
+                                return Err((
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    [(header::RETRY_AFTER, "10")],
+                                    "Too many publishes in progress, retry later",
+                                )
+                                    .into_response());
+                            };
+                            more
+                        }
+                    };
+                    match &mut held {
+                        Some(h) => h.merge(more),
+                        None => held = Some(more),
+                    }
+                }
+                buf.reserve_exact(target - buf.len());
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(Self(match held {
+            Some(permit) => {
+                debug_assert!(buf.capacity() as u64 <= permit.num_permits() as u64 * MIB);
+                Bytes::from_owner(BudgetedBody {
+                    bytes: buf,
+                    _permit: permit,
+                })
+            }
+            None => Bytes::from(buf),
+        }))
+    }
+}
 
 impl axum::extract::FromRequest<AppState> for PublishBody {
     type Rejection = Response;
 
     async fn from_request(req: axum::extract::Request, state: &AppState) -> Result<Self, Response> {
-        let cap = state.config.server.publish_body_limit();
-        match axum::body::to_bytes(req.into_body(), cap).await {
-            Ok(body) => Ok(Self(body)),
-            Err(_) => Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("Publish body too large. Max size: {cap} bytes"),
-            )
-                .into_response()),
-        }
+        let registry = req.uri().path().split('/').nth(1).unwrap_or("").to_owned();
+        Self::read(state, &registry, req.into_body()).await
     }
 }
 
@@ -3331,6 +3448,173 @@ mod tests {
         // Under the cap the body reaches the handler (here: invalid JSON).
         let resp = send(&ctx.app, Method::PUT, "/npm/pkg", vec![b'x'; 1024]).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A body of `chunk` bytes that then stays open until `open` is dropped; counts the
+    /// bytes the server pulled.
+    fn held_open_body(
+        chunk: usize,
+        pulled: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        open: tokio::sync::oneshot::Receiver<()>,
+    ) -> Body {
+        let first = futures::stream::once(async move {
+            pulled.fetch_add(chunk, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, std::io::Error>(Bytes::from(vec![0u8; chunk]))
+        });
+        let rest = futures::stream::once(async move {
+            let _ = open.await;
+            Ok::<_, std::io::Error>(Bytes::new())
+        });
+        Body::from_stream(first.chain(rest))
+    }
+
+    /// A072: all buffered publish bodies together hold at most `publish_inflight_mb`; one
+    /// that would pass it is a 503 with `Retry-After`, and the budget comes back once the
+    /// publish holding it is done.
+    #[tokio::test]
+    async fn buffered_publish_bodies_share_one_inflight_budget() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::Method;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let ctx = create_test_context_with_config(|c| c.server.publish_inflight_mb = 2);
+        let pulled = std::sync::Arc::new(AtomicUsize::new(0));
+        let (close, open) = tokio::sync::oneshot::channel();
+        let app = ctx.app.clone();
+        let body = held_open_body(2 * MIB as usize, pulled.clone(), open);
+        let first = tokio::spawn(async move {
+            send(
+                &app,
+                Method::PUT,
+                "/maven2/com/acme/lib/1.0/lib-1.0.jar",
+                body,
+            )
+            .await
+            .status()
+        });
+        while pulled.load(Ordering::SeqCst) < 2 * MIB as usize {
+            tokio::task::yield_now().await;
+        }
+        let resp = send(&ctx.app, Method::PUT, "/npm/pkg", vec![b'x'; 16]).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()[header::RETRY_AFTER], "10");
+
+        drop(close);
+        assert_eq!(first.await.unwrap(), StatusCode::CREATED);
+        // The budget is back, all of it: a body that grows to it chunk by chunk reaches the
+        // handler (here: invalid JSON).
+        let chunks = (0..2).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; MIB as usize])));
+        let body = Body::from_stream(futures::stream::iter(chunks));
+        let resp = send(&ctx.app, Method::PUT, "/npm/pkg", body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // A body bigger than the whole budget could never pass: 413, not 503.
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/npm/pkg",
+            vec![b'x'; 2 * MIB as usize + 1],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // A body cut short is refused as before, and leaves the budget whole.
+        let cut = futures::stream::once(async { Err::<Bytes, _>(std::io::Error::other("reset")) });
+        let resp = send(&ctx.app, Method::PUT, "/npm/pkg", Body::from_stream(cut)).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            ctx.state
+                .publish_budget
+                .as_ref()
+                .unwrap()
+                .available_permits(),
+            2
+        );
+    }
+
+    /// A072: the permits cover the buffer's allocation, not only the bytes in it: a body
+    /// whose growth would double past a budget that is not a power of two takes exactly what
+    /// it needs (the capacity check is the `debug_assert` in `read`), and gives it back.
+    #[tokio::test]
+    async fn the_publish_budget_covers_the_buffer_capacity() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.server.publish_inflight_mb = 3
+        });
+        let chunks = [MIB as usize, MIB as usize, 1]
+            .map(|n| Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; n])));
+        let body = Body::from_stream(futures::stream::iter(chunks));
+        let read = PublishBody::read(&ctx.state, "npm", body).await;
+        let body = read.unwrap_or_else(|_| panic!("fits the budget"));
+        assert_eq!(body.0.len(), 2 * MIB as usize + 1);
+        let budget = ctx.state.publish_budget.as_ref().unwrap();
+        assert_eq!(budget.available_permits(), 0);
+        drop(body);
+        assert_eq!(budget.available_permits(), 3);
+    }
+
+    /// A072: a publish body that stops arriving is refused after the idle deadline instead
+    /// of holding its buffer.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_publish_body_is_refused() {
+        use crate::test_helpers::{create_test_context, send};
+        use axum::http::Method;
+        let ctx = create_test_context();
+        let pulled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (_close, open) = tokio::sync::oneshot::channel::<()>();
+        let body = held_open_body(1024, pulled, open);
+        let resp = tokio::time::timeout(
+            PUBLISH_BODY_IDLE * 2,
+            send(&ctx.app, Method::PUT, "/npm/pkg", body),
+        )
+        .await
+        .expect("a stalled body is answered");
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    /// A072: Maven, npm and deb publishes decide the namespace scope on the URL before they
+    /// read any of the body: an out-of-scope caller is answered with nothing pulled.
+    #[tokio::test]
+    async fn out_of_scope_publishes_are_refused_before_the_body_is_read() {
+        use crate::auth::NamespaceAuthority;
+        use crate::config::ScopeEnforcement;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.deb.enabled = true;
+            c.rpm.enabled = true;
+        });
+        let authority = NamespaceAuthority::from_oidc_scope(
+            "ci",
+            &["vscode/**".to_string()],
+            ScopeEnforcement::Enforce,
+        );
+        #[allow(unused_mut)]
+        let mut cases = vec![
+            (maven_routes(), "/maven2/com/other/lib/1.0/lib-1.0.jar"),
+            (npm_routes(), "/npm/other-package"),
+            (
+                npm_routes(),
+                "/npm/-/package/other-package/dist-tags/latest",
+            ),
+            (npm_routes(), "/npm/other-package/-rev/1-abc"),
+        ];
+        #[cfg(feature = "deb")]
+        cases.push((deb_routes(), "/deb/other/pool/x.deb"));
+        #[cfg(feature = "rpm")]
+        cases.push((rpm_routes(), "/rpm/other/x.rpm"));
+        for (routes, uri) in cases {
+            let app = routes
+                .layer(axum::Extension(authority.clone()))
+                .with_state(ctx.state.clone());
+            let pulled = std::sync::Arc::new(AtomicUsize::new(0));
+            let (_close, open) = tokio::sync::oneshot::channel::<()>();
+            let req = axum::http::Request::put(uri)
+                .body(held_open_body(MIB as usize, pulled.clone(), open))
+                .unwrap();
+            let resp = tokio::time::timeout(Duration::from_secs(5), app.oneshot(req))
+                .await
+                .unwrap_or_else(|_| panic!("{uri}: answered without the body"))
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+            assert_eq!(pulled.load(Ordering::SeqCst), 0, "{uri}");
+        }
     }
 
     /// C54: only NuGet's flat container, or a provenance record whose digest is still

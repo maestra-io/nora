@@ -752,16 +752,20 @@ async fn upload(
     Query(query): Query<PublishQuery>,
     Extension(authority): Extension<NamespaceAuthority>,
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
-    super::PublishBody(body): super::PublishBody,
+    body: axum::body::Body,
 ) -> Response {
-    if let Err(response) = os_repo::write_preflight::<Deb>(&state, &repo, &path) {
+    if let Err(response) = os_repo::write_preflight::<Deb>(&state, &repo, &path, &authority) {
         return response;
     }
     let placement = match resolve_placement(query) {
         Ok(p) => p,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
-    os_repo::publish::<Deb>(&state, &repo, &path, &authority, &user, &body, |body| {
+    let body = match super::PublishBody::read(&state, "deb", body).await {
+        Ok(body) => body.0,
+        Err(response) => return response,
+    };
+    os_repo::publish::<Deb>(&state, &repo, &path, &user, &body, |body| {
         extract_record(body, &path, placement)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("Not a valid deb: {e}")).into_response())
     })
@@ -1467,7 +1471,7 @@ mod integration_tests {
             axum::extract::Query(super::PublishQuery::default()),
             axum::Extension(scoped(ScopeEnforcement::Enforce)),
             None,
-            crate::registry::PublishBody(axum::body::Bytes::from(build_test_deb("x", "1.0"))),
+            axum::body::Body::from(axum::body::Bytes::from(build_test_deb("x", "1.0"))),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1479,7 +1483,7 @@ mod integration_tests {
             axum::extract::Query(super::PublishQuery::default()),
             axum::Extension(scoped(ScopeEnforcement::Enforce)),
             None,
-            crate::registry::PublishBody(axum::body::Bytes::from(build_test_deb("x", "1.0"))),
+            axum::body::Body::from(axum::body::Bytes::from(build_test_deb("x", "1.0"))),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CREATED);
