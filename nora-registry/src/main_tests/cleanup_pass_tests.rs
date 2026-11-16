@@ -292,6 +292,33 @@ fn the_gc_done_line_names_the_proxy_cache_evictions_apart_from_the_orphans() {
     );
 }
 
+/// Audit A028: the scheduler's summary says when Docker objects were kept by an
+/// incomplete mark, on applied and dry passes alike.
+#[test]
+fn the_gc_done_line_reports_an_incomplete_docker_mark() {
+    let mut result = gc::GcResult {
+        total_candidates: 0,
+        orphaned: 0,
+        deleted: 0,
+        bytes_freed: 0,
+        orphan_keys: Vec::new(),
+        duration_secs: 0.0,
+        uncovered: Vec::new(),
+        metadata_phantoms_removed: 0,
+        skipped_recent: 0,
+        stat_failures: 0,
+        docker_mark_failed: true,
+        proxy_cache_eviction: gc::ProxyCacheEviction::default(),
+    };
+    for dry_run in [false, true] {
+        let line = gc_done_line(&result, dry_run);
+        assert!(line.contains("docker_mark_failed=true"), "{line}");
+    }
+    result.docker_mark_failed = false;
+    let line = gc_done_line(&result, false);
+    assert!(line.contains("docker_mark_failed=false"), "{line}");
+}
+
 #[cfg(feature = "rpm")]
 fn artifacts_gauge(rt: RegistryType) -> i64 {
     metrics::ARTIFACTS_TOTAL
