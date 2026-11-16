@@ -435,15 +435,9 @@ async fn gem_dates(
         }
     }
     let fetched = match upstream_url(state) {
-        Some(proxy) => {
-            fetch_gem_dates(
-                &state.http_client,
-                &proxy,
-                name,
-                state.config.gems.proxy_timeout,
-            )
+        Some(proxy) => fetch_gem_dates(state, &proxy, name, wanted)
             .await
-        }
+            .map(|dates| (*dates).clone()),
         None => None,
     };
     match fetched {
@@ -458,79 +452,71 @@ async fn gem_dates(
 }
 
 /// Every version's `created_at` from the RubyGems API, keyed `<number>` for a pure-Ruby gem
-/// and `<number>-<platform>` otherwise, as the compact index writes its rows.
+/// and `<number>-<platform>` otherwise, as the compact index writes its rows. One lookup per
+/// gem for `gems.metadata_ttl`, shared by the index filter and the `.gem` gate
+/// (`upstream_dates`); a `wanted` row missing from a kept answer asks again once a minute.
 async fn fetch_gem_dates(
-    client: &reqwest::Client,
+    state: &AppState,
     proxy: &str,
     name: &str,
-    timeout_secs: u64,
-) -> Option<std::collections::HashMap<String, i64>> {
-    let url = format!(
-        "{}/api/v1/versions/{}.json",
-        proxy.trim_end_matches('/'),
-        name
-    );
-    let resp = client
-        .get(&url)
-        .timeout(Duration::from_secs(timeout_secs))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let arr: Vec<serde_json::Value> = resp.json().await.ok()?;
-    Some(
-        arr.iter()
-            .filter_map(|v| {
-                let number = v.get("number")?.as_str()?;
-                let date = crate::curation::parse_iso8601_to_unix(v.get("created_at")?.as_str()?)?;
-                let key = match v.get("platform").and_then(|p| p.as_str()) {
-                    None | Some("ruby") => number.to_string(),
-                    Some(platform) => format!("{number}-{platform}"),
-                };
-                Some((key, date))
-            })
-            .collect(),
+    wanted: &[&str],
+) -> Option<std::sync::Arc<std::collections::HashMap<String, i64>>> {
+    let proxy = proxy.trim_end_matches('/').to_owned();
+    let url = format!("{proxy}/api/v1/versions/{name}.json");
+    let timeout = Duration::from_secs(state.config.gems.proxy_timeout);
+    let ttl = Duration::from_secs(state.config.gems.metadata_ttl.max(0) as u64);
+    let fetching = state.clone();
+    super::upstream_dates::dates(
+        state,
+        RegistryType::Gems,
+        &format!("{proxy}#{name}"),
+        ttl,
+        wanted,
+        move || async move {
+            let body =
+                super::upstream_dates::get(&fetching, RegistryType::Gems, &proxy, &url, timeout)
+                    .await
+                    .ok()?;
+            let arr: Vec<serde_json::Value> = serde_json::from_slice(&body).ok()?;
+            Some(
+                arr.iter()
+                    .filter_map(|v| {
+                        let number = v.get("number")?.as_str()?;
+                        let created = v.get("created_at")?.as_str()?;
+                        let date = crate::curation::parse_iso8601_to_unix(created)?;
+                        let platform = v.get("platform").and_then(|p| p.as_str());
+                        Some((gem_date_key(number, platform), date))
+                    })
+                    .collect(),
+            )
+        },
     )
+    .await
+}
+
+/// The key of a version's date: its compact index row (`1.2.0`, `1.2.0-java`).
+fn gem_date_key(number: &str, platform: Option<&str>) -> String {
+    match platform {
+        None | Some("ruby") => number.to_string(),
+        Some(platform) => format!("{number}-{platform}"),
+    }
 }
 
 /// Best-effort per-version `created_at` from the RubyGems API (the compact index
-/// has no dates). Any failure → `None` (quarantine falls back to NORA's clock).
+/// has no dates), by [`fetch_gem_dates`]. Any failure → `None` (quarantine falls back to
+/// NORA's clock).
 async fn fetch_gems_date(
-    client: &reqwest::Client,
+    state: &AppState,
     proxy: &str,
     name: &str,
     version: &str,
     platform: Option<&str>,
-    timeout_secs: u64,
 ) -> Option<i64> {
-    let url = format!(
-        "{}/api/v1/versions/{}.json",
-        proxy.trim_end_matches('/'),
-        name
-    );
-    let resp = client
-        .get(&url)
-        .timeout(Duration::from_secs(timeout_secs))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let arr: Vec<serde_json::Value> = resp.json().await.ok()?;
-    // The API lists each version once per platform (`ruby` for a pure-Ruby gem).
-    let platform = platform.unwrap_or("ruby");
-    let date_str = arr
-        .iter()
-        .find(|v| {
-            v.get("number").and_then(|n| n.as_str()) == Some(version)
-                && v.get("platform").and_then(|p| p.as_str()).unwrap_or("ruby") == platform
-        })?
-        .get("created_at")?
-        .as_str()?;
-    crate::curation::parse_iso8601_to_unix(date_str)
+    let row = gem_date_key(version, platform);
+    fetch_gem_dates(state, proxy, name, &[&row])
+        .await?
+        .get(&row)
+        .copied()
 }
 
 // ── Gem download (immutable) ───────────────────────────────────────────
@@ -1525,12 +1511,11 @@ async fn upstream_gem_release_dates(
             Some(_) if kept.is_some() => kept,
             Some(proxy) => {
                 fetch_gems_date(
-                    &state.http_client,
+                    state,
                     proxy,
                     &identity.name,
                     &identity.version,
                     identity.platform.as_deref(),
-                    state.config.gems.proxy_timeout,
                 )
                 .await
             }
@@ -2177,14 +2162,32 @@ mod platform_gem_curation {
             ])))
             .mount(&upstream)
             .await;
-        let client = reqwest::Client::new();
+        let ctx = create_test_context_with_config(|_| {});
         let date = |platform| {
-            let (client, uri) = (client.clone(), upstream.uri());
-            async move { fetch_gems_date(&client, &uri, "nokogiri", "1.13.0", platform, 5).await }
+            let (state, uri) = (ctx.state.clone(), upstream.uri());
+            async move { fetch_gems_date(&state, &uri, "nokogiri", "1.13.0", platform).await }
         };
         assert_eq!(date(None).await, Some(1_640_995_200));
         assert_eq!(date(Some("x86_64-linux")).await, Some(1_641_081_600));
         assert_eq!(date(Some("arm64-darwin")).await, None);
+    }
+
+    /// A055: a versions answer over the date-lookup cap gives no date instead of being read
+    /// whole.
+    #[tokio::test]
+    async fn a055_versions_answer_over_the_cap_gives_no_date() {
+        let upstream = MockServer::start().await;
+        let pad = "x".repeat(crate::registry::upstream_dates::MAX_BODY as usize);
+        Mock::given(method("GET"))
+            .and(path("/api/v1/versions/a055gem.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"number": "1.0.0", "platform": "ruby", "created_at": "2022-01-01T00:00:00Z", "pad": pad}
+            ])))
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|_| {});
+        let date = fetch_gems_date(&ctx.state, &upstream.uri(), "a055gem", "1.0.0", None).await;
+        assert_eq!(date, None);
     }
 }
 

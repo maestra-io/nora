@@ -33,6 +33,7 @@ pub(crate) mod raw;
 #[cfg(feature = "rpm")]
 pub(crate) mod rpm;
 pub(crate) mod terraform;
+mod upstream_dates;
 
 // Cross-registry regression suite for namespace isolation on metadata paths (#732).
 #[cfg(test)]
@@ -58,6 +59,7 @@ pub use helm::routes as helm_routes;
 pub use hf::routes as hf_routes;
 pub use maven::routes as maven_routes;
 pub use npm::routes as npm_routes;
+pub use upstream_dates::Memo as UpstreamDateMemo;
 
 // Storage-key builders reused by `nora import` so imported keys are
 // byte-identical to the keys these handlers serve — GC/retention/UI browse walk

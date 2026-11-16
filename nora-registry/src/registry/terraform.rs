@@ -1476,29 +1476,46 @@ fn terraform_upstream_is_official(state: &AppState) -> bool {
 /// registry.terraform.io `/v2` API, by version. The *standard* provider protocol
 /// exposes no date (neither `versions` nor `download/{os}/{arch}` carry one —
 /// verified against the live API), so this v2 endpoint is the only trusted source,
-/// and it only exists on the official registry. Any failure → `None`.
+/// and it only exists on the official registry. Any failure → `None`. One lookup per
+/// provider for `terraform.metadata_ttl`, shared by every route (`upstream_dates`).
 async fn fetch_terraform_registry_dates(
-    client: &reqwest::Client,
+    state: &AppState,
     ns: &str,
     ptype: &str,
-    timeout_secs: u64,
-) -> Option<std::collections::HashMap<String, i64>> {
+    wanted: &[&str],
+) -> Option<std::sync::Arc<std::collections::HashMap<String, i64>>> {
     let url = format!(
-        "https://registry.terraform.io/v2/providers/{}/{}?include=provider-versions",
+        "{TERRAFORM_REGISTRY}/v2/providers/{}/{}?include=provider-versions",
         ns, ptype
     );
-    let resp = client
-        .get(&url)
-        .timeout(Duration::from_secs(timeout_secs))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let json: serde_json::Value = resp.json().await.ok()?;
-    Some(parse_registry_dates(&json))
+    let timeout = Duration::from_secs(state.config.terraform.proxy_timeout);
+    let ttl = Duration::from_secs(state.config.terraform.metadata_ttl.max(0) as u64);
+    let fetching = state.clone();
+    super::upstream_dates::dates(
+        state,
+        RegistryType::Terraform,
+        &format!("{ns}/{ptype}"),
+        ttl,
+        wanted,
+        move || async move {
+            let body = super::upstream_dates::get(
+                &fetching,
+                RegistryType::Terraform,
+                TERRAFORM_REGISTRY,
+                &url,
+                timeout,
+            )
+            .await
+            .ok()?;
+            let json: serde_json::Value = serde_json::from_slice(&body).ok()?;
+            Some(parse_registry_dates(&json))
+        },
+    )
+    .await
 }
+
+/// The only Terraform upstream with a date API.
+const TERRAFORM_REGISTRY: &str = "https://registry.terraform.io";
 
 /// `version → published-at` (unix seconds) from a `/v2/providers/…?include=provider-versions` body.
 fn parse_registry_dates(json: &serde_json::Value) -> std::collections::HashMap<String, i64> {
@@ -1527,13 +1544,12 @@ fn parse_registry_dates(json: &serde_json::Value) -> std::collections::HashMap<S
 
 /// Release date of one provider version via [`fetch_terraform_registry_dates`].
 async fn fetch_terraform_registry_date(
-    client: &reqwest::Client,
+    state: &AppState,
     ns: &str,
     ptype: &str,
     ver: &str,
-    timeout_secs: u64,
 ) -> Option<i64> {
-    fetch_terraform_registry_dates(client, ns, ptype, timeout_secs)
+    fetch_terraform_registry_dates(state, ns, ptype, &[ver])
         .await?
         .get(ver)
         .copied()
@@ -1563,14 +1579,14 @@ async fn hide_young_versions(
     {
         return versions_json;
     }
-    let Some(dates) = fetch_terraform_registry_dates(
-        &state.http_client,
-        ns,
-        ptype,
-        state.config.terraform.proxy_timeout,
-    )
-    .await
-    else {
+    let listed: Vec<&str> = versions_json
+        .get("versions")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("version").and_then(|v| v.as_str()))
+        .collect();
+    let Some(dates) = fetch_terraform_registry_dates(state, ns, ptype, &listed).await else {
         return versions_json;
     };
     drop_hidden_versions(
@@ -1658,14 +1674,7 @@ async fn extract_terraform_publish_date(
             && state.config.server.trust_upstream_dates
             && terraform_upstream_is_official(state)
         {
-            return fetch_terraform_registry_date(
-                &state.http_client,
-                ns,
-                ptype,
-                ver,
-                state.config.terraform.proxy_timeout,
-            )
-            .await;
+            return fetch_terraform_registry_date(state, ns, ptype, ver).await;
         }
         return None;
     }
