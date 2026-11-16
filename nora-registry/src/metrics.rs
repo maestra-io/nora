@@ -90,6 +90,18 @@ pub static CURATION_MIN_AGE_ALLOWED_TOTAL: LazyLock<IntCounterVec> = LazyLock::n
     .expect("failed to create CURATION_MIN_AGE_ALLOWED_TOTAL metric at startup")
 });
 
+/// Downloads whose trusted release date stayed unknown and that `[curation.<registry>]
+/// unknown_date = "log"` left undated (min-release-age skipped them), by registry. The
+/// signal for switching a registry to `"hold"`.
+pub static CURATION_UNKNOWN_RELEASE_DATE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_curation_unknown_release_date_total",
+        "Downloads left undated by unknown_date = log (min-release-age skipped), by registry",
+        &["registry"]
+    )
+    .expect("failed to create CURATION_UNKNOWN_RELEASE_DATE_TOTAL metric at startup")
+});
+
 /// Internal-namespace requests refused by namespace isolation — the
 /// dependency-confusion defense firing: an internal name that was neither served
 /// from local storage nor proxied upstream (blocked / 404'd). Previously the guard

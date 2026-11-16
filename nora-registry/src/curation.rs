@@ -250,6 +250,42 @@ impl CurationEngine {
             .then(|| crate::cache_ttl::now_unix() as i64)
     }
 
+    /// The date min-release-age judges a proxied `registry` version by: `date`, or for one
+    /// still unknown with trusted upstream dates (every date source tried) on a registry held
+    /// to a release age, what `[curation.<registry>] unknown_date` makes of it: `hold` (NuGet's
+    /// default) gives [`Self::unknown_release_date`], `log` (every other registry's default)
+    /// leaves it undated, logs and counts it.
+    pub fn judged_release_date(
+        &self,
+        registry: RegistryType,
+        trust: bool,
+        date: Option<i64>,
+    ) -> Option<i64> {
+        if date.is_some() || !trust || !self.reads_release_date(registry) {
+            return date;
+        }
+        let mode = self
+            .config
+            .registry_override(registry)
+            .and_then(|own| own.unknown_date)
+            .unwrap_or(if registry == RegistryType::Nuget {
+                crate::config::UnknownDate::Hold
+            } else {
+                crate::config::UnknownDate::Log
+            });
+        if mode == crate::config::UnknownDate::Hold {
+            return self.unknown_release_date();
+        }
+        crate::metrics::CURATION_UNKNOWN_RELEASE_DATE_TOTAL
+            .with_label_values(&[registry.as_str()])
+            .inc();
+        tracing::warn!(
+            registry = %registry,
+            "[SECURITY] min-release-age unknown date: not held (unknown_date = \"log\")"
+        );
+        None
+    }
+
     /// Whether `name@version` has not logged its audit hiding line within
     /// [`AUDIT_HIDDEN_LOG_SECS`]; records it as logged now if so.
     fn first_audit_hidden_log(&self, registry: RegistryType, name: &str, version: &str) -> bool {
@@ -6784,6 +6820,55 @@ mod pypi_files_as_pip_reads_them {
         assert_eq!(
             parse_pypi_version(&project, "flask-1.0.tar.gz").as_deref(),
             Some("1.0")
+        );
+    }
+}
+
+#[cfg(test)]
+mod judged_release_date_tests {
+    use super::*;
+    use crate::config::UnknownDate;
+
+    fn engine(nuget: Option<UnknownDate>) -> CurationEngine {
+        let mut config = CurationConfig {
+            mode: CurationMode::Enforce,
+            ..Default::default()
+        };
+        config.nuget.unknown_date = nuget;
+        let mut engine = CurationEngine::new(config);
+        engine.set_min_release_age(MinReleaseAgeFilter::new(3 * 86400, "3d"));
+        engine
+    }
+
+    /// NuGet holds an unknown date by default, every other registry logs it; a section's
+    /// `unknown_date` decides; a known date, untrusted dates or no release age pass through.
+    #[test]
+    fn an_unknown_date_is_held_or_logged_per_registry() {
+        let held = engine(None);
+        let now = crate::cache_ttl::now_unix() as i64;
+        assert!(held
+            .judged_release_date(RegistryType::Nuget, true, None)
+            .is_some_and(|d| d >= now));
+        assert_eq!(held.judged_release_date(RegistryType::Go, true, None), None);
+        assert_eq!(
+            held.judged_release_date(RegistryType::Go, true, Some(7)),
+            Some(7)
+        );
+        assert_eq!(
+            held.judged_release_date(RegistryType::Nuget, false, None),
+            None
+        );
+        assert_eq!(
+            engine(Some(UnknownDate::Log)).judged_release_date(RegistryType::Nuget, true, None),
+            None
+        );
+        assert_eq!(
+            CurationEngine::new(CurationConfig::default()).judged_release_date(
+                RegistryType::Nuget,
+                true,
+                None
+            ),
+            None
         );
     }
 }

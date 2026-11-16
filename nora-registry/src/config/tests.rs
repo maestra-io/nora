@@ -5345,3 +5345,35 @@ mod proptest_trusted_proxies {
         }
     }
 }
+
+/// `[curation.<registry>] unknown_date` parses from TOML and env; a value other than
+/// hold/log is refused.
+#[test]
+fn test_curation_unknown_date_toml_and_env() {
+    let _lock = env_lock();
+    let toml = r#"
+            [curation.go]
+            unknown_date = "hold"
+        "#;
+    let mut config: Config = toml::from_str(toml).unwrap();
+    assert_eq!(config.curation.go.unknown_date, Some(UnknownDate::Hold));
+    assert_eq!(config.curation.nuget.unknown_date, None);
+
+    std::env::set_var("NORA_CURATION_GO_UNKNOWN_DATE", "LOG");
+    let applied = config.apply_env_overrides();
+    std::env::remove_var("NORA_CURATION_GO_UNKNOWN_DATE");
+    applied.unwrap();
+    assert_eq!(config.curation.go.unknown_date, Some(UnknownDate::Log));
+
+    std::env::set_var("NORA_CURATION_GO_UNKNOWN_DATE", "");
+    let applied = config.apply_env_overrides();
+    std::env::remove_var("NORA_CURATION_GO_UNKNOWN_DATE");
+    applied.unwrap();
+    assert_eq!(config.curation.go.unknown_date, None);
+
+    std::env::set_var("NORA_CURATION_GO_UNKNOWN_DATE", "open");
+    let applied = config.apply_env_overrides();
+    std::env::remove_var("NORA_CURATION_GO_UNKNOWN_DATE");
+    assert!(applied.unwrap_err().contains("hold, log"));
+    assert!(toml::from_str::<Config>("[curation.go]\nunknown_date = \"open\"").is_err());
+}
