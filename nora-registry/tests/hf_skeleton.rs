@@ -49,6 +49,8 @@ fn serve_in(dir: tempfile::TempDir, env: &[(&str, &str)]) -> Server {
             .env_remove("NORA_HF_ENABLED")
             .env_remove("NORA_HF_PROXY")
             .env_remove("NORA_REGISTRIES_ENABLE")
+            // The fixture upstreams listen on (and redirect to) loopback.
+            .env("NORA_ALLOW_PRIVATE_UPSTREAMS", "true")
             .env("NORA_HOST", "127.0.0.1")
             .env("NORA_PORT", port.to_string())
             .env("NORA_STORAGE_PATH", dir.path().join("data"))

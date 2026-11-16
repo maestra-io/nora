@@ -631,22 +631,35 @@ fn sanitize_proxy_url(url: &str) -> String {
     url.to_string()
 }
 
-/// Log detected outbound proxy configuration from environment variables.
-fn log_outbound_proxy() {
-    let vars = [
+/// The first outbound proxy variable set in the environment, with its value: reqwest sends
+/// every request through it.
+fn outbound_proxy_env() -> Option<(&'static str, String)> {
+    [
         "ALL_PROXY",
         "all_proxy",
         "HTTPS_PROXY",
         "https_proxy",
         "HTTP_PROXY",
         "http_proxy",
-    ];
-    for var in &vars {
-        if let Ok(val) = std::env::var(var) {
-            if !val.is_empty() {
-                info!(var = %var, proxy = %sanitize_proxy_url(&val), "Outbound proxy detected from environment");
-                break;
-            }
+    ]
+    .into_iter()
+    .find_map(|var| {
+        std::env::var(var)
+            .ok()
+            .filter(|val| !val.is_empty())
+            .map(|val| (var, val))
+    })
+}
+
+/// Log detected outbound proxy configuration from environment variables.
+fn log_outbound_proxy(allow_private_upstreams: bool) {
+    if let Some((var, val)) = outbound_proxy_env() {
+        info!(var = %var, proxy = %sanitize_proxy_url(&val), "Outbound proxy detected from environment");
+        if !allow_private_upstreams {
+            warn!(
+                "Outbound proxy set: NORA refuses redirect hops to loopback/private IP literals, \
+                 but host names are resolved by the proxy, which must refuse private destinations itself"
+            );
         }
     }
     let no_proxy = std::env::var("NO_PROXY")
@@ -669,12 +682,31 @@ const USER_AGENT: &str = concat!("nora/", env!("CARGO_PKG_VERSION"));
 /// (the healthcheck) that must reach the local server directly, not via an
 /// upstream proxy. `redirect` is reqwest's own default (`Policy::default()`) for
 /// every client but the one in [`build_no_redirect_client`].
+///
+/// Unless `allow_private` (`server.allow_private_upstreams` for the server's clients), the
+/// client never reaches a loopback, private, link-local or metadata address: a redirect hop to
+/// such an IP literal fails before `redirect` is asked, and, when no outbound proxy resolves
+/// names instead of NORA, a host name is connected only to the addresses of it outside those
+/// ranges ([`import::http::GuardedResolver`]). The initial URL is the operator's: an IP literal
+/// there is not checked.
 fn build_http_client(
     tls: &TlsConfig,
     timeout: Option<std::time::Duration>,
     no_proxy: bool,
     redirect: reqwest::redirect::Policy,
+    allow_private: bool,
 ) -> reqwest::Client {
+    let redirect = if allow_private {
+        redirect
+    } else {
+        reqwest::redirect::Policy::custom(move |attempt| {
+            if import::http::is_blocked_url_host(attempt.url().as_str(), false) {
+                attempt.error("redirect to a loopback/private address refused")
+            } else {
+                redirect.redirect(attempt)
+            }
+        })
+    };
     // A black-holed upstream fails the connect in seconds instead of eating the
     // whole per-request timeout (twice, with the proxy retry).
     // Idle pooled connections are dropped after 30 s, before the usual 60 s idle
@@ -692,6 +724,12 @@ fn build_http_client(
 
     if no_proxy {
         builder = builder.no_proxy();
+    }
+
+    if !allow_private && (no_proxy || outbound_proxy_env().is_none()) {
+        builder = builder.dns_resolver(std::sync::Arc::new(import::http::GuardedResolver::new(
+            false,
+        )));
     }
 
     if let Some(ref ca_path) = tls.ca_cert {
@@ -723,8 +761,27 @@ fn build_http_client(
 /// hop said (hf: the commit rides on the Hub's redirect). Built by [`build_http_client`]
 /// (custom CA, user agent, proxy settings); the test context builds it here too, so the
 /// tests run against the very client the server uses.
-pub(crate) fn build_no_redirect_client(tls: &TlsConfig) -> reqwest::Client {
-    build_http_client(tls, None, false, reqwest::redirect::Policy::none())
+pub(crate) fn build_no_redirect_client(tls: &TlsConfig, allow_private: bool) -> reqwest::Client {
+    build_http_client(
+        tls,
+        None,
+        false,
+        reqwest::redirect::Policy::none(),
+        allow_private,
+    )
+}
+
+/// The client every other upstream fetch, the token exchange and the JWKS fetches use: it
+/// follows up to reqwest's default ten redirects. Built by [`build_http_client`], here for the
+/// test context too.
+pub(crate) fn build_upstream_client(tls: &TlsConfig, allow_private: bool) -> reqwest::Client {
+    build_http_client(
+        tls,
+        None,
+        false,
+        reqwest::redirect::Policy::default(),
+        allow_private,
+    )
 }
 
 /// The client that follows a redirect only on the origin (scheme, host and port) of the URL
@@ -732,9 +789,67 @@ pub(crate) fn build_no_redirect_client(tls: &TlsConfig) -> reqwest::Client {
 /// in the path: a hop to another origin is handed back unfollowed, so that name and the request
 /// go to no host NORA was not given. Built by [`build_http_client`], here for the test context
 /// too.
-pub(crate) fn build_same_origin_client(tls: &TlsConfig) -> reqwest::Client {
-    build_http_client(tls, None, false, same_origin_redirects())
+pub(crate) fn build_same_origin_client(tls: &TlsConfig, allow_private: bool) -> reqwest::Client {
+    build_http_client(tls, None, false, same_origin_redirects(), allow_private)
 }
+
+/// The hosts the server fetches from on its own: every configured upstream
+/// ([`Config::upstream_hostnames`], which leaves out `localhost` and `127.0.0.1`) and the JWKS
+/// of each token issuer.
+fn outbound_hosts(config: &Config) -> Vec<String> {
+    let mut hosts: Vec<String> = config
+        .upstream_hostnames()
+        .into_iter()
+        .map(|(_, host)| host)
+        .collect();
+    let teleport = &config.auth.teleport;
+    let oidc = &config.auth.oidc;
+    let jwks = teleport
+        .enabled
+        .then_some(teleport.jwks_url.as_str())
+        .into_iter()
+        .chain(
+            oidc.providers
+                .iter()
+                .filter(|_| oidc.enabled)
+                .flat_map(|p| [Some(p.issuer.as_str()), p.jwks_uri.as_deref()])
+                .flatten(),
+        );
+    hosts.extend(
+        jwks.filter_map(|url| Some(reqwest::Url::parse(url).ok()?.host_str()?.to_string())),
+    );
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// Startup check behind `server.allow_private_upstreams = false`: warns about each host whose
+/// every address the server's clients refuse, so an internal upstream or JWKS that would now
+/// answer 502 is named with the switch that allows it. Returns the hosts warned about.
+/// The hosts are resolved concurrently.
+async fn warn_private_upstreams(hosts: Vec<String>) -> Vec<String> {
+    let checked = futures::future::join_all(hosts.into_iter().map(|host| async move {
+        let blocked = import::http::resolves_only_to_blocked(&host).await;
+        (host, blocked)
+    }))
+    .await;
+    let mut refused = Vec::new();
+    for (host, blocked) in checked {
+        if blocked {
+            warn!(
+                host = %host,
+                "Upstream host resolves only to loopback/private addresses and its fetches fail; \
+                 set server.allow_private_upstreams (NORA_ALLOW_PRIVATE_UPSTREAMS) to allow it"
+            );
+            refused.push(host);
+        }
+    }
+    refused
+}
+
+#[cfg(test)]
+#[path = "main_tests/outbound_guard_tests.rs"]
+mod outbound_guard_tests;
 
 /// Each redirect is decided by [`nora_registry::npm_links::next_hop`]: one the credential may go
 /// along is followed, one off the origin is handed back, and past the tenth the request fails.
@@ -790,11 +905,13 @@ async fn run_healthcheck(timeout_secs: u64) -> i32 {
     // Reuse the central HTTP client builder, but with no_proxy: a loopback probe
     // must reach the local server directly, never through an upstream HTTP proxy
     // (which would 502 the local address when HTTP_PROXY is set).
+    // Unguarded: the probe's target is the server's own loopback address.
     let client = build_http_client(
         &TlsConfig::default(),
         Some(std::time::Duration::from_secs(timeout_secs)),
         true,
         reqwest::redirect::Policy::default(),
+        true,
     );
     match client.get(&url).send().await {
         // /health returns 200 when healthy, 503 when storage is unreachable.
@@ -1243,11 +1360,13 @@ async fn main() {
             concurrency,
             json,
         }) => {
+            // Unguarded: an operator's CLI, whose `--registry` is usually a NORA on loopback.
             let client = build_http_client(
                 &config.tls,
                 Some(std::time::Duration::from_secs(300)),
                 false,
                 reqwest::redirect::Policy::default(),
+                true,
             );
             if let Err(e) = mirror::run_mirror(format, &registry, concurrency, json, &client).await
             {
@@ -1960,15 +2079,16 @@ async fn run_server(mut config: Config, storage: Storage) {
     // Warn about plaintext credentials in config.toml
     config.warn_plaintext_credentials();
 
-    let http_client = build_http_client(
-        &config.tls,
-        None,
-        false,
-        reqwest::redirect::Policy::default(),
-    );
-    let http_client_no_redirect = build_no_redirect_client(&config.tls);
-    let http_client_same_origin = build_same_origin_client(&config.tls);
-    log_outbound_proxy();
+    let allow_private = config.server.allow_private_upstreams;
+    let http_client = build_upstream_client(&config.tls, allow_private);
+    let http_client_no_redirect = build_no_redirect_client(&config.tls, allow_private);
+    let http_client_same_origin = build_same_origin_client(&config.tls, allow_private);
+    log_outbound_proxy(allow_private);
+    if !allow_private {
+        // Bounded, so a slow resolver cannot hold the start; the fetches report it anyway.
+        let check = warn_private_upstreams(outbound_hosts(&config));
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), check).await;
+    }
 
     // Initialize Docker auth with shared HTTP client (includes custom CA certs)
     let docker_auth = registry::DockerAuth::new(http_client.clone(), config.docker.proxy_timeout);
