@@ -158,7 +158,18 @@ pub fn validate_storage_key(key: &str) -> Result<(), ValidationError> {
 /// valid storage key on its own, so no empty, `.` or `..` segment either. Anything else would
 /// name another artifact's files.
 pub fn is_one_segment(name: &str) -> bool {
-    !name.contains('/') && validate_storage_key(name).is_ok()
+    !name.contains('/') && is_url_path_stable(name) && validate_storage_key(name).is_ok()
+}
+
+/// Whether `s`, a decoded request path or part of one, reaches an upstream URL as the same
+/// string: no ASCII control byte (the URL parser strips tab, LF and CR, so `.<TAB>.` turns into
+/// `..`), no space (trimmed at the ends) and no `#` or `?` (each ends the path). A proxy that
+/// judges a coordinate on `s` and formats `s` into the upstream URL needs this, or curation,
+/// the storage key and the upstream each read a different coordinate. Not part of
+/// [`validate_storage_key`]: raw and hosted keys may hold a space.
+pub fn is_url_path_stable(s: &str) -> bool {
+    !s.bytes()
+        .any(|b| b.is_ascii_control() || matches!(b, b' ' | b'#' | b'?'))
 }
 
 /// The storage key a listing prefix stands for: the prefix without the one `/` it may end
@@ -464,6 +475,10 @@ pub(crate) enum EdgeRefusal {
     NullByte,
     /// A `%` that one decode leaves in the path.
     DoubleEncoded,
+    /// An ASCII control byte other than NUL (`%01`-`%1F`, `%7F`), encoded or literal: the
+    /// upstream URL parser strips tab, LF and CR, so the name a handler judges is not the
+    /// one the upstream is asked for.
+    ControlByte,
 }
 
 impl EdgeRefusal {
@@ -472,6 +487,7 @@ impl EdgeRefusal {
         match self {
             Self::NullByte => "Bad Request: null byte in URL path",
             Self::DoubleEncoded => "Bad Request: double-encoded sequence in URL path",
+            Self::ControlByte => "Bad Request: control character in URL path",
         }
     }
 }
@@ -484,9 +500,28 @@ pub(crate) fn edge_refusal(path: &str) -> Option<EdgeRefusal> {
         Some(EdgeRefusal::NullByte)
     } else if !decodes_to_no_percent(path) {
         Some(EdgeRefusal::DoubleEncoded)
+    } else if has_control_byte(path) {
+        Some(EdgeRefusal::ControlByte)
     } else {
         None
     }
+}
+
+/// Whether `path` (raw) holds an ASCII control byte, literal or encoded once (`%09`, `%7f`).
+fn has_control_byte(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.iter().enumerate().any(|(at, &b)| {
+        b.is_ascii_control()
+            || (b == b'%'
+                && match bytes.get(at + 1..at + 3) {
+                    Some(&[high, low]) => match (high, low.to_ascii_uppercase()) {
+                        (b'0' | b'1', low) => low.is_ascii_hexdigit(),
+                        (b'7', b'F') => true,
+                        _ => false,
+                    },
+                    _ => false,
+                })
+    })
 }
 
 /// Whether `path` (raw, as it came in) holds no `%` once decoded: every `%` in
@@ -675,8 +710,35 @@ mod tests {
             "a\\b",
             "a\0b",
             "naïve",
+            "a\tb",
+            "a\nb",
+            "a\rb",
+            "a b",
+            "a#b",
+            "a?b",
+            ".\t.",
+            "requests#",
         ] {
             assert!(!is_one_segment(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_url_path_stable_string_has_no_byte_the_url_parser_reinterprets() {
+        for s in [
+            "v1.0.0",
+            "lib-1.0.jar",
+            "Foo-1.0.tar.gz",
+            "pool/main/g/gcc/gcc_12.2.0-14+deb12u1~bpo_amd64.deb",
+            "pool/main/s/sys/sys_1%3a2.0_amd64.deb",
+            "@scope/name",
+        ] {
+            assert!(is_url_path_stable(s), "{s}");
+        }
+        for s in [
+            "a\tb", "a\nb", "a\rb", "a b", "a#b", "a?b", ".\t.", "x\u{7f}", "x\u{1}", "x ",
+        ] {
+            assert!(!is_url_path_stable(s), "{s:?}");
         }
     }
 
@@ -1337,7 +1399,7 @@ mod encoding_guard_tests {
     /// cut-off escape (invariant 1). Null byte: literal, `%00` or `%2500`
     /// anywhere, ahead of the double-encoding reason (invariant 2).
     fn table() -> Vec<(String, Option<EdgeRefusal>)> {
-        use EdgeRefusal::{DoubleEncoded, NullByte};
+        use EdgeRefusal::{ControlByte, DoubleEncoded, NullByte};
         let mut rows: Vec<(String, Option<EdgeRefusal>)> = [
             ("/npm/lodash", None),
             ("/npm/@acme%2Fcore", None),
@@ -1378,6 +1440,20 @@ mod encoding_guard_tests {
             ("/x/%2500", Some(NullByte)),
             ("/npm/a%2500/b", Some(NullByte)),
             ("/npm/a\0b", Some(NullByte)),
+            ("/nuget/v3/flatcontainer/a%09b/1.0.0/x", Some(ControlByte)),
+            ("/go/example.com/a%0ab/@v/list", Some(ControlByte)),
+            ("/go/example.com/a%0Db/@v/list", Some(ControlByte)),
+            ("/cpan/authors/id/A%01/x", Some(ControlByte)),
+            ("/cpan/authors/id/A%1f/x", Some(ControlByte)),
+            ("/npm/x%7F", Some(ControlByte)),
+            ("/npm/x%7f", Some(ControlByte)),
+            ("/npm/a\tb", Some(ControlByte)),
+            ("/npm/%00%09", Some(NullByte)),
+            ("/npm/%2509", Some(DoubleEncoded)),
+            ("/npm/x%20y", None),
+            ("/npm/x%2e%2f", None),
+            ("/npm/x%7E%3a%23%3F", None),
+            ("/npm/x%0", Some(DoubleEncoded)),
         ]
         .into_iter()
         .map(|(path, verdict)| (path.to_string(), verdict))
@@ -1416,7 +1492,7 @@ mod encoding_guard_tests {
     #[tokio::test]
     async fn the_middleware_answers_the_verdict_for_every_method_before_the_handler() {
         for (path, verdict) in table() {
-            if path.contains('\0') {
+            if path.bytes().any(|b| b.is_ascii_control()) {
                 continue; // not a valid URI: hyper refuses it before any service
             }
             let uri = if path.is_empty() {

@@ -532,9 +532,12 @@ fn split_go_path(path: &str) -> Option<(String, String)> {
 
 /// Path validation: a Go proxy path is a valid storage key — no traversal, no null byte, and
 /// no empty segment anywhere: `a//b` and a trailing `/` (no Go proxy path ends in one) would
-/// name another module's file, and `x.zip/` is no longer a `.zip` to curation.
+/// name another module's file, and `x.zip/` is no longer a `.zip` to curation. Nor a byte the
+/// upstream URL parser reads differently (control, space, `#`, `?`): curation judges this
+/// string, and the upstream must be asked for the same one.
 fn is_safe_path(path: &str) -> bool {
-    crate::validation::validate_storage_key(path).is_ok()
+    crate::validation::is_url_path_stable(path)
+        && crate::validation::validate_storage_key(path).is_ok()
 }
 
 /// Content-Type for Go proxy responses
@@ -1310,6 +1313,44 @@ mod empty_segment_requests {
         }
         let sent = upstream_paths(&up).await;
         assert!(sent.is_empty(), "sent upstream: {sent:?}");
+    }
+
+    // A byte the upstream URL parser strips or reads as a delimiter (tab, LF, CR, `#`, `?`, a
+    // space) would let curation judge one module or version and the upstream serve another.
+    #[tokio::test]
+    async fn a_path_byte_the_url_parser_reinterprets_never_reaches_upstream() {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"EVIL-ZIP".to_vec()))
+            .mount(&up)
+            .await;
+        let (_dir, blocklist) = blocklist_file("go", "example.com/evil");
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.go.proxy = Some(up.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+        });
+        let control = "/go/example.com/evil/@v/v1.0.0.zip";
+        let resp = send(&ctx.app, Method::GET, control, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+        for uri in [
+            "/go/example.com/ev%09il/@v/v1.0.0.zip",
+            "/go/example.com/ev%0Ail/@v/v1.0.0.zip",
+            "/go/example.com/ev%0Dil/@v/v1.0.0.zip",
+            "/go/example.com/evil%20/@v/v1.0.0.zip",
+            "/go/example.com/evil/@v/v1.0.0.zip%23x.zip",
+            "/go/example.com/evil/@v/v1.0.0.zip%3Fx.zip",
+            "/go/a/.%09./example.com/evil/@v/v1.0.0.zip",
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        let sent = upstream_paths(&up).await;
+        assert!(sent.is_empty(), "sent upstream: {sent:?}");
+        // A plain module still reaches the upstream.
+        let resp = send(&ctx.app, Method::GET, "/go/example.com/good/@v/list", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(upstream_paths(&up).await, ["/example.com/good/@v/list"]);
     }
 }
 

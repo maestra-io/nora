@@ -378,3 +378,76 @@ async fn a_bulk_audit_is_refused_while_the_store_cannot_tell_what_is_published()
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(asked(&upstream).await, Vec::<String>::new());
 }
+
+/// A tarball belongs to a package `pkg` or `@scope/pkg`: a deeper name (`pkg/versions`) is
+/// refused before any upstream request or cache write, so nothing lands under another
+/// package's `versions/`. A key nested under `versions/` that is already there is no
+/// version of that package and does not make it published.
+#[tokio::test]
+async fn a_tarball_under_a_nested_name_writes_nothing_under_another_package() {
+    let upstream = recording_upstream().await;
+    let uri = upstream.uri();
+    let ctx = create_test_context_with_config(move |c| {
+        c.npm.proxy = Some(uri);
+    });
+    for path in [
+        "/npm/dummy/versions/-/versions-1.0.0.tgz",
+        "/npm/@scope/dummy/versions/-/versions-1.0.0.tgz",
+        "/npm/@scope/-/scope-1.0.0.tgz",
+    ] {
+        let resp = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+    assert!(asked(&upstream).await.is_empty());
+    for prefix in ["npm/dummy/versions/", "npm/@scope/dummy/versions/"] {
+        assert!(ctx.state.storage.list(prefix).await.unwrap().is_empty());
+    }
+    // The package `-` and a scoped name still reach the tarball path.
+    for path in ["/npm/-/-/--1.0.0.tgz", "/npm/@scope/pkg/-/pkg-1.0.0.tgz"] {
+        let resp = send(&ctx.app, Method::GET, path, "").await;
+        assert_ne!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+
+    ctx.state
+        .storage
+        .put("npm/stray/versions/upstream/packument.json", b"{}")
+        .await
+        .unwrap();
+    assert!(matches!(
+        super::published_state(&ctx.state.storage, "stray").await,
+        super::Published::No
+    ));
+    publish(&ctx, "stray", "1.0.0").await;
+    match super::published_state(&ctx.state.storage, "stray").await {
+        super::Published::Yes(versions) => {
+            assert_eq!(versions.into_iter().collect::<Vec<_>>(), ["1.0.0"]);
+        }
+        _ => panic!("stray 1.0.0 is published"),
+    }
+}
+
+/// A name byte the upstream URL parser strips or reads as a delimiter (control, space, `#`,
+/// `?`) would let curation judge one package and the upstream serve another: refused.
+#[tokio::test]
+async fn a_path_byte_the_url_parser_reinterprets_never_reaches_upstream() {
+    let upstream = recording_upstream().await;
+    let uri = upstream.uri();
+    let ctx = create_test_context_with_config(move |c| {
+        c.npm.proxy = Some(uri);
+        c.curation.internal_namespaces = vec!["internalpkg".to_string()];
+    });
+    for path in [
+        "/npm/internal%09pkg",
+        "/npm/internal%0Apkg",
+        "/npm/internal%0Dpkg",
+        "/npm/internalpkg%20",
+        "/npm/x%23",
+        "/npm/x%3Fy",
+        "/npm/internal%09pkg/-/internalpkg-1.0.0.tgz",
+        "/npm/x/-/x-1.0.0.tgz%23",
+    ] {
+        let resp = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+    assert!(asked(&upstream).await.is_empty());
+}

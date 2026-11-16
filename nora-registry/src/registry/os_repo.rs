@@ -113,7 +113,13 @@ pub(super) async fn download<F: OsRepo>(
     // configured upstream. Packages are immutable; metadata is TTL-bounded.
     if let Some(entry) = settings.proxies.get(&repo) {
         let key = F::package_key(&repo, &path);
-        if validate_storage_key(&key).is_err() || path.starts_with(META_DIR) {
+        // The path goes into the upstream URL as written: a byte the URL parser strips or
+        // reads as a delimiter (control, space, `#`, `?`) would let the package gate and the
+        // package class judge another file than the one the upstream serves.
+        if validate_storage_key(&key).is_err()
+            || path.starts_with(META_DIR)
+            || !crate::validation::is_url_path_stable(&path)
+        {
             return StatusCode::BAD_REQUEST.into_response();
         }
         let immutable = F::is_package(&path.to_ascii_lowercase());
@@ -261,10 +267,23 @@ pub(super) fn write_preflight<F: OsRepo>(
     if settings.proxies.contains_key(repo) {
         return Err(proxied_repo_conflict());
     }
+    // Both go verbatim into the generated indexes (`Label:`, `Filename:`): a line break
+    // there would add fields and stanzas of its own.
+    if has_control(repo) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid repository name").into_response());
+    }
+    if has_control(path) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid path").into_response());
+    }
     if let Err(msg) = F::validate_package_path(repo, path) {
         return Err((StatusCode::BAD_REQUEST, msg).into_response());
     }
     Ok(())
+}
+
+/// Whether `s` holds an ASCII control byte (tab, line feed, carriage return, ...).
+pub(super) fn has_control(s: &str) -> bool {
+    s.bytes().any(|b| b.is_ascii_control())
 }
 
 /// PUT after [`write_preflight`] and the format's own query checks: namespace
@@ -426,7 +445,12 @@ pub(super) async fn reindex<F: OsRepo>(
     if !settings.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if repo.is_empty() || !repo.is_ascii() || repo.contains('/') || repo.starts_with('.') {
+    if repo.is_empty()
+        || !repo.is_ascii()
+        || repo.contains('/')
+        || repo.starts_with('.')
+        || has_control(&repo)
+    {
         return (StatusCode::BAD_REQUEST, "Invalid repository name").into_response();
     }
     if settings.proxies.contains_key(&repo) {
@@ -461,7 +485,10 @@ pub(super) async fn reindex<F: OsRepo>(
                 sidecars.insert(pkg.to_string());
             }
         } else if let Some(rest) = key.strip_prefix(&prefix) {
-            if F::is_stored_package(rest) {
+            if has_control(rest) {
+                // Its name would go into the index as written; a publish refuses it.
+                tracing::warn!(repo = %repo, key = %key.escape_debug(), "{name} reindex: skipping a key with a control character");
+            } else if F::is_stored_package(rest) {
                 packages.insert(rest.to_string());
             }
         }

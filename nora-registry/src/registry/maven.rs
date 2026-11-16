@@ -456,8 +456,13 @@ async fn download(
 ) -> Response {
     let key = storage_key(&path);
     // A path with an empty segment names another artifact's file and must not reach
-    // curation, storage or an upstream (which may normalise it to that artifact).
-    if crate::validation::validate_storage_key(&key).is_err() {
+    // curation, storage or an upstream (which may normalise it to that artifact). So does a
+    // byte the upstream URL parser strips or reads as a delimiter (control, space, `#`, `?`):
+    // curation would judge one GAV and the upstream serve another.
+    if !crate::validation::is_url_path_stable(&path)
+        || crate::validation::validate_storage_key(&key).is_err()
+    {
+        tracing::debug!(path = %path.escape_debug(), "Maven: invalid path");
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
     }
 
