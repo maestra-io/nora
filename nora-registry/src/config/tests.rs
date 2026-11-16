@@ -5377,3 +5377,80 @@ fn test_curation_unknown_date_toml_and_env() {
     assert!(applied.unwrap_err().contains("hold, log"));
     assert!(toml::from_str::<Config>("[curation.go]\nunknown_date = \"open\"").is_err());
 }
+
+/// Audit B23: OIDC issuer and jwks_uri and the Teleport jwks_url are trust anchors for
+/// token keys. Plain http off loopback is refused at startup; https and loopback pass.
+#[test]
+fn auth_key_urls_must_be_https_or_loopback() {
+    let _lock = env_lock();
+    let about_https = |errors: &[String]| -> Vec<String> {
+        errors
+            .iter()
+            .filter(|e| e.contains("https://"))
+            .cloned()
+            .collect()
+    };
+    let oidc = |issuer: &str, jwks: &str| -> Config {
+        toml::from_str(&format!(
+            "[auth]\nenabled = true\n[auth.oidc]\nenabled = true\n\
+             [[auth.oidc.providers]]\nname = \"gh\"\nissuer = \"{issuer}\"\n\
+             audience = \"nora\"\n{jwks}\n"
+        ))
+        .unwrap()
+    };
+
+    let (_, errors) = oidc("http://idp.example", "").validate_with_config_path(None);
+    let refused = about_https(&errors);
+    assert_eq!(refused.len(), 1, "{errors:#?}");
+    assert!(refused[0].contains("\"gh\"") && refused[0].contains("issuer"));
+
+    let (_, errors) = oidc(
+        "https://idp.example",
+        "jwks_uri = \"http://idp.example/keys\"",
+    )
+    .validate_with_config_path(None);
+    let refused = about_https(&errors);
+    assert_eq!(refused.len(), 1, "{errors:#?}");
+    assert!(refused[0].contains("jwks_uri"));
+
+    for (issuer, jwks) in [
+        ("https://token.actions.githubusercontent.com", ""),
+        (
+            "http://127.0.0.1:1234",
+            "jwks_uri = \"http://[::1]:1/keys\"",
+        ),
+        ("http://localhost:8080", ""),
+    ] {
+        let (_, errors) = oidc(issuer, jwks).validate_with_config_path(None);
+        assert!(about_https(&errors).is_empty(), "{issuer}: {errors:#?}");
+    }
+    // Not a URL, or another scheme: refused.
+    for issuer in ["idp.example", "ftp://idp.example", "https://"] {
+        let (_, errors) = oidc(issuer, "").validate_with_config_path(None);
+        assert_eq!(about_https(&errors).len(), 1, "{issuer}: {errors:#?}");
+    }
+    // A disabled provider is not checked.
+    let mut config = oidc("http://idp.example", "");
+    config.auth.oidc.providers[0].enabled = false;
+    assert!(about_https(&config.validate_with_config_path(None).1).is_empty());
+
+    let mut config = Config::default();
+    config.auth.teleport.enabled = true;
+    config.auth.teleport.jwks_url = "http://tp.example/.well-known/jwks.json".to_string();
+    let (_, errors) = config.validate_with_config_path(None);
+    let refused = about_https(&errors);
+    assert_eq!(refused.len(), 1, "{errors:#?}");
+    assert!(refused[0].contains("auth.teleport.jwks_url"));
+    for ok in [
+        "https://teleport.example.com/.well-known/jwks.json",
+        "http://127.0.0.1:3080/.well-known/jwks.json",
+        "",
+    ] {
+        config.auth.teleport.jwks_url = ok.to_string();
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(about_https(&errors).is_empty(), "{ok}: {errors:#?}");
+    }
+    config.auth.teleport.enabled = false;
+    config.auth.teleport.jwks_url = "http://tp.example/jwks".to_string();
+    assert!(about_https(&config.validate_with_config_path(None).1).is_empty());
+}

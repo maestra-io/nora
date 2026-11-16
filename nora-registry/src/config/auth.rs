@@ -352,7 +352,8 @@ pub struct AuthConfig {
 pub struct TeleportConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// The proxy's JWKS (`https://<proxy>/.well-known/jwks.json`).
+    /// The proxy's JWKS (`https://<proxy>/.well-known/jwks.json`). https://
+    /// only (http:// on a loopback host).
     #[serde(default)]
     pub jwks_url: String,
     /// Expected `iss`: the Teleport cluster name.
@@ -554,7 +555,8 @@ impl OidcConfig {
 pub struct OidcProvider {
     /// Human-readable name for logs/debugging
     pub name: String,
-    /// OIDC issuer URL (must match `iss` claim exactly)
+    /// OIDC issuer URL (must match `iss` claim exactly). https:// only
+    /// (http:// on a loopback host), like `jwks_uri`.
     pub issuer: String,
     /// Explicit JWKS URI override. If not set, NORA discovers it via
     /// `{issuer}/.well-known/openid-configuration`. Use when the provider's
@@ -638,7 +640,10 @@ impl OidcProvider {
 /// Maps a subject pattern to a NORA role.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OidcRoleRule {
-    /// Glob pattern matched against the JWT `sub` claim
+    /// Glob pattern matched against the JWT `sub` claim, whose fields are
+    /// `:`-separated. A `*` that ends the pattern matches the rest of the
+    /// subject, `:` included; any other `*` matches within one field only, so
+    /// `repo:org/*:ref:refs/heads/main` names a repo, never extra fields.
     pub pattern: String,
     /// Role to assign: "read", "write", or "admin"
     pub role: String,
