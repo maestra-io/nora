@@ -15,7 +15,7 @@ tests:
     asserts:
       - matchRegex:
           path: data["config.toml"]
-          pattern: '\[server\]\nhost = "0\.0\.0\.0"\nport = 4000\npublic_url = "https://packages\.maestra\.io"\nbody_limit_mb = 256\ninternal_port = 9100\nspool_dir = "/spool"\nspool_max_mb = 3584\ntrust_upstream_dates = true\n'
+          pattern: '\[server\]\nhost = "0\.0\.0\.0"\nport = 4000\npublic_url = "https://packages\.maestra\.io"\nbody_limit_mb = 256\ninternal_port = 9100\nspool_dir = "/spool"\nspool_max_mb = 3584\nteleport_port = 4001\ntrust_upstream_dates = true\n'
       - matchRegex:
           path: data["config.toml"]
           pattern: '\[registries\]\nenable = \["nuget", "npm", "pypi", "docker"\]\n'
@@ -70,11 +70,24 @@ tests:
           path: spec.ingress[1].toPorts[0].ports[0].port
           value: "4000"
       - equal:
+          path: spec.ingress[1].toPorts[0].ports[1].port
+          value: "4001"
+      - equal:
           path: spec.ingress[2].fromEndpoints[0].matchLabels["app.kubernetes.io/name"]
           value: vmagent
       - equal:
           path: spec.ingress[2].toPorts[0].ports[0].port
           value: "9100"
+
+  - it: exposes the Teleport listener as containerPort teleport (audit A007)
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: teleport
+            containerPort: 4001
+            protocol: TCP
 
   - it: passes the Docker Hub credential from its Secret, never through the ConfigMap
     template: templates/deployment.yaml

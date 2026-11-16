@@ -209,6 +209,28 @@ tests:
           path: spec.template.spec.containers[0].livenessProbe.httpGet.port
           value: http
 
+  - it: exposes the Teleport port only when config.server.teleport_port is set
+    template: templates/deployment.yaml
+    set:
+      config.server.teleport_port: 4001
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: teleport
+            containerPort: 4001
+            protocol: TCP
+
+  - it: has no Teleport port by default
+    template: templates/deployment.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: teleport
+            containerPort: 4001
+            protocol: TCP
+
   - it: mounts custom htpasswd secret key
     template: templates/deployment.yaml
     set:

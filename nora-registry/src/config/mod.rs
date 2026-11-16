@@ -1165,6 +1165,25 @@ impl Config {
                 errors.push("server.internal_port must not be 0 nor equal server.port".to_string());
             }
         }
+        if let Some(teleport) = self.server.teleport_port {
+            if teleport == 0
+                || teleport == self.server.port
+                || Some(teleport) == self.server.internal_port
+            {
+                errors.push(
+                    "server.teleport_port must not be 0 nor equal server.port or server.internal_port"
+                        .to_string(),
+                );
+            }
+        }
+        if self.auth.teleport.enabled
+            && !self.auth.teleport.accept_on_main_port
+            && self.server.teleport_port.is_none()
+        {
+            errors.push(
+                "auth.teleport.accept_on_main_port = false needs server.teleport_port".to_string(),
+            );
+        }
 
         // 1a. Connection limits: a zero would close every connection at once or accept none.
         for (key, value) in [

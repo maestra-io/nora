@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 const SOURCE: &str = include_str!("../main.rs");
 
 /// The tasks the server runs, by the name they are supervised under.
-const SUPERVISED: [&str; 7] = [
+const SUPERVISED: [&str; 8] = [
     "cleanup",
     "internal_listener",
     "maintenance",
@@ -18,6 +18,7 @@ const SUPERVISED: [&str; 7] = [
     "quarantine_exceptions",
     "repo_index",
     "sighup",
+    "teleport_listener",
 ];
 
 /// Spawns in that code that are not long-lived, by the function they are in: the task of

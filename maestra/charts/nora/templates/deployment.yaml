@@ -82,6 +82,11 @@ spec:
               containerPort: {{ . }}
               protocol: TCP
             {{- end }}
+            {{- with .Values.config.server.teleport_port }}
+            - name: teleport
+              containerPort: {{ . }}
+              protocol: TCP
+            {{- end }}
           startupProbe:
             httpGet:
               path: /health

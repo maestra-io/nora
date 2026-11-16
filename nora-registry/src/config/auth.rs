@@ -373,6 +373,11 @@ pub struct TeleportConfig {
     /// challenge (no password dialog).
     #[serde(default)]
     pub require_for_ui: bool,
+    /// Also honour the header on `server.port`, not only on `server.teleport_port`.
+    /// Default true for the switch-over release: turn it off once the Teleport app
+    /// targets `teleport_port`.
+    #[serde(default = "super::default_true")]
+    pub accept_on_main_port: bool,
     #[serde(default = "default_oidc_leeway")]
     pub leeway_secs: u64,
     #[serde(default = "default_teleport_jwks_cache_secs")]
@@ -389,6 +394,7 @@ impl Default for TeleportConfig {
             trusted_proxies: no_peers(),
             write_roles: Vec::new(),
             require_for_ui: false,
+            accept_on_main_port: true,
             leeway_secs: default_oidc_leeway(),
             jwks_cache_secs: default_teleport_jwks_cache_secs(),
         }
@@ -423,6 +429,9 @@ impl TeleportConfig {
         }
         if let Ok(val) = env::var("NORA_AUTH_TELEPORT_REQUIRE_FOR_UI") {
             self.require_for_ui = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_AUTH_TELEPORT_ACCEPT_ON_MAIN_PORT") {
+            self.accept_on_main_port = val.to_lowercase() == "true" || val == "1";
         }
         if let Ok(val) = env::var("NORA_AUTH_TELEPORT_LEEWAY_SECS") {
             super::parse_env_warn(
@@ -943,6 +952,7 @@ mod tests {
             ("NORA_AUTH_TELEPORT_REQUIRE_FOR_UI", "1"),
             ("NORA_AUTH_TELEPORT_LEEWAY_SECS", "30"),
             ("NORA_AUTH_TELEPORT_JWKS_CACHE_SECS", "120"),
+            ("NORA_AUTH_TELEPORT_ACCEPT_ON_MAIN_PORT", "false"),
         ];
         for (k, v) in vars {
             std::env::set_var(k, v);
@@ -963,6 +973,8 @@ mod tests {
         assert!(t.require_for_ui);
         assert_eq!(t.leeway_secs, 30);
         assert_eq!(t.jwks_cache_secs, 120);
+        assert!(!t.accept_on_main_port);
+        assert!(AuthConfig::default().teleport.accept_on_main_port);
     }
 
     #[test]

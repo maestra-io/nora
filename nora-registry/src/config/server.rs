@@ -80,6 +80,12 @@ pub struct ServerConfig {
     /// `NORA_INTERNAL_PORT=0` unsets it.
     #[serde(default)]
     pub internal_port: Option<u16>,
+    /// Port of a listener (same `host`) for the Teleport app agent. It serves the same
+    /// routes as `port` but never trusts X-Forwarded-For / X-Real-IP (the client address
+    /// is the TCP peer), and it is the port where `auth.teleport` reads the identity
+    /// header. Default unset; `NORA_TELEPORT_PORT=0` unsets it.
+    #[serde(default)]
+    pub teleport_port: Option<u16>,
     /// Maximum body in MB of a publish that is buffered in memory (npm, Maven,
     /// Cargo, deb, rpm); a bigger one is answered 413. Bounded by `body_limit_mb`.
     /// Streamed uploads (Docker blobs, raw, NuGet push, PyPI upload) have their own
@@ -231,6 +237,7 @@ impl Default for ServerConfig {
             trust_upstream_dates: default_trust_upstream_dates(),
             allow_private_upstreams: false,
             internal_port: None,
+            teleport_port: None,
             publish_body_limit_mb: default_publish_body_limit_mb(),
             publish_inflight_mb: default_publish_inflight_mb(),
             stream_threshold_mb: default_stream_threshold_mb(),
@@ -380,6 +387,12 @@ impl ServerConfig {
             super::parse_env_warn("NORA_INTERNAL_PORT", &val, &mut port);
             self.internal_port = (port > 0).then_some(port);
         }
+        if let Ok(val) = env::var("NORA_TELEPORT_PORT") {
+            // 0 = off.
+            let mut port = self.teleport_port.unwrap_or(0);
+            super::parse_env_warn("NORA_TELEPORT_PORT", &val, &mut port);
+            self.teleport_port = (port > 0).then_some(port);
+        }
         if let Ok(val) = env::var("NORA_KEEP_ALIVE_TIMEOUT") {
             super::parse_env_warn(
                 "NORA_KEEP_ALIVE_TIMEOUT",
@@ -497,6 +510,15 @@ mod tests {
         config.apply_env_overrides();
         std::env::remove_var("NORA_INTERNAL_PORT");
         assert_eq!(config.internal_port, Some(9100));
+        assert_eq!(defaults.teleport_port, None);
+        std::env::set_var("NORA_TELEPORT_PORT", "4001");
+        config.apply_env_overrides();
+        std::env::set_var("NORA_TELEPORT_PORT", "0");
+        let mut off = config.clone();
+        off.apply_env_overrides();
+        std::env::remove_var("NORA_TELEPORT_PORT");
+        assert_eq!(config.teleport_port, Some(4001));
+        assert_eq!(off.teleport_port, None);
     }
 
     /// The upstream clients refuse private addresses unless the operator allows them.

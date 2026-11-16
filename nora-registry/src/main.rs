@@ -2507,35 +2507,8 @@ async fn run_server(mut config: Config, storage: Storage) {
         });
     }
 
-    // Maestra: detailed /health and /metrics on an internal port, off the public hostname.
-    // Bound here, so a taken port fails the start; served under the supervisor from a
-    // clone of that socket, so a restart after a panic serves the same port.
-    if let Some(port) = state.config.server.internal_port {
-        let internal_listener = bind_listener(&state.config.server.host, port)
-            .await
-            .and_then(|l| l.into_std())
-            .expect("Failed to bind server.internal_port");
-        info!(port, "Internal listener: /health, /ready, /metrics");
-        let internal = health::internal_routes().with_state(state.clone());
-        let limits = ConnLimits::from_config(&state.config.server);
-        let stop = cancel_token.clone();
-        state.tasks.spawn("internal_listener", move || {
-            let (internal, stop) = (internal.clone(), stop.clone());
-            let listener = internal_listener
-                .try_clone()
-                .and_then(tokio::net::TcpListener::from_std);
-            async move {
-                let listener = listener.expect("clone server.internal_port listener");
-                let drain = std::time::Duration::from_secs(1);
-                if let Err(e) =
-                    serve_with_drain(listener, internal, stop.cancelled_owned(), drain, limits)
-                        .await
-                {
-                    error!(error = %e, "internal listener failed");
-                }
-            }
-        });
-    }
+    // Maestra: the internal and Teleport listeners, bound here so a taken port fails the start.
+    spawn_side_listeners(&state, &app).await;
 
     // Graceful shutdown on SIGTERM/SIGINT, draining for at most `shutdown_timeout` (#1016)
     let drain = std::time::Duration::from_secs(state.config.server.shutdown_timeout);
@@ -2972,6 +2945,103 @@ mod server_supervision_tests;
 #[allow(clippy::unwrap_used)]
 #[path = "main_tests/maintenance_storage_tests.rs"]
 mod maintenance_storage_tests;
+
+/// Bind and spawn the side listeners `server` asks for; returns their addresses
+/// (internal, Teleport).
+/// - `internal_port`: detailed /health and /metrics, off the public hostname.
+/// - `teleport_port`: the Teleport app agent's own listener. Same routes as `app`, but
+///   X-Forwarded-For and X-Real-IP are dropped before anything reads them, so the client
+///   address is the agent's TCP peer, and auth.teleport reads the identity header here
+///   (auth/teleport.rs).
+async fn spawn_side_listeners(
+    state: &AppState,
+    app: &Router,
+) -> (Option<std::net::SocketAddr>, Option<std::net::SocketAddr>) {
+    let server = &state.config.server;
+    let limits = ConnLimits::from_config(server);
+    let mut internal = None;
+    if let Some(port) = server.internal_port {
+        let routes = health::internal_routes().with_state(state.clone());
+        let stop = state.cancel_token.clone();
+        let (addr, serve) = side_listener(
+            "server.internal_port",
+            &server.host,
+            port,
+            routes,
+            stop,
+            limits,
+        )
+        .await;
+        info!(port, "Internal listener: /health, /ready, /metrics");
+        state.tasks.spawn("internal_listener", serve);
+        internal = Some(addr);
+    }
+    let mut teleport = None;
+    if let Some(port) = server.teleport_port {
+        let routes = app.clone().layer(middleware::map_request(
+            auth::teleport::mark_teleport_listener,
+        ));
+        let stop = state.cancel_token.clone();
+        let (addr, serve) = side_listener(
+            "server.teleport_port",
+            &server.host,
+            port,
+            routes,
+            stop,
+            limits,
+        )
+        .await;
+        info!(port, "Teleport listener: forwarding headers ignored");
+        state.tasks.spawn("teleport_listener", serve);
+        teleport = Some(addr);
+    }
+    (internal, teleport)
+}
+
+/// Bind a side listener (internal, Teleport) on `host:port`, so a taken port fails the
+/// start, and return its address and the supervised task serving `app` there until `stop`.
+/// Each run serves a clone of that socket, so a restart after a panic serves the same port.
+async fn side_listener(
+    what: &'static str,
+    host: &str,
+    port: u16,
+    app: Router,
+    stop: tokio_util::sync::CancellationToken,
+    limits: ConnLimits,
+) -> (
+    std::net::SocketAddr,
+    impl FnMut() -> futures::future::BoxFuture<'static, ()> + Send + 'static,
+) {
+    let listener = bind_listener(host, port)
+        .await
+        .and_then(|l| l.into_std())
+        .unwrap_or_else(|e| panic!("Failed to bind {what}: {e}"));
+    let addr = listener
+        .local_addr()
+        .unwrap_or_else(|e| panic!("{what} address: {e}"));
+    let serve = move || {
+        let (app, stop) = (app.clone(), stop.clone());
+        let listener = listener
+            .try_clone()
+            .and_then(tokio::net::TcpListener::from_std);
+        async move {
+            let listener = listener.unwrap_or_else(|e| panic!("clone {what} listener: {e}"));
+            let drain = std::time::Duration::from_secs(1);
+            if let Err(e) =
+                serve_with_drain(listener, app, stop.cancelled_owned(), drain, limits).await
+            {
+                error!(error = %e, listener = what, "side listener failed");
+            }
+        }
+        .boxed()
+    };
+    (addr, serve)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "main_tests/side_listener_tests.rs"]
+mod side_listener_tests;
 
 /// How serving ended after the shutdown signal.
 #[derive(Debug, PartialEq, Eq)]

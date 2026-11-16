@@ -63,6 +63,9 @@ config:
     # Detailed /health and /metrics only on this port (R2-53): the ServiceMonitor
     # scrapes it, the vmagent ingress rule below admits it; probes stay on 4000.
     internal_port: 9100
+    # The Teleport app agent's own port: it sits in trusted_proxies (pod pool),
+    # so it gets a listener that never trusts X-Forwarded-For / X-Real-IP.
+    teleport_port: 4001
 
   registries:
     enable: ["nuget", "npm", "pypi", "docker"]
@@ -121,7 +124,8 @@ config:
     # addresses in the pod pool (one per node, not pinned across node
     # rebuilds), hence the whole pod CIDR. networkPolicy below admits only
     # traefik (host/remote-node), vmagent and the Teleport agent, so no other
-    # pod can reach nora to spoof X-Forwarded-For.
+    # pod can reach nora to spoof X-Forwarded-For; the agent's own port
+    # (server.teleport_port) ignores it.
     trusted_proxies:
       - 10.60.8.0/24
       - 10.62.0.0/16
@@ -230,9 +234,12 @@ networkPolicy:
             k8s:io.kubernetes.pod.namespace: teleport-maestra-agent
             io.cilium.k8s.policy.cluster: us-iota-lw-kube-infra
             app: teleport-maestra-agent
+      # 4000 until the Teleport app Service targets `teleport` (4001).
       toPorts:
         - ports:
             - port: "4000"
+              protocol: TCP
+            - port: "4001"
               protocol: TCP
     - fromEndpoints:
         - matchLabels:

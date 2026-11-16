@@ -8,6 +8,11 @@
 //! `auth.teleport.trusted_proxies`, nora verifies it against the proxy JWKS and
 //! takes `username` as the identity; `roles` ∩ `write_roles` decides write vs read.
 //! Registry paths never look at the header: they keep token / OIDC auth.
+//!
+//! The agent is served on its own listener (`server.teleport_port`), which never
+//! trusts forwarding headers: `mark_teleport_listener` drops X-Forwarded-For and
+//! X-Real-IP there, so the client address (limiter key, logged client_ip) is the
+//! agent's TCP peer, never a value a Teleport user sent.
 
 use axum::{
     body::Body,
@@ -42,6 +47,20 @@ struct Claims {
     username: String,
     #[serde(default)]
     roles: Vec<String>,
+}
+
+/// Request extension: the request arrived on `server.teleport_port`.
+#[derive(Debug, Clone, Copy)]
+pub struct TeleportListener;
+
+/// Outermost layer of the Teleport listener: drop the forwarding headers (the
+/// client address falls back to the TCP peer) and mark the request.
+pub async fn mark_teleport_listener(mut request: Request<Body>) -> Request<Body> {
+    let headers = request.headers_mut();
+    headers.remove("x-forwarded-for");
+    headers.remove("x-real-ip");
+    request.extensions_mut().insert(TeleportListener);
+    request
 }
 
 pub struct TeleportValidator {
@@ -89,11 +108,18 @@ impl TeleportValidator {
         }
     }
 
-    /// The `Teleport-Jwt-Assertion` value, when a trusted peer sent one.
+    /// The `Teleport-Jwt-Assertion` value, when a trusted peer sent one on the
+    /// Teleport listener (or on any port while `accept_on_main_port`).
     /// Returned owned: `Request<Body>` is not `Sync`, so it cannot be held
     /// across the verification await.
     pub fn trusted_header(&self, request: &Request<Body>) -> Option<String> {
         let jwt = request.headers().get(HEADER)?.to_str().ok()?;
+        if !self.config.accept_on_main_port
+            && request.extensions().get::<TeleportListener>().is_none()
+        {
+            tracing::warn!("Teleport-Jwt-Assertion outside server.teleport_port ignored");
+            return None;
+        }
         let peer = request
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()
@@ -797,6 +823,55 @@ AJvDZc4Bbdm5PNsOvQZYEIacnJLnu7vP0RqnkhSbTJ0lRhSmCMjFDCjQ
         let resp = ctx.app.clone().oneshot(req).await.unwrap();
         assert_ne!(resp.status(), StatusCode::FORBIDDEN);
         assert!(resp.status().is_success(), "{}", resp.status());
+    }
+
+    /// The header from a trusted peer, on the Teleport listener or not.
+    fn header_request(on_teleport_listener: bool) -> Request<Body> {
+        let (k, v) = jwt_header("alice", &["apps"]);
+        let mut req = Request::builder()
+            .uri("/ui/")
+            .header(k, v)
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            "10.62.5.5".parse().unwrap(),
+            0,
+        )));
+        if on_teleport_listener {
+            req.extensions_mut().insert(TeleportListener);
+        }
+        req
+    }
+
+    // Audit A007: with accept_on_main_port off, the identity header counts only on the Teleport
+    // listener, even from a peer in auth.teleport.trusted_proxies.
+    #[tokio::test]
+    async fn header_only_on_the_teleport_listener_once_main_port_is_off() {
+        let server = jwks_server().await;
+        let mut cfg = config(&server, "10.62.0.0/16");
+        assert!(cfg.accept_on_main_port, "switch-over default");
+        let v = TeleportValidator::new(cfg.clone(), Client::new()).unwrap();
+        assert!(v.trusted_header(&header_request(false)).is_some());
+        cfg.accept_on_main_port = false;
+        let v = TeleportValidator::new(cfg, Client::new()).unwrap();
+        assert!(v.trusted_header(&header_request(false)).is_none());
+        assert!(v.trusted_header(&header_request(true)).is_some());
+    }
+
+    #[tokio::test]
+    async fn teleport_listener_layer_drops_forwarding_headers_and_marks() {
+        let req = Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", "198.51.100.77")
+            .header("x-real-ip", "198.51.100.78")
+            .header(HEADER, "kept")
+            .body(Body::empty())
+            .unwrap();
+        let req = mark_teleport_listener(req).await;
+        assert!(req.headers().get("x-forwarded-for").is_none());
+        assert!(req.headers().get("x-real-ip").is_none());
+        assert_eq!(req.headers()[HEADER], "kept");
+        assert!(req.extensions().get::<TeleportListener>().is_some());
     }
 
     #[tokio::test]

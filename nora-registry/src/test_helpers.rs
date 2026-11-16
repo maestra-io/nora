@@ -173,6 +173,7 @@ fn build_context_full(
             header_read_timeout: 30,
             keep_alive_timeout: 120,
             internal_port: None,
+            teleport_port: None,
             max_connections: 4096,
             maintenance_stall_secs: 300,
             publish_body_limit_mb: 512,
