@@ -88,7 +88,22 @@ async fn check_password(
     username: &str,
     password: &str,
 ) -> Result<(), Response> {
-    let locked_out = state.auth_failures.check_blocked(&client_ip, username);
+    // A password bcrypt will check takes a slot first, before any await, so guesses sent
+    // at once cannot all be checked before their failures count (begin_check).
+    let slot = match state.auth.as_ref() {
+        Some(auth) if auth.verified(username, password).is_none() => {
+            let pair = auth.verdict_key(username, password);
+            match state.auth_failures.begin_check(client_ip, username, pair) {
+                Ok(slot) => Some(slot),
+                Err(refused) => return Err(too_many_failed_attempts(refused.retry_after())),
+            }
+        }
+        _ => None,
+    };
+    let locked_out = match slot {
+        Some(_) => None,
+        None => state.auth_failures.check_blocked(&client_ip, username),
+    };
     let wrong = || BasicDecision::Unauthorized {
         message: "Invalid credentials",
         record_failure: true,
@@ -107,7 +122,10 @@ async fn check_password(
         (None, Some(_)) => wrong(),
     };
     let (decision, count) = lockout_rule(locked_out, checked, Some(username));
-    state.auth_failures.count(client_ip, username, count);
+    match slot {
+        Some(slot) => slot.settle(count),
+        None => state.auth_failures.count(client_ip, username, count),
+    }
     match decision {
         BasicDecision::Authenticated { .. } => Ok(()),
         BasicDecision::LockedOut(retry_after) => Err(too_many_failed_attempts(retry_after)),

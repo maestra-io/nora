@@ -562,3 +562,43 @@ async fn lockout_refusals_are_logged_once() {
         "{out}"
     );
 }
+
+/// Audit A020: an API token sent as the Basic username (an empty or a placeholder
+/// password) is never written to the log, neither on the refusal nor on the lockout.
+#[tokio::test]
+async fn a_token_in_the_username_is_logged_without_the_secret() {
+    let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+    let sink = LogSink::default();
+    let _guard = sink.install();
+    let token_user = |p: &str| {
+        let cred = format!("nra_canarytoken3333333333333333:{p}");
+        format!("Basic {}", STANDARD.encode(cred))
+    };
+    assert_eq!(
+        get_with_auth(&ctx, &token_user("")).await,
+        StatusCode::UNAUTHORIZED
+    );
+    for _ in 0..5 {
+        assert_eq!(
+            get_with_auth(&ctx, &token_user("x-oauth-basic")).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        get_with_auth(&ctx, &token_user("x-oauth-basic")).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let out = sink.text();
+    let refused = out
+        .lines()
+        .find(|l| l.contains("auth rejected: credential refused"))
+        .unwrap_or_else(|| panic!("no rejection logged in {out}"));
+    assert!(
+        refused.contains(r#""username":"<credential-in-username>""#),
+        "{refused}"
+    );
+    assert_eq!(out.matches("auth lockout:").count(), 1, "{out}");
+    for secret in ["canary", "nra_"] {
+        assert!(!out.contains(secret), "{secret} leaked: {out}");
+    }
+}

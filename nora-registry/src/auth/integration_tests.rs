@@ -1984,3 +1984,107 @@ async fn test_token_mint_capped_at_caller_role() {
     assert_eq!(store.list_tokens("viewer").await.len(), 1);
     assert_eq!(store.list_tokens("ro").await.len(), 1);
 }
+
+/// Send every request of `requests` (method, uri, headers, body) at once from the test
+/// client, released together behind one barrier, and return their statuses.
+async fn burst(
+    ctx: &crate::test_helpers::TestContext,
+    requests: Vec<(Method, &'static str, Vec<(&'static str, String)>, String)>,
+) -> Vec<StatusCode> {
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(requests.len()));
+    let mut set = tokio::task::JoinSet::new();
+    for (method, uri, headers, body) in requests {
+        let (app, barrier) = (ctx.app.clone(), barrier.clone());
+        set.spawn(async move {
+            barrier.wait().await;
+            let headers = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            send_with_headers(&app, method, uri, headers, body)
+                .await
+                .status()
+        });
+    }
+    let mut statuses = Vec::new();
+    while let Some(status) = set.join_next().await {
+        statuses.push(status.unwrap());
+    }
+    statuses
+}
+
+fn tally(statuses: &[StatusCode], status: StatusCode) -> usize {
+    statuses.iter().filter(|s| **s == status).count()
+}
+
+/// Audit A019: wrong passwords sent at once are not all checked before their failures
+/// count. At most as many are checked as the account has attempts before its lockout
+/// (5 in the test tracker); the rest are answered 429, and the account ends locked out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_wrong_passwords_cannot_outrun_the_lockout() {
+    let ctx = create_test_context_with_auth(&[("alice", "right-horse")]);
+    let requests = (0..64)
+        .map(|i| {
+            let auth = basic_header("alice", &format!("guess-{i}"));
+            (
+                Method::GET,
+                "/v2/",
+                vec![("authorization", auth)],
+                String::new(),
+            )
+        })
+        .collect();
+    let statuses = burst(&ctx, requests).await;
+    assert!(bcrypt_runs(&ctx) <= 5, "bcrypt ran {}", bcrypt_runs(&ctx));
+    let checked = tally(&statuses, StatusCode::UNAUTHORIZED);
+    assert!(checked <= 5, "{checked} guesses checked");
+    assert_eq!(
+        tally(&statuses, StatusCode::TOO_MANY_REQUESTS),
+        64 - checked
+    );
+    assert!(ctx
+        .state
+        .auth_failures
+        .check_blocked(&CLIENT_IP, "alice")
+        .is_some());
+}
+
+/// Audit A019: the right password sent at once by many requests (a parallel pull) shares
+/// one check: every request is served, bcrypt runs once, no 429.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_right_passwords_share_one_check() {
+    let ctx = create_test_context_with_auth(&[("alice", "right-horse")]);
+    let requests = (0..32)
+        .map(|_| {
+            let auth = basic_header("alice", "right-horse");
+            (
+                Method::GET,
+                "/v2/",
+                vec![("authorization", auth)],
+                String::new(),
+            )
+        })
+        .collect();
+    let statuses = burst(&ctx, requests).await;
+    assert_eq!(tally(&statuses, StatusCode::OK), 32, "{statuses:?}");
+    assert_eq!(bcrypt_runs(&ctx), 1);
+}
+
+/// Audit A019: the same bound on the token routes, which check the password of their
+/// JSON body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_wrong_passwords_on_a_token_route_cannot_outrun_the_lockout() {
+    let ctx = create_test_context_with_auth(&[("alice", "right-horse")]);
+    let requests = (0..64)
+        .map(|i| {
+            let body = format!(r#"{{"username":"alice","password":"tok-{i}"}}"#);
+            let json = ("content-type", "application/json".to_string());
+            (Method::POST, "/api/tokens/list", vec![json], body)
+        })
+        .collect();
+    let statuses = burst(&ctx, requests).await;
+    assert!(bcrypt_runs(&ctx) <= 5, "bcrypt ran {}", bcrypt_runs(&ctx));
+    let checked = tally(&statuses, StatusCode::UNAUTHORIZED);
+    assert!(checked <= 5, "{checked} guesses checked");
+    assert_eq!(
+        tally(&statuses, StatusCode::TOO_MANY_REQUESTS),
+        64 - checked
+    );
+}

@@ -20,6 +20,9 @@ const REFUSED_CAPACITY: usize = 4096;
 /// the same time queue on it, and each after the first finds the first one's verdict.
 const PAIR_LOCKS: usize = 64;
 
+/// Bytes of a password bcrypt reads; a longer one never matches.
+const BCRYPT_MAX_PASSWORD: usize = 72;
+
 /// Htpasswd-based authentication.
 ///
 /// bcrypt is slow on purpose, so it never runs on an async worker: checks run on the
@@ -170,9 +173,16 @@ impl HtpasswdAuth {
         self.bcrypt_runs
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (hash, password) = (hash.to_owned(), Zeroizing::new(password.to_owned()));
-        match tokio::task::spawn_blocking(move || bcrypt::verify(password.as_str(), &hash)).await {
+        // bcrypt reads 72 bytes at most: a longer password is refused, not cut to its first
+        // 72 (bcrypt's own non_truncating_verify refuses 72 bytes too, which it reads whole).
+        let check = move || match password.len() {
+            0..=BCRYPT_MAX_PASSWORD => bcrypt::verify(password.as_str(), &hash),
+            _ => Ok(false),
+        };
+        match tokio::task::spawn_blocking(check).await {
             Ok(checked) => {
-                // A hash bcrypt cannot read matches nothing, now or later.
+                // A hash bcrypt cannot read, or a password longer than bcrypt reads,
+                // matches nothing, now or later.
                 let verdict = checked.unwrap_or(false);
                 self.remember(unchecked.key, verdict);
                 verdict
@@ -191,7 +201,9 @@ impl HtpasswdAuth {
         self.remembered(&self.verdict_key(username, password))
     }
 
-    fn verdict_key(&self, username: &str, password: &str) -> [u8; 32] {
+    /// A keyed digest of `username` and `password`, the same for the same pair for the life
+    /// of the process; never the password itself.
+    pub(crate) fn verdict_key(&self, username: &str, password: &str) -> [u8; 32] {
         let mut digest = Sha256::new();
         digest.update(self.key);
         // The length first, so no other username and password make the same bytes.
@@ -318,6 +330,21 @@ mod tests {
         let auth = HtpasswdAuth::from_file(file.path()).unwrap();
 
         assert!(auth.verify("test", "secret").await);
+    }
+
+    /// Audit B14: a password differing from the right one only past bcrypt's 72 bytes is
+    /// refused, and the refusal is remembered.
+    #[tokio::test]
+    async fn a_password_past_72_bytes_never_matches_on_its_prefix() {
+        let password = "a".repeat(72);
+        let file = create_test_htpasswd(&[("test", &password)]);
+        let auth = HtpasswdAuth::from_file(file.path()).unwrap();
+
+        assert!(auth.verify("test", &password).await);
+        for suffix in ["b", "c"] {
+            assert!(!auth.verify("test", &format!("{password}{suffix}")).await);
+        }
+        assert_eq!(auth.verified("test", &format!("{password}b")), Some(false));
     }
 
     #[tokio::test]
