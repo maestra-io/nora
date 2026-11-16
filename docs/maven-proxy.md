@@ -54,6 +54,13 @@ that fails (timeout, throttled 403, no date) leaves the artifact on the first-se
 on `proxy_timeout` (30 s), silently: a throttled search added 30 s to a cold miss and held a
 years-old artifact as new.
 
+A file is looked up once per `maven.metadata_ttl` (a miss once a minute), and concurrent misses
+of the file share one lookup. A HEAD answered 429 or 503 is not followed by the search. The HEAD
+and the search report to breakers of their own (`maven:<url>#dates`), never the download breaker,
+and the search answer is read up to 32 MiB. The same memo serves the RubyGems versions API and
+the registry.terraform.io `/v2` API; `nora_upstream_date_lookup_total{registry,outcome}` counts
+`memo`, `fetch` and `breaker_open`.
+
 A cache hit asks Central again (once per digest per hour) when the quarantine holds the artifact
 or has no entry for it, and a Central date moves the clock back. No entry is what a restart
 leaves for an artifact dated past the prune line on its miss: that entry is never persisted, so

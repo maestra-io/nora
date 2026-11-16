@@ -211,6 +211,8 @@ enum DateMiss {
     /// Answered without a date (no `Last-Modified`, no `timestamp`).
     Missing,
     Parse,
+    /// The `#dates` breaker of the host is open: not asked.
+    BreakerOpen,
 }
 
 impl DateMiss {
@@ -222,6 +224,7 @@ impl DateMiss {
             DateMiss::NotFound => "not_found",
             DateMiss::Missing => "missing",
             DateMiss::Parse => "parse",
+            DateMiss::BreakerOpen => "breaker_open",
         }
     }
 
@@ -243,23 +246,45 @@ impl DateMiss {
 }
 
 /// `Last-Modified` of the file on Central (a HEAD): Central files are immutable, so it is
-/// the upload date.
+/// the upload date. Reported to the `<central>#dates` breaker, never the download one.
 async fn central_last_modified(
-    client: &reqwest::Client,
+    state: &AppState,
+    central: &str,
     file_url: &str,
     auth: Option<&str>,
     timeout: Duration,
 ) -> Result<i64, DateMiss> {
-    let mut request = client.head(file_url).timeout(timeout);
+    let mut request = state.http_client.head(file_url).timeout(timeout);
     if let Some(credentials) = auth {
         let value = UpstreamAuth::Basic(credentials)
             .header_value()
             .map_err(|_| DateMiss::Transport)?;
         request = request.header(header::AUTHORIZATION, value);
     }
-    let resp = request.send().await.map_err(|e| DateMiss::from_send(&e))?;
-    if !resp.status().is_success() {
-        return Err(DateMiss::from_status(resp.status()));
+    let cb = &state.circuit_breaker;
+    let key = super::upstream_dates::breaker_key(RegistryType::Maven, central);
+    let probe = cb.check(&key).map_err(|_| {
+        super::upstream_dates::count(RegistryType::Maven, "breaker_open");
+        DateMiss::BreakerOpen
+    })?;
+    let resp = match request.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            cb.record_failure(&key, probe);
+            return Err(DateMiss::from_send(&e));
+        }
+    };
+    let status = resp.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        cb.record_failure(&key, probe);
+    } else if status.is_success() {
+        cb.record_success(&key, probe);
+    } else {
+        // Answered: alive, but no proof a failure tally is over (as `proxy_fetch`).
+        cb.record_alive(&key, probe);
+    }
+    if !status.is_success() {
+        return Err(DateMiss::from_status(status));
     }
     let lm = resp
         .headers()
@@ -271,9 +296,10 @@ async fn central_last_modified(
         .map_err(|_| DateMiss::Parse)
 }
 
-/// Upload timestamp of a GAV from the Central search API.
+/// Upload timestamp of a GAV from the Central search API, read through
+/// [`super::upstream_dates::get`] (capped, on the `<search>#dates` breaker).
 async fn central_search_date(
-    client: &reqwest::Client,
+    state: &AppState,
     search_base: &str,
     (group, artifact, version): (&str, &str, &str),
     timeout: Duration,
@@ -282,22 +308,21 @@ async fn central_search_date(
         "{}/solrsearch/select?q=g:%22{}%22+AND+a:%22{}%22+AND+v:%22{}%22&core=gav&rows=1&wt=json",
         search_base, group, artifact, version
     );
-    let resp = client
-        .get(&url)
-        .timeout(timeout)
-        .send()
+    let body = super::upstream_dates::get(state, RegistryType::Maven, search_base, &url, timeout)
         .await
-        .map_err(|e| DateMiss::from_send(&e))?;
-    if !resp.status().is_success() {
-        return Err(DateMiss::from_status(resp.status()));
-    }
-    let json: serde_json::Value = resp.json().await.map_err(|e| {
-        if e.is_timeout() {
-            DateMiss::Timeout
-        } else {
-            DateMiss::Parse
-        }
-    })?;
+        .map_err(|e| match e {
+            super::ProxyError::NotFound => DateMiss::NotFound,
+            super::ProxyError::Timeout(_) => DateMiss::Timeout,
+            super::ProxyError::RateLimited(_) => DateMiss::Status(429),
+            super::ProxyError::Upstream(status) | super::ProxyError::Denied(status, _) => {
+                DateMiss::Status(status)
+            }
+            super::ProxyError::CircuitOpen(_) => DateMiss::BreakerOpen,
+            // Over the cap: an answer no GAV search gives.
+            super::ProxyError::Spool(_) => DateMiss::Parse,
+            _ => DateMiss::Transport,
+        })?;
+    let json: serde_json::Value = serde_json::from_slice(&body).map_err(|_| DateMiss::Parse)?;
     let docs = json["response"]["docs"].as_array().ok_or(DateMiss::Parse)?;
     let doc = docs.first().ok_or(DateMiss::NotFound)?;
     let ts_ms = doc["timestamp"].as_i64().ok_or(DateMiss::Missing)?;
@@ -329,8 +354,10 @@ fn record_date_lookup(source: &str, result: Result<i64, DateMiss>, path: &str) {
 /// `timestamp`, both within one `budget` (a slow or throttled lookup must not hold the
 /// download). `None` leaves the quarantine on NORA's first-seen clock; every failure is
 /// logged at WARN with its reason and counted in `nora_maven_date_lookup_total`.
+#[allow(clippy::too_many_arguments)]
 async fn maven_central_publish_date(
-    client: &reqwest::Client,
+    state: &AppState,
+    central: &str,
     file_url: &str,
     auth: Option<&str>,
     search_base: &str,
@@ -338,12 +365,14 @@ async fn maven_central_publish_date(
     budget: Duration,
 ) -> Option<i64> {
     let started = std::time::Instant::now();
-    let head = central_last_modified(client, file_url, auth, budget).await;
+    let head = central_last_modified(state, central, file_url, auth, budget).await;
     record_date_lookup("last_modified", head, file_url);
     match head {
         Ok(ts) => return Some(ts),
         // Not on Central / out of budget: the search cannot answer either.
         Err(DateMiss::NotFound | DateMiss::Timeout) => return None,
+        // Central is throttling or down: the search is Central's too, asked no further.
+        Err(DateMiss::Status(429 | 503) | DateMiss::BreakerOpen) => return None,
         Err(_) => {}
     }
     let remaining = budget.saturating_sub(started.elapsed());
@@ -351,13 +380,19 @@ async fn maven_central_publish_date(
         record_date_lookup("search", Err(DateMiss::Timeout), file_url);
         return None;
     }
-    let search = central_search_date(client, search_base, gav, remaining).await;
+    let search = tokio::time::timeout(
+        remaining,
+        central_search_date(state, search_base, gav, remaining),
+    )
+    .await
+    .unwrap_or(Err(DateMiss::Timeout));
     record_date_lookup("search", search, file_url);
     search.ok()
 }
 
 /// [`maven_central_publish_date`] of `path` on the configured Central proxy; `None` with no
-/// Central proxy, so a private mirror's coordinates never reach Central (#68/#733).
+/// Central proxy, so a private mirror's coordinates never reach Central (#68/#733). One
+/// lookup per file for `maven.metadata_ttl`, a miss for a minute (`upstream_dates`).
 async fn central_publish_date(
     state: &AppState,
     path: &str,
@@ -371,15 +406,38 @@ async fn central_publish_date(
         .iter()
         .find(|p| url_is_maven_central(p.url()))?;
     let (group, artifact) = maven_name.split_once(':')?;
-    maven_central_publish_date(
-        &state.http_client,
-        &format!("{}/{}", central.url().trim_end_matches('/'), path),
-        central.auth(),
-        MAVEN_CENTRAL_SEARCH,
-        (group, artifact, version),
-        Duration::from_secs(state.config.maven.date_lookup_timeout),
+    let base = central.url().trim_end_matches('/').to_owned();
+    let file_url = format!("{base}/{path}");
+    let auth = central.auth().map(str::to_owned);
+    let (group, artifact, version) = (group.to_owned(), artifact.to_owned(), version.to_owned());
+    let budget = Duration::from_secs(state.config.maven.date_lookup_timeout);
+    let ttl = Duration::from_secs(state.config.maven.metadata_ttl.max(0) as u64);
+    let fetching = state.clone();
+    let key = file_url.clone();
+    let dated = version.clone();
+    super::upstream_dates::dates(
+        state,
+        RegistryType::Maven,
+        &key,
+        ttl,
+        &[],
+        move || async move {
+            let at = maven_central_publish_date(
+                &fetching,
+                &base,
+                &file_url,
+                auth.as_deref(),
+                MAVEN_CENTRAL_SEARCH,
+                (&group, &artifact, &version),
+                budget,
+            )
+            .await?;
+            Some(std::collections::HashMap::from([(version, at)]))
+        },
     )
-    .await
+    .await?
+    .get(&dated)
+    .copied()
 }
 
 /// A held digest is dated again at most once per this many seconds.

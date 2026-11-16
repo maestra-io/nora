@@ -50,9 +50,11 @@ mod central_date {
             .with_ansi(false)
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
+        let ctx = crate::test_helpers::create_test_context_with_config(|_| {});
         let started = std::time::Instant::now();
         let date = maven_central_publish_date(
-            &reqwest::Client::new(),
+            &ctx.state,
+            &server.uri(),
             &format!("{}{}", server.uri(), JAR),
             None,
             &server.uri(),
@@ -148,6 +150,46 @@ mod central_date {
             warns[1].contains("search") && warns[1].contains("timeout"),
             "{log}"
         );
+    }
+
+    /// A085: Central throttling or failing the HEAD is not passed on to its search API.
+    #[tokio::test]
+    async fn a085_throttled_head_skips_the_search() {
+        for status in [429, 503] {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            Mock::given(path("/solrsearch/select"))
+                .respond_with(search_hit())
+                .expect(0)
+                .mount(&server)
+                .await;
+            let (date, _, _) = lookup(&server, Duration::from_secs(5)).await;
+            assert_eq!(date, None, "{status}");
+        }
+    }
+
+    /// A055: a search answer over the date-lookup cap gives no date instead of being read whole.
+    #[tokio::test]
+    async fn a055_search_answer_over_the_cap_gives_no_date() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let pad = "x".repeat(crate::registry::upstream_dates::MAX_BODY as usize);
+        Mock::given(path("/solrsearch/select"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "response": {"docs": [{"timestamp": 1_173_268_800_000_i64}]},
+                "pad": pad
+            })))
+            .mount(&server)
+            .await;
+        let (date, _, log) = lookup(&server, Duration::from_secs(5)).await;
+        assert_eq!(date, None);
+        assert!(log.contains("search") && log.contains("parse"), "{log}");
     }
 
     /// A HEAD that times out spends the whole budget: no search after it.

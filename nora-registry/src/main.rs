@@ -470,6 +470,8 @@ pub struct AppState {
     pub docker_auth: Arc<registry::DockerAuth>,
     /// Docker publish-date listings walked per repository (ghcr, mcr, public.ecr.aws).
     pub docker_date_walks: Arc<registry::DockerDateWalks>,
+    /// Release-date lookups of the RubyGems, terraform `/v2` and Maven Central APIs, by key.
+    pub upstream_dates: Arc<registry::UpstreamDateMemo>,
     pub repo_index: Arc<RepoIndex>,
     pub http_client: reqwest::Client,
     /// The same client, except that it never follows a redirect: for a format whose answer
@@ -2158,6 +2160,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         )),
         docker_auth: Arc::new(docker_auth),
         docker_date_walks: Default::default(),
+        upstream_dates: Default::default(),
         repo_index: Arc::new(RepoIndex::new()),
         http_client,
         http_client_no_redirect,

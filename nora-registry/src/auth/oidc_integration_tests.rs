@@ -180,6 +180,7 @@ fn create_oidc_test_context_with(
         audit: ctx.state.audit.clone(),
         docker_auth: Arc::new(crate::registry::DockerAuth::new(reqwest::Client::new(), 5)),
         docker_date_walks: Default::default(),
+        upstream_dates: Default::default(),
         repo_index: Arc::new(crate::repo_index::RepoIndex::new()),
         http_client: reqwest::Client::new(),
         http_client_no_redirect: reqwest::Client::new(),

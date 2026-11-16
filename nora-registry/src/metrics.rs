@@ -79,6 +79,18 @@ pub static MAVEN_DATE_LOOKUP_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create MAVEN_DATE_LOOKUP_TOTAL metric at startup")
 });
 
+/// Release-date lookups of the RubyGems, terraform `/v2` and Maven Central APIs, by
+/// `outcome` ∈ {memo (answered by a kept or in-flight lookup), fetch (a new lookup),
+/// breaker_open (refused by the `<upstream>#dates` breaker)}.
+pub static UPSTREAM_DATE_LOOKUP_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_upstream_date_lookup_total",
+        "Upstream release-date lookups by registry and outcome",
+        &["registry", "outcome"]
+    )
+    .expect("failed to create UPSTREAM_DATE_LOOKUP_TOTAL metric at startup")
+});
+
 /// Downloads younger than `min_release_age` let through because their exact version is
 /// on `[curation.<registry>] allow` — each one a deliberate cooldown exemption.
 pub static CURATION_MIN_AGE_ALLOWED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
