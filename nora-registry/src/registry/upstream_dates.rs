@@ -37,10 +37,12 @@ const KEYS: usize = 1024;
 /// Version (as the format keys it) -> its release date, unix seconds.
 pub(super) type Dates = HashMap<String, i64>;
 type Lookup = Shared<BoxFuture<'static, Option<Arc<Dates>>>>;
+/// When a lookup started, then when it finished: what its answer's age is counted from.
+type Stamp = Arc<Mutex<Instant>>;
 
-/// Lookups by key (`AppState::upstream_dates`): when each started, and the fetch every
-/// caller of that key awaits.
-pub type Memo = Mutex<HashMap<String, (Instant, Lookup)>>;
+/// Lookups by key (`AppState::upstream_dates`): their [`Stamp`], and the fetch every caller
+/// of that key awaits.
+pub type Memo = Mutex<HashMap<String, (Stamp, Lookup)>>;
 
 /// The dates of `key` of `registry`: the kept answer while it is fresh (`ttl` for an answer
 /// holding every `wanted` version, [`RETRY`] for a miss or one lacking a wanted version),
@@ -60,14 +62,14 @@ where
     let key = format!("{}:{key}", registry.as_str());
     let lookup = {
         let mut memo = state.upstream_dates.lock();
-        let kept = memo.get(&key).and_then(|(started, lookup)| {
+        let kept = memo.get(&key).and_then(|(stamp, lookup)| {
             let fresh_for = match lookup.peek() {
                 // In flight: join it.
                 None => return Some(lookup.clone()),
                 Some(Some(dates)) if wanted.iter().all(|w| dates.contains_key(*w)) => ttl,
                 Some(_) => RETRY,
             };
-            (started.elapsed() < fresh_for).then(|| lookup.clone())
+            (stamp.lock().elapsed() < fresh_for).then(|| lookup.clone())
         });
         match kept {
             Some(lookup) => {
@@ -77,17 +79,25 @@ where
             None => {
                 count(registry, "fetch");
                 if memo.len() >= KEYS {
-                    memo.retain(|_, (started, _)| started.elapsed() < ttl.max(RETRY));
+                    memo.retain(|_, (stamp, _)| stamp.lock().elapsed() < ttl.max(RETRY));
                 }
                 if memo.len() >= KEYS {
                     // ponytail: drops every key at once; an LRU if 1024 keys churn in a TTL.
                     memo.clear();
                 }
-                let lookup = tokio::spawn(tokio::time::timeout(DEADLINE, fetch()))
-                    .map(|done| done.ok().and_then(Result::ok).flatten().map(Arc::new))
-                    .boxed()
-                    .shared();
-                memo.insert(key, (Instant::now(), lookup.clone()));
+                let stamp: Stamp = Arc::new(Mutex::new(Instant::now()));
+                let finished = Arc::clone(&stamp);
+                let fetching = tokio::time::timeout(DEADLINE, fetch());
+                let lookup = tokio::spawn(async move {
+                    let done = fetching.await;
+                    // A slow miss is kept a full RETRY too.
+                    *finished.lock() = Instant::now();
+                    done
+                })
+                .map(|done| done.ok().and_then(Result::ok).flatten().map(Arc::new))
+                .boxed()
+                .shared();
+                memo.insert(key, (stamp, lookup.clone()));
                 lookup
             }
         }
@@ -161,8 +171,9 @@ mod tests {
 
     /// Moves every kept lookup `by` into the past.
     fn age(state: &AppState, by: Duration) {
-        for (started, _) in state.upstream_dates.lock().values_mut() {
-            *started = started.checked_sub(by).unwrap();
+        for (stamp, _) in state.upstream_dates.lock().values() {
+            let mut at = stamp.lock();
+            *at = at.checked_sub(by).unwrap();
         }
     }
 
@@ -349,6 +360,35 @@ mod tests {
         futures::future::join_all((0..4).map(|_| send(&ctx.app, Method::GET, jar, ""))).await;
         let head = "/repo1.maven.org/maven2/com/example/a085/1.0/a085-1.0.jar";
         assert_eq!(hits(&central, "HEAD", head).await, 1);
+    }
+
+    /// A miss is kept for its window from when the fetch ended, not when it began: a slow
+    /// failure is not asked again by the next request.
+    #[tokio::test]
+    async fn a085_a_kept_lookup_ages_from_its_completion() {
+        let ctx = create_test_context_with_config(|_| {});
+        let begun = std::time::Instant::now();
+        let fetch = || async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            None
+        };
+        let got = super::dates(
+            &ctx.state,
+            crate::registry_type::RegistryType::Gems,
+            "slow",
+            Duration::from_secs(300),
+            &[],
+            fetch,
+        )
+        .await;
+        assert!(got.is_none());
+        let memo = ctx.state.upstream_dates.lock();
+        let (stamp, _) = memo.get("gems:slow").unwrap();
+        let age = stamp.lock().elapsed();
+        assert!(
+            age + Duration::from_millis(300) < begun.elapsed(),
+            "{age:?}"
+        );
     }
 
     #[tokio::test]
