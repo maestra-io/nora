@@ -329,10 +329,11 @@ fn docker_proxy_namespaces(config: &config::Config) -> Vec<String> {
 /// `deleted` nor in its `bytes_freed`.
 fn gc_done_line(result: &gc::GcResult, dry_run: bool) -> String {
     let eviction = &result.proxy_cache_eviction;
+    let docker_mark_failed = result.docker_mark_failed;
     if dry_run {
         // A dry pass deletes nothing: its counts are what a real pass would take.
         return format!(
-            "GC scheduler: dry run in {:.1}s — {} orphans ({} bytes would be freed), {} would be evicted from the proxy cache ({} bytes), {} metadata phantoms, {} skipped (grace)",
+            "GC scheduler: dry run in {:.1}s — {} orphans ({} bytes would be freed), {} would be evicted from the proxy cache ({} bytes), {} metadata phantoms, {} skipped (grace), docker_mark_failed={docker_mark_failed}",
             result.duration_secs,
             result.orphaned,
             result.bytes_freed,
@@ -343,7 +344,7 @@ fn gc_done_line(result: &gc::GcResult, dry_run: bool) -> String {
         );
     }
     format!(
-        "GC scheduler: done in {:.1}s — {} orphans ({} deleted, {} bytes freed), {} evicted from the proxy cache ({} bytes freed), {} metadata phantoms, {} skipped (grace)",
+        "GC scheduler: done in {:.1}s — {} orphans ({} deleted, {} bytes freed), {} evicted from the proxy cache ({} bytes freed), {} metadata phantoms, {} skipped (grace), docker_mark_failed={docker_mark_failed}",
         result.duration_secs,
         result.orphaned,
         result.deleted,
@@ -1211,7 +1212,7 @@ async fn main() {
             println!("  Deleted:           {}", result.deleted);
             println!("  Bytes freed:       {}", result.bytes_freed);
             if result.docker_mark_failed {
-                println!("  Docker sweep:      skipped (manifest graph incomplete; all Docker objects kept)");
+                println!("  Docker sweep:      incomplete (unreadable manifests; their objects kept, see the GC warnings)");
             }
             if result.skipped_recent > 0 {
                 println!(

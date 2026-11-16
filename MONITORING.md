@@ -95,7 +95,7 @@ with `registry=~"pypi(:.*)?"`, not `registry="pypi"`.
 | `nora_gc_last_run_timestamp` | gauge | — | Unix timestamp of last GC run |
 | `nora_gc_metadata_phantoms_total` | counter | — | Metadata entries without corresponding blobs |
 | `nora_gc_stat_failures_total` | counter | — | Orphans GC could not stat; kept, age unknown |
-| `nora_gc_docker_mark_failures_total` | counter | — | Docker sweeps skipped because the manifest graph could not be read |
+| `nora_gc_docker_mark_failures_total` | counter | — | Docker manifests GC could not use: one that is not a JSON object keeps its repository, a listing or read error keeps every Docker object for the pass |
 | `nora_gc_list_failures_total` | counter | — | Listings GC could not read; everything they cover was kept for the pass. Nonzero means that space is not reclaimed |
 | `nora_gc_delete_failures_total` | counter | — | Deletes GC or proxy-cache eviction attempted that the store refused; the object is still there |
 
@@ -155,6 +155,7 @@ The dashboard includes a `registry` template variable to filter by specific prot
 | `NoraStorageWriteErrors` | `nora_storage_operations_total{operation=~"put\|copy",status="error"}` increasing for 5m | warning |
 | `NoraStorageUnreachable` | `nora_storage_reachable == 0` for 2m (readiness failing) | critical |
 | `NoraIntegrityFailure` | any `get` with `status=~"integrity_fail\|verify_error"` | critical |
+| `NoraGcDockerMarkFailed` | any `nora_gc_docker_mark_failures_total` increase in 1d: GC kept Docker objects it could not prove unused (a manifest that is not a JSON object keeps its repository; a listing or read error keeps all) | warning |
 | `NoraTaskPanic` | any `nora_task_panics_total` increase in 15m (a background task panicked and was restarted) | warning |
 | `NoraQuarantineExceptionUsed` | any `nora_docker_quarantine_exception_used_total` increase in 15m, by listed `digest` and `reason` (the summary shows the reason, which names the image): a break-glass entry of `[docker] quarantine_exceptions` admitted a held image (Maestra fork) | warning |
 | `NoraQuarantineExceptionsInvalid` | `nora_docker_quarantine_exceptions_invalid == 1` for 5m: the exceptions file is refused, the last good list stays (Maestra fork) | warning |

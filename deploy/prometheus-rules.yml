@@ -169,6 +169,23 @@ groups:
             Find `Quarantine exceptions file refused` in the error log for the broken
             rule, and fix the file.
 
+      - alert: NoraGcDockerMarkFailed
+        # A GC pass could not read the whole Docker manifest graph and kept objects it
+        # cannot prove unused: a stored manifest that is not a JSON object keeps its
+        # repository, a listing or read error keeps every Docker object. The 1d window
+        # covers one scheduled pass; space there is not reclaimed until it is fixed.
+        expr: sum(increase(nora_gc_docker_mark_failures_total[1d])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NORA GC kept Docker objects: the manifest graph could not be read"
+          description: >-
+            Find `GC: Docker manifest is not a JSON object` (the key names the
+            repository kept) or `GC: cannot establish Docker manifest reachability`
+            in the warn log. Delete or re-push the broken manifest; `nora gc`
+            (a dry run) lists what the next pass would remove.
+
   - name: nora-integrity
     rules:
       - alert: NoraIntegrityFailure
