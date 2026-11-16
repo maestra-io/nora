@@ -1187,10 +1187,20 @@ pub(crate) async fn proxy_fetch_shared(
 // Bounded-memory proxied artifacts (C17/C74)
 // ============================================================================
 
-/// Subdirectories of `server.spool_dir`: proxied downloads, NuGet pushes, PyPI uploads.
+/// Subdirectories of `server.spool_dir`: proxied downloads, NuGet pushes, PyPI
+/// uploads, raw uploads, Hugging Face cache fills.
 pub(crate) const PROXY_SPOOL_SUBDIR: &str = "proxy-spool";
 pub(crate) const NUGET_UPLOAD_SUBDIR: &str = "nuget-uploads";
 pub(crate) const PYPI_UPLOAD_SUBDIR: &str = "pypi-uploads";
+pub(crate) const RAW_UPLOAD_SUBDIR: &str = "raw-uploads";
+pub(crate) const HF_FILL_SUBDIR: &str = "hf-proxy";
+const SPOOL_SUBDIRS: [&str; 5] = [
+    PROXY_SPOOL_SUBDIR,
+    NUGET_UPLOAD_SUBDIR,
+    PYPI_UPLOAD_SUBDIR,
+    RAW_UPLOAD_SUBDIR,
+    HF_FILL_SUBDIR,
+];
 
 /// Spool files older than this are orphans (crash, OOM) and reaped: a transfer in
 /// progress keeps writing, and a served download is unlinked when its last reader ends.
@@ -1199,7 +1209,7 @@ const SPOOL_MAX_AGE: Duration = Duration::from_secs(4 * 60 * 60);
 /// Remove orphaned spool files from every spool directory (startup and the
 /// periodic maintenance tick).
 pub(crate) fn cleanup_spool_dirs(spool_dir: &std::path::Path) {
-    for sub in [PROXY_SPOOL_SUBDIR, NUGET_UPLOAD_SUBDIR, PYPI_UPLOAD_SUBDIR] {
+    for sub in SPOOL_SUBDIRS {
         let dir = spool_dir.join(sub);
         let removed = remove_stale_temp_files(&dir, SPOOL_MAX_AGE);
         if removed > 0 {
@@ -1306,7 +1316,8 @@ impl SpoolError {
 }
 
 /// The disk spool directory and its byte budget (`server.spool_dir`,
-/// `server.spool_max_mb`), shared by proxied downloads, NuGet pushes and PyPI uploads.
+/// `server.spool_max_mb`), shared by proxied downloads, NuGet pushes, PyPI and raw
+/// uploads and Hugging Face cache fills.
 #[derive(Debug)]
 pub(crate) struct SpoolBudget {
     dir: std::path::PathBuf,
@@ -3044,31 +3055,49 @@ pub(crate) async fn stream_body_to_file(
     file: &mut tokio::fs::File,
     budget: u64,
 ) -> StreamOutcome {
+    // Without a reservation nothing refuses a frame.
+    stream_body_to_spool(body, file, budget, None)
+        .await
+        .unwrap_or_else(|e| StreamOutcome::Io(std::io::Error::other(format!("{e:?}"))))
+}
+
+/// [`stream_body_to_file`], with `spool` (when given) grown to the running total
+/// before each frame is written: no byte reaches disk past `server.spool_max_mb` or
+/// the spool's free-space floor. `Err` is that refusal ([`SpoolError::response`]).
+pub(crate) async fn stream_body_to_spool(
+    body: Body,
+    file: &mut tokio::fs::File,
+    budget: u64,
+    mut spool: Option<&mut SpoolReservation>,
+) -> Result<StreamOutcome, SpoolError> {
     use tokio::io::AsyncWriteExt;
     let mut stream = body.into_data_stream();
     let mut written: u64 = 0;
     while let Some(frame) = stream.next().await {
         let chunk = match frame {
             Ok(c) => c,
-            Err(_) => return StreamOutcome::ClientGone,
+            Err(_) => return Ok(StreamOutcome::ClientGone),
         };
         written = written.saturating_add(chunk.len() as u64);
         if written > budget {
-            return StreamOutcome::TooLarge;
+            return Ok(StreamOutcome::TooLarge);
+        }
+        if let Some(spool) = spool.as_deref_mut() {
+            spool.grow(written)?;
         }
         if let Err(e) = file.write_all(&chunk).await {
-            return StreamOutcome::Io(e);
+            return Ok(StreamOutcome::Io(e));
         }
     }
     if let Err(e) = file.flush().await {
-        return StreamOutcome::Io(e);
+        return Ok(StreamOutcome::Io(e));
     }
     // Durability: put_from_path's direct-rename commit relies on the caller
     // having fsync'd the source — without this, a power loss just after the
     // rename can leave the key's directory entry pointing at data that never
     // reached disk (latent for docker since the switch to streaming; #846).
     if let Err(e) = file.sync_all().await {
-        return StreamOutcome::Io(e);
+        return Ok(StreamOutcome::Io(e));
     }
     // Postcondition: a successful stream never exceeds the budget — the loop
     // returns TooLarge before writing any frame that would cross it.
@@ -3076,7 +3105,7 @@ pub(crate) async fn stream_body_to_file(
         written <= budget,
         "stream_body_to_file wrote {written} bytes > budget {budget}"
     );
-    StreamOutcome::Ok(written)
+    Ok(StreamOutcome::Ok(written))
 }
 
 /// Parse the `Content-Length` header, if present and well-formed.
@@ -4737,13 +4766,14 @@ mod tests {
         assert!(matches!(err, ProxyError::Timeout(_)), "{err:?}");
     }
 
-    /// R2-10/R2-34/R2-58: the maintenance sweep reaps orphans in every spool
-    /// directory, NuGet push and PyPI upload included, and leaves fresh files.
+    /// R2-10/R2-34/R2-58, audit A080/A069: the maintenance sweep reaps orphans in
+    /// every spool directory (NuGet push, PyPI and raw upload, hf fill included) and
+    /// leaves fresh files.
     #[test]
     fn cleanup_spool_dirs_reaps_orphans_in_every_spool_dir() {
         let root = tempfile::tempdir().unwrap();
         let old = std::time::SystemTime::now() - SPOOL_MAX_AGE - Duration::from_secs(60);
-        for sub in [PROXY_SPOOL_SUBDIR, NUGET_UPLOAD_SUBDIR, PYPI_UPLOAD_SUBDIR] {
+        for sub in SPOOL_SUBDIRS {
             let dir = root.path().join(sub);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("fresh"), b"x").unwrap();
@@ -4757,7 +4787,7 @@ mod tests {
                 .unwrap();
         }
         cleanup_spool_dirs(root.path());
-        for sub in [PROXY_SPOOL_SUBDIR, NUGET_UPLOAD_SUBDIR, PYPI_UPLOAD_SUBDIR] {
+        for sub in SPOOL_SUBDIRS {
             let dir = root.path().join(sub);
             assert!(!dir.join("orphan").exists(), "{sub}");
             assert!(dir.join("fresh").exists(), "{sub}");

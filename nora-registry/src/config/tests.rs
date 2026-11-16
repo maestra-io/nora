@@ -738,6 +738,30 @@ fn test_env_override_storage_virtual_hosted_default_off() {
     std::env::remove_var("NORA_STORAGE_S3_VIRTUAL_HOSTED");
 }
 
+/// Audit A080: a raw `max_file_size` above `spool_max_mb` warns at start, since every
+/// upload past the spool budget is a 507; no budget (0) or raw disabled stays quiet.
+#[test]
+fn test_raw_max_file_size_above_the_spool_budget_warns() {
+    let _lock = env_lock();
+    let mut config = Config::default();
+    config.raw.enabled = true;
+    config.server.spool_max_mb = 4;
+    config.raw.max_file_size = 4 * 1024 * 1024;
+    let hit = |c: &Config| {
+        let (warnings, errors) = c.validate_with_config_path(None);
+        assert!(!errors.iter().any(|m| m.contains("raw.max_file_size")));
+        warnings.iter().any(|m| m.contains("raw.max_file_size"))
+    };
+    assert!(!hit(&config), "a cap within the budget warned");
+    config.raw.max_file_size += 1;
+    assert!(hit(&config), "a cap above the budget did not warn");
+    config.server.spool_max_mb = 0;
+    assert!(!hit(&config), "no budget warned");
+    config.server.spool_max_mb = 4;
+    config.raw.enabled = false;
+    assert!(!hit(&config), "raw disabled warned");
+}
+
 /// R4-T10: a `raw.cache_control` that cannot be a header value is a warning (an error
 /// under NORA_CONFIG_STRICT), and the default is what a request sends.
 #[test]

@@ -100,8 +100,9 @@ pub struct ServerConfig {
     #[serde(default = "default_stream_threshold_mb")]
     pub stream_threshold_mb: u64,
     /// Directory of the disk spools: proxied artifacts above `stream_threshold_mb`
-    /// (`proxy-spool/`), NuGet pushes (`nuget-uploads/`) and PyPI uploads
-    /// (`pypi-uploads/`). Default `{storage.path}/tmp`. Point it at a volume of its
+    /// (`proxy-spool/`), NuGet pushes (`nuget-uploads/`), PyPI uploads
+    /// (`pypi-uploads/`), raw uploads (`raw-uploads/`) and Hugging Face cache fills
+    /// (`hf-proxy/`). Default `{storage.path}/tmp`. Point it at a volume of its
     /// own so a full spool cannot starve the tokens and the quarantine ledger.
     #[serde(default)]
     pub spool_dir: Option<String>,

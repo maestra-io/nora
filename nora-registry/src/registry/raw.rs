@@ -5,8 +5,8 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::registry::{
-    content_length, method_not_allowed, sha256_of_file, stream_body_to_file, StreamOutcome,
-    TempFileGuard,
+    content_length, method_not_allowed, sha256_of_file, stream_body_to_spool, SpoolError,
+    StreamOutcome, TempFileGuard, RAW_UPLOAD_SUBDIR,
 };
 use crate::validation::validate_storage_key;
 use crate::AppState;
@@ -273,29 +273,44 @@ async fn upload(
         return too_large();
     }
 
-    // Stream the body to a temp file on the storage filesystem — the body is
-    // never held in memory, so uploads are bounded by disk, not RAM, and the
-    // local backend's put_from_path commits by rename (no copy). The size cap
+    // Stream the body to a spool file — the body is never held in memory, and
+    // every frame is reserved in the shared `server.spool_max_mb` budget before it
+    // is written (503 while the budget is busy, 507 past it or the free-space
+    // floor), so concurrent uploads cannot fill the spool volume. The size cap
     // is enforced incrementally as frames arrive. Streamed BEFORE taking the
     // publish lock so a slow client cannot hold the key's lock for the
-    // duration of a multi-GB transfer.
-    let temp_dir = raw_upload_temp_dir(&state.config.storage.path);
+    // duration of a multi-GB transfer. The reservation is held until the
+    // handler returns, past put_from_path.
+    let mut spool = match state.spool.reserve(0) {
+        Ok(r) => r,
+        Err(e) => return e.response("raw"),
+    };
+    let temp_dir = state.spool.dir(RAW_UPLOAD_SUBDIR);
     let temp_path = temp_dir.join(uuid::Uuid::new_v4().to_string());
+    let local = |e| SpoolError::io(&temp_path)(e).response("raw");
+    if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
+        return local(e);
+    }
     let mut temp_guard = TempFileGuard::new(temp_path.clone());
     let mut file = match tokio::fs::File::create(&temp_path).await {
         Ok(f) => f,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to create raw upload temp file");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+        Err(e) => return local(e),
     };
-    match stream_body_to_file(body, &mut file, state.config.raw.max_file_size).await {
-        StreamOutcome::Ok(_) => {}
-        StreamOutcome::TooLarge => return too_large(),
-        StreamOutcome::ClientGone => {
+    let streamed = stream_body_to_spool(
+        body,
+        &mut file,
+        state.config.raw.max_file_size,
+        Some(&mut spool),
+    )
+    .await;
+    match streamed {
+        Err(e) => return e.response("raw"),
+        Ok(StreamOutcome::Ok(_)) => {}
+        Ok(StreamOutcome::TooLarge) => return too_large(),
+        Ok(StreamOutcome::ClientGone) => {
             return (StatusCode::BAD_REQUEST, "Request body stream ended early").into_response()
         }
-        StreamOutcome::Io(e) => {
+        Ok(StreamOutcome::Io(e)) => {
             tracing::error!(error = %e, "Failed to write raw upload temp file");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
@@ -643,7 +658,9 @@ async fn check_exists(
     }
 }
 
-/// Where streamed raw uploads are written before commit, under the storage path.
+/// Where streamed raw uploads were written before they moved under
+/// `server.spool_dir` (audit A080). Still reaped for one release, so orphans left
+/// there on persistent storage do not stay; remove with the sweep after that.
 const RAW_UPLOAD_TEMP_SUBDIR: &str = "tmp/raw-uploads";
 
 /// Idle age after which a streamed raw upload's temp file is an orphan: the same
@@ -660,16 +677,6 @@ pub fn cleanup_upload_temp_dir(data_dir: &str) {
     if removed > 0 {
         tracing::info!(removed, dir = %dir.display(), "Cleaned up stale raw upload temp files");
     }
-}
-
-/// Temp directory for streamed raw uploads, created on demand. Lives inside
-/// the storage path so the local backend's commit is a same-filesystem rename.
-fn raw_upload_temp_dir(data_dir: &str) -> std::path::PathBuf {
-    let dir = std::path::PathBuf::from(data_dir).join(RAW_UPLOAD_TEMP_SUBDIR);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::error!(path = %dir.display(), error = %e, "failed to create raw upload temp directory");
-    }
-    dir
 }
 
 /// Format a Unix timestamp as an HTTP-date (RFC 7231 §7.1.1.1).
@@ -738,7 +745,8 @@ mod tests {
     fn test_cleanup_upload_temp_dir_reaps_only_idle_files() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().to_str().unwrap();
-        let dir = raw_upload_temp_dir(root);
+        let dir = std::path::PathBuf::from(root).join(RAW_UPLOAD_TEMP_SUBDIR);
+        std::fs::create_dir_all(&dir).unwrap();
         let orphan = dir.join("orphan");
         let live = dir.join("live");
         std::fs::write(&orphan, b"partial").unwrap();
@@ -919,6 +927,49 @@ mod integration_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Audit A080: a raw upload is spooled within `server.spool_max_mb` — 503 +
+    /// `Retry-After` while the budget is in use, 507 past the whole budget — and
+    /// leaves no spool file and no held budget behind, whatever the outcome.
+    #[tokio::test]
+    async fn upload_over_the_spool_budget_is_refused_and_leaves_no_spool() {
+        use axum::http::header;
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.server.spool_max_mb = 4;
+            cfg.raw.max_file_size = 100 * 1024 * 1024;
+        });
+        let put = |name: &'static str, mib: usize| {
+            let app = ctx.app.clone();
+            async move { send(&app, Method::PUT, name, vec![7u8; mib * 1024 * 1024]).await }
+        };
+        let spooled = || {
+            std::fs::read_dir(ctx.state.spool.dir(crate::registry::RAW_UPLOAD_SUBDIR))
+                .map(|d| d.count())
+                .unwrap_or(0)
+        };
+
+        let held = ctx.state.spool.reserve(3 * 1024 * 1024).unwrap();
+        let resp = put("/raw/busy.bin", 2).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
+        assert!(ctx.state.storage.stat("raw/busy.bin").await.is_none());
+        assert_eq!(spooled(), 0);
+        drop(held);
+
+        let resp = put("/raw/huge.bin", 5).await;
+        assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert!(ctx.state.storage.stat("raw/huge.bin").await.is_none());
+        assert_eq!(spooled(), 0);
+
+        let resp = put("/raw/fits.bin", 2).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(ctx.state.storage.stat("raw/fits.bin").await.is_some());
+        assert_eq!(spooled(), 0);
+        assert!(
+            ctx.state.spool.reserve(4 * 1024 * 1024).is_ok(),
+            "an upload kept its spool budget"
+        );
     }
 
     #[tokio::test]

@@ -31,7 +31,10 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::circuit_breaker::BreakerScope;
 use crate::curation::RequestVersion;
-use crate::registry::{circuit_open_response, nora_base_url, ProxyError, TempFileGuard};
+use crate::registry::{
+    circuit_open_response, content_length, nora_base_url, ProxyError, SpoolReservation,
+    TempFileGuard, HF_FILL_SUBDIR,
+};
 use crate::registry_type::RegistryType;
 use crate::storage::Storage;
 use crate::validation::validate_storage_key;
@@ -99,10 +102,6 @@ const MAX_QUERY: usize = 2048;
 
 /// Cached files live under `hf/models/{repo}/blobs/{digest}`.
 const CACHE_PREFIX: &str = "hf/models";
-/// Fills in progress, under the storage path as docker's proxy temp files are.
-const FILL_TEMP_DIR: &str = "tmp/hf-proxy";
-/// A temp file untouched this long belongs to a fill that will not finish.
-const FILL_TEMP_MAX_AGE: Duration = Duration::from_secs(4 * 60 * 60);
 /// The content type of every file answer, cached or not: the label an upstream gave a file
 /// never reaches a browser.
 const FILE_CONTENT_TYPE: &str = "application/octet-stream";
@@ -1144,6 +1143,12 @@ struct FillStore {
     path: PathBuf,
     /// Removes the temp file on every path but a committed fill.
     guard: TempFileGuard,
+    /// The fill's share of `server.spool_max_mb`, grown with every chunk and held until
+    /// the commit ends (audit A069).
+    reservation: SpoolReservation,
+    written: u64,
+    /// `server.proxy_max_artifact`: a bigger file is served, not cached.
+    cap: Option<u64>,
 }
 
 /// Plans the check (and the fill) of a full GET. `None` — the file is passed through unchecked
@@ -1174,7 +1179,7 @@ async fn plan_fill(
         }
     };
     let store = match cache_key(repo, &expected) {
-        Some(key) => fill_store(state, key).await,
+        Some(key) => fill_store(state, key, content_length(body.headers()).unwrap_or(0)).await,
         None => None,
     };
     Some(Fill {
@@ -1185,8 +1190,23 @@ async fn plan_fill(
     })
 }
 
-async fn fill_store(state: &AppState, key: String) -> Option<FillStore> {
-    let dir = std::path::Path::new(&state.config.storage.path).join(FILL_TEMP_DIR);
+/// A temp file under `{spool_dir}/hf-proxy` and the spool budget for `expected_len` bytes, or
+/// `None` (served uncached) when the file is over `proxy_max_artifact_mb` or the budget has no
+/// room for it.
+async fn fill_store(state: &AppState, key: String, expected_len: u64) -> Option<FillStore> {
+    let cap = state.config.server.proxy_max_artifact();
+    if cap.is_some_and(|cap| expected_len > cap) {
+        tracing::warn!(registry = "hf", key = %key, expected_len, "file over proxy_max_artifact_mb; serving uncached");
+        return None;
+    }
+    let reservation = match state.spool.reserve(expected_len) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(registry = "hf", key = %key, error = ?e, "no spool budget for the cache fill; serving uncached");
+            return None;
+        }
+    };
+    let dir = state.spool.dir(HF_FILL_SUBDIR);
     let path = dir.join(format!("{}.part", uuid::Uuid::new_v4()));
     let created = async {
         tokio::fs::create_dir_all(&dir).await?;
@@ -1201,6 +1221,9 @@ async fn fill_store(state: &AppState, key: String) -> Option<FillStore> {
             file,
             guard: TempFileGuard::new(path.clone()),
             path,
+            reservation,
+            written: 0,
+            cap,
         }),
         Err(e) => {
             tracing::warn!(registry = "hf", path = %path.display(), error = %e, "no temp file for the cache fill; serving uncached");
@@ -1217,7 +1240,14 @@ impl Fill {
         }
         if let Some(store) = self.store.as_mut() {
             use tokio::io::AsyncWriteExt;
-            if let Err(e) = store.file.write_all(chunk).await {
+            store.written = store.written.saturating_add(chunk.len() as u64);
+            if store.cap.is_some_and(|cap| store.written > cap) {
+                tracing::warn!(registry = "hf", key = %store.key, "file over proxy_max_artifact_mb; serving uncached");
+                self.store = None;
+            } else if let Err(e) = store.reservation.grow(store.written) {
+                tracing::warn!(registry = "hf", key = %store.key, error = ?e, "spool budget refused the cache fill; serving uncached");
+                self.store = None;
+            } else if let Err(e) = store.file.write_all(chunk).await {
                 tracing::warn!(registry = "hf", key = %store.key, error = %e, "cache fill write failed; serving uncached");
                 self.store = None;
             }
@@ -1414,6 +1444,9 @@ fn commit_fill(store: FillStore, sha256: String) {
             file,
             path,
             mut guard,
+            // Released when the commit ends, with the temp file.
+            reservation: _reservation,
+            ..
         } = store;
         match sync_and_commit(&storage, &key, file, &path, &sha256).await {
             Ok(()) => {
@@ -1541,16 +1574,6 @@ async fn cached_response(
             key.to_string(),
         )))
         .ok()
-}
-
-/// Removes temp files of cache fills that will not finish (a crash, a kill), at start and
-/// on the periodic sweep, as docker does for its proxy temp files.
-pub fn cleanup_fill_temp_dir(data_dir: &str) {
-    let dir = std::path::Path::new(data_dir).join(FILL_TEMP_DIR);
-    let removed = super::remove_stale_temp_files(&dir, FILL_TEMP_MAX_AGE);
-    if removed > 0 {
-        tracing::info!(removed, dir = %dir.display(), "Cleaned up stale hf cache fill temp files");
-    }
 }
 
 async fn datasets() -> Response {
@@ -4166,7 +4189,7 @@ mod tests {
 
     /// Temp files of fills, finished or not.
     fn fill_temps(ctx: &TestContext) -> usize {
-        std::fs::read_dir(std::path::Path::new(&ctx.state.config.storage.path).join(FILL_TEMP_DIR))
+        std::fs::read_dir(ctx.state.spool.dir(HF_FILL_SUBDIR))
             .map(|dir| dir.count())
             .unwrap_or(0)
     }
@@ -4423,7 +4446,7 @@ mod tests {
                     expected,
                     sha256: sha2::Sha256::new(),
                     git: None,
-                    store: fill_store(&state, key.to_string()).await,
+                    store: fill_store(&state, key.to_string(), 0).await,
                 };
                 let chunks: Chunks = Box::pin(futures::stream::iter(vec![
                     Ok(Bytes::from(body[..100].to_vec())),
@@ -4522,13 +4545,110 @@ mod tests {
         );
     }
 
+    /// A fill of `body` under `key` (length unknown up front), fed in 64 KiB chunks.
+    async fn spooled_fill(ctx: &TestContext, key: &str, body: &[u8]) -> checked::FillStream {
+        let fill = Fill {
+            expected: HubDigest::Sha256(hex::encode(sha2::Sha256::digest(body))),
+            sha256: sha2::Sha256::new(),
+            git: None,
+            store: fill_store(&ctx.state, key.to_string(), 0).await,
+        };
+        let chunks: Vec<Result<Bytes, std::io::Error>> = body
+            .chunks(64 * 1024)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        checked::fill_stream(Box::pin(futures::stream::iter(chunks)), fill)
+    }
+
+    /// Bytes in the fill temp files right now.
+    fn fill_temp_bytes(ctx: &TestContext) -> u64 {
+        std::fs::read_dir(ctx.state.spool.dir(HF_FILL_SUBDIR))
+            .map(|dir| {
+                dir.flatten()
+                    .map(|e| e.metadata().map_or(0, |m| m.len()))
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Audit A069: fills whose clients stopped reading together hold no more disk than
+    /// `server.spool_max_mb`. A fill the budget has no room for is served whole and checked,
+    /// just not cached; the budget is released with the temp files.
+    #[tokio::test]
+    async fn stalled_fills_stay_within_the_spool_budget() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.hf.enabled = true;
+            cfg.server.spool_max_mb = 4;
+            cfg.server.proxy_max_artifact_mb = 0;
+        });
+        let body: Vec<u8> = (0..3 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let key = |i: usize| format!("hf/models/org/m{i}/blobs/x");
+        let mut fills = Vec::new();
+        let mut got = Vec::new();
+        for i in 0..3 {
+            let mut fill = spooled_fill(&ctx, &key(i), &body).await;
+            let mut read = Vec::new();
+            while read.len() < body.len() - 128 * 1024 {
+                read.extend_from_slice(&fill.next().await.unwrap().unwrap());
+            }
+            fills.push(fill);
+            got.push(read);
+        }
+        let on_disk = fill_temp_bytes(&ctx);
+        assert!(
+            on_disk <= 4 * 1024 * 1024,
+            "stalled fills hold {on_disk} bytes past the 4 MiB spool budget"
+        );
+        for (fill, read) in fills.iter_mut().zip(got.iter_mut()) {
+            while let Some(frame) = fill.next().await {
+                read.extend_from_slice(&frame.expect("served whole and checked"));
+            }
+            assert_eq!(*read, body);
+        }
+        drop(fills);
+        wait_stored(&ctx, &key(0)).await;
+        wait_no_fill_temps(&ctx).await;
+        for i in 1..3 {
+            assert!(ctx.state.storage.stat(&key(i)).await.is_none(), "{i}");
+        }
+        assert!(
+            ctx.state.spool.reserve(4 * 1024 * 1024).is_ok(),
+            "a fill kept its spool budget"
+        );
+    }
+
+    /// Audit A069: a file over `proxy_max_artifact_mb` is served, not cached — refused on its
+    /// declared length, or dropped once the running count crosses the cap.
+    #[tokio::test]
+    async fn fills_over_the_artifact_cap_are_served_uncached() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.hf.enabled = true;
+            cfg.server.proxy_max_artifact_mb = 1;
+        });
+        assert!(fill_store(&ctx.state, "k".into(), 1024 * 1024 + 1)
+            .await
+            .is_none());
+        let body: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let key = "hf/models/org/big/blobs/x";
+        let mut fill = spooled_fill(&ctx, key, &body).await;
+        let mut read = Vec::new();
+        while let Some(frame) = fill.next().await {
+            read.extend_from_slice(&frame.expect("served whole and checked"));
+            assert!(fill_temp_bytes(&ctx) <= 1024 * 1024);
+        }
+        assert_eq!(read, body);
+        settle().await;
+        assert!(ctx.state.storage.stat(key).await.is_none());
+        assert_eq!(fill_temps(&ctx), 0);
+    }
+
     /// A write that fails mid-fill stops the fill for good: what reached the temp file is no
     /// longer the whole file, so nothing is committed, while the client is served and checked.
     #[tokio::test]
     async fn a_failed_write_stops_the_fill() {
         let ctx = hf_enabled();
         let key = "hf/models/org/model/blobs/w";
-        let dir = std::path::Path::new(&ctx.state.config.storage.path).join(FILL_TEMP_DIR);
+        let dir = ctx.state.spool.dir(HF_FILL_SUBDIR);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("read-only.part");
         std::fs::write(&path, b"").unwrap();
@@ -4545,6 +4665,9 @@ mod tests {
                 file,
                 guard: TempFileGuard::new(path.clone()),
                 path,
+                reservation: ctx.state.spool.reserve(0).unwrap(),
+                written: 0,
+                cap: None,
             }),
         };
         let body = weights();
@@ -5084,7 +5207,7 @@ mod tests {
     #[test]
     fn stale_fill_temp_files_are_removed_and_fresh_ones_kept() {
         let dir = tempfile::tempdir().unwrap();
-        let temps = dir.path().join(FILL_TEMP_DIR);
+        let temps = dir.path().join(HF_FILL_SUBDIR);
         std::fs::create_dir_all(&temps).unwrap();
         let aged = |name: &str, quiet: Duration| {
             let path = temps.join(name);
@@ -5100,7 +5223,7 @@ mod tests {
         let dead = aged("dead.part", Duration::from_secs(4 * 3600 + 60));
         let slow = aged("slow.part", Duration::from_secs(4 * 3600 - 60));
         let live = aged("live.part", Duration::ZERO);
-        cleanup_fill_temp_dir(dir.path().to_str().unwrap());
+        crate::registry::cleanup_spool_dirs(dir.path());
         assert!(!dead.exists());
         assert!(
             slow.exists(),
