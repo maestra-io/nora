@@ -1714,3 +1714,38 @@ async fn test_oidc_identity_cannot_manage_api_tokens() {
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// Audit A022: the write rule `repo:myorg/*:ref:refs/heads/main` binds a repo on main;
+/// a subject with more fields that merely ends with `:ref:refs/heads/main` gets the
+/// trailing-`*` read rule, so its write is refused.
+#[tokio::test]
+async fn test_oidc_role_inner_star_stays_in_one_sub_field() {
+    let mock_server = jwks_server().await;
+    let issuer = mock_server.uri();
+    let ctx = create_oidc_test_context(&issuer);
+    let now = now_secs();
+    let cases = [
+        ("repo:myorg/app:ref:refs/heads/main", StatusCode::OK),
+        (
+            "repo:myorg/app:environment:x:ref:refs/heads/main",
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "repo:myorg/app:ref:refs/heads/dev:workflow:x:ref:refs/heads/main",
+            StatusCode::FORBIDDEN,
+        ),
+    ];
+    for (i, (sub, want)) in cases.into_iter().enumerate() {
+        let bearer = format!("Bearer {}", make_jwt(&issuer, sub, "nora", now, now + 300));
+        let status = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            &format!("/raw/oidc-glob-{i}.txt"),
+            vec![("authorization", bearer.as_str())],
+            b"x".to_vec(),
+        )
+        .await
+        .status();
+        assert_eq!(status, want, "sub {sub}");
+    }
+}

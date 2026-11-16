@@ -1128,6 +1128,25 @@ impl Config {
                 .unwrap_or(false)
     }
 
+    /// True if `url` is an https URL with a host, or an http URL whose host is loopback.
+    /// Token-signing keys and issuers fetched over plain http off-host could be swapped by
+    /// anyone on the path; loopback stays allowed for local test servers.
+    pub(crate) fn https_or_loopback(url: &str) -> bool {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        let host = parsed
+            .host_str()
+            .unwrap_or_default()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        match parsed.scheme() {
+            "https" => !host.is_empty(),
+            "http" => Self::is_loopback_host(host),
+            _ => false,
+        }
+    }
+
     /// Validate configuration with explicit config_path to avoid env var
     /// dependency in tests (env vars are process-global, tests run in parallel).
     pub fn validate_with_config_path(
@@ -1388,6 +1407,17 @@ impl Config {
                     )),
                     AudienceCheck::Expect(_) => {}
                 }
+                let urls = std::iter::once(("issuer", provider.issuer.as_str()))
+                    .chain(provider.jwks_uri.as_deref().map(|u| ("jwks_uri", u)));
+                for (key, url) in urls {
+                    if !Self::https_or_loopback(url) {
+                        errors.push(format!(
+                            "auth.oidc provider \"{}\" has {key} = \"{url}\": it must be an \
+                             https:// URL (http:// only on a loopback host)",
+                            provider.name
+                        ));
+                    }
+                }
                 if provider.session_lifetime_secs
                     > crate::auth::oidc_session::MAX_SESSION_LIFETIME_SECS
                 {
@@ -1399,6 +1429,20 @@ impl Config {
                     ));
                 }
             }
+        }
+
+        // 7c. The Teleport JWKS is the trust anchor of the UI identity: https only. An empty
+        // URL is refused by the Teleport validator itself.
+        let teleport = &self.auth.teleport;
+        if teleport.enabled
+            && !teleport.jwks_url.is_empty()
+            && !Self::https_or_loopback(&teleport.jwks_url)
+        {
+            errors.push(format!(
+                "auth.teleport.jwks_url = \"{}\": it must be an https:// URL (http:// only on a \
+                 loopback host)",
+                teleport.jwks_url
+            ));
         }
 
         // An interval of 0 is not "disabled": every pass would be due again the moment it

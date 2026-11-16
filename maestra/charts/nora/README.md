@@ -167,7 +167,7 @@ The chart mounts the Secret at `/etc/nora/users.htpasswd` and sets `htpasswd_fil
 
 #### OIDC
 
-Role rules use glob patterns on the JWT `sub` claim; first match wins.
+Role rules use glob patterns on the JWT `sub` claim; first match wins. A `*` at the end of a pattern matches the rest of the subject; any other `*` matches within one `:`-separated field. `issuer` and `jwks_uri` must be `https://` URLs (`http://` only on a loopback host).
 
 ```yaml
 config:

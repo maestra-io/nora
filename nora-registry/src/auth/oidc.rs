@@ -135,12 +135,12 @@ pub struct OidcValidator {
 const OIDC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Outcome of an OIDC discovery request, reduced to what the caller needs. Pure classification,
-/// so every "unusable" case (non-2xx, unparseable body, empty `jwks_uri`, or no response at all)
-/// collapses to one branch that falls back WITHOUT caching — a transient discovery failure can
-/// never pin the fallback. Unit-tested in `classify_discovery_only_accepts_2xx_json_with_uri`.
+/// so every "unusable" case (non-2xx, unparseable body, empty or non-https `jwks_uri`, or no
+/// response at all) collapses to one branch that falls back WITHOUT caching — a transient
+/// discovery failure can never pin the fallback. Unit-tested in `classify_discovery_only_accepts_2xx_json_with_uri`.
 #[derive(Debug, PartialEq, Eq)]
 enum DiscoveryOutcome {
-    /// A usable `jwks_uri` was discovered (2xx + parseable body + non-empty uri).
+    /// A usable `jwks_uri` was discovered (2xx + parseable body + an https or loopback uri).
     Found(String),
     /// Nothing usable; the caller uses the legacy fallback and caches nothing.
     Unusable,
@@ -152,7 +152,10 @@ fn classify_discovery(status: Option<u16>, body: &[u8]) -> DiscoveryOutcome {
     match status {
         Some(s) if (200..300).contains(&s) => {
             match serde_json::from_slice::<OidcDiscoveryDoc>(body) {
-                Ok(doc) if !doc.jwks_uri.is_empty() => DiscoveryOutcome::Found(doc.jwks_uri),
+                // A plain-http key URL would let anyone on the path swap the signing keys.
+                Ok(doc) if crate::config::Config::https_or_loopback(&doc.jwks_uri) => {
+                    DiscoveryOutcome::Found(doc.jwks_uri)
+                }
                 _ => DiscoveryOutcome::Unusable,
             }
         }
@@ -557,49 +560,38 @@ impl OidcValidator {
     }
 }
 
-/// Simple glob matching: supports `*` (any chars within segment) and `**` is not needed
-/// since sub claims use `:` as separator, not `/`.
-/// Patterns: "repo:org/*" matches "repo:org/myrepo:ref:refs/heads/main"
+/// Glob match of a role-rule pattern against a `sub` claim, whose fields are `:`-separated.
+/// A `*` that ends the pattern matches the rest of the subject, `:` included
+/// ("repo:org/*" matches "repo:org/myrepo:ref:refs/heads/main"). Every other `*` matches
+/// within one field only, so "repo:org/*:ref:refs/heads/main" does not match a subject
+/// that merely ends with ":ref:refs/heads/main" after more fields.
 fn glob_match(pattern: &str, value: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-
     let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        // No wildcard — exact match
+    let last = parts.len() - 1;
+    if last == 0 {
         return pattern == value;
     }
-
-    // First part must be prefix, last part must be suffix
-    let mut remaining = value;
-
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
+    let Some(mut remaining) = value.strip_prefix(parts[0]) else {
+        return false;
+    };
+    // The leftmost occurrence of each middle part leaves the shortest gap, so it is the
+    // only candidate worth trying: a later one skips at least as much of the subject.
+    for part in &parts[1..last] {
+        let Some(pos) = remaining.find(part) else {
+            return false;
+        };
+        if remaining[..pos].contains(':') {
+            return false;
         }
-        if i == 0 {
-            // Must start with this
-            if !remaining.starts_with(part) {
-                return false;
-            }
-            remaining = &remaining[part.len()..];
-        } else if i == parts.len() - 1 {
-            // Must end with this
-            if !remaining.ends_with(part) {
-                return false;
-            }
-            return true;
-        } else {
-            // Must contain this
-            match remaining.find(part) {
-                Some(pos) => remaining = &remaining[pos + part.len()..],
-                None => return false,
-            }
-        }
+        remaining = &remaining[pos + part.len()..];
     }
-
-    true
+    let tail = parts[last];
+    if tail.is_empty() {
+        return true; // trailing `*`: spans fields
+    }
+    remaining
+        .strip_suffix(tail)
+        .is_some_and(|gap| !gap.contains(':'))
 }
 
 /// Classify a [`OidcValidator::validate_token`] rejection string into a bounded
@@ -661,6 +653,15 @@ mod tests {
         assert_eq!(classify_discovery(Some(404), b""), Unusable);
         // no response (transport error / timeout) -> Unusable.
         assert_eq!(classify_discovery(None, b""), Unusable);
+        // Audit B23: a plain-http key URL off loopback is not trusted -> Unusable.
+        assert_eq!(
+            classify_discovery(Some(200), br#"{"jwks_uri":"http://idp/keys"}"#),
+            Unusable
+        );
+        assert_eq!(
+            classify_discovery(Some(200), br#"{"jwks_uri":"http://127.0.0.1:9/keys"}"#),
+            Found("http://127.0.0.1:9/keys".to_string())
+        );
     }
 
     #[test]
@@ -751,6 +752,48 @@ mod tests {
         ));
     }
 
+    /// Audit A022: an inner `*` matches inside one `:` field; a trailing `*` spans fields.
+    #[test]
+    fn glob_inner_star_does_not_cross_sub_fields() {
+        let main = "repo:myorg/*:ref:refs/heads/main";
+        assert!(glob_match(main, "repo:myorg/app:ref:refs/heads/main"));
+        assert!(!glob_match(
+            main,
+            "repo:myorg/app:environment:x:ref:refs/heads/main"
+        ));
+        assert!(!glob_match(
+            main,
+            "repo:myorg/app:ref:refs/heads/dev:workflow:x:ref:refs/heads/main"
+        ));
+        // A leading `*` is not trailing: one field only.
+        assert!(glob_match("*:pull_request", "repo:pull_request"));
+        assert!(!glob_match("*:pull_request", "repo:myorg/app:pull_request"));
+        // Several inner stars, each in its own field.
+        assert!(glob_match("repo:*/*:ref:*", "repo:org/app:ref:x:y"));
+        assert!(!glob_match("repo:*/*:ref:*", "repo:org:x/app:ref:y"));
+        // A part may itself hold `:`; it still needs a field-local gap before it.
+        assert!(glob_match("a*:b:*", "ax:b:c:d"));
+        assert!(!glob_match("a*:b:c", "a:x:b:c"));
+        // Trailing `*` still spans fields.
+        assert!(glob_match(
+            "repo:myorg/*",
+            "repo:myorg/app:ref:refs/heads/dev"
+        ));
+        assert!(glob_match(
+            "repo:myorg/admin-scoped:*",
+            "repo:myorg/admin-scoped:environment:x:ref:refs/heads/main"
+        ));
+        assert!(glob_match(
+            "repo:org/app:ref:refs/heads/mindbox/*",
+            "repo:org/app:ref:refs/heads/mindbox/3.2"
+        ));
+        assert!(glob_match("**", "a:b"));
+        // Prefix and suffix may not overlap.
+        assert!(!glob_match("ab*ba", "aba"));
+        assert!(!glob_match("", "a"));
+        assert!(glob_match("", ""));
+    }
+
     #[test]
     fn test_match_role_first_wins() {
         let config = OidcConfig::default();
@@ -804,6 +847,15 @@ mod tests {
         // different org → no match
         let m = validator.match_role(&provider, "repo:other/app:ref:refs/heads/main");
         assert!(m.is_none());
+
+        // Audit A022: subjects that only END with the main-branch fields get read, not write.
+        for sub in [
+            "repo:myorg/app:environment:x:ref:refs/heads/main",
+            "repo:myorg/app:ref:refs/heads/dev:workflow:x:ref:refs/heads/main",
+        ] {
+            let m = validator.match_role(&provider, sub);
+            assert!(matches!(m, Some((Role::Read, None))), "{sub}: {m:?}");
+        }
     }
 
     #[test]
