@@ -61,6 +61,36 @@ pub enum CurationOnFailure {
     Open,
 }
 
+/// What curation makes of a proxied version whose trusted upstream release date stayed
+/// unknown after every date source was tried (`[curation.<registry>] unknown_date`).
+///
+/// - `hold` — judged as released now: refused while `min_release_age` lasts
+/// - `log` — left undated (min-release-age defers to the quarantine), with a
+///   `[SECURITY] min-release-age unknown date` line and
+///   `nora_curation_unknown_release_date_total{registry}`
+///
+/// Unset: `hold` for NuGet, `log` for every other registry.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum UnknownDate {
+    Hold,
+    Log,
+}
+
+impl std::str::FromStr for UnknownDate {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "hold" => Ok(Self::Hold),
+            "log" => Ok(Self::Log),
+            other => Err(format!(
+                "unknown unknown_date {other:?} — valid values: hold, log"
+            )),
+        }
+    }
+}
+
 /// Curation layer configuration.
 ///
 /// # Environment Variables
@@ -74,8 +104,8 @@ pub enum CurationOnFailure {
 /// - `NORA_CURATION_MIN_RELEASE_AGE` — minimum release age (e.g., "7d", "24h", "1w")
 /// - `NORA_CURATION_QUARANTINE` — quarantine mode: off/observe/enforce (default: off)
 /// - `NORA_CURATION_QUARANTINE_TTL` — quarantine hold duration (e.g., "14d", "24h")
-/// - `NORA_CURATION_<REGISTRY>_MIN_RELEASE_AGE` / `_QUARANTINE` / `_QUARANTINE_TTL` —
-///   per-registry overrides
+/// - `NORA_CURATION_<REGISTRY>_MIN_RELEASE_AGE` / `_QUARANTINE` / `_QUARANTINE_TTL` /
+///   `_UNKNOWN_DATE` — per-registry overrides
 /// - `NORA_CURATION_<REGISTRY>_ALLOW` — comma-separated `allow` entries exempt from
 ///   `min_release_age` (e.g., `NORA_CURATION_NUGET_ALLOW=Newtonsoft.Json@13.0.4,Microsoft.NETCore.*`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +206,10 @@ pub struct RegistryCurationOverride {
     /// of the curation policy.
     #[serde(default)]
     pub allow: Vec<String>,
+    /// `hold` or `log` a version whose trusted release date stayed unknown; see
+    /// [`UnknownDate`]. Reloaded on SIGHUP.
+    #[serde(default)]
+    pub unknown_date: Option<UnknownDate>,
 }
 
 impl Default for CurationConfig {
@@ -312,6 +346,7 @@ impl CurationConfig {
                 // In the engine a reload builds.
                 min_release_age: _,
                 allow: _,
+                unknown_date: _,
                 quarantine,
                 quarantine_ttl,
             } = own;
@@ -449,6 +484,15 @@ impl CurationConfig {
             }
             if let Ok(val) = env::var(format!("NORA_CURATION_{}_QUARANTINE_TTL", env_suffix)) {
                 field.quarantine_ttl = if val.is_empty() { None } else { Some(val) };
+            }
+            if let Ok(val) = env::var(format!("NORA_CURATION_{}_UNKNOWN_DATE", env_suffix)) {
+                field.unknown_date = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.parse::<UnknownDate>().map_err(|e| {
+                        format!("NORA_CURATION_{}_UNKNOWN_DATE={:?}: {}", env_suffix, val, e)
+                    })?)
+                };
             }
             if let Ok(val) = env::var(format!("NORA_CURATION_{}_ALLOW", env_suffix)) {
                 field.allow = val

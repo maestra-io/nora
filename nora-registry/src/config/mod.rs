@@ -33,7 +33,7 @@ pub use self::auth::{
 #[allow(unused_imports)]
 pub use self::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerOverride};
 pub use self::curation::{
-    CurationConfig, CurationMode, CurationOnFailure, RegistryCurationOverride,
+    CurationConfig, CurationMode, CurationOnFailure, RegistryCurationOverride, UnknownDate,
 };
 pub use self::gc::GcConfig;
 pub use self::rate_limit::RateLimitConfig;

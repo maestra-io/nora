@@ -1500,14 +1500,14 @@ async fn catalog_created(state: &AppState, id: &str, version: &str, url: &str) -
     nuget_date(leaf.get("created")).or_else(|| nuget_date(leaf.get("catalog:commitTimeStamp")))
 }
 
-/// The date curation judges a proxied version by: its release date, or for one still
-/// unknown with `trust_upstream_dates` (every date source tried), what
-/// `curation.on_failure` makes of it ([`crate::curation::CurationEngine::unknown_release_date`]).
+/// The date curation judges a proxied version by
+/// ([`crate::curation::CurationEngine::judged_release_date`]).
 fn judged_date(state: &AppState, date: Option<i64>) -> Option<i64> {
-    if date.is_some() || !state.config.server.trust_upstream_dates {
-        return date;
-    }
-    state.curation().curation_engine.unknown_release_date()
+    state.curation().curation_engine.judged_release_date(
+        RegistryType::Nuget,
+        state.config.server.trust_upstream_dates,
+        date,
+    )
 }
 
 /// Find `version` in a registration index: an inlined leaf, or the page that covers it.

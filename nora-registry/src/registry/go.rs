@@ -80,31 +80,27 @@ async fn handle(
         None
     };
 
+    let storage_key = format!("go/{}", path);
+
     // Hoisted to function scope so the digest-quarantine serve gate can seed
     // first_seen from a trusted upstream release date (#750).
     let mut publish_date: Option<i64> = None;
     // Curation check — .zip downloads only (metadata passes through)
     if let Some((ref module_name, ref version)) = go_curation {
-        // Extract publish date from cached .info file
-        publish_date = if let Some(ref ver) = version {
-            let info_key = format!("go/{}/@v/{}.info", module_encoded, ver);
-            extract_go_publish_date(
-                &state.storage,
-                &info_key,
-                state.config.server.trust_upstream_dates,
-            )
-            .await
-        } else {
-            None
-        };
-
         // #733: an internal-namespace module is operator-owned — skip curation; the namespace
         // guard below (after the cache serve) serves any local copy and blocks the upstream branch.
-        if !crate::curation::is_internal_namespace(
+        let internal = crate::curation::is_internal_namespace(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Go,
             module_name,
-        ) {
+        );
+        publish_date = match version {
+            Some(ver) => go_publish_date(&state, &module_encoded, ver, !internal).await,
+            None => None,
+        };
+
+        if !internal {
+            let judged = go_judged_date(&state, publish_date, &storage_key).await;
             if let Some(response) = crate::curation::check_download(
                 &state.curation().curation_engine,
                 state.bypass_token().as_deref(),
@@ -112,14 +108,13 @@ async fn handle(
                 crate::curation::RegistryType::Go,
                 module_name,
                 crate::curation::RequestVersion::of_artifact(version.as_deref()),
-                publish_date,
+                judged,
             ) {
                 return response;
             }
         }
     }
 
-    let storage_key = format!("go/{}", path);
     let content_type = content_type_for(&file);
 
     // Mutable endpoints: @v/list, @latest, and a non-canonical `@v/<query>.info` (a branch,
@@ -441,6 +436,11 @@ async fn handle(
 /// ```json
 /// { "Version": "v1.0.0", "Time": "2024-01-15T10:30:00Z" }
 /// ```
+///
+/// `Time` is the publisher's commit date, which the publisher sets: it bounds the release
+/// from below only. A canonical .info is cached once (`put_if_absent`) and never rewritten,
+/// so its write time is NORA's first sight of the version; the date is the later of the two,
+/// and now when the write time cannot be read.
 async fn extract_go_publish_date(
     storage: &crate::storage::Storage,
     info_key: &str,
@@ -453,7 +453,85 @@ async fn extract_go_publish_date(
     let data = storage.get(info_key).await.ok()?;
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
     let date_str = json.get("Time")?.as_str()?;
-    crate::curation::parse_iso8601_to_unix(date_str)
+    let time = crate::curation::parse_iso8601_to_unix(date_str)?;
+    let first_seen = crate::curation::extract_mtime_as_publish_date(storage, info_key)
+        .await
+        .unwrap_or_else(|| crate::cache_ttl::now_unix() as i64);
+    Some(time.max(first_seen))
+}
+
+/// A version's release date from its `.info` (see [`extract_go_publish_date`]). With
+/// `fetch` (a proxied module) and a release age to judge, an `.info` NORA has none of is
+/// fetched first: a `.zip` asked for first, or cached without its `.info`, is dated too.
+async fn go_publish_date(
+    state: &AppState,
+    module_encoded: &str,
+    ver: &str,
+    fetch: bool,
+) -> Option<i64> {
+    let trust = state.config.server.trust_upstream_dates;
+    let file = format!("@v/{ver}.info");
+    let info_key = format!("go/{module_encoded}/{file}");
+    if fetch
+        && trust
+        && state
+            .curation()
+            .curation_engine
+            .reads_release_date(RegistryType::Go)
+    {
+        ensure_go_info_cached(state, module_encoded, &file, &info_key).await;
+    }
+    extract_go_publish_date(&state.storage, &info_key, trust).await
+}
+
+/// The date min-release-age judges a `.zip` by: `date`, else the write time of NORA's copy
+/// of the zip (NORA's clock, never earlier than the release), then what
+/// `[curation.go] unknown_date` makes of a date still unknown. Not the quarantine's seed:
+/// a cached copy's age is the quarantine's own business (R4-C05).
+async fn go_judged_date(state: &AppState, date: Option<i64>, zip_key: &str) -> Option<i64> {
+    let trust = state.config.server.trust_upstream_dates;
+    let curation = state.curation();
+    let engine = &curation.curation_engine;
+    let date = match date {
+        None if trust && engine.reads_release_date(RegistryType::Go) => {
+            crate::curation::extract_mtime_as_publish_date(&state.storage, zip_key).await
+        }
+        date => date,
+    };
+    engine.judged_release_date(RegistryType::Go, trust, date)
+}
+
+/// Store the upstream `.info` (`file`) at `info_key` when NORA has none, synchronously, so the
+/// release date is readable on this request (cargo's `ensure_cargo_metadata_cached`).
+/// Best-effort: a failed fetch leaves it absent. The caller keeps internal modules out.
+async fn ensure_go_info_cached(state: &AppState, module_encoded: &str, file: &str, info_key: &str) {
+    if state.storage.get(info_key).await.is_ok() {
+        return;
+    }
+    let Some(proxy_url) = &state.config.go.proxy else {
+        return;
+    };
+    let url = format!(
+        "{}/{}",
+        proxy_url.trim_end_matches('/'),
+        format_upstream_path(module_encoded, file)
+    );
+    if let Ok(text) = proxy_fetch_text(
+        &state.http_client,
+        &url,
+        Duration::from_secs(state.config.go.proxy_timeout),
+        expose_opt(&state.config.go.proxy_auth).map(UpstreamAuth::Basic),
+        None,
+        &state.circuit_breaker,
+        RegistryType::Go,
+    )
+    .await
+    {
+        let _ = state
+            .storage
+            .put_if_absent(info_key, Bytes::from(text.into_bytes()))
+            .await;
+    }
 }
 
 /// Decode Go module path: `!x` → `X`
@@ -1511,5 +1589,165 @@ mod quarantine_first_seen {
     async fn with_trusted_dates_an_old_release_matures_in_the_quarantine() {
         let (_up, ctx) = context(true).await;
         assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::OK);
+    }
+}
+
+/// A Go version's release date under trusted upstream dates (audit A066, A067): the `.info`
+/// `Time` bounded below by NORA's first sight of the version, the `.info` fetched before a
+/// `.zip` asked for first, and a date still unknown judged by `[curation.go] unknown_date`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod release_date_judged {
+    use crate::test_helpers::{
+        create_test_context_with_config, put_written_days_ago, quarantine_7d, send, upstream_paths,
+        TestContext,
+    };
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const ZIP: &str = "/go/example.org/mod/@v/v2.3.4.zip";
+    const INFO: &str = "/go/example.org/mod/@v/v2.3.4.info";
+    const ZIP_KEY: &str = "go/example.org/mod/@v/v2.3.4.zip";
+    const INFO_KEY: &str = "go/example.org/mod/@v/v2.3.4.info";
+    const UP_INFO: &str = "/example.org/mod/@v/v2.3.4.info";
+
+    fn info(age: chrono::Duration) -> Vec<u8> {
+        let t = (chrono::Utc::now() - age).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        format!(r#"{{"Version":"v2.3.4","Time":"{t}"}}"#).into_bytes()
+    }
+
+    /// An upstream serving the zip and, when `info_body` is set, the `.info` (else 500).
+    async fn upstream(info_body: Option<Vec<u8>>) -> MockServer {
+        let up = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/example.org/mod/@v/v2.3.4.zip"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ZIP".to_vec()))
+            .mount(&up)
+            .await;
+        let info = match info_body {
+            Some(body) => ResponseTemplate::new(200).set_body_bytes(body),
+            None => ResponseTemplate::new(500),
+        };
+        Mock::given(method("GET"))
+            .and(path(UP_INFO))
+            .respond_with(info)
+            .mount(&up)
+            .await;
+        up
+    }
+
+    /// Live shape: enforce, go min_release_age 3d, quarantine observe, trusted dates.
+    fn min_age(up: &MockServer, hold: bool) -> TestContext {
+        let uri = up.uri();
+        create_test_context_with_config(move |cfg| {
+            cfg.go.proxy = Some(uri);
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.go.min_release_age = Some("3d".to_string());
+            cfg.curation.go.quarantine = Some(crate::digest_quarantine::QuarantineMode::Observe);
+            cfg.curation.go.quarantine_ttl = Some("3d".to_string());
+            if hold {
+                cfg.curation.go.unknown_date = Some(crate::config::UnknownDate::Hold);
+            }
+        })
+    }
+
+    async fn status(ctx: &TestContext, uri: &str) -> StatusCode {
+        send(&ctx.app, Method::GET, uri, "").await.status()
+    }
+
+    /// The `.info` through NORA, as `go mod download` asks, and its background write done.
+    async fn info_through_nora(ctx: &TestContext) {
+        let holders = ctx.state.storage.holders();
+        assert_eq!(status(ctx, INFO).await, StatusCode::OK);
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
+        assert!(ctx.state.storage.get(INFO_KEY).await.is_ok(), "info cached");
+    }
+
+    // A066: a `Time` 30 days back on a version NORA first sees now does not age it.
+    #[tokio::test]
+    async fn a_backdated_info_time_does_not_skip_min_release_age() {
+        let up = upstream(Some(info(chrono::Duration::days(30)))).await;
+        let ctx = min_age(&up, false);
+        info_through_nora(&ctx).await;
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::FORBIDDEN);
+
+        // Control: the same `.info` NORA cached 30 days ago.
+        let ctx = min_age(&up, false);
+        put_written_days_ago(&ctx, INFO_KEY, &info(chrono::Duration::days(30)), 30).await;
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::OK);
+    }
+
+    // A066: nor does it seed an enforcing quarantine as mature.
+    #[tokio::test]
+    async fn a_backdated_info_time_does_not_seed_the_quarantine() {
+        let body = br#"{"Version":"v2.3.4","Time":"2019-01-01T00:00:00Z"}"#.to_vec();
+        let up = upstream(Some(body)).await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.go.proxy = Some(uri);
+            cfg.server.trust_upstream_dates = true;
+            quarantine_7d(cfg);
+        });
+        info_through_nora(&ctx).await;
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::FORBIDDEN);
+    }
+
+    // A067 (A): a `.zip` asked for first fetches its `.info` and is judged by it.
+    #[tokio::test]
+    async fn a_zip_first_is_dated_by_its_fetched_info() {
+        let up = upstream(Some(info(chrono::Duration::hours(1)))).await;
+        let ctx = min_age(&up, false);
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::FORBIDDEN);
+        assert!(upstream_paths(&up).await.iter().any(|p| p == UP_INFO));
+        assert!(ctx.state.storage.get(INFO_KEY).await.is_ok());
+    }
+
+    // A067 (B): the `.info` through NORA first, then the `.zip`.
+    #[tokio::test]
+    async fn an_info_then_zip_is_refused() {
+        let up = upstream(Some(info(chrono::Duration::hours(1)))).await;
+        let ctx = min_age(&up, false);
+        info_through_nora(&ctx).await;
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::FORBIDDEN);
+    }
+
+    // A067 (C): a zip cached without its `.info` is dated, not served undated.
+    #[tokio::test]
+    async fn a_cached_zip_without_info_is_dated() {
+        let up = upstream(Some(info(chrono::Duration::hours(1)))).await;
+        let ctx = min_age(&up, false);
+        ctx.state.storage.put(ZIP_KEY, b"ZIP").await.unwrap();
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::FORBIDDEN);
+    }
+
+    // A067: with no `.info` to be had, `hold` refuses a version NORA has no copy of.
+    #[tokio::test]
+    async fn an_unknown_date_is_held_under_hold() {
+        let up = upstream(None).await;
+        let ctx = min_age(&up, true);
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::FORBIDDEN);
+    }
+
+    /// `log` (Go's default) serves it, and counts it.
+    #[tokio::test]
+    async fn an_unknown_date_is_counted_under_log() {
+        let up = upstream(None).await;
+        let ctx = min_age(&up, false);
+        let counter =
+            crate::metrics::CURATION_UNKNOWN_RELEASE_DATE_TOTAL.with_label_values(&["go"]);
+        let before = counter.get();
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::OK);
+        assert!(counter.get() > before);
+    }
+
+    /// A zip NORA cached more than 3 days ago is as old as that, `.info` or not.
+    #[tokio::test]
+    async fn a_zip_cached_long_ago_is_dated_by_its_copy() {
+        let up = upstream(None).await;
+        let ctx = min_age(&up, true);
+        put_written_days_ago(&ctx, ZIP_KEY, b"ZIP", 4).await;
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::OK);
     }
 }
