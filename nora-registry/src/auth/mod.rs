@@ -113,6 +113,127 @@ struct FailureCounts {
     addresses: HashMap<IpAddr, (u32, Instant)>,
     /// Accounts whose current lockout already logged a 429.
     refusals_logged: std::collections::HashSet<(IpAddr, [u8; 32])>,
+    /// Passwords being checked ([`AuthFailureTracker::begin_check`]), by account and by
+    /// address: each distinct pair with the number of requests waiting on its verdict.
+    checking_accounts: HashMap<(IpAddr, [u8; 32]), HashMap<[u8; 32], u32>>,
+    checking_addresses: HashMap<IpAddr, HashMap<[u8; 32], u32>>,
+}
+
+impl FailureCounts {
+    /// One more failure for the account `key` and its address: the account's failures.
+    fn add_failure(&mut self, key: (IpAddr, [u8; 32]), now: Instant) -> u32 {
+        let account = self.accounts.entry(key).or_insert((0, now));
+        *account = (account.0.saturating_add(1), now);
+        let failures = account.0;
+        let address = self.addresses.entry(key.0).or_insert((0, now));
+        *address = (address.0.saturating_add(1), now);
+        self.refusals_logged.remove(&key);
+        failures
+    }
+
+    fn clear(&mut self, key: &(IpAddr, [u8; 32])) {
+        self.accounts.remove(key);
+        self.refusals_logged.remove(key);
+    }
+
+    /// Let go of one request's hold on the pair `pair` of the account `key`.
+    fn release(&mut self, key: (IpAddr, [u8; 32]), pair: [u8; 32]) {
+        fn drop_one<K: std::hash::Hash + Eq>(
+            map: &mut HashMap<K, HashMap<[u8; 32], u32>>,
+            k: K,
+            pair: [u8; 32],
+        ) {
+            if let std::collections::hash_map::Entry::Occupied(mut pairs) = map.entry(k) {
+                if let Some(n) = pairs.get_mut().get_mut(&pair) {
+                    *n -= 1;
+                    if *n == 0 {
+                        pairs.get_mut().remove(&pair);
+                    }
+                }
+                if pairs.get().is_empty() {
+                    pairs.remove();
+                }
+            }
+        }
+        drop_one(&mut self.checking_accounts, key, pair);
+        drop_one(&mut self.checking_addresses, key.0, pair);
+    }
+}
+
+/// Why [`AuthFailureTracker::begin_check`] refused to check a password.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckRefused {
+    /// The account or its address is locked out, for so many seconds.
+    LockedOut(u64),
+    /// As many distinct passwords as the account or its address has attempts left are
+    /// being checked already: retry in a second, nothing counted.
+    Busy,
+}
+
+impl CheckRefused {
+    pub(crate) fn retry_after(self) -> u64 {
+        match self {
+            CheckRefused::LockedOut(secs) => secs,
+            CheckRefused::Busy => 1,
+        }
+    }
+}
+
+/// A password check [`AuthFailureTracker::begin_check`] let run: held until
+/// [`CheckSlot::settle`] counts its outcome, or let go uncounted when dropped (an early
+/// return, a cancelled request).
+pub(crate) struct CheckSlot<'a> {
+    tracker: &'a AuthFailureTracker,
+    key: (IpAddr, [u8; 32]),
+    pair: [u8; 32],
+    username: String,
+    settled: bool,
+}
+
+impl CheckSlot<'_> {
+    /// Count the outcome and let go of the slot, in one hold of the tracker's lock: the
+    /// next check of the account sees the failure before it sees the room.
+    pub(crate) fn settle(mut self, count: LockoutCount) {
+        let failures = {
+            let mut entries = self.tracker.entries.lock();
+            let failures = match count {
+                LockoutCount::Nothing => None,
+                LockoutCount::Failure => Some(entries.add_failure(self.key, Instant::now())),
+                LockoutCount::Clear => {
+                    entries.clear(&self.key);
+                    None
+                }
+            };
+            entries.release(self.key, self.pair);
+            failures
+        };
+        self.settled = true;
+        if let Some(failures) = failures {
+            self.tracker
+                .lockout_started(self.key.0, &self.username, failures);
+        }
+    }
+}
+
+impl Drop for CheckSlot<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.tracker.entries.lock().release(self.key, self.pair);
+        }
+    }
+}
+
+/// The Basic username as it may be logged: a value shaped like a credential (an API or
+/// session token, a JWT), sent in the username slot by mistake, is replaced by a marker.
+fn loggable_username(username: &str) -> String {
+    let credential = username.starts_with("nra_")
+        || username.starts_with(oidc_session::SESSION_TOKEN_PREFIX)
+        || (username.starts_with("eyJ") && username.split('.').count() == 3);
+    if credential {
+        "<credential-in-username>".to_string()
+    } else {
+        username.chars().take(64).collect()
+    }
 }
 
 fn account_key(ip: IpAddr, username: &str) -> (IpAddr, [u8; 32]) {
@@ -157,6 +278,67 @@ impl AuthFailureTracker {
         account.max(address)
     }
 
+    /// Before the password `pair` (a key of username and password, the same for the same
+    /// pair) of `username` at `ip` is checked: refuse it under a lockout, as
+    /// [`Self::check_blocked`] does, or when the account or its address already has as
+    /// many other passwords being checked as it has attempts left before a lockout, so
+    /// guesses sent at once are not all checked before their failures are counted. A pair
+    /// already being checked shares that check's room. One attempt always has room.
+    pub(crate) fn begin_check(
+        &self,
+        ip: IpAddr,
+        username: &str,
+        pair: [u8; 32],
+    ) -> Result<CheckSlot<'_>, CheckRefused> {
+        let key = account_key(ip, username);
+        let address_threshold = self
+            .max_failures
+            .saturating_mul(ADDRESS_FAILURES_PER_ACCOUNT);
+        let mut entries = self.entries.lock();
+        let account = entries.accounts.get(&key);
+        let address = entries.addresses.get(&ip);
+        if let Some(secs) = self
+            .lockout_left(account, self.max_failures)
+            .max(self.lockout_left(address, address_threshold))
+        {
+            return Err(CheckRefused::LockedOut(secs));
+        }
+        let room = |count: Option<&(u32, Instant)>, threshold: u32| {
+            threshold.saturating_sub(count.map_or(0, |c| c.0)).max(1) as usize
+        };
+        let full = |checking: Option<&HashMap<[u8; 32], u32>>, room: usize| {
+            checking.is_some_and(|pairs| !pairs.contains_key(&pair) && pairs.len() >= room)
+        };
+        if full(
+            entries.checking_accounts.get(&key),
+            room(account, self.max_failures),
+        ) || full(
+            entries.checking_addresses.get(&ip),
+            room(address, address_threshold),
+        ) {
+            return Err(CheckRefused::Busy);
+        }
+        *entries
+            .checking_accounts
+            .entry(key)
+            .or_default()
+            .entry(pair)
+            .or_default() += 1;
+        *entries
+            .checking_addresses
+            .entry(ip)
+            .or_default()
+            .entry(pair)
+            .or_default() += 1;
+        Ok(CheckSlot {
+            tracker: self,
+            key,
+            pair,
+            username: username.to_string(),
+            settled: false,
+        })
+    }
+
     /// Apply to the counts of `username` at `ip` what [`lockout_rule`]
     /// decided an attempt does to them: the one way an attempt changes them.
     pub(crate) fn count(&self, ip: IpAddr, username: &str, count: LockoutCount) {
@@ -174,25 +356,23 @@ impl AuthFailureTracker {
     /// refused before its password is checked, so every failure at or past the
     /// threshold starts a new (longer) lockout, logged and counted once.
     fn record_failure(&self, ip: IpAddr, username: &str) -> Option<u64> {
-        let now = Instant::now();
-        let key = account_key(ip, username);
-        let failures = {
-            let mut entries = self.entries.lock();
-            let account = entries.accounts.entry(key).or_insert((0, now));
-            *account = (account.0.saturating_add(1), now);
-            let failures = account.0;
-            let address = entries.addresses.entry(ip).or_insert((0, now));
-            *address = (address.0.saturating_add(1), now);
-            entries.refusals_logged.remove(&key);
-            failures
-        };
+        let failures = self
+            .entries
+            .lock()
+            .add_failure(account_key(ip, username), Instant::now());
+        self.lockout_started(ip, username, failures)
+    }
+
+    /// The lockout `failures` failures of `username` at `ip` start, logged and counted:
+    /// `None` below the threshold.
+    fn lockout_started(&self, ip: IpAddr, username: &str, failures: u32) -> Option<u64> {
         if failures < self.max_failures {
             return None;
         }
         let exponent = (failures - self.max_failures).min(20);
         let lockout_secs = (1u64 << exponent).min(self.max_lockout_secs);
         crate::metrics::AUTH_LOCKOUTS_TOTAL.inc();
-        let username: String = username.chars().take(64).collect();
+        let username = loggable_username(username);
         tracing::warn!(
             client_ip = %ip,
             username = %username,
@@ -215,10 +395,7 @@ impl AuthFailureTracker {
     /// A login as `username` from `ip`: clears that account's failures, not
     /// the address's.
     fn record_success(&self, ip: &IpAddr, username: &str) {
-        let key = account_key(*ip, username);
-        let mut entries = self.entries.lock();
-        entries.accounts.remove(&key);
-        entries.refusals_logged.remove(&key);
+        self.entries.lock().clear(&account_key(*ip, username));
     }
 
     /// Remove entries older than 2 x max_lockout_secs (call periodically).
@@ -404,7 +581,8 @@ async fn anonymous_read_passthrough(mut request: Request<Body>, next: Next) -> R
 #[derive(Clone)]
 struct AuthRejection {
     /// Bounded: wrong_password, token_invalid, malformed, no_password, basic_not_configured,
-    /// no_oidc, locked_out, session_invalid, or an OIDC class from `oidc::classify_rejection`.
+    /// no_oidc, locked_out, checks_in_flight, session_invalid, or an OIDC class from
+    /// `oidc::classify_rejection`.
     reason: &'static str,
     /// Counted in `nora_auth_oidc_rejected_total` already.
     oidc: bool,
@@ -477,7 +655,7 @@ fn presented_credential(request: &Request<Body>) -> Option<(&'static str, Option
     } else {
         "basic_htpasswd"
     };
-    Some((kind, Some(user.chars().take(64).collect())))
+    Some((kind, Some(loggable_username(&user))))
 }
 
 /// `sub` and `repository` of a JWT, decoded WITHOUT verifying the signature.
@@ -981,9 +1159,29 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
     let encoded = &auth_header[6..];
     let credentials = basic_credentials(encoded).ok();
     let account = client_ip.zip(credentials.as_ref().map(|(user, _)| user.clone()));
-    let locked_out = account
-        .as_ref()
-        .and_then(|(ip, user)| state.auth_failures.check_blocked(ip, user));
+    // A password bcrypt will check takes a slot first, before any await, so guesses sent
+    // at once cannot all be checked before their failures count (begin_check).
+    let begun = match (&account, htpasswd, &credentials) {
+        (Some((ip, user)), Some(htpasswd), Some((_, password)))
+            if htpasswd.verified(user, password).is_none() =>
+        {
+            let pair = htpasswd.verdict_key(user, password);
+            Some(state.auth_failures.begin_check(*ip, user, pair))
+        }
+        _ => None,
+    };
+    let (slot, refused) = match begun {
+        Some(Ok(slot)) => (Some(slot), None),
+        Some(Err(refused)) => (None, Some(refused)),
+        None => (None, None),
+    };
+    let locked_out = match (&slot, refused) {
+        (Some(_), _) => None,
+        (None, Some(refused)) => Some(refused.retry_after()),
+        (None, None) => account
+            .as_ref()
+            .and_then(|(ip, user)| state.auth_failures.check_blocked(ip, user)),
+    };
 
     // Verify credentials: htpasswd first, then the token store (#736, #1094);
     // `decide_basic_auth` has the rules, this applies its decision. The htpasswd check is
@@ -1034,8 +1232,10 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
         LockoutCount::Failure if htpasswd.is_none() => LockoutCount::Nothing,
         count => count,
     };
-    if let Some((ip, username)) = &account {
-        state.auth_failures.count(*ip, username, count);
+    match (slot, &account) {
+        (Some(slot), _) => slot.settle(count),
+        (None, Some((ip, username))) => state.auth_failures.count(*ip, username, count),
+        (None, None) => {}
     }
     match decision {
         BasicDecision::Authenticated { user, role } => {
@@ -1079,6 +1279,15 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
                 (true, _) => AuthRejection::new("wrong_password"),
             };
             rejection.on(unauthorized_response(message, realm))
+        }
+        // Too many passwords of the account in flight: not a lockout, not logged.
+        BasicDecision::LockedOut(retry_after) if refused == Some(CheckRefused::Busy) => {
+            AuthRejection {
+                log: false,
+                retry_after: Some(retry_after),
+                ..AuthRejection::new("checks_in_flight")
+            }
+            .on(too_many_failed_attempts(retry_after))
         }
         BasicDecision::LockedOut(retry_after) => AuthRejection {
             log: account

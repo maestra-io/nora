@@ -603,3 +603,86 @@ fn test_auth_failure_tracker_exponential_backoff() {
         retry3
     );
 }
+
+/// Audit A019: a check takes a slot before it runs. An account has as many slots for
+/// distinct passwords as attempts left before its lockout; the same password shares its
+/// slot, a dropped slot is let go uncounted, and a settled failure is counted before its
+/// slot is let go.
+#[test]
+fn begin_check_reserves_the_attempts_left() {
+    let tracker = AuthFailureTracker::new(5, 900);
+    let ip: IpAddr = "10.0.0.1".parse().unwrap();
+    let pair = |n: u8| [n; 32];
+    let slots: Vec<_> = (0..5)
+        .map(|n| tracker.begin_check(ip, "alice", pair(n)).unwrap())
+        .collect();
+    assert_eq!(
+        tracker.begin_check(ip, "alice", pair(5)).err(),
+        Some(CheckRefused::Busy)
+    );
+    // The same password joins its check; another account has its own slots.
+    let joined = tracker.begin_check(ip, "alice", pair(0)).unwrap();
+    assert!(tracker.begin_check(ip, "bob", pair(9)).is_ok());
+    drop(joined);
+    // Dropped unsettled: room again, nothing counted.
+    let mut slots = slots.into_iter();
+    drop(slots.next());
+    let again = tracker.begin_check(ip, "alice", pair(6)).unwrap();
+    assert!(tracker.check_blocked(&ip, "alice").is_none());
+    // Settled failures are counted, and the room shrinks with them: one failure leaves
+    // four attempts, all four other slots still held.
+    again.settle(LockoutCount::Failure);
+    assert_eq!(
+        tracker.begin_check(ip, "alice", pair(7)).err(),
+        Some(CheckRefused::Busy)
+    );
+    for slot in slots {
+        slot.settle(LockoutCount::Failure);
+    }
+    assert!(matches!(
+        tracker.begin_check(ip, "alice", pair(7)),
+        Err(CheckRefused::LockedOut(_))
+    ));
+    assert_eq!(CheckRefused::Busy.retry_after(), 1);
+    assert_eq!(CheckRefused::LockedOut(7).retry_after(), 7);
+    // A login clears the account, and lets go of its slot.
+    tracker.record_success(&ip, "alice");
+    let login = tracker.begin_check(ip, "alice", pair(8)).unwrap();
+    login.settle(LockoutCount::Clear);
+    assert!(tracker.entries.lock().checking_accounts.is_empty());
+}
+
+/// Audit A019: the address has slots too, as many as its attempts left before it is held
+/// whatever the username.
+#[test]
+fn begin_check_bounds_the_address() {
+    let tracker = AuthFailureTracker::new(1, 900);
+    let ip: IpAddr = "10.0.0.1".parse().unwrap();
+    let slots: Vec<_> = (0..ADDRESS_FAILURES_PER_ACCOUNT as u8)
+        .map(|n| {
+            tracker
+                .begin_check(ip, &format!("user{n}"), [n; 32])
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        tracker.begin_check(ip, "another", [99; 32]).err(),
+        Some(CheckRefused::Busy)
+    );
+    drop(slots);
+    assert!(tracker.begin_check(ip, "another", [99; 32]).is_ok());
+}
+
+/// Audit A020: a credential sent as the Basic username is never logged as one.
+#[test]
+fn a_credential_in_the_username_is_not_logged() {
+    for credential in [
+        "nra_0123456789abcdef",
+        "nrs_1700000000_0123",
+        "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln",
+    ] {
+        assert_eq!(loggable_username(credential), "<credential-in-username>");
+    }
+    assert_eq!(loggable_username("alice"), "alice");
+    assert_eq!(loggable_username(&"x".repeat(100)), "x".repeat(64));
+}
