@@ -144,7 +144,8 @@ pub static AUTH_LOCKOUTS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
 
 /// Refused credentials that `nora_auth_oidc_rejected_total` does not count, by
 /// credential kind and reason (both bounded; the client is in the WARN "auth
-/// rejected: credential refused"). Anonymous challenge requests are not counted.
+/// rejected: credential refused"). Anonymous challenge requests are not counted;
+/// a Basic username with an empty password is counted as `no_password`, not logged.
 pub static AUTH_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "nora_auth_rejected_total",

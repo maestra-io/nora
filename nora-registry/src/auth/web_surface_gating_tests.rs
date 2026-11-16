@@ -515,6 +515,28 @@ async fn anonymous_challenge_is_not_logged() {
     assert_eq!(sink.text(), "");
 }
 
+/// A username with an empty password is the same challenge round for clients that
+/// fetch the password after a 401 (uv's keyring provider sends `token:` to every new
+/// URL): 401, never logged, never counted toward the lockout.
+#[tokio::test]
+async fn password_less_challenge_is_not_logged_or_counted() {
+    let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+    let sink = LogSink::default();
+    let _guard = sink.install();
+    for user in ["token", "admin", ""] {
+        let empty = format!("Basic {}", STANDARD.encode(format!("{user}:")));
+        for _ in 0..10 {
+            assert_eq!(get_with_auth(&ctx, &empty).await, StatusCode::UNAUTHORIZED);
+        }
+    }
+    let ok = format!("Basic {}", STANDARD.encode("admin:secret"));
+    assert_ne!(
+        get_with_auth(&ctx, &ok).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(sink.text(), "");
+}
+
 /// One lockout: one WARN at its start, one for its refusals, however many 429s.
 #[tokio::test]
 async fn lockout_refusals_are_logged_once() {

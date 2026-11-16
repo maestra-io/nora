@@ -403,7 +403,7 @@ async fn anonymous_read_passthrough(mut request: Request<Body>, next: Next) -> R
 /// refusal; `auth_middleware` logs it with the request context. Never a secret.
 #[derive(Clone)]
 struct AuthRejection {
-    /// Bounded: wrong_password, token_invalid, malformed, basic_not_configured,
+    /// Bounded: wrong_password, token_invalid, malformed, no_password, basic_not_configured,
     /// no_oidc, locked_out, session_invalid, or an OIDC class from `oidc::classify_rejection`.
     reason: &'static str,
     /// Counted in `nora_auth_oidc_rejected_total` already.
@@ -1066,15 +1066,19 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
             message,
             record_failure,
         } => {
-            let password = credentials
-                .as_ref()
-                .map_or("", |(_, password)| password.as_str());
-            let reason = match (record_failure, password.starts_with("nra_")) {
-                (false, _) => "malformed",
-                (true, true) => "token_invalid",
-                (true, false) => "wrong_password",
+            let password = credentials.as_ref().map(|(_, password)| password.as_str());
+            let rejection = match (record_failure, password) {
+                // The challenge round of a password-less client (decide_basic_auth):
+                // counted in the metric, never logged, as an anonymous 401 is not.
+                (false, Some("")) => AuthRejection {
+                    log: false,
+                    ..AuthRejection::new("no_password")
+                },
+                (false, _) => AuthRejection::new("malformed"),
+                (true, Some(p)) if p.starts_with("nra_") => AuthRejection::new("token_invalid"),
+                (true, _) => AuthRejection::new("wrong_password"),
             };
-            AuthRejection::new(reason).on(unauthorized_response(message, realm))
+            rejection.on(unauthorized_response(message, realm))
         }
         BasicDecision::LockedOut(retry_after) => AuthRejection {
             log: account
@@ -1235,6 +1239,15 @@ where
         }
     };
     let (username, password) = (username.as_str(), password.as_str());
+    // A username with no password is the first round of a client that fetches the
+    // password only after a 401 (uv's keyring provider sends `token:` to every new URL,
+    // the .NET SDK sends `:`). Nothing was guessed: refused, uncounted.
+    if password.is_empty() {
+        return BasicDecision::Unauthorized {
+            message: "Invalid username or password",
+            record_failure: false,
+        };
+    }
 
     if htpasswd.is_some_and(|check| check(username, password)) {
         // Basic-auth carries no role, so it can never satisfy an admin path:
