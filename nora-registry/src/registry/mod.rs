@@ -174,37 +174,57 @@ impl PublishBody {
             if len > cap {
                 return Err(too_large());
             }
-            if let Some(permits) = &state.publish_budget {
-                let need = (len as u64).div_ceil(MIB) as u32;
-                let have = held.as_ref().map_or(0, |p| p.num_permits() as u32);
-                if need > have {
-                    let Ok(more) =
-                        std::sync::Arc::clone(permits).try_acquire_many_owned(need - have)
-                    else {
-                        tracing::warn!(registry, "publish refused: in-flight body budget full");
-                        crate::metrics::SPOOL_FAILURES
-                            .with_label_values(&[registry, "publish_busy"])
-                            .inc();
-                        return Err((
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            [(header::RETRY_AFTER, "10")],
-                            "Too many publishes in progress, retry later",
-                        )
-                            .into_response());
+            if len > buf.capacity() {
+                // The permits cover the allocation, not only the bytes in it: grow by doubling
+                // within the cap, or to exactly what is needed when the budget is short.
+                let doubled = len.max(buf.capacity() * 2).min(cap);
+                let mut target = doubled;
+                if let Some(permits) = &state.publish_budget {
+                    let have = held.as_ref().map_or(0, |p| p.num_permits());
+                    let acquire = |bytes: usize| {
+                        let need = (bytes as u64).div_ceil(MIB) as usize;
+                        std::sync::Arc::clone(permits)
+                            .try_acquire_many_owned(need.saturating_sub(have) as u32)
+                    };
+                    let more = match acquire(doubled) {
+                        Ok(more) => more,
+                        Err(_) => {
+                            target = len;
+                            let Ok(more) = acquire(len) else {
+                                tracing::warn!(
+                                    registry,
+                                    "publish refused: in-flight body budget full"
+                                );
+                                crate::metrics::SPOOL_FAILURES
+                                    .with_label_values(&[registry, "publish_busy"])
+                                    .inc();
+                                return Err((
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    [(header::RETRY_AFTER, "10")],
+                                    "Too many publishes in progress, retry later",
+                                )
+                                    .into_response());
+                            };
+                            more
+                        }
                     };
                     match &mut held {
                         Some(h) => h.merge(more),
                         None => held = Some(more),
                     }
                 }
+                buf.reserve_exact(target - buf.len());
             }
             buf.extend_from_slice(&chunk);
         }
         Ok(Self(match held {
-            Some(permit) => Bytes::from_owner(BudgetedBody {
-                bytes: buf,
-                _permit: permit,
-            }),
+            Some(permit) => {
+                debug_assert!(buf.capacity() as u64 <= permit.num_permits() as u64 * MIB);
+                Bytes::from_owner(BudgetedBody {
+                    bytes: buf,
+                    _permit: permit,
+                })
+            }
             None => Bytes::from(buf),
         }))
     }
@@ -3509,6 +3529,26 @@ mod tests {
         );
     }
 
+    /// A072: the permits cover the buffer's allocation, not only the bytes in it: a body
+    /// whose growth would double past a budget that is not a power of two takes exactly what
+    /// it needs (the capacity check is the `debug_assert` in `read`), and gives it back.
+    #[tokio::test]
+    async fn the_publish_budget_covers_the_buffer_capacity() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.server.publish_inflight_mb = 3
+        });
+        let chunks = [MIB as usize, MIB as usize, 1]
+            .map(|n| Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; n])));
+        let body = Body::from_stream(futures::stream::iter(chunks));
+        let read = PublishBody::read(&ctx.state, "npm", body).await;
+        let body = read.unwrap_or_else(|_| panic!("fits the budget"));
+        assert_eq!(body.0.len(), 2 * MIB as usize + 1);
+        let budget = ctx.state.publish_budget.as_ref().unwrap();
+        assert_eq!(budget.available_permits(), 0);
+        drop(body);
+        assert_eq!(budget.available_permits(), 3);
+    }
+
     /// A072: a publish body that stops arriving is refused after the idle deadline instead
     /// of holding its buffer.
     #[tokio::test(start_paused = true)]
@@ -3549,6 +3589,11 @@ mod tests {
         let mut cases = vec![
             (maven_routes(), "/maven2/com/other/lib/1.0/lib-1.0.jar"),
             (npm_routes(), "/npm/other-package"),
+            (
+                npm_routes(),
+                "/npm/-/package/other-package/dist-tags/latest",
+            ),
+            (npm_routes(), "/npm/other-package/-rev/1-abc"),
         ];
         #[cfg(feature = "deb")]
         cases.push((deb_routes(), "/deb/other/pool/x.deb"));

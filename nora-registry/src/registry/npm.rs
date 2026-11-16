@@ -3234,6 +3234,13 @@ async fn handle_publish(
     }
     let read = |body| super::PublishBody::read(&state, "npm", body);
     if let Some(rest) = path.strip_prefix("-/package/") {
+        // The scope is decided on the URL before any of the body is read (A072).
+        let Some((name, _)) = rest.rsplit_once("/dist-tags/") else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        if enforce_namespace_scope(&authority, name).is_err() {
+            return StatusCode::FORBIDDEN.into_response();
+        }
         let body = match read(body).await {
             Ok(body) => body.0,
             Err(response) => return response,
@@ -3249,6 +3256,9 @@ async fn handle_publish(
         return set_dist_tag(&state, &authority, &user, rest, Some(&version)).await;
     }
     if let Some((name, _rev)) = path.rsplit_once("/-rev/") {
+        if enforce_namespace_scope(&authority, name).is_err() {
+            return StatusCode::FORBIDDEN.into_response();
+        }
         let body = match read(body).await {
             Ok(body) => body.0,
             Err(response) => return response,
