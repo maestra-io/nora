@@ -5,3 +5,7 @@ e5eb0f51c2560fdc9acf2f203cfb6f0ce823a141:nora-registry/src/auth/mod.rs:jwt:3699
 b188f16b3bd9a91ef2e5b3f3ebc6ad07f5a7dea4:nora-registry/src/auth/teleport.rs:private-key:247
 # registry/nuget/hosted.rs: TEST_RSA_PRIVATE_KEY, the test signing key of the OIDC tests
 be8c0b6a6db6147c5e9d55f125461569570b1793:nora-registry/src/registry/nuget/hosted.rs:private-key:2221
+
+# Upstream lines only (identical on the upstream default branch, or written by an upstream
+# commit): upstream test fixtures / docs / vendored code, not our credentials. issues-maestra#1649
+nora-registry/src/tokens.rs:generic-api-key:1023
