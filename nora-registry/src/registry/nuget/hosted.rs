@@ -22,7 +22,10 @@
 //! on every write), so a request for a non-hosted ID costs no storage call and search
 //! never reads storage. An ID with a state document is owned by this feed: its metadata
 //! and downloads are never proxied upstream. An internal ID that has not been pushed
-//! yet is only kept off nuget.org by `curation.internal_namespaces`.
+//! yet is only kept off nuget.org by `curation.internal_namespaces`. With an upstream
+//! configured, an unscoped non-Admin credential cannot push the first version of an ID
+//! outside those namespaces (it would replace the proxied package); the first push to
+//! an ID brought in by `nora import` copies its imported versions into the document.
 //!
 //! Re-pushing an existing version with identical bytes answers 200 and writes nothing;
 //! different bytes answer 409. [`run_retention`] (periodic cleanup pass) expires PR
@@ -33,7 +36,9 @@
 use super::{is_valid_package_id, with_json, with_json_gzip, SearchParams};
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::auth::{enforce_namespace_scope, AuthenticatedUser, NamespaceAuthority};
+use crate::auth::{
+    enforce_namespace_scope, AuthenticatedRole, AuthenticatedUser, NamespaceAuthority,
+};
 use crate::registry::{nora_base_url, SpoolError};
 use crate::registry_type::RegistryType;
 use crate::storage::{Storage, StorageError};
@@ -452,6 +457,7 @@ async fn push(
     State(state): State<AppState>,
     Extension(authority): Extension<NamespaceAuthority>,
     user: Option<Extension<AuthenticatedUser>>,
+    role: Option<Extension<AuthenticatedRole>>,
     mut multipart: Multipart,
 ) -> Response {
     // Per the protocol the first part is the package; names and later parts are ignored.
@@ -517,6 +523,20 @@ async fn push(
     if !scope_allows(&authority, &parsed.id_lower) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    // An ID this feed does not host yet is served from the upstream: its first push would
+    // replace it for every consumer. Only an internal ID, a namespace-scoped caller, an
+    // Admin, or a feed with no upstream (or no auth) claims one; [`store`] decides under
+    // the lock whether the ID is new.
+    let may_claim = super::upstream_url(&state).is_none()
+        || !matches!(authority, NamespaceAuthority::Unrestricted)
+        || role
+            .as_ref()
+            .is_none_or(|Extension(AuthenticatedRole(r))| r.can_admin())
+        || crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            RegistryType::Nuget,
+            &parsed.id_lower,
+        );
     // Loaded before the write, so the update below cannot race the initial load.
     let Ok(map) = index(&state).await else {
         return unavailable();
@@ -525,6 +545,7 @@ async fn push(
         &state.storage,
         &state.publish_locks,
         Some(&map),
+        may_claim,
         parsed,
         &spool.0,
         &sha256,
@@ -603,11 +624,16 @@ pub(crate) enum Stored {
 
 /// Store a parsed package under its ID's publish lock: blobs first, the state
 /// document last, then the in-memory index when `map` is given. An existing version
-/// with identical bytes is [`Stored::Identical`]; different bytes are a 409.
+/// (pushed or brought in by `nora import`) with identical bytes is
+/// [`Stored::Identical`]; different bytes are a 409. An ID neither pushed nor imported
+/// is created only when `may_claim`, else 403. The first push to an imported ID carries
+/// its imported versions into the document, which the read path consults first.
+#[allow(clippy::too_many_arguments)]
 async fn store(
     storage: &Storage,
     locks: &crate::PublishLocks,
     map: Option<&IndexMap>,
+    may_claim: bool,
     parsed: Parsed,
     src: &std::path::Path,
     sha256: &str,
@@ -623,22 +649,44 @@ async fn store(
     let lock = crate::acquire_publish_lock(locks, &meta_key(&id_lower));
     let _guard = lock.lock().await;
 
-    let mut pkg = match load(storage, &id_lower).await {
-        Ok(p) => p.unwrap_or_default(),
+    let doc = match load(storage, &id_lower).await {
+        Ok(p) => p,
         Err(_) => return Err(unavailable_err()),
     };
+    let imported = imported_versions(storage, &id_lower).await?;
+    if doc.is_none() && !imported.hosted() && !may_claim {
+        tracing::warn!(id = %id_lower, "nuget hosted: first push of a proxied ID refused");
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "{} is not hosted by this feed and is served from the upstream; the first push \
+                 of an ID outside curation.internal_namespaces needs an Admin token, or add its \
+                 prefix to curation.internal_namespaces",
+                spec.id
+            ),
+        ));
+    }
+    let mut pkg = doc.unwrap_or_default();
     let dir = format!("{BLOB_PREFIX}{id_lower}/{ver_lower}");
     let nupkg_key = format!("{dir}/{id_lower}.{ver_lower}.nupkg");
-    if pkg
+    let existing = if pkg
         .versions
         .iter()
         .any(|v| v.version.eq_ignore_ascii_case(&version))
     {
+        Some(nupkg_key.clone())
+    } else if imported.version(&ver_lower) == super::imported::Version::Own {
+        // An imported version is as immutable as a pushed one.
+        Some(super::package_key(&id_lower, &ver_lower).unwrap_or_default())
+    } else {
+        None
+    };
+    if let Some(existing_key) = existing {
         let artifact = format!("{} {}", pkg_id(&pkg, &spec.id), version);
         // Idempotent re-push (a retry after a lost 201): the same bytes are a success
         // and rewrite nothing; different bytes for an existing version stay a 409.
         // The NuGet client treats any 2xx as pushed.
-        if storage.pin(&nupkg_key).await.as_deref() == Some(sha256) {
+        if storage.pin(&existing_key).await.as_deref() == Some(sha256) {
             tracing::info!(package = %artifact, "nuget hosted: identical re-push accepted");
             return Ok(Stored::Identical(format!(
                 "{artifact} already exists (identical)"
@@ -699,10 +747,96 @@ async fn store(
         dependency_groups: spec.dependency_groups,
         package_types: spec.package_types,
     });
+    adopt_imported(storage, &id_lower, &imported, &mut pkg).await?;
     pkg.versions
         .sort_by(|a, b| compare_versions(&a.version, &b.version));
     save(storage, map, &id_lower, &pkg).await?;
     Ok(Stored::Created(format!("{}@{}", pkg.id, version)))
+}
+
+/// The `nora import` records of `id_lower`, listed uncached (a write decides by them).
+/// A failed listing fails the push closed.
+async fn imported_versions(
+    storage: &Storage,
+    id_lower: &str,
+) -> Result<super::imported::Versions, (StatusCode, String)> {
+    let prefix = super::hosted_prefix(id_lower);
+    match storage.list(&prefix).await {
+        Ok(keys) => Ok(super::imported::Versions::from_listing(
+            keys.iter().filter_map(|k| k.strip_prefix(&prefix)),
+        )),
+        Err(e) => {
+            tracing::error!(id = %id_lower, error = %e, "nuget hosted: imported records not listed");
+            Err(unavailable_err())
+        }
+    }
+}
+
+/// Copy every imported version `pkg` does not name into the pushed feed's blob dirs and
+/// add it to `pkg`: once the ID has a state document, only the versions it names are
+/// served. A record whose package is gone is skipped (it is not served either); any
+/// storage failure fails the push closed, before the document is written.
+async fn adopt_imported(
+    storage: &Storage,
+    id_lower: &str,
+    imported: &super::imported::Versions,
+    pkg: &mut HostedPackage,
+) -> Result<(), (StatusCode, String)> {
+    let missing: Vec<&String> = imported
+        .listed()
+        .iter()
+        .filter(|v| {
+            !pkg.versions
+                .iter()
+                .any(|p| p.version.eq_ignore_ascii_case(v))
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let fail = |what: &str, e: &dyn std::fmt::Display| {
+        tracing::error!(id = %id_lower, error = %e, "nuget hosted: adopting imported versions: {what}");
+        unavailable_err()
+    };
+    let flat = format!("nuget/flatcontainer/{id_lower}/");
+    let stored = storage
+        .list_with_meta(&flat)
+        .await
+        .map_err(|e| fail("listing", &e))?;
+    for ver in missing {
+        let Some(src) = super::package_key(id_lower, ver) else {
+            continue;
+        };
+        let Some((_, meta)) = stored.iter().find(|(k, _)| *k == src) else {
+            tracing::warn!(id = %id_lower, version = %ver, "nuget hosted: imported record without a package, not adopted");
+            continue;
+        };
+        let dir = format!("{BLOB_PREFIX}{id_lower}/{ver}");
+        storage
+            .copy(&src, &format!("{dir}/{id_lower}.{ver}.nupkg"), None)
+            .await
+            .map_err(|e| fail("package copy", &e))?;
+        match storage
+            .copy(
+                &super::nuspec_key(id_lower, ver),
+                &format!("{dir}/{id_lower}.nuspec"),
+                None,
+            )
+            .await
+        {
+            // Without it the manifest is read from the package below.
+            Ok(()) | Err(StorageError::NotFound) => {}
+            Err(e) => return Err(fail("nuspec copy", &e)),
+        }
+        match version_from_blobs(storage, id_lower, ver, meta, true).await {
+            Ok((v, _)) => pkg.versions.push(v),
+            Err(BlobsError::Unusable(why)) => {
+                tracing::warn!(id = %id_lower, version = %ver, why = %why, "nuget hosted: imported version not adopted");
+            }
+            Err(e @ BlobsError::Storage(_)) => return Err(fail("manifest", &e)),
+        }
+    }
+    Ok(())
 }
 
 /// OIDC `namespace_scope` for NuGet: IDs are case-insensitive, so the lowercase ID is
@@ -3506,6 +3640,167 @@ Jd74nq6dNCjpWG4drIsyhqX+
         )
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn get_bytes(app: &axum::Router, uri: &str) -> (StatusCode, Vec<u8>) {
+        let resp = send(app, Method::GET, uri, "").await;
+        let status = resp.status();
+        (status, body_bytes(resp).await.to_vec())
+    }
+
+    /// Audit A097: an unscoped Write credential cannot claim an ID the feed proxies. The
+    /// first push of a non-internal ID needs an Admin token; once hosted, Write pushes
+    /// its next versions; internal IDs are claimed by Write as before.
+    #[tokio::test]
+    async fn first_push_of_a_proxied_id_needs_admin() {
+        use wiremock::matchers::{any, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(path_regex(r"index\.json$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"versions":["13.0.1"]}"#)
+                    .insert_header("content-type", "application/json"),
+            )
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UPSTREAM-13.0.1".to_vec()))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_anonymous_read_and_config(&[("ci", "secret")], |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["maestra.*".to_string()];
+        });
+        let tokens = ctx.state.tokens.as_ref().unwrap();
+        let write = tokens
+            .create_token("ci", 1, None, crate::tokens::Role::Write)
+            .await
+            .unwrap();
+        let admin = tokens
+            .create_token("ci", 1, None, crate::tokens::Role::Admin)
+            .await
+            .unwrap();
+        let write_h = [("X-NuGet-ApiKey", write.as_str())];
+        let idx = "/nuget/v3/flatcontainer/newtonsoft.json/index.json";
+        let old = "/nuget/v3/flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg";
+
+        let pkg99 = nupkg("Newtonsoft.Json", "99.0.0", "");
+        assert_eq!(
+            push(&ctx.app, &pkg99, &write_h).await,
+            StatusCode::FORBIDDEN
+        );
+        let (s, v) = get_json(&ctx.app, idx).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["versions"], serde_json::json!(["13.0.1"]));
+        let (s, body) = get_bytes(&ctx.app, old).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(body, b"UPSTREAM-13.0.1");
+
+        assert_eq!(
+            push(&ctx.app, &nupkg("Maestra.Foo", "1.0.0", ""), &write_h).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            push(&ctx.app, &pkg99, &[("X-NuGet-ApiKey", &admin)]).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            push(&ctx.app, &nupkg("Newtonsoft.Json", "99.0.1", ""), &write_h).await,
+            StatusCode::CREATED
+        );
+    }
+
+    /// Audit A096: a push to an ID brought in by `nora import` keeps its imported
+    /// versions immutable and served.
+    #[tokio::test]
+    async fn push_over_an_imported_id_keeps_its_versions() {
+        use super::test_support::nupkg_with_payload;
+        let ctx = create_test_context_with_anonymous_read_and_config(&[("ci", "secret")], |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.nuget.proxy_timeout = 1;
+            cfg.nuget.metadata_proxy_timeout = 1;
+        });
+        let st = &ctx.state.storage;
+        // The writes of `nora import` (import/transfer.rs), in its order.
+        let mut imp = Vec::new();
+        for (ver, payload) in [("1.0.0", "imp-A"), ("2.0.0", "imp-B")] {
+            let bytes = nupkg_with_payload("Imp.Lib", ver, "", payload);
+            let key = crate::registry::nuget::package_key("Imp.Lib", ver).unwrap();
+            let pkg =
+                crate::registry::nuget::imported_package(&key, std::io::Cursor::new(bytes.clone()))
+                    .unwrap();
+            st.put(&pkg.marker_key, b"").await.unwrap();
+            st.put(&key, &bytes).await.unwrap();
+            st.put(&pkg.nuspec_key, &pkg.nuspec).await.unwrap();
+            st.put(&pkg.record_key, &pkg.record).await.unwrap();
+            imp.push(bytes);
+        }
+        let write = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("ci", 1, None, crate::tokens::Role::Write)
+            .await
+            .unwrap();
+        let h = [("X-NuGet-ApiKey", write.as_str())];
+        let url = |v: &str| format!("/nuget/v3/flatcontainer/imp.lib/{v}/imp.lib.{v}.nupkg");
+        let served = |want: [(&'static str, Vec<u8>); 2]| {
+            let app = ctx.app.clone();
+            async move {
+                for (v, bytes) in want {
+                    assert_eq!(
+                        get_bytes(&app, &url(v)).await,
+                        (StatusCode::OK, bytes),
+                        "{v}"
+                    );
+                }
+            }
+        };
+
+        // (1) Other bytes for an imported version: 409, nothing hidden.
+        let other = nupkg_with_payload("Imp.Lib", "1.0.0", "", "OTHER-BYTES");
+        assert_eq!(push(&ctx.app, &other, &h).await, StatusCode::CONFLICT);
+        served([("1.0.0", imp[0].clone()), ("2.0.0", imp[1].clone())]).await;
+
+        // (2) The imported bytes again: idempotent success, no document written.
+        assert_eq!(push(&ctx.app, &imp[0], &h).await, StatusCode::OK);
+        assert!(st.stat("nuget/hosted-meta/imp.lib.json").await.is_none());
+
+        // (3) A new version adopts the imported ones.
+        let new = nupkg_with_payload("Imp.Lib", "3.0.0", "", "pushed-C");
+        assert_eq!(push(&ctx.app, &new, &h).await, StatusCode::CREATED);
+        let (s, v) = get_json(&ctx.app, "/nuget/v3/flatcontainer/imp.lib/index.json").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            v["versions"],
+            serde_json::json!(["1.0.0", "2.0.0", "3.0.0"])
+        );
+        served([("1.0.0", imp[0].clone()), ("2.0.0", imp[1].clone())]).await;
+        assert_eq!(
+            get_bytes(&ctx.app, &url("3.0.0")).await,
+            (StatusCode::OK, new)
+        );
+
+        // (4) The registration names all three.
+        let (s, reg) = get_json(&ctx.app, "/nuget/v3/registration/imp.lib/index.json").await;
+        assert_eq!(s, StatusCode::OK);
+        let versions: Vec<&str> = reg["items"][0]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["catalogEntry"]["version"].as_str().unwrap())
+            .collect();
+        assert_eq!(versions, ["1.0.0", "2.0.0", "3.0.0"]);
+
+        // An adopted version stays immutable, its identical re-push idempotent.
+        assert_eq!(push(&ctx.app, &other, &h).await, StatusCode::CONFLICT);
+        assert_eq!(push(&ctx.app, &imp[1], &h).await, StatusCode::OK);
     }
 
     // ── Round two: idempotent re-push, retention, rebuild, UI, index hardening ──
