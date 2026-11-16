@@ -656,13 +656,16 @@ fn parse_dist_filename(filename: &str) -> (String, Option<String>) {
     (stem.to_string(), None)
 }
 
-/// Validate distribution path: no path traversal, no null bytes.
+/// Validate distribution path: no path traversal, no null bytes, and no byte the upstream URL
+/// parser strips or reads as a delimiter (control, space, `#`, `?`), so curation judges the
+/// file the upstream is asked for.
 fn is_valid_dist_path(path: &str) -> bool {
     !path.is_empty()
         && path.len() <= 1024
         && !path.contains('\0')
         && !path.contains("..")
         && path.chars().all(|c| c.is_ascii() && c != '\0')
+        && crate::validation::is_url_path_stable(path)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -1383,6 +1386,41 @@ mod empty_segment_requests {
             "/cpan/authors/id/F/FO/FOO/Foo-1.0.tar.gz/",
             "/cpan/authors/id/F/FO//FOO/Foo-1.0.tar.gz",
             "/cpan/authors/id//F/FO/FOO/Foo-1.0.tar.gz",
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        let sent = upstream_paths(&up).await;
+        assert!(sent.is_empty(), "sent upstream: {sent:?}");
+    }
+
+    // A byte the upstream URL parser strips or reads as a delimiter would let curation judge
+    // one file name and the upstream serve another.
+    #[tokio::test]
+    async fn a_distribution_path_byte_the_url_parser_reinterprets_never_reaches_upstream() {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"EVIL-TGZ".to_vec()))
+            .mount(&up)
+            .await;
+        let (_dir, blocklist) = blocklist_file("cpan", "Foo");
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.cpan.enabled = true;
+            cfg.cpan.proxy = Some(up.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+        });
+        let control = "/cpan/authors/id/F/FO/FOO/Foo-1.0.tar.gz";
+        let resp = send(&ctx.app, Method::GET, control, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+        for uri in [
+            "/cpan/authors/id/F/FO/FOO/Foo-1.0.tar.gz%23",
+            "/cpan/authors/id/F/FO/FOO/Foo-1.0.tar.gz%3Fx",
+            "/cpan/authors/id/F/FO/FOO/F%09oo-1.0.tar.gz",
+            "/cpan/authors/id/F/FO/FOO/F%0Aoo-1.0.tar.gz",
+            "/cpan/authors/id/F/FO/FOO/F%0Doo-1.0.tar.gz",
+            "/cpan/authors/id/F/FO/FOO/Foo-1.0.tar.gz%20",
+            "/cpan/authors/id/.%09./.%09./x.tar.gz",
         ] {
             let resp = send(&ctx.app, Method::GET, uri, "").await;
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");

@@ -939,6 +939,17 @@ async fn flatcontainer_download(
     }
 
     let id_lower = id.to_lowercase();
+    // The id and version are judged here and formatted into the upstream URL: a NuGet id and
+    // version (no control byte, space, `#` or `?` the URL parser would strip or cut at), and
+    // the file one of that id and version, as NuGet clients build it from one string each.
+    let (ver_lower, file_lower) = (ver.to_lowercase(), filename.to_lowercase());
+    if !is_valid_package_id(&id_lower)
+        || !is_valid_version(ver)
+        || (file_lower != format!("{id_lower}.{ver_lower}.nupkg")
+            && file_lower != format!("{id_lower}.nuspec"))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     if let Some(resp) = hosted::download(&state, &headers, path, &id_lower).await {
         return resp;
     }

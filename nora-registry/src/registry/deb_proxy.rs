@@ -1546,6 +1546,44 @@ mod integration_tests {
         (release, pkgs)
     }
 
+    /// The gate looks the pool path up as written, and the upstream URL parser cuts it at an
+    /// encoded `#` or `?`: such a path is refused before the gate and the upstream, so the
+    /// held file is never fetched under another name.
+    #[tokio::test]
+    async fn held_package_path_with_encoded_hash_or_query_is_refused() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        publish(&server, &key, &[("a", "1")]).await;
+        let uri = server.uri();
+        let dir = keydir.path().to_str().unwrap().to_string();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.deb.enabled = true;
+            cfg.deb.metadata_ttl = 0;
+            cfg.deb.upstream_keyring_dir = dir;
+            cfg.deb
+                .proxies
+                .insert("debian".into(), RepoProxyEntry::Simple(uri));
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.deb.min_release_age = Some("3d".into());
+        });
+        served(&ctx).await;
+        publish(&server, &key, &[("a", "2")]).await;
+        served(&ctx).await;
+        let held = "/deb/debian/pool/main/a_2_amd64.deb";
+        let resp = send(&ctx.app, Method::GET, held, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+        for suffix in ["%23.deb", "%3Fv=1.deb", "%3F", "%20"] {
+            let uri = format!("{held}{suffix}");
+            let resp = send(&ctx.app, Method::GET, &uri, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        let asked: Vec<String> = upstream_paths(&server).await;
+        assert!(
+            !asked.iter().any(|p| p.starts_with("/pool/main/a_2")),
+            "{asked:?}"
+        );
+    }
+
     #[tokio::test]
     async fn holds_young_versions_signs_and_refuses_held_packages() {
         let (key, keydir) = upstream_key();

@@ -696,6 +696,12 @@ async fn handle_request(
     if let Err(e) = crate::validation::validate_storage_key(&key) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
+    // Nor a byte the upstream URL parser strips or reads as a delimiter (control, space, `#`,
+    // `?`): curation would judge one name and the upstream serve another.
+    if !crate::validation::is_url_path_stable(&path) {
+        tracing::debug!(path = %path.escape_debug(), "npm: path not stable in a URL");
+        return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
+    }
 
     let package_name = if let Some((name, _)) = github_packages {
         name.to_string()
@@ -704,6 +710,16 @@ async fn handle_request(
     } else {
         path.clone()
     };
+    // A tarball belongs to a package `pkg` or `@scope/pkg` (or `-`): a deeper name would
+    // write its caches under another package's `versions/`.
+    if github_packages.is_none()
+        && is_tarball
+        && package_name != "-"
+        && !matches!(classify_metadata_path(&package_name), MetadataPath::Packument { name } if name == package_name)
+    {
+        tracing::warn!(package = %package_name.escape_debug(), "npm: tarball path names no package");
+        return audit_refused(StatusCode::BAD_REQUEST, "not an npm package name");
+    }
 
     // Parse tarball version (used for both pre-download and integrity checks)
     let tarball_version = if let Some((_, version)) = github_packages {
@@ -1963,19 +1979,26 @@ async fn published_state(storage: &crate::Storage, name: &str) -> Published {
             return Published::Unknown;
         }
     };
-    if !listed.is_empty() {
+    // Only a direct child of `versions/` is a publish (`versions/<v>.json`): a key nested
+    // deeper is no version of this package, whoever wrote it.
+    let direct: Vec<&str> = listed
+        .iter()
+        .filter_map(|k| k.strip_prefix(&prefix))
+        .filter(|rest| !rest.contains('/'))
+        .collect();
+    if !direct.is_empty() {
         return Published::Yes(
-            listed
+            direct
                 .iter()
-                .filter_map(|k| k.strip_prefix(&prefix)?.strip_suffix(".json"))
+                .filter_map(|rest| rest.strip_suffix(".json"))
                 .map(str::to_string)
                 .collect(),
         );
     }
     // Remembered: the checks below already said "not published" for this listing.
-    let Some(claim) = claim else {
+    if listed.is_empty() && claim.is_none() {
         return Published::No;
-    };
+    }
     // An empty listing beside a packument NORA assembled is not taken at its word: the
     // package was published, and a backend that answers "nothing here" for files it cannot
     // read must not hand its name to an upstream.
@@ -1994,7 +2017,7 @@ async fn published_state(storage: &crate::Storage, name: &str) -> Published {
         .and_then(|r| r.split_once('\n'))
         .is_some_and(|(origin, _)| origin == ASSEMBLED_BY_NORA);
     if !names_nora {
-        if answered {
+        if let Some(claim) = claim.filter(|_| answered) {
             claim.remember();
         }
         return Published::No;

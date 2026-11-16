@@ -1986,6 +1986,39 @@ mod proxy_tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// A package path whose decoded form holds a byte the upstream URL parser strips or
+    /// reads as a delimiter is no package to the classifier (`.rpm?`), yet names one to the
+    /// upstream: refused before the class is decided, so no package skips the quarantine.
+    #[tokio::test]
+    async fn test_rpm_proxy_refuses_path_bytes_the_url_parser_reinterprets() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"heldrpm".to_vec()))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.rpm.enabled = true;
+            cfg.rpm
+                .proxies
+                .insert("fedora".to_string(), RepoProxyEntry::Simple(uri));
+            cfg.curation.rpm.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+        });
+        let held = "/rpm/fedora/Packages/held-1.0-1.x86_64.rpm";
+        for suffix in ["%3F", "%23", "%09", "%20", "%0A", "%0D", "%3Fx=1"] {
+            let uri = format!("{held}{suffix}");
+            let resp = send(&ctx.app, Method::GET, &uri, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+        let keys = ctx.state.storage.list("rpm/").await.unwrap();
+        assert!(keys.is_empty(), "{keys:?}");
+        let resp = send(&ctx.app, Method::GET, held, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+        let resp = send(&ctx.app, Method::GET, "/rpm/fedora/repodata/repomd.xml", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// R4-C05, the shared rpm/deb proxy path: the ledger forgets a digest 90 days after its
     /// first sight. A package cached for longer is not held for a new TTL by the first cache
     /// hit after a restart: its clock is the day NORA wrote the copy.

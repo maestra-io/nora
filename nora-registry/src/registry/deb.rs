@@ -510,6 +510,16 @@ pub(crate) async fn regenerate_indexes(
 ) -> Result<(), String> {
     let meta_prefix = format!("deb/{repo}/{META_DIR}/");
     let mut pkgs: Vec<PkgRecord> = super::read_json_sidecars(storage, &meta_prefix).await?;
+    // A file name with a control character (a sidecar written before publishes refused it)
+    // would add fields and stanzas to the signed index: that one record is left out, the
+    // rest of the repo is still indexed.
+    pkgs.retain(|p| {
+        let clean = !super::os_repo::has_control(&p.filename);
+        if !clean {
+            tracing::error!(repo = %repo, filename = %p.filename.escape_debug(), "deb: index rebuild drops a record whose file name has a control character");
+        }
+        clean
+    });
     // Deterministic output: same package set → byte-identical indexes
     // (modulo the Release Date field).
     pkgs.sort_by(|a, b| {
@@ -1297,6 +1307,135 @@ mod integration_tests {
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{control:?}");
         }
         assert!(ctx.state.storage.list("deb/").await.unwrap().is_empty());
+    }
+
+    /// The upload path and the repo name go verbatim into the signed indexes (`Filename:`,
+    /// `Label:`): a control character in either is refused on upload, delete and reindex,
+    /// a stored key holding one is never adopted by a reindex, and a sidecar holding one
+    /// is left out of the rebuild instead of failing it.
+    #[tokio::test]
+    async fn test_deb_rejects_control_chars_in_path_and_repo() {
+        let ctx = create_test_context();
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/deb/myrepo/pool/neighbour_1.0_amd64.deb",
+            build_test_deb("neighbour", "1.0"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let packages = || async {
+            let resp = send(&ctx.app, Method::GET, "/deb/myrepo/Packages", "").await;
+            String::from_utf8(body_bytes(resp).await.to_vec()).unwrap()
+        };
+        let before = packages().await;
+        let forged = "%0A%0APackage:%20forged%0AVersion:%2099.0%0AArchitecture:%20amd64%0ADescription:%20y.deb";
+        for sep in ["%0A", "%0D", "%09", "%01"] {
+            let uri = format!("/deb/myrepo/pool/carrier.deb{}", forged.replace("%0A", sep));
+            let resp = send(
+                &ctx.app,
+                Method::PUT,
+                &uri,
+                build_test_deb("carrier", "1.0"),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let resp = send(&ctx.app, Method::DELETE, &uri, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "DELETE {uri}");
+        }
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/deb/lab%0AOrigin:%20forged/a.deb",
+            build_test_deb("other", "1.0"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(packages().await, before);
+
+        // Keys written out of band: a repo and a package name with a line feed.
+        ctx.state
+            .storage
+            .put("deb/lab\nx/a.deb", &build_test_deb("other", "1.0"))
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::POST, "/deb/lab%0Ax/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        ctx.state
+            .storage
+            .put(
+                "deb/myrepo/pool/c.deb\n\nPackage: forged\nVersion: 99.0\nArchitecture: amd64\nX: y.deb",
+                &build_test_deb("carrier", "1.0"),
+            )
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::POST, "/deb/myrepo/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let after = packages().await;
+        assert!(!after.contains("forged"), "{after}");
+        assert!(after.contains("Package: neighbour\n"), "{after}");
+
+        // A sidecar written before the fix: its record is left out, the rest is indexed.
+        let sidecar = super::sidecar_key("myrepo", "pool/neighbour_1.0_amd64.deb");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&ctx.state.storage.get(&sidecar).await.unwrap()).unwrap();
+        record["filename"] = "pool/n.deb\n\nPackage: forged\nVersion: 99.0".into();
+        ctx.state
+            .storage
+            .put(
+                &super::sidecar_key("myrepo", "pool/legacy.deb"),
+                &serde_json::to_vec(&record).unwrap(),
+            )
+            .await
+            .unwrap();
+        super::regenerate_indexes(&ctx.state.storage, None, "myrepo")
+            .await
+            .unwrap();
+        let rebuilt = packages().await;
+        assert!(!rebuilt.contains("forged"), "{rebuilt}");
+        assert!(rebuilt.contains("Package: neighbour\n"), "{rebuilt}");
+    }
+
+    /// A pull-through pool path goes into the upstream URL as written: a byte the URL parser
+    /// strips or reads as a delimiter is refused before the package gate and the upstream,
+    /// and real pool file names (`+`, `~`, `%3a`) still go through.
+    #[tokio::test]
+    async fn test_deb_proxy_refuses_path_bytes_the_url_parser_reinterprets() {
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"DEB".to_vec()))
+            .mount(&up)
+            .await;
+        let uri = up.uri();
+        let ctx = crate::test_helpers::create_test_context_with_config(move |c| {
+            c.deb.enabled = true;
+            c.deb.proxies.insert(
+                "debian".to_string(),
+                crate::config::RepoProxyEntry::Simple(uri),
+            );
+        });
+        for path in [
+            "pool/main/h/held/held_1.0_amd64.deb%3F",
+            "pool/main/h/held/held_1.0_amd64.deb%3F.deb",
+            "pool/main/h/held/held_1.0_amd64.deb%23.deb",
+            "pool/main/h/held/held_1.0_amd64.deb%20",
+            "pool/main/h/held/he%09ld_1.0_amd64.deb",
+            "pool/main/h/held/held_1.0_amd64.deb%0A",
+            "pool/main/h/held/held_1.0_amd64.deb%0D",
+        ] {
+            let resp = send(&ctx.app, Method::GET, &format!("/deb/debian/{path}"), "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+        }
+        assert!(crate::test_helpers::upstream_paths(&up).await.is_empty());
+        for path in [
+            "pool/main/g/gcc/gcc_12.2.0-14+deb12u1~bpo_amd64.deb",
+            "pool/main/s/sys/sys_1%3a2.0_amd64.deb",
+        ] {
+            let resp = send(&ctx.app, Method::GET, &format!("/deb/debian/{path}"), "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        }
+        assert_eq!(crate::test_helpers::upstream_paths(&up).await.len(), 2);
     }
 
     #[tokio::test]

@@ -2811,3 +2811,51 @@ async fn test_big_registration_document_renders_as_a_small_one() {
         assert_eq!(json_body(resp).await, expected);
     }
 }
+
+/// A flat-container download judges its id, version and file before the upstream URL is
+/// built from them: an id or version that is no NuGet one (a control byte, `#`, `?`) or a
+/// file of another package is refused, so the internal namespace and curation see the
+/// package the upstream would serve.
+#[tokio::test]
+async fn a_flatcontainer_download_judges_a_nuget_id_version_and_file() {
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"NUPKG".to_vec()))
+        .mount(&upstream)
+        .await;
+    let ctx = create_test_context_with_config(|cfg| {
+        cfg.nuget.enabled = true;
+        cfg.nuget.proxy = Some(upstream.uri());
+        cfg.curation.mode = crate::config::CurationMode::Enforce;
+        cfg.curation.internal_namespaces = vec!["maestra.*".to_string()];
+    });
+    let base = "/nuget/v3/flatcontainer";
+    for path in [
+        "maes%09tra.secret/1.0.0/maes%09tra.secret.1.0.0.nupkg",
+        "maes%0Atra.secret/1.0.0/maes%0Atra.secret.1.0.0.nupkg",
+        "maes%0Dtra.secret/1.0.0/maes%0Dtra.secret.1.0.0.nupkg",
+        "maes%09tra.secret/1.0.0/maes%09tra.secret.nuspec",
+        "maestra.secret%23/1.0.0/maestra.secret%23.1.0.0.nupkg",
+        "maestra.secret/1.0.0%3F/maestra.secret.1.0.0%3F.nupkg",
+        "maestra.secret%20/1.0.0/maestra.secret%20.1.0.0.nupkg",
+        "newtonsoft.json/13.0.1/.%09./.%09./.%09./maestra.secret/1.0.0/maestra.secret.1.0.0.nupkg",
+        "newtonsoft.json/13.0.1/maestra.secret.1.0.0.nupkg",
+        "newtonsoft.json/13.0.1/newtonsoft.json.13.0.2.nupkg",
+    ] {
+        let resp = send(&ctx.app, Method::GET, &format!("{base}/{path}"), "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+    let asked = upstream.received_requests().await.unwrap();
+    assert!(asked.is_empty(), "{asked:?}");
+    for path in [
+        "newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg",
+        "Newtonsoft.Json/13.0.1/Newtonsoft.Json.13.0.1.nupkg",
+        "newtonsoft.json/13.0.1/newtonsoft.json.nuspec",
+    ] {
+        let resp = send(&ctx.app, Method::GET, &format!("{base}/{path}"), "").await;
+        assert_ne!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+}

@@ -105,3 +105,30 @@ async fn a_project_name_with_an_inner_slash_never_reaches_upstream() {
     let sent = upstream_paths(&up).await;
     assert!(sent.is_empty(), "sent upstream: {sent:?}");
 }
+
+// A project name byte the upstream URL parser strips or reads as a delimiter (control, space,
+// `#`, `?`) would let curation and the internal namespaces judge one project while the
+// upstream index of another is served.
+#[tokio::test]
+async fn a_name_byte_the_url_parser_reinterprets_never_reaches_upstream() {
+    let up = upstream("<html></html>").await;
+    let ctx = create_test_context_with_config(|cfg| {
+        cfg.pypi.proxy = Some(up.uri());
+        cfg.curation.internal_namespaces = vec!["internalpkg".to_string()];
+    });
+    for uri in [
+        "/simple/internal%09pkg/",
+        "/simple/internal%0Apkg/",
+        "/simple/internal%0Dpkg/",
+        "/simple/internalpkg%20/",
+        "/simple/internalpkg%23/",
+        "/simple/internalpkg%3Fx/",
+        "/simple/internal%09pkg/internalpkg-1.0.tar.gz",
+        "/simple/internalpkg%23/internalpkg-1.0.tar.gz",
+    ] {
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+    }
+    let sent = upstream_paths(&up).await;
+    assert!(sent.is_empty(), "sent upstream: {sent:?}");
+}
