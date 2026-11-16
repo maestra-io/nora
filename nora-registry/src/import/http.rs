@@ -1,10 +1,9 @@
 //! SSRF-guarded HTTP client for `nora import` (#599, review R2).
 //!
-//! `build_http_client` (`main.rs`) sets only user-agent/timeout/no_proxy/CA — it
-//! has **no** redirect policy and **no** DNS resolver, so it cannot defend an
-//! operator-supplied source URL against SSRF (a whole-tree grep for
-//! `redirect::Policy`/`is_private`/`dns_resolver` finds nothing to reuse). This
-//! module builds a purpose-built client with two layers that together cover the
+//! The server's clients (`build_http_client`, `main.rs`) reuse both layers below
+//! but honour an ambient proxy and take no host list, so the import CLI keeps its
+//! own client. This module builds a purpose-built client with two layers that
+//! together cover the
 //! initial request **and every redirect hop**, for both hostname and IP-literal
 //! targets:
 //!
@@ -200,6 +199,28 @@ pub(crate) struct GuardedResolver {
     allow_private: bool,
 }
 
+impl GuardedResolver {
+    pub(crate) fn new(allow_private: bool) -> Self {
+        Self { allow_private }
+    }
+}
+
+/// True if `host` is a blocked IP literal, or a name whose every address is blocked: a fetch
+/// from it through a guarded client fails. A name that does not resolve is not reported here,
+/// its fetch fails for that reason.
+pub(crate) async fn resolves_only_to_blocked(host: &str) -> bool {
+    if let Some(ip) = host_as_ip(host) {
+        return is_blocked_ip(ip);
+    }
+    match tokio::net::lookup_host((host, 0u16)).await {
+        Ok(addrs) => {
+            let addrs: Vec<SocketAddr> = addrs.collect();
+            !addrs.is_empty() && addrs.iter().all(|a| is_blocked_ip(a.ip()))
+        }
+        Err(_) => false,
+    }
+}
+
 impl reqwest::dns::Resolve for GuardedResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let allow_private = self.allow_private;
@@ -303,8 +324,8 @@ fn build_guarded_client(
         });
 
     // SAFETY(reqwest-client-bypass): build_http_client is deliberately NOT reused
-    // here — it has no redirect policy and no DNS resolver, so it cannot provide
-    // the SSRF defence this client exists to add (review R2, issue #599). This
+    // here — it honours an ambient proxy (which defeats the resolver) and has no
+    // read timeout or host list (review R2, issue #599). This
     // builder replicates its user-agent/CA handling and adds no_proxy + the
     // DNS-pinning resolver + per-hop redirect guard on top.
     let mut builder = reqwest::ClientBuilder::new() // nosemgrep: reqwest-client-bypass
@@ -320,7 +341,7 @@ fn build_guarded_client(
         // reason to honor an ambient proxy (review: SSRF-via-proxy).
         .no_proxy()
         .redirect(redirect_policy)
-        .dns_resolver(Arc::new(GuardedResolver { allow_private }));
+        .dns_resolver(Arc::new(GuardedResolver::new(allow_private)));
 
     if let Some(ref ca_path) = tls.ca_cert {
         let pem = std::fs::read(ca_path).map_err(|e| format!("read CA cert {ca_path}: {e}"))?;

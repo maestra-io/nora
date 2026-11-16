@@ -42,6 +42,8 @@ fn serve(env: &[(&str, &str)]) -> Server {
             .env_remove("NORA_CONFIG_PATH")
             .env_remove("NORA_REGISTRIES_ENABLE")
             .env_remove("NORA_NPM_PROXY_AUTH")
+            // The fixture upstreams listen on (and redirect to) loopback.
+            .env("NORA_ALLOW_PRIVATE_UPSTREAMS", "true")
             .env("NORA_HOST", "127.0.0.1")
             .env("NORA_PORT", port.to_string())
             .env("NORA_STORAGE_PATH", dir.path().join("data"))

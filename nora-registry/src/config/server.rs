@@ -35,6 +35,13 @@ pub struct ServerConfig {
     /// package just cached will be quarantined for `min_release_age`.
     #[serde(default = "default_trust_upstream_dates")]
     pub trust_upstream_dates: bool,
+    /// Let the server's upstream clients reach loopback, private, link-local and metadata
+    /// addresses. Default `false`: a redirect hop to such an address, or an upstream or JWKS
+    /// host that resolves only to such addresses, fails the fetch (502), so an upstream cannot
+    /// send NORA to its own internal listener or to a cluster-internal service. Set `true` to
+    /// proxy an internal registry by a private address. Env `NORA_ALLOW_PRIVATE_UPSTREAMS`.
+    #[serde(default)]
+    pub allow_private_upstreams: bool,
     /// Seconds in-flight requests get to finish after SIGTERM/SIGINT before the
     /// connections still open are closed and shutdown continues (#1016). A client that
     /// stops reading could otherwise hold the process until the orchestrator kills it,
@@ -212,6 +219,7 @@ impl Default for ServerConfig {
             max_connections: default_max_connections(),
             maintenance_stall_secs: default_maintenance_stall_secs(),
             trust_upstream_dates: default_trust_upstream_dates(),
+            allow_private_upstreams: false,
             internal_port: None,
             publish_body_limit_mb: default_publish_body_limit_mb(),
             stream_threshold_mb: default_stream_threshold_mb(),
@@ -419,6 +427,13 @@ impl ServerConfig {
                 &mut self.trust_upstream_dates,
             );
         }
+        if let Ok(val) = env::var("NORA_ALLOW_PRIVATE_UPSTREAMS") {
+            super::parse_env_warn(
+                "NORA_ALLOW_PRIVATE_UPSTREAMS",
+                &val,
+                &mut self.allow_private_upstreams,
+            );
+        }
     }
 }
 
@@ -464,6 +479,18 @@ mod tests {
         config.apply_env_overrides();
         std::env::remove_var("NORA_INTERNAL_PORT");
         assert_eq!(config.internal_port, Some(9100));
+    }
+
+    /// The upstream clients refuse private addresses unless the operator allows them.
+    #[test]
+    fn allow_private_upstreams_default_and_env_override() {
+        let _lock = crate::test_env::env_lock();
+        assert!(!ServerConfig::default().allow_private_upstreams);
+        let mut config = ServerConfig::default();
+        std::env::set_var("NORA_ALLOW_PRIVATE_UPSTREAMS", "true");
+        config.apply_env_overrides();
+        std::env::remove_var("NORA_ALLOW_PRIVATE_UPSTREAMS");
+        assert!(config.allow_private_upstreams);
     }
 
     /// The publish cap defaults to 512 MB, follows the env and never exceeds the

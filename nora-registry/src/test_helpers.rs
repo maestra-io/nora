@@ -167,6 +167,9 @@ fn build_context_full(
             // the trust=false path has its own dedicated tests).
             shutdown_timeout: 15,
             trust_upstream_dates: true,
+            // The wiremock fixtures listen on 127.0.0.1 and redirect to it; the guard's
+            // own tests turn this off.
+            allow_private_upstreams: true,
             header_read_timeout: 30,
             keep_alive_timeout: 120,
             internal_port: None,
@@ -424,11 +427,15 @@ fn build_context_full(
                     .expect("egress client"),
             )
         }
-        None => (
-            reqwest::Client::new(),
-            crate::build_no_redirect_client(&config.tls),
-            crate::build_same_origin_client(&config.tls),
-        ),
+        // The clients the server builds, guard included.
+        None => {
+            let allow_private = config.server.allow_private_upstreams;
+            (
+                crate::build_upstream_client(&config.tls, allow_private),
+                crate::build_no_redirect_client(&config.tls, allow_private),
+                crate::build_same_origin_client(&config.tls, allow_private),
+            )
+        }
     };
     let (tasks, maintenance) = crate::supervision(&config.server);
     let state = AppState {
