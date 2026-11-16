@@ -132,6 +132,7 @@ async fn push_date_after_re_push(with_pull: bool) -> i64 {
             State(state),
             Path(("race-img".to_string(), "v1".to_string())),
             body,
+            "test",
         )
         .await
         .status()
@@ -250,6 +251,7 @@ async fn a_delete_during_a_pull_leaves_no_metadata() {
         State(state.clone()),
         Path(("race-img".to_string(), "v1".to_string())),
         manifest,
+        "test",
     )
     .await;
     assert_eq!(pushed.status(), StatusCode::CREATED);
@@ -270,6 +272,7 @@ async fn a_delete_during_a_pull_leaves_no_metadata() {
     let delete = super::delete_manifest(
         State(state.clone()),
         Path(("race-img".to_string(), "v1".to_string())),
+        "test",
     )
     .await;
     assert_eq!(delete.status(), StatusCode::ACCEPTED);

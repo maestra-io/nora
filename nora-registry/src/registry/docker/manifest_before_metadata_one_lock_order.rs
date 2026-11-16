@@ -188,15 +188,20 @@ async fn push(state: crate::AppState, body: Bytes) -> StatusCode {
         State(state),
         Path(("race-img".to_string(), "v1".to_string())),
         body,
+        "test",
     )
     .await
     .status()
 }
 
 async fn delete(state: crate::AppState, reference: String) -> StatusCode {
-    super::delete_manifest(State(state), Path(("race-img".to_string(), reference)))
-        .await
-        .status()
+    super::delete_manifest(
+        State(state),
+        Path(("race-img".to_string(), reference)),
+        "test",
+    )
+    .await
+    .status()
 }
 
 async fn pull(state: &crate::AppState, reference: &str) {
