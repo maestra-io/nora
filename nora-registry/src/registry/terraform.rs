@@ -60,32 +60,31 @@ pub const INDEX_PATTERN: (&str, &str) = ("terraform/", ".zip");
 // with Terraform 1.13 and latest). Metadata served to an authenticated client
 // therefore names these files by short-lived HMAC-signed URLs, and the auth layer
 // admits a GET on DOWNLOAD_PREFIX that carries a valid signature. The key is random
-// per process: a restart only invalidates URLs handed out in the last hour.
+// per process: a restart only invalidates URLs handed out in the last 15 minutes.
 
 /// The path prefix of provider package files (archives, SHA256SUMS, .sig).
 pub(crate) const DOWNLOAD_PREFIX: &str = "/terraform/v1/providers/download/";
-/// How long a signed download URL stays valid.
-const SIGNED_URL_TTL_SECS: u64 = 3600;
+/// How long a signed download URL stays valid. Terraform fetches the file seconds after it
+/// reads the metadata, and expiry is checked when the download starts (audit B25).
+const SIGNED_URL_TTL_SECS: u64 = 900;
 
 static SIGNING_KEY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(rand::random);
 
+/// HMAC-SHA256 under `key` over `path`, a newline and `exp` (audit B21).
+fn mac_with(key: &[u8], path: &str, exp: u64) -> hmac::Hmac<sha2::Sha256> {
+    use hmac::{KeyInit, Mac};
+    let mut mac =
+        hmac::Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(path.as_bytes());
+    mac.update(b"\n");
+    mac.update(exp.to_string().as_bytes());
+    mac
+}
+
 /// Hex HMAC-SHA256 over `path` and `exp` with the process key.
 fn download_signature(path: &str, exp: u64) -> String {
-    use sha2::{Digest, Sha256};
-    let (mut ipad, mut opad) = ([0x36u8; 64], [0x5cu8; 64]);
-    for (i, b) in SIGNING_KEY.iter().enumerate() {
-        ipad[i] ^= b;
-        opad[i] ^= b;
-    }
-    let mut inner = Sha256::new();
-    inner.update(ipad);
-    inner.update(path.as_bytes());
-    inner.update(b"\n");
-    inner.update(exp.to_string().as_bytes());
-    let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner.finalize());
-    hex::encode(outer.finalize())
+    use hmac::Mac;
+    hex::encode(mac_with(&*SIGNING_KEY, path, exp).finalize().into_bytes())
 }
 
 /// `url` with a signature query when it names a provider package file, else unchanged.
@@ -100,7 +99,7 @@ fn sign_download_url(url: &str) -> String {
 
 /// Whether a request for `path` with `query` carries a valid, unexpired download signature.
 pub(crate) fn download_signature_valid(path: &str, query: Option<&str>) -> bool {
-    use subtle::ConstantTimeEq;
+    use hmac::Mac;
     if !path.starts_with(DOWNLOAD_PREFIX) {
         return false;
     }
@@ -112,14 +111,13 @@ pub(crate) fn download_signature_valid(path: &str, query: Option<&str>) -> bool 
             _ => {}
         }
     }
-    let (Some(exp), Some(sig)) = (exp, sig) else {
+    let (Some(exp), Some(Ok(sig))) = (exp, sig.map(hex::decode)) else {
         return false;
     };
     exp >= crate::cache_ttl::now_unix()
-        && download_signature(path, exp)
-            .as_bytes()
-            .ct_eq(sig.as_bytes())
-            .into()
+        && mac_with(&*SIGNING_KEY, path, exp)
+            .verify_slice(&sig)
+            .is_ok()
 }
 
 pub fn routes() -> Router<AppState> {
@@ -1086,15 +1084,26 @@ async fn module_source_download(
 // the actual binary download through the existing (cached, quarantined,
 // integrity-verified) `/terraform/v1/providers/download/{*path}` handler.
 //
-// Single-upstream limitation (accepted): NORA has one configured Terraform
-// upstream (`terraform.proxy`); the {hostname} path segment is validated but not
-// used to select an upstream, so only the configured upstream's providers resolve.
+// Single upstream: NORA has one configured Terraform upstream (`terraform.proxy`)
+// and its cache keys carry no hostname, so the mirror answers only the origin
+// hostnames listed in `terraform.mirror_hostnames` (audit A105). Any other
+// {hostname} is 404 ("not in this mirror") before curation, cache or upstream.
 //
 // Integrity note (accepted): NORA does not itself GPG-verify SHA256SUMS.sig, and
 // Terraform in network_mirror mode does not run the origin-registry GPG check —
 // so mirror mode is a weaker trust anchor than the Registry Protocol. Archives are
 // served with a `zh:<sha256>` hash from the upstream metadata; any platform whose
 // shasum is unavailable is omitted (fail-closed: never serve an unhashed archive).
+
+/// Whether the mirror answers for origin `hostname` (`terraform.mirror_hostnames`).
+fn mirror_host_allowed(state: &AppState, hostname: &str) -> bool {
+    state
+        .config
+        .terraform
+        .mirror_hostnames
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(hostname))
+}
 
 /// `index.json` — List Available Versions (network mirror protocol).
 /// Reshapes the Registry-Protocol versions list into `{"versions":{"X":{}}}`.
@@ -1104,6 +1113,9 @@ async fn mirror_provider_index(
 ) -> Response {
     if !is_valid_name(&hostname) || !is_valid_name(&ns) || !is_valid_name(&ptype) {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    if !mirror_host_allowed(&state, &hostname) {
+        return StatusCode::NOT_FOUND.into_response();
     }
     let provider = provider_identity(&ns, &ptype);
     let internal = match tf_decide(&state, &HeaderMap::new(), &provider, None, None) {
@@ -1149,6 +1161,9 @@ async fn mirror_provider_version(
         || !is_valid_version(ver)
     {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    if !mirror_host_allowed(&state, &hostname) {
+        return StatusCode::NOT_FOUND.into_response();
     }
 
     // Curation parity (SEC #2): version.json is decided as the download-metadata step is, so a
@@ -4955,6 +4970,27 @@ mod maestra_tests {
         let index =
             "https://packages.example/terraform/registry.terraform.io/hashicorp/null/index.json";
         assert_eq!(sign_download_url(index), index);
+        // A signature that is not hex, or odd-length hex, is refused (audit B21).
+        for bad in ["zz", "abc", ""] {
+            let q = format!("nora_exp={exp}&nora_sig={bad}");
+            assert!(!download_signature_valid(ZIP, Some(&q)), "{bad}");
+        }
+        // A URL lives at most 15 minutes (audit B25).
+        let now = crate::cache_ttl::now_unix();
+        assert!(exp > now && exp <= now + 900, "exp {exp}, now {now}");
+    }
+
+    /// Audit B21: the signer is standard HMAC-SHA256 over `path`, a newline and the decimal
+    /// expiry. The vector comes from an independent implementation (Python `hmac`), so a
+    /// change to the construction fails here even though signing and checking share code.
+    #[test]
+    fn download_mac_is_standard_hmac_sha256() {
+        use hmac::Mac;
+        let mac = super::mac_with(b"Jefe", "/terraform/v1/providers/download/x", 1_700_000_000);
+        assert_eq!(
+            hex::encode(mac.finalize().into_bytes()),
+            "0c51004ff00d2485a197ef14d38ef3ef9fa7cf58ef5ea325567b76dd31a27a64"
+        );
     }
 
     /// With auth on, the archive URL a mirror client gets is signed, and only that URL
@@ -5059,5 +5095,95 @@ mod maestra_tests {
             .collect();
         // The young version is hidden; an undated one is left to the download gate.
         assert_eq!(kept, ["1.0.0", "1.2.0"]);
+    }
+}
+
+/// Audit A105: the network mirror answers only the origin hostnames in
+/// `terraform.mirror_hostnames`; any other host is 404 before cache or upstream.
+#[cfg(test)]
+mod mirror_hostname_cases {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn upstream() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/providers/acme/tool/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"versions":[{"version":"1.0.0","protocols":["5.0"],"platforms":[{"os":"linux","arch":"amd64"}]}]}"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/providers/acme/tool/1.0.0/download/linux/amd64"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"download_url":"https://releases.example/tool_1.0.0_linux_amd64.zip","shasum":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
+            ))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn paths(host: &str) -> [String; 2] {
+        [
+            format!("/terraform/{host}/acme/tool/index.json"),
+            format!("/terraform/{host}/acme/tool/1.0.0.json"),
+        ]
+    }
+
+    async fn status_of(ctx: &crate::test_helpers::TestContext, host: &str) -> [StatusCode; 2] {
+        let [index, version] = paths(host);
+        [
+            send(&ctx.app, Method::GET, &index, "").await.status(),
+            send(&ctx.app, Method::GET, &version, "").await.status(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn only_configured_origin_hosts_are_mirrored() {
+        let server = upstream().await;
+        let url = server.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(url);
+        });
+        // Unlisted hosts first, on a cold cache: 404 and the upstream is never asked.
+        for host in ["private.registry.corp.example", "registry.opentofu.org"] {
+            assert_eq!(
+                status_of(&ctx, host).await,
+                [StatusCode::NOT_FOUND; 2],
+                "{host}"
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            status_of(&ctx, "registry.terraform.io").await,
+            [StatusCode::OK; 2]
+        );
+        assert_eq!(
+            status_of(&ctx, "REGISTRY.Terraform.IO").await,
+            [StatusCode::OK; 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn mirror_hostnames_replaces_the_default() {
+        let server = upstream().await;
+        let url = server.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(url);
+            cfg.terraform.mirror_hostnames = vec!["registry.opentofu.org".into()];
+        });
+        assert_eq!(
+            status_of(&ctx, "registry.terraform.io").await,
+            [StatusCode::NOT_FOUND; 2]
+        );
+        assert_eq!(
+            status_of(&ctx, "registry.opentofu.org").await,
+            [StatusCode::OK; 2]
+        );
     }
 }

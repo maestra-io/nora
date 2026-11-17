@@ -24,6 +24,15 @@ pub struct TerraformConfig {
     pub metadata_ttl: i64,
     #[serde(default = "super::super::default_true")]
     pub serve_stale: bool,
+    /// Origin hostnames the network mirror answers for (`/terraform/{hostname}/…`), compared
+    /// case-insensitively. Every mirrored name resolves from the one `proxy`, so another
+    /// hostname is answered 404 rather than with that upstream's provider of the same name.
+    #[serde(default = "default_mirror_hostnames")]
+    pub mirror_hostnames: Vec<String>,
+}
+
+fn default_mirror_hostnames() -> Vec<String> {
+    vec!["registry.terraform.io".to_string()]
 }
 
 fn default_terraform_proxy() -> Option<String> {
@@ -40,6 +49,7 @@ impl Default for TerraformConfig {
             proxy_timeout_dl: 120,
             metadata_ttl: 300,
             serve_stale: true,
+            mirror_hostnames: default_mirror_hostnames(),
         }
     }
 }
@@ -74,6 +84,14 @@ impl TerraformConfig {
         }
         if let Ok(val) = env::var("NORA_TF_SERVE_STALE") {
             self.serve_stale = !matches!(val.as_str(), "false" | "0");
+        }
+        if let Ok(val) = env::var("NORA_TF_MIRROR_HOSTNAMES") {
+            self.mirror_hostnames = val
+                .split(',')
+                .map(str::trim)
+                .filter(|host| !host.is_empty())
+                .map(str::to_lowercase)
+                .collect();
         }
     }
 }

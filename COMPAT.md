@@ -211,11 +211,18 @@ NORA serves both Terraform protocols against the same upstream: the **Registry P
 | Provider publish | — | Proxy-only (read) |
 
 Client (network mirror — Terraform requires an `https:` URL, trailing slash):
-`provider_installation { network_mirror { url = "https://nora.example.com/terraform/" } }`
+`provider_installation { network_mirror { url = "https://nora.example.com/terraform/" include = ["registry.terraform.io/*/*"] } direct { exclude = ["registry.terraform.io/*/*"] } }`
 
 **Limitations (accepted):**
-- **Single upstream** — the `{hostname}` in a mirror request is validated but not routed;
-  only the configured `terraform.proxy` upstream's providers resolve.
+- **Single upstream** — every mirrored provider resolves from the one `terraform.proxy`, so the
+  mirror answers only the origin hostnames in `terraform.mirror_hostnames` (default
+  `["registry.terraform.io"]`, `NORA_TF_MIRROR_HOSTNAMES` comma list, case-insensitive). Any
+  other `{hostname}` is 404 ("not in this mirror"); keep the `include` filter so Terraform
+  installs those providers another way. OpenTofu's default host is `registry.opentofu.org`:
+  list it (with a proxy that serves it) or filter it out.
+- **Signed download URLs** — Terraform sends no credentials for provider package files, so
+  metadata names them by HMAC-SHA256-signed URLs that expire after 15 minutes. The key is per
+  process: a restart, or another NORA process, refuses an outstanding URL.
 - **Mirror-mode integrity is weaker than registry mode** — in `network_mirror` mode
   Terraform does not run the origin-registry GPG check, and NORA does not itself verify
   `SHA256SUMS.sig`. Archives carry `zh:<sha256>` from upstream metadata (fail-closed: a

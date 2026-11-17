@@ -31,6 +31,8 @@ sha2.workspace = true
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 sha1 = "0.11"
 md-5 = "0.11"
+# Terraform signed download URLs; 0.13 shares digest 0.11 with sha2 0.11.
+hmac = "0.13"
 async-trait.workspace = true
 hex.workspace = true
 object_store = { version = "0.13", features = ["aws", "gcp"] }
