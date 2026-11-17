@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 #![cfg(test)]
 
-use crate::test_helpers::{body_bytes, create_test_context, send, send_with_headers};
+use crate::test_helpers::{body_bytes, create_test_context, pypi_dist, send, send_with_headers};
 use axum::http::{header, Method, StatusCode};
 
 /// A cold miss is "not found" only when an upstream said so. The simple index and a file
@@ -1392,7 +1392,7 @@ async fn hosted_wheel_serves_core_metadata_and_requires_python() {
         &ctx.app,
         &[("name", "hostpkg"), ("version", "1.0")],
         "hostpkg-1.0.tar.gz",
-        b"sdist",
+        &pypi_dist("hostpkg-1.0.tar.gz", b"sdist"),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1559,7 +1559,16 @@ async fn proxied_core_metadata_follows_the_upstream_advertisement() {
 async fn upload_spools_content_and_cleans_up() {
     let ctx = create_test_context();
     let spool = std::path::PathBuf::from(&ctx.state.config.storage.path).join("tmp/pypi-uploads");
-    let content: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    // A real gzip stream, stored (not compressed) so the body stays 3 MiB: an upload is the
+    // archive its name says (B11).
+    let content: Vec<u8> = {
+        use std::io::Write as _;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+        let payload: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        gz.write_all(&payload).unwrap();
+        gz.finish().unwrap()
+    };
+    assert!(content.len() > 3 * 1024 * 1024);
     let resp = twine_upload(
         &ctx.app,
         &[
@@ -1620,7 +1629,7 @@ async fn internal_project_never_touches_a_dead_upstream() {
         cfg.pypi.metadata_ttl = 0;
         cfg.curation.internal_namespaces = vec!["corp-*".to_string()];
     });
-    let content = b"sdist-bytes".to_vec();
+    let content = pypi_dist("corp-lib-1.0.tar.gz", b"sdist-bytes");
     let resp = twine_upload(
         &ctx.app,
         &[("name", "corp-lib"), ("version", "1.0")],
@@ -1676,6 +1685,7 @@ async fn internal_project_never_touches_a_dead_upstream() {
 async fn upload_refuses_an_oversized_text_field() {
     let ctx = create_test_context();
     let long = "a".repeat(super::MAX_UPLOAD_TEXT_FIELD + 1);
+    let sdist = pypi_dist("foo-1.0.tar.gz", b"data");
     for field in [
         "name",
         "version",
@@ -1686,7 +1696,7 @@ async fn upload_refuses_an_oversized_text_field() {
         let mut fields = vec![("name", "foo"), ("version", "1.0")];
         fields.retain(|(name, _)| *name != field);
         fields.push((field, long.as_str()));
-        let resp = twine_upload(&ctx.app, &fields, "foo-1.0.tar.gz", b"data").await;
+        let resp = twine_upload(&ctx.app, &fields, "foo-1.0.tar.gz", &sdist).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{field}");
         let body = crate::test_helpers::body_bytes(resp).await;
         assert!(body.ends_with(b"exceeds 8192 bytes"), "{field}: {body:?}");
@@ -1697,7 +1707,7 @@ async fn upload_refuses_an_oversized_text_field() {
         ("version", "1.0"),
         ("requires_python", &fits),
     ];
-    let resp = twine_upload(&ctx.app, &fields, "foo-1.0.tar.gz", b"data").await;
+    let resp = twine_upload(&ctx.app, &fields, "foo-1.0.tar.gz", &sdist).await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
@@ -1725,7 +1735,7 @@ async fn upload_rejects_a_filename_of_another_project_or_version() {
             &ctx.app,
             &[("name", name), ("version", version)],
             filename,
-            b"data",
+            &pypi_dist(filename, b"data"),
         )
         .await;
         assert_eq!(resp.status(), want, "{name} {version} {filename}");
@@ -1820,7 +1830,14 @@ async fn uploaded_files_are_neither_quarantined_nor_dated_upstream() {
     use wiremock::matchers::any;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    let upstream = MockServer::start().await;
+    // Unpooled: a pooled server can still receive another test's late request.
+    let upstream = MockServer::builder().start().await;
+    // A101: the upload that claims `ownpkg` asks whether an upstream lists it; none does.
+    Mock::given(wiremock::matchers::path("/ownpkg/"))
+        .respond_with(ResponseTemplate::new(404))
+        .with_priority(1)
+        .mount(&upstream)
+        .await;
     Mock::given(any())
         .respond_with(ResponseTemplate::new(500))
         .mount(&upstream)
@@ -1839,19 +1856,29 @@ async fn uploaded_files_are_neither_quarantined_nor_dated_upstream() {
             &ctx.app,
             &[("name", project), ("version", "1.0")],
             &file,
-            b"sdist",
+            &pypi_dist(&file, b"sdist"),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+    let claimed = upstream.received_requests().await.unwrap();
+    assert_eq!(
+        claimed.iter().map(|r| r.url.path()).collect::<Vec<_>>(),
+        ["/ownpkg/"],
+        "only the claim of the name outside internal_namespaces asks the upstream"
+    );
+    for project in ["intpkg", "ownpkg"] {
+        let file = format!("{project}-1.0.tar.gz");
         for _ in 0..2 {
             let uri = format!("/simple/{project}/{file}");
             let resp = send(&ctx.app, Method::GET, &uri, "").await;
             assert_eq!(resp.status(), StatusCode::OK, "{uri}");
-            assert_eq!(text(resp).await, "sdist");
+            assert_eq!(&body_bytes(resp).await[..], &pypi_dist(&file, b"sdist")[..]);
         }
     }
-    assert!(
-        upstream.received_requests().await.unwrap().is_empty(),
+    assert_eq!(
+        upstream.received_requests().await.unwrap().len(),
+        claimed.len(),
         "an uploaded file is never looked up upstream"
     );
 
@@ -2051,7 +2078,7 @@ async fn hosted_project_upstream_404_is_cached() {
         &ctx.app,
         &[("name", "priv"), ("version", "1.0")],
         "priv-1.0.tar.gz",
-        b"x",
+        &pypi_dist("priv-1.0.tar.gz", b"x"),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2325,36 +2352,23 @@ async fn a_proxied_hit_costs_one_head_before_its_get() {
 }
 
 /// R4-R04: a project with a file uploaded here is owned locally, as a published npm name
-/// is. The first upload outside `curation.internal_namespaces` makes it hosted: its index
-/// (HTML and PEP 691) and files come from its own files only, a version the upstream lists
-/// under the name is neither listed nor fetched, a proxy cache copy from before the upload
-/// is no longer served, and an earlier upload (no provenance marker) stays one of its own.
-/// That first upload is counted once, with whether the cached upstream index lists the
-/// name; an internal name is not claimed; the upstream is never asked.
+/// is. The first upload outside `curation.internal_namespaces` of a name no upstream lists
+/// makes it hosted: its index (HTML and PEP 691) and files come from its own files only, a
+/// version the upstream registers under the name later is neither listed nor fetched, a proxy
+/// cache copy from before the upload is no longer served, and an earlier upload (no provenance
+/// marker) stays one of its own. Each claim is counted (`upstream_lists="no"`); an internal
+/// name is not claimed and never asked of the upstream; a hosted name is asked no more.
 #[tokio::test]
 async fn an_uploaded_project_owns_its_name() {
     use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
     // Unpooled: a pooled server can still receive another test's late request.
     let upstream = MockServer::builder().start().await;
-    Mock::given(any())
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"<a href="https://up/mixed-9.0.tar.gz">mixed-9.0.tar.gz</a>"#),
-        )
-        .mount(&upstream)
-        .await;
     let uri = upstream.uri();
     let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
         cfg.pypi.proxy = Some(uri);
         cfg.curation.internal_namespaces = vec!["acme-*".to_string()];
     });
-    let index = br#"[{"filename":"mixed-9.0.tar.gz","url":"https://up/mixed-9.0.tar.gz"},
-            {"filename":"mixed-0.9.tar.gz","url":"https://up/mixed-0.9.tar.gz"}]"#;
     let storage = &ctx.state.storage;
-    storage
-        .put("pypi/mixed/upstream-index.json", index)
-        .await
-        .unwrap();
     // A proxy cache copy, and an upload stored before uploads were recorded.
     storage
         .put("pypi/mixed/mixed-0.9.tar.gz", b"proxied")
@@ -2376,8 +2390,9 @@ async fn an_uploaded_project_owns_its_name() {
             .with_label_values(&[label])
             .get()
     };
-    let (listed, unknown) = (count("yes"), count("unknown"));
+    let claimed = count("no");
 
+    // No mock mounted yet: the upstream answers 404 for every name.
     for (name, version, file) in [
         ("mixed", "1.0", "mixed-1.0.tar.gz"),
         ("mixed", "1.1", "mixed-1.1.tar.gz"),
@@ -2385,22 +2400,30 @@ async fn an_uploaded_project_owns_its_name() {
         ("acme-utils", "1.0", "acme_utils-1.0.tar.gz"),
     ] {
         let fields = [("name", name), ("version", version)];
-        let resp = twine_upload(&ctx.app, &fields, file, b"data").await;
+        let resp = twine_upload(&ctx.app, &fields, file, &pypi_dist(file, b"data")).await;
         assert_eq!(resp.status(), StatusCode::OK, "{file}");
     }
-    // Counted, not read from a log capture: tests running alongside emit the same WARN
-    // callsite, and a capture can miss it when another thread registers the callsite while
-    // the capture starts. Only this test seeds a cached index listing the name ("yes"),
-    // so two uploads of `mixed` counting once is exact.
-    assert_eq!(
-        count("yes") - listed,
-        1,
-        "one report for two uploads of mixed"
-    );
-    assert!(count("unknown") > unknown, "fresh is reported");
+    // Counted, not read from a log capture: tests running alongside emit the same WARN.
+    assert!(count("no") >= claimed + 2, "mixed and fresh are claimed");
     let internal = super::own_records(storage, "acme-utils").await.unwrap();
     assert!(!internal.hosted(), "an internal name is not claimed");
+    let asked: Vec<String> = upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert_eq!(asked, ["/mixed/", "/fresh/"], "each claim asks once");
 
+    // The upstream registers the name after the claim.
+    Mock::given(any())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"<a href="https://up/mixed-9.0.tar.gz">mixed-9.0.tar.gz</a>"#),
+        )
+        .mount(&upstream)
+        .await;
     let html = send(&ctx.app, Method::GET, "/simple/mixed/", "").await;
     assert_eq!(html.status(), StatusCode::OK);
     let html = String::from_utf8(body_bytes(html).await.to_vec()).unwrap();
@@ -2431,7 +2454,289 @@ async fn an_uploaded_project_owns_its_name() {
         let resp = send(&ctx.app, Method::GET, &format!("/simple/mixed/{file}"), "").await;
         assert_eq!(resp.status(), status, "{file}");
     }
-    assert!(upstream.received_requests().await.unwrap().is_empty());
+    assert_eq!(
+        upstream.received_requests().await.unwrap().len(),
+        asked.len(),
+        "a hosted name is never asked of the upstream again"
+    );
+}
+
+/// A101: an upload never claims a name an upstream lists. Outside
+/// `curation.internal_namespaces` it is a 409 for any version, the project stays proxied and
+/// the upstream's files stay listed; while the upstream fails it is the upstream's 5xx and
+/// nothing is claimed; a name every upstream 404s is claimed; an internal name never asks.
+#[tokio::test]
+async fn an_upload_into_an_upstream_project_is_refused() {
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    // Unpooled: a pooled server can still receive another test's late request.
+    let upstream = MockServer::builder().start().await;
+    Mock::given(path("/acmepub/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<a href="/files/acmepub-1.0.tar.gz#sha256=00">acmepub-1.0.tar.gz</a>"#,
+        ))
+        .mount(&upstream)
+        .await;
+    Mock::given(path("/down/"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&upstream)
+        .await;
+    let uri = upstream.uri();
+    let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+        cfg.pypi.proxy = Some(uri);
+        cfg.curation.internal_namespaces = vec!["acme-int".to_string()];
+    });
+    let storage = &ctx.state.storage;
+    let refused = crate::metrics::PYPI_MIXED_PROJECT_UPLOADS_TOTAL
+        .with_label_values(&["yes"])
+        .get();
+    let upload = |name: &'static str, version: &'static str| {
+        let app = ctx.app.clone();
+        async move {
+            let file = format!("{}-{version}.tar.gz", name.replace('-', "_"));
+            let fields = [("name", name), ("version", version)];
+            twine_upload(&app, &fields, &file, &pypi_dist(&file, b"mine"))
+                .await
+                .status()
+        }
+    };
+
+    for version in ["1.0", "99.0"] {
+        assert_eq!(
+            upload("acmepub", version).await,
+            StatusCode::CONFLICT,
+            "{version}"
+        );
+    }
+    assert!(
+        crate::metrics::PYPI_MIXED_PROJECT_UPLOADS_TOTAL
+            .with_label_values(&["yes"])
+            .get()
+            >= refused + 2
+    );
+    assert!(!super::own_records(storage, "acmepub")
+        .await
+        .unwrap()
+        .hosted());
+    assert!(storage
+        .stat("pypi/acmepub/acmepub-99.0.tar.gz")
+        .await
+        .is_none());
+    let html = text(send(&ctx.app, Method::GET, "/simple/acmepub/", "").await).await;
+    assert!(html.contains("acmepub-1.0.tar.gz"), "{html}");
+    assert!(!html.contains("acmepub-99.0.tar.gz"), "{html}");
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/simple/acmepub/acmepub-99.0.tar.gz",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let status = upload("down", "1.0").await;
+    assert!(status.is_server_error(), "{status}");
+    assert!(!super::own_records(storage, "down").await.unwrap().hosted());
+    assert!(storage.stat("pypi/down/down-1.0.tar.gz").await.is_none());
+
+    assert_eq!(upload("fresh", "1.0").await, StatusCode::OK);
+    assert!(super::own_records(storage, "fresh").await.unwrap().hosted());
+
+    assert_eq!(upload("acme-int", "1.0").await, StatusCode::OK);
+    let asked = upstream.received_requests().await.unwrap();
+    assert!(
+        !asked
+            .iter()
+            .any(|r| r.url.path().contains("acme") && r.url.path() != "/acmepub/"),
+        "an internal name is never asked"
+    );
+}
+
+/// A101: an upload claims a name only on every upstream's answer now. While one upstream 404s
+/// and another fails, or the cached empty answer has expired and the refetch fails, the
+/// upload is a 503 and nothing is claimed; once every upstream answers, it is claimed.
+#[tokio::test]
+async fn an_upload_never_claims_a_name_on_an_incomplete_or_expired_answer() {
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    // Unpooled: a pooled server can still receive another test's late request.
+    let missing = MockServer::builder().start().await;
+    Mock::given(path("/partial/"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&missing)
+        .await;
+    let failing = MockServer::builder().start().await;
+    Mock::given(path("/partial/"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&failing)
+        .await;
+    let urls = vec![missing.uri(), failing.uri()];
+    let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+        cfg.pypi.proxies = serde_json::from_value(serde_json::json!(urls)).unwrap();
+    });
+    let fields = [("name", "partial"), ("version", "1.0")];
+    let file = "partial-1.0.tar.gz";
+    let resp = twine_upload(&ctx.app, &fields, file, &pypi_dist(file, b"mine")).await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!super::own_records(&ctx.state.storage, "partial")
+        .await
+        .unwrap()
+        .hosted());
+    assert!(ctx
+        .state
+        .storage
+        .stat("pypi/partial/partial-1.0.tar.gz")
+        .await
+        .is_none());
+
+    // Expired: the cached empty answer is older than the TTL and the refetch fails.
+    let upstream = MockServer::builder().start().await;
+    Mock::given(path("/expired/"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&upstream)
+        .await;
+    let uri = upstream.uri();
+    let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+        cfg.pypi.proxy = Some(uri);
+        cfg.pypi.metadata_ttl = 0; // every cached answer is expired
+    });
+    let resp = send(&ctx.app, Method::GET, "/simple/expired/", "").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(ctx
+        .state
+        .storage
+        .stat("pypi/expired/upstream-index.json")
+        .await
+        .is_some());
+    upstream.reset().await;
+    Mock::given(path("/expired/"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&upstream)
+        .await;
+    let fields = [("name", "expired"), ("version", "1.0")];
+    let file = "expired-1.0.tar.gz";
+    let resp = twine_upload(&ctx.app, &fields, file, &pypi_dist(file, b"mine")).await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!super::own_records(&ctx.state.storage, "expired")
+        .await
+        .unwrap()
+        .hosted());
+
+    // Every upstream answers now that it has no such project: claimed.
+    upstream.reset().await;
+    Mock::given(path("/expired/"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&upstream)
+        .await;
+    let resp = twine_upload(&ctx.app, &fields, file, &pypi_dist(file, b"mine")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(super::own_records(&ctx.state.storage, "expired")
+        .await
+        .unwrap()
+        .hosted());
+}
+
+/// B11: an upload is the archive its name says, as PyPI requires: a `.whl`, `.zip` or `.egg`
+/// that is no zip and a `.tar.gz` or `.tgz` that is no gzip stream are a 400 and not stored.
+/// Real archives upload, a wheel without core metadata among them.
+#[tokio::test]
+async fn an_upload_that_is_not_the_archive_its_name_says_is_refused() {
+    let ctx = create_test_context();
+    for file in [
+        "demo-1.0-py3-none-any.whl",
+        "demo-1.0.zip",
+        "demo-1.0-py3.12.egg",
+        "demo-1.0.tar.gz",
+        "demo-1.0.tgz",
+    ] {
+        let fields = [("name", "demo"), ("version", "1.0")];
+        let resp = twine_upload(&ctx.app, &fields, file, b"not an archive").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{file}");
+        let resp = send(&ctx.app, Method::GET, &format!("/simple/demo/{file}"), "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{file}");
+    }
+    // An uncompressed tar named .tar.gz is no gzip stream either.
+    let fields = [("name", "demo"), ("version", "1.0")];
+    let resp = twine_upload(&ctx.app, &fields, "demo-1.0.tar.gz", &[0u8; 1024]).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // The gzip magic alone, a cut stream and a stream whose CRC does not match are no gzip
+    // stream: the whole stream is checked, not its signature.
+    let real = pypi_dist("demo-1.0.tar.gz", &[7u8; 4096]);
+    let mut bad_crc = real.clone();
+    let crc_at = bad_crc.len() - 8;
+    bad_crc[crc_at] ^= 0xff;
+    for (what, content) in [
+        ("magic only", vec![0x1f, 0x8b]),
+        ("header only", real[..10].to_vec()),
+        ("cut", real[..real.len() - 4].to_vec()),
+        ("bad crc", bad_crc),
+    ] {
+        let resp = twine_upload(&ctx.app, &fields, "demo-1.0.tar.gz", &content).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{what}");
+    }
+    let resp = send(&ctx.app, Method::GET, "/simple/demo/demo-1.0.tar.gz", "").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    for (file, content) in [
+        (
+            "demo-1.0-py3-none-any.whl",
+            wheel(
+                "demo-1.0.dist-info",
+                "Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n",
+            ),
+        ),
+        ("demo-1.0.tar.gz", pypi_dist("demo-1.0.tar.gz", b"sdist")),
+        ("demo-1.0.zip", pypi_dist("demo-1.0.zip", b"sdist")),
+        // A zip wheel without a dist-info/METADATA: stored, served without core metadata.
+        (
+            "demo-1.0-py2-none-any.whl",
+            pypi_dist("demo-1.0-py2-none-any.whl", b"x"),
+        ),
+    ] {
+        let resp = twine_upload(&ctx.app, &fields, file, &content).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{file}");
+    }
+    let html = text(send(&ctx.app, Method::GET, "/simple/demo/", "").await).await;
+    let bare = html
+        .lines()
+        .find(|l| l.contains("demo-1.0-py2-none-any.whl"))
+        .unwrap();
+    assert!(!bare.contains("data-core-metadata"), "{bare}");
+    let full = html
+        .lines()
+        .find(|l| l.contains("demo-1.0-py3-none-any.whl"))
+        .unwrap();
+    assert!(full.contains("data-core-metadata"), "{full}");
+}
+
+/// A079: an upload's name normalizes to the PEP 503 alphabet, `[a-z0-9]` runs joined by `-`;
+/// any other is a 400 and nothing is stored. A name that normalizes into it still uploads and
+/// is listed under the name pip asks for.
+#[tokio::test]
+async fn an_upload_under_a_name_outside_the_pep503_alphabet_is_refused() {
+    let ctx = create_test_context();
+    for (name, file) in [
+        // A quote in the quoted multipart filename is sent backslash-escaped.
+        ("V3\"><svg onload=1>x", "v3\\\"><svg onload=1>x-1.0.tar.gz"),
+        ("-lead", "-lead-1.0.tar.gz"),
+        ("trail_", "trail_-1.0.tar.gz"),
+        ("caf\u{e9}", "caf\u{e9}-1.0.tar.gz"),
+    ] {
+        let fields = [("name", name), ("version", "1.0")];
+        let resp = twine_upload(&ctx.app, &fields, file, &pypi_dist(file, b"x")).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{name}");
+    }
+    assert!(ctx.state.storage.list("pypi/").await.unwrap().is_empty());
+
+    let fields = [("name", "My_Pkg.Name"), ("version", "1.0")];
+    let file = "my_pkg_name-1.0.tar.gz";
+    let resp = twine_upload(&ctx.app, &fields, file, &pypi_dist(file, b"x")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = text(send(&ctx.app, Method::GET, "/simple/my-pkg-name/", "").await).await;
+    assert!(
+        html.contains("/simple/my-pkg-name/my_pkg_name-1.0.tar.gz"),
+        "{html}"
+    );
 }
 
 // ── A name with an empty segment never names another key's file ─────────
@@ -2577,7 +2882,7 @@ async fn concurrent_uploads_of_one_file_store_it_once() {
     let uploads = (0..8).map(|i| {
         let app = ctx.app.clone();
         tokio::spawn(async move {
-            let content = format!("sdist-{i}").into_bytes();
+            let content = pypi_dist("race-1.0.tar.gz", format!("sdist-{i}").as_bytes());
             twine_upload(
                 &app,
                 &[
@@ -2623,8 +2928,11 @@ async fn concurrent_uploads_keep_every_requires_python_entry() {
     let upload = |i: usize| {
         let app = ctx.app.clone();
         async move {
-            let content = format!("sdist-{i}").into_bytes();
             let version = format!("1.{i}");
+            let content = pypi_dist(
+                &format!("many-{version}.tar.gz"),
+                format!("sdist-{i}").as_bytes(),
+            );
             twine_upload(
                 &app,
                 &[

@@ -692,6 +692,19 @@ fn test_index_attributes_round_trip_html_and_json() {
     );
     assert_eq!(parsed[0].core_metadata.as_deref(), Some("sha256=cc"));
     assert_eq!(parsed[1].core_metadata.as_deref(), Some("true"));
+
+    // A079: the project name is escaped in every link as on the page, whatever stored it.
+    let html = body(versions_html_response(
+        "v3\"><svg onload=1>x",
+        &files,
+        "http://nora",
+    ));
+    let html = std::str::from_utf8(&html).unwrap();
+    assert!(!html.contains("\"><svg"), "{html}");
+    assert!(
+        html.contains("/simple/v3&quot;&gt;&lt;svg onload=1&gt;x/pkg-1.0.tar.gz"),
+        "{html}"
+    );
     assert_eq!(parsed[2].core_metadata, None);
     let legacy = parse_upstream_files(
         r#"<a href="https://up/pkg-1.0-py3-none-any.whl" data-dist-info-metadata="sha256=dd">x</a>"#,

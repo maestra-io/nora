@@ -1875,7 +1875,8 @@ mod integration_tests {
         );
     }
 
-    /// `twine upload` of `filename` (project `name`, `version`) to NORA.
+    /// `twine upload` of `filename` (project `name`, `version`) to NORA, holding `content` in the
+    /// archive format its name says.
     async fn twine_upload(
         app: &axum::Router,
         name: &str,
@@ -1901,7 +1902,7 @@ mod integration_tests {
             )
             .as_bytes(),
         );
-        body.extend_from_slice(content);
+        body.extend_from_slice(&crate::test_helpers::pypi_dist(filename, content));
         body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
         let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
         crate::test_helpers::send_with_headers(
@@ -2023,7 +2024,8 @@ mod integration_tests {
         )
         .await;
         assert_eq!(uploaded.status(), StatusCode::OK);
-        assert_eq!(asked(&upstream).await, Vec::<String>::new());
+        // A101: only the first upload asks whether an upstream lists the name (none does).
+        assert_eq!(asked(&upstream).await, vec!["/simple/corppkg/".to_string()]);
 
         // A file of the imported project's name that NORA holds but does not own can be uploaded:
         // the upload replaces it, and it is the project's from then on.
@@ -2046,7 +2048,10 @@ mod integration_tests {
         )
         .await;
         assert_eq!(own.status(), StatusCode::OK);
-        assert_eq!(&body_bytes(own).await[..], b"own 9.9.9");
+        assert_eq!(
+            &body_bytes(own).await[..],
+            &crate::test_helpers::pypi_dist("corppkg-9.9.9-py3-none-any.whl", b"own 9.9.9")[..]
+        );
     }
 
     /// An imported file has no upstream release: a listing an upstream gave for the project
@@ -2101,8 +2106,9 @@ mod integration_tests {
     }
 
     /// R4-R04: an upload to a project nothing imported owns it as an import does: its index is
-    /// the upload alone, not merged with the upstream's, and a file it does not hold is not
-    /// fetched from the upstream; the name is never asked of it.
+    /// the upload alone, not merged with what an upstream registers under the name later, and a
+    /// file it does not hold is not fetched from the upstream. A101: the name is asked of the
+    /// upstream once, by the upload that claims it (no upstream lists it), and never after.
     #[tokio::test]
     async fn an_upload_to_a_project_nothing_imported_owns_it_as_an_import_does() {
         use crate::test_helpers::{create_test_context_with_config, send};
@@ -2110,12 +2116,6 @@ mod integration_tests {
 
         // Unpooled: a pooled server can still receive another test's late request.
         let upstream = MockServer::builder().start().await;
-        Mock::given(wiremock::matchers::path("/simple/otherpkg/"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<a href="/files/otherpkg-9.9.9-py3-none-any.whl">otherpkg-9.9.9-py3-none-any.whl</a>"#,
-            ))
-            .mount(&upstream)
-            .await;
         let uri = upstream.uri();
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.pypi.enabled = true;
@@ -2132,6 +2132,17 @@ mod integration_tests {
             .await,
             StatusCode::OK
         );
+        assert_eq!(
+            asked(&upstream).await,
+            vec!["/simple/otherpkg/".to_string()]
+        );
+        // The upstream registers the name after the upload.
+        Mock::given(wiremock::matchers::path("/simple/otherpkg/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="/files/otherpkg-9.9.9-py3-none-any.whl">otherpkg-9.9.9-py3-none-any.whl</a>"#,
+            ))
+            .mount(&upstream)
+            .await;
         let html = simple_index(&ctx.app, "otherpkg").await;
         assert!(html.contains("otherpkg-1.0.0.tar.gz"), "{html}");
         assert!(!html.contains("otherpkg-9.9.9-py3-none-any.whl"), "{html}");
@@ -2143,7 +2154,10 @@ mod integration_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert_eq!(asked(&upstream).await, Vec::<String>::new());
+        assert_eq!(
+            asked(&upstream).await,
+            vec!["/simple/otherpkg/".to_string()]
+        );
     }
 
     /// A .nupkg imported from a hosted repository is NORA's own: the flat container lists and

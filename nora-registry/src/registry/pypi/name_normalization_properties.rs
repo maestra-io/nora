@@ -50,7 +50,12 @@ async fn an_upload_is_listed_under_the_name_pip_asks_for() {
     let ctx = create_test_context();
     let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
     let filename = "foo_bar-1.0-py3-none-any.whl";
-    let body = upload_body("Foo__Bar", "1.0", filename, b"wheel");
+    let body = upload_body(
+        "Foo__Bar",
+        "1.0",
+        filename,
+        &crate::test_helpers::pypi_dist(filename, b"wheel"),
+    );
     let resp = send_with_headers(
         &ctx.app,
         Method::POST,
