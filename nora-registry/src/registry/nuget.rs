@@ -313,6 +313,30 @@ impl Search {
     }
 }
 
+/// Whether text names an internal-namespace ID: any run of package-ID characters in it
+/// (so `packageid:X`, `"X"`, `(X)` and a term among others all count).
+pub(super) fn search_names_internal(state: &AppState, text: &str) -> bool {
+    let engine = &state.curation().curation_engine;
+    text.split(|c: char| !(c.is_alphanumeric() || matches!(c, '.' | '_' | '-')))
+        .any(|t| {
+            !t.is_empty()
+                && crate::curation::is_internal_namespace(
+                    engine,
+                    crate::curation::RegistryType::Nuget,
+                    &t.to_lowercase(),
+                )
+        })
+}
+
+/// [`search_names_internal`] over a raw query string, keys and values alike: everything
+/// in it is sent upstream verbatim.
+pub(super) fn query_names_internal(state: &AppState, raw_qs: &str) -> bool {
+    search_names_internal(
+        state,
+        &percent_encoding::percent_decode_str(&raw_qs.replace('+', " ")).decode_utf8_lossy(),
+    )
+}
+
 /// Proxy a search to the upstream service with a short timeout (UX-critical path),
 /// local results when there is no upstream, for an internal-namespace term, and as
 /// the stale fallback (R4-T11: was two copies).
@@ -343,17 +367,14 @@ async fn proxied_search(
         return with_json(local().await);
     }
 
-    // #68 namespace isolation: never forward a term that matches an internal
-    // namespace upstream (dependency confusion) — serve local results only.
-    if crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Nuget,
-        &query,
-    ) {
+    // #68 namespace isolation: never forward a query that names an internal namespace
+    // upstream (dependency confusion) — serve local results only. Every value of the
+    // query string that goes out is checked, `q` terms and `id` alike.
+    let qs = raw_query.0.unwrap_or_default();
+    if query_names_internal(state, &qs) {
         return with_json(local().await);
     }
 
-    let qs = raw_query.0.unwrap_or_default();
     let service = match kind {
         Search::Query => &state.config.nuget.search_service,
         Search::Autocomplete => &state.config.nuget.autocomplete,

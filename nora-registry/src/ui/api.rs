@@ -2359,10 +2359,11 @@ mod tests {
             // npm first decides which packument to read (published or the upstream cache):
             // one listing of `versions/`, one read of the published key with its pin, one
             // stat of the upstream key — the same for one version as for N.
-            let (stat, list, get) = if name == "npm" {
-                (Some(&1), Some(&1), 3)
-            } else {
-                (None, None, 2)
+            // NuGet also re-reads the ID's hosted state document, once per 30 s (A076).
+            let (stat, list, get) = match name {
+                "npm" => (Some(&1), Some(&1), 3),
+                "nuget" => (None, None, 3),
+                _ => (None, None, 2),
             };
             assert_eq!(
                 ops.get("stat"),

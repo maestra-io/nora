@@ -19,7 +19,8 @@
 //!                                              per-ID publish lock, after the blobs.
 //!
 //! [`HostedIndex`] keeps every state document in memory (loaded on first use, updated
-//! on every write), so a request for a non-hosted ID costs no storage call and search
+//! on every write and re-read on access at most every [`HOSTED_RECHECK`]), so a request
+//! for a non-hosted ID costs at most one storage call per `HOSTED_RECHECK` and search
 //! never reads storage. An ID with a state document is owned by this feed: its metadata
 //! and downloads are never proxied upstream. An internal ID that has not been pushed
 //! yet is only kept off nuget.org by `curation.internal_namespaces`. With an upstream
@@ -207,13 +208,17 @@ fn unavailable_err() -> (StatusCode, String) {
 /// first (one LIST, parallel GETs), and updated after every
 /// successful write. A failed load leaves no index at all (never an empty or partial
 /// one that would let public namesakes through): every hosted hook answers 503 and the
-/// load is retried on a later request, with backoff. nora runs a single writer replica,
-/// so nothing invalidates the index from outside; a document written behind nora's
-/// back (`nora nuget rebuild`, a restore) is picked up by re-reading a corrupt entry
-/// on access, by the periodic hosted retention pass, or by `POST /api/v1/admin/reindex`.
+/// load is retried on a later request, with backoff. A document written by another
+/// process (a second replica during a rolling update, `nora nuget rebuild`, a restore)
+/// is seen by [`lookup`] within [`HOSTED_RECHECK`]: an entry, or the remembered absence
+/// of one, older than that is re-read from storage on access. Search and the UI summary
+/// read the map as it is; the hosted retention pass and `POST /api/v1/admin/reindex`
+/// re-read every document.
 #[derive(Default)]
 pub(crate) struct HostedIndex {
     map: arc_swap::ArcSwapOption<IndexMap>,
+    /// IDs found to have no state document, each re-read after its instant.
+    absent: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
     /// Serializes loads; holds the backoff after a failed one.
     loader: tokio::sync::Mutex<Backoff>,
     /// Not hosted state: the proxied IDs' Q04 hidden-version memo, kept here as the
@@ -232,10 +237,22 @@ struct Backoff {
 const CORRUPT_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
 /// Cap on the retry backoff after a failed index load (1 s, 2 s, 4 s … 60 s).
 const MAX_LOAD_BACKOFF_SECS: u64 = 60;
+/// How long [`lookup`] trusts an entry (or an ID's absence) before re-reading storage:
+/// the bound on how late another process's push, unlist or relist is seen here. Costs
+/// one storage GET per looked-up ID per interval.
+const HOSTED_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
+/// Remembered absences kept before expired ones are dropped.
+// ponytail: whole-map prune at the cap, an LRU if the proxied-ID working set gets that big.
+const ABSENT_MAX: usize = 4096;
+
+fn recheck_at() -> std::time::Instant {
+    std::time::Instant::now() + HOSTED_RECHECK
+}
 
 #[derive(Clone)]
 enum Doc {
-    Ready(Arc<HostedPackage>),
+    /// Served until the instant, then re-read from storage on access.
+    Ready(Arc<HostedPackage>, std::time::Instant),
     /// Unparsable; re-read from storage on access after this instant.
     Corrupt(std::time::Instant),
 }
@@ -296,7 +313,7 @@ async fn load_index(storage: &Storage) -> Result<HashMap<String, Doc>, ()> {
     for (id, doc) in loaded {
         match doc {
             Ok(Some(pkg)) => {
-                map.insert(id, Doc::Ready(Arc::new(pkg)));
+                map.insert(id, Doc::Ready(Arc::new(pkg), recheck_at()));
             }
             Ok(None) => {} // deleted between LIST and GET
             Err(LoadError::Corrupt) => {
@@ -329,7 +346,7 @@ async fn reload_locked(
     match doc {
         Ok(Some(pkg)) => {
             let pkg = Arc::new(pkg);
-            m.insert(id_lower.to_string(), Doc::Ready(pkg.clone()));
+            m.insert(id_lower.to_string(), Doc::Ready(pkg.clone(), recheck_at()));
             Ok(Some(pkg))
         }
         Ok(None) => {
@@ -384,7 +401,7 @@ pub(crate) async fn repo_summary(state: &AppState) -> Option<Vec<(String, usize,
     Some(
         map.iter()
             .filter_map(|(id, doc)| match doc {
-                Doc::Ready(pkg) => Some((id, pkg)),
+                Doc::Ready(pkg, _) => Some((id, pkg)),
                 Doc::Corrupt(_) => None,
             })
             .map(|(id, pkg)| {
@@ -412,27 +429,113 @@ enum Lookup {
     Unavailable,
 }
 
+/// The index's answer for one ID, and whether it is still within [`HOSTED_RECHECK`]
+/// (or a corrupt entry's retry delay).
+fn cached(idx: &HostedIndex, map: &IndexMap, id_lower: &str) -> (bool, Lookup) {
+    let now = std::time::Instant::now();
+    match map.read().get(id_lower) {
+        Some(Doc::Ready(pkg, at)) => (now < *at, Lookup::Hosted(pkg.clone())),
+        Some(Doc::Corrupt(at)) => (now < *at, Lookup::Unavailable),
+        None => (
+            idx.absent.lock().get(id_lower).is_some_and(|at| now < *at),
+            Lookup::NotHosted,
+        ),
+    }
+}
+
+/// Remember that `id_lower` has no state document until [`HOSTED_RECHECK`] from now.
+fn remember_absent(idx: &HostedIndex, id_lower: &str) {
+    let mut absent = idx.absent.lock();
+    if absent.len() >= ABSENT_MAX {
+        let now = std::time::Instant::now();
+        absent.retain(|_, at| now < *at);
+        if absent.len() >= ABSENT_MAX {
+            absent.clear();
+        }
+    }
+    absent.insert(id_lower.to_string(), recheck_at());
+}
+
 async fn lookup(state: &AppState, id_lower: &str) -> Lookup {
     let Ok(map) = index(state).await else {
         return Lookup::Unavailable;
     };
-    let doc = map.read().get(id_lower).cloned();
-    match doc {
-        None => Lookup::NotHosted,
-        Some(Doc::Ready(pkg)) => Lookup::Hosted(pkg),
-        Some(Doc::Corrupt(retry_at)) if std::time::Instant::now() < retry_at => Lookup::Unavailable,
-        Some(Doc::Corrupt(_)) => {
-            let lock = state.publish_lock(&meta_key(id_lower));
-            let _guard = lock.lock().await;
-            match reload_locked(&state.storage, &map, id_lower).await {
-                Ok(Some(pkg)) => {
-                    tracing::info!(id = %id_lower, "nuget hosted: repaired state document picked up");
-                    Lookup::Hosted(pkg)
-                }
-                Ok(None) => Lookup::NotHosted,
-                Err(_) => Lookup::Unavailable,
+    let idx = &state.nuget_hosted;
+    let (fresh, answer) = cached(idx, &map, id_lower);
+    if fresh {
+        return answer;
+    }
+    if matches!(answer, Lookup::NotHosted) {
+        // No entry: claim the recheck (concurrent requests keep the cached answer) and
+        // read without the publish lock, which would otherwise be created, and kept, for
+        // every proxied ID ever requested. Only a document found takes its ID's lock.
+        remember_absent(idx, id_lower);
+        match load(&state.storage, id_lower).await {
+            Ok(None) => return Lookup::NotHosted,
+            Err(LoadError::Storage) => {
+                tracing::warn!(id = %id_lower, "nuget hosted: recheck failed; serving the previous answer");
+                return Lookup::NotHosted;
+            }
+            Ok(Some(_)) | Err(LoadError::Corrupt) => {
+                idx.absent.lock().remove(id_lower);
             }
         }
+    }
+    // Due: one re-read per ID under its publish lock. While another request re-reads a
+    // hosted entry, or this process writes it, the cached answer stands.
+    let lock = state.publish_lock(&meta_key(id_lower));
+    let _guard = match lock.try_lock() {
+        Ok(guard) => guard,
+        Err(_) if matches!(answer, Lookup::Hosted(_)) => return answer,
+        Err(_) => lock.lock().await,
+    };
+    let (fresh, answer) = cached(idx, &map, id_lower);
+    if fresh {
+        return answer;
+    }
+    match reload_locked(&state.storage, &map, id_lower).await {
+        Ok(Some(pkg)) => {
+            if !matches!(answer, Lookup::Hosted(_)) {
+                tracing::info!(id = %id_lower, "nuget hosted: state document picked up from storage");
+            }
+            Lookup::Hosted(pkg)
+        }
+        Ok(None) => {
+            remember_absent(idx, id_lower);
+            Lookup::NotHosted
+        }
+        Err(LoadError::Corrupt) => Lookup::Unavailable,
+        // Storage did not answer: keep the previous answer for another interval rather
+        // than fail restores on a storage hiccup.
+        Err(LoadError::Storage) => {
+            tracing::warn!(id = %id_lower, "nuget hosted: recheck failed; serving the previous answer");
+            match &answer {
+                Lookup::Hosted(pkg) => {
+                    map.write()
+                        .insert(id_lower.to_string(), Doc::Ready(pkg.clone(), recheck_at()));
+                }
+                Lookup::NotHosted => remember_absent(idx, id_lower),
+                Lookup::Unavailable => {}
+            }
+            answer
+        }
+    }
+}
+
+/// Make every entry and remembered absence due for a recheck, as [`HOSTED_RECHECK`]
+/// passing would (tests run on real sockets, so the clock is not paused).
+#[cfg(test)]
+pub(crate) fn expire_rechecks(state: &AppState) {
+    let now = std::time::Instant::now();
+    if let Some(map) = state.nuget_hosted.map.load_full() {
+        for doc in map.write().values_mut() {
+            if let Doc::Ready(_, at) = doc {
+                *at = now;
+            }
+        }
+    }
+    for at in state.nuget_hosted.absent.lock().values_mut() {
+        *at = now;
     }
 }
 
@@ -964,8 +1067,10 @@ async fn save(
         failed()
     })?;
     if let Some(map) = map {
-        map.write()
-            .insert(id_lower.to_string(), Doc::Ready(Arc::new(pkg.clone())));
+        map.write().insert(
+            id_lower.to_string(),
+            Doc::Ready(Arc::new(pkg.clone()), recheck_at()),
+        );
     }
     Ok(())
 }
@@ -983,7 +1088,8 @@ fn bad_request(msg: impl Into<String>) -> Response {
 }
 
 // ── Read hooks (called by the proxy handlers before they go upstream) ──
-// A non-hosted ID returns `None` from memory, without a storage call.
+// A non-hosted ID returns `None` from memory, with at most one storage call per
+// `HOSTED_RECHECK`.
 
 /// Flat-container `{id}/index.json`: every version, unlisted included (as nuget.org).
 pub(super) async fn version_list(state: &AppState, id_lower: &str) -> Option<Response> {
@@ -1313,7 +1419,28 @@ async fn merged_search(
 
     // Autocomplete `?id=`: versions of one package, never package IDs.
     if let (true, Some(id)) = (names, p.id.as_deref()) {
-        return match lookup(&state, &id.to_lowercase()).await {
+        let id_lower = id.to_lowercase();
+        return match lookup(&state, &id_lower).await {
+            // An internal ID never goes upstream: an imported one answers from its
+            // records, any other has no versions.
+            Lookup::NotHosted if super::search_names_internal(&state, &id_lower) => {
+                let Some(records) = super::hosted_versions(&state.storage, &id_lower).await else {
+                    return unavailable();
+                };
+                let versions: Vec<&String> = records
+                    .listed()
+                    .iter()
+                    .filter(|v| {
+                        (prerelease || !v.contains('-'))
+                            && (semver2 || !super::is_semver2_version(v))
+                    })
+                    .collect();
+                with_json(
+                    json!({ "totalHits": versions.len(), "data": versions })
+                        .to_string()
+                        .into_bytes(),
+                )
+            }
             Lookup::NotHosted => {
                 upstream_search(state, headers, upstream_params(p.skip, p.take), raw, names).await
             }
@@ -1360,7 +1487,9 @@ async fn merged_search(
     // Without a proxy, or for an internal-namespace term, the upstream handler answers
     // from its local cache index, which lists hosted IDs too (UI) and would cost one
     // storage miss per matching hosted ID. Hosted IDs are answered here instead.
-    if local_only(&state, q) && (!hits.is_empty() || hosted_name_matches(&state, q).await) {
+    if local_only(&state, raw.0.as_deref().unwrap_or(""))
+        && (!hits.is_empty() || hosted_name_matches(&state, q).await)
+    {
         return with_json(merge_page(&hosted_ids, page, &Value::Null, 0));
     }
     if hits.is_empty() {
@@ -1403,13 +1532,8 @@ async fn merged_search(
 }
 
 /// The upstream search handlers' own condition for answering from the local cache.
-fn local_only(state: &AppState, q: &str) -> bool {
-    state.config.nuget.proxy.is_none()
-        || crate::curation::is_internal_namespace(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Nuget,
-            q,
-        )
+fn local_only(state: &AppState, raw_qs: &str) -> bool {
+    state.config.nuget.proxy.is_none() || super::query_names_internal(state, raw_qs)
 }
 
 /// Whether the upstream local search's substring filter would pick a hosted ID.
@@ -1497,7 +1621,7 @@ async fn hosted_hits(
     let mut pkgs: Vec<(String, Arc<HostedPackage>)> = Vec::new();
     for (id, doc) in matching {
         let pkg = match doc {
-            Doc::Ready(pkg) => pkg,
+            Doc::Ready(pkg, _) => pkg,
             // Re-read if due; a matching hosted ID we still cannot read fails the query
             // rather than let its public namesake through.
             Doc::Corrupt(_) => match lookup(state, &id).await {
@@ -2048,7 +2172,8 @@ pub(crate) async fn ui_detail(
     Vec<crate::ui::api::VersionInfo>,
     crate::ui::api::PackageMetadata,
 )> {
-    // The in-memory index: no storage read, for hosted and proxied IDs alike.
+    // The in-memory index: at most one storage read per `HOSTED_RECHECK`, for hosted and
+    // proxied IDs alike.
     let Lookup::Hosted(pkg) = lookup(state, id_lower).await else {
         return None;
     };
@@ -2414,6 +2539,28 @@ mod tests {
         ] {
             assert_eq!(n(bad), None, "{bad:?} must be rejected");
         }
+    }
+
+    /// The remembered absences stay bounded: at the cap, expired ones go first, and
+    /// all of them when none has expired.
+    #[test]
+    fn remembered_absences_are_capped() {
+        let idx = HostedIndex::default();
+        for i in 0..ABSENT_MAX {
+            remember_absent(&idx, &format!("p{i}"));
+        }
+        remember_absent(&idx, "fresh");
+        assert_eq!(idx.absent.lock().len(), 1);
+        for i in 0..ABSENT_MAX - 1 {
+            remember_absent(&idx, &format!("p{i}"));
+        }
+        if let Some(at) = idx.absent.lock().get_mut("p0") {
+            *at = std::time::Instant::now();
+        }
+        remember_absent(&idx, "late");
+        let absent = idx.absent.lock();
+        assert_eq!(absent.len(), ABSENT_MAX);
+        assert!(!absent.contains_key("p0") && absent.contains_key("late"));
     }
 
     #[test]
@@ -4600,6 +4747,198 @@ Jd74nq6dNCjpWG4drIsyhqX+
         let (s, idx) = get_json(&ctx.app, uri).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(idx["versions"], serde_json::json!(["1.0.0"]));
+    }
+
+    /// An upstream that answers every request with `body`.
+    async fn upstream_answering(body: Value) -> wiremock::MockServer {
+        let up = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&up)
+            .await;
+        up
+    }
+
+    /// A076: a push written by another process over the same storage (a second replica
+    /// during a rolling update) is served here within `HOSTED_RECHECK`, without a
+    /// reindex: a new ID and a new version of an ID already held. The ID never goes
+    /// upstream meanwhile.
+    #[tokio::test]
+    async fn other_process_push_seen_without_reindex() {
+        let up = upstream_answering(serde_json::json!({ "versions": ["7.7.7"] })).await;
+        let conf = |uri: String| {
+            move |cfg: &mut crate::config::Config| {
+                cfg.nuget.enabled = true;
+                cfg.nuget.proxy = Some(uri);
+                cfg.curation.internal_namespaces = vec!["maestra.*".to_string()];
+            }
+        };
+        let a = create_test_context_with_config(conf(up.uri()));
+        let b = crate::test_helpers::create_test_context_with_storage_and_config(
+            a.state.storage.clone(),
+            conf(up.uri()),
+        );
+        let idx = "/nuget/v3/flatcontainer/maestra.tool/index.json";
+        // B looks the ID up before it exists, and remembers it as not hosted.
+        assert_ne!(get_json(&b.app, idx).await.0, StatusCode::OK);
+
+        let v1 = super::test_support::nupkg_with_payload("Maestra.Tool", "1.0.0", "", "HOSTED");
+        assert_eq!(push(&a.app, &v1, &[]).await, StatusCode::CREATED);
+        super::expire_rechecks(&b.state);
+        let (s, v) = get_json(&b.app, idx).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["versions"], serde_json::json!(["1.0.0"]));
+        let dl = send(
+            &b.app,
+            Method::GET,
+            "/nuget/v3/flatcontainer/maestra.tool/1.0.0/maestra.tool.1.0.0.nupkg",
+            "",
+        )
+        .await;
+        assert_eq!(dl.status(), StatusCode::OK);
+        assert_eq!(body_bytes(dl).await.to_vec(), v1);
+
+        assert_eq!(
+            push(&a.app, &nupkg("Maestra.Tool", "1.1.0", ""), &[]).await,
+            StatusCode::CREATED
+        );
+        super::expire_rechecks(&b.state);
+        let (_, v) = get_json(&b.app, idx).await;
+        assert_eq!(v["versions"], serde_json::json!(["1.0.0", "1.1.0"]));
+        let seen = crate::test_helpers::upstream_paths(&up).await;
+        assert!(seen.iter().all(|p| !p.contains("maestra.tool")), "{seen:?}");
+    }
+
+    /// A076 cost: a proxied ID re-reads its (absent) state document once per
+    /// `HOSTED_RECHECK`, not on every request.
+    #[tokio::test]
+    async fn proxied_id_rechecks_hosted_state_once_per_interval() {
+        let up = upstream_answering(serde_json::json!({ "versions": ["7.7.7"] })).await;
+        let (storage, ops) = crate::test_helpers::op_counting_storage();
+        let uri = up.uri();
+        let ctx =
+            crate::test_helpers::create_test_context_with_storage_and_config(storage, |cfg| {
+                cfg.nuget.enabled = true;
+                cfg.nuget.proxy = Some(uri);
+            });
+        let idx = "/nuget/v3/flatcontainer/contoso.tool/index.json";
+        let key = "nuget/hosted-meta/contoso.tool.json";
+        ops.reset();
+        for _ in 0..2 {
+            let (s, v) = get_json(&ctx.app, idx).await;
+            assert_eq!(s, StatusCode::OK);
+            assert_eq!(v["versions"], serde_json::json!(["7.7.7"]));
+        }
+        assert_eq!(ops.calls("get", key), 1, "{:?}", ops.snapshot());
+        super::expire_rechecks(&ctx.state);
+        get_json(&ctx.app, idx).await;
+        assert_eq!(ops.calls("get", key), 2, "{:?}", ops.snapshot());
+        // The recheck of an ID with no document takes no publish lock: one would be kept
+        // for every proxied ID ever requested.
+        assert!(!ctx.state.publish_locks.lock().contains_key(key));
+    }
+
+    /// A076: a storage error during a recheck keeps the previous answer: a hosted ID
+    /// stays served (no 503, no fall-through to upstream).
+    #[tokio::test]
+    async fn recheck_storage_error_serves_previous_answer() {
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        let ctx =
+            crate::test_helpers::create_test_context_with_storage_and_config(storage, |cfg| {
+                cfg.nuget.enabled = true;
+                cfg.nuget.proxy = None;
+            });
+        assert_eq!(
+            push(&ctx.app, &nupkg("Maestra.Keep", "1.0.0", ""), &[]).await,
+            StatusCode::CREATED
+        );
+        outage.fail_reads_of("hosted-meta/maestra.keep.json");
+        super::expire_rechecks(&ctx.state);
+        let (s, v) = get_json(&ctx.app, "/nuget/v3/flatcontainer/maestra.keep/index.json").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["versions"], serde_json::json!(["1.0.0"]));
+        outage.end();
+    }
+
+    /// A098: no search or autocomplete that names an internal-namespace ID reaches the
+    /// upstream search services: `?id=`, `packageid:`/`id:` terms, a term among others.
+    /// `?id=` answers from what is hosted or imported here; a public query still goes
+    /// upstream.
+    #[tokio::test]
+    async fn internal_ids_never_reach_upstream_search() {
+        let up = upstream_answering(serde_json::json!({ "totalHits": 1, "data": ["9.9.9"] })).await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+            cfg.nuget.autocomplete = format!("{uri}/autocomplete");
+            cfg.curation.internal_namespaces = vec!["maestra.*".to_string()];
+        });
+        let naming = [
+            "/nuget/v3/autocomplete?id=Maestra.Dummy",
+            "/nuget/v3/query?q=packageid:Maestra.Dummy",
+            "/nuget/v3/query?q=id:Maestra.Dummy",
+            "/nuget/v3/query?q=%20Maestra.Dummy",
+            "/nuget/v3/query?q=foo%20Maestra.Dummy",
+            "/nuget/v3/query?q=foo+packageid%3A%22Maestra.Dummy%22",
+            "/nuget/v3/autocomplete?q=%20Maestra.Dummy",
+            "/nuget/v3/query?q=(Maestra.Dummy)",
+            "/nuget/v3/query?q=foo&Maestra.Dummy",
+        ];
+        for u in naming {
+            assert_eq!(get_json(&ctx.app, u).await.0, StatusCode::OK, "{u}");
+        }
+        let (_, v) = get_json(&ctx.app, naming[0]).await;
+        assert_eq!(v["data"], serde_json::json!([]));
+        assert_eq!(
+            crate::test_helpers::upstream_paths(&up).await,
+            Vec::<String>::new()
+        );
+
+        assert_eq!(
+            push(&ctx.app, &nupkg("Maestra.Dummy", "1.0.0", ""), &[]).await,
+            StatusCode::CREATED
+        );
+        for u in naming {
+            assert_eq!(get_json(&ctx.app, u).await.0, StatusCode::OK, "{u}");
+        }
+        let (_, v) = get_json(&ctx.app, naming[0]).await;
+        assert_eq!(v["data"], serde_json::json!(["1.0.0"]));
+        let (_, v) = get_json(&ctx.app, naming[1]).await;
+        assert_eq!(v["totalHits"], 1);
+
+        // An imported internal ID (records only, no state document) answers `?id=` from
+        // its records.
+        let st = &ctx.state.storage;
+        st.put("nuget/hosted/maestra.imported/imported", b"")
+            .await
+            .unwrap();
+        st.put("nuget/hosted/maestra.imported/2.0.0.json", b"{}")
+            .await
+            .unwrap();
+        st.put("nuget/hosted/maestra.imported/2.1.0-rc.1.json", b"{}")
+            .await
+            .unwrap();
+        let (_, v) = get_json(&ctx.app, "/nuget/v3/autocomplete?id=Maestra.Imported").await;
+        assert_eq!(v["data"], serde_json::json!(["2.0.0"]));
+        let (_, v) = get_json(
+            &ctx.app,
+            "/nuget/v3/autocomplete?id=Maestra.Imported&prerelease=true&semVerLevel=2.0.0",
+        )
+        .await;
+        assert_eq!(v["data"], serde_json::json!(["2.0.0", "2.1.0-rc.1"]));
+        assert_eq!(
+            crate::test_helpers::upstream_paths(&up).await,
+            Vec::<String>::new()
+        );
+
+        // Control: a public query still goes upstream.
+        get_json(&ctx.app, "/nuget/v3/query?q=Newtonsoft.Json").await;
+        assert_eq!(
+            crate::test_helpers::upstream_paths(&up).await,
+            vec!["/query"]
+        );
     }
 }
 
