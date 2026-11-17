@@ -31,8 +31,18 @@ rm "$TMP/wf/release-images.yml"
 printf '%s\n' ".github/workflows/release.yml active" > "$TMP/states"
 run; expect "an enabled upstream release is reported" 1 "release.yml is active on GitHub"
 
+touch "$TMP/wf/auto-reland.yml"
+printf '%s\n' ".github/workflows/auto-reland.yml active" > "$TMP/states"
+run; expect "an enabled upstream auto-reland is reported (audit A003)" 1 "auto-reland.yml is active on GitHub"
+rm "$TMP/wf/auto-reland.yml"
+
 printf '%s\n' ".github/workflows/new-upstream.yml active" > "$TMP/states"
 run; expect "an active workflow known only to GitHub is reported" 1 "new-upstream.yml is active on GitHub"
+
+printf '%s\n' ".github/workflows/release.yml disabled_manually" "dynamic/dependabot/update-graph active" > "$TMP/states"
+run; expect "a workflow GitHub runs itself is not upstream's" 0 "upstream workflows OK"
+printf '%s\n' "dynamic/dependabot/update-graph active" ".github/workflows/release.yml active" > "$TMP/states"
+run; expect "a GitHub-run workflow does not hide an enabled upstream release" 1 "release.yml is active on GitHub"
 
 # Release gate (audit A016), on edited copies of the real maestra-release.yml.
 printf '%s\n' ".github/workflows/release.yml disabled_manually" > "$TMP/states"

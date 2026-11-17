@@ -203,6 +203,8 @@ jobs:
       - name: Script self-tests
         run: |
           bash scripts/test-reland-filechanges.sh
+          bash scripts/test-install-sh.sh
+          bash scripts/test-coherence-check.sh
           bash scripts/test-diff-coverage.sh
           bash scripts/test-pre-commit-check.sh
           bash scripts/test-lock-audit.sh
