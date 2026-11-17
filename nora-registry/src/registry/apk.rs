@@ -37,6 +37,7 @@ use crate::circuit_breaker::BreakerScope;
 use crate::config::{ApkConfig, RepoProxyEntry, UpstreamAuth};
 use crate::registry::{circuit_open_response, proxy_error_response, ProxyBody, ProxyError};
 use crate::registry_type::RegistryType;
+use crate::storage::FileMeta;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -556,18 +557,69 @@ async fn parse_cached(data: Bytes) -> Option<Cached> {
         .flatten()
 }
 
-async fn fresh_index(state: &AppState, key: &str) -> Option<Cached> {
+/// Parsed indexes by upstream and storage key, with the stored copy's (mtime, size) they
+/// were parsed from. Every package GET looks its entry up in the index: without this each
+/// one fetched and parsed the whole stored JSON (Wolfi's is ~55 MB; one apko build of 55
+/// packages took a local NORA to 2.3 GB RSS). Keyed by the upstream too, like the render
+/// cache: it is per process, not per AppState.
+type ParsedIndexes = HashMap<String, (u64, u64, Arc<Cached>)>;
+
+fn parsed_indexes() -> &'static Mutex<ParsedIndexes> {
+    static CACHE: std::sync::OnceLock<Mutex<ParsedIndexes>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn remember_index(memo: &str, meta: &FileMeta, index: &Arc<Cached>) {
+    if let Ok(mut c) = parsed_indexes().lock() {
+        c.insert(
+            memo.to_string(),
+            (meta.modified, meta.size, Arc::clone(index)),
+        );
+    }
+}
+
+/// The stored index `key` as of `meta`, parsed once per stored copy: concurrent misses
+/// wait for the first parse instead of each holding their own copy.
+async fn stored_index(
+    state: &AppState,
+    memo: &str,
+    key: &str,
+    meta: &FileMeta,
+) -> Option<Arc<Cached>> {
+    let hit = || {
+        parsed_indexes()
+            .lock()
+            .ok()?
+            .get(memo)
+            .filter(|(modified, size, _)| *modified == meta.modified && *size == meta.size)
+            .map(|(_, _, index)| Arc::clone(index))
+    };
+    if let Some(index) = hit() {
+        return Some(index);
+    }
+    let lock = state.publish_lock(&format!("{key}#parsed"));
+    let _parsing = lock.lock().await;
+    if let Some(index) = hit() {
+        return Some(index);
+    }
+    let index = Arc::new(parse_cached(state.storage.get(key).await.ok()?).await?);
+    remember_index(memo, meta, &index);
+    Some(index)
+}
+
+async fn fresh_index(state: &AppState, memo: &str, key: &str) -> Option<Arc<Cached>> {
     let meta = state.storage.stat(key).await?;
     if !is_within_ttl(meta.modified, state.config.apk.metadata_ttl) {
         return None;
     }
-    parse_cached(state.storage.get(key).await.ok()?).await
+    stored_index(state, memo, key, &meta).await
 }
 
 /// The last cached index whatever its age; `serve_stale` decides whether it may be
 /// served, a refresh always merges into it.
-async fn last_index(state: &AppState, key: &str) -> Option<Cached> {
-    parse_cached(state.storage.get(key).await.ok()?).await
+async fn last_index(state: &AppState, memo: &str, key: &str) -> Option<Arc<Cached>> {
+    let meta = state.storage.stat(key).await?;
+    stored_index(state, memo, key, &meta).await
 }
 
 /// The index of `path` and whether it is a stale copy, or the response to give when
@@ -576,9 +628,10 @@ async fn load_index(
     state: &AppState,
     path: &RepoPath,
     up: &RepoProxyEntry,
-) -> Result<(Cached, bool), Response> {
+) -> Result<(Arc<Cached>, bool), Response> {
     let key = path.index_key();
-    if let Some(index) = fresh_index(state, &key).await {
+    let memo = format!("{}|{key}", up.url());
+    if let Some(index) = fresh_index(state, &memo, &key).await {
         return Ok((index, false));
     }
     let serve_stale = state.config.apk.serve_stale;
@@ -587,14 +640,14 @@ async fn load_index(
         Ok(guard) => guard,
         Err(_) => {
             if serve_stale {
-                if let Some(index) = last_index(state, &key).await {
+                if let Some(index) = last_index(state, &memo, &key).await {
                     return Ok((index, true));
                 }
             }
             lock.lock().await
         }
     };
-    if let Some(index) = fresh_index(state, &key).await {
+    if let Some(index) = fresh_index(state, &memo, &key).await {
         return Ok((index, false));
     }
 
@@ -616,7 +669,7 @@ async fn load_index(
         MAX_INDEX_BYTES,
     )
     .await;
-    let prev = last_index(state, &key).await;
+    let prev = last_index(state, &memo, &key).await;
     let err = match fetched {
         Ok(body) => {
             let min_age = state
@@ -646,8 +699,11 @@ async fn load_index(
             .await;
             match parsed {
                 Ok(Ok((cached, json))) => {
+                    let cached = Arc::new(cached);
                     if let Err(e) = state.storage.put(&key, &json).await {
                         tracing::warn!(key = %key, error = %e, "apk: failed to cache index");
+                    } else if let Some(meta) = state.storage.stat(&key).await {
+                        remember_index(&memo, &meta, &cached);
                     }
                     return Ok((cached, false));
                 }
@@ -1546,6 +1602,35 @@ mod integration_tests {
             StatusCode::NOT_FOUND,
             "only files an index lists"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stored_index_is_parsed_once_per_copy() {
+        // Every package GET loads the index: it must reuse one parse, not refetch and
+        // re-parse the stored JSON (Wolfi's is ~55 MB) per request.
+        let up_keys = key_files("alpine-test.rsa.pub");
+        let own_keys = key_files("nora-test.rsa.pub");
+        let signer = upstream_signer(&up_keys, &own_keys);
+        let server = MockServer::start().await;
+        let entries = [super::tests::entry("jdk", "17-r0", now() - 30 * DAY, "Q1x")];
+        mount(
+            &server,
+            "/x86_64/APKINDEX.tar.gz",
+            upstream_index(&signer, &entries),
+        )
+        .await;
+        let mut cfg_apk = config(&up_keys, &own_keys);
+        let up = RepoProxyEntry::Simple(server.uri());
+        cfg_apk.proxies.insert("flat".into(), up.clone());
+        let ctx = create_test_context_with_config(|cfg| cfg.apk = cfg_apk);
+        let path = super::RepoPath::new("flat".into(), &["x86_64"]).unwrap();
+
+        let (first, _) = super::load_index(&ctx.state, &path, &up).await.unwrap();
+        let (second, _) = super::load_index(&ctx.state, &path, &up).await.unwrap();
+        let (third, _) = super::load_index(&ctx.state, &path, &up).await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert!(std::sync::Arc::ptr_eq(&second, &third));
+        assert_eq!(third.entries[0].name, "jdk");
     }
 
     #[tokio::test]
