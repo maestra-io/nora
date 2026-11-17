@@ -24,6 +24,13 @@ pub struct GoConfig {
     /// content-addressed and always immutable.
     #[serde(default = "super::super::default_metadata_ttl")]
     pub metadata_ttl: i64,
+    /// Date a version NORA has not seen before by the `Last-Modified` of its `.zip` on `proxy`
+    /// (a HEAD, cached once per version), not by NORA's first sight. On proxy.golang.org that
+    /// is the proxy's own first fetch of the version (the index.golang.org `Timestamp`), which
+    /// the publisher cannot set, unlike the `.info` `Time` (A066). Only for a `proxy` whose
+    /// `Last-Modified` means that; off, a new version ages from NORA's first sight.
+    #[serde(default)]
+    pub attested_dates: bool,
 }
 
 fn default_go_proxy() -> Option<String> {
@@ -48,6 +55,7 @@ impl Default for GoConfig {
             proxy_timeout_zip: 120,
             max_zip_size: 104_857_600,
             metadata_ttl: 300,
+            attested_dates: false,
         }
     }
 }
@@ -79,6 +87,9 @@ impl GoConfig {
         }
         if let Ok(val) = env::var("NORA_GO_MAX_ZIP_SIZE") {
             super::super::parse_env_warn("NORA_GO_MAX_ZIP_SIZE", &val, &mut self.max_zip_size);
+        }
+        if let Ok(val) = env::var("NORA_GO_ATTESTED_DATES") {
+            self.attested_dates = val.to_lowercase() == "true" || val == "1";
         }
         if let Ok(val) = env::var("NORA_GO_METADATA_TTL") {
             super::super::parse_env_warn("NORA_GO_METADATA_TTL", &val, &mut self.metadata_ttl);
