@@ -6084,6 +6084,118 @@ async fn a_quarantine_exception_admits_the_image_and_what_it_names() {
     );
 }
 
+/// `[[docker.quarantine_exempt]]` (issues-maestra#1649): a fresh manifest and its blob of the
+/// exempt repository are served under enforce, by the prefix and the host form alike, say
+/// `exempt` and are counted; a sibling repository of the same upstream is still held.
+#[tokio::test]
+async fn a_quarantine_exempt_repository_is_served_while_fresh_and_its_sibling_held() {
+    use crate::config::{DockerUpstream, QuarantineExempt};
+    use crate::digest_quarantine::QuarantineMode;
+    use crate::test_helpers::create_test_context_with_config;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let sha = |b: &[u8]| format!("sha256:{}", hex::encode(sha2::Sha256::digest(b)));
+    let config = br#"{}"#.to_vec();
+    let layer = b"vulnerability db".to_vec();
+    let manifest = format!(
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.aquasec.trivy.config.v1+json","digest":"{}","size":{}}},"layers":[{{"mediaType":"application/vnd.aquasec.trivy.db.layer.v1.tar+gzip","digest":"{}","size":{}}}]}}"#,
+        sha(&config),
+        config.len(),
+        sha(&layer),
+        layer.len()
+    )
+    .into_bytes();
+    let upstream = MockServer::start().await;
+    for repo in ["aquasecurity/trivy-db", "aquasecurity/trivy"] {
+        for (route, body, ct) in [
+            (
+                "manifests/2".to_string(),
+                manifest.clone(),
+                "application/vnd.oci.image.manifest.v1+json",
+            ),
+            (
+                format!("blobs/{}", sha(&layer)),
+                layer.clone(),
+                "application/octet-stream",
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/{repo}/{route}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Type", ct)
+                        .set_body_bytes(body),
+                )
+                .mount(&upstream)
+                .await;
+        }
+    }
+    let ctx = create_test_context_with_config(|cfg| {
+        cfg.docker.upstreams = vec![DockerUpstream {
+            trust_upstream_dates: false,
+            date_token_file: None,
+            url: upstream.uri(),
+            auth: None,
+            auth_env: None,
+            namespace: Some("ghcr.io".to_string()),
+            prefix: Some("ghcr".to_string()),
+            namespaces: Vec::new(),
+        }];
+        cfg.docker.quarantine_exempt = vec![QuarantineExempt {
+            repository: "ghcr.io/aquasecurity/trivy-db".to_string(),
+            reason: "issues-maestra#1649: vulnerability DB".to_string(),
+        }];
+        cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+        cfg.curation.quarantine_ttl = Some("1h".to_string());
+    });
+    let exempt = || {
+        crate::metrics::DOCKER_QUARANTINE_EXEMPT_TOTAL
+            .with_label_values(&["ghcr.io/aquasecurity/trivy-db"])
+            .get()
+    };
+    let before = exempt();
+    let app = &ctx.app;
+    let get = |uri: String| async move { send(app, Method::GET, &uri, Body::empty()).await };
+
+    let r = get("/v2/ghcr/aquasecurity/trivy-db/manifests/2".into()).await;
+    assert_eq!(r.status(), StatusCode::OK, "the exempt repository, fresh");
+    assert_eq!(r.headers().get("x-nora-quarantine").unwrap(), "exempt");
+    assert_eq!(
+        get(format!(
+            "/v2/ghcr/aquasecurity/trivy-db/blobs/{}",
+            sha(&layer)
+        ))
+        .await
+        .status(),
+        StatusCode::OK,
+        "its blob"
+    );
+    assert_eq!(
+        get("/v2/ghcr.io/aquasecurity/trivy-db/manifests/2".into())
+            .await
+            .status(),
+        StatusCode::OK,
+        "the host form of the same repository"
+    );
+    assert!(exempt() >= before + 3, "{} exempt reads", exempt() - before);
+
+    assert_eq!(
+        get("/v2/ghcr/aquasecurity/trivy/manifests/2".into())
+            .await
+            .status(),
+        StatusCode::FORBIDDEN,
+        "a sibling repository of the same upstream is held"
+    );
+    assert_eq!(
+        get(format!("/v2/ghcr/aquasecurity/trivy/blobs/{}", sha(&layer)))
+            .await
+            .status(),
+        StatusCode::FORBIDDEN,
+        "and so is the same blob read through it"
+    );
+}
+
 /// `trust_upstream_dates` (issues-maestra#1649): the registry's own publish date
 /// starts the quarantine clock of a manifest NORA sees for the first time; anything
 /// short of a usable past date leaves NORA's first-seen. Driven through quay.io's

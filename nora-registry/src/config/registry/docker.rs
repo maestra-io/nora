@@ -53,6 +53,23 @@ pub struct DockerConfig {
     /// every 30 s (quarantine_exceptions.rs, docs/docker-proxy.md).
     #[serde(default)]
     pub quarantine_exceptions: Option<String>,
+    /// Maestra: repositories the digest quarantine never holds, as `<upstream namespace>/<repo>`
+    /// (`ghcr.io/aquasecurity/trivy-db`), each with a `reason`. For data artifacts only
+    /// (vulnerability databases), never images that run code; docs/docker-proxy.md. Read at
+    /// start: an invalid entry stops NORA.
+    #[serde(default)]
+    pub quarantine_exempt: Vec<QuarantineExempt>,
+}
+
+/// One `[[docker.quarantine_exempt]]` entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuarantineExempt {
+    /// The upstream's namespace (its host) and the repository on it, exactly: no pattern,
+    /// tag or digest.
+    pub repository: String,
+    /// Why it is exempt; logged with every exempt request. Must not be empty.
+    pub reason: String,
 }
 
 /// One Docker upstream.
@@ -330,6 +347,7 @@ impl Default for DockerConfig {
             default_action: DefaultAction::default(),
             upstreams: default_docker_upstreams(),
             quarantine_exceptions: None,
+            quarantine_exempt: Vec::new(),
         }
     }
 }
@@ -339,6 +357,48 @@ pub(in crate::config) const RESERVED_DOCKER_SEGMENTS: &[&str] =
     &["blobs", "manifests", "tags", "uploads", "_catalog", "v2"];
 
 impl DockerConfig {
+    /// Errors in `quarantine_exempt` (fail-closed at load): an entry needs a reason and an
+    /// exact `<namespace>/<repo>` of a configured upstream, listed once.
+    pub(in crate::config) fn quarantine_exempt_problems(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (i, e) in self.quarantine_exempt.iter().enumerate() {
+            let r = &e.repository;
+            if e.reason.trim().is_empty() {
+                errors.push(format!(
+                    "docker.quarantine_exempt[{i}] ({r:?}): reason must not be empty"
+                ));
+            }
+            let exact = !r.is_empty()
+                && r == &r.to_lowercase()
+                && !r.contains(['*', '?', '[', ':', '@', ' '])
+                && r.split('/').all(|s| !s.is_empty());
+            let known = r.split_once('/').is_some_and(|(ns, repo)| {
+                !repo.is_empty() && self.upstreams.iter().any(|u| u.resolved_namespace() == ns)
+            });
+            if !exact || !known {
+                errors.push(format!(
+                    "docker.quarantine_exempt[{i}]: repository {r:?} must be <upstream namespace>/<repository> of a configured upstream, exactly: lowercase, no pattern, tag or digest"
+                ));
+            } else if !seen.insert(r.as_str()) {
+                errors.push(format!(
+                    "docker.quarantine_exempt[{i}]: repository {r:?} is listed twice"
+                ));
+            }
+        }
+        errors
+    }
+
+    /// The `quarantine_exempt` entry for `name` on the upstream whose namespace is `ns`.
+    pub fn quarantine_exempt_for(&self, ns: &str, name: &str) -> Option<&QuarantineExempt> {
+        self.quarantine_exempt.iter().find(|e| {
+            e.repository
+                .strip_prefix(ns)
+                .and_then(|rest| rest.strip_prefix('/'))
+                == Some(name)
+        })
+    }
+
     /// Configuration errors in upstream `namespaces` and `prefix` patterns (fail-closed at
     /// load) and warnings (#1188). `internal_namespaces` are curation's, never proxied.
     pub(in crate::config) fn namespaces_problems(

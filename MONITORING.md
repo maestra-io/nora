@@ -115,6 +115,7 @@ Break-glass entries from `[docker] quarantine_exceptions` ([procedure](docs/dock
 | `nora_docker_quarantine_exception_used_total` | counter | digest, reason | Held digests admitted past the quarantine, per listed digest and the entry's `reason`, children counted against the entry that named them. The series appears at 0 when the entry loads |
 | `nora_docker_quarantine_exceptions_active` | gauge | — | Listed entries that have not expired, refreshed on every re-read |
 | `nora_docker_quarantine_exceptions_invalid` | gauge | — | 1 while the last read of the file was refused and the last good list is in force, else 0 |
+| `nora_docker_quarantine_exempt_total` | counter | repository | Reads of a `[[docker.quarantine_exempt]]` repository while the quarantine is on, never held by it ([policy](docs/docker-proxy.md)) |
 
 ### Health probes
 

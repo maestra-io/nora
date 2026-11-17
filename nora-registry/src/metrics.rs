@@ -228,6 +228,16 @@ pub static DOCKER_QUARANTINE_EXCEPTION_USED_TOTAL: LazyLock<IntCounterVec> = Laz
     .expect("failed to create DOCKER_QUARANTINE_EXCEPTION_USED_TOTAL metric at startup")
 });
 
+/// Docker reads of a `[[docker.quarantine_exempt]]` repository, which the quarantine never holds.
+pub static DOCKER_QUARANTINE_EXEMPT_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_docker_quarantine_exempt_total",
+        "Docker reads of a repository exempt from the quarantine by policy (docker.quarantine_exempt)",
+        &["repository"]
+    )
+    .expect("failed to create DOCKER_QUARANTINE_EXEMPT_TOTAL metric at startup")
+});
+
 /// Unexpired entries in the quarantine exceptions file, as of its last read.
 pub static DOCKER_QUARANTINE_EXCEPTIONS_ACTIVE: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(

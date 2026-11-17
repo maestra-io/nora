@@ -151,6 +151,7 @@ under `observe`, where nothing is refused (fluxcd `scripts/nora-image-check.py`)
 |---|---|---|
 | 200, digest still inside the TTL | `pending` | unix seconds the hold ends |
 | 200, admitted (past the TTL, dated past it by the registry, quarantine off, or a local push with no proxy record) | `mature` | absent |
+| 200, a `quarantine_exempt` repository | `exempt` | absent |
 | 403 under `enforce` | `pending` or `new`, as before | unix seconds the hold ends |
 
 A plain request for a digest NORA has not cached fetches it and starts its clock. To read a
@@ -207,3 +208,33 @@ notice, and an entry that breaks a rule fails the job. Once merged, nora admits 
 within about 1–2 minutes (ConfigMap propagation plus one read). Remove the entry in a follow-up
 PR once the digest is past `quarantine_ttl` (the `x-nora-quarantine-until` it had), or at the
 latest when it expires.
+
+## Repositories exempt by policy (`quarantine_exempt`)
+
+Rule: **data artifacts only, never images that run code.** An entry is for an OCI artifact
+that a tool reads as data and that its publisher rebuilds more often than `quarantine_ttl`,
+so its tag is always younger than the hold: trivy's vulnerability, Java and checks databases
+(`aquasecurity/trivy-db`, `trivy-java-db`, `trivy-checks`) are rebuilt several times a day,
+and under `enforce` every trivy run through nora would get 403. The accepted risk: a poisoned
+database is served without delay. For an urgent image use the break-glass list above.
+
+```toml
+[[docker.quarantine_exempt]]
+repository = "ghcr.io/aquasecurity/trivy-db"   # <upstream namespace>/<repository>, exactly
+reason = "issues-maestra#1649: trivy vulnerability DB, rebuilt every 6 h (data, not code)"
+```
+
+- A read (`GET`/`HEAD` of a manifest, blob, tag list or referrers) of that repository on the
+  upstream with that namespace is never held, under `observe` and `enforce`: the
+  prefix form (`ghcr/aquasecurity/trivy-db`) and the host form (`ghcr.io/aquasecurity/trivy-db`)
+  alike. The manifest answer carries `x-nora-quarantine: exempt`.
+- Only that repository: another repository of the same upstream (`ghcr.io/aquasecurity/trivy`,
+  the scanner image) is held as before, and so is a blob read through it.
+- Each read, while the quarantine is on, logs `Quarantine: repository exempt by policy` (with
+  `repository`, `reason`, `path`) and counts
+  `nora_docker_quarantine_exempt_total{repository}`.
+- Rules, checked at start (and on a SIGHUP reload, which keeps the running config when they
+  fail): a non-empty `reason` (name the issue), `repository` lowercase, no pattern, tag or
+  digest, its first segment the `namespace` of a configured upstream, listed once. A broken
+  entry stops nora at start. Unlike the break-glass file, the list is part of `config.toml`:
+  a change restarts nora.
