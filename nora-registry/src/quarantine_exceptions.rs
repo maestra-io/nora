@@ -261,7 +261,7 @@ mod tests {
         ex.reload(path);
         assert_eq!(ex.covering(D).unwrap().0, D);
         let index = format!(
-            r#"{{"manifests":[{{"digest":"sha256:{}"}}]}}"#,
+            r#"{{"schemaVersion":2,"manifests":[{{"digest":"sha256:{}"}}]}}"#,
             "1".repeat(64)
         );
         let child = format!("sha256:{}", "1".repeat(64));

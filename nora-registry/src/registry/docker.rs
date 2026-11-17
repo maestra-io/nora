@@ -969,10 +969,13 @@ fn blob_unknown_response(digest: &str) -> Response {
 /// `Pending`. A digest with no proxy record (`New` — a locally-pushed or internal
 /// artifact, or a record pruned past 90d) is served, and `Mature` is served. Local
 /// pushes are not recorded, so they always read as `New` and serve; a trusted push
-/// can therefore neither hold nor mature a digest on the proxy path. Returns
-/// `Some(403)` to block, `None` to proceed.
+/// can therefore neither hold nor mature a digest on the proxy path. While the ledger
+/// is not in memory whole, a digest with no record is judged by its own entry object
+/// ([`crate::digest_quarantine::DigestStore::read_unknown`]), which the verdict header
+/// then reports too; a store that cannot answer is a 503 under enforce. Returns
+/// `Some(403 | 503)` to block, `None` to proceed.
 #[must_use = "the returned response blocks a quarantined artifact; dropping it serves it"]
-fn quarantine_cache_serve_gate(
+async fn quarantine_cache_serve_gate(
     state: &AppState,
     digest: &str,
     manifest: Option<&[u8]>,
@@ -980,6 +983,15 @@ fn quarantine_cache_serve_gate(
     let (q_mode, q_secs) = resolve_quarantine(state);
     if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
         return None;
+    }
+    if let Err(e) = state.digest_store.read_unknown("docker", digest).await {
+        if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce)
+            && state.quarantine_exceptions.covering(digest).is_none()
+        {
+            return Some(quarantine_ledger_loading(digest));
+        }
+        tracing::warn!(digest = %digest, error = %e,
+            "Quarantine: ledger incomplete and the digest's entry unreadable, served as unrecorded");
     }
     let status = state.digest_store.check("docker", digest, q_secs);
     if let crate::digest_quarantine::QuarantineStatus::Pending { .. } = status {
@@ -1208,21 +1220,40 @@ async fn quarantine_redate_cached(
     }
 }
 
+/// Most digests one manifest may name for the quarantine to record them with it: real
+/// images name a few hundred layers, indexes a few dozen manifests.
+const MAX_NAMED_DIGESTS: usize = 1024;
+
 /// The digests a manifest names: an index's manifests, an image's config and layers.
+/// Nothing for a document that is not a manifest (no `schemaVersion`, no `mediaType`) or
+/// that names more than [`MAX_NAMED_DIGESTS`]: each child is then dated by its own fetch.
 pub(crate) fn named_digests(manifest: &[u8]) -> Vec<String> {
     let Ok(doc) = serde_json::from_slice::<serde_json::Value>(manifest) else {
         return Vec::new();
     };
+    if doc.get("schemaVersion").is_none() && doc.get("mediaType").is_none() {
+        return Vec::new();
+    }
     let listed = ["manifests", "layers"]
         .iter()
         .filter_map(|k| doc[*k].as_array())
         .flatten();
-    listed
+    let named: Vec<String> = listed
         .chain(std::iter::once(&doc["config"]))
         .filter_map(|named| named["digest"].as_str())
         .filter(|d| validate_digest(d).is_ok())
+        .take(MAX_NAMED_DIGESTS + 1)
         .map(str::to_owned)
-        .collect()
+        .collect();
+    if named.len() > MAX_NAMED_DIGESTS {
+        tracing::warn!(
+            manifest_bytes = manifest.len(),
+            cap = MAX_NAMED_DIGESTS,
+            "Quarantine: manifest names more digests than the cap, its children are not recorded with it"
+        );
+        return Vec::new();
+    }
+    named
 }
 
 /// Admit what a cached proxied manifest names when the manifest itself is admitted. A
@@ -1830,7 +1861,7 @@ async fn check_blob(
             // Mirror download_blob / HEAD-manifest: a proxy-cached blob still within its
             // cooldown is reported as held (403), not available — so HEAD and GET agree.
             // A local/internal blob has no proxy record (`New`) and acks normally.
-            if let Some(resp) = quarantine_cache_serve_gate(&state, &digest, None) {
+            if let Some(resp) = quarantine_cache_serve_gate(&state, &digest, None).await {
                 return resp;
             }
             if let Some(response) = crate::curation::verify_integrity_by_hash(
@@ -1927,7 +1958,7 @@ async fn serve_local_blob(
     // A blob with no proxy record (a local push, or an entry pruned past 90d)
     // reads as `New` and is served; only `Pending` blocks (enforce). Covers both
     // the 206 range serve and the 200 full serve below.
-    if let Some(resp) = quarantine_cache_serve_gate(state, digest, None) {
+    if let Some(resp) = quarantine_cache_serve_gate(state, digest, None).await {
         return Some(resp);
     }
 
@@ -2221,7 +2252,10 @@ async fn mount_blob(
 
     // A digest still inside its proxy cooldown must not be laundered into a
     // local repository by a mount.
-    if quarantine_cache_serve_gate(&state, digest, None).is_some() {
+    if quarantine_cache_serve_gate(&state, digest, None)
+        .await
+        .is_some()
+    {
         return start_upload(state, Path(raw_name.to_string())).await;
     }
 
@@ -3086,7 +3120,8 @@ async fn try_fetch_and_cache(
                         let Some((copy, ns)) = admitted else {
                             return Some(quarantine_forbidden(&digest, &q_status, q_secs));
                         };
-                        let mut response = serve_cached_manifest(state, copy, name, reference, ns);
+                        let mut response =
+                            serve_cached_manifest(state, copy, name, reference, ns).await;
                         let until = entry.first_seen + q_secs;
                         if let Ok(value) = axum::http::HeaderValue::from_str(&digest) {
                             response
@@ -3431,7 +3466,9 @@ async fn get_manifest(
     // fresh or not.
     if only_if_cached(&headers) {
         return match cached {
-            Some(ref data) => serve_cached_manifest(&state, data, &name, &reference, served_ns),
+            Some(ref data) => {
+                serve_cached_manifest(&state, data, &name, &reference, served_ns).await
+            }
             None => (
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(json!({"errors": [{
@@ -3480,7 +3517,7 @@ async fn get_manifest(
             if !hosted && !internal {
                 quarantine_redate_cached(&state, &upstreams_to_try, &name, &reference, data).await;
             }
-            return serve_cached_manifest(&state, data, &name, &reference, served_ns);
+            return serve_cached_manifest(&state, data, &name, &reference, served_ns).await;
         }
     }
 
@@ -3492,7 +3529,7 @@ async fn get_manifest(
     // lookups on locally-hosted images.
     if internal {
         if let Some(ref data) = cached {
-            return serve_cached_manifest(&state, data, &name, &reference, served_ns);
+            return serve_cached_manifest(&state, data, &name, &reference, served_ns).await;
         }
         crate::metrics::record_namespace_isolation_refused("docker");
         return manifest_unknown_response(&name, &reference);
@@ -3556,7 +3593,8 @@ async fn get_manifest(
                 reference = %reference,
                 "Upstream failed, serving stale cached manifest"
             );
-            let mut response = serve_cached_manifest(&state, data, &name, &reference, served_ns);
+            let mut response =
+                serve_cached_manifest(&state, data, &name, &reference, served_ns).await;
             response.headers_mut().insert(
                 axum::http::header::HeaderName::from_static("x-nora-stale"),
                 axum::http::header::HeaderValue::from_static("true"),
@@ -3614,7 +3652,7 @@ fn only_if_cached(headers: &axum::http::HeaderMap) -> bool {
 }
 
 /// Serve a manifest from local cache with all required headers and side-effects.
-fn serve_cached_manifest(
+async fn serve_cached_manifest(
     state: &AppState,
     data: &[u8],
     name: &str,
@@ -3649,7 +3687,7 @@ fn serve_cached_manifest(
     // with no proxy record (a local push, or a pruned entry) reads as `New` and serves —
     // only `Pending` blocks, so a local push is never held and never matures a proxy
     // digest. (A just-proxied manifest is recorded + checked on the fetch path above.)
-    if let Some(resp) = quarantine_cache_serve_gate(state, &digest, Some(data)) {
+    if let Some(resp) = quarantine_cache_serve_gate(state, &digest, Some(data)).await {
         return resp;
     }
     quarantine_readmit_referenced(state, data, &digest, ns);
@@ -3712,7 +3750,9 @@ async fn missing_manifest_ref(
                 };
                 if proxied == pushed
                     || !content_has_digest(d, &child)
-                    || quarantine_cache_serve_gate(state, d, Some(&child)).is_some()
+                    || quarantine_cache_serve_gate(state, d, Some(&child))
+                        .await
+                        .is_some()
                     || storage.put(&pushed, &child).await.is_err()
                 {
                     return Some(d.to_string());
@@ -3746,7 +3786,7 @@ async fn missing_manifest_ref(
             let proxied = blob_key(ns, name, d);
             if proxied == pushed
                 || storage.stat(&proxied).await.is_none()
-                || quarantine_cache_serve_gate(state, d, None).is_some()
+                || quarantine_cache_serve_gate(state, d, None).await.is_some()
                 || storage
                     .copy(&proxied, &pushed, d.strip_prefix("sha256:"))
                     .await

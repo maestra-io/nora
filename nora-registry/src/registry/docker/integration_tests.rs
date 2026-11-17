@@ -7344,6 +7344,237 @@ mod trust_upstream_dates {
         assert_eq!(held.map(|r| r.status()), Some(StatusCode::FORBIDDEN));
     }
 
+    /// Audit A058: a cache hit while the ledger is not in memory whole (loading, or a walk
+    /// that failed) is judged by the digest's own entry object, never served as unrecorded:
+    /// held under enforce (manifest GET and HEAD, the blob), reported `pending` with its
+    /// until under observe, never `mature`.
+    #[tokio::test]
+    async fn a_cache_hit_of_an_incomplete_ledger_is_judged_by_its_entry() {
+        let (server, image, layer) = upstream_with_image().await;
+        let first_seen = chrono::Utc::now().timestamp() - 3600;
+        let until = first_seen + 3 * 86400;
+        let manifest_uri = format!("/v2/library/demo/manifests/{}", sha(&image));
+        for mode in [QuarantineMode::Enforce, QuarantineMode::Observe] {
+            let ctx = context(&server, false, mode.clone());
+            let storage = &ctx.state.storage;
+            let key = manifest_key(Some("quay.io"), "library/demo", &sha(&image));
+            storage.put(&key, &image).await.unwrap();
+            let blob = super::super::blob_key(Some("quay.io"), "library/demo", &sha(&layer));
+            storage.put(&blob, &layer).await.unwrap();
+            for digest in [sha(&image), sha(&layer)] {
+                let entry = serde_json::json!({
+                    "registry": "docker", "digest": digest, "first_seen": first_seen, "upstream": "up"
+                });
+                storage
+                    .put(
+                        &format!(".nora-quarantine/docker/{digest}"),
+                        entry.to_string().as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            ctx.state.digest_store.set_loaded(false);
+
+            let resp = send(&ctx.app, Method::GET, &manifest_uri, Body::empty()).await;
+            let expected = match mode {
+                QuarantineMode::Enforce => StatusCode::FORBIDDEN,
+                _ => StatusCode::OK,
+            };
+            assert_eq!(resp.status(), expected, "{mode:?}");
+            assert_eq!(resp.headers()["x-nora-quarantine"], "pending", "{mode:?}");
+            let served_until: i64 = resp.headers()["x-nora-quarantine-until"]
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(
+                (served_until - until).abs() <= 5,
+                "{mode:?}: {served_until}"
+            );
+            if mode == QuarantineMode::Enforce {
+                let head = send(&ctx.app, Method::HEAD, &manifest_uri, Body::empty()).await;
+                assert_eq!(head.status(), StatusCode::FORBIDDEN);
+                let uri = format!("/v2/library/demo/blobs/{}", sha(&layer));
+                let blob = send(&ctx.app, Method::GET, &uri, Body::empty()).await;
+                assert_eq!(blob.status(), StatusCode::FORBIDDEN);
+            }
+        }
+    }
+
+    /// Audit A058: an entry the store cannot read while the ledger is incomplete is a 503 with
+    /// Retry-After under enforce, never the artifact; under observe the hit is served.
+    #[tokio::test]
+    async fn an_unreadable_entry_of_a_cache_hit_is_a_503_under_enforce() {
+        let blob = sha(b"a cached layer");
+        for (mode, held) in [
+            (QuarantineMode::Enforce, true),
+            (QuarantineMode::Observe, false),
+        ] {
+            let (storage, outage) = crate::test_helpers::outage_storage();
+            let ctx =
+                crate::test_helpers::create_test_context_with_storage_and_config(storage, |cfg| {
+                    cfg.curation.quarantine = Some(mode);
+                    cfg.curation.quarantine_ttl = Some("3d".to_string());
+                });
+            ctx.state.digest_store.set_loaded(false);
+            outage.fail_reads_of(&blob);
+            let resp = super::super::quarantine_cache_serve_gate(&ctx.state, &blob, None).await;
+            assert_eq!(resp.is_some(), held);
+            if let Some(resp) = resp {
+                assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert!(resp.headers().contains_key(header::RETRY_AFTER));
+            }
+        }
+    }
+
+    /// Audit A059: one manifest records at most `MAX_NAMED_DIGESTS` children with it: an
+    /// index naming more is still served, and each child is dated by its own fetch.
+    #[tokio::test]
+    async fn a_manifest_naming_too_many_digests_records_only_itself() {
+        let names = |n: usize| -> Vec<serde_json::Value> {
+            (0..n)
+                .map(|i| serde_json::json!({"digest": format!("sha256:{i:064x}"), "size": 1}))
+                .collect()
+        };
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": names(2000),
+        })
+        .to_string()
+        .into_bytes();
+        let (server, image, _) = upstream_with_image().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/library/demo/manifests/idx"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/vnd.oci.image.index.v1+json")
+                    .set_body_bytes(index),
+            )
+            .mount(&server)
+            .await;
+        let ctx = context(&server, false, QuarantineMode::Observe);
+        let store = &ctx.state.digest_store;
+        assert_eq!(get(&ctx, "manifests/idx").await, StatusCode::OK);
+        assert_eq!(store.len(), 1, "only the index itself");
+        // Control: an image records its config and layer with it (one digest here).
+        let before = store.len();
+        assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::OK);
+        assert_eq!(store.len(), before + 2);
+        assert!(matches!(
+            store.check("docker", &sha(&image), 3 * 86400),
+            QuarantineStatus::Pending { .. }
+        ));
+    }
+
+    /// Audit A059: the cap, and a document that is not a manifest names nothing.
+    #[test]
+    fn named_digests_stop_at_the_cap() {
+        let doc = |n: usize| {
+            let layers: Vec<_> = (0..n)
+                .map(|i| serde_json::json!({"digest": format!("sha256:{i:064x}")}))
+                .collect();
+            serde_json::json!({"schemaVersion": 2, "layers": layers}).to_string()
+        };
+        let named = |n: usize| super::super::named_digests(doc(n).as_bytes()).len();
+        assert_eq!(
+            named(super::super::MAX_NAMED_DIGESTS),
+            super::super::MAX_NAMED_DIGESTS
+        );
+        assert_eq!(named(super::super::MAX_NAMED_DIGESTS + 1), 0);
+        let one = format!(r#"{{"layers":[{{"digest":"sha256:{:064x}"}}]}}"#, 1);
+        assert!(super::super::named_digests(one.as_bytes()).is_empty());
+        let typed = format!(
+            r#"{{"mediaType":"application/vnd.docker.distribution.manifest.v2+json","layers":[{{"digest":"sha256:{:064x}"}}]}}"#,
+            1
+        );
+        assert_eq!(super::super::named_digests(typed.as_bytes()).len(), 1);
+    }
+
+    /// Audit A015: on Docker Hub an index is dated by a tag only when the tag lists each of
+    /// its images. An entry labelled as an attestation but on a runnable platform is one of
+    /// them, so a tag that does not list it leaves the index, that entry and its layer on
+    /// first-seen. BuildKit's own form (unknown/unknown) is still left out.
+    #[tokio::test]
+    async fn an_attestation_label_on_a_runnable_platform_is_dated_by_no_tag() {
+        for (platform, dated) in [(("linux", "amd64"), false), (("unknown", "unknown"), true)] {
+            let server = MockServer::start().await;
+            let layer = format!("layer of {}", platform.0).into_bytes();
+            let image = format!(
+                r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{l}","size":{n}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{l}","size":{n}}}]}}"#,
+                l = sha(&layer),
+                n = layer.len()
+            )
+            .into_bytes();
+            let arm64 = sha(b"an arm64 manifest");
+            let index = serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [
+                    {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": sha(&image),
+                     "size": image.len(), "platform": {"os": platform.0, "architecture": platform.1},
+                     "annotations": {"vnd.docker.reference.type": "attestation-manifest"}},
+                    {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": arm64,
+                     "size": 1, "platform": {"os": "linux", "architecture": "arm64"}},
+                ],
+            })
+            .to_string()
+            .into_bytes();
+            for (route, body, ct) in [
+                (
+                    format!("manifests/{}", sha(&index)),
+                    index.clone(),
+                    "application/vnd.oci.image.index.v1+json",
+                ),
+                (
+                    format!("manifests/{}", sha(&image)),
+                    image.clone(),
+                    "application/vnd.oci.image.manifest.v1+json",
+                ),
+                (
+                    format!("blobs/{}", sha(&layer)),
+                    layer.clone(),
+                    "application/octet-stream",
+                ),
+            ] {
+                Mock::given(method("GET"))
+                    .and(path(format!("/v2/library/demo/{route}")))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("Content-Type", ct)
+                            .set_body_bytes(body),
+                    )
+                    .mount(&server)
+                    .await;
+            }
+            let pushed = chrono::DateTime::from_timestamp(days_ago(30), 0)
+                .unwrap()
+                .to_rfc3339();
+            Mock::given(method("GET"))
+                .and(path("/v2/repositories/library/demo/tags"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "next": null,
+                    "results": [{"name": "old", "digest": sha(b"another index"),
+                                 "tag_last_pushed": pushed, "images": [{"digest": arm64}]}],
+                })))
+                .mount(&server)
+                .await;
+            let ctx = walked(&server, "docker.io", None);
+            let expected = if dated {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            for route in [
+                format!("manifests/{}", sha(&index)),
+                format!("manifests/{}", sha(&image)),
+                format!("blobs/{}", sha(&layer)),
+            ] {
+                assert_eq!(get(&ctx, &route).await, expected, "{platform:?} {route}");
+            }
+        }
+    }
+
     /// The manifest path the same: 503 with Retry-After while the ledger cannot judge the
     /// digest (here a load that is given no time), judged by the ledger once it ends.
     #[tokio::test]
