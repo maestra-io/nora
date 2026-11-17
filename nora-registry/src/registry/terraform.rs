@@ -614,13 +614,14 @@ async fn provider_download_binary(
         "terraform",
         &url,
         state.config.terraform.allow_private_hosts,
+        state.config.terraform.proxy_timeout_dl,
     ) {
         Ok(client) => client,
         Err(status) => return status.into_response(),
     };
 
     match proxy_fetch(
-        client,
+        &client,
         &url,
         Duration::from_secs(state.config.terraform.proxy_timeout_dl),
         own_origin_auth(&state, &url, &base),
@@ -1024,13 +1025,14 @@ async fn module_source_download(
         "terraform",
         &upstream_url,
         state.config.terraform.allow_private_hosts,
+        state.config.terraform.proxy_timeout_dl,
     ) {
         Ok(client) => client,
         Err(status) => return status.into_response(),
     };
 
     match proxy_fetch(
-        client,
+        &client,
         &upstream_url,
         Duration::from_secs(state.config.terraform.proxy_timeout_dl),
         own_origin_auth(&state, &upstream_url, &base),

@@ -188,6 +188,32 @@ async fn metadata_cannot_aim_nora_at_a_private_address() {
     assert!(files.received_requests().await.unwrap().is_empty());
 }
 
+/// The switch lets them through, whether or not private upstreams are allowed (the shared
+/// client refuses private addresses unless they are).
+#[tokio::test]
+async fn allow_private_hosts_fetches_a_private_archive() {
+    let files = file_host().await;
+    let port = files.address().port();
+    let up = registry(
+        &format!("http://localhost:{port}/x/{ZIP}"),
+        &format!("http://localhost:{port}/x/mod.tar.gz"),
+    )
+    .await;
+    let uri = up.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.terraform.enabled = true;
+        cfg.terraform.proxy = Some(uri);
+        cfg.terraform.allow_private_hosts = true;
+        cfg.server.allow_private_upstreams = false;
+    });
+    // The registry upstream itself is an IP literal, which the shared client does not check.
+    assert_eq!(
+        provider_file(&ctx).await,
+        (StatusCode::OK, ARCHIVE.to_vec())
+    );
+    assert_eq!(module_file(&ctx).await, (StatusCode::OK, ARCHIVE.to_vec()));
+}
+
 /// Audit A106: with no metadata, a file outside the `hashicorp` namespace is not guessed from
 /// releases.hashicorp.com by type and version: 404, nothing fetched or cached.
 #[tokio::test]

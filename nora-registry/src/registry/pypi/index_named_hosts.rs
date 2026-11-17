@@ -88,18 +88,39 @@ async fn a_file_host_name_that_resolves_privately_is_refused() {
     }
 }
 
-/// The switch lets an internal mirror's files through.
+/// The switch lets an internal mirror's files through, by IP literal or by a name that
+/// resolves to one, whether or not private upstreams are allowed.
 #[tokio::test]
 async fn allow_private_file_hosts_fetches_them() {
     let files = file_host().await;
-    let up = upstream(&files.uri()).await;
-    let ctx = context(&up, true, true);
-    assert_eq!(
-        get(&ctx, SDIST).await,
-        (StatusCode::OK, b"internal".to_vec())
+    let port = files.address().port();
+    for base in [files.uri(), format!("http://localhost:{port}")] {
+        let up = upstream(&base).await;
+        for allow_upstreams in [false, true] {
+            let ctx = context(&up, true, allow_upstreams);
+            let ok = (StatusCode::OK, b"internal".to_vec());
+            assert_eq!(get(&ctx, SDIST).await, ok, "{base} {allow_upstreams}");
+            assert_eq!(get(&ctx, &format!("{WHEEL}.metadata")).await, ok, "{base}");
+        }
+    }
+}
+
+/// A refused file host is recorded like a failed fetch, so the loop goes on to the next
+/// upstream and answers 502 only when none serves the file.
+#[tokio::test]
+async fn a_refused_file_host_is_recorded_as_an_upstream_failure() {
+    let up = MockServer::start().await;
+    let ctx = context(&up, false, true);
+    let url = "http://127.0.0.1:9/pkg-1.0.tar.gz";
+    let mut err = None;
+    assert!(super::content_client(&ctx.state, url, &mut err).is_none());
+    let (at, e) = err.expect("refusal recorded");
+    assert_eq!(at, url);
+    assert!(
+        matches!(e, crate::registry::ProxyError::Network(_)),
+        "{e:?}"
     );
-    assert_eq!(
-        get(&ctx, &format!("{WHEEL}.metadata")).await,
-        (StatusCode::OK, b"internal".to_vec())
-    );
+    let mut none = None;
+    assert!(super::content_client(&ctx.state, "https://files.example/x", &mut none).is_some());
+    assert!(none.is_none());
 }

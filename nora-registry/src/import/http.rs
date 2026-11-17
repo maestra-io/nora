@@ -302,26 +302,29 @@ fn build_guarded_client(
     allow_private: bool,
     hosts: Option<Arc<[String]>>,
 ) -> Result<reqwest::Client> {
-    let redirect_policy =
-        reqwest::redirect::Policy::custom(move |attempt| {
-            match redirect_verdict(
-                attempt.url().host_str(),
-                attempt.previous().len(),
-                allow_private,
-                hosts.as_deref(),
-            ) {
-                RedirectVerdict::Follow => attempt.follow(),
-                RedirectVerdict::TooMany => attempt.error(SsrfRedirectError(format!(
-                    "exceeded {MAX_REDIRECTS} redirects"
-                ))),
-                RedirectVerdict::Blocked(ip) => {
-                    attempt.error(SsrfRedirectError(format!("redirect to blocked IP {ip}")))
-                }
-                RedirectVerdict::OffList(host) => attempt.error(SsrfRedirectError(format!(
-                    "redirect to {host}, which is not an allowed host"
-                ))),
+    let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+        if downgrades(attempt.previous().last(), attempt.url()) {
+            // reqwest keeps the credential on a same host and port hop.
+            return attempt.error(SsrfRedirectError("redirect from https to http".into()));
+        }
+        match redirect_verdict(
+            attempt.url().host_str(),
+            attempt.previous().len(),
+            allow_private,
+            hosts.as_deref(),
+        ) {
+            RedirectVerdict::Follow => attempt.follow(),
+            RedirectVerdict::TooMany => attempt.error(SsrfRedirectError(format!(
+                "exceeded {MAX_REDIRECTS} redirects"
+            ))),
+            RedirectVerdict::Blocked(ip) => {
+                attempt.error(SsrfRedirectError(format!("redirect to blocked IP {ip}")))
             }
-        });
+            RedirectVerdict::OffList(host) => attempt.error(SsrfRedirectError(format!(
+                "redirect to {host}, which is not an allowed host"
+            ))),
+        }
+    });
 
     // SAFETY(reqwest-client-bypass): build_http_client is deliberately NOT reused
     // here — it honours an ambient proxy (which defeats the resolver) and has no
@@ -391,6 +394,12 @@ fn redirect_verdict(
         }
     }
     RedirectVerdict::Follow
+}
+
+/// A hop from https to plain http: refused, the request and any credential it carries
+/// would leave TLS.
+fn downgrades(from: Option<&reqwest::Url>, to: &reqwest::Url) -> bool {
+    from.is_some_and(|from| from.scheme() == "https") && to.scheme() == "http"
 }
 
 /// Error type surfaced from the redirect policy so a blocked hop aborts the
@@ -526,6 +535,22 @@ mod tests {
             redirect_verdict(Some("10.0.0.1"), 1, true, None),
             RedirectVerdict::Follow
         );
+    }
+
+    #[test]
+    fn a_hop_from_https_to_http_is_a_downgrade() {
+        let url = |u: &str| reqwest::Url::parse(u).unwrap();
+        let https = url("https://files.example:8443/a");
+        assert!(downgrades(
+            Some(&https),
+            &url("http://files.example:8443/a")
+        ));
+        assert!(!downgrades(Some(&https), &url("https://cdn.example/a")));
+        assert!(!downgrades(
+            Some(&url("http://a.example/")),
+            &url("http://b.example/")
+        ));
+        assert!(!downgrades(None, &url("http://a.example/")));
     }
 
     #[test]

@@ -563,6 +563,7 @@ async fn chart(
         "helm",
         &url,
         state.config.helm.allow_private_chart_hosts,
+        state.config.helm.proxy_timeout,
     ) {
         Ok(client) => client,
         Err(status) => return status.into_response(),
@@ -616,7 +617,7 @@ async fn chart(
         let want = expected.clone();
         crate::registry::proxy_stream_artifact(
             &state,
-            client,
+            &client,
             &key,
             "helm",
             &url,
@@ -635,7 +636,7 @@ async fn chart(
         .await
     } else {
         crate::registry::proxy_fetch_artifact_with(
-            &state, client, &key, "helm", &url, timeout, auth, scope,
+            &state, &client, &key, "helm", &url, timeout, auth, scope,
         )
         .await
         .map(|(body, cache)| crate::registry::Served::Whole(body, cache))

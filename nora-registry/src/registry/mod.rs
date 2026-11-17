@@ -2144,28 +2144,53 @@ pub(crate) fn same_origin(a: &str, b: &str) -> bool {
 /// `.metadata`, a Terraform provider or module archive), or 502 when it may not be fetched.
 /// Such a URL is the upstream's, not the operator's: unless `allow_private` (the registry's
 /// own switch) it never reaches a loopback, private, link-local or metadata address, on the
-/// first request or on a redirect hop.
-pub(crate) fn content_url_client<'a>(
-    state: &'a AppState,
+/// first request, on a redirect hop or through a name that resolves to one. That client
+/// connects directly (DNS pinned, no outbound proxy, which would resolve names itself) and
+/// reads with `read_timeout_secs`; the switch gives the shared upstream client, private
+/// addresses allowed.
+pub(crate) fn content_url_client(
+    state: &AppState,
     registry: &'static str,
     url: &str,
     allow_private: bool,
-) -> Result<&'a reqwest::Client, StatusCode> {
+    read_timeout_secs: u64,
+) -> Result<reqwest::Client, StatusCode> {
     if allow_private {
-        return Ok(&state.http_client);
+        if state.config.server.allow_private_upstreams {
+            return Ok(state.http_client.clone());
+        }
+        // The shared client refuses private addresses (#236); the switch allows them here.
+        static OPEN: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        return Ok(OPEN
+            .get_or_init(|| crate::build_upstream_client(&state.config.tls, true))
+            .clone());
     }
     if crate::import::http::is_blocked_url_host(url, false) {
-        // An IP literal reaches no resolver, and the shared client checks redirect hops only.
+        // An IP literal never reaches the guard's resolver: checked here.
         tracing::warn!(registry, url = %crate::import::http::redact_url(url), "upstream metadata names a file on a loopback/private address, refusing it (the registry's allow_private switch allows it)");
         return Err(StatusCode::BAD_GATEWAY);
     }
-    if !state.config.server.allow_private_upstreams {
-        // Guarded itself: redirect hops and resolved names (#236).
-        return Ok(&state.http_client);
+    static GUARDED: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::BTreeMap<u64, reqwest::Client>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let mut clients = GUARDED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(client) = clients.get(&read_timeout_secs) {
+        return Ok(client.clone());
     }
-    // The operator allowed private upstreams, not private hosts their metadata names.
-    static GUARDED: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    Ok(GUARDED.get_or_init(|| crate::build_upstream_client(&state.config.tls, false)))
+    let client = crate::import::http::build_import_client(
+        &state.config.tls,
+        Duration::from_secs(10),
+        Duration::from_secs(read_timeout_secs.max(1)),
+        false,
+    )
+    .map_err(|e| {
+        tracing::error!(registry, error = %e, "no SSRF-guarded client, refusing a download");
+        StatusCode::BAD_GATEWAY
+    })?;
+    clients.insert(read_timeout_secs, client.clone());
+    Ok(client)
 }
 
 /// [`proxy_fetch_artifact`] over `client` instead of the shared one (a file URL an
