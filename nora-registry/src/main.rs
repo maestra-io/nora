@@ -134,6 +134,10 @@ enum Commands {
         /// Input backup file path
         #[arg(short, long)]
         input: PathBuf,
+        /// Restore the archive's token records even when the store already holds some
+        /// (disaster recovery): this brings back tokens revoked since the backup.
+        #[arg(long)]
+        include_tokens: bool,
     },
     /// Garbage collect orphaned blobs and checksum sidecars
     Gc {
@@ -1165,8 +1169,11 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::Restore { input }) => {
-            if let Err(e) = backup::restore_backup(&storage, &input).await {
+        Some(Commands::Restore {
+            input,
+            include_tokens,
+        }) => {
+            if let Err(e) = backup::restore_backup(&storage, &input, include_tokens).await {
                 error!("Restore failed: {}", e);
                 std::process::exit(1);
             }

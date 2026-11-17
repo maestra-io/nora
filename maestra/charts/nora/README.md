@@ -372,7 +372,7 @@ resources:
 
 ### Backup and restore (Maestra)
 
-With `storage.mode: s3` everything durable is in the bucket. A backup is `kubectl exec deploy/nora -- nora backup --output /tmp/nora.tar.gz` copied out of the pod (`kubectl cp`); `nora restore --input <archive>` brings it back, `.nora-tokens/` and `.nora-quarantine/` included. Legacy archives of the removed backup CronJob (`s3://<bucket>/.nora-backup/<ts>.tar.gz`, `data/tokens/*.json` + `data/storage/quarantine.jsonl`) still restore: extract them into `auth.token_storage` / `storage.path` in the pod and restart the container (an emptyDir survives that); the next start imports them.
+With `storage.mode: s3` everything durable is in the bucket. A backup is `kubectl exec deploy/nora -- nora backup --output /tmp/nora.tar.gz` copied out of the pod (`kubectl cp`); `nora restore --input <archive>` brings it back, `.nora-tokens/` and `.nora-quarantine/` included. Tokens come back only onto a bucket with no token records: a bucket that holds some keeps its own set, so a token revoked since the backup stays revoked, and the restore prints how many archive records it left out. `nora restore --include-tokens` restores them all (disaster recovery after token records were lost; it also brings back tokens revoked since the backup). Legacy archives of the removed backup CronJob (`s3://<bucket>/.nora-backup/<ts>.tar.gz`, `data/tokens/*.json` + `data/storage/quarantine.jsonl`) still restore: extract them into `auth.token_storage` / `storage.path` in the pod and restart the container (an emptyDir survives that); the next start imports them.
 
 ## S3 Storage
 

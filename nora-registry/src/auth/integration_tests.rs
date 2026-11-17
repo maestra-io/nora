@@ -2132,3 +2132,59 @@ fn privatize_cache_control_swaps_only_public() {
     assert_eq!(run(&["public", "max-age=5"]), ["private", "max-age=5"]);
     assert!(run(&[]).is_empty());
 }
+
+/// B30: every token-route reply carries credentials or their listing and is never
+/// stored by a cache, on success and on refusal alike.
+#[tokio::test]
+async fn token_route_replies_are_not_stored() {
+    let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+    let creds = r#"{"username":"admin","password":"secret"}"#;
+    for (uri, body, want) in [
+        ("/api/tokens", creds, StatusCode::OK),
+        ("/api/tokens/list", creds, StatusCode::OK),
+        (
+            "/api/tokens",
+            r#"{"username":"admin","password":"wrong"}"#,
+            StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            uri,
+            vec![("content-type", "application/json")],
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), want, "{uri}");
+        assert_eq!(response.headers()["cache-control"], "no-store", "{uri}");
+    }
+}
+
+/// B05: a token-route body is capped at 16 KiB before the handler reads it, not at
+/// the server-wide upload limit; a normal body still mints.
+#[tokio::test]
+async fn a_token_route_body_over_16_kib_is_refused_unread() {
+    let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+    let store = ctx.state.tokens.as_ref().unwrap();
+    let mint = |description: String| {
+        send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/tokens",
+            vec![("content-type", "application/json")],
+            format!(r#"{{"username":"admin","password":"secret","description":"{description}"}}"#),
+        )
+    };
+
+    let response = mint("x".repeat(32 * 1024)).await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        store.list_tokens("admin").await.is_empty(),
+        "nothing minted"
+    );
+
+    let response = mint("deploy".to_string()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(store.list_tokens("admin").await.len(), 1);
+}

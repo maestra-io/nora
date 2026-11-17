@@ -14,7 +14,6 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use parking_lot::RwLock;
@@ -37,6 +36,12 @@ const LAST_USED_KEY: &str = ".nora-tokens/last_used.json";
 /// Ids of the `auth.token_storage` files already imported once, so a token revoked
 /// after the import is not brought back by the next boot.
 const IMPORTED_KEY: &str = ".nora-tokens/legacy_imported.json";
+
+/// A new token secret: 128 random bits from rand's CSPRNG, `nra_` + 32 lowercase hex
+/// (the shape tokens always had, so issued tokens and scanners are unaffected).
+fn new_secret() -> String {
+    format!("{TOKEN_PREFIX}{:032x}", rand::random::<u128>())
+}
 
 fn record_key(id: &str) -> String {
     format!("{STORAGE_PREFIX}{id}.json")
@@ -269,12 +274,7 @@ impl TokenStore {
     ) -> Result<MintedToken, TokenError> {
         let granted_role = role.clone();
         let ttl_secs = lifetime.secs();
-        // Generate random token
-        let raw_token = format!(
-            "{}{}",
-            TOKEN_PREFIX,
-            Uuid::new_v4().to_string().replace("-", "")
-        );
+        let raw_token = new_secret();
         let to_hash = Zeroizing::new(raw_token.clone());
         let token_hash = off_worker(move || hash_token_argon2(&to_hash)).await??;
         // Use SHA256 of token as the record id (deterministic, for lookup)
@@ -847,7 +847,33 @@ mod tests {
             .unwrap();
 
         assert!(token.starts_with("nra_"));
-        assert_eq!(token.len(), 4 + 32); // prefix + uuid without dashes
+        assert_eq!(token.len(), 4 + 32); // prefix + 32 hex chars
+    }
+
+    /// B17: the secret is 128 random bits as 32 lowercase hex, not a UUIDv4 whose
+    /// version and variant nibbles are fixed (122 bits). A false failure is ~2^-128.
+    #[test]
+    fn a_token_secret_carries_128_random_bits() {
+        let bodies: Vec<String> = (0..64)
+            .map(|_| new_secret().strip_prefix(TOKEN_PREFIX).unwrap().to_string())
+            .collect();
+        for body in &bodies {
+            assert_eq!(body.len(), 32, "{body}");
+            assert!(
+                body.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "{body}"
+            );
+        }
+        assert!(
+            bodies.iter().any(|b| b.as_bytes()[12] != b'4'),
+            "the UUIDv4 version nibble is fixed in every token"
+        );
+        assert!(
+            bodies
+                .iter()
+                .any(|b| !matches!(b.as_bytes()[16], b'8' | b'9' | b'a' | b'b')),
+            "the UUID variant nibble is fixed in every token"
+        );
     }
 
     /// Every mint path goes through `create_token`, so the TTL clamp lives there:

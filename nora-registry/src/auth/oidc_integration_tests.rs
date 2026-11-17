@@ -1421,6 +1421,8 @@ async fn exchange(ctx: &TestContext, auth: &str) -> (StatusCode, serde_json::Val
     )
     .await;
     let status = resp.status();
+    // B30: the reply carries a session token (or a refusal): never stored by a cache.
+    assert_eq!(resp.headers()["cache-control"], "no-store", "{status}");
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();

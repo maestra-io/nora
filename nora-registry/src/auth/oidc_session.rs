@@ -294,7 +294,10 @@ async fn exchange(State(state): State<AppState>, headers: HeaderMap) -> Response
 }
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route(SESSION_ROUTE, post(exchange))
+    // The reply carries a session token: never stored by a cache.
+    Router::new()
+        .route(SESSION_ROUTE, post(exchange))
+        .layer(super::no_store())
 }
 
 #[cfg(test)]
