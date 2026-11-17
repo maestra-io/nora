@@ -482,7 +482,10 @@ async fn provider_download_meta(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "proxy", "", "terraform", ""));
 
-            cache_platform_meta(&state, &storage_key, &rewritten).await;
+            if let Err(response) = cache_platform_meta(&state, &ns, &storage_key, &rewritten).await
+            {
+                return response;
+            }
             with_json(strip_nora_internal_fields(rewritten.as_bytes()))
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -1428,7 +1431,9 @@ async fn mirror_fetch_archive(
             .await
             .map_err(ArchiveMiss::Upstream)?;
             let rewritten = rewrite_download_url(&text, base_url, ns, ptype, ver);
-            cache_platform_meta(state, &storage_key, &rewritten).await;
+            cache_platform_meta(state, ns, &storage_key, &rewritten)
+                .await
+                .map_err(|response| ArchiveMiss::Unreadable(Box::new(response)))?;
             rewritten
         }
     };
@@ -1809,16 +1814,33 @@ fn own_origin_auth<'a>(state: &'a AppState, url: &str, base: &str) -> Option<Ups
 
 /// Writes the rewritten platform metadata before the answer that names its archive goes out,
 /// so the client's archive request right after finds the stored URL (audit A106). A failed
-/// write is logged and counted; the answer still goes out.
-async fn cache_platform_meta(state: &AppState, key: &str, meta: &str) {
+/// write is logged and counted; outside the `hashicorp` namespace, whose files the fallback
+/// still finds, it answers a retryable 503 instead of naming an archive NORA could not fetch.
+async fn cache_platform_meta(
+    state: &AppState,
+    ns: &str,
+    key: &str,
+    meta: &str,
+) -> Result<(), Response> {
     match state
         .storage
         .put_bytes(key, Bytes::from(meta.to_owned()))
         .await
     {
         Ok(()) => state.repo_index.invalidate("terraform"),
-        Err(e) => crate::record_cache_write_error("terraform", key, &e),
+        Err(e) => {
+            crate::record_cache_write_error("terraform", key, &e);
+            if !ns.eq_ignore_ascii_case("hashicorp") {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::RETRY_AFTER, "30")],
+                    "storage temporarily unavailable",
+                )
+                    .into_response());
+            }
+        }
     }
+    Ok(())
 }
 
 /// Extract OS and arch from a terraform provider filename.

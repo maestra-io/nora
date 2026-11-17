@@ -284,3 +284,26 @@ async fn platform_metadata_is_stored_before_the_answer() {
         assert!(ctx.state.storage.stat(META_KEY).await.is_some(), "{uri}");
     }
 }
+
+/// Audit A106: a platform metadata write that fails answers a retryable 503 outside the
+/// `hashicorp` namespace (its archive could not be resolved later), on both routes.
+#[tokio::test]
+async fn a_failed_metadata_write_is_retryable_outside_hashicorp() {
+    let files = file_host().await;
+    let up = registry(&format!("{}/x/{ZIP}", files.uri()), "").await;
+    for uri in [
+        "/terraform/v1/providers/acme/tool/1.0.0/download/linux/amd64",
+        "/terraform/registry.terraform.io/acme/tool/1.0.0.json",
+    ] {
+        let (storage, ops) = op_counting_storage();
+        let url = up.uri();
+        let ctx = create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(url);
+        });
+        ops.fail_puts_ending(Some("linux_amd64.json"));
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        assert!(resp.headers().contains_key("retry-after"), "{uri}");
+    }
+}
