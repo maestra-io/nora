@@ -840,6 +840,7 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
     if !htpasswd_peer_ok && request.uri().path().starts_with("/api/tokens") {
         return (
             StatusCode::FORBIDDEN,
+            [(header::CACHE_CONTROL, "no-store")],
             "Password authentication is not accepted from this address",
         )
             .into_response();
@@ -1560,6 +1561,15 @@ fn basic_credentials(encoded: &str) -> Result<(String, String), &'static str> {
         return Err("Invalid credentials format");
     };
     Ok((username.to_string(), password.to_string()))
+}
+
+/// `Cache-Control: no-store` on every reply of a router whose replies carry credentials.
+pub(crate) fn no_store() -> tower_http::set_header::SetResponseHeaderLayer<axum::http::HeaderValue>
+{
+    tower_http::set_header::SetResponseHeaderLayer::overriding(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    )
 }
 
 /// The answer to a password from a locked-out account.

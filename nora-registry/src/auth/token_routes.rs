@@ -4,7 +4,7 @@
 //! Token management API routes (create, list, revoke).
 
 use axum::{
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -313,12 +313,18 @@ async fn revoke_token(
     }
 }
 
-/// Token management routes
+/// Largest token-route request body. A real mint/list/revoke body is a few hundred
+/// bytes; this one overrides the server-wide upload limit before the password check.
+const TOKEN_BODY_LIMIT: usize = 16 * 1024;
+
+/// Token management routes. Their replies carry credentials: never stored by a cache.
 pub fn token_routes() -> Router<AppState> {
     Router::new()
         .route("/api/tokens", post(create_token))
         .route("/api/tokens/list", post(list_tokens))
         .route("/api/tokens/revoke", post(revoke_token))
+        .layer(DefaultBodyLimit::max(TOKEN_BODY_LIMIT))
+        .layer(super::no_store())
 }
 
 #[cfg(test)]

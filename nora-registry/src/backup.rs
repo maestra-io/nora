@@ -49,6 +49,9 @@ pub struct BackupMetadata {
 /// `.nora-` keys are internal, so no artifact key can collide with it.
 const LOCAL_PREFIX: &str = ".nora-local/";
 const LOCAL_TOKENS: &str = "tokens/";
+/// Present while a restore writes token records into a store that had none, so a rerun
+/// after a failure writes the rest instead of treating the store as the authority.
+const RESTORE_MARKER: &str = ".nora-tokens/restore_in_progress";
 
 /// Statistics returned after backup
 #[derive(Debug)]
@@ -64,6 +67,9 @@ pub struct RestoreStats {
     pub artifact_count: usize,
     pub total_bytes: u64,
     pub local_files: usize,
+    /// Token records the archive has and the store lacks, left out because the store
+    /// holds live token state: a revoked token is one of them.
+    pub tokens_skipped: usize,
 }
 
 /// Create a backup of all artifacts to a tar.gz file
@@ -280,8 +286,27 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
     Ok(stats)
 }
 
-/// Restore artifacts from a backup file
-pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreStats, String> {
+/// Write [`RESTORE_MARKER`] once, before the first token record a restore writes.
+async fn mark_token_restore(storage: &Storage, unmarked: &mut bool) -> Result<(), String> {
+    if std::mem::take(unmarked) {
+        storage
+            .put(RESTORE_MARKER, b"")
+            .await
+            .map_err(|e| format!("Failed to store {}: {}", RESTORE_MARKER, e))?;
+    }
+    Ok(())
+}
+
+/// Restore artifacts from a backup file.
+///
+/// A store that already holds token records is the authority on which tokens exist: a
+/// record it lacks was revoked (or lost), so the archive's token state is left out unless
+/// `include_tokens` (disaster recovery). A store without token records gets them all.
+pub async fn restore_backup(
+    storage: &Storage,
+    input: &Path,
+    include_tokens: bool,
+) -> Result<RestoreStats, String> {
     println!("Restoring from: {}", input.display());
     println!("Storage backend: {}", storage.backend_name());
 
@@ -346,6 +371,38 @@ pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreSt
     let mut quarantine_restored = false;
     let write_times = metadata.as_ref().is_some_and(|m| m.write_times);
     let mut writes = digest_quarantine::CarriedWrites::default();
+    let listed = if include_tokens {
+        Vec::new()
+    } else {
+        storage
+            .list_internal(tokens::STORAGE_PREFIX)
+            .await
+            .map_err(|e| format!("storage list failed: {}", e))?
+    };
+    // A restore that began on a store without token records and was cut short resumes
+    // as one: the records it wrote do not make the store the authority.
+    let resumed = listed.iter().any(|k| k == RESTORE_MARKER);
+    let store_tokens: std::collections::HashSet<String> = listed
+        .into_iter()
+        .filter(|k| !resumed && tokens::is_record_key(k))
+        .collect();
+    if resumed {
+        println!("Resuming a restore that began on a store without token records");
+    }
+    // Written before the first token record (below), dropped when the restore completes.
+    let marked = !include_tokens && store_tokens.is_empty();
+    let mut unmarked = marked;
+    let mut tokens_skipped = 0;
+    // A record the store has is the same (records are immutable); one it lacks is counted.
+    let mut skip_token_state = |key: &str| {
+        if store_tokens.is_empty() {
+            return false;
+        }
+        if tokens::is_record_key(key) && !store_tokens.contains(key) {
+            tokens_skipped += 1;
+        }
+        true
+    };
 
     // Second pass: restore files
     for entry in archive
@@ -386,7 +443,17 @@ pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreSt
         if let Some(name) = path.strip_prefix(LOCAL_PREFIX) {
             // Older archives: a token record goes into storage; anything else is refused.
             match name.strip_prefix(LOCAL_TOKENS) {
-                Some(record) => tokens::import_record(storage, record, &data).await?,
+                Some(record)
+                    if skip_token_state(&format!("{}{record}", tokens::STORAGE_PREFIX)) =>
+                {
+                    pb.inc(1);
+                    continue;
+                }
+                Some(record) => {
+                    tokens::check_record(record, &data)?;
+                    mark_token_restore(storage, &mut unmarked).await?;
+                    tokens::import_record(storage, record, &data).await?
+                }
                 None => return Err(format!("Unknown local-state entry {path}")),
             }
             local_files += 1;
@@ -394,6 +461,12 @@ pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreSt
             continue;
         }
         if writes.carried(&path, &data) {
+            pb.inc(1);
+            continue;
+        }
+        if path == RESTORE_MARKER
+            || path.starts_with(tokens::STORAGE_PREFIX) && skip_token_state(&path)
+        {
             pb.inc(1);
             continue;
         }
@@ -409,6 +482,9 @@ pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreSt
         }
         quarantine_restored |= path.starts_with(digest_quarantine::ENTRY_PREFIX);
 
+        if path.starts_with(tokens::STORAGE_PREFIX) {
+            mark_token_restore(storage, &mut unmarked).await?;
+        }
         // Put to storage
         storage
             .put(&path, &data)
@@ -438,12 +514,20 @@ pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreSt
         }
     }
 
+    if marked && !unmarked {
+        match storage.delete(RESTORE_MARKER).await {
+            Ok(()) | Err(crate::storage::StorageError::NotFound) => {}
+            Err(e) => return Err(format!("Failed to drop {}: {}", RESTORE_MARKER, e)),
+        }
+    }
+
     pb.finish_with_message("Restore complete");
 
     let stats = RestoreStats {
         artifact_count,
         total_bytes,
         local_files,
+        tokens_skipped,
     };
 
     println!();
@@ -454,6 +538,13 @@ pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreSt
         stats.local_files
     );
     println!("  Total data: {} bytes", stats.total_bytes);
+    if !store_tokens.is_empty() {
+        println!(
+            "  Tokens: the store's own kept; {} token records not in the store were not \
+             restored (revoked or lost); rerun with --include-tokens to restore them",
+            stats.tokens_skipped
+        );
+    }
 
     Ok(stats)
 }
@@ -550,7 +641,7 @@ mod tests {
         let root = dir.path().join("data");
         let storage = Storage::new_local(root.to_str().unwrap());
 
-        let err = restore_backup(&storage, &archive_path)
+        let err = restore_backup(&storage, &archive_path, false)
             .await
             .expect_err("an entry in the staging directory must be refused");
         assert!(
@@ -580,7 +671,7 @@ mod tests {
         assert_eq!(fs::read(&output).unwrap(), b"last night's backup");
         let partial = dir.path().join("backup.tar.gz.partial");
         let restored = Storage::new_local(dir.path().join("restored").to_str().unwrap());
-        let stats = restore_backup(&restored, &partial).await.unwrap();
+        let stats = restore_backup(&restored, &partial, false).await.unwrap();
         assert_eq!(
             stats.artifact_count, 1,
             "the partial archive holds the rest"
@@ -609,7 +700,7 @@ mod tests {
 
         // Restore to different storage
         let restore_storage = Storage::new_local(dir.path().join("restored").to_str().unwrap());
-        let restore_stats = restore_backup(&restore_storage, &backup_file)
+        let restore_stats = restore_backup(&restore_storage, &backup_file, false)
             .await
             .unwrap();
         assert_eq!(restore_stats.artifact_count, 2);
@@ -639,7 +730,9 @@ mod tests {
         let backup_file = dir.path().join("backup.tar.gz");
         create_backup(&storage, &backup_file).await.unwrap();
         let restored = Storage::new_local(dir.path().join("restored").to_str().unwrap());
-        restore_backup(&restored, &backup_file).await.unwrap();
+        restore_backup(&restored, &backup_file, false)
+            .await
+            .unwrap();
 
         assert_eq!(
             &restored.get(&origin_key(key)).await.unwrap()[..],
@@ -665,7 +758,9 @@ mod tests {
         let backup_file = dir.path().join("backup.tar.gz");
         create_backup(&storage, &backup_file).await.unwrap();
         let restored = Storage::new_local(dir.path().join("restored").to_str().unwrap());
-        restore_backup(&restored, &backup_file).await.unwrap();
+        restore_backup(&restored, &backup_file, false)
+            .await
+            .unwrap();
 
         assert_eq!(
             &restored.get(&first_seen_key(key)).await.unwrap()[..],
@@ -788,7 +883,9 @@ mod tests {
             2
         );
 
-        let rstats = restore_backup(&restored, &backup_file).await.unwrap();
+        let rstats = restore_backup(&restored, &backup_file, false)
+            .await
+            .unwrap();
         assert_eq!(rstats.artifact_count, 3);
         assert_eq!(rstats.local_files, 0);
 
@@ -859,7 +956,9 @@ mod tests {
         let backup_file = dir.path().join("backup.tar.gz");
         create_backup(&storage, &backup_file).await.unwrap();
         let restored = Storage::new_local(dir.path().join("restored").to_str().unwrap());
-        restore_backup(&restored, &backup_file).await.unwrap();
+        restore_backup(&restored, &backup_file, false)
+            .await
+            .unwrap();
         assert!(
             !held_after_start(&restored, key).await,
             "the restored copy is not held again"
@@ -893,7 +992,7 @@ mod tests {
             tar.into_inner().unwrap().finish().unwrap();
         }
         let fresh = Storage::new_local(dir.path().join("fresh").to_str().unwrap());
-        restore_backup(&fresh, &old).await.unwrap();
+        restore_backup(&fresh, &old, false).await.unwrap();
         assert!(
             held_after_start(&fresh, key).await,
             "an older archive restores as before"
@@ -938,7 +1037,9 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        let stats = restore_backup(&storage, &archive_path).await.unwrap();
+        let stats = restore_backup(&storage, &archive_path, false)
+            .await
+            .unwrap();
         assert_eq!((stats.artifact_count, stats.local_files), (0, 1));
         let ledger = DigestStore::load(storage, "/nonexistent").await;
         assert_eq!(
@@ -970,7 +1071,7 @@ mod tests {
                 tar.into_inner().unwrap().finish().unwrap();
             }
             let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
-            restore_backup(&storage, &archive_path)
+            restore_backup(&storage, &archive_path, false)
                 .await
                 .expect_err(name);
             let written = storage.list_internal(tokens::STORAGE_PREFIX).await.unwrap();
@@ -1007,9 +1108,140 @@ mod tests {
             tar.into_inner().unwrap().finish().unwrap();
         }
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
-        let stats = restore_backup(&storage, &archive_path).await.unwrap();
+        let stats = restore_backup(&storage, &archive_path, false)
+            .await
+            .unwrap();
         assert_eq!(stats.local_files, 1);
         let (user, _) = TokenStore::new(storage).verify_token(&raw).await.unwrap();
         assert_eq!(user, "ci");
+    }
+
+    /// A025: a store that holds token records decides which tokens exist. A restore of an
+    /// older archive leaves out a record the store lacks (revoked since), and says so;
+    /// an empty store gets every token, and `include_tokens` restores them all.
+    #[tokio::test]
+    async fn restore_does_not_bring_back_a_revoked_token() {
+        use crate::tokens::{Role, TokenError, TokenStore};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let store = TokenStore::new(storage.clone());
+        let revoked = store
+            .create_token("ci", 30, None, Role::Write)
+            .await
+            .unwrap();
+        let revoked_id = store.list_tokens("ci").await[0].file_id.clone();
+        let kept = store
+            .create_token("ci", 30, None, Role::Write)
+            .await
+            .unwrap();
+        let backup_file = dir.path().join("backup.tar.gz");
+        create_backup(&storage, &backup_file).await.unwrap();
+        store.revoke_token(&revoked_id).await.unwrap();
+
+        let stats = restore_backup(&storage, &backup_file, false).await.unwrap();
+        assert_eq!(stats.tokens_skipped, 1);
+        let fresh = TokenStore::new(storage.clone());
+        assert!(matches!(
+            fresh.verify_token(&revoked).await,
+            Err(TokenError::NotFound)
+        ));
+        fresh.verify_token(&kept).await.unwrap();
+
+        let empty = Storage::new_local(dir.path().join("empty").to_str().unwrap());
+        let stats = restore_backup(&empty, &backup_file, false).await.unwrap();
+        assert_eq!(stats.tokens_skipped, 0);
+        let fresh = TokenStore::new(empty);
+        fresh.verify_token(&revoked).await.unwrap();
+        fresh.verify_token(&kept).await.unwrap();
+
+        let stats = restore_backup(&storage, &backup_file, true).await.unwrap();
+        assert_eq!(stats.tokens_skipped, 0);
+        TokenStore::new(storage)
+            .verify_token(&revoked)
+            .await
+            .expect("--include-tokens restores every record");
+    }
+
+    /// A025, older archive: a `.nora-local/tokens/` record is left out too when the
+    /// store already holds token records.
+    #[tokio::test]
+    async fn restore_skips_old_archive_tokens_when_the_store_has_tokens() {
+        use crate::tokens::{Role, TokenError, TokenStore};
+        let dir = tempfile::tempdir().unwrap();
+        let minted = Storage::new_local(dir.path().join("old").to_str().unwrap());
+        let raw = TokenStore::new(minted.clone())
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let key = minted.list_internal(tokens::STORAGE_PREFIX).await.unwrap()[0].clone();
+        let body = minted.get(&key).await.unwrap();
+        let name = key.strip_prefix(tokens::STORAGE_PREFIX).unwrap();
+        let archive_path = dir.path().join("old.tar.gz");
+        {
+            let gz = GzEncoder::new(File::create(&archive_path).unwrap(), Compression::default());
+            let mut tar = tar::Builder::new(gz);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o600);
+            header.set_cksum();
+            tar.append_data(&mut header, format!(".nora-local/tokens/{name}"), &body[..])
+                .unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let other = TokenStore::new(storage.clone())
+            .create_token("ops", 30, None, Role::Read)
+            .await
+            .unwrap();
+
+        let stats = restore_backup(&storage, &archive_path, false)
+            .await
+            .unwrap();
+        assert_eq!((stats.tokens_skipped, stats.local_files), (1, 0));
+        let fresh = TokenStore::new(storage);
+        assert!(matches!(
+            fresh.verify_token(&raw).await,
+            Err(TokenError::NotFound)
+        ));
+        fresh.verify_token(&other).await.unwrap();
+    }
+
+    /// A025: a restore onto a store without token records that was cut short after some
+    /// of them resumes on a rerun: the rest are written, not left out as revoked.
+    #[tokio::test]
+    async fn an_interrupted_restore_onto_an_empty_store_resumes() {
+        use crate::tokens::{Role, TokenStore};
+        let dir = tempfile::tempdir().unwrap();
+        let src = Storage::new_local(dir.path().join("src").to_str().unwrap());
+        let store = TokenStore::new(src.clone());
+        let first = store
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let second = store
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let backup_file = dir.path().join("backup.tar.gz");
+        create_backup(&src, &backup_file).await.unwrap();
+
+        // What the cut-short run left: its marker and one of the two records.
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        storage.put(RESTORE_MARKER, b"").await.unwrap();
+        let key = src.list_internal(tokens::STORAGE_PREFIX).await.unwrap()[0].clone();
+        storage
+            .put(&key, &src.get(&key).await.unwrap())
+            .await
+            .unwrap();
+
+        let stats = restore_backup(&storage, &backup_file, false).await.unwrap();
+        assert_eq!(stats.tokens_skipped, 0);
+        let fresh = TokenStore::new(storage.clone());
+        fresh.verify_token(&first).await.unwrap();
+        fresh.verify_token(&second).await.unwrap();
+        assert!(
+            storage.stat(RESTORE_MARKER).await.is_none(),
+            "a finished restore drops its marker"
+        );
     }
 }
