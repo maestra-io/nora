@@ -81,6 +81,9 @@ fi
 
 if [ -n "$states" ]; then
     while read -r path state; do
+        # dynamic/*: GitHub's own workflows (Dependabot's dependency graph for a manifest
+        # such as maestra/scripts/import/requirements.txt), not files of this repository.
+        case "$path" in dynamic/*) continue ;; esac
         file=$(basename "$path")
         case "$file" in maestra-*) continue ;; esac
         listed "$file" "$ACTIVE" && continue

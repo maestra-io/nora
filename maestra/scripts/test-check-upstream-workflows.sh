@@ -34,6 +34,9 @@ run; expect "an enabled upstream release is reported" 1 "release.yml is active o
 printf '%s\n' ".github/workflows/new-upstream.yml active" > "$TMP/states"
 run; expect "an active workflow known only to GitHub is reported" 1 "new-upstream.yml is active on GitHub"
 
+printf '%s\n' "dynamic/dependabot/update-graph active" > "$TMP/states"
+run; expect "GitHub's dynamic Dependabot workflow is not an upstream one" 0 "upstream workflows OK"
+
 # Release gate (audit A016), on edited copies of the real maestra-release.yml.
 printf '%s\n' ".github/workflows/release.yml disabled_manually" > "$TMP/states"
 release_variant() { # description, expected output fragment, sed program
