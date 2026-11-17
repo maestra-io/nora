@@ -15,7 +15,8 @@
 //! (`/repos/{owner}/{repo}/releases/tags/{tag}`, cached under `github/meta/` for
 //! `metadata_ttl`, a stale copy served on upstream error): its `published_at` is the
 //! release date for `min_release_age` (`[curation.github]`, package `owner/repo`,
-//! version = tag) and, with `server.trust_upstream_dates`, the quarantine's first seen;
+//! version = tag) and, with `server.trust_upstream_dates`, the quarantine's first seen
+//! (an uncached asset uploaded after its release is dated by its own `created_at`);
 //! an asset it does not list is a 404 and never fetched; its asset `digest` (sha256)
 //! must match the body. Assets are fetched only from `download_url` through the SSRF
 //! guard, every redirect hop pinned to that host, the API host and GitHub's asset CDN,
@@ -67,12 +68,16 @@ pub fn routes() -> Router<AppState> {
     )
 }
 
-/// What NORA keeps of a release: its date and its assets' digests.
+/// What NORA keeps of a release: its date and its assets' digests and upload dates.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 struct Release {
     published_at: Option<String>,
     /// Asset file name (as in its download URL) → hex sha256, when GitHub has one.
     assets: BTreeMap<String, Option<String>>,
+    /// Asset file name → when its bytes were uploaded (`created_at`). A field of its
+    /// own, so a record written before it (or read by a binary without it) still parses.
+    #[serde(default)]
+    asset_dates: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -87,6 +92,10 @@ struct ApiAsset {
     name: String,
     browser_download_url: Option<String>,
     digest: Option<String>,
+    /// The upload: a file's bytes change only by a delete and re-upload, which gives a
+    /// new `created_at`; `updated_at` also moves on a label edit.
+    created_at: Option<String>,
+    updated_at: Option<String>,
 }
 
 /// `s` as a lowercase hex sha256, when it is one.
@@ -97,6 +106,7 @@ pub(crate) fn hex_sha256(s: &str) -> Option<String> {
 impl Release {
     fn from_api(body: &[u8]) -> Result<Self, String> {
         let api: ApiRelease = serde_json::from_slice(body).map_err(|e| e.to_string())?;
+        let mut asset_dates = BTreeMap::new();
         let assets = api
             .assets
             .into_iter()
@@ -115,12 +125,16 @@ impl Release {
                     .as_deref()
                     .and_then(|d| d.strip_prefix("sha256:"))
                     .and_then(hex_sha256);
+                if let Some(date) = a.created_at.or(a.updated_at) {
+                    asset_dates.insert(file.clone(), date);
+                }
                 (file, sha256)
             })
             .collect();
         Ok(Self {
             published_at: api.published_at,
             assets,
+            asset_dates,
         })
     }
 }
@@ -275,14 +289,50 @@ async fn cached_record<T: DeserializeOwned>(
     serde_json::from_slice(&state.storage.get(key).await.ok()?).ok()
 }
 
+/// How long an upstream's "no such release" is remembered, so asking again for a
+/// release that does not exist costs no API call (audit A065).
+const NOT_FOUND_TTL: Duration = Duration::from_secs(300);
+/// The most "no such release" answers remembered; past it the memory starts over.
+const NOT_FOUND_MAX: usize = 10_000;
+
+/// Remembered "no such release" answers, by upstream and record key, with when each
+/// was given. In memory only: a restart forgets them, and a record another process
+/// stores is still found first.
+fn not_found(
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<String, std::time::Instant>> {
+    static NOT_FOUND: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::LazyLock::new(Default::default);
+    NOT_FOUND
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn known_not_found(id: &str) -> bool {
+    not_found()
+        .get(id)
+        .is_some_and(|at| at.elapsed() < NOT_FOUND_TTL)
+}
+
+fn remember_not_found(id: String) {
+    let mut map = not_found();
+    map.retain(|_, at| at.elapsed() < NOT_FOUND_TTL);
+    if map.len() >= NOT_FOUND_MAX {
+        map.clear();
+    }
+    map.insert(id, std::time::Instant::now());
+}
+
 /// The release record under `key`, fetched by `fetch` (which names the URL it failed
 /// on) once `ttl` seconds have passed, or the response to give when there is none.
 /// One refresh per record runs at a time; a request arriving meanwhile gets the stale
 /// copy at once, or (with none) waits for the refresh. Any upstream failure falls back
-/// to the last copy: a record only dates a release and lists its digests.
+/// to the last copy: a record only dates a release and lists its digests. An
+/// upstream's (`api`) "not found" with no copy is remembered for [`NOT_FOUND_TTL`].
 pub(crate) async fn load_record<T, F, Fut>(
     state: &AppState,
     registry: &'static str,
+    api: &str,
     key: &str,
     ttl: i64,
     fetch: F,
@@ -294,6 +344,10 @@ where
 {
     if let Some(record) = cached_record(state, key, Some(ttl)).await {
         return Ok(record);
+    }
+    let not_found_id = format!("{api}\n{key}");
+    if known_not_found(&not_found_id) {
+        return Err(StatusCode::NOT_FOUND.into_response());
     }
     let lock = state.publish_lock(key);
     let _refresh = match lock.try_lock() {
@@ -307,6 +361,10 @@ where
     };
     if let Some(record) = cached_record(state, key, Some(ttl)).await {
         return Ok(record);
+    }
+    // A request that waited on the lock shares the answer of the one it waited for.
+    if known_not_found(&not_found_id) {
+        return Err(StatusCode::NOT_FOUND.into_response());
     }
     let (url, err) = match fetch().await {
         Ok(record) => {
@@ -329,17 +387,23 @@ where
         return Ok(record);
     }
     Err(match err {
-        ProxyError::NotFound => StatusCode::NOT_FOUND.into_response(),
+        ProxyError::NotFound => {
+            remember_not_found(not_found_id);
+            StatusCode::NOT_FOUND.into_response()
+        }
         ProxyError::CircuitOpen(reg) => circuit_open_response(&reg),
         e => proxy_error_response(registry, &url, &e),
     })
 }
 
-/// GET `url` capped at [`MAX_RECORD_BYTES`], the URL named on failure.
+/// GET `url` capped at [`MAX_RECORD_BYTES`], the URL named on failure. The circuit
+/// breaker is the one of `breaker_base` (the API), so a rate limit or an outage backs
+/// off every record lookup, not only the release that hit it (audit A065).
 pub(crate) async fn fetch_record(
     state: &AppState,
     up: &Upstream,
     registry: RegistryType,
+    breaker_base: &str,
     url: &str,
     auth: Option<UpstreamAuth<'_>>,
 ) -> Result<axum::body::Bytes, (String, ProxyError)> {
@@ -351,7 +415,7 @@ pub(crate) async fn fetch_record(
         Duration::from_secs(up.timeout),
         auth,
         &state.circuit_breaker,
-        BreakerScope::upstream(registry, url),
+        BreakerScope::upstream(registry, breaker_base),
         MAX_RECORD_BYTES,
     )
     .await
@@ -387,25 +451,33 @@ async fn asset(
     let up = github_upstream(&state);
     // The release record is required even for a cached asset: it is the release date.
     let key = format!("github/meta/{owner_key}/{repo_key}/{}.json", tag_key(&tag));
-    let release: Release = match load_record(&state, "github", &key, cfg.metadata_ttl, || async {
-        let url = join_segments(
-            &cfg.api_url,
-            &["repos", &owner, &repo, "releases", "tags", &tag],
-        )
-        .ok_or_else(|| (cfg.api_url.clone(), ProxyError::Upstream(502)))?;
-        let body = fetch_record(
-            &state,
-            &up,
-            RegistryType::Github,
-            &url,
-            crate::secrets::expose_opt(&cfg.token).map(UpstreamAuth::Bearer),
-        )
-        .await?;
-        Release::from_api(&body).map_err(|e| {
-            tracing::warn!(url = %url, error = %e, "github: release record unreadable");
-            (url.clone(), ProxyError::Upstream(502))
-        })
-    })
+    let release: Release = match load_record(
+        &state,
+        "github",
+        &cfg.api_url,
+        &key,
+        cfg.metadata_ttl,
+        || async {
+            let url = join_segments(
+                &cfg.api_url,
+                &["repos", &owner, &repo, "releases", "tags", &tag],
+            )
+            .ok_or_else(|| (cfg.api_url.clone(), ProxyError::Upstream(502)))?;
+            let body = fetch_record(
+                &state,
+                &up,
+                RegistryType::Github,
+                &cfg.api_url,
+                &url,
+                crate::secrets::expose_opt(&cfg.token).map(UpstreamAuth::Bearer),
+            )
+            .await?;
+            Release::from_api(&body).map_err(|e| {
+                tracing::warn!(url = %url, error = %e, "github: release record unreadable");
+                (url.clone(), ProxyError::Upstream(502))
+            })
+        },
+    )
     .await
     {
         Ok(release) => release,
@@ -431,6 +503,10 @@ async fn asset(
                 .published_at
                 .as_deref()
                 .and_then(crate::curation::parse_iso8601_to_unix),
+            file_date: release
+                .asset_dates
+                .get(&file)
+                .and_then(|d| crate::curation::parse_iso8601_to_unix(d)),
             expected,
             key: format!(
                 "github/releases/{owner_key}/{repo_key}/{}/{file}",
@@ -455,6 +531,9 @@ pub(crate) struct Asset<'a> {
     pub version: &'a str,
     /// Release date (unix seconds) from the upstream's own record.
     pub published: Option<i64>,
+    /// When the upstream got this file (unix seconds), which can be after the release:
+    /// a file added or re-uploaded later. `None` when the record does not say.
+    pub file_date: Option<i64>,
     /// Hex sha256 the upstream publishes for the file, when it has one.
     pub expected: Option<String>,
     pub key: String,
@@ -535,6 +614,36 @@ pub(crate) async fn serve_asset(state: &AppState, headers: &HeaderMap, a: Asset<
         let len = cached.len();
         return asset_response(Some(len), cached.into_body(state, reg, &a.key, false));
     }
+
+    // A miss fetches the file as the upstream has it now, so its age is that of its own
+    // upload when later than the release: a file added to or replaced in an old release
+    // (audit A064). A cached copy, served above, is the one first seen.
+    if let Some(file_date) = a.file_date.filter(|f| a.published.is_none_or(|p| *f > p)) {
+        tracing::info!(
+            registry = reg,
+            label = %a.label,
+            release_date = ?a.published,
+            file_date,
+            "release asset uploaded after its release: dated by its upload"
+        );
+        if let Some(response) = crate::curation::check_download(
+            engine,
+            state.bypass_token().as_deref(),
+            headers,
+            a.registry,
+            a.name,
+            crate::curation::RequestVersion::Known(a.version.to_string()),
+            Some(file_date),
+        ) {
+            return response;
+        }
+    }
+    // With no file date (a record read before asset dates were) the quarantine keeps
+    // its own clock rather than the release's.
+    let publish_date = crate::digest_quarantine::first_seen_seed(
+        state.config.server.trust_upstream_dates,
+        a.file_date.map(|f| a.published.map_or(f, |p| p.max(f))),
+    );
 
     // A published digest is the one the file must have: curation and the quarantine
     // decide on it before the fetch, so a GET streams the file as it downloads (R4-P03)
@@ -759,6 +868,31 @@ mod tests {
         assert_eq!(release.assets.get("bad.tgz"), Some(&None));
         assert!(Release::from_api(b"not json").is_err());
     }
+
+    /// Each asset keeps its own upload date (`created_at`, else `updated_at`), and a
+    /// record stored before asset dates were read still parses (audit A064).
+    #[test]
+    fn reads_asset_upload_dates_and_old_records() {
+        let body = br#"{"published_at":"2020-01-01T00:00:00Z","assets":[
+            {"name":"new.bin","created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-03T00:00:00Z"},
+            {"name":"edited.bin","updated_at":"2026-01-04T00:00:00Z"},
+            {"name":"undated.bin"}]}"#;
+        let release = Release::from_api(body).unwrap();
+        assert_eq!(
+            release.asset_dates.get("new.bin").map(String::as_str),
+            Some("2026-01-02T00:00:00Z")
+        );
+        assert_eq!(
+            release.asset_dates.get("edited.bin").map(String::as_str),
+            Some("2026-01-04T00:00:00Z")
+        );
+        assert!(!release.asset_dates.contains_key("undated.bin"));
+        let old: Release =
+            serde_json::from_str(r#"{"published_at":"2020-01-01T00:00:00Z","assets":{"a":null}}"#)
+                .unwrap();
+        assert!(old.asset_dates.is_empty());
+        assert_eq!(old.assets.get("a"), Some(&None));
+    }
 }
 
 #[cfg(test)]
@@ -787,6 +921,19 @@ mod integration_tests {
         assets: &[(&str, &[u8], bool)],
     ) -> MockServer {
         let server = MockServer::start().await;
+        mount_github(&server, tag_path, tag, published, None, assets).await;
+        server
+    }
+
+    /// [`github`] on `server`, each asset uploaded at `created` when given.
+    async fn mount_github(
+        server: &MockServer,
+        tag_path: &str,
+        tag: &str,
+        published: &str,
+        created: Option<&str>,
+        assets: &[(&str, &[u8], bool)],
+    ) {
         let list: Vec<serde_json::Value> = assets
             .iter()
             .map(|(file, body, digest)| {
@@ -794,6 +941,7 @@ mod integration_tests {
                     "name": file,
                     "browser_download_url": format!("https://github.com/o/r/releases/download/{tag_path}/{file}"),
                     "digest": digest.then(|| format!("sha256:{}", sha(body))),
+                    "created_at": created,
                 })
             })
             .collect();
@@ -802,7 +950,7 @@ mod integration_tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({"tag_name": tag, "published_at": published, "assets": list}),
             ))
-            .mount(&server)
+            .mount(server)
             .await;
         for (file, body, _) in assets {
             Mock::given(method("GET"))
@@ -811,15 +959,14 @@ mod integration_tests {
                     ResponseTemplate::new(302)
                         .insert_header("location", format!("{}/cdn/{file}", server.uri())),
                 )
-                .mount(&server)
+                .mount(server)
                 .await;
             Mock::given(method("GET"))
                 .and(path(format!("/cdn/{file}")))
                 .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
-                .mount(&server)
+                .mount(server)
                 .await;
         }
-        server
     }
 
     fn configure(cfg: &mut crate::config::Config, server: &MockServer) {
@@ -1050,5 +1197,160 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let resp = get(&ctx, "/github/o/r/releases/download/v500/a.bin").await;
         assert!(resp.status().is_server_error(), "{}", resp.status());
+    }
+
+    /// A file uploaded to an old release today is as young as its upload: refused by
+    /// the release-age rule and held by the quarantine; the same file uploaded with the
+    /// release is served (audit A064).
+    #[tokio::test]
+    async fn a_file_added_to_an_old_release_is_dated_by_its_upload() {
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        for (created, want) in [
+            (Some(now.as_str()), StatusCode::FORBIDDEN),
+            (Some(OLD), StatusCode::OK),
+            (None, StatusCode::OK),
+        ] {
+            let server = MockServer::start().await;
+            mount_github(&server, "v1", "v1", OLD, created, &[("a.bin", b"a", true)]).await;
+            let age = create_test_context_with_config(|cfg| {
+                configure(cfg, &server);
+                cfg.curation.mode = CurationMode::Enforce;
+                cfg.curation.github.min_release_age = Some("3d".into());
+            });
+            let resp = get(&age, "/github/o/r/releases/download/v1/a.bin").await;
+            assert_eq!(resp.status(), want, "age, uploaded {created:?}");
+            if want == StatusCode::FORBIDDEN {
+                assert_eq!(resp.headers()["x-nora-rule"], "min-release-age");
+            }
+            let held = create_test_context_with_config(|cfg| {
+                configure(cfg, &server);
+                cfg.curation.github.quarantine = Some(QuarantineMode::Enforce);
+                cfg.curation.github.quarantine_ttl = Some("3d".into());
+                cfg.server.trust_upstream_dates = true;
+            });
+            let resp = get(&held, "/github/o/r/releases/download/v1/a.bin").await;
+            // Undated, the quarantine keeps its own clock: a never-seen digest is held.
+            let want = if created.is_none() {
+                StatusCode::FORBIDDEN
+            } else {
+                want
+            };
+            assert_eq!(resp.status(), want, "quarantine, uploaded {created:?}");
+            if want == StatusCode::FORBIDDEN {
+                assert!(resp.headers().contains_key("x-nora-quarantine"));
+            }
+        }
+    }
+
+    /// A copy cached before its file was replaced upstream is still the one served: the
+    /// upload date only judges a fetch (audit A064).
+    #[tokio::test]
+    async fn a_cached_asset_keeps_its_release_date() {
+        let server = MockServer::start().await;
+        mount_github(
+            &server,
+            "v1",
+            "v1",
+            OLD,
+            Some(OLD),
+            &[("a.bin", b"a", true)],
+        )
+        .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            configure(cfg, &server);
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.github.min_release_age = Some("3d".into());
+        });
+        let holders = ctx.state.storage.holders();
+        let resp = get(&ctx, "/github/o/r/releases/download/v1/a.bin").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"a".as_slice());
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
+        ctx.state
+            .storage
+            .delete("github/meta/o/r/v1.json")
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        server.reset().await;
+        mount_github(
+            &server,
+            "v1",
+            "v1",
+            OLD,
+            Some(&now),
+            &[("a.bin", b"b", true)],
+        )
+        .await;
+        let resp = get(&ctx, "/github/o/r/releases/download/v1/a.bin").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"a".as_slice());
+    }
+
+    /// A release the API does not know is asked about once per [`super::NOT_FOUND_TTL`],
+    /// however many requests, in sequence or at once, ask for it (audit A065).
+    #[tokio::test]
+    async fn an_unknown_release_is_asked_about_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex(
+                "^/api/repos/o/r/releases/tags/",
+            ))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| configure(cfg, &server));
+        let calls = || async { server.received_requests().await.unwrap().len() };
+        let uri = "/github/o/r/releases/download/nope-a065/a.bin";
+        for _ in 0..6 {
+            assert_eq!(get(&ctx, uri).await.status(), StatusCode::NOT_FOUND);
+        }
+        let at_once = futures::future::join_all((0..6).map(|_| get(&ctx, uri))).await;
+        assert!(at_once.iter().all(|r| r.status() == StatusCode::NOT_FOUND));
+        assert_eq!(calls().await, 1);
+        for tag in ["gone-a065-1", "gone-a065-2", "gone-a065-3"] {
+            let uri = format!("/github/o/r/releases/download/{tag}/a.bin");
+            assert_eq!(get(&ctx, &uri).await.status(), StatusCode::NOT_FOUND);
+            assert_eq!(get(&ctx, &uri).await.status(), StatusCode::NOT_FOUND);
+        }
+        assert_eq!(calls().await, 4);
+    }
+
+    /// An API rate limit (a 403 with `x-ratelimit-remaining: 0`) opens the breaker for
+    /// every release lookup: unknown releases answer 503 with Retry-After at no further
+    /// API call, a release with a stored record is served from it (audit A065).
+    #[tokio::test]
+    async fn an_api_rate_limit_backs_off_every_release() {
+        let server = github("v1", "v1", OLD, &[("a.bin", b"a", true)]).await;
+        let ctx = create_test_context_with_config(|cfg| {
+            configure(cfg, &server);
+            cfg.github.metadata_ttl = 1;
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 2;
+        });
+        let holders = ctx.state.storage.holders();
+        let v1 = "/github/o/r/releases/download/v1/a.bin";
+        assert_eq!(get(&ctx, v1).await.status(), StatusCode::OK);
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex("^/api/"))
+            .respond_with(ResponseTemplate::new(403).insert_header("x-ratelimit-remaining", "0"))
+            .mount(&server)
+            .await;
+        for i in 0..6 {
+            let resp = get(
+                &ctx,
+                &format!("/github/o/r/releases/download/new-{i}/a.bin"),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "new-{i}");
+            assert!(resp.headers().contains_key("retry-after"), "new-{i}");
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        let resp = get(&ctx, v1).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"a".as_slice());
     }
 }
