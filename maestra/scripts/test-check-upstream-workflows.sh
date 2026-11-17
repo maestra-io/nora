@@ -16,8 +16,10 @@ expect() { # description, expected exit code, expected output fragment
 }
 run() { OUT=$(WORKFLOWS_DIR="$TMP/wf" STATES_FILE="$TMP/states" bash "$CHECK" 2>&1); RC=$?; }
 
+REAL_RELEASE="$(cd "$(dirname "$0")/../.." && pwd)/.github/workflows/maestra-release.yml"
 mkdir "$TMP/wf"
 touch "$TMP/wf/maestra-ci.yml" "$TMP/wf/release.yml" "$TMP/wf/gitleaks.yml"
+cp "$REAL_RELEASE" "$TMP/wf/maestra-release.yml"
 printf '%s\n' ".github/workflows/maestra-ci.yml active" ".github/workflows/release.yml disabled_manually" \
     ".github/workflows/gitleaks.yml active" > "$TMP/states"
 run; expect "listed files, upstream release disabled: passes" 0 "upstream workflows OK"
@@ -31,5 +33,25 @@ run; expect "an enabled upstream release is reported" 1 "release.yml is active o
 
 printf '%s\n' ".github/workflows/new-upstream.yml active" > "$TMP/states"
 run; expect "an active workflow known only to GitHub is reported" 1 "new-upstream.yml is active on GitHub"
+
+# Release gate (audit A016), on edited copies of the real maestra-release.yml.
+printf '%s\n' ".github/workflows/release.yml disabled_manually" > "$TMP/states"
+release_variant() { # description, expected output fragment, sed program
+    sed "$3" "$REAL_RELEASE" > "$TMP/wf/maestra-release.yml"
+    run; expect "$1" 1 "$2"
+}
+release_variant "image job without the protected environment is reported" \
+    "job image is not in environment nora-release" '/^    environment: nora-release$/d'
+release_variant "image job in another environment is reported" \
+    "job image is not in environment nora-release" 's/^    environment: nora-release$/    environment: scratch/'
+release_variant "image job that skips verify and ci is reported" \
+    "job image does not need \[verify, ci\]" 's/^    needs: \[verify, ci\]$/    needs: []/'
+release_variant "an unanchored tag check is reported" \
+    "tag check accepts v1.4.3-maestra.15-unreviewed" 's/-maestra\\\.\[0-9\]+\$ \]\]/-maestra\\.[0-9]+ ]]/'
+# shellcheck disable=SC2016  # $GIT_TAG is matched literally
+release_variant "a tag check only in verify is reported" \
+    "do not share one" '/^  image:$/,$ s/\[\[ "\$GIT_TAG" =~ .* \]\]/true/'
+rm "$TMP/wf/maestra-release.yml"
+run; expect "a missing maestra-release.yml is reported" 1 "maestra-release.yml is missing"
 
 [ "$FAILURES" = 0 ] && echo "check-upstream-workflows self-test PASSED" || exit 1
