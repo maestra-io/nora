@@ -223,7 +223,8 @@ jobs:
         working-directory: maestra/scripts/import
         run: |
           python3 -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/pip" install --quiet requests==2.32.5
+          # The lock the daily sync installs: a broken one fails here first.
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet --require-hashes --only-binary=:all: -r requirements.txt
           for t in test_common test_enumerate test_import; do
             "$RUNNER_TEMP/venv/bin/python" "$t.py" || exit 1
           done

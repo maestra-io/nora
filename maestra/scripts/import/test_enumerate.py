@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import enumerate as en
@@ -30,8 +31,21 @@ def entry(ver, listed=True):
     return {"catalogEntry": {"version": ver, "listed": listed, "@id": f"leaf/{ver}"}, "packageContent": f"pkg/{ver}"}
 
 
-def leaf(size=10, algo="SHA512"):
-    return Response(body={"packageSize": size, "packageHash": "aGFzaA==", "packageHashAlgorithm": algo})
+def ago(**kw):
+    return (datetime.now(timezone.utc) - timedelta(**kw)).isoformat()
+
+
+OLD = ago(days=10)
+
+
+def leaf(size=10, algo="SHA512", **dates):
+    """A catalog leaf; released 10 days ago unless `created` / `published` are given (None drops the field)."""
+    dates = {k: v for k, v in (dates or {"created": OLD}).items() if v is not None}
+    return Response(body={"packageSize": size, "packageHash": "aGFzaA==", "packageHashAlgorithm": algo, **dates})
+
+
+def reg(*entries):
+    return Response(body={"items": [{"items": list(entries)}]})
 
 
 def with_http(routes):
@@ -136,23 +150,94 @@ def test_npm_missing_refuses_a_version_without_a_sha512_integrity():
             assert "@mindbox-cloud/a@1.0.0" in raises_exit(lambda: en.npm_missing(pkgs)), weak
 
 
-def test_nuget_takes_in_scope_files_and_adds_nuget_org_only_versions():
+def test_nuget_adds_nuget_org_versions_only_for_listed_public_ids():
+    # audit A002: an in-scope name on Artifactory does not make its nuget.org owner trusted.
     art_reg = f"{en.ART}/api/nuget/v3/nuget-local/registration-semver2"
     files = [{"uri": "/Mindbox.A.1.0.0.nupkg", "size": 5, "sha2": "aa"},
              {"uri": "/Mindbox.A.odd-name.1.0.nupkg", "size": 6, "sha2": "bb"},
              {"uri": "/Other.Lib.1.0.0.nupkg", "size": 7, "sha2": "cc"},
              {"uri": "/nested/Mindbox.B.1.0.0.nupkg", "size": 8, "sha2": "dd"}]
-    routes = {f"{art_reg}/mindbox.a/index.json": Response(body={"items": [{"items": [entry("1.0.0", listed=False)]}]}),
-              f"{REG}/mindbox.a/index.json": Response(body={"items": [{"items": [entry("1.0.0"), entry("0.5.0")]}]}),
+    routes = {f"{art_reg}/mindbox.a/index.json": reg(entry("1.0.0", listed=False)),
+              f"{REG}/mindbox.a/index.json": reg(entry("1.0.0"), entry("0.5.0")),
               f"{art_reg}/mindbox.a.odd-name/index.json": Response(404),
-              f"{REG}/mindbox.a.odd-name/index.json": Response(404)}
-    _, patched = with_http(routes)
-    with patched, mock.patch.object(en, "head_meta", lambda s, url: (11, None)):
-        pkgs, stray = en.nuget(files)
-    assert [p["id"] for p in pkgs] == ["Mindbox.A"] and pkgs[0]["on_nuget_org"] is True
+              "leaf/1.0.0": leaf(), "leaf/0.5.0": leaf(size=11)}
+    http, patched = with_http(routes)
+    with patched:
+        pkgs, stray = en.nuget(files, set(), timedelta(days=3))
+    assert not [url for url in http.sent("GET") if url.startswith(REG) or url.startswith("leaf/")]
+    assert [p["id"] for p in pkgs] == ["Mindbox.A"] and pkgs[0]["on_nuget_org"] is False
     assert [(v["version"], v["origin"], v["size"], v["sha256"], v["listed"]) for v in pkgs[0]["versions"]] == [
-        ("0.5.0", "nuget.org", 11, None, True), ("1.0.0", "artifactory", 5, "aa", False)]
+        ("1.0.0", "artifactory", 5, "aa", False)]
     assert stray == [{"file": "mindbox.a.odd-name.1.0.nupkg", "size": 6, "sha256": "bb"}]
+
+    _, patched = with_http(routes)
+    with patched:
+        pkgs, _ = en.nuget(files, {"mindbox.a"}, timedelta(days=3))
+    assert pkgs[0]["on_nuget_org"] is True
+    assert [(v["version"], v["origin"], v["size"], v.get("sha512"), v["listed"]) for v in pkgs[0]["versions"]] == [
+        ("0.5.0", "nuget.org", 11, "aGFzaA==", True), ("1.0.0", "artifactory", 5, None, False)]
+
+
+def test_a_version_younger_than_min_age_is_deferred():
+    # audit A102: a fresh nuget.org release waits out the same cooldown curation gives proxied ones.
+    routes = {f"{REG}/mindbox.a/index.json": reg(*(entry(v) for v in ("1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0"))),
+              "leaf/1.0.0": leaf(created=OLD),
+              "leaf/1.1.0": leaf(created=ago(hours=1)),
+              "leaf/1.2.0": leaf(created=None),  # no date at all
+              "leaf/1.3.0": leaf(published=OLD),  # no `created`: `published` dates it
+              "leaf/1.4.0": leaf(published="1900-01-01T00:00:00+00:00"),  # nuget.org's unlisted marker
+              "leaf/1.5.0": leaf(created="not a date")}
+    _, patched = with_http(routes)
+    with patched, mock.patch("builtins.print"):
+        [pkg] = en.nuget_org(["Mindbox.A"], False, timedelta(days=3))
+        assert [v["version"] for v in pkg["versions"]] == ["1.0.0", "1.3.0"]
+        [pkg] = en.nuget_org(["Mindbox.A"], False, timedelta(0))
+        assert [v["version"] for v in pkg["versions"]] == ["1.0.0", "1.1.0", "1.3.0"]
+        [pkg] = en.nuget_org(["Mindbox.A"], False)
+        assert [v["version"] for v in pkg["versions"]] == ["1.0.0", "1.3.0"], "the default is not 3 days"
+
+
+def test_min_age_parses_days_and_hours_only():
+    assert en.parse_age("3d") == timedelta(days=3) and en.parse_age("12h") == timedelta(hours=12)
+    assert en.parse_age("0d") == timedelta(0)
+    for bad in ("", "3", "-1d", "3w", "1.5d", "3d; x"):
+        try:
+            en.parse_age(bad)
+        except en.argparse.ArgumentTypeError:
+            continue
+        raise AssertionError(f"{bad!r} parsed")
+
+
+def test_a_listed_id_missing_on_nuget_org_stops_the_run():
+    # audit A102: an unregistered listed ID would be imported whole once anyone registers it.
+    _, patched = with_http({f"{REG}/mindbox.gone/index.json": Response(404)})
+    with patched:
+        assert "Mindbox.Gone" in raises_exit(lambda: en.nuget_org(["Mindbox.Gone"], False))
+
+
+def test_hosted_version_unlisted_upstream_is_emitted_unlist_only():
+    # audit A102: an unlist on nuget.org after the import reaches nora; no leaf is fetched for it.
+    routes = {f"{REG}/mindbox.a/index.json": reg(entry("1.0.0", listed=False), entry("1.1.0"), entry("2.0.0")),
+              f"{en.NORA}/nuget/v3/flatcontainer/mindbox.a/index.json": Response(body={"versions": ["1.0.0", "1.1.0"]}),
+              "leaf/2.0.0": leaf()}
+    _, patched = with_http(routes)
+    with patched:
+        [pkg] = en.nuget_org(["Mindbox.A"], missing_only=True)
+    assert pkg["versions"][0] == {"version": "1.0.0", "listed": False, "unlist_only": True, "size": 0,
+                                  "origin": "nuget.org"}
+    assert [v["version"] for v in pkg["versions"]] == ["1.0.0", "2.0.0"]
+    assert en.totals([pkg], "versions")["artifacts"] == 2
+
+
+def test_pypi_reads_only_the_repository_the_operator_names():
+    # audit A002: the `pypi` virtual repository also answers from its public remotes.
+    os.environ.pop("ART_PYPI_REPO", None)
+    assert "ART_PYPI_REPO" in raises_exit(en.pypi)
+    routes = {f"{en.ART}/api/pypi/pypi-local/simple/{n}/": Response(404, text="nf") for n in en.PYPI_NAMES}
+    http, patched = with_http(routes)
+    with patched, mock.patch.dict(os.environ, {"ART_PYPI_REPO": "pypi-local"}):
+        got = en.pypi()
+    assert [e["status"] for e in got] == [404] * len(en.PYPI_NAMES) and len(http.calls) == len(en.PYPI_NAMES)
 
 
 def test_links_and_totals():
@@ -172,15 +257,15 @@ def test_main_reads_the_id_file_without_comments_and_blank_lines():
             f.write("# public IDs\nMindbox.A\n\n  Mindbox.B  # moved in 2026\n#Mindbox.C\n")
         seen = {}
 
-        def fake_nuget_org(id_list, missing_only):
-            seen.update(ids=id_list, missing_only=missing_only)
+        def fake_nuget_org(id_list, missing_only, min_age):
+            seen.update(ids=id_list, missing_only=missing_only, min_age=min_age)
             return [{"id": i, "on_nuget_org": True, "versions": []} for i in id_list]
 
-        argv = ["enumerate.py", "--nuget-org-ids", ids, "--missing-only", "--out", out]
+        argv = ["enumerate.py", "--nuget-org-ids", ids, "--missing-only", "--min-age", "0d", "--out", out]
         with mock.patch.object(en, "nuget_org", fake_nuget_org), mock.patch.object(sys, "argv", argv), \
                 mock.patch("builtins.print"):
             en.main()
-        assert seen == {"ids": ["Mindbox.A", "Mindbox.B"], "missing_only": True}
+        assert seen == {"ids": ["Mindbox.A", "Mindbox.B"], "missing_only": True, "min_age": timedelta(0)}
         with open(out) as f:
             manifest = json.load(f)
         assert [p["id"] for p in manifest["nuget"]] == ["Mindbox.A", "Mindbox.B"]
