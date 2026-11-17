@@ -1404,18 +1404,25 @@ impl Config {
         }
 
         // 6c. `[go] attested_dates` reads only proxy.golang.org's `Last-Modified`.
-        if self.go.attested_dates
-            && !self
+        if self.go.enabled && self.go.attested_dates {
+            if !self
                 .go
                 .proxy
                 .as_deref()
                 .is_some_and(GoConfig::attests_first_fetch)
-        {
-            warnings.push(format!(
-                "go.attested_dates is on but go.proxy={:?} is not https://proxy.golang.org: \
-                 ignored, Go versions are dated by NORA's first sight",
-                self.go.proxy.as_deref().unwrap_or("")
-            ));
+            {
+                warnings.push(format!(
+                    "go.attested_dates is on but go.proxy={:?} is not https://proxy.golang.org: \
+                     ignored, Go versions are dated by NORA's first sight",
+                    self.go.proxy.as_deref().unwrap_or("")
+                ));
+            } else if !self.server.trust_upstream_dates {
+                warnings.push(
+                    "go.attested_dates is on but server.trust_upstream_dates is off: ignored, \
+                     no Go release date is read"
+                        .to_string(),
+                );
+            }
         }
 
         // 7. Trusted proxies /0 — security footgun

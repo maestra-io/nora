@@ -1,7 +1,8 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 //! One memoised lookup of an upstream's release dates (the RubyGems versions API, the
-//! registry.terraform.io `/v2` API, Maven Central), shared by every request that needs it.
+//! registry.terraform.io `/v2` API, Maven Central, a Go zip's `Last-Modified` on
+//! proxy.golang.org), shared by every request that needs it.
 //!
 //! A key is fetched once at a time: concurrent callers await the same fetch. An answer is
 //! kept for the format's `metadata_ttl`, a miss (404, 429, 5xx, timeout, an open breaker) for
