@@ -757,16 +757,23 @@ fn record_id(key: &str) -> Option<&str> {
         .filter(|id| is_valid_hash_prefix(id))
 }
 
+/// The checks [`import_record`] makes before it writes: a flat `<16hex>.json` name and a
+/// parsable [`TokenInfo`].
+pub fn check_record(name: &str, data: &[u8]) -> Result<(), String> {
+    if !name.strip_suffix(".json").is_some_and(is_valid_hash_prefix) {
+        return Err(format!("not a token record name: {name:?}"));
+    }
+    serde_json::from_slice::<TokenInfo>(data)
+        .map(drop)
+        .map_err(|e| format!("token record {name} is not valid: {e}"))
+}
+
 /// Store a token record from a pre-storage backup archive (`.nora-local/tokens/<name>`)
 /// under [`STORAGE_PREFIX`], replacing a record of the same name. The name and body
 /// come from an archive, so both are checked: a flat `<16hex>.json` name and a
 /// parsable [`TokenInfo`].
 pub async fn import_record(storage: &Storage, name: &str, data: &[u8]) -> Result<(), String> {
-    if !name.strip_suffix(".json").is_some_and(is_valid_hash_prefix) {
-        return Err(format!("not a token record name: {name:?}"));
-    }
-    serde_json::from_slice::<TokenInfo>(data)
-        .map_err(|e| format!("token record {name} is not valid: {e}"))?;
+    check_record(name, data)?;
     storage
         .put(&format!("{STORAGE_PREFIX}{name}"), data)
         .await

@@ -840,6 +840,7 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
     if !htpasswd_peer_ok && request.uri().path().starts_with("/api/tokens") {
         return (
             StatusCode::FORBIDDEN,
+            [(header::CACHE_CONTROL, "no-store")],
             "Password authentication is not accepted from this address",
         )
             .into_response();

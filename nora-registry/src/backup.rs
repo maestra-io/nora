@@ -49,6 +49,9 @@ pub struct BackupMetadata {
 /// `.nora-` keys are internal, so no artifact key can collide with it.
 const LOCAL_PREFIX: &str = ".nora-local/";
 const LOCAL_TOKENS: &str = "tokens/";
+/// Present while a restore writes token records into a store that had none, so a rerun
+/// after a failure writes the rest instead of treating the store as the authority.
+const RESTORE_MARKER: &str = ".nora-tokens/restore_in_progress";
 
 /// Statistics returned after backup
 #[derive(Debug)]
@@ -283,6 +286,17 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
     Ok(stats)
 }
 
+/// Write [`RESTORE_MARKER`] once, before the first token record a restore writes.
+async fn mark_token_restore(storage: &Storage, unmarked: &mut bool) -> Result<(), String> {
+    if std::mem::take(unmarked) {
+        storage
+            .put(RESTORE_MARKER, b"")
+            .await
+            .map_err(|e| format!("Failed to store {}: {}", RESTORE_MARKER, e))?;
+    }
+    Ok(())
+}
+
 /// Restore artifacts from a backup file.
 ///
 /// A store that already holds token records is the authority on which tokens exist: a
@@ -357,17 +371,27 @@ pub async fn restore_backup(
     let mut quarantine_restored = false;
     let write_times = metadata.as_ref().is_some_and(|m| m.write_times);
     let mut writes = digest_quarantine::CarriedWrites::default();
-    let store_tokens: std::collections::HashSet<String> = if include_tokens {
-        Default::default()
+    let listed = if include_tokens {
+        Vec::new()
     } else {
         storage
             .list_internal(tokens::STORAGE_PREFIX)
             .await
             .map_err(|e| format!("storage list failed: {}", e))?
-            .into_iter()
-            .filter(|k| tokens::is_record_key(k))
-            .collect()
     };
+    // A restore that began on a store without token records and was cut short resumes
+    // as one: the records it wrote do not make the store the authority.
+    let resumed = listed.iter().any(|k| k == RESTORE_MARKER);
+    let store_tokens: std::collections::HashSet<String> = listed
+        .into_iter()
+        .filter(|k| !resumed && tokens::is_record_key(k))
+        .collect();
+    if resumed {
+        println!("Resuming a restore that began on a store without token records");
+    }
+    // Written before the first token record (below), dropped when the restore completes.
+    let marked = !include_tokens && store_tokens.is_empty();
+    let mut unmarked = marked;
     let mut tokens_skipped = 0;
     // A record the store has is the same (records are immutable); one it lacks is counted.
     let mut skip_token_state = |key: &str| {
@@ -425,7 +449,11 @@ pub async fn restore_backup(
                     pb.inc(1);
                     continue;
                 }
-                Some(record) => tokens::import_record(storage, record, &data).await?,
+                Some(record) => {
+                    tokens::check_record(record, &data)?;
+                    mark_token_restore(storage, &mut unmarked).await?;
+                    tokens::import_record(storage, record, &data).await?
+                }
                 None => return Err(format!("Unknown local-state entry {path}")),
             }
             local_files += 1;
@@ -436,7 +464,9 @@ pub async fn restore_backup(
             pb.inc(1);
             continue;
         }
-        if path.starts_with(tokens::STORAGE_PREFIX) && skip_token_state(&path) {
+        if path == RESTORE_MARKER
+            || path.starts_with(tokens::STORAGE_PREFIX) && skip_token_state(&path)
+        {
             pb.inc(1);
             continue;
         }
@@ -452,6 +482,9 @@ pub async fn restore_backup(
         }
         quarantine_restored |= path.starts_with(digest_quarantine::ENTRY_PREFIX);
 
+        if path.starts_with(tokens::STORAGE_PREFIX) {
+            mark_token_restore(storage, &mut unmarked).await?;
+        }
         // Put to storage
         storage
             .put(&path, &data)
@@ -478,6 +511,13 @@ pub async fn restore_backup(
         match storage.delete(digest_quarantine::SNAPSHOT_KEY).await {
             Ok(()) | Err(crate::storage::StorageError::NotFound) => {}
             Err(e) => return Err(format!("Failed to drop the quarantine snapshot: {e}")),
+        }
+    }
+
+    if marked && !unmarked {
+        match storage.delete(RESTORE_MARKER).await {
+            Ok(()) | Err(crate::storage::StorageError::NotFound) => {}
+            Err(e) => return Err(format!("Failed to drop {}: {}", RESTORE_MARKER, e)),
         }
     }
 
@@ -1164,5 +1204,44 @@ mod tests {
             Err(TokenError::NotFound)
         ));
         fresh.verify_token(&other).await.unwrap();
+    }
+
+    /// A025: a restore onto a store without token records that was cut short after some
+    /// of them resumes on a rerun: the rest are written, not left out as revoked.
+    #[tokio::test]
+    async fn an_interrupted_restore_onto_an_empty_store_resumes() {
+        use crate::tokens::{Role, TokenStore};
+        let dir = tempfile::tempdir().unwrap();
+        let src = Storage::new_local(dir.path().join("src").to_str().unwrap());
+        let store = TokenStore::new(src.clone());
+        let first = store
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let second = store
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let backup_file = dir.path().join("backup.tar.gz");
+        create_backup(&src, &backup_file).await.unwrap();
+
+        // What the cut-short run left: its marker and one of the two records.
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        storage.put(RESTORE_MARKER, b"").await.unwrap();
+        let key = src.list_internal(tokens::STORAGE_PREFIX).await.unwrap()[0].clone();
+        storage
+            .put(&key, &src.get(&key).await.unwrap())
+            .await
+            .unwrap();
+
+        let stats = restore_backup(&storage, &backup_file, false).await.unwrap();
+        assert_eq!(stats.tokens_skipped, 0);
+        let fresh = TokenStore::new(storage.clone());
+        fresh.verify_token(&first).await.unwrap();
+        fresh.verify_token(&second).await.unwrap();
+        assert!(
+            storage.stat(RESTORE_MARKER).await.is_none(),
+            "a finished restore drops its marker"
+        );
     }
 }

@@ -2159,6 +2159,21 @@ async fn token_route_replies_are_not_stored() {
         assert_eq!(response.status(), want, "{uri}");
         assert_eq!(response.headers()["cache-control"], "no-store", "{uri}");
     }
+
+    // A password from a peer outside htpasswd_allowed_peers is refused before the routes.
+    let ctx = create_test_context_with_auth_and_config(&[("admin", "secret")], |cfg| {
+        cfg.auth.htpasswd_allowed_peers = Some(crate::config::TrustedProxies::parse("10.255.255.1"))
+    });
+    let response = send_with_headers(
+        &ctx.app,
+        Method::POST,
+        "/api/tokens",
+        vec![("content-type", "application/json")],
+        creds,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.headers()["cache-control"], "no-store");
 }
 
 /// B05: a token-route body is capped at 16 KiB before the handler reads it, not at
