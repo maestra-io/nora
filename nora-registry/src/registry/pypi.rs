@@ -15,9 +15,9 @@ use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::circuit_breaker::BreakerScope;
 use crate::config::UpstreamAuth;
 use crate::registry::{
-    cache_read, circuit_open_response, method_not_allowed, nora_base_url, proxy_error_response,
-    proxy_fetch_artifact, proxy_fetch_bytes, proxy_fetch_text, read_cached_artifact, ProxyBody,
-    SpoolError, TempFileGuard,
+    cache_read, circuit_open_response, content_url_client, method_not_allowed, nora_base_url,
+    proxy_error_response, proxy_fetch_artifact_with, proxy_fetch_bytes, proxy_fetch_text,
+    read_cached_artifact, same_origin, ProxyBody, SpoolError, TempFileGuard,
 };
 use crate::registry_type::RegistryType;
 use crate::ui::components::html_escape;
@@ -898,9 +898,15 @@ async fn download_file(
         } else {
             None
         };
+        // The index names the file's host: never a loopback/private one unless allowed.
+        // A refused host is skipped like a failed one: a later upstream may list the file.
+        let Some(client) = content_client(&state, &file_url, &mut upstream_err) else {
+            continue;
+        };
         // A file above `server.stream_threshold_mb` is spooled to disk (C17).
-        match proxy_fetch_artifact(
+        match proxy_fetch_artifact_with(
             &state,
+            &client,
             &key,
             "pypi",
             &file_url,
@@ -1068,6 +1074,30 @@ async fn download_file(
     StatusCode::NOT_FOUND.into_response()
 }
 
+/// The client for a file `url` an upstream index names ([`content_url_client`]), or None
+/// with the refusal recorded in `upstream_err`, which answers 502 when no upstream serves it.
+fn content_client(
+    state: &AppState,
+    url: &str,
+    upstream_err: &mut Option<(String, crate::registry::ProxyError)>,
+) -> Option<reqwest::Client> {
+    let cfg = &state.config.pypi;
+    content_url_client(
+        state,
+        "pypi",
+        url,
+        cfg.allow_private_file_hosts,
+        cfg.proxy_timeout,
+    )
+    .map_err(|_| {
+        *upstream_err = Some((
+            url.to_string(),
+            crate::registry::ProxyError::Network("refused file host".into()),
+        ));
+    })
+    .ok()
+}
+
 /// GET /simple/{name}/{wheel}.metadata — PEP 658 core metadata: the copy stored next to
 /// a local wheel, else the upstream's own `.metadata` where its index advertises one.
 async fn core_metadata(state: &AppState, normalized: &str, wheel: &str) -> Response {
@@ -1125,8 +1155,11 @@ async fn core_metadata(state: &AppState, normalized: &str, wheel: &str) -> Respo
         } else {
             None
         };
+        let Some(client) = content_client(state, &url, &mut upstream_err) else {
+            continue;
+        };
         match proxy_fetch_bytes(
-            &state.http_client,
+            &client,
             &url,
             timeout,
             auth,
@@ -2089,18 +2122,6 @@ async fn extract_pypi_publish_date(
     crate::curation::extract_mtime_as_publish_date(&state.storage, &dates_key).await
 }
 
-/// True when both URLs have the same scheme, host and port.
-fn same_origin(a: &str, b: &str) -> bool {
-    match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
-        (Ok(a), Ok(b)) => {
-            a.scheme() == b.scheme()
-                && a.host_str() == b.host_str()
-                && a.port_or_known_default() == b.port_or_known_default()
-        }
-        _ => false,
-    }
-}
-
 /// Cache a `filename → upload-time` map (`pypi/{name}/dates.json`) from the
 /// upstream PEP 691 simple JSON (PEP 700 `upload-time`) and return it. Best-effort:
 /// any failure returns the cached map (or none) and the quarantine clock falls back
@@ -2680,3 +2701,9 @@ mod upstream_index_digest;
 
 #[cfg(test)]
 mod own_memo_tests;
+
+/// A file (or `.metadata`) the upstream index names is fetched from no loopback/private host
+/// unless `[pypi] allow_private_file_hosts` (audit A100).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod index_named_hosts;
