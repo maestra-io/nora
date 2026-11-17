@@ -442,8 +442,8 @@ struct Ledger {
     retired: Vec<Stanza>,
 }
 
-/// Date `current` from `prev` (a file not seen before: `now`, or 0 when there is no
-/// previous ledger), and keep from `dropped` + `prev.retired` what may still be served.
+/// Date `current` from `prev` (its `seen`, else its `retired`; a file not seen before:
+/// `now`, or 0 when there is no previous ledger), and keep from `dropped` + `prev.retired` what may still be served.
 fn update_ledger(
     prev: Option<&Ledger>,
     current: &mut [Stanza],
@@ -455,7 +455,19 @@ fn update_ledger(
     for s in current.iter_mut() {
         s.first_seen = match prev {
             None => 0,
-            Some(p) => p.seen.get(&s.filename).copied().unwrap_or(now),
+            // A re-listed file NORA had dropped keeps its date: one stale upstream answer
+            // must not make a known version new (audit A048).
+            Some(p) => p
+                .seen
+                .get(&s.filename)
+                .copied()
+                .or_else(|| {
+                    p.retired
+                        .iter()
+                        .find(|r| r.filename == s.filename)
+                        .map(|r| r.first_seen)
+                })
+                .unwrap_or(now),
         };
         seen.insert(s.filename.clone(), s.first_seen);
     }
@@ -611,14 +623,48 @@ struct SuiteState {
     /// index by its uncompressed name, then fetches the gz), current and previous build.
     #[serde(default)]
     plain: BTreeMap<String, String>,
+    /// The upstream Release `Date` (unix seconds) of the build: an older one is refused.
+    #[serde(default)]
+    upstream_date: Option<i64>,
 }
 
 /// Held versions per index: filename → (name, version, first_seen).
 type Young = BTreeMap<String, BTreeMap<String, (String, String, i64)>>;
 
+/// `Ok(None)`: no such object. A storage error or bytes that do not parse are an `Err`
+/// naming the key (logged): a hold or a date must not be read as absent.
+async fn read_json<T: for<'de> Deserialize<'de>>(
+    state: &AppState,
+    key: &str,
+) -> Result<Option<T>, String> {
+    let read = match state.storage.get(key).await {
+        Ok(data) => serde_json::from_slice(&data)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        Err(crate::storage::StorageError::NotFound) => return Ok(None),
+        Err(e) => Err(e.to_string()),
+    };
+    read.map_err(|e| {
+        tracing::error!(key, error = %e, "deb proxy: cannot read a state object (docs/deb-proxy.md: delete it to rebuild)");
+        format!("{key}: {e}")
+    })
+}
+
 async fn get_json<T: for<'de> Deserialize<'de>>(state: &AppState, key: &str) -> Option<T> {
-    let data = state.storage.get(key).await.ok()?;
-    serde_json::from_slice(&data).ok()
+    read_json(state, key).await.ok().flatten()
+}
+
+/// A Release `Date` in unix seconds. Debian and Ubuntu write `... UTC`, which RFC 2822
+/// does not name.
+fn release_date(rel: &Release) -> Option<i64> {
+    let date = rel.field("Date")?;
+    let date = match date.strip_suffix(" UTC") {
+        Some(d) => format!("{d} +0000"),
+        None => date.to_string(),
+    };
+    chrono::DateTime::parse_from_rfc2822(&date)
+        .ok()
+        .map(|d| d.timestamp())
 }
 
 async fn put_json<T: Serialize>(state: &AppState, key: &str, v: &T) -> Result<(), String> {
@@ -815,6 +861,18 @@ async fn build_suite(
             rel.field("Codename")
         )));
     }
+    // An older generation, however validly signed, is not served over a newer one
+    // (audit A048, A086). Without a parsable Date there is nothing to compare.
+    let upstream_date = release_date(&rel);
+    let served_date = current.and_then(|c| c.upstream_date);
+    if let (Some(new), Some(old)) = (upstream_date, served_date) {
+        if new < old {
+            return Err(BuildError::Refused(format!(
+                "{suite}: the upstream Release Date {:?} is older than the served build's",
+                rel.field("Date")
+            )));
+        }
+    }
     let by_hash = rel
         .field("Acquire-By-Hash")
         .is_some_and(|v| v.eq_ignore_ascii_case("yes"));
@@ -834,6 +892,8 @@ async fn build_suite(
     let mut matures_at: Option<i64> = None;
     let mut young: BTreeMap<String, BTreeMap<String, (String, String, i64)>> = BTreeMap::new();
     let mut served: HashSet<String> = HashSet::new();
+    // Indexes the upstream did not host this time: their holds stay (audit A049).
+    let mut skipped: HashSet<String> = HashSet::new();
     // Every ledger of the repo: one pool file can be listed by several suites, components
     // and architectures.
     // An unreadable ledger fails the build: dating without it would hold, and write to
@@ -850,7 +910,11 @@ async fn build_suite(
         let (hash, _) = rel.sha256[path].clone();
         let lkey = ledger_key(repo, suite, comp, arch);
         let ukey = upstream_copy_key(repo, suite, comp, arch);
-        let prev: Option<Ledger> = get_json(state, &lkey).await;
+        // Only an absent ledger is a first sight: an unreadable one would date everything
+        // 0 and release every hold of the index (audit A043).
+        let prev: Option<Ledger> = read_json(state, &lkey)
+            .await
+            .map_err(BuildError::Internal)?;
         // The previous upstream listing, for the stanzas this one dropped.
         let prev_upstream = match prev.as_ref().and_then(|p| p.upstream.clone()) {
             Some((ppath, _)) => state.storage.get(&ukey).await.ok().map(|d| (ppath, d)),
@@ -875,6 +939,7 @@ async fn build_suite(
                     // but each hosts only its own: an index that is not there is left out.
                     Err(ProxyError::NotFound) => {
                         tracing::debug!(repo, suite, %url, "deb proxy: index listed but absent upstream");
+                        skipped.insert(format!("{suite}/{comp}/{arch}"));
                         continue;
                     }
                     Err(e) => return Err(BuildError::Upstream(e)),
@@ -1024,7 +1089,7 @@ async fn build_suite(
         return Err(BuildError::Upstream(ProxyError::NotFound));
     }
     // Held versions first, so a direct package fetch is refused before apt can see them.
-    update_young(state, repo, suite, young, min_age, now)
+    update_young(state, repo, suite, young, &skipped, min_age, now)
         .await
         .map_err(BuildError::Internal)?;
 
@@ -1073,6 +1138,7 @@ async fn build_suite(
         files,
         prev_files,
         plain,
+        upstream_date: upstream_date.or(served_date),
     };
     put_json(state, &state_key, &new_state)
         .await
@@ -1136,11 +1202,9 @@ async fn earliest_seen(
     // ponytail: parses every ledger of the repo when a build has young files; a
     // repo-wide first-seen map if that gets slow.
     for key in keys {
-        let ledger: Ledger = match state.storage.get(key).await {
-            Ok(data) => serde_json::from_slice(&data).map_err(|e| format!("{key}: {e}"))?,
-            // Listed, then replaced or removed meanwhile: nothing to date from.
-            Err(crate::storage::StorageError::NotFound) => continue,
-            Err(e) => return Err(format!("{key}: {e}")),
+        // None: listed, then replaced or removed meanwhile: nothing to date from.
+        let Some(ledger) = read_json::<Ledger>(state, key).await? else {
+            continue;
         };
         let dates = ledger
             .seen
@@ -1162,15 +1226,18 @@ async fn update_young(
     repo: &str,
     suite: &str,
     held: BTreeMap<String, BTreeMap<String, (String, String, i64)>>,
+    skipped: &HashSet<String>,
     min_age: Option<i64>,
     since: i64,
 ) -> Result<(), String> {
     let key = young_key(repo);
     let lock = state.publish_lock(&key);
     let _g = lock.lock().await;
-    let mut young: Young = get_json(state, &key).await.unwrap_or_default();
+    // An unreadable set fails the build: rewritten from empty it would drop every other
+    // suite's holds (audit A043, A049).
+    let mut young: Young = read_json(state, &key).await?.unwrap_or_default();
     let prefix = format!("{suite}/");
-    young.retain(|k, _| !k.starts_with(&prefix));
+    young.retain(|k, _| !k.starts_with(&prefix) || skipped.contains(k));
     let mut held = held;
     if min_age.is_some() {
         // Ledgers another build wrote after this one read them (a suite's first build
@@ -1223,7 +1290,7 @@ async fn clear_served(
     let key = young_key(repo);
     let lock = state.publish_lock(&key);
     let _g = lock.lock().await;
-    let mut young: Young = get_json(state, &key).await.unwrap_or_default();
+    let mut young: Young = read_json(state, &key).await?.unwrap_or_default();
     let before: usize = young.values().map(BTreeMap::len).sum();
     for files in young.values_mut() {
         files.retain(|f, _| !served.contains(f));
@@ -1240,20 +1307,24 @@ async fn clear_served(
     Ok(())
 }
 
-async fn load_young(state: &AppState, repo: &str) -> Arc<Young> {
+/// The held set; on a read error the last one read, however old, else `Err`.
+async fn load_young(state: &AppState, repo: &str) -> Result<Arc<Young>, String> {
     let key = young_key(repo);
     let cached = state.deb_young.lock().get(&key).cloned();
-    if let Some((at, y)) = cached {
+    if let Some((at, y)) = &cached {
         if at.elapsed() < YOUNG_TTL {
-            return y;
+            return Ok(y.clone());
         }
     }
-    let y: Arc<Young> = Arc::new(get_json(state, &key).await.unwrap_or_default());
+    let y: Arc<Young> = match read_json(state, &key).await {
+        Ok(y) => Arc::new(y.unwrap_or_default()),
+        Err(e) => return cached.map(|(_, y)| y).ok_or(e),
+    };
     state
         .deb_young
         .lock()
         .insert(key, (Instant::now(), y.clone()));
-    y
+    Ok(y)
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -1368,7 +1439,16 @@ pub(crate) async fn package_gate(
     repo: &str,
     path: &str,
 ) -> Option<Response> {
-    let young = load_young(state, repo).await;
+    // Unknown holds: no download passes (audit A043).
+    let Ok(young) = load_young(state, repo).await else {
+        return Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "30")],
+            )
+                .into_response(),
+        );
+    };
     let (name, version, first_seen) = young.values().find_map(|m| m.get(path))?.clone();
     let engine = &state.curation().curation_engine;
     crate::curation::check_download(
@@ -1485,6 +1565,29 @@ mod tests {
             "two mature versions are enough; z is gone upstream"
         );
     }
+
+    /// audit A048: a file NORA dropped and the upstream lists again keeps its date.
+    #[test]
+    fn a_relisted_file_keeps_its_retired_date() {
+        let prev = Ledger {
+            upstream: None,
+            seen: [("pool/main/a_1_amd64.deb".to_string(), 1000)].into(),
+            retired: vec![st("a", "2", 0)],
+        };
+        let mut cur = vec![st("a", "2", 0)];
+        let (seen, _) = update_ledger(Some(&prev), &mut cur, vec![], Some(3 * DAY), 50 * DAY);
+        assert_eq!(seen["pool/main/a_2_amd64.deb"], 0);
+        assert_eq!(cur[0].first_seen, 0);
+    }
+
+    #[test]
+    fn a_release_date_parses_with_utc_or_an_offset() {
+        let date = |d: &str| release_date(&parse_release(&format!("Origin: X\nDate: {d}\n")));
+        assert_eq!(date("Thu, 01 Jan 1970 00:01:00 UTC"), Some(60));
+        assert_eq!(date("Thu, 01 Jan 1970 01:01:00 +0100"), Some(60));
+        assert_eq!(date("yesterday"), None);
+        assert_eq!(release_date(&parse_release("Origin: X\n")), None);
+    }
 }
 
 #[cfg(test)]
@@ -1565,16 +1668,32 @@ mod integration_tests {
         comps: &[(&str, &[(&str, &str)])],
         delay: std::time::Duration,
     ) {
-        let names = format!("Suite: {suite}\nCodename: bookworm\n");
-        mount_release(server, key, suite, &names, comps, delay).await;
+        mount_dated(server, key, suite, DATE, comps, delay).await;
     }
 
-    /// `mount_suite_comps` whose Release carries the `Suite`/`Codename` lines `names`.
+    /// The Release `Date` of every generation the helpers publish.
+    const DATE: &str = "Tue, 03 Nov 2026 00:00:00 UTC";
+
+    /// `mount_suite_comps` whose Release carries `date`.
+    async fn mount_dated(
+        server: &MockServer,
+        key: &SignedSecretKey,
+        suite: &str,
+        date: &str,
+        comps: &[(&str, &[(&str, &str)])],
+        delay: std::time::Duration,
+    ) {
+        let names = format!("Suite: {suite}\nCodename: bookworm\n");
+        mount_release(server, key, suite, &names, date, comps, delay).await;
+    }
+
+    /// `mount_dated` whose Release carries the `Suite`/`Codename` lines `names`.
     async fn mount_release(
         server: &MockServer,
         key: &SignedSecretKey,
         suite: &str,
         names: &str,
+        date: &str,
         comps: &[(&str, &[(&str, &str)])],
         delay: std::time::Duration,
     ) {
@@ -1596,7 +1715,7 @@ mod integration_tests {
         }
         let comp_names: Vec<&str> = comps.iter().map(|(c, _)| *c).collect();
         let release = format!(
-            "Origin: Test\n{names}Date: Tue, 03 Nov 2026 00:00:00 UTC\nArchitectures: amd64 i386\nComponents: {}\nSigned-By: ABCDEF\nSHA256:\n{sums}",
+            "Origin: Test\n{names}Date: {date}\nArchitectures: amd64 i386\nComponents: {}\nSigned-By: ABCDEF\nSHA256:\n{sums}",
             comp_names.join(" "),
         );
         let signed =
@@ -1956,15 +2075,25 @@ mod integration_tests {
         };
         let age = Some(3 * 86_400);
         // Read before the build started (since = later): the hold stays.
-        super::update_young(state, "debian", "security", held(now), age, now + 3600)
-            .await
-            .unwrap();
-        assert!(super::load_young(state, "debian").await["security/main/amd64"].contains_key(&f));
+        let none = std::collections::HashSet::new();
+        super::update_young(
+            state,
+            "debian",
+            "security",
+            held(now),
+            &none,
+            age,
+            now + 3600,
+        )
+        .await
+        .unwrap();
+        let young = super::load_young(state, "debian").await.unwrap();
+        assert!(young["security/main/amd64"].contains_key(&f));
         // Written during the build: the hold goes, but not the one on an internal name.
-        super::update_young(state, "debian", "security", held(now), age, now)
+        super::update_young(state, "debian", "security", held(now), &none, age, now)
             .await
             .unwrap();
-        let young = super::load_young(state, "debian").await;
+        let young = super::load_young(state, "debian").await.unwrap();
         let files = &young["security/main/amd64"];
         assert!(!files.contains_key(&f), "{files:?}");
         assert!(files.contains_key(&corp), "{files:?}");
@@ -2391,7 +2520,7 @@ mod integration_tests {
         let z = std::time::Duration::ZERO;
         let old: &[(&str, &[(&str, &str)])] = &[("main", &[("openssl", "1.1.1n")])];
         let other = "Suite: oldoldstable\nCodename: buster\n";
-        mount_release(&server, &key, "bookworm", other, old, z).await;
+        mount_release(&server, &key, "bookworm", other, DATE, old, z).await;
         let ctx = keyring_ctx(
             &[("debian", server.uri())],
             keydir.path().to_str().unwrap(),
@@ -2410,12 +2539,12 @@ mod integration_tests {
         server.reset().await;
         let by_suite: &[(&str, &[(&str, &str)])] = &[("main", &[("openssl", "3.1")])];
         let names = "Suite: bookworm\nCodename: other\n";
-        mount_release(&server, &key, "bookworm", names, by_suite, z).await;
+        mount_release(&server, &key, "bookworm", names, DATE, by_suite, z).await;
         assert_eq!(served(&ctx).await.1, [("openssl".into(), "3.1".into())]);
 
         // A replayed Release of another suite: the last good build stays served.
         server.reset().await;
-        mount_release(&server, &key, "bookworm", other, old, z).await;
+        mount_release(&server, &key, "bookworm", other, DATE, old, z).await;
         assert_eq!(served(&ctx).await.1, [("openssl".into(), "3.1".into())]);
     }
 
@@ -2512,5 +2641,303 @@ mod integration_tests {
             .iter()
             .any(|e| e.contains("deb.upstream_keyrings.vendor")));
         assert!(errors.iter().any(|e| e.contains("missing.gpg")));
+    }
+
+    // ── Upstream generations (audit A048, A086) and unreadable state (A043, A049) ──
+
+    /// `publish` of a Release dated `date`.
+    async fn publish_dated(
+        server: &MockServer,
+        key: &SignedSecretKey,
+        stanzas: &[(&str, &str)],
+        date: &str,
+    ) {
+        server.reset().await;
+        let z = std::time::Duration::ZERO;
+        mount_dated(server, key, "bookworm", date, &[("main", stanzas)], z).await;
+    }
+
+    /// A filtered proxy of `uri` holding 3 days, over `storage`.
+    fn held_ctx(
+        uri: String,
+        dir: &tempfile::TempDir,
+        storage: Option<crate::storage::Storage>,
+    ) -> TestContext {
+        let dir = dir.path().to_str().unwrap().to_string();
+        let customize = move |cfg: &mut crate::config::Config| {
+            cfg.deb.enabled = true;
+            cfg.deb.metadata_ttl = 0;
+            cfg.deb.upstream_keyring_dir = dir;
+            cfg.deb
+                .proxies
+                .insert("debian".into(), RepoProxyEntry::Simple(uri));
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.deb.min_release_age = Some("3d".into());
+        };
+        match storage {
+            Some(s) => create_test_context_with_storage_and_config(s, customize),
+            None => create_test_context_with_config(customize),
+        }
+    }
+
+    fn pkgs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// audit A086: a validly signed Release older than the served build is refused, and
+    /// NORA keeps serving (and signing) the newer one.
+    #[tokio::test]
+    async fn an_older_signed_generation_is_not_served_over_a_newer_one() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        let dir = keydir.path().to_str().unwrap();
+        let ctx = keyring_ctx(&[("debian", server.uri())], dir, &[]);
+        publish_dated(&server, &key, &[("a", "2")], DATE).await;
+        assert_eq!(served(&ctx).await.1, pkgs(&[("a", "2")]));
+
+        publish_dated(
+            &server,
+            &key,
+            &[("a", "1")],
+            "Wed, 01 Jan 2020 00:00:00 UTC",
+        )
+        .await;
+        let (release, served_now) = served(&ctx).await;
+        assert_eq!(served_now, pkgs(&[("a", "2")]));
+        assert!(release.contains(&format!("Date: {DATE}\n")), "{release}");
+
+        // A newer one is built; an equal Date too.
+        publish_dated(
+            &server,
+            &key,
+            &[("a", "3")],
+            "Thu, 05 Nov 2026 00:00:00 +0000",
+        )
+        .await;
+        assert_eq!(served(&ctx).await.1, pkgs(&[("a", "3")]));
+        publish_dated(
+            &server,
+            &key,
+            &[("a", "4")],
+            "Thu, 05 Nov 2026 00:00:00 +0000",
+        )
+        .await;
+        assert_eq!(served(&ctx).await.1, pkgs(&[("a", "4")]));
+    }
+
+    /// audit A048: one stale upstream answer neither re-dates known versions as new nor
+    /// withdraws them.
+    #[tokio::test]
+    async fn a_stale_generation_does_not_redate_known_versions() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        let ctx = held_ctx(server.uri(), &keydir, None);
+        let ctx = &ctx;
+        let get = |p: String| async move { status(ctx, &p).await };
+        let pool = |n: &str, v: &str| format!("/deb/debian/pool/main/{n}_{v}_amd64.deb");
+        let gen3: &[(&str, &str)] = &[("a", "2"), ("b", "1"), ("c", "1")];
+
+        publish_dated(&server, &key, gen3, DATE).await;
+        assert_eq!(served(ctx).await.1, pkgs(gen3));
+        assert_eq!(get(pool("a", "2")).await, StatusCode::OK);
+
+        let older = "Sun, 01 Nov 2026 00:00:00 UTC";
+        publish_dated(&server, &key, &[("a", "1"), ("b", "1")], older).await;
+        assert_eq!(served(ctx).await.1, pkgs(gen3), "the older generation");
+
+        publish_dated(&server, &key, gen3, DATE).await;
+        assert_eq!(served(ctx).await.1, pkgs(gen3));
+        assert_eq!(get(pool("a", "2")).await, StatusCode::OK);
+        assert_eq!(get(pool("c", "1")).await, StatusCode::OK);
+
+        // Control: a newer generation still holds what is new.
+        let newer = "Thu, 05 Nov 2026 00:00:00 UTC";
+        let gen4: &[(&str, &str)] = &[("a", "2"), ("b", "1"), ("c", "1"), ("d", "1")];
+        publish_dated(&server, &key, gen4, newer).await;
+        assert_eq!(served(ctx).await.1, pkgs(gen3));
+        assert_eq!(get(pool("d", "1")).await, StatusCode::FORBIDDEN);
+    }
+
+    /// audit A043: a ledger NORA cannot read or parse is not a first sight; the build
+    /// fails, the last one stays served and its holds stay.
+    #[tokio::test]
+    async fn an_unreadable_own_ledger_keeps_the_hold() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        let (storage, outage) = outage_storage();
+        let ctx = held_ctx(server.uri(), &keydir, Some(storage));
+        let a2 = "/deb/debian/pool/main/a_2_amd64.deb";
+        let lkey = super::ledger_key("debian", "bookworm", "main", "amd64");
+        publish(&server, &key, &[("a", "1")]).await;
+        served(&ctx).await;
+        publish(&server, &key, &[("a", "2")]).await;
+        assert_eq!(served(&ctx).await.1, pkgs(&[]));
+        assert_eq!(status(&ctx, a2).await, StatusCode::FORBIDDEN);
+
+        // A read error.
+        outage.fail_reads_of("/ledger/bookworm/main/amd64.json");
+        publish(&server, &key, &[("a", "2"), ("z", "1")]).await;
+        assert_eq!(served(&ctx).await.1, pkgs(&[]));
+        assert_eq!(status(&ctx, a2).await, StatusCode::FORBIDDEN);
+        outage.end();
+        served(&ctx).await;
+        let ledger: super::Ledger = super::get_json(&ctx.state, &lkey).await.unwrap();
+        assert_ne!(ledger.seen["pool/main/a_2_amd64.deb"], 0, "{ledger:?}");
+        assert_eq!(status(&ctx, a2).await, StatusCode::FORBIDDEN);
+
+        // Bytes that do not parse.
+        ctx.state.storage.put(&lkey, b"not json").await.unwrap();
+        publish(&server, &key, &[("a", "2"), ("y", "1")]).await;
+        assert_eq!(served(&ctx).await.1, pkgs(&[]));
+        assert_eq!(status(&ctx, a2).await, StatusCode::FORBIDDEN);
+    }
+
+    /// audit A043: an unreadable hold set is an error, never an empty set: a download
+    /// waits (503) unless a set was read before.
+    #[tokio::test]
+    async fn an_unreadable_hold_set_is_an_error() {
+        let ctx = create_test_context_with_config(|cfg| cfg.deb.enabled = true);
+        let state = &ctx.state;
+        let key = super::young_key("debian");
+        state.storage.put(&key, b"not json").await.unwrap();
+        let none = std::collections::HashSet::new();
+        let held = Default::default();
+        assert!(
+            super::update_young(state, "debian", "bookworm", held, &none, None, 0)
+                .await
+                .is_err()
+        );
+        assert!(super::clear_served(state, "debian", &none).await.is_err());
+        assert!(super::load_young(state, "debian").await.is_err());
+        let file = "pool/main/a_2_amd64.deb";
+        let headers = axum::http::HeaderMap::new();
+        let gate = super::package_gate(state, &headers, "debian", file).await;
+        assert_eq!(gate.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // A set read before, however old, answers for the unreadable one.
+        let young: super::Young = [(
+            "bookworm/main/amd64".to_string(),
+            [(file.to_string(), ("a".into(), "2".into(), 0))].into(),
+        )]
+        .into();
+        let long_ago = std::time::Instant::now()
+            .checked_sub(super::YOUNG_TTL * 2)
+            .unwrap();
+        let cached = std::sync::Arc::new(young);
+        state
+            .deb_young
+            .lock()
+            .insert(key.clone(), (long_ago, cached.clone()));
+        assert_eq!(super::load_young(state, "debian").await.unwrap(), cached);
+    }
+
+    /// audit A049: an index the upstream did not host this time keeps its holds.
+    #[tokio::test]
+    async fn a_skipped_index_keeps_its_holds() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        let ctx = held_ctx(server.uri(), &keydir, None);
+        let z = std::time::Duration::ZERO;
+        let r2 = "/deb/debian/pool/main/r_2_amd64.deb";
+        let suite = |main: &'static [(&'static str, &'static str)],
+                     contrib: &'static [(&'static str, &'static str)]| {
+            [("main", main), ("contrib", contrib)]
+        };
+        mount_suite_comps(
+            &server,
+            &key,
+            "bookworm",
+            &suite(&[("a", "1")], &[("r", "1")]),
+            z,
+        )
+        .await;
+        served(&ctx).await;
+        server.reset().await;
+        mount_suite_comps(
+            &server,
+            &key,
+            "bookworm",
+            &suite(&[("a", "2")], &[("r", "2")]),
+            z,
+        )
+        .await;
+        served(&ctx).await;
+        assert_eq!(status(&ctx, r2).await, StatusCode::FORBIDDEN);
+
+        // contrib changes but its index is not there: main is rebuilt, contrib skipped.
+        server.reset().await;
+        let gen3 = suite(&[("a", "2"), ("z", "1")], &[("r", "2"), ("s", "1")]);
+        mount_suite_comps(&server, &key, "bookworm", &gen3, z).await;
+        Mock::given(method("GET"))
+            .and(path("/dists/bookworm/contrib/binary-amd64/Packages.gz"))
+            .respond_with(ResponseTemplate::new(404))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        served(&ctx).await;
+        let young: super::Young = super::get_json(&ctx.state, &super::young_key("debian"))
+            .await
+            .unwrap();
+        assert!(
+            young["bookworm/contrib/amd64"].contains_key("pool/main/r_2_amd64.deb"),
+            "{young:?}"
+        );
+        assert!(young["bookworm/main/amd64"].contains_key("pool/main/z_1_amd64.deb"));
+        assert_eq!(status(&ctx, r2).await, StatusCode::FORBIDDEN);
+    }
+
+    /// audit A049: a hold set NORA cannot read or parse fails the build; the other
+    /// suites' holds are not dropped and the object is not rewritten.
+    #[tokio::test]
+    async fn an_unreadable_hold_set_fails_the_build_and_keeps_other_suites() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        let (storage, outage) = outage_storage();
+        let ctx = held_ctx(server.uri(), &keydir, Some(storage));
+        let z = std::time::Duration::ZERO;
+        let t2 = "/deb/debian/pool/main/t_2_amd64.deb";
+        let ykey = super::young_key("debian");
+        let generation = |bookworm: &'static [(&'static str, &'static str)]| {
+            let server = &server;
+            let key = &key;
+            async move {
+                server.reset().await;
+                mount_suite(server, key, "bookworm", "main", bookworm, z).await;
+                mount_suite(server, key, "trixie", "main", &[("t", "2")], z).await;
+            }
+        };
+        mount_suite(&server, &key, "bookworm", "main", &[("a", "1")], z).await;
+        mount_suite(&server, &key, "trixie", "main", &[("t", "1")], z).await;
+        served_in(&ctx, "bookworm", "main").await;
+        served_in(&ctx, "trixie", "main").await;
+        generation(&[("a", "2")]).await;
+        served_in(&ctx, "bookworm", "main").await;
+        served_in(&ctx, "trixie", "main").await;
+        assert_eq!(status(&ctx, t2).await, StatusCode::FORBIDDEN);
+        let has_t2 = |young: &super::Young| {
+            young
+                .get("trixie/main/amd64")
+                .is_some_and(|m| m.contains_key("pool/main/t_2_amd64.deb"))
+        };
+
+        // A read error: bookworm's last build stays served, trixie's hold stays.
+        outage.fail_reads_of("/young.json");
+        generation(&[("a", "2"), ("z", "1")]).await;
+        assert_eq!(served_in(&ctx, "bookworm", "main").await.1, pkgs(&[]));
+        outage.end();
+        let young: super::Young = super::get_json(&ctx.state, &ykey).await.unwrap();
+        assert!(has_t2(&young), "{young:?}");
+        assert_eq!(status(&ctx, t2).await, StatusCode::FORBIDDEN);
+
+        // A truncated object: not rewritten.
+        let bytes = ctx.state.storage.get(&ykey).await.unwrap();
+        let cut = bytes[..bytes.len() / 2].to_vec();
+        ctx.state.storage.put(&ykey, &cut).await.unwrap();
+        generation(&[("a", "2"), ("y", "1")]).await;
+        served_in(&ctx, "bookworm", "main").await;
+        assert_eq!(ctx.state.storage.get(&ykey).await.unwrap().to_vec(), cut);
+        assert_eq!(status(&ctx, t2).await, StatusCode::FORBIDDEN);
     }
 }
