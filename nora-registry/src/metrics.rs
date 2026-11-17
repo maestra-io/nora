@@ -610,6 +610,18 @@ pub static METADATA_CORRUPT_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create METADATA_CORRUPT_TOTAL metric at startup")
 });
 
+/// Upstream indexes refused because their newest entry is older than the cached
+/// generation's; the cached generation keeps being served. A steady rate means an index
+/// stuck on an old generation.
+pub static UPSTREAM_INDEX_OLDER_REFUSED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_upstream_index_older_refused_total",
+        "Upstream indexes refused as older than the cached generation",
+        &["registry"]
+    )
+    .expect("failed to create UPSTREAM_INDEX_OLDER_REFUSED_TOTAL metric at startup")
+});
+
 /// Packuments rebuilt from per-version keys because the derived
 /// `metadata.json` was absent (#956). A non-zero rate points at storage that
 /// was written or restored outside NORA.
