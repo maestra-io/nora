@@ -18,8 +18,9 @@
 set -euo pipefail
 
 DISABLED="auto-reland.yml benchmarks.yml ci.yml codeql.yml kani.yml link-check.yml packaging.yml post-release.yml pr-image-cleanup.yml release.yml scorecard.yml"
-# gitleaks.yml is ours despite the name: the org-wide secret scan on pull requests.
-ACTIVE="gitleaks.yml"
+# gitleaks.yml and security-scan.yml are ours despite the names: the org-wide secret scan and
+# the shared security scan (issues-maestra#1649) on pull requests.
+ACTIVE="gitleaks.yml security-scan.yml"
 
 WORKFLOWS_DIR="${WORKFLOWS_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/.github/workflows}"
 failed=0
