@@ -102,10 +102,14 @@ serves is dropped.
 1. `dists/<suite>/InRelease` is fetched under `metadata_ttl` and refused unless one of
    its signatures is unexpired and was made by an unexpired signing key of the
    repository's keyring, and unless its `Suite` or `Codename` is the requested suite
-   (apt's own rule). A refused refresh keeps the last good build served. Each `<component>/binary-<arch>/Packages` it lists
+   (apt's own rule), or when its `Date` is older than the `Date` of the build NORA serves
+   (a mirror or replay answering an older generation; a missing or unparsable `Date` is
+   not compared). A refused refresh keeps the last good build served. Each `<component>/binary-<arch>/Packages` it lists
    (gz, else xz, else plain; `by-hash` when the upstream offers it) is fetched and refused
    on a SHA-256 other than the Release's. An index the Release lists but the mirror does
-   not host (Ubuntu's archive and ports list every architecture) is left out.
+   not host (Ubuntu's archive and ports list every architecture) is left out; the
+   versions it held stay held. A file the upstream lists again after NORA dropped it keeps
+   its first date.
 2. A package keeps its listed versions older than `min_release_age`. When all of them are
    younger, the newest dropped version (one the upstream listed before and has since
    replaced) older than that stands in, if NORA has its `.deb` cached; otherwise the
@@ -125,3 +129,22 @@ serves is dropped.
 
 Storage per repo: the last upstream `Packages` per index, the ledgers, and the built
 `Packages.gz` of the current and previous build (`by-hash/`).
+
+## Unreadable state
+
+A ledger or the held-version map (`deb/<repo>/.nora-meta/proxy/young.json`) that NORA
+cannot read or parse is never taken as absent: that would date every listed file "before
+NORA" or drop every hold. The rebuild fails instead, logged at error level with the key (`deb proxy: cannot read a state object`), and the last good build stays
+served; a suite with no build yet answers 500. With the held-version map unreadable and
+not cached, `.deb` downloads of that repository answer 503 (`Retry-After: 30`).
+
+A transient storage error clears on the next refresh. An object that stays unreadable
+freezes that suite (a ledger) or every suite of the repository (`young.json`), and a frozen
+suite with `Valid-Until` (debian-security, about 7 days) ends in apt's "Release file
+expired". Recovery: delete the object the error names. The next build re-dates the files
+of a deleted ledger from the other ledgers, else as first sight. After deleting
+`young.json`, also delete the repository's `dists/*/state.json`: a suite re-enters its holds
+only when it rebuilds, and until then its held `.deb` files are not refused. An upstream whose `Date` really goes back (a rollback, or a
+bogus future `Date` once published) is refused the same way and logged as
+`refresh failed, serving the last build`: delete
+`deb/<repo>/.nora-meta/proxy/dists/<suite>/state.json` to accept it.
