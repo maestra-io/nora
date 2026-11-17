@@ -986,7 +986,8 @@ pub(crate) fn request_layers(router: Router<AppState>, state: &AppState) -> Rout
         ))
         // Prefix the UI's root-absolute self-links + redirects with the public_url
         // path so the UI works under a sub-path behind a proxy. No-op when unset;
-        // only buffers text/html (UI pages), so blob streams pass through untouched.
+        // acts only on NORA's own routes (/, /ui, /api/ui, /api-docs), so registry
+        // responses pass through byte-for-byte; buffered pages are capped.
         .layer(middleware::from_fn_with_state(
             state.clone(),
             ui::rewrite_ui_base_path,
