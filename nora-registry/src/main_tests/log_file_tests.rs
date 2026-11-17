@@ -48,3 +48,14 @@ fn open_log_file_empty_path() {
     // Empty path will fail to open
     assert!(result.is_none());
 }
+
+/// A new log file is owner-only whatever the umask: other local users cannot read it.
+#[test]
+fn open_log_file_creates_it_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("nora.log");
+    assert!(open_log_file(path.to_str().unwrap()).is_some());
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "log file mode {mode:o}");
+}

@@ -110,7 +110,7 @@ config:
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `config.gc.*` | Every `[gc]` key: `enabled`, `interval`, `dry_run`, `grace_secs`, `proxy_cache_max_bytes` | `true`, `86400`, unset |
-| `config.audit.*` | `mode`: `file` (`{storage.path}/audit.jsonl`, rotated at `max_size_mb`, `max_files` kept), `stdout` (pod log), `both`, `off` | `stdout` |
+| `config.audit.*` | `mode`: `file` (`{storage.path}/audit.jsonl`, downloads in `audit-reads.jsonl` at half the size, rotated at `max_size_mb`, `max_files` kept, files 0600), `stdout` (pod log), `both`, `off` | `stdout` |
 | `config.circuit_breaker.*` | `enabled`, `failure_threshold`, `reset_timeout`: fail fast (503) on an upstream that keeps failing | `true`, `5`, `30` |
 | `config.nuget.*` | Any `[nuget]` key, e.g. `proxy_timeout`, `metadata_proxy_timeout` | `30`, `15` |
 | `config.npm.*`, `config.pypi.*` | Any scalar `[npm]` / `[pypi]` key (e.g. `metadata_ttl`); rendered only when set | unset |

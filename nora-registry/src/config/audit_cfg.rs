@@ -11,9 +11,9 @@ use std::env;
 /// Audit log configuration.
 ///
 /// Controls where audit events are written:
-/// - `file`   — write to {storage_path}/audit.jsonl (default)
+/// - `file`   — write to {storage_path}/audit.jsonl (reads to audit-reads.jsonl)
 /// - `stdout` — write JSONL to stderr (12-factor compatible)
-/// - `both`   — write to file AND stderr
+/// - `both`   — write to file AND stderr (default)
 /// - `off`    — disable audit logging
 ///
 /// ENV: `NORA_AUDIT_LOG=file|stdout|both|off`
@@ -23,12 +23,14 @@ pub struct AuditConfig {
     pub mode: crate::audit::AuditMode,
     /// `file`/`both`: once `audit.jsonl` would grow past this many MiB it is
     /// renamed to `audit.jsonl.1` (older files shift up) and a new file is
-    /// started. 0 disables rotation (unbounded file).
+    /// started; `audit-reads.jsonl` rotates the same way at half this size.
+    /// 0 disables rotation (unbounded files).
     /// Default 100. ENV: NORA_AUDIT_MAX_SIZE_MB.
     #[serde(default = "default_max_size_mb")]
     pub max_size_mb: u64,
     /// Rotated files kept (`audit.jsonl.1` .. `audit.jsonl.N`); the oldest is
-    /// deleted on rotation. Disk use is bounded by `(max_files + 1) * max_size_mb`.
+    /// deleted on rotation; the same count of `audit-reads.jsonl.N`. Disk use is
+    /// bounded by `1.5 * (max_files + 1) * max_size_mb`.
     /// Default 5. ENV: NORA_AUDIT_MAX_FILES.
     #[serde(default = "default_max_files")]
     pub max_files: u32,
@@ -45,7 +47,7 @@ fn default_max_files() -> u32 {
 impl Default for AuditConfig {
     fn default() -> Self {
         Self {
-            mode: crate::audit::AuditMode::File,
+            mode: crate::audit::AuditMode::Both,
             max_size_mb: default_max_size_mb(),
             max_files: default_max_files(),
         }
