@@ -1922,7 +1922,7 @@ mod tests {
     /// that the ledger holds. An enforcing gate reads that digest's own entry, once: found,
     /// its date decides and stays in memory; missing, the digest is new as before; a store
     /// that cannot answer is a 503 with Retry-After, never a 403 and never the artifact.
-    /// Observe reads nothing.
+    /// An observing gate reads nothing (its record's write reads the stored entry back).
     #[tokio::test(start_paused = true)]
     async fn an_incomplete_ledger_reads_the_digest_entry() {
         let (st, ops) = crate::test_helpers::op_counting_storage();
@@ -1945,7 +1945,24 @@ mod tests {
         assert!(gate(QuarantineMode::Observe, "sha256:known")
             .await
             .is_none());
-        assert_eq!(ops.calls("get", key), 0, "observe reads nothing");
+        assert_eq!(ops.calls("get", key), 0, "the observing gate reads nothing");
+        // Its record() writes the digest from a spawned task, which finds the stored object
+        // and reads it back for the ledger's date. Counted with the enforcing gate below,
+        // that read made "read once" fail whenever the task ran first (CI on 16.11.2026).
+        // The paused clock moves only while no task or blocking hash runs.
+        for _ in 0..500 {
+            if store.check("nuget", "sha256:known", ttl) == QuarantineStatus::Mature {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            store.check("nuget", "sha256:known", ttl),
+            QuarantineStatus::Mature,
+            "the record adopts the stored date"
+        );
+        assert_eq!(ops.calls("get", key), 1, "by one read of the stored entry");
+        ops.reset();
         store.entries.write().clear();
 
         assert!(
