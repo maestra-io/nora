@@ -9,7 +9,8 @@
 #   - .github/workflows holds a file that is neither maestra-* nor listed below
 #     (decide: `gh workflow disable <file>` and add it to DISABLED, or to ACTIVE);
 #   - GitHub reports a DISABLED workflow, or an unlisted non-maestra one, as active;
-#   - maestra-release.yml loses its release gate (see below).
+#   - maestra-release.yml loses its release gate (see below);
+#   - a maestra-* workflow runs `pip install` without --require-hashes (see below).
 #
 # Usage: GH_TOKEN=... GITHUB_REPOSITORY=maestra-io/nora maestra/scripts/check-upstream-workflows.sh
 #        STATES_FILE=<file of "path state" lines> skips the API call (self-test, offline).
@@ -59,6 +60,15 @@ else
         done
     fi
 fi
+
+# Python dependencies (audit A103): a pip install in our workflows takes every package
+# by sha256 from a lock (`--require-hashes -r <requirements.txt>`), never by a range.
+for path in "$WORKFLOWS_DIR"/maestra-*; do
+    [ -f "$path" ] || continue
+    while IFS= read -r line; do
+        fail "$(basename "$path"):${line%%:*}: pip install without --require-hashes"
+    done < <(grep -nE "pip[\"']? install" "$path" | grep -v -- '--require-hashes' || true)
+done
 
 states="${STATES_FILE:-}"
 if [ -z "$states" ] && [ -n "${GH_TOKEN:-}" ]; then

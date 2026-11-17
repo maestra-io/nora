@@ -13,8 +13,9 @@ ART_TOKEN: Artifactory read token (GET/HEAD only). NORA_TOKEN: a nora `write` to
 Idempotent and resumable: every finished artifact is appended to --state (JSON lines) and skipped
 on the next run; nora's own 409 on an existing version counts as done (= `--skip-duplicate`).
 Each artifact is verified against the source digest before it is pushed (NuGet: Artifactory
-sha256, nuget.org catalog packageHash sha512 for an `enumerate.py --nuget-org-ids` manifest; npm: dist.integrity sha512, else shasum; PyPI: the index sha256). Packages run in
-parallel (--workers), the versions of one package run in version order.
+sha256, nuget.org catalog packageHash sha512 for an `enumerate.py --nuget-org-ids` manifest; npm: dist.integrity sha512, else shasum; PyPI: the index sha256). An entry without a
+source digest is failed, never pushed. A NuGet `unlist_only` entry (hosted, unlisted on nuget.org)
+is only unlisted. Packages run in parallel (--workers), the versions of one package run in version order.
 
 Not preserved, because nora's APIs take no such input: NuGet `published` and the npm `time`
 map are the import time (nora regenerates them). Preserved: bytes, NuGet listed flag (unlisted
@@ -129,10 +130,12 @@ def nuget_pkg(p, st, a):
         ver, key = v["version"], f"nuget:{idl}/{v['version'].lower()}"
         t0 = time.monotonic()
         try:
-            if not st.has(key, a.dry_run):
+            if not v.get("unlist_only") and not st.has(key, a.dry_run):
+                if not v.get("sha256") and not v.get("sha512"):
+                    raise Failed("no source digest")
                 path, size, _, sha256, sha512 = download(v["url"], a.workdir)
                 try:
-                    if v["sha256"] and sha256 != v["sha256"]:
+                    if v.get("sha256") and sha256 != v["sha256"]:
                         raise Failed(f"sha256 mismatch {sha256} != {v['sha256']}")
                     if v.get("sha512") and base64.b64encode(sha512).decode() != v["sha512"]:
                         raise Failed("sha512 mismatch against the nuget.org catalog packageHash")
@@ -243,9 +246,11 @@ def pypi_pkg(p, st, a):
             continue
         t0 = time.monotonic()
         try:
+            if not v.get("sha256"):
+                raise Failed("no source digest")
             path, size, _, sha256, _ = download(v["url"], a.workdir)
             try:
-                if v["sha256"] and sha256 != v["sha256"]:
+                if sha256 != v["sha256"]:
                     raise Failed("sha256 mismatch")
                 final = os.path.join(os.path.dirname(path), v["filename"])  # twine reads metadata from the name
                 os.rename(path, final)

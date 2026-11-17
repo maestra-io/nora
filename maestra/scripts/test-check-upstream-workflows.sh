@@ -53,5 +53,17 @@ release_variant "a tag check only in verify is reported" \
     "do not share one" '/^  image:$/,$ s/\[\[ "\$GIT_TAG" =~ .* \]\]/true/'
 rm "$TMP/wf/maestra-release.yml"
 run; expect "a missing maestra-release.yml is reported" 1 "maestra-release.yml is missing"
+cp "$REAL_RELEASE" "$TMP/wf/maestra-release.yml"
+
+# Python dependencies (audit A103), on the real workflows and on edited copies.
+REAL_WF="$(dirname "$REAL_RELEASE")"
+for f in maestra-ci.yml maestra-sync-public-ids.yml; do cp "$REAL_WF/$f" "$TMP/wf/$f"; done
+run; expect "the real workflows install Python dependencies by hash" 0 "upstream workflows OK"
+# shellcheck disable=SC2016  # the workflow line is written literally
+printf '%s\n' '      - run: "$RUNNER_TEMP/venv/bin/pip" install --quiet requests==2.32.5' >> "$TMP/wf/maestra-ci.yml"
+run; expect "a pip install by version only is reported" 1 "maestra-ci.yml:[0-9]*: pip install without --require-hashes"
+cp "$REAL_WF/maestra-ci.yml" "$TMP/wf/maestra-ci.yml"
+sed 's/ --require-hashes//' "$REAL_WF/maestra-sync-public-ids.yml" > "$TMP/wf/maestra-sync-public-ids.yml"
+run; expect "the sync job without --require-hashes is reported" 1 "maestra-sync-public-ids.yml:[0-9]*: pip install without"
 
 [ "$FAILURES" = 0 ] && echo "check-upstream-workflows self-test PASSED" || exit 1

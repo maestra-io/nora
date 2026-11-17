@@ -117,7 +117,9 @@ def test_a_package_that_differs_from_its_source_digest_is_not_pushed():
     right512 = base64.b64encode(hashlib.sha512(good).digest()).decode()
     cases = [("sha256 mismatch", good, {"sha256": sha256(b"other")}),
              ("sha512 mismatch", good, {"sha256": None, "sha512": wrong512}),
-             ("not a zip", b"<html>", {"sha256": sha256(b"<html>")})]
+             ("not a zip", b"<html>", {"sha256": sha256(b"<html>")}),
+             # audit A002: nothing to check the bytes against is a refusal, not a pass.
+             ("no source digest", good, {"sha256": None})]
     for reason, body, fields in cases:
         run = Run({}, body=body)  # no route: a push would fail the test
         version = {**nuget_version("1.0.0", body), **fields}
@@ -129,6 +131,30 @@ def test_a_package_that_differs_from_its_source_digest_is_not_pushed():
     run = Run({("PUT", NUPKG_PUT): Response(201)})
     version = nuget_version("1.0.0", good, sha256=None, sha512=right512)
     assert run.go(imp.nuget_pkg, {"id": "Mindbox.A", "versions": [version]}) == {"nuget:mindbox.a/1.0.0": "pushed"}
+
+
+def test_a_pypi_file_without_a_source_digest_is_not_pushed():
+    # audit A002: the same refusal for PyPI.
+    run = Run({})
+    pkg = {"name": "mindbox-ml-commons", "files": [{"filename": "mindbox_ml_commons-1.0.tar.gz", "url": "src/1.0",
+                                                     "sha256": None}]}
+    assert run.go(imp.pypi_pkg, pkg) == {"pypi:mindbox-ml-commons/mindbox_ml_commons-1.0.tar.gz": "failed"}
+    assert run.downloads == [] and run.nora.calls == []
+    pkg["files"][0]["sha256"] = sha256(run.body)
+    assert run.go(imp.pypi_pkg, pkg, dry_run=True) == {"pypi:mindbox-ml-commons/mindbox_ml_commons-1.0.tar.gz": "verified"}
+    pkg["files"][0]["sha256"] = sha256(b"other")
+    run = Run({}, dry_run=True)
+    assert run.go(imp.pypi_pkg, pkg) == {"pypi:mindbox-ml-commons/mindbox_ml_commons-1.0.tar.gz": "failed"}
+
+
+def test_an_unlist_only_version_is_unlisted_and_never_downloaded():
+    # audit A102: a hosted version nuget.org unlisted after the import.
+    unlist = ("DELETE", f"{NUPKG_PUT}Mindbox.A/1.0.0")
+    run = Run({unlist: Response(204)})
+    pkg = {"id": "Mindbox.A", "versions": [{"version": "1.0.0", "listed": False, "unlist_only": True, "size": 0,
+                                            "origin": "nuget.org"}]}
+    assert run.go(imp.nuget_pkg, pkg) == {"nuget:mindbox.a/1.0.0:unlisted": "pushed"}
+    assert run.downloads == [] and run.nora.sent("PUT") == [] and run.nora.sent("DELETE") == [unlist[1]]
 
 
 def test_a_failed_version_is_tried_again_and_the_others_still_go():

@@ -10,19 +10,24 @@ github/shared/artifactory/PRIVATE_PACKAGES_TOKEN, field `value`) in ART_TOKEN.
     ART_TOKEN=... uv run maestra/scripts/import/enumerate.py --out manifest.json
 
 NuGet: every `Mindbox.*` / strays `.nupkg` in `nuget-local` (versions and the listed flag from the
-local registration). For an ID that is also on nuget.org, its nuget.org-only versions are added
-with origin `nuget.org` and fetched from nuget.org itself: once the ID is hosted in nora, nora
-stops proxying it upstream, so they must be imported too to stay resolvable.
+local registration). For an ID listed in public-ids.txt (the reviewed list of IDs Mindbox owns on
+nuget.org), its nuget.org-only versions are added with origin `nuget.org` and their catalog sha512:
+once the ID is hosted in nora, nora stops proxying it upstream, so they must be imported too to stay
+resolvable. Any other ID gets only its Artifactory versions: nuget.org is not asked who owns it.
 npm: every `@mindbox-cloud/*` package in `npm-local` (packument from the local repo).
-PyPI: the four internal names from the `pypi` virtual repo's simple index.
+PyPI: the four internal names from the simple index of the Artifactory repository named in
+ART_PYPI_REPO (required, a local repository: a virtual one also answers from its public remotes).
 
 nuget.org only (no ART_TOKEN): the public `Mindbox.*` IDs listed in a file, every version from the
 nuget.org registration with its catalog `packageHash` (sha512), origin `nuget.org`. With
 --missing-only (NORA_TOKEN, read is enough) only versions nora does not host yet: the daily sync
-(.github/workflows/maestra-sync-public-ids.yml), since nora never proxies an ID it hosts.
+(.github/workflows/maestra-sync-public-ids.yml), since nora never proxies an ID it hosts. A version
+younger than --min-age (default 3d, as `curation.nuget.min_release_age`; dated by its catalog leaf
+`created`, else `published`, undated = too young) is deferred to a later run. A listed ID nuget.org
+does not know stops the run. A hosted version nuget.org has unlisted is emitted `unlist_only`.
 
     uv run maestra/scripts/import/enumerate.py --nuget-org-ids maestra/scripts/import/public-ids.txt \
-        [--missing-only] --out manifest.json
+        [--missing-only] [--min-age 3d] --out manifest.json
 
 npm only, missing only (ART_TOKEN + NORA_TOKEN, read is enough on nora): the `@mindbox-cloud/*`
 versions in Artifactory `npm-local` that nora does not host yet. GitLab pipelines still publish
@@ -35,10 +40,12 @@ GitHub never published those versions to nora. The scheduled import of them was 
 import argparse
 import html.parser
 import json
+import os
+import re
 import sys
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -89,7 +96,14 @@ def registration(base, idl):
     return out
 
 
-def nuget(files):
+def read_ids(path):
+    """The IDs of a public-ids.txt file: one per line, `#` comments and blank lines dropped."""
+    with open(path) as f:
+        return [i for i in (ln.split("#", 1)[0].strip() for ln in f) if i]
+
+
+def nuget(files, public, min_age):
+    """`public`: lower-cased IDs from public-ids.txt, the only ones whose nuget.org versions are added."""
     by_file, ids = {}, {}
     for f in files:
         name = f["uri"].lstrip("/")
@@ -107,13 +121,11 @@ def nuget(files):
             size, sha = (f["size"], f["sha2"]) if f else head_meta(art, e["url"])
             versions.append({**e, "size": size, "sha256": sha, "origin": "artifactory"})
             seen.add(e["version"].lower())
-        upstream = registration("https://api.nuget.org/v3/registration5-gz-semver2", idl)
-        for e in upstream:
-            if e["version"].lower() not in seen:
-                size, _ = head_meta(pub, e["url"])
-                versions.append({**e, "size": size, "sha256": None, "origin": "nuget.org"})
+        if idl in public:
+            [upstream] = nuget_org([pkg_id], False, min_age)
+            versions += [v for v in upstream["versions"] if v["version"].lower() not in seen]
         versions.sort(key=lambda v: version_key(v["version"]))
-        return {"id": pkg_id, "on_nuget_org": bool(upstream), "versions": versions}
+        return {"id": pkg_id, "on_nuget_org": idl in public, "versions": versions}
 
     with ThreadPoolExecutor(8) as ex:
         pkgs = [p for p in ex.map(one, sorted(ids)) if p["versions"]]
@@ -125,9 +137,31 @@ def nuget(files):
 NUGET_ORG_REG = "https://api.nuget.org/v3/registration5-gz-semver2"
 
 
-def nuget_org(ids, missing_only):
+def parse_age(s):
+    """'3d' / '12h' / '0d' -> timedelta."""
+    m = re.fullmatch(r"(\d+)([dh])", s.strip())
+    if not m:
+        raise argparse.ArgumentTypeError(f"not an age like 3d or 12h: {s!r}")
+    return timedelta(**{"days" if m[2] == "d" else "hours": int(m[1])})
+
+
+def leaf_date(leaf):
+    """The leaf's `created`, else `published` (an unlisted version's `published` is 1900); None if neither parses."""
+    for k in ("created", "published"):
+        try:
+            d = datetime.fromisoformat(leaf[k])
+        except (KeyError, TypeError, ValueError):
+            continue
+        d = d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        if d.year > 1900:
+            return d
+    return None
+
+
+def nuget_org(ids, missing_only, min_age=timedelta(days=3)):
     """Versions of public IDs from nuget.org, verified later against the catalog leaf's packageHash."""
     auth = {"Authorization": "Bearer " + env("NORA_TOKEN")} if missing_only else {}
+    cutoff = datetime.now(timezone.utc) - min_age
 
     def one(pkg_id):
         idl, have = pkg_id.lower(), set()
@@ -136,15 +170,25 @@ def nuget_org(ids, missing_only):
             if r.status_code != 404:
                 r.raise_for_status()
                 have = {v.lower() for v in r.json()["versions"]}
-        versions = []
-        for e in registration(NUGET_ORG_REG, idl):
+        versions, upstream = [], registration(NUGET_ORG_REG, idl)
+        if not upstream:
+            # A listed ID nobody registered yet: whoever registers it later would be imported whole.
+            sys.exit(f"{pkg_id}: listed in the public IDs but not on nuget.org")
+        for e in upstream:
             if e["version"].split("+", 1)[0].lower() in have:
+                if not e["listed"]:  # unlisted upstream after the import: unlist it in nora too
+                    versions.append({"version": e["version"], "listed": False, "unlist_only": True, "size": 0,
+                                     "origin": "nuget.org"})
                 continue
             leaf = get(pub, e["leaf"])
             leaf.raise_for_status()
             leaf = leaf.json()
             if leaf.get("packageHashAlgorithm", "").upper() != "SHA512":
                 sys.exit(f"{pkg_id} {e['version']}: unexpected packageHashAlgorithm {leaf.get('packageHashAlgorithm')}")
+            date = leaf_date(leaf)
+            if date is None or date > cutoff:
+                print(f"{pkg_id} {e['version']}: deferred, released {date or 'at an unknown date'}", file=sys.stderr)
+                continue
             versions.append({**e, "size": leaf["packageSize"], "sha256": None, "sha512": leaf["packageHash"],
                              "origin": "nuget.org"})
         versions.sort(key=lambda v: version_key(v["version"]))
@@ -201,9 +245,9 @@ class Links(html.parser.HTMLParser):
 
 
 def pypi():
-    out = []
+    repo, out = env("ART_PYPI_REPO"), []
     for name in PYPI_NAMES:
-        base = f"{ART}/api/pypi/pypi/simple/{name}/"
+        base = f"{ART}/api/pypi/{repo}/simple/{name}/"
         r = get(art, base)
         entry = {"name": name, "status": r.status_code, "files": []}
         if r.ok:
@@ -257,6 +301,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--nuget-org-ids", help="file of public NuGet IDs (one per line, # comments): nuget.org only")
     ap.add_argument("--missing-only", action="store_true", help="with --nuget-org-ids: skip versions nora hosts")
+    ap.add_argument("--min-age", type=parse_age, default="3d",
+                    help="defer nuget.org versions released less than this ago (3d, 12h, 0d)")
     ap.add_argument("--npm-missing-only", action="store_true",
                     help="Artifactory npm-local only: the @mindbox-cloud/* versions nora does not host yet")
     args = ap.parse_args()
@@ -273,9 +319,7 @@ def main():
                           "missing": {p["name"]: [v["version"] for v in p["versions"]] for p in pkgs}}, indent=1))
         return
     if args.nuget_org_ids:
-        with open(args.nuget_org_ids) as f:
-            ids = [ln.split("#", 1)[0].strip() for ln in f]
-        pkgs = nuget_org([i for i in ids if i], args.missing_only)
+        pkgs = nuget_org(read_ids(args.nuget_org_ids), args.missing_only, args.min_age)
         t = {"nuget": totals(pkgs, "versions")}
         manifest = {"generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "started_at": started.strftime("%Y-%m-%dT%H:%M:%SZ"), "source": "https://api.nuget.org",
@@ -285,7 +329,8 @@ def main():
         print(json.dumps({"generated_at": manifest["generated_at"], "totals": t,
                           "missing": {p["id"]: len(p["versions"]) for p in pkgs if p["versions"]}}, indent=1))
         return
-    nuget_pkgs, nuget_stray = nuget(storage_list("nuget-local"))
+    public = {i.lower() for i in read_ids(os.path.join(os.path.dirname(os.path.abspath(__file__)), "public-ids.txt"))}
+    nuget_pkgs, nuget_stray = nuget(storage_list("nuget-local"), public, args.min_age)
     npm_pkgs = npm(storage_list("npm-local"))
     pypi_pkgs = pypi()
     t = {"nuget": totals(nuget_pkgs, "versions"), "npm": totals(npm_pkgs, "versions"), "pypi": totals(pypi_pkgs, "files")}
