@@ -21,7 +21,7 @@ alpine = "https://dl-cdn.alpinelinux.org/alpine"
 corretto = "https://apk.corretto.aws"   # flat: <arch>/APKINDEX.tar.gz at the root
 
 [curation.apk]
-min_release_age = "3d"   # held back by the build time `t:` in the signed index
+min_release_age = "3d"   # from the build time `t:` or NORA's first sight, the later
 quarantine = "observe"
 quarantine_ttl = "3d"
 ```
@@ -58,14 +58,26 @@ read it from a BuildKit secret mount inside the `RUN` that uses it.
 
 1. The upstream `APKINDEX.tar.gz` is fetched under `metadata_ttl` and refused (502, or
    the stale copy) unless its `.SIGN.RSA.`/`.SIGN.RSA256.` signature verifies with a key
-   of that name under `upstream_keys_dir`.
+   of that name under `upstream_keys_dir`. A `.SIGN.RSA256.` signature is the one checked
+   whenever the index carries one; SHA-1 `.SIGN.RSA.` is accepted alone only because
+   Alpine v2 indexes are signed that way.
+   An index whose newest build time is older than the cached index's is an earlier
+   generation (a replayed or lagging copy): NORA keeps serving the cached one, marked
+   `x-nora-stale: true` whatever `serve_stale` says, stores it again so the next refetch
+   waits `metadata_ttl`, and counts the refusal in
+   `nora_upstream_index_older_refused_total{registry="apk"}`. When the upstream removes
+   its single newest package and adds nothing newer, the cached index stays until the
+   next upload.
 2. NORA keeps every entry the upstream has listed and since dropped, while it can still
    matter (newer than the package's second-newest version older than `min_release_age`,
    at least 7 days, so a hold switched on later still has it). An Alpine branch
    lists one version per package and deletes the file of the version it replaces.
-3. On serve, each package gets its newest version older than `min_release_age` by its
-   build time (`t:`) that NORA can deliver: listed upstream, or dropped and cached by
-   NORA. A package with no such version is left out: `apk add` fails with `no such
+3. On serve, each package gets its newest version older than `min_release_age` that
+   NORA can deliver (listed upstream, or dropped and cached by NORA), dated by the later
+   of its build time (`t:`) and when NORA first saw it listed. Every entry of the first
+   index NORA reads of a repository counts as seen before NORA, so its build time alone
+   dates it; a version that appears later with an old `t:` still waits
+   `min_release_age` from its first sight. A package with no such version is left out: `apk add` fails with `no such
    package`, it never reaches the upstream around NORA. A fresh security fix therefore
    waits `min_release_age`; an entry in the curation `allow` list releases it early.
 4. The result is re-signed with NORA's key as `.SIGN.RSA256.<key_name>` (verified with apk-tools
@@ -79,8 +91,8 @@ downloads (a curation integrity pin on the package or an enforcing quarantine ne
 whole file's digest first, so there, and for a HEAD, the package is fetched whole first).
 Packages are cached under `apk/pkgs/` (counted by `gc.proxy_cache_max_bytes`; an evicted
 dropped version can no longer be the fallback) and pass the digest quarantine, seeded
-from the build time with `server.trust_upstream_dates` (the date sits inside the
-upstream-signed index).
+with `server.trust_upstream_dates` from the same date as the hold: the later of the
+build time (inside the upstream-signed index) and NORA's first sight.
 
 Fallback limit: a dropped version is a fallback only if NORA cached it before the
 upstream deleted it, i.e. some build installed it through NORA while it was current.

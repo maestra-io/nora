@@ -13,18 +13,20 @@
 //! The upstream index is refused unless one of `upstream_keys_dir`'s keys verifies its
 //! signature. It is kept as JSON (`apk/index/...json`) with every entry the upstream has
 //! listed and since dropped, while it may still be needed: an Alpine branch lists ONE
-//! version per package and deletes the file of the one it replaces. On serve, each
-//! package gets its newest version that is older than `min_release_age` by its build time
-//! (`t:`, inside the signed index) and that NORA can still deliver (listed upstream, or a
-//! dropped one NORA has cached). A package whose every version is too young is left out,
-//! so `apk add` fails with "no such package" rather than reaching around NORA. The result
-//! is signed with NORA's key (`.SIGN.RSA256.<key_name>`), which clients trust from
+//! version per package and deletes the file of the one it replaces. An index whose newest
+//! build is older than the cached one's is an earlier generation and is not taken. On
+//! serve, each package gets its newest version that is older than `min_release_age` by
+//! the later of its build time (`t:`, inside the signed index) and NORA's first sight of
+//! it, and that NORA can still deliver (listed upstream, or a dropped one NORA has
+//! cached). A package whose every version is too young is left out, so `apk add` fails
+//! with "no such package" rather than reaching around NORA. The result is signed with
+//! NORA's key (`.SIGN.RSA256.<key_name>`), which clients trust from
 //! `/etc/apk/keys/<key_name>`; signature checking stays on end to end.
 //!
 //! A package is fetched only under the name and version an index entry lists, refused
 //! when its control segment does not hash to the entry's `C:` (the identity apk itself
 //! verifies), cached under `apk/pkgs/` and held by the digest quarantine like any proxy
-//! artifact, seeded from the signed build time with `server.trust_upstream_dates`.
+//! artifact, seeded from that same date with `server.trust_upstream_dates`.
 //!
 //! Client: `https://nora.example.com/apk/alpine/v3.22/main` as the repository, the token
 //! in `HTTP_AUTH="basic:*:token:<token>"` (apk-tools <= 2.14.6 rejects a URL password over
@@ -79,16 +81,25 @@ pub fn routes() -> Router<AppState> {
 // ── Index model ───────────────────────────────────────────────────────────────
 
 /// One package entry of an APKINDEX: its name (`P:`), version (`V:`), build time
-/// (`t:`) and the whole block as the upstream wrote it.
+/// (`t:`), when NORA first saw it listed (0: in the first index NORA read) and the whole
+/// block as the upstream wrote it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Entry {
     name: String,
     version: String,
     built: i64,
+    #[serde(default)]
+    seen: i64,
     block: String,
 }
 
 impl Entry {
+    /// The date its age counts from: the later of the build time and NORA's first sight,
+    /// so a version listed only now is not mature by an old `t:` alone.
+    fn dated(&self) -> i64 {
+        self.built.max(self.seen)
+    }
+
     fn file(&self) -> String {
         format!("{}-{}.apk", self.name, self.version)
     }
@@ -141,10 +152,31 @@ fn parse_apkindex(text: &str) -> Vec<Entry> {
                 name: name.to_string(),
                 version: version.to_string(),
                 built,
+                seen: 0,
                 block: block.to_string(),
             })
         })
         .collect()
+}
+
+/// Sets each entry's first sight: kept from `prev` (current or dropped), `now` for a
+/// version `prev` does not know, 0 for every entry of the first index (as the deb ledger).
+fn date_entries(prev: Option<&Cached>, entries: &mut [Entry], now: i64) {
+    let Some(prev) = prev else {
+        return;
+    };
+    let known: HashMap<(&str, &str), i64> = prev
+        .entries
+        .iter()
+        .chain(&prev.retired)
+        .map(|e| ((e.name.as_str(), e.version.as_str()), e.seen))
+        .collect();
+    for e in entries {
+        e.seen = known
+            .get(&(e.name.as_str(), e.version.as_str()))
+            .copied()
+            .unwrap_or(now);
+    }
 }
 
 /// History kept even with no (or a shorter) `min_release_age`, so a hold switched on
@@ -181,7 +213,7 @@ fn retire(prev: &Cached, current: &[Entry], min_age: Option<i64>, now: i64) -> V
             if mature == 2 {
                 break;
             }
-            if now - e.built >= min_age {
+            if now - e.dated() >= min_age {
                 mature += 1;
             }
             if dropped {
@@ -290,16 +322,19 @@ fn tar_entry(name: &str, data: &[u8], mtime: u64) -> Result<Vec<u8>, String> {
 }
 
 /// The signature of an apk archive's first segment: (digest is SHA-256, key name, bytes).
+/// A `.SIGN.RSA256.` one wins wherever it sits; the SHA-1 `.SIGN.RSA.` (how Alpine v2
+/// indexes are signed) is taken only when there is none.
 fn signature(sig_tar: &[u8]) -> Result<(bool, String, Vec<u8>), String> {
+    let mut sha1 = None;
     for (name, data) in tar_files(sig_tar)? {
         if let Some(key) = name.strip_prefix(".SIGN.RSA256.") {
             return Ok((true, key.to_string(), data.to_vec()));
         }
         if let Some(key) = name.strip_prefix(".SIGN.RSA.") {
-            return Ok((false, key.to_string(), data.to_vec()));
+            sha1.get_or_insert_with(|| (false, key.to_string(), data.to_vec()));
         }
     }
-    Err("no .SIGN.RSA signature".to_string())
+    sha1.ok_or_else(|| "no .SIGN.RSA signature".to_string())
 }
 
 fn rsa_verify(key: &RsaPublicKey, sha256: bool, signed: &[u8], sig: &[u8]) -> bool {
@@ -329,6 +364,9 @@ fn open_upstream_index(
     let signed = &buf[sig_len..];
     if !rsa_verify(key, sha256, signed, &sig) {
         return Err(format!("signature by {key_name} does not verify"));
+    }
+    if !sha256 {
+        tracing::debug!(key = %key_name, "apk: upstream index verified by its SHA-1 signature");
     }
     let mut tar = Vec::new();
     flate2::read::MultiGzDecoder::new(signed)
@@ -677,35 +715,53 @@ async fn load_index(
                 .curation_engine
                 .min_release_age_secs(RegistryType::Apk);
             let prev_for_merge = prev.as_ref().map(|p| Cached {
-                description: String::new(),
+                description: p.description.clone(),
                 entries: p.entries.clone(),
                 retired: p.retired.clone(),
             });
             let parsed = tokio::task::spawn_blocking(move || {
                 let (description, text) = open_upstream_index(&body, &keys.upstream)?;
-                let entries = parse_apkindex(&text);
+                let mut entries = parse_apkindex(&text);
                 let now = crate::cache_ttl::now_unix() as i64;
-                let retired = prev_for_merge
-                    .map(|p| retire(&p, &entries, min_age, now))
-                    .unwrap_or_default();
-                let cached = Cached {
-                    description,
-                    entries,
-                    retired,
+                let newest = |e: &[Entry]| e.iter().map(|e| e.built).max();
+                // An index whose newest build is older than the cached one's is an earlier
+                // generation (a replay or a lagging mirror): keep the cached one.
+                let (cached, older) = match prev_for_merge {
+                    Some(p) if newest(&entries) < newest(&p.entries) => (p, true),
+                    prev => {
+                        date_entries(prev.as_ref(), &mut entries, now);
+                        let retired = prev
+                            .map(|p| retire(&p, &entries, min_age, now))
+                            .unwrap_or_default();
+                        let cached = Cached {
+                            description,
+                            entries,
+                            retired,
+                        };
+                        (cached, false)
+                    }
                 };
                 let json = serde_json::to_vec(&cached).map_err(|e| e.to_string())?;
-                Ok::<_, String>((cached, json))
+                Ok::<_, String>((cached, json, older))
             })
             .await;
             match parsed {
-                Ok(Ok((cached, json))) => {
+                Ok(Ok((cached, json, older))) => {
+                    if older {
+                        crate::metrics::UPSTREAM_INDEX_OLDER_REFUSED_TOTAL
+                            .with_label_values(&["apk"])
+                            .inc();
+                        tracing::warn!(url = %url, "apk: upstream index older than the cached generation, keeping the cached one");
+                    }
+                    // Stored again when refused too: the TTL restarts and the upstream is
+                    // not asked again on every request.
                     let cached = Arc::new(cached);
                     if let Err(e) = state.storage.put(&key, &json).await {
                         tracing::warn!(key = %key, error = %e, "apk: failed to cache index");
                     } else if let Some(meta) = state.storage.stat(&key).await {
                         remember_index(&memo, &meta, &cached);
                     }
-                    return Ok((cached, false));
+                    return Ok((cached, older));
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(url = %url, error = %e, "apk: upstream index refused");
@@ -857,7 +913,7 @@ async fn render(
     let engine = &state.curation().curation_engine;
     let by_name = candidates(&cached, |e| {
         crate::curation::is_internal_namespace(engine, RegistryType::Apk, &e.name)
-            || engine.hides_from_metadata(RegistryType::Apk, &e.name, &e.version, Some(e.built))
+            || engine.hides_from_metadata(RegistryType::Apk, &e.name, &e.version, Some(e.dated()))
     });
     // A dropped version is deliverable only from NORA's cache; a listed one always.
     let mut chosen = Vec::with_capacity(by_name.len());
@@ -934,12 +990,13 @@ async fn package(
         RegistryType::Apk,
         &entry.name,
         crate::curation::RequestVersion::Known(entry.version.clone()),
-        Some(entry.built),
+        Some(entry.dated()),
     ) {
         return response;
     }
-    // The build time sits inside the upstream-signed index: a trusted publish date.
-    let publish_date = Some(entry.built).filter(|_| state.config.server.trust_upstream_dates);
+    // The build time sits inside the upstream-signed index, bounded by NORA's first sight
+    // of the version: a trusted publish date.
+    let publish_date = Some(entry.dated()).filter(|_| state.config.server.trust_upstream_dates);
     let (q_mode, q_secs) = quarantine(state);
     let key = path.package_key(file);
     let label = format!("{}/{}/{file}", path.name, path.dir);
@@ -1284,6 +1341,7 @@ mod tests {
             name: name.into(),
             version: version.into(),
             built,
+            seen: 0,
             block: format!("C:{identity}\nP:{name}\nV:{version}\nA:x86_64\nt:{built}\nD:so:libc.musl-x86_64.so.1"),
         }
     }
@@ -1387,6 +1445,96 @@ mod tests {
         body.extend(data);
         let (_, text) = open_upstream_index(&body, &trusted.upstream).unwrap();
         assert_eq!(parse_apkindex(&text).len(), 1);
+    }
+
+    #[test]
+    fn an_rsa256_signature_is_preferred_over_sha1() {
+        use rsa::sha2::Digest as _;
+        let up = key_files("alpine-test.rsa.pub");
+        let own = key_files("nora-test.rsa.pub");
+        let signer = upstream_signer(&up, &own);
+        let trusted = keys(&config(&up, &own)).unwrap();
+        let mut tar = tar_entry("DESCRIPTION", b"d", 0).unwrap();
+        tar.extend(tar_entry("APKINDEX", b"P:a\nV:1\nt:1\n\n", 0).unwrap());
+        tar.resize(tar.len() + 1024, 0);
+        let data = gzip(&tar);
+        let sha1 = signer
+            .signer
+            .sign(
+                Pkcs1v15Sign::new::<sha1_digest010::Sha1>(),
+                &sha1_digest010::Sha1::digest(&data),
+            )
+            .unwrap();
+        let sha256 = signer
+            .signer
+            .sign(
+                Pkcs1v15Sign::new::<rsa::sha2::Sha256>(),
+                &rsa::sha2::Sha256::digest(&data),
+            )
+            .unwrap();
+        let body = |sigs: &[(&str, &[u8])]| {
+            let mut seg = Vec::new();
+            for (name, sig) in sigs {
+                seg.extend(tar_entry(name, sig, 0).unwrap());
+            }
+            let mut out = gzip(&seg);
+            out.extend_from_slice(&data);
+            out
+        };
+        // The SHA-1 one first, the SHA-256 one after it: SHA-256 is the one checked.
+        let both = body(&[
+            (".SIGN.RSA.alpine-test.rsa.pub", b"garbage"),
+            (".SIGN.RSA256.alpine-test.rsa.pub", &sha256),
+        ]);
+        let (sig_tar, _) = gzip_member(&both, 1 << 20).unwrap();
+        assert!(signature(&sig_tar).unwrap().0, "RSA256 is chosen");
+        open_upstream_index(&both, &trusted.upstream).unwrap();
+        // A valid SHA-1 one does not stand in for a broken SHA-256 one.
+        let mut bad = sha256.clone();
+        bad[0] ^= 1;
+        let downgrade = body(&[
+            (".SIGN.RSA.alpine-test.rsa.pub", &sha1),
+            (".SIGN.RSA256.alpine-test.rsa.pub", &bad),
+        ]);
+        assert!(open_upstream_index(&downgrade, &trusted.upstream).is_err());
+        // SHA-1 alone still verifies (Alpine v2 indexes).
+        let only = body(&[(".SIGN.RSA.alpine-test.rsa.pub", &sha1)]);
+        open_upstream_index(&only, &trusted.upstream).unwrap();
+    }
+
+    #[test]
+    fn date_entries_keeps_first_sight_and_dates_a_new_version_now() {
+        let seen = |e: &[Entry]| e.iter().map(|e| e.seen).collect::<Vec<_>>();
+        let mut first = vec![entry("a", "1", 5, "Q1a="), entry("b", "1", 5, "Q1b=")];
+        date_entries(None, &mut first, 1_000);
+        assert_eq!(seen(&first), [0, 0], "the first index is dated before NORA");
+        let mut dropped = entry("c", "1", 5, "Q1c=");
+        dropped.seen = 400;
+        let mut known = entry("a", "1", 5, "Q1a=");
+        known.seen = 300;
+        let prev = Cached {
+            entries: vec![known],
+            retired: vec![dropped],
+            ..Cached::default()
+        };
+        let mut next = vec![
+            entry("a", "1", 5, "Q1a="),
+            entry("c", "1", 5, "Q1c="),
+            entry("a", "2", 5, "Q1d="),
+        ];
+        date_entries(Some(&prev), &mut next, 1_000);
+        assert_eq!(seen(&next), [300, 400, 1_000]);
+        assert_eq!(
+            next[2].dated(),
+            1_000,
+            "first sight bounds an old build time"
+        );
+        // A cached index written before first sight was recorded reads as 0.
+        let old: Cached = serde_json::from_str(
+            r#"{"description":"","entries":[{"name":"a","version":"1","built":5,"block":""}]}"#,
+        )
+        .unwrap();
+        assert_eq!((old.entries[0].seen, old.entries[0].dated()), (0, 5));
     }
 
     #[test]
@@ -1601,6 +1749,175 @@ mod integration_tests {
             resp.status(),
             StatusCode::NOT_FOUND,
             "only files an index lists"
+        );
+    }
+
+    /// An `alpine` proxy of `server` with `metadata_ttl` 0, curation enforcing a 3-day
+    /// hold and the quarantine in `q`, dated by the upstream's signed build time.
+    fn held(
+        server: &MockServer,
+        cfg_apk: &mut crate::config::ApkConfig,
+        q: QuarantineMode,
+    ) -> TestContext {
+        cfg_apk.metadata_ttl = 0;
+        cfg_apk.proxies.insert(
+            "alpine".into(),
+            RepoProxyEntry::Simple(format!("{}/alpine", server.uri())),
+        );
+        let apk = cfg_apk.clone();
+        create_test_context_with_config(|cfg| {
+            cfg.apk = apk;
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.apk.min_release_age = Some("3d".into());
+            cfg.curation.apk.quarantine = Some(q);
+            cfg.curation.apk.quarantine_ttl = Some("3d".into());
+        })
+    }
+
+    fn pairs(entries: Vec<super::Entry>) -> Vec<(String, String)> {
+        entries.into_iter().map(|e| (e.name, e.version)).collect()
+    }
+
+    fn pair(name: &str, version: &str) -> (String, String) {
+        (name.to_string(), version.to_string())
+    }
+
+    /// audit A038: a version NORA sees listed for the first time is dated from that sight
+    /// even when its build time `t:` is old.
+    #[tokio::test]
+    async fn a_version_first_listed_now_waits_from_first_sight_not_build_time() {
+        let up_keys = key_files("alpine-test.rsa.pub");
+        let own_keys = key_files("nora-test.rsa.pub");
+        let signer = upstream_signer(&up_keys, &own_keys);
+        let now = now();
+        let (late, late_id) = package("late", b"late");
+        let (young, young_id) = package("young", b"young");
+        let base = super::tests::entry("base", "1-r0", now - 30 * DAY, "Q1b=");
+        let late_e = super::tests::entry("late", "9-r0", now - 30 * DAY, &late_id);
+        let young_e = super::tests::entry("young", "1-r0", now - DAY, &young_id);
+        let get = |file: &str| format!("/apk/alpine/v3.22/main/x86_64/{file}");
+
+        for q in [QuarantineMode::Observe, QuarantineMode::Enforce] {
+            let server = MockServer::start().await;
+            mount(
+                &server,
+                INDEX,
+                upstream_index(&signer, std::slice::from_ref(&base)),
+            )
+            .await;
+            let mut cfg_apk = config(&up_keys, &own_keys);
+            let ctx = held(&server, &mut cfg_apk, q.clone());
+            assert_eq!(pairs(served(&ctx, &cfg_apk).await), [pair("base", "1-r0")]);
+
+            server.reset().await;
+            let next = [base.clone(), late_e.clone(), young_e.clone()];
+            mount(&server, INDEX, upstream_index(&signer, &next)).await;
+            mount(
+                &server,
+                "/alpine/v3.22/main/x86_64/late-9-r0.apk",
+                late.clone(),
+            )
+            .await;
+            mount(
+                &server,
+                "/alpine/v3.22/main/x86_64/young-1-r0.apk",
+                young.clone(),
+            )
+            .await;
+            assert_eq!(
+                pairs(served(&ctx, &cfg_apk).await),
+                [pair("base", "1-r0")],
+                "{q:?}: late 9-r0 is first seen now, whatever its t:"
+            );
+            for file in ["late-9-r0.apk", "young-1-r0.apk"] {
+                let resp = send(&ctx.app, Method::GET, &get(file), "").await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{q:?} {file}");
+            }
+        }
+
+        // The first index NORA reads of a repository is dated by its build times alone.
+        let server = MockServer::start().await;
+        mount(&server, INDEX, upstream_index(&signer, &[late_e])).await;
+        mount(
+            &server,
+            "/alpine/v3.22/main/x86_64/late-9-r0.apk",
+            late.clone(),
+        )
+        .await;
+        let mut cfg_apk = config(&up_keys, &own_keys);
+        let ctx = held(&server, &mut cfg_apk, QuarantineMode::Observe);
+        assert_eq!(pairs(served(&ctx, &cfg_apk).await), [pair("late", "9-r0")]);
+        let resp = send(&ctx.app, Method::GET, &get("late-9-r0.apk"), "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, late);
+    }
+
+    /// audit A086: an index whose newest build is older than the cached generation's is
+    /// not taken; the cached generation stays served, marked stale.
+    #[tokio::test]
+    async fn an_older_index_generation_is_refused_and_the_cached_one_served() {
+        let up_keys = key_files("alpine-test.rsa.pub");
+        let own_keys = key_files("nora-test.rsa.pub");
+        let signer = upstream_signer(&up_keys, &own_keys);
+        let now = now();
+        let entry = super::tests::entry;
+        let server = MockServer::start().await;
+        let gen2 = [
+            entry("lib", "2-r0", now - 30 * DAY, "Q1a="),
+            entry("tool", "2-r0", now - 30 * DAY, "Q1b="),
+        ];
+        mount(&server, INDEX, upstream_index(&signer, &gen2)).await;
+        let mut cfg_apk = config(&up_keys, &own_keys);
+        let ctx = held(&server, &mut cfg_apk, QuarantineMode::Observe);
+        let both = [pair("lib", "2-r0"), pair("tool", "2-r0")];
+        assert_eq!(pairs(served(&ctx, &cfg_apk).await), both);
+
+        server.reset().await;
+        let gen1 = [
+            entry("lib", "1-r0", now - 60 * DAY, "Q1c="),
+            entry("tool", "1-r0", now - 60 * DAY, "Q1d="),
+        ];
+        mount(&server, INDEX, upstream_index(&signer, &gen1)).await;
+        let refused = || {
+            crate::metrics::UPSTREAM_INDEX_OLDER_REFUSED_TOTAL
+                .with_label_values(&["apk"])
+                .get()
+        };
+        let before = refused();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/apk/alpine/v3.22/main/x86_64/APKINDEX.tar.gz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.headers()["x-nora-stale"], "true");
+        assert!(refused() > before);
+        assert_eq!(pairs(served(&ctx, &cfg_apk).await), both);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/apk/alpine/v3.22/main/x86_64/lib-1-r0.apk",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "gen1 was never taken");
+
+        // A newer generation that drops a package is taken.
+        server.reset().await;
+        let gen3 = [
+            entry("lib", "2-r0", now - 30 * DAY, "Q1a="),
+            entry("extra", "1-r0", now - 20 * DAY, "Q1e="),
+        ];
+        mount(&server, INDEX, upstream_index(&signer, &gen3)).await;
+        let up = cfg_apk.proxies["alpine"].clone();
+        let path = super::RepoPath::new("alpine".into(), &["v3.22", "main", "x86_64"]).unwrap();
+        let (index, stale) = super::load_index(&ctx.state, &path, &up).await.unwrap();
+        assert!(!stale);
+        assert_eq!(
+            pairs(index.entries.clone()),
+            [pair("lib", "2-r0"), pair("extra", "1-r0")]
         );
     }
 
