@@ -431,11 +431,21 @@ async fn get_metadata(State(state): State<AppState>, Path(crate_name): Path<Stri
 /// release-age maturation never fires. Synchronous `put` (not `spawn_cache`) so the
 /// date is readable on the same request. Best-effort: any failure leaves the date
 /// `None` (fail-safe — the crate is held as new). Namespace-safe: an internal crate
-/// is never fetched upstream (#68). Mirrors PyPI's `ensure_pypi_dates_cached`.
-async fn ensure_cargo_metadata_cached(state: &AppState, crate_name: &str) {
+/// is never fetched upstream (#68). Mirrors PyPI's `ensure_pypi_dates_cached`: a cached copy
+/// that does not list `version` (released after it was cached) is refetched once it is older
+/// than the miss TTL (A006), so a new release is dated by the upstream, never left undated.
+async fn ensure_cargo_metadata_cached(state: &AppState, crate_name: &str, version: &str) {
     let key = format!("cargo/{}/metadata.json", crate_name);
-    if state.storage.get(&key).await.is_ok() {
-        return;
+    if let Ok(data) = state.storage.get(&key).await {
+        if metadata_lists_version(&data, version)
+            || state
+                .storage
+                .stat(&key)
+                .await
+                .is_some_and(|meta| crate::cache_ttl::is_within_ttl(meta.modified, miss_ttl(state)))
+        {
+            return;
+        }
     }
     // #68: never fetch an internal-namespace crate's metadata upstream.
     if crate::curation::is_internal_namespace(
@@ -466,6 +476,31 @@ async fn ensure_cargo_metadata_cached(state: &AppState, crate_name: &str) {
     {
         let _ = state.storage.put(&key, &data).await;
     }
+}
+
+/// Seconds a cached `metadata.json` that does not list a requested version is kept before that
+/// miss refetches it (PyPI's `MISS_REFETCH_SECS`). Never above `cargo.metadata_ttl`.
+const MISS_REFETCH_SECS: i64 = 60;
+
+fn miss_ttl(state: &AppState) -> i64 {
+    match state.config.cargo.metadata_ttl {
+        ttl if ttl < 0 => MISS_REFETCH_SECS,
+        ttl => ttl.min(MISS_REFETCH_SECS),
+    }
+}
+
+/// Whether crates.io API metadata lists `version` in its `versions` array.
+fn metadata_lists_version(data: &[u8], version: &str) -> bool {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(data) else {
+        return false;
+    };
+    json.get("versions")
+        .and_then(|v| v.as_array())
+        .is_some_and(|versions| {
+            versions
+                .iter()
+                .any(|v| v.get("num").and_then(|n| n.as_str()) == Some(version))
+        })
 }
 
 /// GET /cargo/api/v1/crates/{name}/{version}/download — download .crate file.
@@ -510,6 +545,16 @@ async fn download(
         }
     }
 
+    // A version published here: no upstream dates it, and min-release-age does not judge it.
+    let entry_key = format!(
+        "{}{}.json",
+        entries_prefix(&crate_index_prefix(&crate_name), &crate_name),
+        version
+    );
+    let own_version = record.is_none()
+        && state.config.server.trust_upstream_dates
+        && state.storage.stat(&entry_key).await.is_some();
+
     // Extract publish date from cached Cargo metadata
     let publish_date = {
         let meta_key = format!("cargo/{}/metadata.json", crate_name);
@@ -522,8 +567,9 @@ async fn download(
         // ensure_pypi_dates_cached.
         // A name whose canon record was read here (one with `-` or `_`) is NORA's, published now
         // or before: an upstream's dates for it belong to another crate, and asking gives it away.
-        if state.config.server.trust_upstream_dates && record.is_none() {
-            ensure_cargo_metadata_cached(&state, &crate_name).await;
+        // So is a version with an index entry here, under any name.
+        if state.config.server.trust_upstream_dates && record.is_none() && !own_version {
+            ensure_cargo_metadata_cached(&state, &crate_name, &version).await;
         }
         extract_cargo_publish_date(
             &state.storage,
@@ -543,14 +589,28 @@ async fn download(
         &crate_name,
     );
     if !internal {
+        let curation = state.curation();
+        let engine = &curation.curation_engine;
+        // A proxied version still undated after the refetch above is judged by
+        // `[curation.cargo] unknown_date` (A006); NORA's own crates are never judged. Not the
+        // quarantine's seed, which keeps `publish_date`.
+        let judged_date = if record.is_none() && !own_version {
+            engine.judged_release_date(
+                crate::curation::RegistryType::Cargo,
+                state.config.server.trust_upstream_dates,
+                publish_date,
+            )
+        } else {
+            publish_date
+        };
         if let Some(response) = crate::curation::check_download(
-            &state.curation().curation_engine,
+            engine,
             state.bypass_token().as_deref(),
             &headers,
             crate::curation::RegistryType::Cargo,
             &crate_name,
             crate::curation::RequestVersion::Known(version.to_string()),
-            publish_date,
+            judged_date,
         ) {
             return response;
         }
@@ -722,7 +782,9 @@ async fn download(
             ) {
                 return response;
             }
-            state.spawn_cache("cargo", key.clone(), Bytes::from(data.clone()));
+            // Create-only (A035): a publish of this version that landed meanwhile is never
+            // replaced by the upstream's bytes.
+            state.spawn_cache_immutable("cargo", key.clone(), Bytes::from(data.clone()));
             state.metrics.record_download("cargo");
             state.metrics.record_cache_miss("cargo");
             state.activity.push(ActivityEntry::new(
@@ -984,6 +1046,9 @@ async fn publish(
         Ok(source) => source,
         Err(refusal) => return refusal,
     };
+    if let Some(refusal) = first_publish_refusal(&state, &name, migrate_from.is_some()).await {
+        return refusal;
+    }
 
     if state.storage.put(&crate_key, crate_data).await.is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -1211,6 +1276,47 @@ fn is_import_embedded(state: &AppState, name: &str) -> bool {
         .import_embedded
         .iter()
         .any(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// With an upstream configured, a crate name is the upstream's until it is declared hosted (A005):
+/// its first publish here is refused (403) unless the name is in `curation.internal_namespaces` or
+/// `cargo.import_embedded`, or the publish imports an index NORA holds as the crate's own
+/// (`imports`, see [`migration_source`]). New versions of a crate published here are not gated; a
+/// listing NORA cannot read is a 503. Called under the canon name lock (every spelling is decided
+/// once), after the publish's other refusals.
+async fn first_publish_refusal(state: &AppState, name: &str, imports: bool) -> Option<Response> {
+    if state.config.cargo.proxy.is_none()
+        || imports
+        || is_import_embedded(state, name)
+        || crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Cargo,
+            name,
+        )
+    {
+        return None;
+    }
+    match published_state(&state.storage, &crate_index_prefix(name), name).await {
+        Published::Yes(_) => return None,
+        Published::Unknown => return Some(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+        Published::No => {}
+    }
+    tracing::warn!(registry = "cargo", crate_name = %name, "[SECURITY] cargo first publish refused: name not declared hosted");
+    let detail = format!(
+        "crate `{name}` is served by the upstream and is not declared hosted: add it to curation.internal_namespaces"
+    );
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            serde_json::to_vec(&serde_json::json!({ "errors": [{ "detail": detail }] }))
+                .unwrap_or_default(),
+        )
+            .into_response(),
+    )
 }
 
 /// Whether a crate has versions published here, read from its entries.
@@ -3294,6 +3400,7 @@ mod published_index_ownership {
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.cargo.proxy = Some(uri);
             cfg.cargo.metadata_ttl = 0;
+            cfg.cargo.import_embedded = vec!["corp-lib".to_string()];
         });
         let holders = ctx.state.storage.holders();
         let resp = send(
@@ -3705,6 +3812,17 @@ mod published_index_table {
         })
     }
 
+    /// `proxied` with corp-lib declared hosted through `cargo.import_embedded`, which changes no
+    /// read while no index is stored at the crate's key: its first publish is allowed (A005).
+    fn proxied_declared(storage: Storage, server: &MockServer) -> crate::test_helpers::TestContext {
+        let uri = server.uri();
+        create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.cargo.proxy = Some(uri);
+            cfg.cargo.metadata_ttl = 0;
+            cfg.cargo.import_embedded = vec!["corp-lib".to_string()];
+        })
+    }
+
     /// Row 1: published, the stored index is NORA's → served as it is, no upstream.
     #[tokio::test]
     async fn row1_an_assembled_index_is_served_without_an_upstream() {
@@ -3848,11 +3966,12 @@ mod published_index_table {
 
     /// Row P3: cargo asks for its crate's index before it publishes. The upstream's answer is kept
     /// as NORA's upstream copy, not at the crate's index, so the first publish of a name the
-    /// upstream also has goes through, and the index holds the published version only.
+    /// upstream also has and the operator declared hosted goes through, and the index holds the
+    /// published version only.
     #[tokio::test]
     async fn p3_a_first_publish_after_cargo_asked_the_upstream_goes_through() {
         let server = squatter().await;
-        let ctx = proxied(faulty(Listing::Normal, false, false), &server);
+        let ctx = proxied_declared(faulty(Listing::Normal, false, false), &server);
         let (status, body) = get_index(&ctx.app).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("9.9.9"), "{body}");
@@ -3874,6 +3993,83 @@ mod published_index_table {
             before,
             "a published crate asked upstream"
         );
+    }
+
+    /// A005: with an upstream, the first publish of a name the upstream serves and the operator did
+    /// not declare hosted is refused, writes nothing, and the upstream's index still answers.
+    /// Without an upstream the same publish is a hosted crate's.
+    #[tokio::test]
+    async fn a_first_publish_of_an_upstream_name_not_declared_hosted_is_refused() {
+        let server = squatter().await;
+        let ctx = proxied(faulty(Listing::Normal, false, false), &server);
+        let (_, body) = get_index(&ctx.app).await;
+        assert!(body.contains("9.9.9"), "{body}");
+        assert_eq!(publish(&ctx.app, "0.1.0").await, StatusCode::FORBIDDEN);
+        let storage = &ctx.state.storage;
+        assert!(storage
+            .list("cargo/index-entries/co/rp/corp-lib/")
+            .await
+            .unwrap()
+            .is_empty());
+        for key in [
+            "cargo/corp-lib/0.1.0/corp-lib-0.1.0.crate",
+            "cargo/_names/corp-lib",
+            ASSEMBLED,
+            INDEX,
+        ] {
+            assert!(storage.stat(key).await.is_none(), "{key} written");
+        }
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("9.9.9") && !body.contains("\"0.1.0\""),
+            "{body}"
+        );
+
+        let ctx = create_test_context_with_config(|cfg| cfg.cargo.proxy = None);
+        assert_eq!(publish(&ctx.app, "0.1.0").await, StatusCode::OK);
+    }
+
+    /// A005: a name in `curation.internal_namespaces` publishes under an upstream, and a further
+    /// version of a crate published here needs no declaration.
+    #[tokio::test]
+    async fn a_declared_or_published_crate_publishes_under_an_upstream() {
+        let server = squatter().await;
+        let uri = server.uri();
+        let ctx = create_test_context_with_storage_and_config(
+            faulty(Listing::Normal, false, false),
+            move |cfg| {
+                cfg.cargo.proxy = Some(uri);
+                cfg.curation.internal_namespaces = vec!["corp-lib".to_string()];
+            },
+        );
+        assert_eq!(publish(&ctx.app, "0.1.0").await, StatusCode::OK);
+
+        let ctx = proxied(faulty(Listing::Normal, false, false), &server);
+        seed(&ctx.state.storage, true).await;
+        assert_eq!(publish(&ctx.app, "0.2.0").await, StatusCode::OK);
+        let (_, body) = get_index(&ctx.app).await;
+        assert!(
+            body.contains("\"0.1.0\"") && body.contains("\"0.2.0\"") && !body.contains("9.9.9"),
+            "{body}"
+        );
+    }
+
+    /// A005: a listing that fails at the first-publish gate is a 503, never a pass.
+    #[tokio::test]
+    async fn a_failed_listing_at_the_first_publish_gate_is_a_503() {
+        let server = squatter().await;
+        let ctx = proxied(faulty(Listing::FailsAfterFirst, false, false), &server);
+        assert_eq!(
+            publish(&ctx.app, "0.1.0").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(ctx
+            .state
+            .storage
+            .stat("cargo/corp-lib/0.1.0/corp-lib-0.1.0.crate")
+            .await
+            .is_none());
     }
 
     /// Row 7: an unpublished crate's upstream answer goes to the upstream copy; whatever an older
@@ -4153,7 +4349,7 @@ mod published_index_table {
             )
             .mount(&server)
             .await;
-        let ctx = proxied(faulty(Listing::Normal, false, false), &server);
+        let ctx = proxied_declared(faulty(Listing::Normal, false, false), &server);
         let app = ctx.app.clone();
         let get = tokio::spawn(async move { get_index(&app).await });
         // The publish starts once the upstream holds the GET (it answers 800 ms later).
@@ -4245,7 +4441,7 @@ mod published_index_table {
     #[tokio::test]
     async fn a_publish_in_any_case_is_published_under_the_lowercase_name() {
         let server = squatter().await;
-        let ctx = proxied(faulty(Listing::Normal, false, false), &server);
+        let ctx = proxied_declared(faulty(Listing::Normal, false, false), &server);
         let meta = serde_json::to_vec(&serde_json::json!({
             "name": "Corp-Lib", "vers": "0.1.0", "deps": [], "features": {}
         }))
@@ -4909,11 +5105,18 @@ mod crate_name_one_canon {
         server.received_requests().await.unwrap().len()
     }
 
+    /// Every spelling these tests publish is declared hosted (A005); none has a stored index, so
+    /// the declaration changes no read.
     fn proxied(storage: Storage, server: &MockServer) -> crate::test_helpers::TestContext {
         let uri = server.uri();
         create_test_context_with_storage_and_config(storage, move |cfg| {
             cfg.cargo.proxy = Some(uri);
             cfg.cargo.metadata_ttl = 0;
+            cfg.cargo.import_embedded = [
+                "my-crate", "race-x", "race_x", "zz_q", "a-b-c", "rc-lv", "rclv",
+            ]
+            .map(String::from)
+            .to_vec();
         })
     }
 
@@ -5454,5 +5657,233 @@ mod quarantine_first_seen {
     async fn with_trusted_dates_an_old_release_matures_in_the_quarantine() {
         let (_up, ctx) = context(true).await;
         assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::OK);
+    }
+}
+
+/// Release dates of proxied crates (A006) and the fill of a proxied `.crate` racing a publish (A035).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod release_dates_and_fills {
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_config, put_written_days_ago, send, upstream_paths,
+        TestContext,
+    };
+    use axum::body::Body;
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const META_KEY: &str = "cargo/oldcrate/metadata.json";
+    const UP_META: &str = "/api/v1/crates/oldcrate";
+    const UP_NEW: &str = "/api/v1/crates/oldcrate/1.0.1/download";
+    const NEW: &str = "/cargo/api/v1/crates/oldcrate/1.0.1/download";
+    const CACHED: &[u8] = br#"{"crate":{"name":"oldcrate"},"versions":[{"num":"1.0.0","created_at":"2019-01-01T00:00:00Z"}]}"#;
+
+    fn listing_new(age: chrono::Duration) -> Vec<u8> {
+        let at = (chrono::Utc::now() - age).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        format!(
+            r#"{{"crate":{{"name":"oldcrate"}},"versions":[{{"num":"1.0.1","created_at":"{at}"}},{{"num":"1.0.0","created_at":"2019-01-01T00:00:00Z"}}]}}"#
+        )
+        .into_bytes()
+    }
+
+    async fn serve(up: &MockServer, at: &str, template: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path(at))
+            .respond_with(template)
+            .mount(up)
+            .await;
+    }
+
+    /// An upstream serving every download and `metadata` for oldcrate.
+    async fn upstream(metadata: ResponseTemplate) -> MockServer {
+        let up = MockServer::start().await;
+        serve(&up, UP_META, metadata).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"CRATE".to_vec()))
+            .mount(&up)
+            .await;
+        up
+    }
+
+    /// Live shape: enforce, cargo min_release_age 3d, quarantine observe, trusted dates.
+    fn min_age(up: &MockServer, unknown_date: Option<crate::config::UnknownDate>) -> TestContext {
+        let uri = up.uri();
+        create_test_context_with_config(move |cfg| {
+            cfg.cargo.proxy = Some(uri);
+            cfg.cargo.import_embedded = vec!["hosted".to_string(), "racecrate".to_string()];
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.cargo.min_release_age = Some("3d".to_string());
+            cfg.curation.cargo.quarantine = Some(crate::digest_quarantine::QuarantineMode::Observe);
+            cfg.curation.cargo.quarantine_ttl = Some("3d".to_string());
+            cfg.curation.cargo.unknown_date = unknown_date;
+        })
+    }
+
+    async fn status(ctx: &TestContext, uri: &str) -> StatusCode {
+        send(&ctx.app, Method::GET, uri, "").await.status()
+    }
+
+    async fn publish(app: &axum::Router, name: &str, vers: &str, data: &[u8]) -> StatusCode {
+        let meta = serde_json::to_vec(
+            &serde_json::json!({"name": name, "vers": vers, "deps": [], "features": {}}),
+        )
+        .unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&meta);
+        payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        payload.extend_from_slice(data);
+        send(
+            app,
+            Method::PUT,
+            "/cargo/api/v1/crates/new",
+            Body::from(payload),
+        )
+        .await
+        .status()
+    }
+
+    /// A006: metadata cached before 1.0.1 was released does not leave 1.0.1 undated: it is
+    /// refetched, 1.0.1 is dated 30 minutes old and held, and nothing is downloaded.
+    #[tokio::test]
+    async fn a_version_published_after_metadata_was_cached_is_held() {
+        let up = upstream(
+            ResponseTemplate::new(200).set_body_bytes(listing_new(chrono::Duration::minutes(30))),
+        )
+        .await;
+        let ctx = min_age(&up, None);
+        put_written_days_ago(&ctx, META_KEY, CACHED, 1).await;
+        assert_eq!(status(&ctx, NEW).await, StatusCode::FORBIDDEN);
+        let paths = upstream_paths(&up).await;
+        assert!(paths.iter().any(|p| p == UP_META), "{paths:?}");
+        assert!(!paths.iter().any(|p| p == UP_NEW), "{paths:?}");
+        let stored = ctx.state.storage.get(META_KEY).await.unwrap();
+        assert!(super::metadata_lists_version(&stored, "1.0.1"));
+        // A version the cached copy lists is dated by it, with no further fetch.
+        assert_eq!(
+            status(&ctx, "/cargo/api/v1/crates/oldcrate/1.0.0/download").await,
+            StatusCode::OK
+        );
+        let metas = upstream_paths(&up)
+            .await
+            .iter()
+            .filter(|p| *p == UP_META)
+            .count();
+        assert_eq!(metas, 1);
+    }
+
+    /// A006: a cached copy younger than the miss TTL is not refetched for a version it lacks.
+    #[tokio::test]
+    async fn a_miss_refetches_at_most_once_per_miss_ttl() {
+        let up = upstream(
+            ResponseTemplate::new(200).set_body_bytes(listing_new(chrono::Duration::days(30))),
+        )
+        .await;
+        let ctx = min_age(&up, None);
+        ctx.state.storage.put(META_KEY, CACHED).await.unwrap();
+        assert_eq!(status(&ctx, NEW).await, StatusCode::OK);
+        assert!(!upstream_paths(&up).await.iter().any(|p| p == UP_META));
+    }
+
+    /// A006: a version the upstream's metadata never lists is judged by `unknown_date`: `hold`
+    /// refuses it, `log` (cargo's default) serves it and counts it.
+    #[tokio::test]
+    async fn an_undated_version_is_held_under_hold_and_counted_under_log() {
+        let up = upstream(ResponseTemplate::new(200).set_body_bytes(CACHED.to_vec())).await;
+        let ctx = min_age(&up, Some(crate::config::UnknownDate::Hold));
+        assert_eq!(status(&ctx, NEW).await, StatusCode::FORBIDDEN);
+
+        let ctx = min_age(&up, None);
+        let counter =
+            crate::metrics::CURATION_UNKNOWN_RELEASE_DATE_TOTAL.with_label_values(&["cargo"]);
+        let before = counter.get();
+        assert_eq!(status(&ctx, NEW).await, StatusCode::OK);
+        assert!(counter.get() > before);
+    }
+
+    /// A006: a crate published here (a name with no `-` or `_`, so no name record) is never
+    /// judged as undated, nor its date asked of the upstream, even under `hold`.
+    #[tokio::test]
+    async fn a_published_crate_without_a_dash_downloads_under_hold() {
+        let up = upstream(ResponseTemplate::new(404)).await;
+        let ctx = min_age(&up, Some(crate::config::UnknownDate::Hold));
+        assert_eq!(
+            publish(&ctx.app, "hosted", "0.1.0", b"hosted crate").await,
+            StatusCode::OK
+        );
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/cargo/api/v1/crates/hosted/0.1.0/download",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.as_ref(), b"hosted crate");
+        assert!(upstream_paths(&up).await.is_empty());
+    }
+
+    /// A035: a proxy fill of a version that a publish stores while the upstream answers never
+    /// replaces the published bytes.
+    #[tokio::test]
+    async fn a_late_fill_never_replaces_a_published_crate() {
+        let up = MockServer::start().await;
+        serve(
+            &up,
+            "/api/v1/crates/racecrate/0.9.1/download",
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"upstream crate".to_vec())
+                .set_delay(std::time::Duration::from_millis(800)),
+        )
+        .await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.cargo.proxy = Some(uri);
+            cfg.cargo.import_embedded = vec!["racecrate".to_string()];
+        });
+        let holders = ctx.state.storage.holders();
+        let app = ctx.app.clone();
+        let get = tokio::spawn(async move {
+            send(
+                &app,
+                Method::GET,
+                "/cargo/api/v1/crates/racecrate/0.9.1/download",
+                "",
+            )
+            .await
+            .status()
+        });
+        let asked = async {
+            while up.received_requests().await.unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        };
+        // CANCEL-SAFETY: the wait only reads the mock's request log.
+        tokio::time::timeout(std::time::Duration::from_secs(30), asked)
+            .await
+            .expect("the download never reached the upstream");
+        assert_eq!(
+            publish(&ctx.app, "racecrate", "0.9.1", b"hosted crate").await,
+            StatusCode::OK
+        );
+        assert_eq!(get.await.unwrap(), StatusCode::OK);
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
+        let stored = ctx
+            .state
+            .storage
+            .get("cargo/racecrate/0.9.1/racecrate-0.9.1.crate")
+            .await
+            .unwrap();
+        assert_eq!(stored.as_ref(), b"hosted crate");
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/cargo/api/v1/crates/racecrate/0.9.1/download",
+            "",
+        )
+        .await;
+        assert_eq!(body_bytes(resp).await.as_ref(), b"hosted crate");
     }
 }
