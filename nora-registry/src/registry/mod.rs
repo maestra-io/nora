@@ -927,6 +927,12 @@ where
                     match &result {
                         // A local spool refusal or failure is nora's, not upstream's.
                         Ok(_) | Err(ProxyError::Spool(_)) => cb.record_success(&cb_key, probe),
+                        // The headers came in time and only the whole-body deadline ran
+                        // out: the object's size and the link decide that, not upstream
+                        // availability, so it never charges the shared breaker (A026).
+                        Err(ProxyError::Timeout(_)) if !headers_only => {
+                            body_timeout_is_alive(cb, &cb_key, probe, url)
+                        }
                         // 2xx but the body could not be read (e.g. a mid-stream
                         // drop) — treat as a fetch failure for the breaker.
                         Err(_) => cb.record_failure(&cb_key, probe),
@@ -1019,6 +1025,23 @@ where
     }
     cb.record_failure(&cb_key, probe);
     Err(ProxyError::Network("max retries exceeded".into()))
+}
+
+/// A 2xx whose body outlived the whole-request deadline: the upstream answered, so
+/// it is alive to the breaker (a no-op in Closed, closes a half-open probe), never a
+/// failure — five slow objects must not answer 503 to every reader of the format.
+fn body_timeout_is_alive(
+    cb: &CircuitBreakerRegistry,
+    key: &str,
+    probe: crate::circuit_breaker::ProbeToken,
+    url: &str,
+) {
+    tracing::debug!(
+        breaker = key,
+        url,
+        "upstream sent 2xx headers but the body outlived the proxy timeout; breaker not charged"
+    );
+    cb.record_alive(key, probe);
 }
 
 /// `server.proxy_max_buffered_mb` in bytes (`u64::MAX` = no cap): the largest upstream
@@ -3008,7 +3031,11 @@ pub(crate) async fn proxy_forward_post(
                             return Ok((code, b.to_vec(), content_type));
                         }
                         Err(e) => {
-                            cb.record_failure(&cb_key, probe);
+                            if e.is_timeout() {
+                                body_timeout_is_alive(cb, &cb_key, probe, url);
+                            } else {
+                                cb.record_failure(&cb_key, probe);
+                            }
                             return Err(ProxyError::Network(e.to_string()));
                         }
                     }
@@ -3414,6 +3441,12 @@ pub(crate) async fn proxy_fetch_conditional(
                         // Refused for its size: nora's limit, the upstream is alive.
                         Err(e @ ProxyError::Spool(_)) => {
                             cb.record_success(&cb_key, probe);
+                            Err(e)
+                        }
+                        // Only the whole-body deadline ran out: alive, as in
+                        // proxy_fetch_prepared (A026).
+                        Err(e @ ProxyError::Timeout(_)) => {
+                            body_timeout_is_alive(cb, &cb_key, probe, url);
                             Err(e)
                         }
                         Err(e) => {
@@ -5195,6 +5228,146 @@ mod tests {
             Err(e) => panic!("expected Modified, got {e:?}"),
         }
         assert_eq!(cb.health_snapshot("npm").unwrap().status, "closed");
+    }
+
+    /// A raw upstream answering every connection, and holding it open well past any
+    /// test timeout. `send_headers`: a 200 declaring a 1 MiB body, of which one byte
+    /// comes (only the whole-body deadline can end the read). Otherwise it never
+    /// answers at all (the headers deadline runs out).
+    async fn stalling_upstream(send_headers: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut req = [0u8; 4096];
+                    let _ = sock.read(&mut req).await;
+                    if send_headers {
+                        let head = "HTTP/1.1 200 OK\r\ncontent-length: 1048576\r\n\r\nx";
+                        let _ = sock.write_all(head.as_bytes()).await;
+                    }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+        url
+    }
+
+    const SLOW: Duration = Duration::from_millis(200);
+
+    /// A026: a 2xx whose body outlives the whole-request deadline is the object's
+    /// size and the link, not an unavailable upstream. Six in a row, through every
+    /// buffered fetcher, leave a threshold-1 breaker closed with no failure counted.
+    #[tokio::test]
+    async fn breaker_ignores_a_buffered_body_timeout() {
+        let upstream = stalling_upstream(true).await;
+        let client = reqwest::Client::new();
+        let cb = half_open_test_cb();
+        for _ in 0..6 {
+            let out = proxy_fetch(&client, &upstream, SLOW, None, &cb, RegistryType::Gems).await;
+            assert!(matches!(out, Err(ProxyError::Timeout(_))), "{out:?}");
+            let out = proxy_fetch_conditional(
+                &client,
+                &upstream,
+                SLOW,
+                None,
+                &Validators::default(),
+                &cb,
+                RegistryType::Gems,
+            )
+            .await;
+            assert!(
+                matches!(out, Err(ProxyError::Timeout(_))),
+                "{:?}",
+                out.err()
+            );
+            let out = proxy_forward_post(
+                &client,
+                &upstream,
+                SLOW,
+                None,
+                &[],
+                b"{}",
+                &cb,
+                RegistryType::Gems,
+            )
+            .await;
+            assert!(out.is_err(), "{out:?}");
+            assert!(cb.check("gems").is_ok(), "the breaker must stay closed");
+        }
+        let health = cb.health_snapshot("gems").expect("breaker recorded");
+        assert_eq!((health.status, health.failure_count), ("closed", 0));
+    }
+
+    /// A026, half-open: a slow body picked as the probe proves the upstream answered,
+    /// so it closes the breaker instead of re-opening it, in every buffered fetcher.
+    #[tokio::test]
+    async fn a_slow_body_probe_closes_the_half_open_breaker() {
+        let upstream = stalling_upstream(true).await;
+        let client = reqwest::Client::new();
+        for fetcher in 0..3 {
+            let cb = half_open_test_cb();
+            cb.record_failure("gems", crate::circuit_breaker::ProbeToken::BACKGROUND);
+            cb.expire_open_for_test("gems");
+            let failed = match fetcher {
+                0 => proxy_fetch(&client, &upstream, SLOW, None, &cb, RegistryType::Gems)
+                    .await
+                    .is_err(),
+                1 => proxy_fetch_conditional(
+                    &client,
+                    &upstream,
+                    SLOW,
+                    None,
+                    &Validators::default(),
+                    &cb,
+                    RegistryType::Gems,
+                )
+                .await
+                .is_err(),
+                _ => proxy_forward_post(
+                    &client,
+                    &upstream,
+                    SLOW,
+                    None,
+                    &[],
+                    b"{}",
+                    &cb,
+                    RegistryType::Gems,
+                )
+                .await
+                .is_err(),
+            };
+            assert!(
+                failed,
+                "fetcher {fetcher}: the slow body is still an error to the reader"
+            );
+            assert_eq!(
+                cb.health_snapshot("gems").unwrap().status,
+                "closed",
+                "fetcher {fetcher}: the answered probe must close the breaker"
+            );
+        }
+    }
+
+    /// Control for A026: an upstream that never sends its headers is unavailable, and
+    /// still opens the breaker (the mid-body drop control is
+    /// `conditional_truncated_200_returns_the_probe_as_a_failure`).
+    #[tokio::test]
+    async fn a_headers_timeout_still_opens_the_breaker() {
+        let upstream = stalling_upstream(false).await;
+        let cb = half_open_test_cb();
+        let out = proxy_fetch(
+            &reqwest::Client::new(),
+            &upstream,
+            SLOW,
+            None,
+            &cb,
+            RegistryType::Gems,
+        )
+        .await;
+        assert!(matches!(out, Err(ProxyError::Timeout(_))), "{out:?}");
+        assert_eq!(cb.health_snapshot("gems").unwrap().status, "open");
     }
 
     /// Every shared upstream helper sends the credential with its own scheme (#1055).
