@@ -1871,6 +1871,7 @@ impl Config {
                 .namespaces_problems(&self.curation.internal_namespaces);
             warnings.extend(w);
             errors.extend(e);
+            errors.extend(self.docker.quarantine_exempt_problems());
         }
 
         // 9c. npm multi-upstream (#1055): scope ownership, one default, credentials

@@ -253,6 +253,7 @@ fn build_context_full(
             default_action: crate::config::DefaultAction::Allow,
             upstreams: vec![],
             quarantine_exceptions: None,
+            quarantine_exempt: Vec::new(),
         },
         raw: RawConfig {
             enabled: true,

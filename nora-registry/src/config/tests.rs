@@ -5587,3 +5587,60 @@ fn auth_key_urls_must_be_https_or_loopback() {
     config.auth.teleport.jwks_url = "http://tp.example/jwks".to_string();
     assert!(about_https(&config.validate_with_config_path(None).1).is_empty());
 }
+
+/// `[[docker.quarantine_exempt]]`: an exact `<upstream namespace>/<repo>` of a configured
+/// upstream with a reason, once; anything else stops NORA at load.
+#[test]
+fn quarantine_exempt_needs_a_reason_and_an_exact_repository() {
+    let errors = |entries: &str| {
+        let toml = format!(
+            "[docker]\n[[docker.upstreams]]\nurl = \"https://ghcr.io\"\nprefix = \"ghcr\"\nnamespace = \"ghcr.io\"\n{entries}"
+        );
+        let config: Config = toml::from_str(&toml).unwrap();
+        config
+            .validate_with_config_path(None)
+            .1
+            .into_iter()
+            .filter(|e| e.contains("quarantine_exempt"))
+            .collect::<Vec<_>>()
+    };
+    let entry = |repository: &str, reason: &str| {
+        format!("[[docker.quarantine_exempt]]\nrepository = {repository:?}\nreason = {reason:?}\n")
+    };
+    assert!(errors(&entry(
+        "ghcr.io/aquasecurity/trivy-db",
+        "issues-maestra#1649: vuln DB"
+    ))
+    .is_empty());
+    for (repository, reason, why) in [
+        ("ghcr.io/aquasecurity/trivy-db", "", "no reason"),
+        ("ghcr.io/aquasecurity/trivy-db", "  ", "a blank reason"),
+        ("ghcr.io/aquasecurity/*", "r", "a pattern"),
+        ("ghcr.io/aquasecurity/trivy-db:2", "r", "a tag"),
+        (
+            "ghcr/aquasecurity/trivy-db",
+            "r",
+            "the prefix, not the namespace",
+        ),
+        (
+            "docker.io/library/postgres",
+            "r",
+            "an upstream not configured",
+        ),
+        ("ghcr.io", "r", "no repository"),
+        ("ghcr.io/Aquasecurity/trivy-db", "r", "uppercase"),
+    ] {
+        assert_eq!(errors(&entry(repository, reason)).len(), 1, "{why}");
+    }
+    let twice = entry("ghcr.io/aquasecurity/trivy-db", "r").repeat(2);
+    assert_eq!(errors(&twice).len(), 1, "listed twice");
+    let unknown_key = format!(
+        "{}note = \"x\"\n",
+        entry("ghcr.io/aquasecurity/trivy-db", "r")
+    );
+    let toml = format!("[docker]\n{unknown_key}");
+    assert!(
+        toml::from_str::<Config>(&toml).is_err(),
+        "a misspelt key is refused"
+    );
+}

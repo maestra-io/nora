@@ -656,11 +656,31 @@ pub fn cleanup_proxy_temp_dir(data_dir: &str) {
     }
 }
 
+tokio::task_local! {
+    /// Set for a read of a `[[docker.quarantine_exempt]]` repository ([`docker_v2_dispatch`]):
+    /// every quarantine gate the request reaches sees the quarantine off.
+    static QUARANTINE_EXEMPT: bool;
+}
+
+/// Whether the current request reads a repository exempt from the quarantine by policy.
+fn quarantine_exempt_request() -> bool {
+    QUARANTINE_EXEMPT.try_with(|e| *e).unwrap_or(false)
+}
+
 /// Resolve effective quarantine mode and TTL (seconds) for Docker.
 ///
 /// Returns `(QuarantineMode, quarantine_secs)`. Per-registry override takes
-/// precedence over global curation config. Returns `(Off, 0)` when disabled.
+/// precedence over global curation config. Returns `(Off, 0)` when disabled, and for a
+/// read of a `quarantine_exempt` repository.
 fn resolve_quarantine(state: &AppState) -> (crate::digest_quarantine::QuarantineMode, i64) {
+    if quarantine_exempt_request() {
+        return (crate::digest_quarantine::QuarantineMode::Off, 0);
+    }
+    resolve_quarantine_policy(state)
+}
+
+/// [`resolve_quarantine`] without the per-request exemption.
+fn resolve_quarantine_policy(state: &AppState) -> (crate::digest_quarantine::QuarantineMode, i64) {
     use crate::digest_quarantine::QuarantineMode;
 
     let mode = state
@@ -782,7 +802,8 @@ fn quarantine_ledger_loading(digest: &str) -> Response {
 /// digest is still within the TTL, `mature` once admitted: past the TTL, dated past it by
 /// the registry (`trust_upstream_dates`), quarantine off, or served without a proxy record
 /// (a local push), `exception` while held but admitted by a break-glass exception
-/// ([`quarantine_excepted`]). A 403 keeps the headers [`quarantine_forbidden`] set.
+/// ([`quarantine_excepted`]), `exempt` for a `quarantine_exempt` repository. A 403 keeps the
+/// headers [`quarantine_forbidden`] set.
 fn with_quarantine_verdict(state: &AppState, mut resp: Response) -> Response {
     if resp.status() != StatusCode::OK {
         return resp;
@@ -810,6 +831,7 @@ fn with_quarantine_verdict(state: &AppState, mut resp: Response) -> Response {
     let held = held.filter(|_| !excepted);
     let headers = resp.headers_mut();
     let verdict = match (excepted, held) {
+        _ if quarantine_exempt_request() => "exempt",
         (true, _) => "exception",
         (false, Some(_)) => "pending",
         (false, None) => "mature",
@@ -1266,12 +1288,76 @@ pub fn routes() -> Router<AppState> {
         .route("/v2/{*rest}", axum::routing::any(docker_v2_dispatch))
 }
 
+/// Docker v2 image endpoints: a read (GET/HEAD) of a `[[docker.quarantine_exempt]]` repository
+/// runs with the quarantine off ([`QUARANTINE_EXEMPT`]), logged and counted; everything else
+/// goes to [`docker_v2_route`] as is.
+// Each argument is an axum extractor of the request.
+#[allow(clippy::too_many_arguments)]
+async fn docker_v2_dispatch(
+    state: State<AppState>,
+    method: Method,
+    path: Path<String>,
+    authority: Extension<NamespaceAuthority>,
+    user: Option<Extension<AuthenticatedUser>>,
+    uri: Uri,
+    headers: axum::http::HeaderMap,
+    body: Body,
+) -> Response {
+    let exempt = matches!(method, Method::GET | Method::HEAD)
+        && quarantine_exempt_entry(&state.0, path.0.trim_start_matches('/')).is_some();
+    let route = docker_v2_route(state, method, path, authority, user, uri, headers, body);
+    if exempt {
+        QUARANTINE_EXEMPT.scope(true, route).await
+    } else {
+        route.await
+    }
+}
+
+/// The `quarantine_exempt` entry a read of `rest` (`<name>/manifests/<ref>`,
+/// `<name>/blobs/<digest>`, `<name>/tags/list`, `<name>/referrers/<digest>`) falls under, by the
+/// upstream its name routes to; logged and counted when the quarantine is on.
+fn quarantine_exempt_entry<'a>(
+    state: &'a AppState,
+    rest: &str,
+) -> Option<&'a crate::config::QuarantineExempt> {
+    if state.config.docker.quarantine_exempt.is_empty() {
+        return None;
+    }
+    let raw = ["/manifests/", "/blobs/", "/referrers/"]
+        .iter()
+        .find_map(|sep| rest.rsplit_once(sep).map(|(name, _)| name))
+        .or_else(|| rest.strip_suffix("/tags/list"))?;
+    let c = canonicalize(raw, &state.config.docker);
+    if !c.routed() {
+        return None;
+    }
+    let entry = state
+        .config
+        .docker
+        .quarantine_exempt_for(c.namespace.as_deref()?, &c.name)?;
+    if !matches!(
+        resolve_quarantine_policy(state).0,
+        crate::digest_quarantine::QuarantineMode::Off
+    ) {
+        crate::metrics::DOCKER_QUARANTINE_EXEMPT_TOTAL
+            .with_label_values(&[entry.repository.as_str()])
+            .inc();
+        tracing::info!(
+            repository = %entry.repository,
+            reason = %entry.reason,
+            path = %rest,
+            "Quarantine: repository exempt by policy"
+        );
+    }
+    Some(entry)
+}
+
 /// Unified dispatcher for all Docker v2 image endpoints.
 /// Parses the image name (arbitrary depth) and operation from the wildcard path,
 /// then delegates to the appropriate handler with correct method routing.
 // Each argument is an axum extractor of the request.
 #[allow(clippy::too_many_arguments)]
-async fn docker_v2_dispatch(
+async fn docker_v2_route(
     state: State<AppState>,
     method: Method,
     Path(wildcard): Path<String>,

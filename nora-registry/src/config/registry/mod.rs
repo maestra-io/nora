@@ -170,7 +170,7 @@ pub(in crate::config) use self::docker::RESERVED_DOCKER_SEGMENTS;
 #[allow(unused_imports)]
 pub use self::docker::{
     extract_docker_namespace, is_docker_hub_host, DateSource, DefaultAction, DockerConfig,
-    DockerUpstream,
+    DockerUpstream, QuarantineExempt,
 };
 pub use self::gems::GemsConfig;
 pub use self::github::GithubConfig;
