@@ -236,6 +236,7 @@ fn build_context_full(
             proxy_timeout_zip: 30,
             max_zip_size: 10_485_760,
             metadata_ttl: 300,
+            attested_dates: false,
         },
         cargo: CargoConfig {
             enabled: true,

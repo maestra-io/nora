@@ -24,6 +24,14 @@ pub struct GoConfig {
     /// content-addressed and always immutable.
     #[serde(default = "super::super::default_metadata_ttl")]
     pub metadata_ttl: i64,
+    /// Date a version NORA first saw inside the release age by the `Last-Modified` of its
+    /// `.zip` on proxy.golang.org (a HEAD, kept once per version) when that is earlier: the
+    /// proxy's own first fetch of the version (the index.golang.org `Timestamp`), which the
+    /// publisher cannot set, unlike the `.info` `Time` (A066). Read only when `proxy` is
+    /// proxy.golang.org ([`Self::attests_first_fetch`]); elsewhere ignored, with a config
+    /// warning. Off: a new version ages from NORA's first sight.
+    #[serde(default)]
+    pub attested_dates: bool,
 }
 
 fn default_go_proxy() -> Option<String> {
@@ -48,11 +56,24 @@ impl Default for GoConfig {
             proxy_timeout_zip: 120,
             max_zip_size: 104_857_600,
             metadata_ttl: 300,
+            attested_dates: false,
         }
     }
 }
 
 impl GoConfig {
+    /// Whether `url` is a Go proxy whose zip `Last-Modified` is its own first fetch of the
+    /// version: proxy.golang.org only. Another proxy may relay the publisher's date or a
+    /// placeholder, which would let a back-dated `.info` `Time` through (A066). Unit tests
+    /// serve it from a mock under the path `/proxy.golang.org`.
+    pub fn attests_first_fetch(url: &str) -> bool {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        (parsed.scheme() == "https" && parsed.host_str() == Some("proxy.golang.org"))
+            || (cfg!(test) && parsed.path().starts_with("/proxy.golang.org"))
+    }
+
     pub(in crate::config) fn apply_env_overrides(&mut self) {
         if let Ok(val) = env::var("NORA_GO_ENABLED") {
             self.enabled = val.to_lowercase() == "true" || val == "1";
@@ -79,6 +100,9 @@ impl GoConfig {
         }
         if let Ok(val) = env::var("NORA_GO_MAX_ZIP_SIZE") {
             super::super::parse_env_warn("NORA_GO_MAX_ZIP_SIZE", &val, &mut self.max_zip_size);
+        }
+        if let Ok(val) = env::var("NORA_GO_ATTESTED_DATES") {
+            self.attested_dates = val.to_lowercase() == "true" || val == "1";
         }
         if let Ok(val) = env::var("NORA_GO_METADATA_TTL") {
             super::super::parse_env_warn("NORA_GO_METADATA_TTL", &val, &mut self.metadata_ttl);

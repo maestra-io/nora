@@ -430,7 +430,7 @@ async fn handle(
 // Module path encoding/decoding
 // ============================================================================
 
-/// Extract publish date from a cached Go .info file.
+/// The publisher's `.info` `Time` of a cached version, and NORA's first sight of it.
 ///
 /// Go .info JSON has a `Time` field in RFC 3339 format:
 /// ```json
@@ -439,49 +439,201 @@ async fn handle(
 ///
 /// `Time` is the publisher's commit date, which the publisher sets: it bounds the release
 /// from below only. A canonical .info is cached once (`put_if_absent`) and never rewritten,
-/// so its write time is NORA's first sight of the version; the date is the later of the two,
-/// and now when the write time cannot be read.
-async fn extract_go_publish_date(
-    storage: &crate::storage::Storage,
-    info_key: &str,
-    trust_upstream: bool,
-) -> Option<i64> {
-    // #513: untrusted upstream dates → no date: never upstream .info Time, nor the cache mtime.
-    if !trust_upstream {
-        return None;
-    }
+/// so its write time is NORA's first sight of the version (now when it cannot be read).
+async fn go_info_dates(storage: &crate::storage::Storage, info_key: &str) -> Option<(i64, i64)> {
     let data = storage.get(info_key).await.ok()?;
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
-    let date_str = json.get("Time")?.as_str()?;
-    let time = crate::curation::parse_iso8601_to_unix(date_str)?;
+    let time = crate::curation::parse_iso8601_to_unix(json.get("Time")?.as_str()?)?;
     let first_seen = crate::curation::extract_mtime_as_publish_date(storage, info_key)
         .await
         .unwrap_or_else(|| crate::cache_ttl::now_unix() as i64);
-    Some(time.max(first_seen))
+    Some((time, first_seen))
 }
 
-/// A version's release date from its `.info` (see [`extract_go_publish_date`]). With
-/// `fetch` (a proxied module) and a release age to judge, an `.info` NORA has none of is
-/// fetched first: a `.zip` asked for first, or cached without its `.info`, is dated too.
+/// A version's release date from its `.info`: the later of `Time` and NORA's first sight
+/// (A066). With `fetch` (a proxied module) and a release age to judge, an `.info` NORA has
+/// none of is fetched first: a `.zip` asked for first, or cached without its `.info`, is
+/// dated too. With `[go] attested_dates` on proxy.golang.org, a first sight still inside the
+/// release age gives way to the proxy's own first fetch when that is earlier
+/// ([`go_attested_date`]): the date is then `max(Time, min(attested, first sight))`, never
+/// earlier than `Time` nor later than what A066 alone would judge. #513: untrusted upstream
+/// dates give no date: never upstream .info Time, nor the cache mtime.
 async fn go_publish_date(
     state: &AppState,
     module_encoded: &str,
     ver: &str,
     fetch: bool,
 ) -> Option<i64> {
-    let trust = state.config.server.trust_upstream_dates;
+    if !state.config.server.trust_upstream_dates {
+        return None;
+    }
     let file = format!("@v/{ver}.info");
     let info_key = format!("go/{module_encoded}/{file}");
-    if fetch
-        && trust
-        && state
-            .curation()
-            .curation_engine
-            .reads_release_date(RegistryType::Go)
-    {
+    let curation = state.curation();
+    let engine = &curation.curation_engine;
+    let aged = fetch && engine.reads_release_date(RegistryType::Go);
+    if aged {
         ensure_go_info_cached(state, module_encoded, &file, &info_key).await;
     }
-    extract_go_publish_date(&state.storage, &info_key, trust).await
+    let (time, mut seen) = go_info_dates(&state.storage, &info_key).await?;
+    let held = engine
+        .min_release_age_secs(RegistryType::Go)
+        .is_some_and(|age| crate::cache_ttl::now_unix() as i64 - seen < age);
+    if aged && held && go_attests(state) {
+        if let Some(at) = go_attested_date(state, module_encoded, ver).await {
+            seen = seen.min(at);
+        }
+    }
+    Some(time.max(seen))
+}
+
+/// `[go] attested_dates` is on and `go.proxy` is one whose zip `Last-Modified` is its own
+/// first fetch ([`crate::config::GoConfig::attests_first_fetch`]); elsewhere it is ignored.
+fn go_attests(state: &AppState) -> bool {
+    state.config.go.attested_dates
+        && state
+            .config
+            .go
+            .proxy
+            .as_deref()
+            .is_some_and(crate::config::GoConfig::attests_first_fetch)
+}
+
+/// `go/{module}/@nora-dates/{version}`: the attested date of a version, Unix seconds. Never
+/// served nor written by a GOPROXY request: `split_go_path` takes the last `/@v/` and wants a
+/// single segment after it (so a key ending in `@nora-dates/<version>` is no `@v/` file), and
+/// a path holding `/@latest` is the `@latest` endpoint.
+fn attested_key(module_encoded: &str, ver: &str) -> String {
+    format!("go/{module_encoded}/@nora-dates/{ver}")
+}
+
+/// proxy.golang.org opened on 2019-04-10: a `Last-Modified` before it is no first fetch of
+/// that proxy (an epoch placeholder, say) and is not taken.
+const GO_PROXY_EPOCH: i64 = 1_554_854_400;
+
+/// The `Last-Modified` of the version's `.zip` on proxy.golang.org: the proxy's first fetch
+/// of the version (the index.golang.org `Timestamp`), which no publisher sets. Kept at
+/// [`attested_key`] once known (a kept value that does not parse or is out of range is
+/// replaced); a lookup goes
+/// through [`super::upstream_dates::dates`], so concurrent requests share one HEAD and a miss
+/// (404, no or unusable `Last-Modified`, 5xx, timeout, open breaker) is asked again at most
+/// once a minute. The HEAD is reported to the proxy's `#dates` breaker, never the download one.
+async fn go_attested_date(state: &AppState, module_encoded: &str, ver: &str) -> Option<i64> {
+    let key = attested_key(module_encoded, ver);
+    let kept = state.storage.get(&key).await.ok();
+    if let Some(at) = kept
+        .as_deref()
+        .and_then(|d| std::str::from_utf8(d).ok())
+        .and_then(|t| t.trim().parse::<i64>().ok())
+        .filter(|at| go_attested_in_range(*at))
+    {
+        return Some(at);
+    }
+    let proxy = state.config.go.proxy.clone()?;
+    let url = format!(
+        "{}/{}",
+        proxy.trim_end_matches('/'),
+        format_upstream_path(module_encoded, &format!("@v/{ver}.zip"))
+    );
+    // A good answer is kept in storage; the memo only joins concurrent requests and paces
+    // misses, so it holds one a minute (the shared memo has 1024 keys, one per version here).
+    let ttl = Duration::from_secs(60);
+    let fetching = state.clone();
+    let memo_key = url.clone();
+    let version = ver.to_owned();
+    let at = super::upstream_dates::dates(
+        state,
+        RegistryType::Go,
+        &memo_key,
+        ttl,
+        &[],
+        move || async move {
+            match go_zip_last_modified(&fetching, &proxy, &url).await {
+                Ok(at) => Some(std::collections::HashMap::from([(version, at)])),
+                Err(miss) => {
+                    tracing::info!(url, miss, "Go attested release date unavailable");
+                    None
+                }
+            }
+        },
+    )
+    .await?
+    .get(ver)
+    .copied()?;
+    let bytes = Bytes::from(at.to_string().into_bytes());
+    let _ = if kept.is_some() {
+        state.storage.put(&key, &bytes).await
+    } else {
+        state.storage.put_if_absent(&key, bytes).await.map(|_| ())
+    };
+    Some(at)
+}
+
+/// HEAD `url` and parse its `Last-Modified`; the error names the miss for the log.
+async fn go_zip_last_modified(
+    state: &AppState,
+    proxy: &str,
+    url: &str,
+) -> Result<i64, &'static str> {
+    let mut request = state
+        .http_client
+        .head(url)
+        .timeout(Duration::from_secs(state.config.go.proxy_timeout));
+    if let Some(credentials) = expose_opt(&state.config.go.proxy_auth) {
+        let value = UpstreamAuth::Basic(credentials)
+            .header_value()
+            .map_err(|_| "transport")?;
+        request = request.header(header::AUTHORIZATION, value);
+    }
+    let cb = &state.circuit_breaker;
+    let key = super::upstream_dates::breaker_key(RegistryType::Go, proxy);
+    let probe = cb.check(&key).map_err(|_| {
+        super::upstream_dates::count(RegistryType::Go, "breaker_open");
+        "breaker_open"
+    })?;
+    let resp = match request.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            cb.record_failure(&key, probe);
+            return Err(if e.is_timeout() {
+                "timeout"
+            } else {
+                "transport"
+            });
+        }
+    };
+    let status = resp.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        cb.record_failure(&key, probe);
+    } else if status.is_success() {
+        cb.record_success(&key, probe);
+    } else {
+        // Answered: alive, but no proof a failure tally is over (as `proxy_fetch`).
+        cb.record_alive(&key, probe);
+    }
+    if !status.is_success() {
+        return Err("status");
+    }
+    let lm = resp
+        .headers()
+        .get(header::LAST_MODIFIED)
+        .ok_or("missing")?
+        .to_str()
+        .map_err(|_| "parse")?;
+    let at = chrono::DateTime::parse_from_rfc2822(lm)
+        .map(|at| at.timestamp())
+        .map_err(|_| "parse")?;
+    if !go_attested_in_range(at) {
+        return Err("out_of_range");
+    }
+    Ok(at)
+}
+
+/// An attested date NORA takes, from the HEAD or from storage alike: not before
+/// proxy.golang.org opened, and not past now (plus a minute of clock skew). Anything else is
+/// no first fetch of that proxy: taken, it would let the publisher's `Time` decide (A066).
+fn go_attested_in_range(at: i64) -> bool {
+    (GO_PROXY_EPOCH..=crate::cache_ttl::now_unix() as i64 + 60).contains(&at)
 }
 
 /// The date min-release-age judges a `.zip` by: `date`, else the write time of NORA's copy
@@ -1781,6 +1933,309 @@ mod release_date_judged {
         let before = counter.get();
         assert_eq!(status(&ctx, ZIP).await, StatusCode::OK);
         assert!(counter.get() > before);
+    }
+
+    // `[go] attested_dates`: proxy.golang.org served by the mock under this path.
+    const GO_PROXY: &str = "/proxy.golang.org";
+    const KEPT: &str = "go/example.org/mod/@nora-dates/v2.3.4";
+    const GO_PROXY_EPOCH_FOR_TESTS: i64 = super::GO_PROXY_EPOCH;
+
+    fn last_modified(age: chrono::Duration) -> ResponseTemplate {
+        let at = (chrono::Utc::now() - age).format("%a, %d %b %Y %H:%M:%S GMT");
+        ResponseTemplate::new(200).insert_header("last-modified", at.to_string())
+    }
+
+    /// proxy.golang.org (under [`GO_PROXY`]) serving the zip, an `.info` `info_age` old and
+    /// `head` for the zip's HEAD.
+    async fn golang_proxy(info_age: chrono::Duration, head: ResponseTemplate) -> MockServer {
+        let up = MockServer::start().await;
+        let zip = format!("{GO_PROXY}/example.org/mod/@v/v2.3.4.zip");
+        Mock::given(method("GET"))
+            .and(path(zip.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ZIP".to_vec()))
+            .mount(&up)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{GO_PROXY}{UP_INFO}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(info(info_age)))
+            .mount(&up)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path(zip))
+            .respond_with(head)
+            .mount(&up)
+            .await;
+        up
+    }
+
+    /// The live shape of [`min_age`] with `[go] attested_dates`, `go.proxy` = `proxy`.
+    fn attested_ctx(
+        proxy: String,
+        customize: impl FnOnce(&mut crate::config::Config),
+    ) -> TestContext {
+        create_test_context_with_config(move |cfg| {
+            cfg.go.proxy = Some(proxy);
+            cfg.go.attested_dates = true;
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.go.min_release_age = Some("3d".to_string());
+            cfg.curation.go.quarantine = Some(crate::digest_quarantine::QuarantineMode::Observe);
+            cfg.curation.go.quarantine_ttl = Some("3d".to_string());
+            customize(cfg);
+        })
+    }
+
+    async fn attested(
+        info_age: chrono::Duration,
+        head: ResponseTemplate,
+    ) -> (MockServer, TestContext) {
+        let up = golang_proxy(info_age, head).await;
+        let ctx = attested_ctx(format!("{}{GO_PROXY}", up.uri()), |_| {});
+        (up, ctx)
+    }
+
+    async fn heads(up: &MockServer) -> usize {
+        let asked = up.received_requests().await.unwrap_or_default();
+        asked.iter().filter(|r| r.method.as_str() == "HEAD").count()
+    }
+
+    async fn kept(ctx: &TestContext) -> Option<i64> {
+        let data = ctx.state.storage.get(KEPT).await.ok()?;
+        std::str::from_utf8(&data).ok()?.trim().parse().ok()
+    }
+
+    fn days_ago(days: i64) -> i64 {
+        (chrono::Utc::now() - chrono::Duration::days(days)).timestamp()
+    }
+
+    // An old version NORA first sees now is dated by the proxy's first fetch, asked once and kept.
+    #[tokio::test]
+    async fn an_attested_old_version_first_seen_now_is_served() {
+        let (up, ctx) = attested(
+            chrono::Duration::days(30),
+            last_modified(chrono::Duration::days(30)),
+        )
+        .await;
+        info_through_nora(&ctx).await;
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::OK);
+        // Past the memo: the second request is answered by the kept date alone.
+        ctx.state.upstream_dates.lock().clear();
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::OK);
+        assert_eq!(heads(&up).await, 1, "one HEAD, then the kept date");
+        let at = kept(&ctx).await.expect("attested date kept");
+        assert!((at - days_ago(30)).abs() < 5, "kept the Last-Modified");
+    }
+
+    // A066 holds: a back-dated `Time` does not age a version the proxy fetched an hour ago.
+    #[tokio::test]
+    async fn a_backdated_info_time_is_bounded_by_the_attested_date() {
+        let (up, ctx) = attested(
+            chrono::Duration::days(30),
+            last_modified(chrono::Duration::hours(1)),
+        )
+        .await;
+        info_through_nora(&ctx).await;
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::FORBIDDEN);
+        assert_eq!(heads(&up).await, 1);
+        let at = kept(&ctx).await.expect("attested date kept");
+        assert!(chrono::Utc::now().timestamp() - at < 3700);
+    }
+
+    // The publisher's `Time` still bounds from below: an earlier attested date is not used.
+    #[tokio::test]
+    async fn an_attested_date_never_predates_the_info_time() {
+        let (_up, ctx) = attested(
+            chrono::Duration::hours(1),
+            last_modified(chrono::Duration::days(30)),
+        )
+        .await;
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::FORBIDDEN);
+    }
+
+    // The option only ever makes a date earlier: a first sight 10 days back stands against a
+    // proxy that re-stored the zip an hour ago, and no HEAD is sent for a version past the age.
+    #[tokio::test]
+    async fn an_old_first_sight_is_not_made_younger() {
+        let (up, ctx) = attested(
+            chrono::Duration::days(30),
+            last_modified(chrono::Duration::hours(1)),
+        )
+        .await;
+        put_written_days_ago(&ctx, INFO_KEY, &info(chrono::Duration::days(30)), 10).await;
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::OK);
+        assert_eq!(heads(&up).await, 0);
+    }
+
+    // No `Last-Modified`: first sight dates it, nothing is kept, and the miss is asked again
+    // at most once a minute, however many requests.
+    #[tokio::test]
+    async fn without_an_attested_date_first_sight_dates_it() {
+        let (up, ctx) = attested(chrono::Duration::days(30), ResponseTemplate::new(200)).await;
+        info_through_nora(&ctx).await;
+        for _ in 0..3 {
+            assert_eq!(status(&ctx, ZIP).await, StatusCode::FORBIDDEN);
+        }
+        assert_eq!(heads(&up).await, 1);
+        assert_eq!(kept(&ctx).await, None);
+    }
+
+    // A `Last-Modified` before proxy.golang.org existed is no first fetch: not taken.
+    #[tokio::test]
+    async fn an_epoch_last_modified_is_not_taken() {
+        let epoch = ResponseTemplate::new(200)
+            .insert_header("last-modified", "Thu, 01 Jan 1970 00:00:00 GMT");
+        let (up, ctx) = attested(chrono::Duration::days(30), epoch).await;
+        info_through_nora(&ctx).await;
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::FORBIDDEN);
+        assert_eq!(heads(&up).await, 1);
+        assert_eq!(kept(&ctx).await, None);
+    }
+
+    // A HEAD answered 404 (or 5xx) dates nothing.
+    #[tokio::test]
+    async fn a_missing_zip_on_the_proxy_dates_nothing() {
+        for code in [404, 503] {
+            let (up, ctx) = attested(chrono::Duration::days(30), ResponseTemplate::new(code)).await;
+            info_through_nora(&ctx).await;
+            assert_eq!(status(&ctx, ZIP).await, StatusCode::FORBIDDEN, "{code}");
+            assert_eq!(heads(&up).await, 1, "{code}");
+            assert_eq!(kept(&ctx).await, None, "{code}");
+        }
+    }
+
+    // Another proxy's `Last-Modified` is never read: the option is ignored there.
+    #[tokio::test]
+    async fn another_proxy_is_not_asked() {
+        let up = golang_proxy(
+            chrono::Duration::days(30),
+            last_modified(chrono::Duration::days(30)),
+        )
+        .await;
+        let other =
+            format!("{}{GO_PROXY}", up.uri()).replace("/proxy.golang.org", "/goproxy.example");
+        let ctx = attested_ctx(other, |_| {});
+        assert!(!crate::config::GoConfig::attests_first_fetch(
+            "https://goproxy.example"
+        ));
+        assert!(!crate::config::GoConfig::attests_first_fetch(
+            "http://proxy.golang.org"
+        ));
+        assert!(crate::config::GoConfig::attests_first_fetch(
+            "https://proxy.golang.org/"
+        ));
+        let _ = status(&ctx, ZIP).await;
+        assert_eq!(heads(&up).await, 0);
+    }
+
+    // Untrusted upstream dates: no date is read, so none is asked for.
+    #[tokio::test]
+    async fn untrusted_dates_send_no_head() {
+        let up = golang_proxy(
+            chrono::Duration::days(30),
+            last_modified(chrono::Duration::days(30)),
+        )
+        .await;
+        let ctx = attested_ctx(format!("{}{GO_PROXY}", up.uri()), |cfg| {
+            cfg.server.trust_upstream_dates = false;
+        });
+        let _ = status(&ctx, ZIP).await;
+        assert_eq!(heads(&up).await, 0);
+    }
+
+    // A kept value that does not parse is asked again and replaced.
+    #[tokio::test]
+    async fn a_corrupt_kept_date_is_replaced() {
+        let (up, ctx) = attested(
+            chrono::Duration::days(30),
+            last_modified(chrono::Duration::days(30)),
+        )
+        .await;
+        ctx.state.storage.put(KEPT, b"not a date").await.unwrap();
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::OK);
+        assert_eq!(heads(&up).await, 1);
+        assert!(kept(&ctx).await.is_some());
+    }
+
+    // A kept date out of range (0, or in the future) is no first fetch: it would let a
+    // back-dated `Time` through (A066). It is asked again and replaced.
+    #[tokio::test]
+    async fn an_out_of_range_kept_date_is_not_taken() {
+        let future = (chrono::Utc::now() + chrono::Duration::days(365)).timestamp();
+        for bad in [0, GO_PROXY_EPOCH_FOR_TESTS - 1, future] {
+            let (up, ctx) = attested(
+                chrono::Duration::days(30),
+                last_modified(chrono::Duration::hours(1)),
+            )
+            .await;
+            ctx.state
+                .storage
+                .put(KEPT, bad.to_string().as_bytes())
+                .await
+                .unwrap();
+            info_through_nora(&ctx).await;
+            assert_eq!(status(&ctx, ZIP).await, StatusCode::FORBIDDEN, "{bad}");
+            assert_eq!(heads(&up).await, 1, "{bad}");
+            let at = kept(&ctx).await.expect("replaced");
+            assert!(chrono::Utc::now().timestamp() - at < 3700, "{bad}");
+        }
+    }
+
+    // #733: an internal module's name never reaches proxy.golang.org, `.info` cached or not.
+    #[tokio::test]
+    async fn an_internal_module_sends_no_head() {
+        let up = golang_proxy(
+            chrono::Duration::days(30),
+            last_modified(chrono::Duration::days(30)),
+        )
+        .await;
+        let ctx = attested_ctx(format!("{}{GO_PROXY}", up.uri()), |cfg| {
+            cfg.curation.internal_namespaces = vec!["example.org/mod".to_string()];
+        });
+        ctx.state
+            .storage
+            .put(INFO_KEY, &info(chrono::Duration::days(30)))
+            .await
+            .unwrap();
+        let _ = status(&ctx, ZIP).await;
+        assert_eq!(heads(&up).await, 0);
+        assert_eq!(kept(&ctx).await, None);
+    }
+
+    // An enforcing quarantine is seeded by the same bounded date: a back-dated `Time` on a
+    // version the proxy fetched an hour ago is held, an attested old one is not.
+    #[tokio::test]
+    async fn the_quarantine_seed_is_the_bounded_date() {
+        for (lm_age, want) in [
+            (chrono::Duration::hours(1), StatusCode::FORBIDDEN),
+            (chrono::Duration::days(30), StatusCode::OK),
+        ] {
+            let up = golang_proxy(chrono::Duration::days(30), last_modified(lm_age)).await;
+            let ctx = attested_ctx(format!("{}{GO_PROXY}", up.uri()), |cfg| {
+                cfg.curation.go.min_release_age = Some("1h".to_string());
+                quarantine_7d(cfg);
+                cfg.curation.go.quarantine =
+                    Some(crate::digest_quarantine::QuarantineMode::Enforce);
+                cfg.curation.go.quarantine_ttl = Some("7d".to_string());
+            });
+            info_through_nora(&ctx).await;
+            assert_eq!(status(&ctx, ZIP).await, want, "{lm_age}");
+        }
+    }
+
+    // The kept date is not a GOPROXY path.
+    #[tokio::test]
+    async fn the_attested_date_is_not_served() {
+        let (_up, ctx) = attested(
+            chrono::Duration::days(30),
+            last_modified(chrono::Duration::days(30)),
+        )
+        .await;
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::OK);
+        assert!(kept(&ctx).await.is_some());
+        assert_eq!(
+            status(&ctx, "/go/example.org/mod/@nora-dates/v2.3.4").await,
+            StatusCode::NOT_FOUND
+        );
     }
 
     /// A zip NORA cached more than 3 days ago is as old as that, `.info` or not.

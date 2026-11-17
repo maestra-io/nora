@@ -89,7 +89,8 @@ pub static MAVEN_DATE_LOOKUP_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create MAVEN_DATE_LOOKUP_TOTAL metric at startup")
 });
 
-/// Release-date lookups of the RubyGems, terraform `/v2` and Maven Central APIs, by
+/// Release-date lookups of the RubyGems, terraform `/v2` and Maven Central APIs and Go zip
+/// `Last-Modified` on proxy.golang.org (`[go] attested_dates`), by
 /// `outcome` ∈ {memo (answered by a kept or in-flight lookup), fetch (a new lookup),
 /// breaker_open (refused by the `<upstream>#dates` breaker)}.
 pub static UPSTREAM_DATE_LOOKUP_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {

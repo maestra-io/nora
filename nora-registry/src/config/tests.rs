@@ -2754,6 +2754,39 @@ fn test_env_override_go_proxy_auth() {
 }
 
 #[test]
+fn test_env_override_go_attested_dates() {
+    let _lock = env_lock();
+    let mut config = Config::default();
+    assert!(!config.go.attested_dates);
+    std::env::set_var("NORA_GO_ATTESTED_DATES", "true");
+    config.apply_env_overrides().unwrap();
+    assert!(config.go.attested_dates);
+    std::env::remove_var("NORA_GO_ATTESTED_DATES");
+}
+
+#[test]
+fn test_go_attested_dates_warns_where_it_is_ignored() {
+    let _lock = env_lock();
+    let mut config = Config::default();
+    config.server.trust_upstream_dates = true;
+    let hit = |c: &Config| {
+        let (warnings, _) = c.validate_with_config_path(None);
+        warnings.iter().any(|m| m.contains("go.attested_dates"))
+    };
+    assert!(!hit(&config), "off warned");
+    config.go.attested_dates = true;
+    assert!(!hit(&config), "proxy.golang.org with trusted dates warned");
+    config.go.proxy = Some("https://goproxy.company.com".to_string());
+    assert!(hit(&config), "another proxy did not warn");
+    config.go.enabled = false;
+    assert!(!hit(&config), "go disabled warned");
+    config.go.enabled = true;
+    config.go.proxy = Some("https://proxy.golang.org".to_string());
+    config.server.trust_upstream_dates = false;
+    assert!(hit(&config), "untrusted dates did not warn");
+}
+
+#[test]
 fn test_cargo_config_default() {
     let c = CargoConfig::default();
     assert_eq!(c.proxy, Some("https://crates.io".to_string()));
