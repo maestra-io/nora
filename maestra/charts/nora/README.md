@@ -160,7 +160,7 @@ The chart mounts the Secret at `/etc/nora/users.htpasswd` and sets `htpasswd_fil
 | `config.auth.admin_users` | htpasswd users allowed to mint admin tokens | `[]` |
 | `config.auth.read_only_users` | htpasswd users that authenticate as `read` (Maestra fork) | `[]` |
 | `config.auth.htpasswd_allowed_peers` | TCP peers whose htpasswd password is checked, list or string (Maestra fork) | `[]` (every peer) |
-| `config.auth.teleport.*` | `[auth.teleport]`: web UI identity from a Teleport app agent's JWT (Maestra fork, see `MAESTRA.md`); `trusted_proxies` may be a list | unset |
+| `config.auth.teleport.*` | `[auth.teleport]`: web UI identity from a Teleport app agent's JWT (Maestra fork, see `MAESTRA.md`); `trusted_proxies` may be a list; `accept_on_main_port: false` honours it only on `config.server.teleport_port` | unset |
 | `config.auth.docker_anon_pull`, `public_web_ui`, `public_metrics`, `token_cache_ttl` | Rendered only when set | nora defaults |
 
 **Behind an ingress set `trusted_proxies`** to the ingress pods'/nodes' addresses. nora keys the brute-force lockout and every rate limiter on the client IP it resolves; with the default (loopback only) every request resolves to the ingress IP, so five bad logins from any client lock out everyone. nora reads `X-Forwarded-For` right to left, so the ingress must not pass client-supplied entries through unchecked.
@@ -354,7 +354,7 @@ resources:
 
 ### Network policy (Maestra)
 
-`networkPolicy.enabled` renders a policy on the nora pods with `ingress` / `egress` rules taken verbatim. `kind: NetworkPolicy` (default) or `CiliumNetworkPolicy`; the latter is the one that can admit a hostNetwork ingress controller (Cilium entities `host` / `remote-node`). Use it whenever `auth.trusted_proxies` has to be wider than the ingress itself (a pod CIDR): every peer in it may set `X-Forwarded-For`, i.e. pick its own lockout and rate-limit key, so only the ingress (and agents you trust) should reach the pod. The chart's `helm test` pod is not admitted.
+`networkPolicy.enabled` renders a policy on the nora pods with `ingress` / `egress` rules taken verbatim. `kind: NetworkPolicy` (default) or `CiliumNetworkPolicy`; the latter is the one that can admit a hostNetwork ingress controller (Cilium entities `host` / `remote-node`). Use it whenever `auth.trusted_proxies` has to be wider than the ingress itself (a pod CIDR): every peer in it may set `X-Forwarded-For`, i.e. pick its own lockout and rate-limit key, so only the ingress (and agents you trust) should reach the pod. An agent inside that range (the Teleport app agent) gets its own port instead: `config.server.teleport_port` adds containerPort `teleport`, a listener with the same routes that never trusts `X-Forwarded-For` / `X-Real-IP`; admit the agent there and point its Service at `teleport`. The chart's `helm test` pod is not admitted.
 
 ### Monitoring (Maestra)
 

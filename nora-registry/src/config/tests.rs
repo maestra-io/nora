@@ -2028,6 +2028,35 @@ fn test_validate_internal_port_equal_to_port() {
 }
 
 #[test]
+fn test_validate_teleport_port() {
+    let _lock = env_lock();
+    let base = Config::default();
+    for port in [0, base.server.port, 9100] {
+        let mut config = base.clone();
+        config.server.internal_port = Some(9100);
+        config.server.teleport_port = Some(port);
+        let (_, errors) = config.validate();
+        assert!(
+            errors.iter().any(|e| e.contains("teleport_port")),
+            "{port}: {errors:?}"
+        );
+    }
+    let mut config = base.clone();
+    config.server.teleport_port = Some(4001);
+    let (_, errors) = config.validate();
+    assert!(errors.is_empty(), "{errors:?}");
+    // The header only on teleport_port, with no teleport_port: no UI at all.
+    config.server.teleport_port = None;
+    config.auth.teleport.enabled = true;
+    config.auth.teleport.accept_on_main_port = false;
+    let (_, errors) = config.validate();
+    assert!(
+        errors.iter().any(|e| e.contains("accept_on_main_port")),
+        "{errors:?}"
+    );
+}
+
+#[test]
 fn test_validate_empty_storage_path_local() {
     let _lock = env_lock();
     let mut config = Config::default();

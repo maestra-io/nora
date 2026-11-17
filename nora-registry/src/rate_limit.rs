@@ -328,6 +328,69 @@ mod tests {
         );
     }
 
+    /// A POST through `layer` from `peer` with both forwarding headers, on the main
+    /// listener or (`teleport`) behind the Teleport listener's outer layer.
+    async fn status_on_listener(
+        layer: &Limiter<TrustedProxyKeyExtractor>,
+        teleport: bool,
+        peer: [u8; 4],
+        xff: &str,
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+        let mut app = axum::Router::new()
+            .route("/", axum::routing::post(|| async { "ok" }))
+            .layer(layer.clone());
+        if teleport {
+            app = app.layer(axum::middleware::map_request(
+                crate::auth::teleport::mark_teleport_listener,
+            ));
+        }
+        let mut req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/")
+            .header("x-forwarded-for", xff)
+            .header("x-real-ip", xff)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from((peer, 10000))));
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    // Audit A007: the Teleport agent sits inside auth.trusted_proxies (the pod CIDR). On the
+    // Teleport listener the forwarding headers it relays never choose the bucket: every request
+    // is keyed by the agent's TCP address. The main listener keeps honouring them.
+    #[tokio::test]
+    async fn teleport_listener_keys_the_limiter_by_the_tcp_peer() {
+        let quota = Quota {
+            interval: Duration::from_secs(3600),
+            burst: 1,
+        };
+        let agent = [10, 62, 5, 5];
+        for teleport in [true, false] {
+            let trusted = TrustedProxies::parse("10.60.8.0/24,10.62.0.0/16");
+            let (layer, _, _) = upload_rate_limiter(quota, trusted);
+            assert_eq!(
+                status_on_listener(&layer, teleport, agent, "198.51.100.77").await,
+                axum::http::StatusCode::OK
+            );
+            let second = status_on_listener(&layer, teleport, agent, "198.51.100.78").await;
+            if teleport {
+                assert_eq!(
+                    second,
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    "a relayed header must not mint a fresh bucket on the Teleport listener"
+                );
+            } else {
+                assert_eq!(
+                    second,
+                    axum::http::StatusCode::OK,
+                    "main listener: two buckets"
+                );
+            }
+        }
+    }
+
     // Behind a reverse proxy that appends to X-Forwarded-For, a client that varies the header it
     // sends still lands in its own bucket: the address the proxy appended decides it.
     #[tokio::test]

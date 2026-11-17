@@ -591,6 +591,14 @@ tests:
           path: data["config.toml"]
           pattern: '\ninternal_port = 9100\n'
 
+  - it: renders server.teleport_port
+    set:
+      config.server.teleport_port: 4001
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\nteleport_port = 4001\n'
+
   - it: refuses a table where the chart renders scalars
     set:
       config.circuit_breaker.overrides:

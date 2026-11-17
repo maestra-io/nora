@@ -138,6 +138,12 @@ config:
     # as containerPort and Service port `internal` (scrape it; never route it).
     # The probes stay on `http`, whose /health then reports the status only.
     # internal_port: 9100
+    # -- teleport_port: listener for the Teleport app agent, exposed as
+    # containerPort `teleport` (point the Teleport app's Service at it). Same
+    # routes as `http`, but X-Forwarded-For / X-Real-IP are never trusted there,
+    # and `[auth.teleport]` reads its header there (on `http` too while
+    # `auth.teleport.accept_on_main_port`, default true).
+    # teleport_port: 4001
   registries:
     enable: "all"
   storage:
