@@ -580,16 +580,30 @@ tests:
     asserts:
       - matchRegex:
           path: data["config.toml"]
-          pattern: 'public_url = "https://registry\.example\.com"\nbody_limit_mb = 256\nshutdown_timeout = 20\n'
+          pattern: 'public_url = "https://registry\.example\.com"\nbody_limit_mb = 256\ninternal_port = 9100\nshutdown_timeout = 20\n'
 
   # Maestra
   - it: renders server.internal_port
     set:
-      config.server.internal_port: 9100
+      config.server.internal_port: 9101
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\ninternal_port = 9101\n'
+
+  - it: moves detailed /health and /metrics to internal_port 9100 by default
     asserts:
       - matchRegex:
           path: data["config.toml"]
           pattern: '\ninternal_port = 9100\n'
+
+  - it: renders no internal_port when it is set to null
+    set:
+      config.server.internal_port: null
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'internal_port'
 
   - it: renders server.teleport_port
     set:

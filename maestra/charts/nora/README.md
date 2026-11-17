@@ -114,6 +114,7 @@ config:
 | `config.circuit_breaker.*` | `enabled`, `failure_threshold`, `reset_timeout`: fail fast (503) on an upstream that keeps failing | `true`, `5`, `30` |
 | `config.nuget.*` | Any `[nuget]` key, e.g. `proxy_timeout`, `metadata_proxy_timeout` | `30`, `15` |
 | `config.npm.*`, `config.pypi.*` | Any scalar `[npm]` / `[pypi]` key (e.g. `metadata_ttl`); rendered only when set | unset |
+| `config.server.internal_port` | Port of detailed `/health` and `/metrics`: containerPort and Service port `internal`. The `http` port then serves the status-only `/health`, `/ready`, and a 404 for `/metrics`. `null` serves both on `http` | `9100` |
 | `config.server.*` | Keys besides host/port/public_url are rendered as is, e.g. `body_limit_mb`, `shutdown_timeout`, `trust_upstream_dates` | unset |
 | `config.extraToml` | TOML appended verbatim, for sections the chart does not render | `""` |
 
@@ -360,14 +361,14 @@ resources:
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `metrics.serviceMonitor.enabled` | ServiceMonitor on the `http` port, `/metrics` | `false` |
+| `metrics.serviceMonitor.enabled` | ServiceMonitor on `/metrics` of the `internal` port (`http` when `config.server.internal_port` is null) | `false` |
 | `metrics.serviceMonitor.labels`, `interval`, `scrapeTimeout` | | `{}`, `30s`, `10s` |
 | `metrics.prometheusRule.enabled` | PrometheusRule with nora's alerts (`files/prometheus-rules.yml`) | `false` |
 | `metrics.prometheusRule.labels`, `annotations` | On the object (e.g. the label your rule selector wants) | `{}` |
 | `metrics.prometheusRule.additionalRuleLabels` | Added to every rule's labels; a rule's own label wins | `{}` |
 | `metrics.prometheusRule.extraGroups` | More rule groups, verbatim | `[]` |
 
-`files/prometheus-rules.yml` is a copy of the repository's `deploy/prometheus-rules.yml` (helm cannot read outside the chart); CI fails when they differ, and the metrics test checks every metric in both against the code. `/metrics` needs `auth.public_metrics` (default true) or scrape credentials.
+`files/prometheus-rules.yml` is a copy of the repository's `deploy/prometheus-rules.yml` (helm cannot read outside the chart); CI fails when they differ, and the metrics test checks every metric in both against the code. `/metrics` needs `auth.public_metrics` (default true) or scrape credentials. A scraper of your own reaches it on port `internal` (9100), which a NetworkPolicy has to admit for it; route only `http` to the ingress.
 
 ### Backup and restore (Maestra)
 

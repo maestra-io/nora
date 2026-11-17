@@ -64,15 +64,15 @@ pub const EXIT_CONFIG: i32 = 78;
 /// Why [`Config::load`] could not produce a configuration to start with.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigLoadError {
-    /// `NORA_CONFIG_PATH` names a file that cannot be read.
-    #[error("NORA_CONFIG_PATH={path} but file cannot be read: {source}")]
+    /// The config file (`NORA_CONFIG_PATH`, else an existing `./config.toml`) cannot be read.
+    #[error("config file {path} cannot be read: {source}")]
     Unreadable {
         path: String,
         #[source]
         source: std::io::Error,
     },
-    /// `NORA_CONFIG_PATH` names a file that is not valid TOML.
-    #[error("NORA_CONFIG_PATH={path} contains invalid TOML: {source}")]
+    /// The config file (`NORA_CONFIG_PATH`, else `./config.toml`) is not valid TOML.
+    #[error("config file {path} contains invalid TOML: {source}")]
     InvalidToml {
         path: String,
         #[source]
@@ -1896,8 +1896,9 @@ impl Config {
     ///
     /// Config file resolution order:
     /// 1. `NORA_CONFIG_PATH` env var (fatal if set but file not found)
-    /// 2. `config.toml` in current working directory (optional)
-    /// 3. Built-in defaults
+    /// 2. `config.toml` in current working directory (optional; when present it must be
+    ///    readable and valid, like the file `NORA_CONFIG_PATH` names)
+    /// 3. Built-in defaults, only when there is no `config.toml`
     ///
     /// A configuration NORA cannot start with is an error, for the caller to report and
     /// exit on with [`EXIT_CONFIG`].
@@ -1938,20 +1939,27 @@ impl Config {
             tracing::info!(path = %config_path, "Loaded config from NORA_CONFIG_PATH");
             cfg
         } else {
+            // Only an absent file means defaults: a file that is there but broken or
+            // unreadable is refused, never replaced by defaults with auth and curation off.
             match fs::read_to_string(fallback) {
-                Ok(content) => match parse_config(&content) {
-                    Ok((cfg, unknown)) => {
-                        refuse_hf_curation_keys(fallback, &unknown)?;
-                        unknown_keys = surface_unknown_keys(fallback, unknown, strict)?;
-                        tracing::info!(path = %fallback, "Loaded config");
-                        cfg
-                    }
-                    Err(e) => {
-                        tracing::warn!(path = %fallback, error = %e, "config exists but contains invalid TOML, using defaults");
-                        Config::default()
-                    }
-                },
-                Err(_) => Config::default(),
+                Ok(content) => {
+                    let (cfg, unknown) =
+                        parse_config(&content).map_err(|source| ConfigLoadError::InvalidToml {
+                            path: fallback.to_string(),
+                            source,
+                        })?;
+                    refuse_hf_curation_keys(fallback, &unknown)?;
+                    unknown_keys = surface_unknown_keys(fallback, unknown, strict)?;
+                    tracing::info!(path = %fallback, "Loaded config");
+                    cfg
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
+                Err(source) => {
+                    return Err(ConfigLoadError::Unreadable {
+                        path: fallback.to_string(),
+                        source,
+                    })
+                }
             }
         };
 
@@ -1996,31 +2004,21 @@ impl Config {
     /// [`Config::path_from_env`]), passed in so a test reloads a file of its own without
     /// setting process-wide state. Returns Err on invalid file/TOML/validation instead of
     /// panicking.
+    ///
+    /// Without `NORA_CONFIG_PATH` the reload reads `./config.toml` and refuses when it
+    /// cannot, absent included: the environment cannot change after start, so there is
+    /// nothing new to apply, and defaults must never replace the running policy.
     pub fn try_load_from(path: Option<String>) -> Result<Self, String> {
-        let file = match path {
-            Some(path) => {
-                let content = fs::read_to_string(&path)
-                    .map_err(|e| format!("Cannot read {}: {}", path, e))?;
-                Some((path, content))
-            }
-            None => fs::read_to_string(DEFAULT_CONFIG_FILE)
-                .ok()
-                .map(|content| (DEFAULT_CONFIG_FILE.to_string(), content)),
-        };
+        let path = path.unwrap_or_else(|| DEFAULT_CONFIG_FILE.to_string());
+        let content =
+            fs::read_to_string(&path).map_err(|e| format!("Cannot read {}: {}", path, e))?;
         // one path for both sources, so neither can skip the unknown-key check
-        let mut config: Config = match file {
-            Some((path, content)) => {
-                let (config, unknown) = parse_config(&content)
-                    .map_err(|e| format!("Invalid TOML in {}: {}", path, e))?;
-                // As at start: `[curation.hf]` is refused, not ignored as an unknown key.
-                refuse_hf_curation_keys(&path, &unknown)
-                    .map_err(|e| format!("Reload refused: {}", e))?;
-                surface_unknown_keys(&path, unknown, config_strict_from_env())
-                    .map_err(|e| format!("Reload refused: {}", e))?;
-                config
-            }
-            None => Config::default(),
-        };
+        let (mut config, unknown) =
+            parse_config(&content).map_err(|e| format!("Invalid TOML in {}: {}", path, e))?;
+        // As at start: `[curation.hf]` is refused, not ignored as an unknown key.
+        refuse_hf_curation_keys(&path, &unknown).map_err(|e| format!("Reload refused: {}", e))?;
+        surface_unknown_keys(&path, unknown, config_strict_from_env())
+            .map_err(|e| format!("Reload refused: {}", e))?;
         config.apply_env_overrides()?;
         // As in `load`: validation judges the registries the enable-set mounts (#1098).
         let set = config.enabled_registries_quiet();

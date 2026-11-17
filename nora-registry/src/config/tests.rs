@@ -1760,6 +1760,60 @@ fn fallback_config_file_is_held_to_the_same_rule() {
     ));
 }
 
+/// A working-directory `config.toml` that is there but broken or unreadable refuses the
+/// start, as `NORA_CONFIG_PATH` does; only an absent file starts on defaults (audit A027).
+#[test]
+fn fallback_file_errors_refuse_start() {
+    let _lock = env_lock();
+    let dir = tempfile::TempDir::new().unwrap();
+    let file = dir.path().join("config.toml");
+    let fallback = file.to_string_lossy().into_owned();
+    let policy = "[auth]\nenabled = true\n[curation]\nmode = \"enforce\"\n";
+    for broken in [
+        "[server\n",
+        "[server]\nport = \"four\"\n",
+        "[[docker.upstreams]]\nurl = \"https://r.example\"\nauht = \"u:p\"\n",
+    ] {
+        std::fs::write(&file, format!("{policy}{broken}")).unwrap();
+        let loaded = Config::load_from(None, &fallback, false);
+        assert!(
+            matches!(loaded, Err(ConfigLoadError::InvalidToml { ref path, .. }) if *path == fallback),
+            "{broken:?} must refuse the start: {:?}",
+            loaded.map(|_| ())
+        );
+    }
+
+    // A directory in place of the file: present, but not readable as a file (works as root).
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    let unreadable = Config::load_from(None, &fallback, false);
+    assert!(
+        matches!(unreadable, Err(ConfigLoadError::Unreadable { ref path, .. }) if *path == fallback),
+        "{:?}",
+        unreadable.map(|_| ())
+    );
+
+    Config::load_from(None, NO_FALLBACK, false).expect("an absent file starts on defaults");
+}
+
+/// A reload without `NORA_CONFIG_PATH` never swaps the running policy for defaults: it is
+/// refused when `./config.toml` is absent or cannot be read (audit A027).
+#[test]
+fn reload_without_readable_fallback_keeps_engine() {
+    let _lock = env_lock();
+    std::env::remove_var("NORA_CONFIG_PATH");
+    assert!(
+        !std::path::Path::new("config.toml").exists(),
+        "the test runs in a directory without config.toml"
+    );
+    let absent = Config::try_load_from(None).expect_err("no file: nothing to reload");
+    assert!(absent.contains("config.toml"), "{absent}");
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let unreadable = dir.path().to_string_lossy().into_owned();
+    Config::try_load_from(Some(unreadable)).expect_err("an unreadable file is refused");
+}
+
 /// OIDC config text with a provider `gh` (extra keys appended) and a
 /// provider `gl` that names its audience.
 fn oidc_config_with(gh_keys: &str) -> String {
