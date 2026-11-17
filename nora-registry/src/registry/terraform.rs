@@ -34,7 +34,8 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::config::UpstreamAuth;
 use crate::registry::{
-    circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text, ProxyError, UpstreamMiss,
+    circuit_open_response, content_url_client, nora_base_url, proxy_fetch, proxy_fetch_text,
+    same_origin, ProxyError, UpstreamMiss,
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -481,7 +482,7 @@ async fn provider_download_meta(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "proxy", "", "terraform", ""));
 
-            state.spawn_cache("terraform", storage_key, Bytes::from(rewritten.clone()));
+            cache_platform_meta(&state, &storage_key, &rewritten).await;
             with_json(strip_nora_internal_fields(rewritten.as_bytes()))
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -509,6 +510,9 @@ async fn provider_download_binary(
         return StatusCode::NOT_FOUND.into_response();
     }
     let (ns, ptype, ver, filename) = (parts[0], parts[1], parts[2], parts[3]);
+    if !is_valid_name(ns) || !is_valid_name(ptype) || !is_valid_version(ver) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let provider = provider_identity(ns, ptype);
 
     let storage_key = format!("terraform/download/{}", path);
@@ -595,20 +599,31 @@ async fn provider_download_binary(
 
     // No upstream when the operator switched it off: a provider file not stored is not fetched
     // from anywhere, the release host its metadata names included.
-    if upstream_url(&state).is_none() {
+    let Some(base) = upstream_url(&state) else {
         return StatusCode::NOT_FOUND.into_response();
-    }
+    };
 
     // Try upstream — resolve the real upstream URL from cached provider metadata.
     // The metadata JSON (cached by provider_download_meta) stores the
     // original download_url in `_nora_upstream_url`.
-    let url = resolve_upstream_download_url(&state, ns, ptype, ver, filename).await;
+    let Some(url) = resolve_upstream_download_url(&state, ns, ptype, ver, filename).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let client = match content_url_client(
+        &state,
+        "terraform",
+        &url,
+        state.config.terraform.allow_private_hosts,
+    ) {
+        Ok(client) => client,
+        Err(status) => return status.into_response(),
+    };
 
     match proxy_fetch(
-        &state.http_client,
+        client,
         &url,
         Duration::from_secs(state.config.terraform.proxy_timeout_dl),
-        expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
+        own_origin_auth(&state, &url, &base),
         &state.circuit_breaker,
         RegistryType::Terraform,
     )
@@ -977,9 +992,9 @@ async fn module_source_download(
     }
     // With the upstream switched off, a source URL stored while it was on is not followed: the
     // archive is served from storage or not at all.
-    if upstream_url(&state).is_none() {
+    let Some(base) = upstream_url(&state) else {
         return StatusCode::NOT_FOUND.into_response();
-    }
+    };
 
     // Resolve original upstream URL from cached metadata
     let source_url_key = format!(
@@ -1004,12 +1019,21 @@ async fn module_source_download(
         tracing::debug!(url = %upstream_url, "Module source URL is not HTTP — cannot proxy");
         return StatusCode::NOT_FOUND.into_response();
     }
+    let client = match content_url_client(
+        &state,
+        "terraform",
+        &upstream_url,
+        state.config.terraform.allow_private_hosts,
+    ) {
+        Ok(client) => client,
+        Err(status) => return status.into_response(),
+    };
 
     match proxy_fetch(
-        &state.http_client,
+        client,
         &upstream_url,
         Duration::from_secs(state.config.terraform.proxy_timeout_dl),
-        expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
+        own_origin_auth(&state, &upstream_url, &base),
         &state.circuit_breaker,
         RegistryType::Terraform,
     )
@@ -1402,7 +1426,7 @@ async fn mirror_fetch_archive(
             .await
             .map_err(ArchiveMiss::Upstream)?;
             let rewritten = rewrite_download_url(&text, base_url, ns, ptype, ver);
-            state.spawn_cache("terraform", storage_key, Bytes::from(rewritten.clone()));
+            cache_platform_meta(state, &storage_key, &rewritten).await;
             rewritten
         }
     };
@@ -1714,14 +1738,16 @@ async fn extract_terraform_publish_date(
 /// releases.hashicorp.com). Checks `_nora_upstream_url` for binaries,
 /// `_nora_upstream_shasums_url` for SHA256SUMS, and
 /// `_nora_upstream_shasums_sig_url` for signature files.
-/// Falls back to constructing a releases.hashicorp.com URL from path components.
+/// Falls back to a releases.hashicorp.com URL built from path components for the `hashicorp`
+/// namespace only: that host publishes a release by type and version, so for any other
+/// namespace the fallback could name another provider's file (audit A106). None: no URL.
 async fn resolve_upstream_download_url(
     state: &AppState,
     ns: &str,
     ptype: &str,
     ver: &str,
     filename: &str,
-) -> String {
+) -> Option<String> {
     // Determine which metadata field to look up based on filename
     let meta_field = if filename.ends_with(".sig") {
         "_nora_upstream_shasums_sig_url"
@@ -1740,7 +1766,7 @@ async fn resolve_upstream_download_url(
         if let Ok(data) = state.storage.get(&meta_key).await {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
                 if let Some(url) = json.get(meta_field).and_then(|v| v.as_str()) {
-                    return url.to_string();
+                    return Some(url.to_string());
                 }
             }
         }
@@ -1754,7 +1780,7 @@ async fn resolve_upstream_download_url(
                 if let Ok(data) = state.storage.get(&key).await {
                     if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
                         if let Some(url) = json.get(meta_field).and_then(|v| v.as_str()) {
-                            return url.to_string();
+                            return Some(url.to_string());
                         }
                     }
                 }
@@ -1763,10 +1789,34 @@ async fn resolve_upstream_download_url(
     }
 
     // Fallback: construct releases.hashicorp.com URL from path parts
-    format!(
-        "https://releases.hashicorp.com/terraform-provider-{}/{}/{}",
-        ptype, ver, filename
-    )
+    ns.eq_ignore_ascii_case("hashicorp").then(|| {
+        format!(
+            "https://releases.hashicorp.com/terraform-provider-{}/{}/{}",
+            ptype, ver, filename
+        )
+    })
+}
+
+/// The upstream's credential for `url`: sent to the upstream's own origin (`base`) only, never
+/// to a host its metadata names (audit A104).
+fn own_origin_auth<'a>(state: &'a AppState, url: &str, base: &str) -> Option<UpstreamAuth<'a>> {
+    same_origin(url, base)
+        .then(|| expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic))
+        .flatten()
+}
+
+/// Writes the rewritten platform metadata before the answer that names its archive goes out,
+/// so the client's archive request right after finds the stored URL (audit A106). A failed
+/// write is logged and counted; the answer still goes out.
+async fn cache_platform_meta(state: &AppState, key: &str, meta: &str) {
+    match state
+        .storage
+        .put_bytes(key, Bytes::from(meta.to_owned()))
+        .await
+    {
+        Ok(()) => state.repo_index.invalidate("terraform"),
+        Err(e) => crate::record_cache_write_error("terraform", key, &e),
+    }
 }
 
 /// Extract OS and arch from a terraform provider filename.
@@ -5187,3 +5237,11 @@ mod mirror_hostname_cases {
         );
     }
 }
+
+/// Archives the upstream's metadata names: the credential stays on the upstream's own origin,
+/// no loopback/private host unless `terraform.allow_private_hosts` (audit A104), the
+/// releases.hashicorp.com fallback only for the `hashicorp` namespace and the platform
+/// metadata stored before its answer (audit A106).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod index_named_urls;

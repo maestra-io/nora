@@ -2128,8 +2128,48 @@ async fn fill_detached(
     answer
 }
 
-/// [`proxy_fetch_artifact`] over `client` instead of the shared one (helm: an
-/// SSRF-guarded client for a host the upstream's index names).
+/// True when both URLs have the same scheme, host and port.
+pub(crate) fn same_origin(a: &str, b: &str) -> bool {
+    match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
+        (Ok(a), Ok(b)) => {
+            a.scheme() == b.scheme()
+                && a.host_str() == b.host_str()
+                && a.port_or_known_default() == b.port_or_known_default()
+        }
+        _ => false,
+    }
+}
+
+/// The client for a file URL an upstream's metadata names (a Helm chart, a PyPI file or its
+/// `.metadata`, a Terraform provider or module archive), or 502 when it may not be fetched.
+/// Such a URL is the upstream's, not the operator's: unless `allow_private` (the registry's
+/// own switch) it never reaches a loopback, private, link-local or metadata address, on the
+/// first request or on a redirect hop.
+pub(crate) fn content_url_client<'a>(
+    state: &'a AppState,
+    registry: &'static str,
+    url: &str,
+    allow_private: bool,
+) -> Result<&'a reqwest::Client, StatusCode> {
+    if allow_private {
+        return Ok(&state.http_client);
+    }
+    if crate::import::http::is_blocked_url_host(url, false) {
+        // An IP literal reaches no resolver, and the shared client checks redirect hops only.
+        tracing::warn!(registry, url = %crate::import::http::redact_url(url), "upstream metadata names a file on a loopback/private address, refusing it (the registry's allow_private switch allows it)");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    if !state.config.server.allow_private_upstreams {
+        // Guarded itself: redirect hops and resolved names (#236).
+        return Ok(&state.http_client);
+    }
+    // The operator allowed private upstreams, not private hosts their metadata names.
+    static GUARDED: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    Ok(GUARDED.get_or_init(|| crate::build_upstream_client(&state.config.tls, false)))
+}
+
+/// [`proxy_fetch_artifact`] over `client` instead of the shared one (a file URL an
+/// upstream's metadata names: [`content_url_client`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn proxy_fetch_artifact_with(
     state: &AppState,

@@ -29,6 +29,11 @@ pub struct TerraformConfig {
     /// hostname is answered 404 rather than with that upstream's provider of the same name.
     #[serde(default = "default_mirror_hostnames")]
     pub mirror_hostnames: Vec<String>,
+    /// Fetch a provider or module archive the upstream's metadata names on a loopback,
+    /// private, link-local or metadata address (`NORA_TF_ALLOW_PRIVATE_HOSTS`). Off: such an
+    /// archive answers 502.
+    #[serde(default)]
+    pub allow_private_hosts: bool,
 }
 
 fn default_mirror_hostnames() -> Vec<String> {
@@ -50,6 +55,7 @@ impl Default for TerraformConfig {
             metadata_ttl: 300,
             serve_stale: true,
             mirror_hostnames: default_mirror_hostnames(),
+            allow_private_hosts: false,
         }
     }
 }
@@ -92,6 +98,9 @@ impl TerraformConfig {
                 .filter(|host| !host.is_empty())
                 .map(str::to_lowercase)
                 .collect();
+        }
+        if let Ok(val) = env::var("NORA_TF_ALLOW_PRIVATE_HOSTS") {
+            self.allow_private_hosts = val.to_lowercase() == "true" || val == "1";
         }
     }
 }

@@ -224,37 +224,6 @@ fn resolve_chart_url(base: &str, url: &str) -> Option<String> {
         .then(|| resolved.to_string())
 }
 
-/// True when both URLs have the same scheme, host and port.
-fn same_origin(a: &str, b: &str) -> bool {
-    match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
-        (Ok(a), Ok(b)) => {
-            a.scheme() == b.scheme()
-                && a.host_str() == b.host_str()
-                && a.port_or_known_default() == b.port_or_known_default()
-        }
-        _ => false,
-    }
-}
-
-/// The client for every chart download: it never connects to a
-/// loopback, private, link-local or metadata address, on the first request or on any
-/// redirect hop (DNS pinned; the `nora import` guard, `crate::import::http`).
-fn guarded_client(state: &AppState) -> Result<&'static reqwest::Client, String> {
-    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
-        std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            crate::import::http::build_import_client(
-                &state.config.tls,
-                Duration::from_secs(10),
-                Duration::from_secs(state.config.helm.proxy_timeout.max(1)),
-                false,
-            )
-        })
-        .as_ref()
-        .map_err(Clone::clone)
-}
-
 fn upstream<'a>(state: &'a AppState, repo: &str) -> Option<&'a RepoProxyEntry> {
     state.config.helm.proxies.get(repo)
 }
@@ -586,23 +555,17 @@ async fn chart(
     // The upstream's credential goes to its own origin only, never to a host its index
     // names. Every chart, the upstream's own included, is fetched through the SSRF
     // guard: an own-origin URL may still redirect to a private address.
-    let auth = same_origin(&url, up.url())
+    let auth = super::same_origin(&url, up.url())
         .then(|| up.auth().map(UpstreamAuth::Basic))
         .flatten();
-    let client = if state.config.helm.allow_private_chart_hosts {
-        &state.http_client
-    } else if crate::import::http::is_blocked_url_host(&url, false) {
-        // An IP literal never reaches the guard's resolver: checked here.
-        tracing::warn!(repo, chart = %name, version, url = %url, "Helm index names a chart on a loopback/private address, refusing it");
-        return StatusCode::BAD_GATEWAY.into_response();
-    } else {
-        match guarded_client(&state) {
-            Ok(client) => client,
-            Err(e) => {
-                tracing::error!(error = %e, "helm: no SSRF-guarded client, refusing a chart");
-                return StatusCode::BAD_GATEWAY.into_response();
-            }
-        }
+    let client = match super::content_url_client(
+        &state,
+        "helm",
+        &url,
+        state.config.helm.allow_private_chart_hosts,
+    ) {
+        Ok(client) => client,
+        Err(status) => return status.into_response(),
     };
     // The index publishes the digest the chart must have: curation and the quarantine
     // decide on it before the fetch, so a GET can stream the chart as it downloads

@@ -227,6 +227,8 @@ fn build_context_full(
             proxies: Vec::new(),
             proxy_timeout: 5,
             metadata_ttl: 300,
+            // The wiremock fixtures serve the files their index names from 127.0.0.1.
+            allow_private_file_hosts: true,
         },
         go: GoConfig {
             enabled: true,
@@ -263,7 +265,11 @@ fn build_context_full(
             cache_control: "no-cache".to_string(),
         },
         gems: GemsConfig::default(),
-        terraform: TerraformConfig::default(),
+        terraform: TerraformConfig {
+            // As above: the fixtures' archives are on 127.0.0.1.
+            allow_private_hosts: true,
+            ..TerraformConfig::default()
+        },
         ansible: AnsibleConfig::default(),
         nuget: NugetConfig::default(),
         pub_dart: crate::config::PubDartConfig::default(),
