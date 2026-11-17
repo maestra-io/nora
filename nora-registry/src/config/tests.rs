@@ -5592,6 +5592,7 @@ fn auth_key_urls_must_be_https_or_loopback() {
 /// upstream with a reason, once; anything else stops NORA at load.
 #[test]
 fn quarantine_exempt_needs_a_reason_and_an_exact_repository() {
+    let _lock = crate::test_env::env_lock();
     let errors = |entries: &str| {
         let toml = format!(
             "[docker]\n[[docker.upstreams]]\nurl = \"https://ghcr.io\"\nprefix = \"ghcr\"\nnamespace = \"ghcr.io\"\n{entries}"
