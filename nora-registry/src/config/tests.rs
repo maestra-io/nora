@@ -109,6 +109,31 @@ fn curation_mode_notice_tells_the_default_from_the_operators_off() {
     assert_eq!(hosted.curation_mode_notice(), None, "only raw mounted");
 }
 
+/// Audit A105: the Terraform network mirror answers registry.terraform.io only by default, and
+/// NORA_TF_MIRROR_HOSTNAMES replaces the list (trimmed, lowercased, empty entries dropped).
+#[test]
+fn terraform_mirror_hostnames_default_and_env() {
+    let _lock = env_lock();
+    assert_eq!(
+        Config::default().terraform.mirror_hostnames,
+        vec!["registry.terraform.io".to_string()]
+    );
+    std::env::set_var(
+        "NORA_TF_MIRROR_HOSTNAMES",
+        " Registry.OpenTofu.org ,,registry.terraform.io",
+    );
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides().unwrap();
+    std::env::remove_var("NORA_TF_MIRROR_HOSTNAMES");
+    assert_eq!(
+        cfg.terraform.mirror_hostnames,
+        vec![
+            "registry.opentofu.org".to_string(),
+            "registry.terraform.io".to_string()
+        ]
+    );
+}
+
 /// The empty setting switches the upstream off in both places it can be written, for all six
 /// formats: the environment variable and the config file.
 #[test]
