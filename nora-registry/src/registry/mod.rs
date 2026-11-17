@@ -1451,6 +1451,23 @@ impl Drop for SpoolFile {
     }
 }
 
+/// A response's read handle on a spool file that also holds the spool, so its path and
+/// its share of `spool_max_mb` last until the response body is sent or dropped (A071).
+struct HeldSpool {
+    file: tokio::fs::File,
+    _spool: std::sync::Arc<SpoolFile>,
+}
+
+impl tokio::io::AsyncRead for HeldSpool {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.file).poll_read(cx, buf)
+    }
+}
+
 /// A proxied artifact body: in memory, or spooled to disk when it is larger than
 /// `server.stream_threshold_mb`. Cloning is O(1) either way.
 #[derive(Clone, Debug)]
@@ -2196,7 +2213,11 @@ pub(crate) struct LiveFill {
     pub(crate) len: Option<u64>,
     bytes: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
     task: AbortOnDrop,
+    /// The finished body, set by the task: the response holds its spool until it ends.
+    hold: SpoolHold,
 }
+
+type SpoolHold = std::sync::Arc<parking_lot::Mutex<Option<ProxyBody>>>;
 
 impl LiveFill {
     /// The next bytes of the body as they land; the last byte only once the whole body
@@ -2210,10 +2231,12 @@ impl LiveFill {
     /// as it lands, checked against `sha256` (lowercase hex) at the end when given.
     pub(crate) fn into_body(self, head: Bytes, sha256: Option<String>, key: &str) -> Body {
         use futures::StreamExt as _;
-        let LiveFill { bytes, task, .. } = self;
+        let LiveFill {
+            bytes, task, hold, ..
+        } = self;
         let head = (!head.is_empty()).then_some(Ok(head));
         let stream = futures::stream::iter(head).chain(bytes).map(move |chunk| {
-            let _alive = &task;
+            let _alive = (&task, &hold);
             chunk
         });
         let reader = tokio_util::io::StreamReader::new(Box::pin(stream));
@@ -2294,11 +2317,16 @@ where
     )?;
     let (whole_tx, whole_rx) = tokio::sync::oneshot::channel();
     let (state, key) = (state.clone(), key.to_string());
+    let hold = SpoolHold::default();
+    let task_hold = std::sync::Arc::clone(&hold);
     let task = tokio::spawn(async move {
         let result = run_artifact_fill(&state, &key, registry, timeout_secs, fetch).await;
         if !shared.started.load(std::sync::atomic::Ordering::Acquire) {
             let _ = whole_tx.send(result);
             return;
+        }
+        if let Ok((body, _)) = &result {
+            *task_hold.lock() = Some(body.clone());
         }
         let done = match result {
             // A response dropped while the verdict runs drops `duty` undecided: the body
@@ -2331,6 +2359,7 @@ where
                 len: start.len,
                 bytes: Box::pin(docker::spool_follower(start.file, start.progress, 0, stall)),
                 task,
+                hold,
             }))
         }
         // The fill never streamed: its whole result.
@@ -2439,11 +2468,15 @@ impl ProxyBody {
         match self {
             ProxyBody::Mem(b) => Ok(Body::from(b)),
             ProxyBody::File(spool) => {
-                // Open while holding the Arc: once open, the data outlives the unlink.
+                // The body holds the spool: its budget is counted until the body ends.
                 let file = tokio::fs::File::open(&spool.path).await?;
+                let sha256 = spool.sha256.clone();
                 let stream = nora_registry::verified::verify_while_streaming(
-                    Box::pin(file),
-                    Some(spool.sha256.clone()),
+                    Box::pin(HeldSpool {
+                        file,
+                        _spool: spool,
+                    }),
+                    Some(sha256),
                     key.to_string(),
                     None,
                 );
@@ -4632,6 +4665,47 @@ mod tests {
             "the refused body never touched the disk"
         );
         drop(held);
+        let (body, _) = fetch_artifact(state, "npm/b", &b, 5).await.unwrap();
+        assert_eq!(body.len(), 2 * MIB);
+    }
+
+    /// A071: a response built from a spooled body is one of its holders. After the
+    /// cache write and every other clone are gone, an unread response still keeps the
+    /// spool file and its share of `spool_max_mb`; both go when the response ends.
+    #[tokio::test]
+    async fn proxy_body_response_holds_the_spool_budget_until_the_response_drops() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7u8; 2 * MIB as usize]))
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.server.stream_threshold_mb = 1;
+            c.server.spool_max_mb = 3;
+        });
+        let state = &ctx.state;
+        let a = format!("{}/a", upstream.uri());
+        let b = format!("{}/b", upstream.uri());
+        let holders = state.storage.holders();
+        let (held, duty) = fetch_artifact(state, "npm/a", &a, 5).await.unwrap();
+        duty.settle();
+        let response = held.clone().into_body("npm/a").await.unwrap();
+        spawn_cache_body(state, "npm", "npm/a".into(), held);
+        crate::test_helpers::background_writes_done(&state.storage, holders).await;
+        assert!(state.storage.stat("npm/a").await.is_some());
+
+        let err = fetch_artifact(state, "npm/b", &b, 5).await.unwrap_err();
+        assert!(
+            matches!(err, ProxyError::Spool(SpoolError::Busy)),
+            "an unread response no longer counts against the budget: {err:?}"
+        );
+        assert_eq!(spool_files(state), 1, "the response's spool file is gone");
+
+        let got = axum::body::to_bytes(response, usize::MAX).await.unwrap();
+        assert_eq!(got.len() as u64, 2 * MIB);
+        assert_eq!(spool_files(state), 0);
         let (body, _) = fetch_artifact(state, "npm/b", &b, 5).await.unwrap();
         assert_eq!(body.len(), 2 * MIB);
     }
