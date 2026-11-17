@@ -1552,6 +1552,51 @@ mod integration_tests {
         assert!(ctx.state.storage.stat(CHART_KEY).await.is_some());
     }
 
+    /// A071: a streamed cold chart keeps its spool, and its share of `spool_max_mb`,
+    /// until its response ends, not only until it is cached: while one sits unread a
+    /// second large cold chart is a 503, and once it is dropped the second is served.
+    #[tokio::test]
+    async fn a_streamed_chart_holds_the_spool_budget_until_its_response_ends() {
+        use futures::StreamExt;
+        let body = pattern(2 * MIB);
+        let (files, gate, _) =
+            gated_body_upstream(body[..MIB].to_vec(), body[MIB..].to_vec(), vec![]).await;
+        let index = index_yaml(&[
+            ("1.0.0", OLD, &format!("{files}/demo-1.0.0.tgz"), &body),
+            ("2.0.0", OLD, &format!("{files}/demo-2.0.0.tgz"), &body),
+        ]);
+        let up = upstream(&index).await;
+        let entry = proxy(&up);
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.helm.enabled = true;
+            cfg.helm.proxies.insert("demo".into(), entry);
+            cfg.helm.allow_private_chart_hosts = true;
+            cfg.server.stream_threshold_mb = 1;
+            cfg.server.spool_max_mb = 3;
+        });
+        let holders = ctx.state.storage.holders();
+        const SECOND: &str = "/helm/demo/charts/demo/demo-2.0.0.tgz";
+
+        let resp = send(&ctx.app, Method::GET, CHART, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut frames = resp.into_body().into_data_stream();
+        assert!(!frames.next().await.unwrap().unwrap().is_empty());
+        gate.send(true).unwrap();
+        background_writes_done(&ctx.state.storage, holders).await;
+        assert!(ctx.state.storage.stat(CHART_KEY).await.is_some());
+
+        let busy = send(&ctx.app, Method::GET, SECOND, "").await;
+        assert_eq!(
+            busy.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an unread streamed chart no longer counts against the budget"
+        );
+        drop(frames);
+        let resp = send(&ctx.app, Method::GET, SECOND, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_bytes(resp).await == body);
+    }
+
     /// Time to the first byte and to the end of a cold 64 MiB chart whose upstream sends
     /// 1 MiB every 20 ms, as a client on a socket sees it (the PR's numbers).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
