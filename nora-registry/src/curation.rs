@@ -1578,7 +1578,7 @@ pub struct BlocklistRule {
 /// - `"foo*"` — prefix match
 /// - `"*foo"` — suffix match
 /// - exact string comparison otherwise
-fn glob_match(pattern: &str, value: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, value: &str) -> bool {
     pattern_holds(pattern, value, str::to_string, '.')
 }
 

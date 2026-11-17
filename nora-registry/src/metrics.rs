@@ -300,6 +300,17 @@ pub static PYPI_MIXED_PROJECT_UPLOADS_TOTAL: LazyLock<IntCounterVec> = LazyLock:
     .expect("failed to create PYPI_MIXED_PROJECT_UPLOADS_TOTAL metric at startup")
 });
 
+/// Maven uploads outside `curation.internal_namespaces` and `maven.hosted_groups` while a proxy
+/// is configured (A017): `warned` stored under `hosted_groups_enforcement = "warn"`, `refused` 403.
+pub static MAVEN_UNHOSTED_UPLOADS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_maven_unhosted_uploads_total",
+        "Maven uploads outside internal_namespaces and maven.hosted_groups while a proxy is configured",
+        &["outcome"]
+    )
+    .expect("failed to create MAVEN_UNHOSTED_UPLOADS_TOTAL metric at startup")
+});
+
 /// Upstream 4xx responses that carried a policy/geo block signature (e.g. an AWS
 /// WAF geo rule via `x-amzn-waf-reason`) and were relayed as a bare 404. Lets an
 /// operator tell an effective region/policy outage apart from a genuine not-found

@@ -1,7 +1,30 @@
 # Maven proxies and release dates (maestra fork)
 
-`/maven2/` serves hosted artifacts first, then tries each `[maven] proxies` entry in order;
-the first upstream that has the file answers.
+`/maven2/` serves a stored file first (an upload here or a cached upstream copy), then tries
+each `[maven] proxies` entry in order; the first upstream that has the file answers.
+
+## Hosted groups
+
+With proxies configured, a coordinate is uploaded (PUT) here only under
+`curation.internal_namespaces` or `[maven] hosted_groups` (the same glob syntax). Elsewhere an
+upload would seat its own file under a coordinate the upstreams serve, before NORA cached it.
+
+```toml
+[maven]
+hosted_groups = ["io.delta.**"]
+hosted_groups_enforcement = "warn"   # or "enforce": 403 "group not hosted here"
+```
+
+`warn` (the default) stores such an upload and logs `[SECURITY] Maven upload outside
+curation.internal_namespaces and maven.hosted_groups`; both modes count
+`nora_maven_unhosted_uploads_total{outcome="warned"|"refused"}`. List the groups the WARN names,
+add them to `hosted_groups`, then switch to `enforce`. Reads are not affected, and a registry
+without proxies hosts every coordinate.
+
+Checksum files are NORA's own: a deploy stores `.md5`, `.sha1`, `.sha256` and `.sha512` of
+the file it stored. An uploaded checksum is compared with that (or with the stored file's digest)
+and never stored as sent: 404 when the file is not stored, 400 on a mismatch
+(`checksum_verify = false` skips the comparison).
 
 ```toml
 [maven]

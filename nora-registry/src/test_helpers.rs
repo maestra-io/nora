@@ -208,6 +208,8 @@ fn build_context_full(
             checksum_verify: true,
             immutable_releases: true,
             metadata_ttl: 300,
+            hosted_groups: vec![],
+            hosted_groups_enforcement: Default::default(),
         },
         npm: NpmConfig {
             enabled: true,
