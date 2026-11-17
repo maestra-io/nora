@@ -134,8 +134,8 @@ fn terraform_mirror_hostnames_default_and_env() {
     );
 }
 
-/// Audit A104: index-named archive hosts are guarded by default; NORA_TF_ALLOW_PRIVATE_HOSTS and
-/// `[pypi] allow_private_file_hosts` lift it.
+/// Audits A100/A104: hosts upstream metadata names are guarded by default;
+/// NORA_TF_ALLOW_PRIVATE_HOSTS and NORA_PYPI_ALLOW_PRIVATE_FILE_HOSTS lift it.
 #[test]
 fn private_content_host_switches_default_off() {
     let _lock = env_lock();
@@ -143,10 +143,13 @@ fn private_content_host_switches_default_off() {
     assert!(!cfg.terraform.allow_private_hosts);
     assert!(!cfg.pypi.allow_private_file_hosts);
     std::env::set_var("NORA_TF_ALLOW_PRIVATE_HOSTS", "true");
+    std::env::set_var("NORA_PYPI_ALLOW_PRIVATE_FILE_HOSTS", "1");
     let mut cfg = Config::default();
     cfg.apply_env_overrides().unwrap();
     std::env::remove_var("NORA_TF_ALLOW_PRIVATE_HOSTS");
+    std::env::remove_var("NORA_PYPI_ALLOW_PRIVATE_FILE_HOSTS");
     assert!(cfg.terraform.allow_private_hosts);
+    assert!(cfg.pypi.allow_private_file_hosts);
 }
 
 /// The empty setting switches the upstream off in both places it can be written, for all six

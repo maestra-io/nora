@@ -70,10 +70,10 @@ EOF
     >"$WORK/upstream.log" 2>&1 &
 PIDS+=($!)
 
-# ── NORA: pypi proxy on the fixture, local storage, no auth ──
+# ── NORA: pypi proxy on the fixture (its files on loopback), local storage, no auth ──
 NORA_HOST=127.0.0.1 NORA_PORT="$NORA_PORT" NORA_PUBLIC_URL="http://127.0.0.1:${NORA_PORT}" \
 NORA_STORAGE_PATH="$WORK/data" NORA_AUTH_ENABLED=false NORA_PYPI_ENABLED=true \
-NORA_PYPI_PROXY="http://127.0.0.1:${UP_PORT}/simple/" \
+NORA_PYPI_PROXY="http://127.0.0.1:${UP_PORT}/simple/" NORA_PYPI_ALLOW_PRIVATE_FILE_HOSTS=true \
     "$NORA_BIN" serve >"$WORK/nora.log" 2>&1 &
 PIDS+=($!)
 

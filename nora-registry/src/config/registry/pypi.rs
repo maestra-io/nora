@@ -28,8 +28,8 @@ pub struct PypiConfig {
     #[serde(default = "super::super::default_metadata_ttl")]
     pub metadata_ttl: i64,
     /// Fetch a file (or its `.metadata`) an upstream index names on a loopback, private,
-    /// link-local or metadata address (an internal mirror's own files). Off: such a file
-    /// answers 502.
+    /// link-local or metadata address (an internal mirror's own files;
+    /// `NORA_PYPI_ALLOW_PRIVATE_FILE_HOSTS`). Off: such a file answers 502.
     #[serde(default)]
     pub allow_private_file_hosts: bool,
 }
@@ -156,6 +156,9 @@ impl PypiConfig {
         }
         if let Ok(val) = env::var("NORA_PYPI_METADATA_TTL") {
             super::super::parse_env_warn("NORA_PYPI_METADATA_TTL", &val, &mut self.metadata_ttl);
+        }
+        if let Ok(val) = env::var("NORA_PYPI_ALLOW_PRIVATE_FILE_HOSTS") {
+            self.allow_private_file_hosts = val.to_lowercase() == "true" || val == "1";
         }
     }
 }
