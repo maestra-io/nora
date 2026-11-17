@@ -58,6 +58,9 @@ pub struct RepoInfo {
     /// True for root-level files in raw storage (not directories)
     #[serde(default)]
     pub is_file: bool,
+    /// Unix seconds behind `updated` (0: unknown), to roll entries up into a directory.
+    #[serde(skip)]
+    pub modified: u64,
 }
 
 /// Index for a single registry type
@@ -622,6 +625,7 @@ async fn build_raw_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
                 "N/A".to_string()
             },
             is_file,
+            modified,
         })
         .collect();
 
@@ -869,6 +873,7 @@ fn to_sorted_vec(map: HashMap<String, (usize, u64, u64)>) -> Vec<RepoInfo> {
                 "N/A".to_string()
             },
             is_file: false,
+            modified,
         })
         .collect();
 

@@ -495,6 +495,10 @@ fn max_session_size() -> usize {
 /// the manifest path (#817). 4 MiB matches common registry limits.
 const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 
+/// Max bytes of an image config blob read for its os/arch (UI metadata only). Real
+/// configs are a few KiB; a larger blob is not read and shows as "unknown".
+const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Per-request byte ceiling for a blob upload: the smaller of the upload-session
 /// cap and the operator's global `body_limit_mb`. A streaming `Body` extractor
 /// is NOT subject to `DefaultBodyLimit` (that only bounds `Bytes`-based
@@ -1620,42 +1624,85 @@ pub(crate) fn strip_docker_namespace(name: &str) -> &str {
     name
 }
 
-/// List all repositories in the registry
-async fn catalog(State(state): State<AppState>) -> Response {
-    let keys = match state.storage.list("docker/").await {
-        Ok(k) => k,
-        Err(e) => {
-            tracing::error!(error = ?e, "docker: failed to list storage for catalog");
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
+/// `GET /v2/_catalog[?n=<int>][&last=<name>]`: every repository, served from the shared
+/// repository index (one background rebuild at a time), never from a listing per request.
+/// Eventually consistent; 503 with `Retry-After` until the index is first built.
+async fn catalog(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let n = match page_size(&params) {
+        Ok(n) => n,
+        Err(r) => return *r,
     };
-
-    // Extract unique repository names from paths like "docker/{name}/manifests/..."
-    let mut repos: Vec<String> = keys
+    let index = state.repo_index.get("docker", &state).await;
+    if !state.repo_index.is_ready("docker") {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "30")],
+        )
+            .into_response();
+    }
+    // Canonicalize so images proxied through different upstreams are deduplicated.
+    let mut repos: Vec<String> = index
         .iter()
-        .filter_map(|k| {
-            let rest = k.strip_prefix("docker/")?;
-            // Find the first known directory separator (manifests/ or blobs/)
-            let name = if let Some(idx) = rest.find("/manifests/") {
-                &rest[..idx]
-            } else if let Some(idx) = rest.find("/blobs/") {
-                &rest[..idx]
-            } else {
-                return None;
-            };
-            if name.is_empty() {
-                return None;
-            }
-            // Canonicalize to strip upstream namespace prefix (e.g. "docker.io/")
-            // so that images proxied through different upstreams are deduplicated.
-            Some(canonicalize(name, &state.config.docker).name)
-        })
+        .map(|r| canonicalize(&r.name, &state.config.docker).name)
         .collect();
-
     repos.sort();
     repos.dedup();
+    let link = page(&mut repos, n, params.get("last"), "/v2/_catalog?");
+    with_link(Json(json!({ "repositories": repos })).into_response(), link)
+}
 
-    Json(json!({ "repositories": repos })).into_response()
+/// The `n` of an OCI listing page, or the 400 `PAGINATION_NUMBER_INVALID` answer when it
+/// is not a number.
+fn page_size(params: &HashMap<String, String>) -> Result<Option<usize>, Box<Response>> {
+    match params.get("n").map(|n| n.parse::<usize>()) {
+        Some(Ok(n)) => Ok(Some(n)),
+        Some(Err(_)) => Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"errors": [{
+                    "code": "PAGINATION_NUMBER_INVALID",
+                    "message": "invalid number of results requested",
+                    "detail": { "n": params.get("n") }
+                }]})),
+            )
+                .into_response(),
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Cut a sorted listing to the OCI page after `last`, at most `n` long, and return the
+/// `Link` to the next page (`base` is the path with its `?`). `n=0` is an empty list, no Link.
+fn page(
+    items: &mut Vec<String>,
+    n: Option<usize>,
+    last: Option<&String>,
+    base: &str,
+) -> Option<String> {
+    if let Some(last) = last {
+        items.retain(|t| t.as_str() > last.as_str());
+    }
+    let n = n?;
+    let mut link = None;
+    if n > 0 && items.len() > n {
+        let last = percent_encoding::utf8_percent_encode(
+            &items[n - 1],
+            percent_encoding::NON_ALPHANUMERIC,
+        );
+        link = Some(format!("<{base}n={n}&last={last}>; rel=\"next\""));
+    }
+    items.truncate(n);
+    link
+}
+
+fn with_link(mut response: Response, link: Option<String>) -> Response {
+    if let Some(link) = link.and_then(|l| axum::http::HeaderValue::from_str(&l).ok()) {
+        response.headers_mut().insert(header::LINK, link);
+    }
+    response
 }
 
 async fn check_blob(
@@ -3853,20 +3900,9 @@ async fn list_tags(
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
-    let n = match params.get("n").map(|n| n.parse::<usize>()) {
-        Some(Ok(n)) => Some(n),
-        Some(Err(_)) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"errors": [{
-                    "code": "PAGINATION_NUMBER_INVALID",
-                    "message": "invalid number of results requested",
-                    "detail": { "n": params.get("n") }
-                }]})),
-            )
-                .into_response();
-        }
-        None => None,
+    let n = match page_size(&params) {
+        Ok(n) => n,
+        Err(r) => return *r,
     };
     let (mut tags, mut known, hosted) = match repository_tags(&state, ns.as_deref(), &name).await {
         Ok(found) => found,
@@ -3919,28 +3955,12 @@ async fn list_tags(
     if !known {
         return name_unknown_response(&name);
     }
-    if let Some(last) = params.get("last") {
-        tags.retain(|t| t.as_str() > last.as_str());
-    }
-    let mut link = None;
-    if let Some(n) = n {
-        // `n=0` is an empty list with no Link (OCI); otherwise a full page names the next.
-        if n > 0 && tags.len() > n {
-            let last = percent_encoding::utf8_percent_encode(
-                &tags[n - 1],
-                percent_encoding::NON_ALPHANUMERIC,
-            );
-            link = Some(format!(
-                "</v2/{raw_name}/tags/list?n={n}&last={last}>; rel=\"next\""
-            ));
-        }
-        tags.truncate(n);
-    }
-    let mut response = (StatusCode::OK, Json(json!({"name": name, "tags": tags}))).into_response();
-    if let Some(link) = link.and_then(|l| axum::http::HeaderValue::from_str(&l).ok()) {
-        response.headers_mut().insert(header::LINK, link);
-    }
-    response
+    let base = format!("/v2/{raw_name}/tags/list?");
+    let link = page(&mut tags, n, params.get("last"), &base);
+    with_link(
+        (StatusCode::OK, Json(json!({"name": name, "tags": tags}))).into_response(),
+        link,
+    )
 }
 
 /// The upstream's tags of a proxied repository: `Ok(None)` when every upstream asked said it has
@@ -4664,40 +4684,41 @@ async fn extract_metadata(manifest: &[u8], storage: &Storage, name: &str) -> Ima
     metadata
 }
 
-/// Get OS/arch information from a config blob
+/// The platform fields of an image config; the rest of the blob is skipped, not built.
+#[derive(Deserialize)]
+struct ConfigPlatform {
+    os: Option<String>,
+    architecture: Option<String>,
+    variant: Option<String>,
+}
+
+/// Get OS/arch information from a config blob. Only a valid digest whose blob is at most
+/// [`MAX_CONFIG_BYTES`] is read: push and proxy fill both land here.
 async fn get_config_info(
     storage: &Storage,
     name: &str,
     config_digest: &str,
 ) -> (String, String, Option<String>) {
-    let key = format!("docker/{}/blobs/{}", name, config_digest);
-
+    let unknown = || ("unknown".to_string(), "unknown".to_string(), None);
+    if validate_digest(config_digest).is_err() {
+        return unknown();
+    }
+    let key = blob_key(None, name, config_digest);
+    match storage.stat(&key).await {
+        Some(meta) if meta.size <= MAX_CONFIG_BYTES => {}
+        _ => return unknown(),
+    }
     let Ok(data) = storage.get(&key).await else {
-        return ("unknown".to_string(), "unknown".to_string(), None);
+        return unknown();
     };
-
-    let Ok(config) = serde_json::from_slice::<Value>(&data) else {
-        return ("unknown".to_string(), "unknown".to_string(), None);
+    let Ok(config) = serde_json::from_slice::<ConfigPlatform>(&data) else {
+        return unknown();
     };
-
-    let os = config
-        .get("os")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    let arch = config
-        .get("architecture")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    let variant = config
-        .get("variant")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    (os, arch, variant)
+    (
+        config.os.unwrap_or_else(|| "unknown".to_string()),
+        config.architecture.unwrap_or_else(|| "unknown".to_string()),
+        config.variant,
+    )
 }
 
 #[cfg(test)]
