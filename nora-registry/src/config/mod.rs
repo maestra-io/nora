@@ -1329,6 +1329,19 @@ impl Config {
             }
         }
 
+        // 3c. A raw upload is spooled within spool_max_mb: a max_file_size above it
+        // makes every upload past the budget a 507, whatever max_file_size allows.
+        if self.raw.enabled
+            && self.server.spool_max_mb > 0
+            && self.raw.max_file_size > self.server.spool_max_mb.saturating_mul(1024 * 1024)
+        {
+            warnings.push(format!(
+                "raw.max_file_size ({} bytes) exceeds server.spool_max_mb ({} MB): raw uploads \
+                 larger than the spool budget are refused with 507",
+                self.raw.max_file_size, self.server.spool_max_mb
+            ));
+        }
+
         // 4. Rate limit values must be > 0 when rate limiting is enabled
         if self.rate_limit.enabled {
             if self.rate_limit.auth_rps == 0 {

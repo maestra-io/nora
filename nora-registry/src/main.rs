@@ -2699,16 +2699,12 @@ async fn clear_dead_instance_files(state: &AppState) {
         registry::docker::cleanup_upload_temp_dir(&state.config.storage.path);
         registry::docker::cleanup_proxy_temp_dir(&state.config.storage.path);
     }
-    // Spool files (proxied downloads, NuGet pushes, PyPI uploads) of an instance
-    // that died mid-transfer.
+    // Spool files (proxied downloads, NuGet pushes, PyPI and raw uploads, Hugging
+    // Face cache fills) of an instance that died mid-transfer.
     registry::cleanup_spool_dirs(&state.config.server.spool_dir(&state.config.storage.path));
-    // ...and streamed raw uploads a crash cut off mid-request.
+    // ...and raw uploads left in their pre-spool directory (one release).
     if state.config.raw.enabled {
         registry::raw::cleanup_upload_temp_dir(&state.config.storage.path);
-    }
-    // ...and Hugging Face cache fills a crash cut off mid-file.
-    if state.config.hf.enabled {
-        registry::hf::cleanup_fill_temp_dir(&state.config.storage.path);
     }
 }
 
@@ -2918,7 +2914,6 @@ async fn maintenance_tick(state: &AppState, tick_count: u64, work: &MaintenanceW
         let spool_dir = state.config.server.spool_dir(&storage_path);
         tokio::task::spawn_blocking(move || {
             registry::docker::cleanup_proxy_temp_dir(&storage_path);
-            registry::hf::cleanup_fill_temp_dir(&storage_path);
             // Reclaim upload temp files orphaned by a storage-write failure
             // without waiting for a restart. cleanup_expired_sessions only
             // frees temps still tracked by a live (expired) session, so an
