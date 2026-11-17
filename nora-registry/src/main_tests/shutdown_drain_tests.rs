@@ -52,6 +52,7 @@ async fn start(
             header_read_timeout: Duration::from_secs(30),
             keep_alive_timeout: Duration::from_secs(120),
             max_connections: 64,
+            body_idle_timeout: Duration::from_secs(120),
         },
     ));
     (addr, tx, server)

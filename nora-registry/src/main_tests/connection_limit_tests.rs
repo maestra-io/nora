@@ -3,14 +3,15 @@
 #![cfg(test)]
 
 //! A connection whose request head does not arrive in time is closed, an idle keep-alive
-//! connection lives longer than that, and open connections are capped.
+//! connection lives longer than that, one whose client stops sending its body or reading
+//! the response is closed, and open connections are capped.
 //!
 //! The head timeouts are tested over an in-memory pipe on tokio's paused clock: no socket
 //! I/O is in flight when tokio moves the clock on, so each close is timed exactly. The
 //! listener and the HTTP/2 paths are tested over loopback sockets in real time.
 use super::{serve_with_drain, ConnLimits, ServeEnd};
 use axum::extract::ConnectInfo;
-use axum::routing::get;
+use axum::routing::{get, put};
 use axum::Router;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -20,6 +21,7 @@ use tokio::time::Instant;
 
 const HEAD: Duration = Duration::from_millis(300);
 const IDLE: Duration = Duration::from_millis(1500);
+const BODY_IDLE: Duration = Duration::from_secs(1);
 const REQUEST: &[u8] = b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
 
 /// A server under test, stopped when the test drops it.
@@ -39,15 +41,32 @@ async fn start(max_connections: usize) -> TestServer {
         header_read_timeout: HEAD,
         keep_alive_timeout: IDLE,
         max_connections,
+        body_idle_timeout: BODY_IDLE,
     })
     .await
 }
 
 fn app() -> Router {
-    Router::new().route("/ok", get(|| async { "ok" })).route(
-        "/peer",
-        get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.ip().to_string() }),
-    )
+    use futures::StreamExt;
+    Router::new()
+        .route("/ok", get(|| async { "ok" }))
+        .route(
+            "/peer",
+            get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.ip().to_string() }),
+        )
+        .route(
+            "/upload",
+            put(|body: axum::body::Bytes| async move { body.len().to_string() }),
+        )
+        // 64 MiB in 64 KiB pieces, more than the socket buffers hold.
+        .route(
+            "/big",
+            get(|| async {
+                axum::body::Body::from_stream(futures::stream::iter(0..1024u32).map(|_| {
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'x'; 64 * 1024]))
+                }))
+            }),
+        )
 }
 
 /// One connection served over an in-memory pipe with `header_read_timeout` = `head`: the
@@ -59,6 +78,7 @@ fn serve_in_memory(head: Duration) -> (tokio::io::DuplexStream, tokio::sync::wat
         header_read_timeout: head,
         keep_alive_timeout: IDLE,
         max_connections: 1,
+        body_idle_timeout: BODY_IDLE,
     };
     let remote = SocketAddr::from(([127, 0, 0, 1], 40000));
     tokio::spawn(crate::server_conn::serve_connection(
@@ -272,6 +292,46 @@ async fn past_max_connections_a_new_client_waits_until_one_closes() {
         .await
         .expect("served once the first connection closed");
     assert!(response.starts_with("HTTP/1.1 200"));
+}
+
+/// Audit A087: with every place taken (`max_connections` = 1) by a client that sent part of
+/// a request body and went silent, the connection is closed at the body idle timeout and
+/// the place serves the next client.
+#[tokio::test]
+async fn a_stalled_request_body_is_closed_and_frees_its_place() {
+    let server = start(1).await;
+    let mut first = TcpStream::connect(server.addr).await.unwrap();
+    first
+        .write_all(b"PUT /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\na")
+        .await
+        .unwrap();
+    let closed = closed_within(&mut first, BODY_IDLE * 5).await;
+    assert!(
+        closed.is_some_and(|d| d >= BODY_IDLE - Duration::from_millis(100)),
+        "a stalled body was closed after {closed:?}, body idle timeout {BODY_IDLE:?}"
+    );
+    let mut next = TcpStream::connect(server.addr).await.unwrap();
+    next.write_all(REQUEST).await.unwrap();
+    assert!(read_response(&mut next).await.starts_with("HTTP/1.1 200"));
+}
+
+/// Audit A087: a client that asks for a large response and never reads it is closed at the
+/// body idle timeout, and its place serves the next client.
+#[tokio::test]
+async fn an_unread_response_is_closed_and_frees_its_place() {
+    let server = start(1).await;
+    let mut first = TcpStream::connect(server.addr).await.unwrap();
+    first
+        .write_all(b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut next = TcpStream::connect(server.addr).await.unwrap();
+    next.write_all(REQUEST).await.unwrap();
+    assert!(
+        read_response(&mut next).await.starts_with("HTTP/1.1 200"),
+        "the place of a client that does not read was not freed"
+    );
+    drop(first);
 }
 
 /// A client speaking HTTP/2 from its first byte (prior knowledge) is served, as it

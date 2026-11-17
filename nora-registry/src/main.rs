@@ -2526,8 +2526,11 @@ async fn run_server(mut config: Config, storage: Storage) {
         header_read_timeout_secs = state.config.server.header_read_timeout,
         keep_alive_timeout_secs = state.config.server.keep_alive_timeout,
         max_connections = state.config.server.max_connections,
+        body_idle_timeout_secs = state.config.server.body_idle_timeout,
         "Connection limits"
     );
+    // Exported from the start, at 0.
+    std::sync::LazyLock::force(&metrics::CONNECTIONS_STALLED_TOTAL);
     match serve_with_drain(listener, app, shutdown_signal(), drain, limits)
         .await
         .expect("Server error")
@@ -3058,12 +3061,13 @@ enum ServeEnd {
 
 /// Serve `app` until `shutdown` resolves, then give in-flight requests `drain` to finish.
 ///
-/// Each connection is served under `limits` (header and keep-alive timeouts, see
+/// Each connection is served under `limits` (header, keep-alive and body idle timeouts, see
 /// [`server_conn`]); past `max_connections` open ones, no new connection is accepted until
 /// one closes. At the signal the listener closes and every connection finishes the request
-/// in flight and closes. A client that stops reading a response would hold its connection
-/// forever, so connections still open when the window passes are not waited for: they are
-/// dropped, and the shutdown steps (schedulers, audit drain, token flush) run.
+/// in flight and closes. A client that stops reading a response holds its connection up to
+/// `body_idle_timeout`, longer than the window, so connections still open when the window
+/// passes are not waited for: they are dropped, and the shutdown steps (schedulers, audit
+/// drain, token flush) run.
 async fn serve_with_drain<F>(
     listener: tokio::net::TcpListener,
     app: Router,
