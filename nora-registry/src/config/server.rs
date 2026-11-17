@@ -64,6 +64,13 @@ pub struct ServerConfig {
     /// until one closes. Keep it below the process's open-file limit. Default 4096.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+    /// Seconds a connection may wait on its client past the request head, for request body
+    /// bytes or for the client to read the response, before it is closed. An idle window,
+    /// not a total: a slow transfer that moves within each window, and time the server takes
+    /// itself (a handler, an upstream fetch), are never cut. Closes are logged and counted in
+    /// `nora_connections_stalled_total`. Default 120, above traefik's 90 s idle; 0 = no limit.
+    #[serde(default = "default_body_idle_timeout")]
+    pub body_idle_timeout: u64,
     /// Seconds without a finished maintenance tick (upload-session expiry, storage
     /// reachability; one every 30 s) after which `/health` answers 503, so an
     /// orchestrator restarts the process. A tick is cut, and counts as finished, after a third
@@ -186,6 +193,10 @@ pub(super) fn default_max_connections() -> usize {
     4096
 }
 
+pub(super) fn default_body_idle_timeout() -> u64 {
+    120
+}
+
 pub(super) fn default_publish_body_limit_mb() -> usize {
     512
 }
@@ -234,6 +245,7 @@ impl Default for ServerConfig {
             header_read_timeout: default_header_read_timeout(),
             keep_alive_timeout: default_keep_alive_timeout(),
             max_connections: default_max_connections(),
+            body_idle_timeout: default_body_idle_timeout(),
             maintenance_stall_secs: default_maintenance_stall_secs(),
             trust_upstream_dates: default_trust_upstream_dates(),
             allow_private_upstreams: false,
@@ -404,6 +416,9 @@ impl ServerConfig {
         if let Ok(val) = env::var("NORA_MAX_CONNECTIONS") {
             super::parse_env_warn("NORA_MAX_CONNECTIONS", &val, &mut self.max_connections);
         }
+        if let Ok(val) = env::var("NORA_BODY_IDLE_TIMEOUT") {
+            super::parse_env_warn("NORA_BODY_IDLE_TIMEOUT", &val, &mut self.body_idle_timeout);
+        }
         if let Ok(val) = env::var("NORA_STREAM_THRESHOLD_MB") {
             super::parse_env_warn(
                 "NORA_STREAM_THRESHOLD_MB",
@@ -495,7 +510,12 @@ mod tests {
         assert_eq!(defaults.header_read_timeout, 30);
         assert_eq!(defaults.keep_alive_timeout, 120);
         assert_eq!(defaults.max_connections, 4096);
+        assert_eq!(defaults.body_idle_timeout, 120);
         let mut config = ServerConfig::default();
+        std::env::set_var("NORA_BODY_IDLE_TIMEOUT", "0");
+        config.apply_env_overrides();
+        std::env::remove_var("NORA_BODY_IDLE_TIMEOUT");
+        assert_eq!(config.body_idle_timeout, 0);
         std::env::set_var("NORA_HEADER_READ_TIMEOUT", "5");
         std::env::set_var("NORA_KEEP_ALIVE_TIMEOUT", "300");
         std::env::set_var("NORA_MAX_CONNECTIONS", "64");

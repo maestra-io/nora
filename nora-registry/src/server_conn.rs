@@ -19,6 +19,11 @@
 //! limits as an HTTP/1 client by [`Streams`]: its first stream must open within
 //! `header_read_timeout` from the accept, and with no stream open the connection is idle and
 //! closed after `keep_alive_timeout`.
+//!
+//! Past the head, a connection is closed once the client has moved nothing for
+//! `body_idle_timeout`: while a handler waits for request body bytes that do not come, or a
+//! response frame waits for a client that does not read it ([`ClientWait`]). Time the
+//! server itself takes (a handler, an upstream fetch, a spool fill) is never counted.
 
 use std::future::Future;
 use std::io;
@@ -45,6 +50,9 @@ pub(crate) struct ConnLimits {
     pub keep_alive_timeout: Duration,
     /// Open connections at most; past it new ones wait in the listen backlog.
     pub max_connections: usize,
+    /// Time a connection may wait on its client, for request body bytes or for it to read
+    /// the response, before it is closed. Zero: no limit.
+    pub body_idle_timeout: Duration,
 }
 
 impl ConnLimits {
@@ -53,6 +61,7 @@ impl ConnLimits {
             header_read_timeout: Duration::from_secs(server.header_read_timeout),
             keep_alive_timeout: Duration::from_secs(server.keep_alive_timeout),
             max_connections: server.max_connections,
+            body_idle_timeout: Duration::from_secs(server.body_idle_timeout),
         }
     }
 }
@@ -93,13 +102,16 @@ pub(crate) async fn serve_connection<S>(
         // What `into_make_service_with_connect_info` gave handlers: the peer address.
         request.extensions_mut().insert(ConnectInfo(remote));
         let stream = StreamOpen::new(&open, accepted);
+        let reading = ClientWait::new(&open, accepted);
+        let sending = ClientWait::new(&open, accepted);
         app.clone()
-            .oneshot(request.map(axum::body::Body::new))
+            .oneshot(request.map(|body| axum::body::Body::new(FromClient { body, reading })))
             .map(|response| {
                 response.map(|response| {
                     response.map(|body| {
                         axum::body::Body::new(InStream {
                             body,
+                            sending,
                             _stream: stream,
                         })
                     })
@@ -113,26 +125,44 @@ pub(crate) async fn serve_connection<S>(
             .timer(hyper_util::rt::TokioTimer::new())
             .keep_alive_interval(limits.keep_alive_timeout)
             .keep_alive_timeout(limits.header_read_timeout);
-        let idle = streams.idle(accepted, limits);
-        drive(builder.serve_connection(io, service), stop, idle, remote).await;
+        let idle = Arc::clone(&streams).idle(accepted, limits);
+        let stalled = streams.stalled(accepted, limits.body_idle_timeout);
+        drive(
+            builder.serve_connection(io, service),
+            stop,
+            idle,
+            stalled,
+            remote,
+        )
+        .await;
     } else {
         let mut builder = hyper::server::conn::http1::Builder::new();
         builder
             .timer(HeadTimer { clock, limits })
             .header_read_timeout(limits.header_read_timeout)
             .keep_alive(true);
-        // HTTP/1 keeps its limits in `HeadTimer`.
+        // HTTP/1 keeps its head limits in `HeadTimer`.
         let idle = std::future::pending();
-        drive(builder.serve_connection(io, service), stop, idle, remote).await;
+        let stalled = streams.stalled(accepted, limits.body_idle_timeout);
+        drive(
+            builder.serve_connection(io, service),
+            stop,
+            idle,
+            stalled,
+            remote,
+        )
+        .await;
     }
 }
 
 /// Run `connection` to its end, shutting it down gracefully once `stop` turns true or the
-/// connection has been `idle` too long.
+/// connection has been `idle` too long. Once it has `stalled` on its client it is dropped at
+/// once: a graceful shutdown would wait for the very request that stalled.
 async fn drive<C>(
     connection: C,
     mut stop: tokio::sync::watch::Receiver<bool>,
     idle: impl Future<Output = ()>,
+    stalled: impl Future<Output = ()>,
     remote: SocketAddr,
 ) where
     C: hyper_util::server::graceful::GracefulConnection,
@@ -150,6 +180,11 @@ async fn drive<C>(
         () = idle => {
             connection.as_mut().graceful_shutdown();
             connection.await
+        }
+        () = stalled => {
+            tracing::info!(peer = %remote, "connection closed: its client moved nothing for server.body_idle_timeout");
+            crate::metrics::CONNECTIONS_STALLED_TOTAL.inc();
+            return;
         }
     };
     if let Err(e) = served {
@@ -169,7 +204,11 @@ struct Streams {
     open: AtomicU64,
     /// Milliseconds from the accept to the end of the last stream; `u64::MAX` before one ends.
     last_end_ms: AtomicU64,
-    /// Woken when a stream opens or ends.
+    /// Streams waiting on the client now, see [`ClientWait`].
+    client_waits: AtomicU64,
+    /// Milliseconds from the accept to when the last wait on the client began.
+    wait_began_ms: AtomicU64,
+    /// Woken when a stream opens or ends, and when a first stream starts waiting on the client.
     changed: tokio::sync::Notify,
 }
 
@@ -178,6 +217,8 @@ impl Default for Streams {
         Self {
             open: AtomicU64::new(0),
             last_end_ms: AtomicU64::new(u64::MAX),
+            client_waits: AtomicU64::new(0),
+            wait_began_ms: AtomicU64::new(0),
             changed: tokio::sync::Notify::new(),
         }
     }
@@ -208,6 +249,112 @@ impl Streams {
                 () = changed => {}
             }
         }
+    }
+
+    /// Resolves once a stream has waited on the client for `limit` and none has started
+    /// waiting since; never with a zero `limit`.
+    async fn stalled(self: Arc<Self>, accepted: tokio::time::Instant, limit: Duration) {
+        if limit.is_zero() {
+            return std::future::pending().await;
+        }
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            // Registered before the state is read, so a change after the read wakes it.
+            changed.as_mut().enable();
+            if self.client_waits.load(Ordering::Acquire) == 0 {
+                changed.await;
+                continue;
+            }
+            let began = Duration::from_millis(self.wait_began_ms.load(Ordering::Acquire));
+            let deadline = accepted + began + limit;
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            // CANCEL-SAFETY: both arms only wake the loop, which reads the state again.
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => {}
+                () = changed => {}
+            }
+        }
+    }
+}
+
+/// Whether one stream is waiting on its client, counted in [`Streams::client_waits`]: its
+/// request body is read and has no bytes, or hyper took a response frame and has not come
+/// back for the next one (it is still writing that one to a client that does not read). A
+/// wait ends when the body yields, or when hyper polls the response again; a response that
+/// then waits on the handler is not waiting on the client.
+struct ClientWait {
+    streams: Arc<Streams>,
+    accepted: tokio::time::Instant,
+    waiting: bool,
+}
+
+impl ClientWait {
+    fn new(streams: &Arc<Streams>, accepted: tokio::time::Instant) -> Self {
+        Self {
+            streams: Arc::clone(streams),
+            accepted,
+            waiting: false,
+        }
+    }
+
+    fn begin(&mut self) {
+        if self.waiting {
+            return;
+        }
+        self.waiting = true;
+        let ms = u64::try_from(self.accepted.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // Stored before the count, so a reader that sees the count sees this start.
+        self.streams.wait_began_ms.store(ms, Ordering::Release);
+        if self.streams.client_waits.fetch_add(1, Ordering::AcqRel) == 0 {
+            self.streams.changed.notify_waiters();
+        }
+    }
+
+    fn end(&mut self) {
+        if std::mem::take(&mut self.waiting) {
+            self.streams.client_waits.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for ClientWait {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// A request body, waiting on the client while it has no bytes for the handler.
+struct FromClient {
+    body: Incoming,
+    reading: ClientWait,
+}
+
+impl hyper::body::Body for FromClient {
+    type Data = axum::body::Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let polled = Pin::new(&mut self.body).poll_frame(cx);
+        if polled.is_pending() {
+            self.reading.begin();
+        } else {
+            self.reading.end();
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
     }
 }
 
@@ -252,9 +399,11 @@ impl Drop for StreamOpen {
 }
 
 /// A response body that holds its stream open until hyper is done with it: sent to its end,
-/// or dropped with a reset stream.
+/// or dropped with a reset stream. From each frame it yields until hyper polls it again, it
+/// waits on the client.
 struct InStream {
     body: axum::body::Body,
+    sending: ClientWait,
     _stream: StreamOpen,
 }
 
@@ -266,7 +415,12 @@ impl hyper::body::Body for InStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
-        Pin::new(&mut self.body).poll_frame(cx)
+        self.sending.end();
+        let polled = Pin::new(&mut self.body).poll_frame(cx);
+        if let Poll::Ready(Some(Ok(_))) = polled {
+            self.sending.begin();
+        }
+        polled
     }
 
     fn is_end_stream(&self) -> bool {
@@ -494,16 +648,19 @@ mod tests {
             header_read_timeout: 7,
             keep_alive_timeout: 123,
             max_connections: 9,
+            body_idle_timeout: 45,
             ..crate::config::ServerConfig::default()
         };
         let limits = ConnLimits::from_config(&server);
         assert_eq!(limits.header_read_timeout, Duration::from_secs(7));
         assert_eq!(limits.keep_alive_timeout, Duration::from_secs(123));
         assert_eq!(limits.max_connections, 9);
+        assert_eq!(limits.body_idle_timeout, Duration::from_secs(45));
         let defaults = ConnLimits::from_config(&crate::config::ServerConfig::default());
         assert_eq!(defaults.header_read_timeout, Duration::from_secs(30));
         assert_eq!(defaults.keep_alive_timeout, Duration::from_secs(120));
         assert_eq!(defaults.max_connections, 4096);
+        assert_eq!(defaults.body_idle_timeout, Duration::from_secs(120));
     }
 
     fn limits() -> ConnLimits {
@@ -511,6 +668,7 @@ mod tests {
             header_read_timeout: Duration::from_secs(7),
             keep_alive_timeout: Duration::from_secs(120),
             max_connections: 1,
+            body_idle_timeout: Duration::from_secs(10),
         }
     }
 
@@ -553,6 +711,156 @@ mod tests {
         assert!(!idle.is_finished(), "closed before the keep-alive timeout");
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(idle.is_finished(), "kept past the keep-alive timeout");
+    }
+
+    /// A connection stalls once a stream has waited on its client for the body idle timeout;
+    /// a wait that ends, or a new one that begins, starts the window again, and with no wait
+    /// it never stalls.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_stalls_after_a_whole_window_waiting_on_its_client() {
+        let streams = Arc::new(Streams::default());
+        let accepted = tokio::time::Instant::now();
+        let window = Duration::from_secs(10);
+        let stalled = tokio::spawn(Arc::clone(&streams).stalled(accepted, window));
+        let mut reading = ClientWait::new(&streams, accepted);
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert!(!stalled.is_finished(), "stalled with no wait on the client");
+        reading.begin();
+        tokio::time::sleep(Duration::from_secs(9)).await;
+        reading.end();
+        reading.begin();
+        tokio::time::sleep(Duration::from_secs(9)).await;
+        assert!(!stalled.is_finished(), "stalled though the client moved");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            stalled.is_finished(),
+            "kept a client silent for the whole window"
+        );
+
+        let off = tokio::spawn(Arc::clone(&streams).stalled(accepted, Duration::ZERO));
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert!(!off.is_finished(), "a zero window closes nothing");
+        drop(reading);
+        assert_eq!(streams.client_waits.load(Ordering::Acquire), 0);
+    }
+
+    /// An app with a 64 MiB response, a handler that answers after 30 s, and an upload
+    /// that reads its whole body.
+    fn stall_app() -> Router {
+        use axum::routing::{get, put};
+        use futures::StreamExt;
+        Router::new()
+            .route(
+                "/big",
+                get(|| async {
+                    axum::body::Body::from_stream(futures::stream::iter(0..1024u32).map(|_| {
+                        Ok::<_, io::Error>(axum::body::Bytes::from(vec![b'x'; 64 * 1024]))
+                    }))
+                }),
+            )
+            .route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    "late"
+                }),
+            )
+            .route(
+                "/upload",
+                put(|body: axum::body::Bytes| async move { body.len().to_string() }),
+            )
+    }
+
+    /// One connection over an in-memory pipe with the given body idle timeout: the client
+    /// end and the connection's task.
+    fn serve_stall_app(window: Duration) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<()>) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let limits = ConnLimits {
+            header_read_timeout: Duration::from_secs(30),
+            keep_alive_timeout: Duration::from_secs(120),
+            max_connections: 1,
+            body_idle_timeout: window,
+        };
+        let task = tokio::spawn(async move {
+            let _stop = stop;
+            let remote = SocketAddr::from(([127, 0, 0, 1], 40000));
+            serve_connection(server, remote, stall_app(), limits, stopped).await;
+        });
+        (client, task)
+    }
+
+    /// Audit A071: a client that never reads a large response is closed at the body idle
+    /// timeout, which drops the response body and whatever it holds (a spool file); with
+    /// the timeout off (0) it is kept.
+    #[tokio::test(start_paused = true)]
+    async fn an_unread_response_is_closed_at_the_body_idle_timeout() {
+        use tokio::io::AsyncWriteExt;
+        for (window, closes) in [(Duration::from_secs(1), true), (Duration::ZERO, false)] {
+            let (mut client, task) = serve_stall_app(window);
+            client
+                .write_all(b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            assert!(!task.is_finished(), "{window:?}: closed before the window");
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            assert_eq!(task.is_finished(), closes, "{window:?}");
+        }
+    }
+
+    /// Audit A087: a request body that stops arriving is closed at the body idle timeout,
+    /// one that keeps arriving slowly is read to its end.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_request_body_is_closed_and_a_slow_one_is_not() {
+        use tokio::io::AsyncWriteExt;
+        let window = Duration::from_secs(1);
+        let (mut client, task) = serve_stall_app(window);
+        client
+            .write_all(b"PUT /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\na")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(!task.is_finished(), "closed before the window");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(task.is_finished(), "a stalled body held its connection");
+
+        let (mut client, task) = serve_stall_app(window);
+        client
+            .write_all(b"PUT /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n")
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            client.write_all(b"a").await.unwrap();
+        }
+        let response = read_some(&mut client).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("10"), "{response}");
+        assert!(!task.is_finished());
+    }
+
+    /// Time the handler takes is not the client's: a response 30 s late is still sent
+    /// under a 1 s body idle timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_handler_is_not_a_client_stall() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, task) = serve_stall_app(Duration::from_secs(1));
+        client
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let response = read_some(&mut client).await;
+        assert!(response.ends_with("late"), "{response}");
+        assert!(!task.is_finished());
+    }
+
+    /// Whatever the server sends next, in one read.
+    async fn read_some(client: &mut tokio::io::DuplexStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 4096];
+        let read = client.read(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf[..read]).into_owned()
     }
 
     /// Before its first stream a connection is kept the header timeout from the accept.

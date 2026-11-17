@@ -175,6 +175,7 @@ fn build_context_full(
             internal_port: None,
             teleport_port: None,
             max_connections: 4096,
+            body_idle_timeout: 120,
             maintenance_stall_secs: 300,
             publish_body_limit_mb: 512,
             publish_inflight_mb: 2048,

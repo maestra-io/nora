@@ -16,6 +16,7 @@ const LIMITS: ConnLimits = ConnLimits {
     header_read_timeout: Duration::from_secs(5),
     keep_alive_timeout: Duration::from_secs(5),
     max_connections: 8,
+    body_idle_timeout: Duration::from_secs(120),
 };
 
 /// What the handler saw of the client address: the forwarding header and the marker.
