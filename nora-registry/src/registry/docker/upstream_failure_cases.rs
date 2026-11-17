@@ -34,6 +34,7 @@ async fn failed_under_plain_name_404_under_library_is_502() {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
                 date_token_file: None,
+                token_hosts: Vec::new(),
                 url,
                 auth: None,
                 auth_env: None,

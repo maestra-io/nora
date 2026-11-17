@@ -63,6 +63,7 @@ fn slow_upstream_ctx(upstream: String) -> TestContext {
         cfg.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: upstream,
             auth: None,
             auth_env: None,
@@ -460,6 +461,7 @@ async fn test_docker_proxy_blob_new_digest_held_on_streaming_path() {
         cfg.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: upstream,
             auth: None,
             auth_env: None,

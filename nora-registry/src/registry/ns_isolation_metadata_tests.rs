@@ -665,6 +665,7 @@ async fn docker_internal_manifest_miss_get_404_not_403() {
         c.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: BLACKHOLE.to_string(),
             auth: None,
             auth_env: None,
@@ -702,6 +703,7 @@ async fn docker_internal_manifest_miss_head_404_not_403() {
         c.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: BLACKHOLE.to_string(),
             auth: None,
             auth_env: None,
@@ -733,6 +735,7 @@ async fn docker_internal_referrers_tag_miss_head_404() {
         c.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: BLACKHOLE.to_string(),
             auth: None,
             auth_env: None,
@@ -765,6 +768,7 @@ async fn docker_internal_blob_miss_get_404_and_head_agrees() {
         c.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: BLACKHOLE.to_string(),
             auth: None,
             auth_env: None,
@@ -987,6 +991,7 @@ async fn an_internal_name_never_reaches_a_recording_upstream_dates_included() {
         c.docker.upstreams = vec![crate::config::DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: uri,
             auth: None,
             auth_env: None,

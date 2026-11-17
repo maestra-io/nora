@@ -349,9 +349,6 @@ fn build_context_full(
         None
     };
 
-    let docker_auth =
-        registry::DockerAuth::new(reqwest::Client::new(), config.docker.proxy_timeout);
-
     // The curation engine is the one the server builds (main.rs `build_curation_engine`), so a
     // test sees exactly the filters production installs. A list that does not parse fails the
     // test in every mode: main.rs refuses it only in enforce, and a test that silently runs
@@ -442,6 +439,9 @@ fn build_context_full(
             )
         }
     };
+    let docker_auth =
+        registry::DockerAuth::new(http_client_no_redirect.clone(), config.docker.proxy_timeout)
+            .with_token_hosts(&config.docker.upstreams);
     let (tasks, maintenance) = crate::supervision(&config.server);
     let state = AppState {
         storage: storage.clone(),

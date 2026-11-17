@@ -16,6 +16,7 @@ fn docker_proxy_namespaces_follow_the_resolved_enable_set() {
     config.docker.upstreams = vec![config::DockerUpstream {
         trust_upstream_dates: false,
         date_token_file: None,
+        token_hosts: Vec::new(),
         url: "https://registry-1.docker.io".into(),
         auth: None,
         auth_env: None,

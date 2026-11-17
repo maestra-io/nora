@@ -191,6 +191,7 @@ pub(super) fn ctx_for(upstream: &ScriptedUpstream, proxy_timeout: u64) -> TestCo
         cfg.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url,
             auth: None,
             auth_env: None,
@@ -479,6 +480,7 @@ async fn refused_resume_does_not_trip_breaker() {
         cfg.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: upstream_url,
             auth: None,
             auth_env: None,

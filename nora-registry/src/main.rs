@@ -2110,8 +2110,10 @@ async fn run_server(mut config: Config, storage: Storage) {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), check).await;
     }
 
-    // Initialize Docker auth with shared HTTP client (includes custom CA certs)
-    let docker_auth = registry::DockerAuth::new(http_client.clone(), config.docker.proxy_timeout);
+    // Docker auth on the no-redirect client: a token request is not bounced off the realm.
+    let docker_auth =
+        registry::DockerAuth::new(http_client_no_redirect.clone(), config.docker.proxy_timeout)
+            .with_token_hosts(&config.docker.upstreams);
 
     // Discover NuGet search endpoints from upstream service index
     if config.nuget.enabled {
@@ -2867,6 +2869,7 @@ async fn maintenance_tick(state: &AppState, tick_count: u64, work: &MaintenanceW
     }
     registry::docker::cleanup_expired_sessions(&state.upload_sessions);
     state.auth_failures.cleanup();
+    state.docker_auth.prune_expired();
     for limiter in &work.limiters {
         limiter.retain_recent();
     }

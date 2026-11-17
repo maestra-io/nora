@@ -2492,6 +2492,7 @@ fn docker_problems(
         .map(|(i, (prefix, masks))| DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: format!("https://r{i}.example"),
             auth: None,
             auth_env: None,
