@@ -1559,11 +1559,16 @@ async fn proxied_core_metadata_follows_the_upstream_advertisement() {
 async fn upload_spools_content_and_cleans_up() {
     let ctx = create_test_context();
     let spool = std::path::PathBuf::from(&ctx.state.config.storage.path).join("tmp/pypi-uploads");
-    // The gzip magic first: an upload is the archive its name says (B11).
-    let content: Vec<u8> = [0x1f, 0x8b]
-        .into_iter()
-        .chain((0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8))
-        .collect();
+    // A real gzip stream, stored (not compressed) so the body stays 3 MiB: an upload is the
+    // archive its name says (B11).
+    let content: Vec<u8> = {
+        use std::io::Write as _;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+        let payload: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        gz.write_all(&payload).unwrap();
+        gz.finish().unwrap()
+    };
+    assert!(content.len() > 3 * 1024 * 1024);
     let resp = twine_upload(
         &ctx.app,
         &[
@@ -2547,6 +2552,90 @@ async fn an_upload_into_an_upstream_project_is_refused() {
     );
 }
 
+/// A101: an upload claims a name only on every upstream's answer now. While one upstream 404s
+/// and another fails, or the cached empty answer has expired and the refetch fails, the
+/// upload is a 503 and nothing is claimed; once every upstream answers, it is claimed.
+#[tokio::test]
+async fn an_upload_never_claims_a_name_on_an_incomplete_or_expired_answer() {
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    // Unpooled: a pooled server can still receive another test's late request.
+    let missing = MockServer::builder().start().await;
+    Mock::given(path("/partial/"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&missing)
+        .await;
+    let failing = MockServer::builder().start().await;
+    Mock::given(path("/partial/"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&failing)
+        .await;
+    let urls = vec![missing.uri(), failing.uri()];
+    let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+        cfg.pypi.proxies = serde_json::from_value(serde_json::json!(urls)).unwrap();
+    });
+    let fields = [("name", "partial"), ("version", "1.0")];
+    let file = "partial-1.0.tar.gz";
+    let resp = twine_upload(&ctx.app, &fields, file, &pypi_dist(file, b"mine")).await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!super::own_records(&ctx.state.storage, "partial")
+        .await
+        .unwrap()
+        .hosted());
+    assert!(ctx
+        .state
+        .storage
+        .stat("pypi/partial/partial-1.0.tar.gz")
+        .await
+        .is_none());
+
+    // Expired: the cached empty answer is older than the TTL and the refetch fails.
+    let upstream = MockServer::builder().start().await;
+    Mock::given(path("/expired/"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&upstream)
+        .await;
+    let uri = upstream.uri();
+    let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+        cfg.pypi.proxy = Some(uri);
+        cfg.pypi.metadata_ttl = 0; // every cached answer is expired
+    });
+    let resp = send(&ctx.app, Method::GET, "/simple/expired/", "").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(ctx
+        .state
+        .storage
+        .stat("pypi/expired/upstream-index.json")
+        .await
+        .is_some());
+    upstream.reset().await;
+    Mock::given(path("/expired/"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&upstream)
+        .await;
+    let fields = [("name", "expired"), ("version", "1.0")];
+    let file = "expired-1.0.tar.gz";
+    let resp = twine_upload(&ctx.app, &fields, file, &pypi_dist(file, b"mine")).await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!super::own_records(&ctx.state.storage, "expired")
+        .await
+        .unwrap()
+        .hosted());
+
+    // Every upstream answers now that it has no such project: claimed.
+    upstream.reset().await;
+    Mock::given(path("/expired/"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&upstream)
+        .await;
+    let resp = twine_upload(&ctx.app, &fields, file, &pypi_dist(file, b"mine")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(super::own_records(&ctx.state.storage, "expired")
+        .await
+        .unwrap()
+        .hosted());
+}
+
 /// B11: an upload is the archive its name says, as PyPI requires: a `.whl`, `.zip` or `.egg`
 /// that is no zip and a `.tar.gz` or `.tgz` that is no gzip stream are a 400 and not stored.
 /// Real archives upload, a wheel without core metadata among them.
@@ -2570,6 +2659,23 @@ async fn an_upload_that_is_not_the_archive_its_name_says_is_refused() {
     let fields = [("name", "demo"), ("version", "1.0")];
     let resp = twine_upload(&ctx.app, &fields, "demo-1.0.tar.gz", &[0u8; 1024]).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // The gzip magic alone, a cut stream and a stream whose CRC does not match are no gzip
+    // stream: the whole stream is checked, not its signature.
+    let real = pypi_dist("demo-1.0.tar.gz", &[7u8; 4096]);
+    let mut bad_crc = real.clone();
+    let crc_at = bad_crc.len() - 8;
+    bad_crc[crc_at] ^= 0xff;
+    for (what, content) in [
+        ("magic only", vec![0x1f, 0x8b]),
+        ("header only", real[..10].to_vec()),
+        ("cut", real[..real.len() - 4].to_vec()),
+        ("bad crc", bad_crc),
+    ] {
+        let resp = twine_upload(&ctx.app, &fields, "demo-1.0.tar.gz", &content).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{what}");
+    }
+    let resp = send(&ctx.app, Method::GET, "/simple/demo/demo-1.0.tar.gz", "").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     for (file, content) in [
         (

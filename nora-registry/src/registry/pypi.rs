@@ -350,7 +350,7 @@ async fn package_versions(
             .map(|(_, meta)| meta.modified);
         let ttl = state.config.pypi.metadata_ttl;
         let upstream = match upstream_index(&state, &normalized, cached_at, ttl).await {
-            UpstreamIndex::Files(upstream) => upstream,
+            UpstreamIndex::Files(upstream) | UpstreamIndex::Partial(upstream) => upstream,
             UpstreamIndex::Stale(upstream) => {
                 stale = true;
                 upstream
@@ -415,8 +415,11 @@ async fn package_versions(
 
 /// The upstream half of a project's index ([`upstream_index`]).
 enum UpstreamIndex {
-    /// Within `metadata_ttl`, just fetched, or the merge of the upstreams that answered.
+    /// Every upstream's answer: within `metadata_ttl` or just fetched.
     Files(Vec<FileEntry>),
+    /// The merge of the upstreams that answered while another failed or its breaker is open:
+    /// what the failed one lists is unknown.
+    Partial(Vec<FileEntry>),
     /// The refetch failed: the last good copy, served with a `Warning`.
     Stale(Vec<FileEntry>),
     /// The refetch failed and there is no copy: the 5xx to send. Serving only the local
@@ -561,7 +564,11 @@ async fn upstream_index(
     // An empty merge beside an open breaker is no answer: the upstream that is down may list
     // the project.
     if fetch.answered && !(fetch.files.is_empty() && fetch.circuit_open) {
-        return UpstreamIndex::Files(fetch.files);
+        return if fetch.circuit_open || fetch.error.is_some() {
+            UpstreamIndex::Partial(fetch.files)
+        } else {
+            UpstreamIndex::Files(fetch.files)
+        };
     }
     // A tripped breaker means the upstream is temporarily down — 503 (retryable)
     // rather than 404, which would poison pip's negative cache.
@@ -602,7 +609,7 @@ async fn upstream_entries(
     let ttl = state.config.pypi.metadata_ttl;
     let cached_at = state.storage.stat(&cache_key).await.map(|m| m.modified);
     let (found, stale) = match upstream_index(state, normalized, cached_at, ttl).await {
-        UpstreamIndex::Files(files) => (listing(files), false),
+        UpstreamIndex::Files(files) | UpstreamIndex::Partial(files) => (listing(files), false),
         UpstreamIndex::Stale(files) => (listing(files), true),
         UpstreamIndex::Failed(response) => return Err(response),
     };
@@ -615,7 +622,9 @@ async fn upstream_entries(
         return Ok(found);
     }
     match upstream_index(state, normalized, cached_at, miss_ttl(state)).await {
-        UpstreamIndex::Files(files) | UpstreamIndex::Stale(files) => Ok(listing(files)),
+        UpstreamIndex::Files(files)
+        | UpstreamIndex::Partial(files)
+        | UpstreamIndex::Stale(files) => Ok(listing(files)),
         UpstreamIndex::Failed(response) => Err(response),
     }
 }
@@ -1404,10 +1413,10 @@ async fn upload(
 /// A101: a name an upstream lists is the upstream's, and an upload does not claim it: with an
 /// upstream configured, the first upload asks the upstreams for the name's index (cached,
 /// single-flight) and is a 409 while one lists a file under it (the opt-in is
-/// `curation.internal_namespaces`), the upstream error while none answered, and claims the name
-/// only when every upstream answered that it has none. Each such upload logs a `[SECURITY]` WARN
-/// and counts in `nora_pypi_mixed_project_uploads_total{upstream_lists}`: `yes` refused, `no`
-/// claimed.
+/// `curation.internal_namespaces`), the upstream error or a 503 while not every upstream answered
+/// now (an expired cached answer is not one), and claims the name only when every upstream
+/// answered that it has none. Each such upload logs a `[SECURITY]` WARN and counts in
+/// `nora_pypi_mixed_project_uploads_total{upstream_lists}`: `yes` refused, `no` claimed.
 async fn claim_uploaded_project(state: &AppState, normalized: &str) -> Result<(), Response> {
     let unavailable = || crate::registry::storage_unavailable("pypi", &own_prefix(normalized));
     if crate::curation::is_internal_namespace(
@@ -1430,7 +1439,11 @@ async fn claim_uploaded_project(state: &AppState, normalized: &str) -> Result<()
         let cached_at = state.storage.stat(&cache_key).await.map(|m| m.modified);
         let ttl = state.config.pypi.metadata_ttl;
         match upstream_index(state, normalized, cached_at, ttl).await {
-            UpstreamIndex::Files(files) | UpstreamIndex::Stale(files) if !files.is_empty() => {
+            UpstreamIndex::Files(files)
+            | UpstreamIndex::Partial(files)
+            | UpstreamIndex::Stale(files)
+                if !files.is_empty() =>
+            {
                 crate::metrics::PYPI_MIXED_PROJECT_UPLOADS_TOTAL
                     .with_label_values(&["yes"])
                     .inc();
@@ -1446,7 +1459,17 @@ async fn claim_uploaded_project(state: &AppState, normalized: &str) -> Result<()
                     .into_response());
             }
             UpstreamIndex::Failed(response) => return Err(response),
-            UpstreamIndex::Files(_) | UpstreamIndex::Stale(_) => {}
+            // Every upstream answered now that it lists nothing under the name.
+            UpstreamIndex::Files(_) => {}
+            // An upstream that did not answer, or answered before the TTL ran out, may list it.
+            UpstreamIndex::Partial(_) | UpstreamIndex::Stale(_) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::RETRY_AFTER, "30")],
+                    format!("not every upstream answered whether it lists project {normalized}; retry the upload"),
+                )
+                    .into_response());
+            }
         }
     }
     let origins = proxied_marker_key(&prefix);
@@ -1861,21 +1884,33 @@ fn upload_filename_mismatch(filename: &str, normalized: &str, version: &str) -> 
     None
 }
 
+/// The most a `.tar.gz` upload may inflate to (B11): far above any real sdist, and the bound
+/// on the work its check costs.
+const UPLOAD_GZIP_INFLATED_MAX: u64 = 4 << 30;
+
 /// B11: an uploaded file is the archive its extension names, as PyPI requires: a zip for
-/// `.whl`, `.zip` and `.egg`, a gzip stream for `.tar.gz` and `.tgz`. `Ok` carries a wheel's
-/// PEP 658 core metadata ([`zip_core_metadata`]); a wheel without one still uploads.
+/// `.whl`, `.zip` and `.egg`, a whole, intact gzip stream for `.tar.gz` and `.tgz`. `Ok`
+/// carries a wheel's PEP 658 core metadata ([`zip_core_metadata`]); a wheel without one still
+/// uploads.
 fn read_upload_archive(
     path: &std::path::Path,
     filename: &str,
 ) -> Result<Option<Vec<u8>>, (StatusCode, &'static str)> {
     use std::io::Read as _;
-    let mut file = std::fs::File::open(path)
+    let file = std::fs::File::open(path)
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "cannot read the upload"))?;
     if let Some(".tar.gz" | ".tgz") = nora_registry::pypi_files::served_extension(filename) {
-        let mut magic = [0u8; 2];
-        return match file.read_exact(&mut magic) {
-            Ok(()) if magic == [0x1f, 0x8b] => Ok(None),
-            _ => Err((StatusCode::BAD_REQUEST, "file is not a gzip archive")),
+        // The whole stream inflates and its CRC and length check, up to a cap: a small file
+        // can inflate into terabytes.
+        let mut inflated = flate2::read::GzDecoder::new(std::io::BufReader::new(file))
+            .take(UPLOAD_GZIP_INFLATED_MAX + 1);
+        return match std::io::copy(&mut inflated, &mut std::io::sink()) {
+            Ok(n) if n <= UPLOAD_GZIP_INFLATED_MAX => Ok(None),
+            Ok(_) => Err((
+                StatusCode::BAD_REQUEST,
+                "gzip archive inflates past the limit",
+            )),
+            Err(_) => Err((StatusCode::BAD_REQUEST, "file is not a gzip archive")),
         };
     }
     let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
