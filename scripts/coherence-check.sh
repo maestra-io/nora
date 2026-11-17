@@ -178,6 +178,63 @@ if [ "$NS_MISSING" -eq 0 ]; then
 fi
 echo ""
 
+# ── maestra: release supply chain pins (audit A001, A008) ─────────────────
+# Every Dockerfile base is pinned by digest. The RU-vendor stages redos and astra are
+# exempt by name: we do not pull from those registries to resolve their digests.
+
+echo "--- Release Supply Chain Pins ---"
+DOCKERFILE="${COHERENCE_DOCKERFILE:-$REPO_ROOT/Dockerfile}"
+FROM_UNPINNED=0
+STAGES=" "
+while read -r -a words; do
+    i=1
+    while [ "${words[$i]:-}" != "${words[$i]#--}" ]; do i=$((i + 1)); done  # --platform=...
+    image="${words[$i]:-}" stage=""
+    if [ "$(echo "${words[$((i + 1))]:-}" | tr '[:upper:]' '[:lower:]')" = as ]; then stage="${words[$((i + 2))]:-}"; fi
+    case "$image|$stage" in
+        scratch\|*|*@sha256:*|*\|redos|*\|astra) ;;
+        *) case "$STAGES" in
+               *" $image "*) ;;  # built on an earlier stage
+               *) fail "Dockerfile FROM $image${stage:+ AS $stage} is not pinned by @sha256: digest"
+                  FROM_UNPINNED=$((FROM_UNPINNED + 1)) ;;
+           esac ;;
+    esac
+    if [ -n "$stage" ]; then STAGES="$STAGES$stage "; fi
+done < <(grep -iE '^FROM[[:space:]]' "$DOCKERFILE")
+if [ "$FROM_UNPINNED" -eq 0 ]; then ok "Dockerfile bases are pinned by digest (redos/astra exempt)"; fi
+
+# One signer identity for every cosign check of upstream release artifacts: release.yml
+# on a v* tag, anchored at both ends.
+CANONICAL_SIGNER='^https://github\.com/getnora-io/nora/\.github/workflows/release\.yml@refs/tags/v[^/]+$'
+SIGNER_OK=1
+GOOD_SIGNER=https://github.com/getnora-io/nora/.github/workflows/release.yml@refs/tags/v0.9.1
+echo "$GOOD_SIGNER" | grep -qE "$CANONICAL_SIGNER" || { fail "signer pattern rejects $GOOD_SIGNER"; SIGNER_OK=0; }
+for evil in \
+    https://github.com/evil/x/.github/workflows/x.yml@refs/heads/github.com/getnora-io/nora \
+    https://github.com/getnora-io/nora-fork/.github/workflows/release.yml@refs/tags/v1 \
+    https://github.com/getnora-io/nora/.github/workflows/ci.yml@refs/heads/main \
+    https://github.com/getnora-io/nora/.github/workflows/release.yml@refs/heads/v1/x; do
+    if echo "$evil" | grep -qE "$CANONICAL_SIGNER"; then fail "signer pattern accepts $evil"; SIGNER_OK=0; fi
+done
+SIGNER_DIRS=("$REPO_ROOT/dist" "$REPO_ROOT/scripts" "$REPO_ROOT/.github/workflows")
+if [ -n "${COHERENCE_SIGNER_DIRS:-}" ]; then SIGNER_DIRS=("$COHERENCE_SIGNER_DIRS"); fi
+# shellcheck disable=SC2016  # $SIGNER_IDENTITY is matched literally
+while IFS=: read -r file lineno content; do
+    case "$content" in
+        *'--certificate-identity-regexp "$SIGNER_IDENTITY"'*)
+            grep -qxF "SIGNER_IDENTITY='$CANONICAL_SIGNER'" "$file" \
+                || { fail "$file:$lineno uses \$SIGNER_IDENTITY but does not set it to the release.yml signer"; SIGNER_OK=0; } ;;
+        *) fail "$file:$lineno: --certificate-identity-regexp must be \"\$SIGNER_IDENTITY\""; SIGNER_OK=0 ;;
+    esac
+done < <(grep -rnF -e '--certificate-identity-regexp' "${SIGNER_DIRS[@]}" \
+    --exclude=coherence-check.sh --exclude='test-*.sh' || true)
+while IFS=: read -r file lineno content; do
+    [ "${content#"${content%%[![:space:]]*}"}" = "SIGNER_IDENTITY='$CANONICAL_SIGNER'" ] \
+        || { fail "$file:$lineno: SIGNER_IDENTITY is not the release.yml signer"; SIGNER_OK=0; }
+done < <(grep -rnE '^[[:space:]]*SIGNER_IDENTITY=' "${SIGNER_DIRS[@]}" --exclude=coherence-check.sh --exclude='test-*.sh' || true)
+if [ "$SIGNER_OK" = 1 ]; then ok "cosign checks pin the release.yml signer"; fi
+echo ""
+
 # ── Summary ───────────────────────────────────────────────────────────────
 
 echo "=== Summary ==="

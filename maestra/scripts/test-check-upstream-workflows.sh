@@ -31,6 +31,11 @@ rm "$TMP/wf/release-images.yml"
 printf '%s\n' ".github/workflows/release.yml active" > "$TMP/states"
 run; expect "an enabled upstream release is reported" 1 "release.yml is active on GitHub"
 
+touch "$TMP/wf/auto-reland.yml"
+printf '%s\n' ".github/workflows/auto-reland.yml active" > "$TMP/states"
+run; expect "an enabled upstream auto-reland is reported (audit A003)" 1 "auto-reland.yml is active on GitHub"
+rm "$TMP/wf/auto-reland.yml"
+
 printf '%s\n' ".github/workflows/new-upstream.yml active" > "$TMP/states"
 run; expect "an active workflow known only to GitHub is reported" 1 "new-upstream.yml is active on GitHub"
 

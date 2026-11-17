@@ -3,6 +3,8 @@ set -euo pipefail
 
 # NORA Artifact Registry — install script
 # Usage: curl -fsSL https://getnora.io/install.sh | bash
+# The binary is installed only after its Sigstore bundle verifies against the
+# release workflow's identity; NORA_SKIP_VERIFY=1 installs it unverified.
 
 VERSION="${NORA_VERSION:-latest}"
 ARCH=$(uname -m)
@@ -11,12 +13,29 @@ INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/nora"
 DATA_DIR="/var/lib/nora"
 LOG_DIR="/var/log/nora"
+SIGNER_IDENTITY='^https://github\.com/getnora-io/nora/\.github/workflows/release\.yml@refs/tags/v[^/]+$'
 
+# Asset names as release.yml publishes them: nora-linux-amd64, nora-linux-arm64.
 case "$ARCH" in
-    x86_64|amd64) ARCH="x86_64" ;;
-    aarch64|arm64) ARCH="aarch64" ;;
+    x86_64|amd64) ARCH="amd64" ;;
+    aarch64|arm64) ARCH="arm64" ;;
     *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
+[ "$OS" = "linux" ] || { echo "Unsupported OS: $OS (release binaries are Linux only)"; exit 1; }
+
+# Private staging directory: nothing is written under a guessable /tmp name.
+STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT
+
+fetch() { # url, destination
+    if command -v curl &>/dev/null; then
+        curl -fsSL -o "$2" "$1"
+    elif command -v wget &>/dev/null; then
+        wget -qO "$2" "$1"
+    else
+        echo "Error: curl or wget required"; exit 1
+    fi
+}
 
 echo "Installing NORA ($OS/$ARCH)..."
 
@@ -28,36 +47,26 @@ else
 fi
 
 echo "Downloading from $DOWNLOAD_URL..."
-if command -v curl &>/dev/null; then
-    curl -fsSL -o /tmp/nora "$DOWNLOAD_URL"
-elif command -v wget &>/dev/null; then
-    wget -qO /tmp/nora "$DOWNLOAD_URL"
+fetch "$DOWNLOAD_URL" "$STAGE/nora"
+
+if [ "${NORA_SKIP_VERIFY:-}" = "1" ]; then
+    echo "WARNING: NORA_SKIP_VERIFY=1 — installing a binary whose signature was NOT verified." >&2
 else
-    echo "Error: curl or wget required"; exit 1
-fi
-
-chmod +x /tmp/nora
-
-# Verify signature if cosign is available
-if command -v cosign &>/dev/null; then
-    echo "Verifying binary signature..."
-    SIG_URL="${DOWNLOAD_URL}.sig"
-    CERT_URL="${DOWNLOAD_URL}.pem"
-    if curl -fsSL -o /tmp/nora.sig "$SIG_URL" 2>/dev/null && \
-       curl -fsSL -o /tmp/nora.pem "$CERT_URL" 2>/dev/null; then
-        cosign verify-blob --signature /tmp/nora.sig --certificate /tmp/nora.pem \
-            --certificate-identity-regexp "github.com/getnora-io/nora" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            /tmp/nora && echo "Signature verified." || echo "Warning: signature verification failed."
-        rm -f /tmp/nora.sig /tmp/nora.pem
-    else
-        echo "Signature files not available, skipping verification."
+    if ! command -v cosign &>/dev/null; then
+        echo "Error: cosign is required to verify the binary: https://docs.sigstore.dev/cosign/system_config/installation/" >&2
+        echo "       (set NORA_SKIP_VERIFY=1 to install without verification)" >&2
+        exit 1
     fi
-else
-    echo "Install cosign for binary signature verification: https://docs.sigstore.dev/cosign/system_config/installation/"
+    echo "Verifying binary signature..."
+    fetch "${DOWNLOAD_URL}.bundle" "$STAGE/nora.bundle"
+    cosign verify-blob --bundle "$STAGE/nora.bundle" \
+        --certificate-identity-regexp "$SIGNER_IDENTITY" \
+        --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+        "$STAGE/nora" || { echo "Error: signature verification failed" >&2; exit 1; }
+    echo "Signature verified."
 fi
 
-sudo mv /tmp/nora "$INSTALL_DIR/nora"
+sudo install -o root -g root -m 0755 "$STAGE/nora" "$INSTALL_DIR/nora"
 
 # Create system user
 if ! id nora &>/dev/null; then
@@ -71,7 +80,7 @@ sudo chown nora:nora "$DATA_DIR" "$LOG_DIR"
 
 # Install default config if not exists
 if [ ! -f "$CONFIG_DIR/nora.env" ]; then
-    cat > /tmp/nora.env << 'ENVEOF'
+    cat > "$STAGE/nora.env" << 'ENVEOF'
 NORA_HOST=::
 NORA_PORT=4000
 # Clients on other hosts need your real address here (e.g. https://registry.example.com)
@@ -81,15 +90,13 @@ NORA_STORAGE_PATH=/var/lib/nora
 # resolves outside the ProtectSystem=strict sandbox and breaks token writes (#816).
 NORA_AUTH_TOKEN_STORAGE=/var/lib/nora/tokens
 ENVEOF
-    sudo mv /tmp/nora.env "$CONFIG_DIR/nora.env"
-    sudo chmod 600 "$CONFIG_DIR/nora.env"
-    sudo chown nora:nora "$CONFIG_DIR/nora.env"
+    sudo install -o nora -g nora -m 0600 "$STAGE/nora.env" "$CONFIG_DIR/nora.env"
     echo "Created default config: $CONFIG_DIR/nora.env"
 fi
 
 # Install systemd service
 if [ -d /etc/systemd/system ]; then
-    cat > /tmp/nora.service << 'SVCEOF'
+    cat > "$STAGE/nora.service" << 'SVCEOF'
 [Unit]
 Description=NORA Artifact Registry
 Documentation=https://getnora.dev
@@ -119,7 +126,7 @@ EnvironmentFile=-/etc/nora/nora.env
 [Install]
 WantedBy=multi-user.target
 SVCEOF
-    sudo mv /tmp/nora.service /etc/systemd/system/nora.service
+    sudo install -o root -g root -m 0644 "$STAGE/nora.service" /etc/systemd/system/nora.service
     sudo systemctl daemon-reload
     sudo systemctl enable nora
     echo "Installed systemd service: nora"

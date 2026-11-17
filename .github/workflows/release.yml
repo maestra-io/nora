@@ -570,23 +570,18 @@ jobs:
         run: |
           set -o pipefail
           NFPM_VERSION=2.46.3
-          # Prefer a matching nfpm already on the runner (persistent self-hosted
-          # box) — avoids a per-release fetch from the GitHub release CDN, which
-          # has no SLA and has hung mid-stream on transient network blips.
-          if command -v nfpm >/dev/null 2>&1 && nfpm --version 2>/dev/null | grep -q "$NFPM_VERSION"; then
-            echo "using pre-installed nfpm at $(command -v nfpm)"
-            nfpm --version
-            exit 0
-          fi
-          # Fallback: fetch the pinned release, hardened against transient CDN
-          # failures (retries on connection/HTTP errors, bounded timeouts,
-          # pipefail so a truncated download fails the step instead of feeding
-          # tar an empty stream).
+          # sha256 of nfpm_2.46.3_Linux_x86_64.tar.gz from the release's checksums.txt.
+          # Never a runner-PATH nfpm: the packager of signed .deb/.rpm is pinned by digest.
+          NFPM_SHA256=9170d25ea056d7329def38134b2bcad98d02d221f8331610dcd619e84d28c565
+          # Fetch the pinned release, hardened against transient CDN failures
+          # (retries on connection/HTTP errors, bounded timeouts), then check it
+          # before tar sees a byte.
           mkdir -p "$RUNNER_TEMP/bin"
           curl -fSL --retry 5 --retry-all-errors --retry-delay 3 \
-            --connect-timeout 15 --max-time 120 \
-            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
-            | tar xz -C "$RUNNER_TEMP/bin" nfpm
+            --connect-timeout 15 --max-time 120 -o "$RUNNER_TEMP/nfpm.tar.gz" \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          echo "$NFPM_SHA256  $RUNNER_TEMP/nfpm.tar.gz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/nfpm.tar.gz" -C "$RUNNER_TEMP/bin" nfpm
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/bin/nfpm" --version
 
