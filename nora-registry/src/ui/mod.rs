@@ -412,7 +412,7 @@ async fn maven_list(
     let auth_enabled = state.auth.is_some();
 
     // Show top-level namespace directories (com, org, io, etc.)
-    let (entries, _) = api::get_maven_dir_listing(&state.storage, "").await;
+    let entries = api::index_root_listing(&state, "maven").await;
     let total = entries.len();
 
     Html(templates::render_maven_dir(
@@ -645,7 +645,7 @@ async fn go_list(
     let auth_enabled = state.auth.is_some();
 
     // Show top-level namespace directories (github.com, golang.org, etc.)
-    let (entries, _) = api::get_go_dir_listing(&state.storage, "").await;
+    let entries = api::index_root_listing(&state, "go").await;
     let total = entries.len();
 
     Html(templates::render_go_dir(

@@ -585,6 +585,31 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
     DockerDetail { tags }
 }
 
+/// A directory browser's root: the first path segments of `registry`'s cached index, so the
+/// root page never lists the whole prefix per request (deeper pages list only their own).
+pub async fn index_root_listing(state: &AppState, registry: &str) -> Vec<RepoInfo> {
+    let index = state.repo_index.get(registry, state).await;
+    let mut groups: std::collections::BTreeMap<&str, (usize, u64, u64)> = Default::default();
+    for repo in index.iter() {
+        let first = repo.name.split('/').next().unwrap_or_default();
+        let group = groups.entry(first).or_default();
+        group.0 += repo.versions;
+        group.1 += repo.size;
+        group.2 = group.2.max(repo.modified);
+    }
+    groups
+        .into_iter()
+        .map(|(name, (versions, size, modified))| RepoInfo {
+            name: name.to_string(),
+            versions,
+            size,
+            updated: format_timestamp(modified),
+            modified,
+            ..Default::default()
+        })
+        .collect()
+}
+
 /// List immediate children of a Maven namespace path for hierarchical browsing.
 /// Returns (entries, is_leaf_artifact). A leaf artifact has maven-metadata.xml.
 pub async fn get_maven_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>, bool) {
@@ -2193,6 +2218,7 @@ pub async fn get_raw_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo
             size,
             updated: format_timestamp(modified),
             is_file,
+            modified,
         })
         .collect();
 
@@ -2687,5 +2713,49 @@ mod registry_stats_cover_every_registry {
             .map(|rt| rt.as_str().to_string())
             .collect();
         assert_eq!(keys, names);
+    }
+}
+
+/// Audit A053 (UI): the Maven and Go root pages come from the repository index.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod root_listing_tests {
+    use crate::test_helpers::{create_test_context_with_storage, op_counting_storage};
+
+    #[tokio::test]
+    async fn root_pages_read_the_index_not_the_whole_prefix() {
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage(storage);
+        for key in [
+            "maven/com/example/lib/1.0/lib-1.0.jar",
+            "maven/com/example/lib/1.0/lib-1.0.jar.sha1",
+            "maven/com/other/app/2.0/app-2.0.jar",
+            "maven/org/acme/x/1.0/x-1.0.jar",
+            "go/github.com/a/b/@v/v1.0.0.zip",
+            "go/golang.org/x/text/@v/v0.1.0.zip",
+        ] {
+            ctx.state.storage.put(key, b"data").await.unwrap();
+        }
+        for registry in ["maven", "go"] {
+            super::index_root_listing(&ctx.state, registry).await;
+        }
+        ops.reset();
+        let maven = super::index_root_listing(&ctx.state, "maven").await;
+        let go = super::index_root_listing(&ctx.state, "go").await;
+        assert_eq!(ops.total(), 0, "{:?}", ops.snapshot());
+        let summary = |v: &[crate::repo_index::RepoInfo]| {
+            v.iter()
+                .map(|r| (r.name.clone(), r.versions, r.size))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            summary(&maven),
+            [("com".into(), 2, 12), ("org".into(), 1, 4)]
+        );
+        assert_eq!(
+            summary(&go),
+            [("github.com".into(), 1, 4), ("golang.org".into(), 1, 4)]
+        );
+        assert!(maven.iter().all(|r| r.updated != "N/A"));
     }
 }

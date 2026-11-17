@@ -895,3 +895,68 @@ async fn tags_list_needs_the_tags_member_of_the_upstream() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["tags"], serde_json::json!([]));
 }
+
+/// Push a manifest naming `config` as its config blob (stored first) and return the os/arch
+/// its metadata sidecar records, with the storage gets of that blob during the push.
+async fn push_with_config(config: &[u8]) -> (String, String, usize) {
+    let (storage, counts) = crate::test_helpers::op_counting_storage();
+    let ctx = create_test_context_with_storage(storage);
+    let digest = digest_of(config);
+    let blob = format!("docker/cfg/img/blobs/{digest}");
+    ctx.state.storage.put(&blob, config).await.unwrap();
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": V2,
+        "config": {
+            "mediaType": "application/vnd.docker.container.image.v1+json",
+            "size": config.len(),
+            "digest": digest
+        },
+        "layers": []
+    }))
+    .unwrap();
+    counts.reset();
+    let put = send(
+        &ctx.app,
+        Method::PUT,
+        "/v2/cfg/img/manifests/v1",
+        Body::from(manifest),
+    )
+    .await;
+    assert_eq!(put.status(), StatusCode::CREATED);
+    let gets = counts.calls("get", &blob);
+    let meta = ctx
+        .state
+        .storage
+        .get("docker/cfg/img/manifests/v1.meta.json")
+        .await
+        .unwrap();
+    let meta: super::ImageMetadata = serde_json::from_slice(&meta).unwrap();
+    (meta.os, meta.arch, gets)
+}
+
+/// Audit A012: a config blob over MAX_CONFIG_BYTES is never read on a manifest push; the push
+/// still succeeds and the image shows os/arch "unknown". A normal config is still read.
+#[tokio::test]
+async fn a_config_blob_over_the_cap_is_not_read() {
+    let pad = "A".repeat(super::MAX_CONFIG_BYTES as usize);
+    let big = format!(r#"{{"os":"linux","architecture":"amd64","pad":"{pad}"}}"#);
+    let (os, arch, gets) = push_with_config(big.as_bytes()).await;
+    assert_eq!(
+        (os.as_str(), arch.as_str(), gets),
+        ("unknown", "unknown", 0)
+    );
+
+    let small = br#"{"os":"linux","architecture":"amd64","variant":"v8","rootfs":{}}"#;
+    let (os, arch, gets) = push_with_config(small).await;
+    assert_eq!((os.as_str(), arch.as_str(), gets), ("linux", "amd64", 1));
+}
+
+/// Audit A012: a config digest that is not a digest never becomes a storage key.
+#[tokio::test]
+async fn a_config_digest_that_is_not_a_digest_is_not_read() {
+    let (storage, counts) = crate::test_helpers::op_counting_storage();
+    let info = super::get_config_info(&storage, "x", "../../x").await;
+    assert_eq!(info, ("unknown".into(), "unknown".into(), None));
+    assert_eq!(counts.total(), 0, "{:?}", counts.snapshot());
+}
