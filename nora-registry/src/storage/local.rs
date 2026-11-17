@@ -782,6 +782,20 @@ impl LocalStorage {
         // Body and pin are published as one critical section (#1041, see commit_lock).
         let lock = self.commit_lock(key);
         let _commit = lock.lock().await;
+        self.write_locked(key, &path, data, sha256, create_only)
+            .await
+    }
+
+    /// [`write`](Self::write) with the key's parent created and its commit lock held.
+    async fn write_locked(
+        &self,
+        key: &str,
+        path: &Path,
+        data: &[u8],
+        sha256: &str,
+        create_only: bool,
+    ) -> Result<bool> {
+        let path = path.to_path_buf();
         // A directory under the key's name is not a stored object: the write below
         // fails on it as a taken name.
         if create_only && is_stored_file(&path).await {
@@ -916,6 +930,79 @@ impl StorageBackend for LocalStorage {
 
     async fn put_if_absent(&self, key: &str, data: Bytes, sha256: &str) -> Result<bool> {
         self.write(key, &data, sha256, true).await
+    }
+
+    async fn put_if_version(
+        &self,
+        key: &str,
+        data: Bytes,
+        sha256: &str,
+        expected: Option<&str>,
+    ) -> Result<bool> {
+        let Some(expected) = expected else {
+            return self.write(key, &data, sha256, true).await;
+        };
+        let path = self.key_to_path(key);
+        // The version is the SHA-256 of the bytes (the default `get_versioned`), checked
+        // under the commit lock every write of the key takes.
+        // ponytail: one process per directory; two processes sharing it would need a file
+        // lock around the check and the rename.
+        let lock = self.commit_lock(key);
+        let _commit = lock.lock().await;
+        let current = match fs::read(&path).await {
+            Ok(current) => current,
+            Err(e) if is_missing(&e) => return Ok(false),
+            Err(e) => return Err(StorageError::Io(e)),
+        };
+        if super::sha256_hex(&current) != expected {
+            return Ok(false);
+        }
+        self.write_locked(key, &path, &data, sha256, false).await
+    }
+
+    async fn put_from_path_if_absent(&self, key: &str, src: &Path, sha256: &str) -> Result<bool> {
+        let dest = self.key_to_path(key);
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = fs::create_dir_all(parent).await {
+                return Err(write_failure(&self.base_path, &dest, e).await);
+            }
+        }
+        let lock = self.commit_lock(key);
+        let _commit = lock.lock().await;
+        if is_stored_file(&dest).await {
+            return Ok(false);
+        }
+        // Published with a hard link, which fails on an existing key: the check and the
+        // write are one step, even across processes sharing the directory. Across
+        // filesystems the file is copied to staging (or beside the key) and linked from
+        // there.
+        let linked = match fs::hard_link(src, &dest).await {
+            Err(e) if e.raw_os_error() == Some(EXDEV) => {
+                let tmp = self.copy_to_tmp(src, &dest, TmpPlace::Staging).await?;
+                match fs::hard_link(tmp.path(), &dest).await {
+                    Err(e) if e.raw_os_error() == Some(EXDEV) => {
+                        drop(tmp);
+                        let beside = self.copy_to_tmp(src, &dest, TmpPlace::BesideKey).await?;
+                        fs::hard_link(beside.path(), &dest).await
+                    }
+                    other => other,
+                }
+            }
+            other => other,
+        };
+        match linked {
+            Ok(()) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists && is_stored_file(&dest).await =>
+            {
+                return Ok(false)
+            }
+            Err(e) => return Err(write_failure(&self.base_path, &dest, e).await),
+        }
+        sync_parent_dir(&dest).await?;
+        let _ = fs::remove_file(src).await;
+        self.record_pin(key, sha256).await?;
+        Ok(true)
     }
 
     async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
@@ -1493,6 +1580,65 @@ mod tests {
 
     async fn get(storage: &LocalStorage, key: &str) -> Result<Bytes> {
         storage.get(key).await.map(|(data, _pin)| data)
+    }
+
+    /// A compare-and-swap with the version read writes once; a second one with the same,
+    /// now stale, version is refused and leaves the first write (audit A033).
+    #[tokio::test]
+    async fn put_if_version_refuses_a_stale_version() {
+        let dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        let key = "nuget/hosted-meta/a.json";
+        let sha = |b: &[u8]| hex::encode(Sha256::digest(b));
+        let write = |body: &'static [u8], expected: Option<String>| {
+            let storage = &storage;
+            async move {
+                storage
+                    .put_if_version(
+                        key,
+                        Bytes::from_static(body),
+                        &sha(body),
+                        expected.as_deref(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(!write(b"no doc", Some(sha(b"x"))).await, "nothing to match");
+        assert!(write(b"v1", None).await);
+        assert!(!write(b"again", None).await, "create-only on a stored key");
+        let (_, _, v1) = storage.get_versioned(key).await.unwrap();
+        assert!(write(b"v2", Some(v1.clone())).await);
+        assert!(!write(b"lost update", Some(v1)).await, "a stale version");
+        let (body, pin) = storage.get(key).await.unwrap();
+        assert_eq!(&body[..], b"v2");
+        assert_eq!(pin, Some(sha(b"v2")));
+        assert!(tmp_leftovers(dir.path()).is_empty());
+    }
+
+    /// A file is published under a free key only: of two writers one stores its bytes and
+    /// pin, the other is told the key is taken and leaves it as it was.
+    #[tokio::test]
+    async fn put_from_path_if_absent_creates_exactly_once() {
+        let dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(dir.path().join("s").to_str().unwrap());
+        let key = "nuget/hosted/a/1.0.0/a.1.0.0.nupkg";
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let sha = |b: &[u8]| hex::encode(Sha256::digest(b));
+        assert!(storage
+            .put_from_path_if_absent(key, &first, &sha(b"first"))
+            .await
+            .unwrap());
+        assert!(!first.exists(), "the source is consumed");
+        assert!(!storage
+            .put_from_path_if_absent(key, &second, &sha(b"second"))
+            .await
+            .unwrap());
+        let (body, pin) = storage.get(key).await.unwrap();
+        assert_eq!(&body[..], b"first");
+        assert_eq!(pin, Some(sha(b"first")));
     }
 
     /// C53: concurrent create-only writes of one key: exactly one lands, the others see

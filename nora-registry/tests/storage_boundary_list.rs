@@ -22,6 +22,7 @@ const READS: &[&str] = &[
     "total_size",
     "backend_name",
     "pin",
+    "get_versioned",
 ];
 
 fn is_test_only(attrs: &[syn::Attribute]) -> bool {

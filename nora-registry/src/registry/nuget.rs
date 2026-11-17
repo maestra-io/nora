@@ -3551,3 +3551,9 @@ mod nuget_release_dates;
 
 #[cfg(test)]
 mod imported_memo_tests;
+
+/// Two servers over one bucket (a rolling update): the hosted feed's writes hold across
+/// processes, by the store's conditional writes (audit A033).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod two_process_tests;

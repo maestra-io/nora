@@ -11,12 +11,17 @@
 //!   GET    /nuget/v3/query, /autocomplete         — hosted hits first, then the proxy
 //!
 //! Storage:
-//!   nuget/hosted/{id}/{ver}/{id}.{ver}.nupkg — package blob (immutable)
+//!   nuget/hosted/{id}/{ver}/{id}.{ver}.nupkg — package blob (immutable, created only
+//!                                              when its key is free)
 //!   nuget/hosted/{id}/{ver}/{id}.nuspec      — extracted manifest
 //!   nuget/hosted-meta/{id}.json              — per-ID state, the single source for the
 //!                                              flat-container version list, registration
 //!                                              and search. Written last, under the
-//!                                              per-ID publish lock, after the blobs.
+//!                                              per-ID publish lock, after the blobs,
+//!                                              by compare-and-swap ([`update_doc`]):
+//!                                              the lock serializes this process, the
+//!                                              store's conditional write every other
+//!                                              (a second server, `nora import`).
 //!
 //! [`HostedIndex`] keeps every state document in memory (loaded on first use, updated
 //! on every write and re-read on access at most every [`HOSTED_RECHECK`]), so a request
@@ -176,7 +181,26 @@ enum LoadError {
 /// `Ok(None)` = the ID is not hosted. An error must neither proxy the ID (it may be
 /// ours) nor be overwritten (a rewrite would drop every version).
 async fn load(storage: &Storage, id_lower: &str) -> Result<Option<HostedPackage>, LoadError> {
-    match storage.get(&meta_key(id_lower)).await {
+    parse_doc(id_lower, storage.get(&meta_key(id_lower)).await)
+}
+
+/// [`load`] plus the version token a [`save_if`] of the document expects (`None`: no
+/// document).
+async fn load_versioned(
+    storage: &Storage,
+    id_lower: &str,
+) -> Result<(Option<HostedPackage>, Option<String>), LoadError> {
+    match storage.get_versioned(&meta_key(id_lower)).await {
+        Ok((data, version)) => Ok((parse_doc(id_lower, Ok(data))?, Some(version))),
+        Err(e) => parse_doc(id_lower, Err(e)).map(|doc| (doc, None)),
+    }
+}
+
+fn parse_doc(
+    id_lower: &str,
+    read: Result<axum::body::Bytes, StorageError>,
+) -> Result<Option<HostedPackage>, LoadError> {
+    match read {
         Ok(data) => serde_json::from_slice(&data).map(Some).map_err(|e| {
             tracing::error!(id = %id_lower, error = %e, "nuget hosted: state document unparsable");
             LoadError::Corrupt
@@ -728,7 +752,8 @@ pub(crate) enum Stored {
 /// Store a parsed package under its ID's publish lock: blobs first, the state
 /// document last, then the in-memory index when `map` is given. An existing version
 /// (pushed or brought in by `nora import`) with identical bytes is
-/// [`Stored::Identical`]; different bytes are a 409. An ID neither pushed nor imported
+/// [`Stored::Identical`]; different bytes are a 409, also when another process stored the
+/// version's package first. An ID neither pushed nor imported
 /// is created only when `may_claim`, else 403. The first push to an imported ID carries
 /// its imported versions into the document, which the read path consults first.
 #[allow(clippy::too_many_arguments)]
@@ -769,7 +794,7 @@ async fn store(
             ),
         ));
     }
-    let mut pkg = doc.unwrap_or_default();
+    let pkg = doc.unwrap_or_default();
     let dir = format!("{BLOB_PREFIX}{id_lower}/{ver_lower}");
     let nupkg_key = format!("{dir}/{id_lower}.{ver_lower}.nupkg");
     let existing = if pkg
@@ -799,7 +824,10 @@ async fn store(
     }
 
     // Blobs first, state document last: the index never names a blob that is not
-    // durable. A failure in between leaves an unreferenced blob a retry overwrites;
+    // durable. The package is written only when its key is free, as one store-side step:
+    // of two pushes of one version (two servers during a rolling update), one stores its
+    // bytes and the other gets a 409, or goes on when its bytes are the same. A failure
+    // after it leaves an unreferenced blob that only the same bytes can complete;
     // downloads resolve through the state document, so it is never served.
     let internal = |what: &str| {
         (
@@ -807,9 +835,21 @@ async fn store(
             format!("failed to store {what}"),
         )
     };
-    if let Err(e) = storage.put_from_path(&nupkg_key, src, Some(sha256)).await {
-        tracing::error!(error = %e, "nuget hosted: failed to store nupkg");
-        return Err(internal("nupkg"));
+    match storage
+        .put_from_path_if_absent(&nupkg_key, src, sha256)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) if storage.pin(&nupkg_key).await.as_deref() == Some(sha256) => {}
+        Ok(false) => {
+            let artifact = format!("{} {}", pkg_id(&pkg, &spec.id), version);
+            tracing::warn!(package = %artifact, "nuget hosted: another push stored this version first");
+            return Err((StatusCode::CONFLICT, format!("{artifact} already exists")));
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "nuget hosted: failed to store nupkg");
+            return Err(internal("nupkg"));
+        }
     }
     if let Err(e) = storage
         .put(&format!("{dir}/{id_lower}.nuspec"), spec.raw.as_bytes())
@@ -819,23 +859,14 @@ async fn store(
         return Err(internal("nuspec"));
     }
 
-    // R2-35: re-read the document right before writing it. `nora import` and `nora nuget
-    // rebuild` write it from another process, which this process's lock does not
-    // exclude, and the upload above can take a while. The window left is this GET-PUT
-    // round trip; a version lost in it keeps its blobs, and the retention pass writes
-    // it back (R2-08).
-    pkg = match load(storage, &id_lower).await {
-        Ok(p) => p.unwrap_or_default(),
-        Err(_) => return Err(unavailable_err()),
-    };
-    // The other writer stored this very version meanwhile: the blobs are ours now (the
-    // last write), so is the entry.
-    pkg.versions
-        .retain(|v| !v.version.eq_ignore_ascii_case(&version));
-    if pkg.id.is_empty() {
-        pkg.id = spec.id.clone();
-    }
-    pkg.versions.push(HostedVersion {
+    let mut known: Vec<String> = pkg
+        .versions
+        .iter()
+        .map(|v| v.version.to_lowercase())
+        .collect();
+    known.push(ver_lower.clone());
+    let adopted = adopt_imported(storage, &id_lower, &imported, &known).await?;
+    let entry = HostedVersion {
         version: version.clone(),
         listed: true,
         published: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -849,12 +880,39 @@ async fn store(
         project_url: spec.project_url,
         dependency_groups: spec.dependency_groups,
         package_types: spec.package_types,
-    });
-    adopt_imported(storage, &id_lower, &imported, &mut pkg).await?;
-    pkg.versions
-        .sort_by(|a, b| compare_versions(&a.version, &b.version));
-    save(storage, map, &id_lower, &pkg).await?;
-    Ok(Stored::Created(format!("{}@{}", pkg.id, version)))
+    };
+    // The document as stored at the write, not as read above: the upload can take a
+    // while, and another process may have written it meanwhile (R2-35).
+    update_doc(storage, map, &id_lower, |doc| {
+        let mut pkg = doc.unwrap_or_default();
+        let named = |pkg: &HostedPackage, ver: &str| {
+            pkg.versions
+                .iter()
+                .any(|v| v.version.eq_ignore_ascii_case(ver))
+        };
+        if named(&pkg, &version) {
+            // Another push of these very bytes (the package blob is them) named it first.
+            let artifact = format!("{} {}", pkg_id(&pkg, &spec.id), version);
+            return Ok((
+                None,
+                Stored::Identical(format!("{artifact} already exists (identical)")),
+            ));
+        }
+        if pkg.id.is_empty() {
+            pkg.id.clone_from(&spec.id);
+        }
+        pkg.versions.push(entry.clone());
+        for v in &adopted {
+            if !named(&pkg, &v.version) {
+                pkg.versions.push(v.clone());
+            }
+        }
+        pkg.versions
+            .sort_by(|a, b| compare_versions(&a.version, &b.version));
+        let created = Stored::Created(format!("{}@{}", pkg.id, version));
+        Ok((Some(pkg), created))
+    })
+    .await
 }
 
 /// The `nora import` records of `id_lower`, listed uncached (a write decides by them).
@@ -875,27 +933,25 @@ async fn imported_versions(
     }
 }
 
-/// Copy every imported version `pkg` does not name into the pushed feed's blob dirs and
-/// add it to `pkg`: once the ID has a state document, only the versions it names are
-/// served. A record whose package is gone is skipped (it is not served either); any
-/// storage failure fails the push closed, before the document is written.
+/// Copy every imported version not in `known` (lowercase) into the pushed feed's blob
+/// dirs and return it, for the document: once the ID has a state document, only the
+/// versions it names are served. A record whose package is gone is skipped (it is not
+/// served either); any storage failure fails the push closed, before the document is
+/// written.
 async fn adopt_imported(
     storage: &Storage,
     id_lower: &str,
     imported: &super::imported::Versions,
-    pkg: &mut HostedPackage,
-) -> Result<(), (StatusCode, String)> {
+    known: &[String],
+) -> Result<Vec<HostedVersion>, (StatusCode, String)> {
+    let mut adopted = Vec::new();
     let missing: Vec<&String> = imported
         .listed()
         .iter()
-        .filter(|v| {
-            !pkg.versions
-                .iter()
-                .any(|p| p.version.eq_ignore_ascii_case(v))
-        })
+        .filter(|v| !known.iter().any(|k| k.eq_ignore_ascii_case(v)))
         .collect();
     if missing.is_empty() {
-        return Ok(());
+        return Ok(adopted);
     }
     let fail = |what: &str, e: &dyn std::fmt::Display| {
         tracing::error!(id = %id_lower, error = %e, "nuget hosted: adopting imported versions: {what}");
@@ -932,14 +988,14 @@ async fn adopt_imported(
             Err(e) => return Err(fail("nuspec copy", &e)),
         }
         match version_from_blobs(storage, id_lower, ver, meta, true).await {
-            Ok((v, _)) => pkg.versions.push(v),
+            Ok((v, _)) => adopted.push(v),
             Err(BlobsError::Unusable(why)) => {
                 tracing::warn!(id = %id_lower, version = %ver, why = %why, "nuget hosted: imported version not adopted");
             }
             Err(e @ BlobsError::Storage(_)) => return Err(fail("manifest", &e)),
         }
     }
-    Ok(())
+    Ok(adopted)
 }
 
 /// OIDC `namespace_scope` for NuGet: IDs are case-insensitive, so the lowercase ID is
@@ -1011,29 +1067,34 @@ async fn set_listed(
     let key = meta_key(&id_lower);
     let lock = state.publish_lock(&key);
     let _guard = lock.lock().await;
-    let mut pkg = match load(&state.storage, &id_lower).await {
-        Ok(Some(p)) => p,
+    let updated = update_doc(&state.storage, Some(&map), &id_lower, |doc| {
+        let Some(mut pkg) = doc else {
+            return Ok((None, None));
+        };
+        let Some(entry) = pkg
+            .versions
+            .iter_mut()
+            .find(|v| v.version.eq_ignore_ascii_case(&version))
+        else {
+            return Ok((None, None));
+        };
+        entry.listed = listed;
+        let id = pkg.id.clone();
+        Ok((Some(pkg), Some(id)))
+    })
+    .await;
+    let pkg_id = match updated {
+        Ok(Some(pkg_id)) => pkg_id,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return unavailable(),
+        Err(e) => return e.into_response(),
     };
-    let Some(entry) = pkg
-        .versions
-        .iter_mut()
-        .find(|v| v.version.eq_ignore_ascii_case(&version))
-    else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    entry.listed = listed;
-    if let Err(e) = save(&state.storage, Some(&map), &id_lower, &pkg).await {
-        return e.into_response();
-    }
 
     state.repo_index.invalidate("nuget");
     let action = if listed { "relist" } else { "unlist" };
     state.audit.log(AuditEntry::new(
         action,
         crate::auth::audit_actor(&user),
-        &format!("{}@{}", pkg.id, version),
+        &format!("{pkg_id}@{version}"),
         "nuget",
         "",
     ));
@@ -1045,14 +1106,54 @@ async fn set_listed(
     }
 }
 
-/// Write the state document, then publish it to the in-memory index (if given). Called under the
-/// ID's publish lock.
-async fn save(
+/// Attempts of one [`update_doc`] before it answers 503.
+const DOC_CAS_ATTEMPTS: u32 = 8;
+
+/// What an [`update_doc`] edit returns: the document to write (`None`: write nothing)
+/// and the caller's result.
+type Edited<T> = Result<(Option<HostedPackage>, T), (StatusCode, String)>;
+
+/// Read-modify-write of `id_lower`'s state document by compare-and-swap: `edit` gets the
+/// stored document (`None`: there is none) and returns the one to write. When another
+/// process wrote the document between the read and the write (a second server during a
+/// rolling update, `nora import`, `nora nuget rebuild`), the write is refused by the
+/// store and the document is read and edited again, up to [`DOC_CAS_ATTEMPTS`] times,
+/// then 503: a version another writer stored is never dropped. The caller holds the
+/// ID's publish lock, which serializes this process's writers.
+async fn update_doc<T>(
+    storage: &Storage,
+    map: Option<&IndexMap>,
+    id_lower: &str,
+    mut edit: impl FnMut(Option<HostedPackage>) -> Edited<T>,
+) -> Result<T, (StatusCode, String)> {
+    for attempt in 0..DOC_CAS_ATTEMPTS {
+        let (doc, version) = load_versioned(storage, id_lower)
+            .await
+            .map_err(|_| unavailable_err())?;
+        let (new, out) = edit(doc)?;
+        let Some(new) = new else {
+            return Ok(out);
+        };
+        if save_if(storage, map, id_lower, &new, version.as_deref()).await? {
+            return Ok(out);
+        }
+        tracing::info!(id = %id_lower, attempt, "nuget hosted: state document changed by another writer, retrying");
+        tokio::time::sleep(std::time::Duration::from_millis(10 << attempt)).await;
+    }
+    tracing::warn!(id = %id_lower, "nuget hosted: state document kept changing, update refused");
+    Err(unavailable_err())
+}
+
+/// Write the state document when the stored one is still `expected` (see
+/// [`Storage::put_if_version`]), then publish it to the in-memory index (if given).
+/// `Ok(false)`: another writer came first, nothing written.
+async fn save_if(
     storage: &Storage,
     map: Option<&IndexMap>,
     id_lower: &str,
     pkg: &HostedPackage,
-) -> Result<(), (StatusCode, String)> {
+    expected: Option<&str>,
+) -> Result<bool, (StatusCode, String)> {
     let failed = || {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1061,18 +1162,22 @@ async fn save(
     };
     let body = serde_json::to_vec(pkg).map_err(|_| failed())?;
     let key = meta_key(id_lower);
-    // Local backend: temp file + rename; S3: single-object PUT — both atomic.
-    storage.put(&key, &body).await.map_err(|e| {
-        tracing::error!(key = %key, error = %e, "nuget hosted: failed to write state document");
-        failed()
-    })?;
-    if let Some(map) = map {
+    // Local backend: temp file + rename under the key's commit lock; object store: a
+    // conditional single-object PUT — both atomic.
+    let written = storage
+        .put_if_version(&key, body.into(), expected)
+        .await
+        .map_err(|e| {
+            tracing::error!(key = %key, error = %e, "nuget hosted: failed to write state document");
+            failed()
+        })?;
+    if let (true, Some(map)) = (written, map) {
         map.write().insert(
             id_lower.to_string(),
             Doc::Ready(Arc::new(pkg.clone()), recheck_at()),
         );
     }
-    Ok(())
+    Ok(written)
 }
 
 fn pkg_id<'a>(pkg: &'a HostedPackage, fallback: &'a str) -> &'a str {
@@ -1876,21 +1981,44 @@ pub(crate) async fn run_retention(state: &AppState, dry_run: bool) -> RetentionS
             if dry_run {
                 tracing::warn!(id = %id, ?versions, "nuget hosted retention (dry-run): would re-add versions the state document lost");
             } else {
-                let mut fixed = (*pkg).clone();
-                fixed.versions.extend(restored.iter().cloned());
-                fixed
-                    .versions
-                    .sort_by(|a, b| compare_versions(&a.version, &b.version));
-                if save(&state.storage, Some(&map), &id, &fixed).await.is_err() {
-                    sum.errors += 1;
-                    continue; // nothing deleted on a document we could not write
-                }
-                tracing::warn!(id = %id, ?versions, "nuget hosted retention: re-added versions the state document lost");
-                for v in &restored {
+                let readded = update_doc(&state.storage, Some(&map), &id, |doc| {
+                    let Some(mut fixed) = doc else {
+                        return Ok((None, None)); // the document is gone: nothing to add to
+                    };
+                    let mut added = Vec::new();
+                    for v in &restored {
+                        if !fixed
+                            .versions
+                            .iter()
+                            .any(|p| p.version.eq_ignore_ascii_case(&v.version))
+                        {
+                            fixed.versions.push(v.clone());
+                            added.push(v.version.clone());
+                        }
+                    }
+                    if added.is_empty() {
+                        return Ok((None, Some((fixed, added))));
+                    }
+                    fixed
+                        .versions
+                        .sort_by(|a, b| compare_versions(&a.version, &b.version));
+                    Ok((Some(fixed.clone()), Some((fixed, added))))
+                })
+                .await;
+                let (fixed, added) = match readded {
+                    Ok(Some(done)) => done,
+                    Ok(None) => continue,
+                    Err(_) => {
+                        sum.errors += 1;
+                        continue; // nothing deleted on a document we could not write
+                    }
+                };
+                tracing::warn!(id = %id, versions = ?added, "nuget hosted retention: re-added versions the state document lost");
+                for v in &added {
                     state.audit.log(AuditEntry::new(
                         "retention-restore",
                         "scheduler",
-                        &format!("{}@{}", pkg_id(&fixed, &id), v.version),
+                        &format!("{}@{}", pkg_id(&fixed, &id), v),
                         "nuget",
                         "unnamed-complete-blob-dir",
                     ));
@@ -1899,12 +2027,39 @@ pub(crate) async fn run_retention(state: &AppState, dry_run: bool) -> RetentionS
                 pkg = Arc::new(fixed);
             }
         }
-        let expired = expired_pr_versions(
-            &pkg.versions,
-            now,
-            cfg.hosted_pr_retention_days,
-            cfg.hosted_pr_keep_last,
-        );
+        let expire = |versions: &[HostedVersion]| {
+            expired_pr_versions(
+                versions,
+                now,
+                cfg.hosted_pr_retention_days,
+                cfg.hosted_pr_keep_last,
+            )
+        };
+        let mut expired = expire(&pkg.versions);
+        if !dry_run && !expired.is_empty() {
+            // Decided again on the document as stored at the write: a version another
+            // process pushed meanwhile stays, and counts towards the newest kept.
+            let kept = update_doc(&state.storage, Some(&map), &id, |doc| {
+                let Some(mut kept) = doc else {
+                    return Ok((None, Vec::new()));
+                };
+                let expired = expire(&kept.versions);
+                if expired.is_empty() {
+                    return Ok((None, expired));
+                }
+                kept.versions
+                    .retain(|v| !expired.iter().any(|e| e == &v.version));
+                Ok((Some(kept), expired))
+            })
+            .await;
+            match kept {
+                Ok(now_expired) => expired = now_expired,
+                Err(_) => {
+                    sum.errors += 1;
+                    continue; // document unchanged: keep every blob it names
+                }
+            }
+        }
         let mut doomed: Vec<(String, &'static str)> = expired
             .iter()
             .map(|v| (v.clone(), "pr-prerelease-expired"))
@@ -1920,15 +2075,6 @@ pub(crate) async fn run_retention(state: &AppState, dry_run: bool) -> RetentionS
                 tracing::info!(id = %pkg.id, version = %ver, reason, "nuget hosted retention (dry-run): would delete");
             }
             continue;
-        }
-        if !expired.is_empty() {
-            let mut kept = (*pkg).clone();
-            kept.versions
-                .retain(|v| !expired.iter().any(|e| e == &v.version));
-            if save(&state.storage, Some(&map), &id, &kept).await.is_err() {
-                sum.errors += 1;
-                continue; // document unchanged: keep every blob it names
-            }
         }
         for (ver, reason) in doomed {
             let Some((keys, _)) = dirs.remove(&ver.to_lowercase()) else {
@@ -2048,40 +2194,58 @@ pub(crate) async fn rebuild(
             "no readable package under {prefix}; nothing written"
         ));
     }
-    if apply {
-        // R2-35: a push that landed after the listing above is in the current document
-        // but not in `pkg`: keep each such version whose blob is there now. A running
-        // server's lock does not reach this process, so the window left is this
-        // GET-PUT round trip; a version lost in it keeps its blobs, which the
-        // retention pass re-adds (R2-08).
-        if let Ok(Some(current)) = load(storage, &id_lower).await {
-            for v in current.versions {
-                let ver_lower = v.version.to_lowercase();
-                let known = pkg
-                    .versions
-                    .iter()
-                    .any(|p| p.version.to_lowercase() == ver_lower);
-                let nupkg_key = format!("{prefix}{ver_lower}/{id_lower}.{ver_lower}.nupkg");
-                if !known && storage.stat(&nupkg_key).await.is_some() {
-                    pkg.versions.push(v);
-                }
-            }
-        }
-    }
+    let summary = |pkg: HostedPackage| {
+        pkg.versions
+            .into_iter()
+            .map(|v| (v.version, v.listed))
+            .collect()
+    };
     pkg.versions
         .sort_by(|a, b| compare_versions(&a.version, &b.version));
-    if apply {
-        let body = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;
-        storage
-            .put(&meta_key(&id_lower), &body)
-            .await
-            .map_err(|e| format!("cannot write the state document: {e}"))?;
+    if !apply {
+        return Ok(summary(pkg));
     }
-    Ok(pkg
-        .versions
-        .into_iter()
-        .map(|v| (v.version, v.listed))
-        .collect())
+    // R2-35: a push that landed after the listing above is in the current document but
+    // not in `pkg`: keep each such version whose blob is there now. A running server's
+    // lock does not reach this process; the write is a compare-and-swap on the document
+    // read here, redone when a push wrote it in between.
+    let key = meta_key(&id_lower);
+    for _ in 0..DOC_CAS_ATTEMPTS {
+        let (current, version) = match storage.get_versioned(&key).await {
+            Ok((data, version)) => (
+                serde_json::from_slice::<HostedPackage>(&data).ok(),
+                Some(version),
+            ),
+            Err(StorageError::NotFound) => (None, None),
+            Err(e) => return Err(format!("cannot read the current state document: {e}")),
+        };
+        let mut out = pkg.clone();
+        for v in current.map(|c| c.versions).unwrap_or_default() {
+            let ver_lower = v.version.to_lowercase();
+            let known = out
+                .versions
+                .iter()
+                .any(|p| p.version.to_lowercase() == ver_lower);
+            let nupkg_key = format!("{prefix}{ver_lower}/{id_lower}.{ver_lower}.nupkg");
+            if !known && storage.stat(&nupkg_key).await.is_some() {
+                out.versions.push(v);
+            }
+        }
+        out.versions
+            .sort_by(|a, b| compare_versions(&a.version, &b.version));
+        let body = serde_json::to_vec(&out).map_err(|e| e.to_string())?;
+        match storage
+            .put_if_version(&key, body.into(), version.as_deref())
+            .await
+        {
+            Ok(true) => return Ok(summary(out)),
+            Ok(false) => {
+                tracing::info!(id = %id_lower, "rebuild: the state document changed meanwhile, merging again")
+            }
+            Err(e) => return Err(format!("cannot write the state document: {e}")),
+        }
+    }
+    Err("the state document kept changing while the rebuild wrote it; nothing written".into())
 }
 
 /// Why a version blob dir yields no version: unusable for good, or not readable now.

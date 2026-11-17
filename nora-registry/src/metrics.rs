@@ -406,6 +406,19 @@ pub static STORAGE_OPERATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create STORAGE_OPERATIONS metric at startup")
 });
 
+/// Conditional writes (`put_if_version`, `put_from_path_if_absent`) the object store
+/// answered "not implemented" for, written unconditionally instead, by operation. Not
+/// zero means two processes writing one bucket (a rolling update) can overwrite each
+/// other's writes on this store.
+pub static STORAGE_CONDITIONAL_FALLBACK: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_storage_conditional_fallback_total",
+        "Conditional storage writes done unconditionally because the store does not support them",
+        &["operation"]
+    )
+    .expect("failed to create STORAGE_CONDITIONAL_FALLBACK metric at startup")
+});
+
 /// Wall-clock of one storage backend call, by operation. `get` and `put` cover the whole
 /// body, `get_reader` / `get_range` only the open (the stream is paced by the download
 /// client), `list*` the whole walk. `nora_storage_operations_total` counts the calls, so
