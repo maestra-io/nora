@@ -4494,16 +4494,23 @@ async fn npm_publish_date(state: &AppState, name: &str, version: &str) -> Option
     if !state.config.server.trust_upstream_dates {
         return None;
     }
-    let times = npm_release_times(state, name).await?;
+    let times = npm_release_times(state, name, version).await?;
     crate::curation::parse_iso8601_to_unix(times.get(version)?.as_str()?)
 }
 
 /// The `time` map of `name`: its [`dates_key`], else the cached packument's (stored
 /// as the companion for next time), else the packument fetched upstream and cached.
+/// A cached map that dates other versions but not `version` predates its release:
+/// the upstream's current map judges it, as on a cold cache.
 async fn npm_release_times(
     state: &AppState,
     name: &str,
+    version: &str,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
+    // An empty map is a dateless upstream, not a stale copy: refetching it adds nothing.
+    let covers = |times: &serde_json::Map<String, serde_json::Value>| {
+        times.is_empty() || times.contains_key(version)
+    };
     // A published package's dates are not an upstream's: nothing upstream is read or
     // cached for it.
     if has_local_versions(&state.storage, name).await {
@@ -4514,7 +4521,9 @@ async fn npm_release_times(
     if cached_copy_trusted(state, name, &key, name, None).await {
         if let Ok(dates) = state.storage.get(&dates_key(name)).await {
             if let Ok(times) = serde_json::from_slice(&dates) {
-                return Some(times);
+                if covers(&times) {
+                    return Some(times);
+                }
             }
         }
     }
@@ -4526,8 +4535,10 @@ async fn npm_release_times(
         }
         if let Ok(data) = state.storage.get(&cached).await {
             let times = packument_times(&data);
-            write_dates(&state.storage, name, &times).await;
-            return Some(times);
+            if covers(&times) {
+                write_dates(&state.storage, name, &times).await;
+                return Some(times);
+            }
         }
     }
     if crate::curation::is_internal_namespace(
