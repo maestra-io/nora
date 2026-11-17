@@ -602,3 +602,67 @@ async fn a_token_in_the_username_is_logged_without_the_secret() {
         assert!(!out.contains(secret), "{secret} leaked: {out}");
     }
 }
+
+/// B07: a write a browser marks as cross-site (or same-site) is refused before any
+/// credential is looked at; package clients (no Sec-Fetch-Site) and the same-origin UI
+/// pass, and reads are never refused.
+#[tokio::test]
+async fn cross_site_writes_are_refused() {
+    let ctx = create_test_context_with_auth(&[]);
+    let token = ctx
+        .state
+        .tokens
+        .as_ref()
+        .unwrap()
+        .create_token("ci", 30, None, crate::tokens::Role::Write)
+        .await
+        .unwrap();
+    let cred = format!("Basic {}", STANDARD.encode(format!("token:{token}")));
+    let write = |method: Method, uri: &'static str, site: Option<&'static str>| {
+        let mut headers = vec![("authorization", cred.clone())];
+        if let Some(s) = site {
+            headers.push(("sec-fetch-site", s.to_string()));
+        }
+        let app = ctx.app.clone();
+        async move {
+            let headers = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            send_with_headers(&app, method, uri, headers, b"x".to_vec())
+                .await
+                .status()
+        }
+    };
+    for site in ["cross-site", "same-site"] {
+        for (method, uri) in [(Method::PUT, "/raw/t.txt"), (Method::POST, "/simple/")] {
+            assert_eq!(
+                write(method, uri, Some(site)).await,
+                StatusCode::FORBIDDEN,
+                "{uri} {site}"
+            );
+        }
+    }
+    assert!(ctx.state.storage.get("raw/t.txt").await.is_err());
+    for site in [None, Some("same-origin"), Some("none")] {
+        assert_eq!(
+            write(Method::PUT, "/raw/t.txt", site).await,
+            StatusCode::OK,
+            "{site:?}"
+        );
+        assert_ne!(
+            write(Method::POST, "/simple/", site).await,
+            StatusCode::FORBIDDEN,
+            "{site:?}"
+        );
+    }
+    let resp = send_with_headers(
+        &ctx.app,
+        Method::GET,
+        "/raw/t.txt",
+        vec![
+            ("authorization", cred.as_str()),
+            ("sec-fetch-site", "cross-site"),
+        ],
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}

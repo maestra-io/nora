@@ -107,6 +107,7 @@ async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> imp
             [
                 (header::CONTENT_TYPE, PEP691_JSON),
                 (header::CACHE_CONTROL, "public, max-age=60, must-revalidate"),
+                (header::VARY, "Accept"),
             ],
             serde_json::to_string(&body).unwrap_or_default(),
         )
@@ -123,7 +124,10 @@ async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> imp
         html.push_str("</body></html>");
         (
             StatusCode::OK,
-            [(header::CACHE_CONTROL, "public, max-age=60, must-revalidate")],
+            [
+                (header::CACHE_CONTROL, "public, max-age=60, must-revalidate"),
+                (header::VARY, "Accept"),
+            ],
             Html(html),
         )
             .into_response()
@@ -372,6 +376,10 @@ async fn package_versions(
         } else {
             versions_html_response(&normalized, &files, &base_url)
         };
+        // The body depends on Accept (PEP 691 JSON or PEP 503 HTML).
+        response
+            .headers_mut()
+            .insert(header::VARY, header::HeaderValue::from_static("Accept"));
         if stale {
             response.headers_mut().insert(
                 header::WARNING,
