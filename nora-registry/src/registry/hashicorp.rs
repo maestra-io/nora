@@ -119,29 +119,52 @@ async fn file(
     let cfg = &state.config.hashicorp;
     let up = hashicorp_upstream(&state);
     let key = format!("hashicorp/meta/{product}/{version}.json");
-    let record: Version = match load_record(&state, "hashicorp", &key, cfg.metadata_ttl, || async {
-        let bad = |url: &str| (url.to_string(), ProxyError::Upstream(502));
-        let api = join_segments(&cfg.api_url, &["v1", "releases", &product, &version])
-            .ok_or_else(|| bad(&cfg.api_url))?;
-        let body = fetch_record(&state, &up, RegistryType::Hashicorp, &api, None).await?;
-        let created = serde_json::from_slice::<ApiVersion>(&body)
-            .map_err(|e| {
-                tracing::warn!(url = %api, error = %e, "hashicorp: release record unreadable");
-                bad(&api)
-            })?
-            .timestamp_created;
-        let sums_file = format!("{product}_{version}_SHA256SUMS");
-        let sums_url = join_segments(&cfg.download_url, &[&product, &version, &sums_file])
-            .ok_or_else(|| bad(&cfg.download_url))?;
-        let sums = fetch_record(&state, &up, RegistryType::Hashicorp, &sums_url, None).await?;
-        let mut files = parse_sums(&sums);
-        if files.is_empty() {
-            tracing::warn!(url = %sums_url, "hashicorp: SHA256SUMS lists no file");
-            return Err(bad(&sums_url));
-        }
-        files.insert(sums_file, hex::encode(sha2::Sha256::digest(&sums)));
-        Ok(Version { created, files })
-    })
+    let record: Version = match load_record(
+        &state,
+        "hashicorp",
+        &cfg.api_url,
+        &key,
+        cfg.metadata_ttl,
+        || async {
+            let bad = |url: &str| (url.to_string(), ProxyError::Upstream(502));
+            let api = join_segments(&cfg.api_url, &["v1", "releases", &product, &version])
+                .ok_or_else(|| bad(&cfg.api_url))?;
+            let body = fetch_record(
+                &state,
+                &up,
+                RegistryType::Hashicorp,
+                &cfg.api_url,
+                &api,
+                None,
+            )
+            .await?;
+            let created = serde_json::from_slice::<ApiVersion>(&body)
+                .map_err(|e| {
+                    tracing::warn!(url = %api, error = %e, "hashicorp: release record unreadable");
+                    bad(&api)
+                })?
+                .timestamp_created;
+            let sums_file = format!("{product}_{version}_SHA256SUMS");
+            let sums_url = join_segments(&cfg.download_url, &[&product, &version, &sums_file])
+                .ok_or_else(|| bad(&cfg.download_url))?;
+            let sums = fetch_record(
+                &state,
+                &up,
+                RegistryType::Hashicorp,
+                &cfg.download_url,
+                &sums_url,
+                None,
+            )
+            .await?;
+            let mut files = parse_sums(&sums);
+            if files.is_empty() {
+                tracing::warn!(url = %sums_url, "hashicorp: SHA256SUMS lists no file");
+                return Err(bad(&sums_url));
+            }
+            files.insert(sums_file, hex::encode(sha2::Sha256::digest(&sums)));
+            Ok(Version { created, files })
+        },
+    )
     .await
     {
         Ok(record) => record,
@@ -153,6 +176,10 @@ async fn file(
     let Some(url) = join_segments(&cfg.download_url, &[&product, &version, &file]) else {
         return StatusCode::BAD_GATEWAY.into_response();
     };
+    let published = record
+        .created
+        .as_deref()
+        .and_then(crate::curation::parse_iso8601_to_unix);
     serve_asset(
         &state,
         &headers,
@@ -160,10 +187,9 @@ async fn file(
             registry: RegistryType::Hashicorp,
             name: &product,
             version: &version,
-            published: record
-                .created
-                .as_deref()
-                .and_then(crate::curation::parse_iso8601_to_unix),
+            published,
+            // A version's files are dated by the version.
+            file_date: published,
             expected: Some(expected),
             key: format!("hashicorp/releases/{product}/{version}/{file}"),
             label: format!("{product}@{version}/{file}"),

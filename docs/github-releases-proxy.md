@@ -47,7 +47,12 @@ one for the server's audience and sends it as the Basic password (or Bearer).
   NORA first reads the release record (`GET <api_url>/repos/<owner>/<repo>/releases/tags/<tag>`),
   cached under `github/meta/` for `metadata_ttl`; one refresh per release runs at a
   time, and an API failure (rate limit included) uses the last copy. A release the API
-  does not know, or an asset it does not list, is a 404 and never fetched. The asset is
+  does not know, or an asset it does not list, is a 404 and never fetched; with no copy
+  of the record, the API's "not found" is remembered in memory for 5 minutes, so asking
+  again costs no API call. An API rate limit (a 429, or a 403 with `Retry-After` or
+  `x-ratelimit-remaining: 0`) answers 503 with `Retry-After` and counts toward the
+  circuit breaker of the API host, which then backs off every release lookup; a
+  release with a stored record keeps being served from it. The asset is
   fetched from `<download_url>/<owner>/<repo>/releases/download/<tag>/<asset>` only,
   refused when its sha256 differs from the `digest` GitHub publishes for it (not
   cached; assets uploaded before mid-2025 have none), and cached under
@@ -66,11 +71,15 @@ one for the server's audience and sends it as the Basic password (or Bearer).
 
 The package name is `<owner>/<repo>` and the version is the tag.
 
-- **Release age** (`min_release_age`): by the release's `published_at`. A younger
-  release answers 403 under `curation.mode = "enforce"`.
+- **Release age** (`min_release_age`): by the release's `published_at`, and for an
+  asset NORA has not cached yet, by the asset's own upload (`created_at`) when that is
+  later: a file added to or re-uploaded in an old release is as young as its upload. A
+  younger release or asset answers 403 under `curation.mode = "enforce"`; the info log
+  `release asset uploaded after its release` names each asset dated that way.
 - **Digest quarantine** (`quarantine`): an asset's sha256 is held from the moment NORA
-  first fetches it (seeded from `published_at` with `server.trust_upstream_dates`). In
-  `enforce` a held asset answers 403 with `x-nora-quarantine`.
+  first fetches it (seeded, with `server.trust_upstream_dates`, from the later of
+  `published_at` and the asset's `created_at`; a record without asset dates seeds
+  nothing). In `enforce` a held asset answers 403 with `x-nora-quarantine`.
 - **A first-seen copy is kept**: an asset re-uploaded upstream with other content keeps
   serving the first cached copy, the one its quarantine dated.
 - **Internal namespaces**, blocklist, allowlist pins and `allow` exemptions apply by

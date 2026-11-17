@@ -393,14 +393,21 @@ fn transport_error(e: reqwest::Error) -> ProxyError {
 
 /// Classify an upstream 4xx. Only a plain 4xx (404/410…) means "no such artifact";
 /// throttling and auth refusals must not reach clients as a cacheable 404.
+/// A 403 is a rate limit (GitHub's API sends its limits that way) only when it says so:
+/// a `Retry-After`, or `x-ratelimit-remaining: 0`; any other 403 stays a refusal.
 pub(crate) fn upstream_4xx(status: u16, headers: &reqwest::header::HeaderMap) -> ProxyError {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let retry_after = header(reqwest::header::RETRY_AFTER.as_str()).map(str::to_owned);
+    let exhausted = header("x-ratelimit-remaining").is_some_and(|v| v.trim() == "0");
     match status {
-        429 => ProxyError::RateLimited(
-            headers
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned),
-        ),
+        429 => ProxyError::RateLimited(retry_after),
+        403 if retry_after.is_some() || exhausted => {
+            ProxyError::RateLimited(retry_after.or_else(|| {
+                // `x-ratelimit-reset` is the unix second the budget refills.
+                let reset: i64 = header("x-ratelimit-reset")?.trim().parse().ok()?;
+                Some((reset - chrono::Utc::now().timestamp()).max(1).to_string())
+            }))
+        }
         401 | 403 => ProxyError::Denied(status, None),
         _ => ProxyError::NotFound,
     }
@@ -3512,6 +3519,52 @@ pub(crate) async fn proxy_fetch_conditional(
 mod tests {
     use super::*;
     use crate::registry_type::RegistryType;
+
+    /// A 403 that says it is a rate limit backs off (503 + Retry-After, a breaker
+    /// failure); any other 403 stays a refusal (audit A065).
+    #[test]
+    fn a_rate_limit_403_is_rate_limited() {
+        let headers = |pairs: &[(&'static str, String)]| {
+            let mut h = reqwest::header::HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(*k, v.parse().unwrap());
+            }
+            h
+        };
+        let reset = (chrono::Utc::now().timestamp() + 120).to_string();
+        let exhausted = headers(&[
+            ("x-ratelimit-remaining", "0".into()),
+            ("x-ratelimit-reset", reset),
+        ]);
+        match upstream_4xx(403, &exhausted) {
+            ProxyError::RateLimited(Some(v)) => {
+                let secs: i64 = v.parse().unwrap();
+                assert!((100..=120).contains(&secs), "{secs}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            upstream_4xx(403, &headers(&[("x-ratelimit-remaining", "0".into())])),
+            ProxyError::RateLimited(None)
+        ));
+        assert!(matches!(
+            upstream_4xx(403, &headers(&[("retry-after", "60".into())])),
+            ProxyError::RateLimited(Some(ref v)) if v == "60"
+        ));
+        for plain in [
+            headers(&[]),
+            headers(&[("x-ratelimit-remaining", "41".into())]),
+        ] {
+            assert!(matches!(
+                upstream_4xx(403, &plain),
+                ProxyError::Denied(403, None)
+            ));
+        }
+        assert!(matches!(
+            upstream_4xx(401, &headers(&[("retry-after", "60".into())])),
+            ProxyError::Denied(401, None)
+        ));
+    }
 
     /// Every publish handler that buffers its body answers 413 once the body passes
     /// `server.publish_body_limit_mb`, well below the global `body_limit_mb` (C66).
