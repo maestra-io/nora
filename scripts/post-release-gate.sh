@@ -8,6 +8,8 @@ set -euo pipefail
 
 REPO="getnora-io/nora"
 GHCR_REGISTRY="ghcr.io/getnora-io/nora"
+# The only signer: release.yml on a v* tag (audit A008; scripts/coherence-check.sh checks it).
+SIGNER_IDENTITY='^https://github\.com/getnora-io/nora/\.github/workflows/release\.yml@refs/tags/v[^/]+$'
 DOCKERHUB_REGISTRY="docker.io/getnora/nora"
 VARIANTS=("" "-redos" "-astra")
 BINARY_PORT="${GATE_PORT:-14100}"
@@ -293,7 +295,7 @@ gh release download "$TAG" --repo "$REPO" \
 if [ -f "$WORK_DIR/nora-linux-amd64.bundle" ]; then
     if cosign_run verify-blob \
         --bundle "$WORK_DIR/nora-linux-amd64.bundle" \
-        --certificate-identity-regexp "github.com/getnora-io/nora" \
+        --certificate-identity-regexp "$SIGNER_IDENTITY" \
         --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
         "$WORK_DIR/nora-linux-amd64" >/dev/null 2>&1; then
         pass "cosign verify-blob binary signature"
@@ -313,7 +315,7 @@ for variant in "${VARIANTS[@]}"; do
         continue
     fi
     if cosign_run verify \
-        --certificate-identity-regexp "github.com/getnora-io/nora" \
+        --certificate-identity-regexp "$SIGNER_IDENTITY" \
         --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
         "$REF" >/dev/null 2>&1; then
         pass "cosign verify GHCR ${SUFFIX:-alpine} image"

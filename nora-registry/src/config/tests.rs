@@ -1281,7 +1281,7 @@ fn shipped_env_defaults_pass_validation() {
     let deb = include_str!("../../../dist/nora.env.example");
     let script = include_str!("../../../dist/install.sh");
     let heredoc = script
-        .split("cat > /tmp/nora.env << 'ENVEOF'")
+        .split("/nora.env\" << 'ENVEOF'")
         .nth(1)
         .and_then(|rest| rest.split("\nENVEOF").next())
         .expect("install.sh writes a default nora.env");
