@@ -186,6 +186,9 @@ config:
     # docs/docker-proxy.md), so an image older than the quarantine TTL passes.
     # date_token_file: a mounted file with the token the date API wants (ghcr.io:
     # any GitHub token, e.g. an App installation token; mount it with extraVolumes).
+    # token_hosts: hosts besides the upstream's own origin whose https token realm
+    # nora follows (`host` or `host:port`); registry-1.docker.io -> auth.docker.io
+    # is built in. A realm anywhere else fails the pull with a warn naming its host.
     upstreams: []
     #  - url: https://registry-1.docker.io
     #    prefix: docker-hub

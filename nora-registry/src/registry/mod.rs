@@ -6039,6 +6039,7 @@ mod first_download_integrity {
                 c.docker.upstreams = vec![crate::config::DockerUpstream {
                     trust_upstream_dates: false,
                     date_token_file: None,
+                    token_hosts: Vec::new(),
                     url: u,
                     auth: None,
                     auth_env: None,
@@ -6137,6 +6138,7 @@ mod first_download_integrity {
                 c.docker.upstreams = vec![crate::config::DockerUpstream {
                     trust_upstream_dates: false,
                     date_token_file: None,
+                    token_hosts: Vec::new(),
                     url: u,
                     auth: None,
                     auth_env: None,
@@ -7271,6 +7273,7 @@ mod upstream_failure_matrix {
             .map(|url| DockerUpstream {
                 trust_upstream_dates: false,
                 date_token_file: None,
+                token_hosts: Vec::new(),
                 url,
                 auth: None,
                 auth_env: None,

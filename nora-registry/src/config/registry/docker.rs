@@ -108,6 +108,11 @@ pub struct DockerUpstream {
     /// installation token included), re-read at each walk so a rotated Secret applies.
     #[serde(default)]
     pub date_token_file: Option<String>,
+    /// Hosts other than the upstream's own origin whose `https` token realm NORA follows for
+    /// it (`host` or `host:port`). A realm elsewhere is refused. `registry-1.docker.io` →
+    /// `auth.docker.io` is built in.
+    #[serde(default)]
+    pub token_hosts: Vec<String>,
 }
 
 /// Where a registry publishes the date a manifest was pushed, read by the registry
@@ -327,6 +332,7 @@ fn default_docker_upstreams() -> Vec<DockerUpstream> {
     vec![DockerUpstream {
         trust_upstream_dates: false,
         date_token_file: None,
+        token_hosts: Vec::new(),
         url: "https://registry-1.docker.io".to_string(),
         auth: None,
         auth_env: None,
@@ -539,6 +545,7 @@ impl DockerConfig {
                     DockerUpstream {
                         trust_upstream_dates: false,
                         date_token_file: None,
+                        token_hosts: Vec::new(),
                         url: parts[0].to_string(),
                         auth,
                         auth_env: None,

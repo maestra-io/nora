@@ -38,6 +38,7 @@ fn upstream(url: String, namespace: &str) -> DockerUpstream {
     DockerUpstream {
         trust_upstream_dates: false,
         date_token_file: None,
+        token_hosts: Vec::new(),
         url,
         auth: None,
         auth_env: None,

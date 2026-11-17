@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 use crate::config::basic_auth_header;
+use nora_registry::npm_links::same_origin;
 use parking_lot::RwLock;
+use reqwest::Url;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,7 +34,16 @@ pub struct DockerAuth {
     tokens: Arc<RwLock<HashMap<String, CachedToken>>>,
     client: reqwest::Client,
     timeout: Duration,
+    /// Per upstream url: the hosts besides its own origin whose `https` realm it may name.
+    token_hosts: Arc<HashMap<String, Vec<String>>>,
 }
+
+/// The most tokens cached at once: past it, expired ones are dropped, and when every one is
+/// still live a new token is used uncached.
+const TOKEN_CACHE_MAX: usize = 4096;
+
+/// The largest token answer read. Real ones are a few KiB.
+const MAX_TOKEN_BODY: u64 = 1 << 20;
 
 impl DockerAuth {
     /// Create a new DockerAuth using the provided HTTP client.
@@ -44,7 +55,30 @@ impl DockerAuth {
             tokens: Arc::new(RwLock::new(HashMap::new())),
             client,
             timeout: Duration::from_secs(timeout),
+            token_hosts: Arc::default(),
         }
+    }
+
+    /// The `token_hosts` of each upstream, so its token server may sit off its own origin.
+    pub fn with_token_hosts(mut self, upstreams: &[crate::config::DockerUpstream]) -> Self {
+        self.token_hosts = Arc::new(
+            upstreams
+                .iter()
+                .filter(|u| !u.token_hosts.is_empty())
+                .map(|u| {
+                    let hosts = u.token_hosts.iter();
+                    let hosts = hosts.map(|h| h.trim().to_ascii_lowercase()).collect();
+                    (u.url.trim_end_matches('/').to_string(), hosts)
+                })
+                .collect(),
+        );
+        self
+    }
+
+    /// Drop expired tokens (maintenance tick).
+    pub fn prune_expired(&self) {
+        let now = Instant::now();
+        self.tokens.write().retain(|_, t| t.expires_at > now);
     }
 
     /// Get a valid token for the given registry and repository scope
@@ -79,19 +113,24 @@ impl DockerAuth {
 
         // Need to fetch a new token. A 401 without a challenge names no way in.
         let www_auth = www_authenticate.ok_or(TokenError::Refused)?;
-        let (token, lifetime) = self.fetch_token(www_auth, name, basic_auth).await?;
+        let (token, lifetime) = self
+            .fetch_token(registry_url, www_auth, name, basic_auth)
+            .await?;
 
         // Cache the token for the lifetime the token server gave it, less a margin
         // for the request that will carry it.
+        // Every name a reader asks for is a key: the map is bounded.
         if let Some(ttl) = lifetime.checked_sub(TOKEN_EXPIRY_MARGIN) {
             let mut tokens = self.tokens.write();
-            tokens.insert(
-                cache_key,
-                CachedToken {
-                    token: token.clone(),
-                    expires_at: Instant::now() + ttl,
-                },
-            );
+            let now = Instant::now();
+            if tokens.len() >= TOKEN_CACHE_MAX && !tokens.contains_key(&cache_key) {
+                tokens.retain(|_, t| t.expires_at > now);
+            }
+            if tokens.len() < TOKEN_CACHE_MAX || tokens.contains_key(&cache_key) {
+                let token = token.clone();
+                let expires_at = now + ttl;
+                tokens.insert(cache_key, CachedToken { token, expires_at });
+            }
         }
 
         Ok(token)
@@ -103,6 +142,7 @@ impl DockerAuth {
     /// Returns the token and its remaining lifetime (see [`token_lifetime`]).
     async fn fetch_token(
         &self,
+        registry_url: &str,
         www_authenticate: &str,
         name: &str,
         basic_auth: Option<&str>,
@@ -114,20 +154,40 @@ impl DockerAuth {
         let realm = params.get("realm").ok_or(TokenError::Unavailable)?;
 
         // Validate realm URL scheme — only HTTP(S) allowed
-        if !realm.starts_with("https://") && !realm.starts_with("http://") {
-            tracing::warn!(realm = %realm, "Rejecting auth realm with non-HTTP(S) scheme");
-            return Err(TokenError::Unavailable);
+        let mut url = match Url::parse(realm) {
+            Ok(url) if matches!(url.scheme(), "https" | "http") => url,
+            _ => {
+                tracing::warn!(realm = %realm, "Rejecting auth realm with non-HTTP(S) scheme");
+                return Err(TokenError::Unavailable);
+            }
+        };
+
+        // The upstream's credential goes, and the answer comes back to it, only where the
+        // upstream itself or its operator-listed token server answers.
+        let extra = self.token_hosts.get(registry_url.trim_end_matches('/'));
+        let extra = extra.map(Vec::as_slice).unwrap_or_default();
+        let upstream = Url::parse(registry_url).ok();
+        if !upstream.is_some_and(|up| realm_allowed(&url, &up, extra)) {
+            tracing::warn!(
+                upstream = %registry_url,
+                realm_host = url.host_str().unwrap_or(""),
+                "Refusing a token realm off the upstream's origin; if it is the upstream's \
+                 own token server, list its host in the upstream's token_hosts"
+            );
+            return Err(TokenError::Refused);
         }
 
         let service = params.get("service").map(|s| s.as_str()).unwrap_or("");
 
         // Build token request URL
         let scope = format!("repository:{}:pull", name);
-        let url = format!("{}?service={}&scope={}", realm, service, scope);
+        url.query_pairs_mut()
+            .append_pair("service", service)
+            .append_pair("scope", &scope);
 
         tracing::debug!(url = %url, "Fetching auth token");
 
-        let mut request = self.client.get(&url).timeout(self.timeout);
+        let mut request = self.client.get(url).timeout(self.timeout);
         if let Some(credentials) = basic_auth {
             request = request.header("Authorization", basic_auth_header(credentials));
             tracing::debug!("Using basic auth for token request");
@@ -147,7 +207,14 @@ impl DockerAuth {
             });
         }
 
-        let json: serde_json::Value = response.json().await.map_err(|_| TokenError::Unavailable)?;
+        let body = super::read_capped(response, MAX_TOKEN_BODY)
+            .await
+            .map_err(|e| {
+                tracing::warn!(upstream = %registry_url, error = ?e, "Unreadable token answer");
+                TokenError::Unavailable
+            })?;
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| TokenError::Unavailable)?;
 
         // Docker Hub returns "token", some registries return "access_token"
         let token = json
@@ -183,6 +250,28 @@ fn token_lifetime(json: &serde_json::Value, now: chrono::DateTime<chrono::Utc>) 
         })
         .unwrap_or(0);
     Duration::from_secs(expires_in.saturating_sub(age))
+}
+
+/// A realm NORA asks for a token: on the upstream's own origin, or `https` on a listed
+/// token host (`registry-1.docker.io` → `auth.docker.io` built in). Never with a fragment,
+/// which would cut off the query NORA appends.
+fn realm_allowed(realm: &Url, upstream: &Url, token_hosts: &[String]) -> bool {
+    if realm.fragment().is_some() {
+        return false;
+    }
+    if same_origin(realm, upstream) {
+        return true;
+    }
+    let Some(host) = realm.host_str() else {
+        return false;
+    };
+    let authority = match realm.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    let builtin =
+        upstream.host_str() == Some("registry-1.docker.io") && authority == "auth.docker.io";
+    realm.scheme() == "https" && (builtin || token_hosts.contains(&authority))
 }
 
 impl Default for DockerAuth {
@@ -306,11 +395,11 @@ mod tests {
             let auth = DockerAuth::default();
             let header = format!(r#"Bearer realm="{}/token",service="s""#, server.uri());
             let token = auth
-                .get_token("https://r.example", "lib/x", Some(&header), None)
+                .get_token(&server.uri(), "lib/x", Some(&header), None)
                 .await;
             assert_eq!(token.as_deref().ok(), Some("tok"));
             let tokens = auth.tokens.read();
-            match tokens.get("https://r.example:lib/x") {
+            match tokens.get(&format!("{}:lib/x", server.uri())) {
                 Some(t) => {
                     assert!(cached, "expires_in {expires_in} must not be cached");
                     let left = t.expires_at.saturating_duration_since(Instant::now());
@@ -358,7 +447,7 @@ mod tests {
             (Some("a:x"), "tok-a"),
         ] {
             let token = auth
-                .get_token("https://r.example", "lib/x", Some(&challenge), credentials)
+                .get_token(&server.uri(), "lib/x", Some(&challenge), credentials)
                 .await;
             assert_eq!(token.as_deref().ok(), Some(want), "{credentials:?}");
         }
@@ -468,7 +557,7 @@ mod tests {
         let auth = DockerAuth::new(reqwest::Client::new(), 1);
         let result = auth
             .get_token(
-                "https://registry.example.com",
+                "http://127.0.0.1:1",
                 "library/test",
                 Some(r#"Bearer realm="http://127.0.0.1:1/token",service="test""#),
                 None,
@@ -553,7 +642,7 @@ mod tests {
             let auth = DockerAuth::new(reqwest::Client::new(), 5);
             let got = auth
                 .get_token(
-                    "https://registry.example.com",
+                    &server.uri(),
                     "project1/service1",
                     Some(&challenge),
                     Some("robot:secret"),
@@ -580,5 +669,211 @@ mod tests {
             )
             .await;
         assert_eq!(result, Err(TokenError::Unavailable));
+    }
+
+    /// A014: a realm is followed on the upstream's own origin, or over https on a token host
+    /// (built-in Docker Hub, or listed); never with a fragment or a downgrade.
+    #[test]
+    fn a_realm_is_bound_to_the_upstream() {
+        let url = |u: &str| Url::parse(u).unwrap();
+        let listed = ["ghcr.io".to_string(), "tok.example:8443".to_string()];
+        let hub = url("https://registry-1.docker.io");
+        let own = url("https://reg.example");
+        for (upstream, realm, ok) in [
+            (&hub, "https://auth.docker.io/token", true),
+            (&hub, "http://auth.docker.io/token", false),
+            (&hub, "https://auth.docker.io:8443/token", false),
+            (&own, "https://auth.docker.io/token", false),
+            (&own, "https://reg.example/token?x=1", true),
+            (&own, "https://reg.example/token#", false),
+            (&own, "http://reg.example/token", false),
+            (&own, "https://reg.example:8443/token", false),
+            (&own, "https://ghcr.io/token", true),
+            (&own, "http://ghcr.io/token", false),
+            (&own, "https://ghcr.io:8443/token", false),
+            (&own, "https://tok.example:8443/token", true),
+            (&own, "https://tok.example/token", false),
+            (&own, "https://elsewhere.example/token", false),
+        ] {
+            assert_eq!(
+                realm_allowed(&url(realm), upstream, &listed),
+                ok,
+                "{upstream} {realm}"
+            );
+        }
+    }
+
+    /// A014: a realm off the upstream's origin gets no request and no credential; a listed
+    /// token host is matched per upstream url; service and scope are encoded.
+    #[tokio::test]
+    async fn get_token_follows_only_a_realm_bound_to_the_upstream() {
+        use wiremock::matchers::{any, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let other = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"token": "MARKER"})),
+            )
+            .mount(&other)
+            .await;
+        let upstream = MockServer::start().await;
+        let auth = DockerAuth::default();
+        for realm in [
+            format!("{}/t", other.uri()),
+            format!("{}/t?x=1#", other.uri()),
+            format!("{}/t#", upstream.uri()),
+        ] {
+            let challenge = format!(r#"Bearer realm="{realm}",service="s""#);
+            let got = auth
+                .get_token(
+                    &upstream.uri(),
+                    "library/x",
+                    Some(&challenge),
+                    Some("u:dummy"),
+                )
+                .await;
+            assert_eq!(got, Err(TokenError::Refused), "{realm}");
+        }
+        assert!(other.received_requests().await.unwrap().is_empty());
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+
+        // Listing the other origin's host for this upstream does not admit plain http.
+        let other_host = other.address().to_string();
+        let mut entry: crate::config::DockerUpstream =
+            toml::from_str(&format!("url = \"{}/\"", upstream.uri())).unwrap();
+        entry.token_hosts = vec![format!(" {other_host} ")];
+        let listed = DockerAuth::default().with_token_hosts(&[entry]);
+        assert_eq!(
+            listed.token_hosts.get(&upstream.uri()),
+            Some(&vec![other_host])
+        );
+        let challenge = format!(r#"Bearer realm="{}/t",service="s""#, other.uri());
+        let got = listed
+            .get_token(&upstream.uri(), "library/x", Some(&challenge), None)
+            .await;
+        assert_eq!(got, Err(TokenError::Refused));
+        assert!(other.received_requests().await.unwrap().is_empty());
+
+        // The upstream's own realm: answered, with the query encoded pair by pair.
+        Mock::given(query_param("service", "s&scope=evil"))
+            .and(query_param("scope", "repository:library/x:pull"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"token": "own"})),
+            )
+            .mount(&upstream)
+            .await;
+        let challenge = format!(
+            r#"Bearer realm="{}/token",service="s&scope=evil""#,
+            upstream.uri()
+        );
+        let got = auth
+            .get_token(&upstream.uri(), "library/x", Some(&challenge), None)
+            .await;
+        assert_eq!(got.as_deref(), Ok("own"));
+        let asked = upstream.received_requests().await.unwrap();
+        let pairs: Vec<_> = asked[0].url.query_pairs().collect();
+        assert_eq!(pairs.iter().filter(|(k, _)| k == "scope").count(), 1);
+    }
+
+    /// A055: a token answer is read up to 1 MiB, declared length or not.
+    #[tokio::test]
+    async fn a_token_answer_over_the_cap_is_unavailable() {
+        use std::io::Write as _;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for (pad, want) in [
+            (1024, Ok("tok".to_string())),
+            (MAX_TOKEN_BODY as usize + 1, Err(TokenError::Unavailable)),
+        ] {
+            let doc = serde_json::json!({"access_token": "tok", "x": "p".repeat(pad)});
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            gz.write_all(doc.to_string().as_bytes()).unwrap();
+            let server = MockServer::start().await;
+            Mock::given(wiremock::matchers::any())
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Type", "application/json")
+                        .insert_header("Content-Encoding", "gzip")
+                        .set_body_bytes(gz.finish().unwrap()),
+                )
+                .mount(&server)
+                .await;
+            let challenge = format!(r#"Bearer realm="{}/t",service="s""#, server.uri());
+            let got = DockerAuth::default()
+                .get_token(&server.uri(), "library/x", Some(&challenge), None)
+                .await;
+            assert_eq!(got, want, "pad {pad}");
+        }
+    }
+
+    fn cached(expires_at: Instant) -> CachedToken {
+        let token = "old".to_string();
+        CachedToken { token, expires_at }
+    }
+
+    async fn token_server() -> wiremock::MockServer {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "tok", "expires_in": 30})),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// A062: a cache full of live tokens stays at the cap and the new token is still used.
+    #[tokio::test]
+    async fn test_get_token_cache_is_bounded() {
+        let server = token_server().await;
+        let auth = DockerAuth::default();
+        let live = Instant::now() + Duration::from_secs(300);
+        auth.tokens
+            .write()
+            .extend((0..TOKEN_CACHE_MAX).map(|i| (format!("k{i}"), cached(live))));
+        let challenge = format!(r#"Bearer realm="{}/t",service="s""#, server.uri());
+        for name in ["lib/new", "lib/other"] {
+            let got = auth
+                .get_token(&server.uri(), name, Some(&challenge), None)
+                .await;
+            assert_eq!(got.as_deref(), Ok("tok"));
+        }
+        let tokens = auth.tokens.read();
+        assert_eq!(tokens.len(), TOKEN_CACHE_MAX);
+        assert!(!tokens.contains_key(&format!("{}:lib/new", server.uri())));
+    }
+
+    /// A062: at the cap, expired tokens make room for the new one.
+    #[tokio::test]
+    async fn test_get_token_drops_expired_at_cap() {
+        let server = token_server().await;
+        let auth = DockerAuth::default();
+        let gone = Instant::now() - Duration::from_secs(1);
+        auth.tokens
+            .write()
+            .extend((0..TOKEN_CACHE_MAX).map(|i| (format!("k{i}"), cached(gone))));
+        let challenge = format!(r#"Bearer realm="{}/t",service="s""#, server.uri());
+        let got = auth
+            .get_token(&server.uri(), "lib/new", Some(&challenge), None)
+            .await;
+        assert_eq!(got.as_deref(), Ok("tok"));
+        let tokens = auth.tokens.read();
+        assert_eq!(tokens.len(), 1);
+        assert!(tokens.contains_key(&format!("{}:lib/new", server.uri())));
+    }
+
+    /// A062: the maintenance sweep drops expired tokens only.
+    #[test]
+    fn test_prune_expired() {
+        let auth = DockerAuth::default();
+        let now = Instant::now();
+        auth.tokens.write().extend([
+            ("gone".to_string(), cached(now - Duration::from_secs(1))),
+            ("live".to_string(), cached(now + Duration::from_secs(300))),
+        ]);
+        auth.prune_expired();
+        let tokens = auth.tokens.read();
+        assert_eq!(tokens.keys().collect::<Vec<_>>(), ["live"]);
     }
 }

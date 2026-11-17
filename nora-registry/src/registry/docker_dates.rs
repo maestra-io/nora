@@ -409,10 +409,11 @@ async fn post_json(
             return None;
         }
     };
-    if response.content_length().is_some_and(|n| n > MAX_BODY) {
-        return None;
-    }
-    response.bytes().await.ok()
+    // A running count: a chunked or compressed body declares no length.
+    super::read_capped(response, MAX_BODY)
+        .await
+        .ok()
+        .map(Into::into)
 }
 
 fn rfc3339(at: &serde_json::Value) -> Option<i64> {
@@ -677,6 +678,7 @@ mod tests {
         DockerUpstream {
             trust_upstream_dates: true,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: url.into(),
             auth: None,
             auth_env: None,
@@ -1004,5 +1006,28 @@ mod tests {
             search_page(DateSource::HubTagLastPushed, b"<html>", D, &[]),
             None
         );
+    }
+
+    /// A055: the gallery POST answer is read up to MAX_BODY, declared length or not.
+    #[tokio::test]
+    async fn post_json_caps_an_undeclared_body() {
+        use std::io::Write as _;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ctx = crate::test_helpers::create_test_context();
+        for (len, ok) in [(1024usize, true), (MAX_BODY as usize + 1, false)] {
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            gz.write_all(&vec![b' '; len]).unwrap();
+            let server = MockServer::start().await;
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Encoding", "gzip")
+                        .set_body_bytes(gz.finish().unwrap()),
+                )
+                .mount(&server)
+                .await;
+            let got = post_json(&ctx.state, &server.uri(), &serde_json::json!({})).await;
+            assert_eq!(got.map(|b| b.len()), ok.then_some(len), "{len}");
+        }
     }
 }

@@ -169,6 +169,7 @@ async fn test_upstream_429_is_429_not_404() {
         cfg.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: upstream.uri(),
             auth: None,
             auth_env: None,
@@ -261,6 +262,7 @@ async fn a_cold_miss_is_404_only_when_an_upstream_said_not_found() {
                 .map(|url| DockerUpstream {
                     trust_upstream_dates: false,
                     date_token_file: None,
+                    token_hosts: Vec::new(),
                     url,
                     auth: None,
                     auth_env: None,
@@ -347,6 +349,7 @@ async fn a_bound_namespace_never_falls_through_to_another_upstream() {
                 auth_env: None,
                 trust_upstream_dates: false,
                 date_token_file: None,
+                token_hosts: Vec::new(),
             };
             let hub = DockerUpstream {
                 url: squatter.uri(),
@@ -357,6 +360,7 @@ async fn a_bound_namespace_never_falls_through_to_another_upstream() {
                 auth_env: None,
                 trust_upstream_dates: false,
                 date_token_file: None,
+                token_hosts: Vec::new(),
             };
             let upstreams = if harbor_first {
                 vec![bound, hub]
@@ -432,6 +436,7 @@ async fn under_deny_an_unrouted_name_is_refused_and_a_bound_name_is_not() {
                 auth_env: None,
                 trust_upstream_dates: false,
                 date_token_file: None,
+                token_hosts: Vec::new(),
             },
             DockerUpstream {
                 url: harbor_url,
@@ -442,6 +447,7 @@ async fn under_deny_an_unrouted_name_is_refused_and_a_bound_name_is_not() {
                 auth_env: None,
                 trust_upstream_dates: false,
                 date_token_file: None,
+                token_hosts: Vec::new(),
             },
         ];
     });
@@ -525,6 +531,7 @@ async fn a_bound_namespace_is_fetched_whole_and_cached_under_its_owner() {
                 auth_env: None,
                 trust_upstream_dates: false,
                 date_token_file: None,
+                token_hosts: Vec::new(),
             },
             DockerUpstream {
                 url: harbor_url,
@@ -535,6 +542,7 @@ async fn a_bound_namespace_is_fetched_whole_and_cached_under_its_owner() {
                 auth_env: None,
                 trust_upstream_dates: false,
                 date_token_file: None,
+                token_hosts: Vec::new(),
             },
         ];
     });
@@ -615,6 +623,7 @@ async fn a_hosted_image_under_a_bound_namespace_is_served_locally() {
             auth_env: None,
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
         }];
         cfg.curation.internal_namespaces = vec!["team-a/*".to_string()];
     });
@@ -726,6 +735,7 @@ async fn a_name_behind_an_unknown_registry_host_is_not_answered_by_another_regis
             auth_env: None,
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
         }];
     });
 
@@ -887,6 +897,7 @@ async fn an_upstream_that_refuses_noras_credentials_is_a_502_that_says_so() {
                 auth_env: None,
                 trust_upstream_dates: false,
                 date_token_file: None,
+                token_hosts: Vec::new(),
             }];
         });
         let case = format!("{challenge:?} token={token:?} credential={credential}");
@@ -959,6 +970,7 @@ async fn an_upstream_that_refuses_noras_credentials_is_a_502_that_says_so() {
                     auth_env: None,
                     trust_upstream_dates: false,
                     date_token_file: None,
+                    token_hosts: Vec::new(),
                 })
                 .collect();
         });
@@ -980,6 +992,7 @@ fn upstreams_of(entries: Vec<(String, Vec<String>)>) -> Vec<crate::config::Docke
             auth_env: None,
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
         })
         .collect()
 }
@@ -1246,6 +1259,7 @@ async fn a_proxied_miss_is_an_oci_error() {
                 auth_env: None,
                 trust_upstream_dates: false,
                 date_token_file: None,
+                token_hosts: Vec::new(),
             }];
         });
         if open {
@@ -1296,6 +1310,7 @@ async fn test_hosted_manifest_skips_upstream_revalidation() {
         cfg.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: "http://127.0.0.1:1".into(),
             auth: None,
             auth_env: None,
@@ -1434,6 +1449,7 @@ async fn a_manifest_by_digest_is_served_only_if_it_has_that_digest() {
     let upstream = |url: String, prefix: Option<&str>| DockerUpstream {
         trust_upstream_dates: false,
         date_token_file: None,
+        token_hosts: Vec::new(),
         url,
         auth: None,
         auth_env: None,
@@ -1566,6 +1582,7 @@ async fn a_stored_copy_by_digest_is_served_only_if_it_has_that_digest() {
     let upstream = DockerUpstream {
         trust_upstream_dates: false,
         date_token_file: None,
+        token_hosts: Vec::new(),
         url: server.uri(),
         auth: None,
         auth_env: None,
@@ -1686,6 +1703,7 @@ async fn a_push_pins_a_tag_that_was_pulled_through_the_proxy() {
         cfg.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: uri,
             auth: None,
             auth_env: None,
@@ -1781,6 +1799,7 @@ async fn table_context() -> (
     let upstream = DockerUpstream {
         trust_upstream_dates: false,
         date_token_file: None,
+        token_hosts: Vec::new(),
         url: server.uri(),
         auth: None,
         auth_env: None,
@@ -1860,6 +1879,7 @@ async fn row1_a_pull_of_a_pushed_tag_reads_its_metadata_once() {
     let upstream = DockerUpstream {
         trust_upstream_dates: false,
         date_token_file: None,
+        token_hosts: Vec::new(),
         url: "http://127.0.0.1:9".to_string(),
         auth: None,
         auth_env: None,
@@ -1898,6 +1918,7 @@ async fn a_pull_by_digest_of_a_proxied_copy_reads_two_documents() {
     let upstream = DockerUpstream {
         trust_upstream_dates: false,
         date_token_file: None,
+        token_hosts: Vec::new(),
         url: "http://127.0.0.1:9".to_string(),
         auth: None,
         auth_env: None,
@@ -2164,6 +2185,7 @@ async fn row7b_curation_dates_a_tag_by_the_push_that_answers_it() {
         let upstream = DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: server.uri(),
             auth: None,
             auth_env: None,
@@ -2248,6 +2270,7 @@ async fn docker_zero_min_release_age_lets_the_second_pull_of_a_fresh_tag_through
         let upstream = DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: "http://127.0.0.1:9".to_string(),
             auth: None,
             auth_env: None,
@@ -2701,6 +2724,7 @@ async fn a_hosted_pull_counts_against_the_pushed_image() {
         cfg.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: "http://127.0.0.1:1".into(),
             auth: None,
             auth_env: None,
@@ -3175,6 +3199,7 @@ async fn a_later_pull_keeps_the_push_date() {
         cfg.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: "http://127.0.0.1:1".into(),
             auth: None,
             auth_env: None,
@@ -3259,6 +3284,7 @@ async fn a_proxied_pull_counts_against_the_proxied_copy() {
         cfg.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: "http://127.0.0.1:1".into(),
             auth: None,
             auth_env: None,
@@ -4778,6 +4804,7 @@ async fn test_docker_circuit_breaker_trips() {
         cfg.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: "http://127.0.0.1:1".into(),
             auth: None,
             auth_env: None,
@@ -5042,6 +5069,7 @@ async fn test_docker_circuit_breaker_per_upstream() {
             DockerUpstream {
                 trust_upstream_dates: false,
                 date_token_file: None,
+                token_hosts: Vec::new(),
                 url: "http://127.0.0.1:1".into(), // upstream A (will be tripped)
                 auth: None,
                 auth_env: None,
@@ -5052,6 +5080,7 @@ async fn test_docker_circuit_breaker_per_upstream() {
             DockerUpstream {
                 trust_upstream_dates: false,
                 date_token_file: None,
+                token_hosts: Vec::new(),
                 url: "http://127.0.0.1:2".into(), // upstream B (stays closed)
                 auth: None,
                 auth_env: None,
@@ -5196,6 +5225,7 @@ fn test_canonicalize_prefix_routing() {
     let upstreams = vec![crate::config::DockerUpstream {
         trust_upstream_dates: false,
         date_token_file: None,
+        token_hosts: Vec::new(),
         url: "https://registry-1.docker.io".to_string(),
         auth: None,
         auth_env: None,
@@ -5217,6 +5247,7 @@ fn test_canonicalize_hostname_detection() {
     let upstreams = vec![crate::config::DockerUpstream {
         trust_upstream_dates: false,
         date_token_file: None,
+        token_hosts: Vec::new(),
         url: "https://registry-1.docker.io".to_string(),
         auth: None,
         auth_env: None,
@@ -5246,6 +5277,7 @@ fn test_canonicalize_fallback() {
     let upstreams = vec![crate::config::DockerUpstream {
         trust_upstream_dates: false,
         date_token_file: None,
+        token_hosts: Vec::new(),
         url: "https://registry-1.docker.io".to_string(),
         auth: None,
         auth_env: None,
@@ -5320,6 +5352,7 @@ fn test_canonicalize_multi_upstream() {
         crate::config::DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             auth_env: None,
@@ -5330,6 +5363,7 @@ fn test_canonicalize_multi_upstream() {
         crate::config::DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: "https://ghcr.io".to_string(),
             auth: None,
             auth_env: None,
@@ -5362,6 +5396,7 @@ fn test_canonicalize_deny_mode_blocks_unmatched() {
         crate::config::DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             auth_env: None,
@@ -5372,6 +5407,7 @@ fn test_canonicalize_deny_mode_blocks_unmatched() {
         crate::config::DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: "https://ghcr.io".to_string(),
             auth: None,
             auth_env: None,
@@ -5406,6 +5442,7 @@ fn test_canonicalize_deny_mode_allows_known_hostname() {
     let upstreams = vec![crate::config::DockerUpstream {
         trust_upstream_dates: false,
         date_token_file: None,
+        token_hosts: Vec::new(),
         url: "https://registry-1.docker.io".to_string(),
         auth: None,
         auth_env: None,
@@ -5435,6 +5472,7 @@ fn bound_upstreams() -> Vec<crate::config::DockerUpstream> {
             auth_env: None,
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
         };
     vec![
         entry("https://ghcr.io", "ghcr.io", Some("ghcr"), &[]),
@@ -5542,6 +5580,7 @@ fn test_canonicalize_registry_host_decision_table() {
         auth_env: None,
         trust_upstream_dates: false,
         date_token_file: None,
+        token_hosts: Vec::new(),
     };
     let with_hub = vec![
         entry("https://registry.gitlab.com", None, &[]),
@@ -5635,6 +5674,7 @@ fn test_denied_response_format() {
     let upstreams = vec![crate::config::DockerUpstream {
         trust_upstream_dates: false,
         date_token_file: None,
+        token_hosts: Vec::new(),
         url: "https://registry-1.docker.io".to_string(),
         auth: None,
         auth_env: None,
@@ -5690,6 +5730,7 @@ async fn test_docker_proxy_blob_sha256_mismatch_rejected() {
         cfg.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: upstream.uri(),
             auth: None,
             auth_env: None,
@@ -5777,6 +5818,7 @@ async fn test_docker_proxy_tag_revalidates_on_upstream_change() {
         cfg.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: upstream.uri(),
             auth: None,
             auth_env: None,
@@ -5877,6 +5919,7 @@ async fn quarantine_dates_what_a_manifest_names_at_its_own_first_seen() {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
                 date_token_file: None,
+                token_hosts: Vec::new(),
                 url: upstream.uri(),
                 auth: None,
                 auth_env: None,
@@ -5996,6 +6039,7 @@ async fn a_quarantine_exception_admits_the_image_and_what_it_names() {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
                 date_token_file: None,
+                token_hosts: Vec::new(),
                 url: upstream.uri(),
                 auth: None,
                 auth_env: None,
@@ -6135,6 +6179,7 @@ async fn a_quarantine_exempt_repository_is_served_while_fresh_and_its_sibling_he
         cfg.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: upstream.uri(),
             auth: None,
             auth_env: None,
@@ -6269,6 +6314,7 @@ mod trust_upstream_dates {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: trust,
                 date_token_file: None,
+                token_hosts: Vec::new(),
                 url: url.clone(),
                 auth: None,
                 auth_env: None,
@@ -6296,6 +6342,7 @@ mod trust_upstream_dates {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: true,
                 date_token_file: file.clone(),
+                token_hosts: Vec::new(),
                 url: url.clone(),
                 auth: None,
                 auth_env: None,
@@ -7454,6 +7501,7 @@ async fn test_docker_proxy_blob_sha256_match_served_and_cached() {
         cfg.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: upstream.uri(),
             auth: None,
             auth_env: None,
@@ -7570,6 +7618,7 @@ fn unreachable_upstream() -> crate::config::DockerUpstream {
     crate::config::DockerUpstream {
         trust_upstream_dates: false,
         date_token_file: None,
+        token_hosts: Vec::new(),
         // Reserved port on localhost — connect fails fast, no real network.
         url: "http://127.0.0.1:9".to_string(),
         auth: None,
@@ -7659,4 +7708,105 @@ async fn manifest_get_serves_hosted_legacy_on_ns_not_found() {
     );
     let body = body_bytes(resp).await;
     assert_eq!(body.as_ref(), b"{\"legacy\":true}");
+}
+
+/// A014: a token realm off the upstream's origin is never asked, the upstream's credential
+/// does not go there, and nothing it would answer reaches the upstream: the pull is a 502.
+/// The upstream's own realm still answers.
+#[tokio::test]
+async fn a_token_realm_off_the_upstreams_origin_is_refused() {
+    use crate::config::DockerUpstream;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let other = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"token": "MARKER"})),
+        )
+        .mount(&other)
+        .await;
+    let manifest = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","size":2,"digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111"},"layers":[]}"#;
+    for (realm, token_hosts, want) in [
+        (
+            format!("{}/t", other.uri()),
+            vec![],
+            StatusCode::BAD_GATEWAY,
+        ),
+        (
+            format!("{}/t?x=1#", other.uri()),
+            vec![],
+            StatusCode::BAD_GATEWAY,
+        ),
+        // listed, but not over https
+        (
+            format!("{}/t", other.uri()),
+            vec![other.address().to_string()],
+            StatusCode::BAD_GATEWAY,
+        ),
+        ("/token".to_string(), vec![], StatusCode::OK),
+    ] {
+        let registry = MockServer::start().await;
+        let realm = if realm.starts_with('/') {
+            format!("{}{realm}", registry.uri())
+        } else {
+            realm
+        };
+        Mock::given(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"token": "OWN"})),
+            )
+            .mount(&registry)
+            .await;
+        for bearer in ["MARKER", "OWN"] {
+            Mock::given(header("authorization", format!("Bearer {bearer}").as_str()))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+                        .set_body_bytes(manifest.to_vec()),
+                )
+                .with_priority(1)
+                .mount(&registry)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "Www-Authenticate",
+                format!("Bearer realm=\"{realm}\",service=\"svc\"").as_str(),
+            ))
+            .with_priority(5)
+            .mount(&registry)
+            .await;
+        let url = registry.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url,
+                auth: Some("u:dummy".to_string().into()),
+                namespace: None,
+                prefix: None,
+                namespaces: Vec::new(),
+                auth_env: None,
+                trust_upstream_dates: false,
+                date_token_file: None,
+                token_hosts,
+            }];
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/a014/manifests/v1",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), want, "{realm}");
+        let relayed = registry.received_requests().await.unwrap();
+        assert!(
+            !relayed.iter().any(
+                |r| r.headers.get("authorization").and_then(|v| v.to_str().ok())
+                    == Some("Bearer MARKER")
+            ),
+            "{realm}: the other origin's answer reached the upstream"
+        );
+    }
+    assert!(other.received_requests().await.unwrap().is_empty());
 }

@@ -210,6 +210,7 @@ async fn joiner_is_curated_on_its_own_request() {
         cfg.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url,
             auth: None,
             auth_env: None,

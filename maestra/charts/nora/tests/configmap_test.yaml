@@ -229,6 +229,20 @@ tests:
           path: data["config.toml"]
           pattern: 'namespace = "ghcr\.io"\n\s*trust_upstream_dates = true\n\s*date_token_file = "/var/run/secrets/github/token"'
 
+  - it: renders token_hosts as a TOML array, and nothing without it
+    set:
+      config.docker.upstreams:
+        - url: https://reg.example
+          token_hosts: [auth.example, "tok.example:8443"]
+        - url: https://quay.io
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'url = "https://reg\.example"\n\s*token_hosts = \["auth\.example", "tok\.example:8443"\]'
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'url = "https://quay\.io"\n\s*token_hosts'
+
   - it: renders retention rules
     set:
       config.retention.enabled: true

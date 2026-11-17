@@ -20,6 +20,7 @@ fn proxying_ctx() -> TestContext {
         cfg.docker.upstreams = vec![DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: "http://127.0.0.1:1".into(),
             auth: None,
             auth_env: None,

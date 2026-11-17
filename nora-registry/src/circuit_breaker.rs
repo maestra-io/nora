@@ -1042,6 +1042,7 @@ mod tests {
         config.docker.upstreams = vec![crate::config::DockerUpstream {
             trust_upstream_dates: false,
             date_token_file: None,
+            token_hosts: Vec::new(),
             url: "https://registry-1.docker.io".into(),
             auth: None,
             auth_env: None,
@@ -1412,6 +1413,7 @@ mod integration_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 trust_upstream_dates: false,
                 date_token_file: None,
+                token_hosts: Vec::new(),
                 url,
                 auth: None,
                 auth_env: None,

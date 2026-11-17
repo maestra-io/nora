@@ -80,6 +80,9 @@ data:
     {{- with $u.date_token_file }}
     date_token_file = {{ . | quote }}
     {{- end }}
+    {{- with $u.token_hosts }}
+    token_hosts = [{{ range $j, $h := . }}{{ if $j }}, {{ end }}{{ $h | quote }}{{ end }}]
+    {{- end }}
     {{- with include "nora.docker.authEnv" (list $i $u) }}
     auth_env = {{ . | quote }}
     {{- end }}
