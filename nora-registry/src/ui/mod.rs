@@ -190,23 +190,41 @@ fn apply_base_path(html: &str, base: &str) -> String {
         .replace("'/api-docs", &format!("'{base}/api-docs"))
 }
 
+/// Upper bound on a NORA-rendered page the base-path rewrite buffers. UI pages are
+/// far below it; a larger body fails with 500 instead of growing memory unbounded.
+const MAX_UI_PAGE: usize = 8 * 1024 * 1024;
+
+/// The swagger initializer: JS, yet it embeds the root-absolute spec URL.
+const SWAGGER_INIT: &str = "/api-docs/swagger-initializer.js";
+
+/// True for a request path NORA itself renders: `/` and anything at or under
+/// `/ui`, `/api/ui` or `/api-docs`. Registry routes (stored artifacts, proxied
+/// pages) are never NORA's pages and must reach the client byte-for-byte.
+fn is_own_ui_path(path: &str) -> bool {
+    path == "/"
+        || ["/ui", "/api/ui", "/api-docs"].iter().any(|p| {
+            path.strip_prefix(p)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
+}
+
 /// Response middleware: rewrite the UI's root-absolute self-links to carry the
 /// configured `public_url` path prefix. Covers HTML bodies (links + inline JS
 /// `fetch`), the Swagger UI initializer's spec URL, and redirect `Location`
-/// headers. A no-op when `base_path` is empty (the router keeps serving `/ui`,
-/// `/api/ui` and `/api-docs`; the proxy strips the prefix).
+/// headers — on NORA's own pages only ([`is_own_ui_path`]). A no-op when
+/// `base_path` is empty (the router keeps serving `/ui`, `/api/ui` and
+/// `/api-docs`; the proxy strips the prefix).
 pub(crate) async fn rewrite_ui_base_path(
     State(state): State<AppState>,
     req: Request,
     next: Next,
 ) -> Response {
     let base = state.config.server.base_path();
-    // Capture the path before the request is consumed: the Swagger initializer
-    // is served as JS (not HTML) yet embeds a root-absolute spec URL that needs
-    // the same prefix, so it is rewritten by path rather than by content type.
+    // Capture the path before the request is consumed: eligibility is decided by
+    // the route, never by the response's content type.
     let path = req.uri().path().to_string();
     let mut resp = next.run(req).await;
-    if base.is_empty() {
+    if base.is_empty() || !is_own_ui_path(&path) {
         return resp;
     }
     // A redirect target (e.g. "/" -> "/ui/", "/api-docs" -> "/api-docs/") must
@@ -232,12 +250,12 @@ pub(crate) async fn rewrite_ui_base_path(
     // The Swagger UI initializer is JS but embeds a root-absolute spec URL
     // ("/api-docs/openapi.json"); rewrite it too so the docs load under a
     // sub-path. Scoped to that one small file — large JS bundles pass through.
-    let is_swagger_init = path.ends_with("/swagger-initializer.js");
+    let is_swagger_init = path == SWAGGER_INIT;
     if !is_html && !is_swagger_init {
         return resp;
     }
     let (mut parts, body) = resp.into_parts();
-    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let bytes = match axum::body::to_bytes(body, MAX_UI_PAGE).await {
         Ok(b) => b,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
@@ -1521,5 +1539,101 @@ mod setup_route_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let html = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
         assert!(html.contains("Set up your machine"));
+    }
+}
+
+/// Audit A090: under a sub-path `public_url`, the base-path rewrite touches NORA's own
+/// pages only; a stored artifact is served byte-for-byte whatever its name or type.
+#[cfg(test)]
+mod base_path_route_tests {
+    use crate::test_helpers::*;
+    use axum::http::{Method, StatusCode};
+
+    fn header(resp: &axum::http::Response<axum::body::Body>, name: &str) -> String {
+        resp.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn own_ui_path_is_route_scoped() {
+        for own in [
+            "/",
+            "/ui",
+            "/ui/",
+            "/api/ui/npm/list",
+            "/api-docs",
+            super::SWAGGER_INIT,
+        ] {
+            assert!(super::is_own_ui_path(own), "{own}");
+        }
+        for other in [
+            "/uix",
+            "/api/uix",
+            "/api-docsx/a",
+            "/raw/ui/a.html",
+            "/simple/x/",
+        ] {
+            assert!(!super::is_own_ui_path(other), "{other}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sub_path_rewrite_leaves_registry_bytes_alone() {
+        let ctx = create_test_context_with_config(|c| {
+            c.server.public_url = Some("https://reg.test/nora".into());
+        });
+        let stored: &[u8] =
+            b"<script src=\"/ui/a.js\"></script> url: \"/api-docs/openapi.json\" \xc3\x28";
+        for path in ["/raw/t/doc.html", "/raw/t/d/swagger-initializer.js"] {
+            let put = send(&ctx.app, Method::PUT, path, stored.to_vec()).await;
+            assert!(put.status().is_success(), "PUT {path}");
+
+            let get = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(get.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                header(&get, "content-length"),
+                stored.len().to_string(),
+                "{path}"
+            );
+            assert!(!header(&get, "etag").is_empty(), "{path}: ETag kept");
+            assert_eq!(&body_bytes(get).await[..], stored, "{path}: body");
+
+            let ranged = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                path,
+                vec![("range", "bytes=12-21")],
+                "",
+            )
+            .await;
+            assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT, "{path}");
+            assert_eq!(
+                &body_bytes(ranged).await[..],
+                &stored[12..22],
+                "{path}: range"
+            );
+
+            let head = send(&ctx.app, Method::HEAD, path, "").await;
+            assert_eq!(
+                header(&head, "content-length"),
+                stored.len().to_string(),
+                "{path}"
+            );
+        }
+
+        // NORA's own pages keep the prefix.
+        let ui = send(&ctx.app, Method::GET, "/ui/", "").await;
+        let html = String::from_utf8(body_bytes(ui).await.to_vec()).unwrap();
+        assert!(html.contains("\"/nora/ui"), "UI links prefixed");
+        let root = send(&ctx.app, Method::GET, "/", "").await;
+        assert_eq!(header(&root, "location"), "/nora/ui/");
+        let docs = crate::request_layers(crate::openapi::routes(), &ctx.state)
+            .with_state(ctx.state.clone());
+        let init = send(&docs, Method::GET, super::SWAGGER_INIT, "").await;
+        assert_eq!(init.status(), StatusCode::OK);
+        let js = String::from_utf8(body_bytes(init).await.to_vec()).unwrap();
+        assert!(js.contains("/nora/api-docs/openapi.json"), "{js}");
     }
 }

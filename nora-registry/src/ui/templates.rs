@@ -898,6 +898,28 @@ fn render_dir(
     layout_dark(&page_title, &content, Some(slug), "", lang, auth_enabled)
 }
 
+/// Per-version install command for the NuGet package page. Reads the package id
+/// and base URL from #install-cmd's data attributes; holds no interpolated data.
+const NUGET_VERSION_JS: &str = r##"<script>
+document.querySelectorAll('.version-row').forEach(function(row) {
+    row.addEventListener('click', function() {
+        var ver = this.getAttribute('data-version');
+        var el = document.getElementById('install-cmd');
+        if (!el) { return; }
+        var cmd = 'dotnet add package ' + el.getAttribute('data-pkg') + ' --version ' + ver + ' --source ' + el.getAttribute('data-base') + '/nuget/v3/index.json';
+        el.textContent = cmd;
+        var btn = document.getElementById('copy-btn');
+        if (btn) { btn.setAttribute('data-cmd', cmd); }
+        document.querySelectorAll('.version-row').forEach(function(r) { r.classList.remove('bg-slate-700/50'); });
+        this.classList.add('bg-slate-700/50');
+    });
+});
+var copyBtn = document.getElementById('copy-btn');
+if (copyBtn) { copyBtn.addEventListener('click', function() {
+    navigator.clipboard.writeText(this.getAttribute('data-cmd') || this.closest('.bg-\\[\\#1e293b\\]').querySelector('code').textContent);
+}); }
+</script>"##;
+
 /// Renders package detail page (npm, cargo, pypi)
 pub fn render_package_detail(
     registry_type: &str,
@@ -1112,30 +1134,11 @@ pub fn render_package_detail(
         detail.versions.len()
     };
 
-    // JavaScript for per-version install command (NuGet-specific)
+    // Per-version install command (NuGet). A constant script: the package name and
+    // base URL reach it only through the html-escaped data-pkg / data-base attributes
+    // on #install-cmd, never as script source (HTML escaping is wrong inside JS).
     let version_js = if rt == Some(RegistryType::Nuget) {
-        format!(
-            r##"<script>
-document.querySelectorAll('.version-row').forEach(function(row) {{
-    row.addEventListener('click', function() {{
-        var ver = this.getAttribute('data-version');
-        var cmd = 'dotnet add package {name} --version ' + ver + ' --source {base}/nuget/v3/index.json';
-        var el = document.getElementById('install-cmd');
-        if (el) {{ el.textContent = cmd; }}
-        var btn = document.getElementById('copy-btn');
-        if (btn) {{ btn.setAttribute('data-cmd', cmd); }}
-        document.querySelectorAll('.version-row').forEach(function(r) {{ r.classList.remove('bg-slate-700/50'); }});
-        this.classList.add('bg-slate-700/50');
-    }});
-}});
-var copyBtn = document.getElementById('copy-btn');
-if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
-    navigator.clipboard.writeText(this.getAttribute('data-cmd') || this.closest('.bg-\\[\\#1e293b\\]').querySelector('code').textContent);
-}}); }}
-</script>"##,
-            name = html_escape(name),
-            base = html_escape(base_url),
-        )
+        NUGET_VERSION_JS.to_string()
     } else {
         String::new()
     };
@@ -1157,7 +1160,7 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
         <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-3 md:p-6 mb-6">
             <h2 class="text-lg font-semibold text-slate-200 mb-3">{install_label}</h2>
             <div class="flex items-center bg-slate-900 text-green-400 rounded-lg p-3 md:p-4 font-mono text-xs md:text-sm overflow-x-auto">
-                <code id="install-cmd" class="flex-1 whitespace-nowrap">{cmd}</code>
+                <code id="install-cmd" data-pkg="{pkg}" data-base="{base}" class="flex-1 whitespace-nowrap">{cmd}</code>
                 <button id="copy-btn" data-cmd="{cmd}" onclick="navigator.clipboard.writeText(this.getAttribute('data-cmd'))" class="ml-4 text-slate-400 hover:text-white transition-colors flex-shrink-0" title="Copy to clipboard">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
@@ -1194,6 +1197,8 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
         title = detail_title,
         install_label = _t.install_command,
         cmd = html_escape(&install_cmd),
+        pkg = html_escape(name),
+        base = html_escape(base_url),
         metadata_panel = metadata_panel,
         versions_label = if rt == Some(RegistryType::Raw) {
             _t.files
@@ -1927,6 +1932,32 @@ mod tests {
             html.contains("/api/ui/go/search"),
             "go search not wired to its endpoint"
         );
+    }
+
+    /// Audit B04: the NuGet page's per-version script carries no request or config
+    /// data; the name and base URL reach it only as html-escaped data attributes.
+    #[test]
+    fn nuget_detail_keeps_name_and_base_out_of_script_source() {
+        let name = "Pkg\\x\n'y";
+        let html = render_package_detail(
+            "nuget",
+            name,
+            &empty_detail(),
+            Lang::En,
+            "https://r.example",
+            false,
+        );
+        assert!(
+            html.contains(NUGET_VERSION_JS),
+            "per-version script present"
+        );
+        for script in html.split("<script").skip(1) {
+            let src = script.split("</script>").next().unwrap();
+            assert!(!src.contains("Pkg"), "name in script source: {src}");
+            assert!(!src.contains("r.example"), "base in script source: {src}");
+        }
+        assert!(html.contains("data-pkg=\"Pkg\\x\n&#39;y\""));
+        assert!(html.contains("data-base=\"https://r.example\""));
     }
 
     #[test]
