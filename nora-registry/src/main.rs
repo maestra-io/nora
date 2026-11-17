@@ -141,7 +141,9 @@ enum Commands {
     },
     /// Garbage collect orphaned blobs and checksum sidecars
     Gc {
-        /// Actually delete orphans (default: dry-run only)
+        /// Actually delete orphans (default: dry-run only). Beside a running server this is
+        /// safe only while the server runs with gc.enabled=true: only then does it record the
+        /// blobs its clients were told exist.
         #[arg(long, default_value = "false")]
         apply: bool,
     },

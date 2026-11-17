@@ -970,6 +970,12 @@ struct Faults {
     deletes: Vec<String>,
     /// Seconds every object's reported modification time lies in the past.
     age_secs: u64,
+    /// Seconds the GC handshake markers' (`.nora-gc-`) modification time lies in the past.
+    marker_age_secs: u64,
+    /// Key prefix whose next `stat` waits until [`StorageOutage::unpark_stat`].
+    park_next_stat: Option<String>,
+    /// A `stat` waits on [`StorageOutage::park_next_stat_of`] now.
+    stat_parked: bool,
 }
 
 /// How the read of a key fails.
@@ -1045,14 +1051,57 @@ impl StorageOutage {
     }
 
     /// Report every object as last modified `secs` ago: an in-memory store stamps "now", and
-    /// age-based cleanup needs old objects.
+    /// age-based cleanup needs old objects. The GC handshake markers (`.nora-gc-`) are aged by
+    /// [`Self::age_markers`] instead: the code under test writes them during the test.
     pub fn age_all(&self, secs: u64) {
         self.faults().age_secs = secs;
     }
 
-    fn aged(&self, mut meta: crate::storage::FileMeta) -> crate::storage::FileMeta {
-        meta.modified = meta.modified.saturating_sub(self.faults().age_secs);
+    /// Report the GC handshake markers as last modified `secs` ago.
+    pub fn age_markers(&self, secs: u64) {
+        self.faults().marker_age_secs = secs;
+    }
+
+    fn aged(&self, key: &str, mut meta: crate::storage::FileMeta) -> crate::storage::FileMeta {
+        let faults = self.faults();
+        let age = if key.starts_with(".nora-gc-") {
+            faults.marker_age_secs
+        } else {
+            faults.age_secs
+        };
+        meta.modified = meta.modified.saturating_sub(age);
         meta
+    }
+
+    /// Make the next `stat` of a key starting with `prefix` wait until [`Self::unpark_stat`]:
+    /// parks its caller at that step while every other call answers.
+    pub fn park_next_stat_of(&self, prefix: &str) {
+        self.faults().park_next_stat = Some(prefix.to_string());
+    }
+
+    /// Whether a `stat` waits on [`Self::park_next_stat_of`] now.
+    pub fn stat_parked(&self) -> bool {
+        self.faults().stat_parked
+    }
+
+    /// Let the parked `stat` go on.
+    pub fn unpark_stat(&self) {
+        self.faults().stat_parked = false;
+    }
+
+    async fn wait_unparked(&self, key: &str) {
+        {
+            let mut faults = self.faults();
+            match &faults.park_next_stat {
+                Some(prefix) if key.starts_with(prefix.as_str()) => {}
+                _ => return,
+            }
+            faults.park_next_stat = None;
+            faults.stat_parked = true;
+        }
+        while self.stat_parked() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     fn stat_fails(&self, key: &str) -> bool {
@@ -1201,11 +1250,12 @@ impl crate::storage::StorageBackend for OutageBackend {
 
     async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
         self.outage.wait_answer().await;
+        self.outage.wait_unparked(key).await;
         self.check().ok()?;
         if self.outage.stat_fails(key) {
             return None;
         }
-        self.inner.stat(key).await.map(|m| self.outage.aged(m))
+        self.inner.stat(key).await.map(|m| self.outage.aged(key, m))
     }
 
     async fn list_with_meta(
@@ -1219,7 +1269,10 @@ impl crate::storage::StorageBackend for OutageBackend {
         let entries = self.inner.list_with_meta(prefix).await?;
         Ok(entries
             .into_iter()
-            .map(|(key, meta)| (key, self.outage.aged(meta)))
+            .map(|(key, meta)| {
+                let meta = self.outage.aged(&key, meta);
+                (key, meta)
+            })
             .collect())
     }
 

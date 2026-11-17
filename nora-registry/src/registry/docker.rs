@@ -1850,10 +1850,10 @@ async fn check_blob(
     // just to return Content-Length on a HEAD request (#526).
     // Through `confirm_blob`: GC must not sweep a layer this answer lets the client skip.
     let found = crate::gc::confirm_blob(
-        state.config.gc.enabled,
+        &state.config.gc,
+        &state.storage,
         &state.publish_locks,
         &[&key, &legacy_key],
-        storage_stat_with_fallback(&state.storage, &key, &legacy_key),
     )
     .await;
     match found {
@@ -2240,10 +2240,10 @@ async fn mount_blob(
     // Must match the key upload finalization writes.
     let dst_key = format!("docker/{}/blobs/{}", name, digest);
     let held = crate::gc::confirm_blob(
-        state.config.gc.enabled,
+        &state.config.gc,
+        &state.storage,
         &state.publish_locks,
         &[&dst_key],
-        state.storage.stat(&dst_key),
     )
     .await;
     if held.is_some() {
@@ -3803,10 +3803,10 @@ async fn missing_manifest_ref(
 /// from the GC sweep and from a blob delete until the manifest has landed.
 async fn confirmed(state: &AppState, key: &str) -> bool {
     crate::gc::confirm_blob(
-        state.config.gc.enabled,
+        &state.config.gc,
+        &state.storage,
         &state.publish_locks,
         &[key],
-        state.storage.stat(key),
     )
     .await
     .is_some()
