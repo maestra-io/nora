@@ -1940,9 +1940,12 @@ fn open_log_file(path: &str) -> Option<std::fs::File> {
         }
     }
 
+    // Owner-only on create, like the audit log; an existing file keeps its mode.
+    use std::os::unix::fs::OpenOptionsExt;
     let file = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(file_path)
     {
         Ok(f) => f,

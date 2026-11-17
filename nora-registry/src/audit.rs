@@ -5,13 +5,16 @@
 //!
 //! Records who/when/what for every registry write operation.
 //! Output modes (NORA_AUDIT_LOG):
-//!   - `file`   — write to {storage_path}/audit.jsonl (default)
+//!   - `file`   — write to {storage_path}/audit.jsonl
 //!   - `stdout`  — write JSONL to stderr (12-factor compatible)
-//!   - `both`   — write to file AND stderr
+//!   - `both`   — write to file AND stderr (default)
 //!   - `off`    — disable audit logging
 //!
-//! The file is size-rotated (`audit.max_size_mb`, `audit.max_files`):
-//! `audit.jsonl` → `audit.jsonl.1` → … → `audit.jsonl.N`, the oldest dropped.
+//! Reads (`pull`, `cache_hit`, `proxy_fetch`, `curation_block`) go to
+//! `audit-reads.jsonl`, everything else to `audit.jsonl`, so download traffic cannot
+//! rotate write records out. Both files are size-rotated (`audit.max_size_mb`, half of
+//! it for reads; `audit.max_files`): `audit.jsonl` → `audit.jsonl.1` → … →
+//! `audit.jsonl.N`, the oldest dropped. Files are created 0600.
 //!
 //! Uses a bounded mpsc channel with a single writer task (#543) to avoid
 //! per-entry `spawn_blocking` + Mutex contention under load.
@@ -21,6 +24,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -30,13 +34,25 @@ use tracing::{info, warn};
 /// load — entries exceeding this are dropped with a warning (#543).
 const AUDIT_CHANNEL_BOUND: usize = 10_000;
 
+/// Where read events go, next to `audit.jsonl`.
+const READS_FILE: &str = "audit-reads.jsonl";
+
+/// A download served or refused. Reads get their own file and budget so they cannot
+/// rotate write records out of `audit.jsonl`; an unknown action counts as a write.
+fn is_read_event(action: &str) -> bool {
+    matches!(
+        action,
+        "pull" | "cache_hit" | "proxy_fetch" | "curation_block"
+    )
+}
+
 /// Audit output mode.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AuditMode {
-    #[default]
     File,
     Stdout,
+    #[default]
     Both,
     Off,
 }
@@ -182,8 +198,36 @@ impl FileSink {
     }
 }
 
+/// Owner-only on create; an existing file keeps its mode.
 fn open_append(path: &Path) -> std::io::Result<fs::File> {
-    OpenOptions::new().create(true).append(true).open(path)
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Open `path` for appending, terminating a tail torn by a kill so the next entry
+/// starts a line.
+fn open_sink(path: PathBuf, rotation: Rotation) -> Option<FileSink> {
+    match open_append(&path) {
+        Ok(mut file) => {
+            let mut size = file.metadata().map(|m| m.len()).unwrap_or(0);
+            if !tail_is_terminated(&path).unwrap_or(true) && file.write_all(b"\n").is_ok() {
+                size += 1;
+            }
+            Some(FileSink {
+                file,
+                path,
+                size,
+                rotation,
+            })
+        }
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "Failed to open audit log file");
+            None
+        }
+    }
 }
 
 /// True when `path` is missing, empty, or ends with a newline.
@@ -232,35 +276,24 @@ impl AuditLog {
             };
         }
 
-        // Open file handle if needed
-        let file = if mode == AuditMode::File || mode == AuditMode::Both {
+        // Open file handles if needed. Reads get half the size budget, so the two chains
+        // together stay within 1.5x what one chain used to take.
+        let (writes, reads) = if mode == AuditMode::File || mode == AuditMode::Both {
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            match open_append(&path) {
-                Ok(mut file) => {
-                    info!(path = %path.display(), mode = ?mode, "Audit log initialized");
-                    let mut size = file.metadata().map(|m| m.len()).unwrap_or(0);
-                    // A tail torn by a kill gets its newline once here, so the next
-                    // entry starts a line.
-                    if !tail_is_terminated(&path).unwrap_or(true) && file.write_all(b"\n").is_ok() {
-                        size += 1;
-                    }
-                    Some(FileSink {
-                        file,
-                        path: path.clone(),
-                        size,
-                        rotation,
-                    })
-                }
-                Err(e) => {
-                    warn!(path = %path.display(), error = %e, "Failed to open audit log file");
-                    None
-                }
-            }
+            let reads_rotation = Rotation {
+                max_bytes: rotation.max_bytes.div_ceil(2),
+                keep: rotation.keep,
+            };
+            info!(path = %path.display(), mode = ?mode, "Audit log initialized");
+            (
+                open_sink(path.clone(), rotation),
+                open_sink(path.with_file_name(READS_FILE), reads_rotation),
+            )
         } else {
             info!(mode = ?mode, "Audit log initialized (stderr only)");
-            None
+            (None, None)
         };
 
         let (tx, rx) = mpsc::channel(AUDIT_CHANNEL_BOUND);
@@ -276,7 +309,7 @@ impl AuditLog {
         let handle = tokio::task::spawn_blocking(move || {
             let exit = crate::supervise::process_exit();
             crate::supervise::blocking("audit", &exit, move || {
-                Self::writer_loop(rx, file, writer_mode)
+                Self::writer_loop(rx, writes, reads, writer_mode)
             });
         });
 
@@ -292,7 +325,8 @@ impl AuditLog {
     /// them to file/stderr. Runs until the channel is closed (all senders dropped).
     fn writer_loop(
         mut rx: mpsc::Receiver<AuditEntry>,
-        mut file: Option<FileSink>,
+        mut writes: Option<FileSink>,
+        mut reads: Option<FileSink>,
         mode: AuditMode,
     ) {
         // blocking_recv() blocks the current thread until an entry arrives
@@ -307,16 +341,16 @@ impl AuditLog {
             if crate::fault_injection::task_fault("audit") {
                 panic!("fault injection: audit task panic");
             }
-            Self::write_entry(&entry, &mut file, &mode);
+            Self::write_entry(&entry, &mut writes, &mut reads, &mode);
         }
 
         // Channel closed — drain any remaining buffered entries
         while let Ok(entry) = rx.try_recv() {
-            Self::write_entry(&entry, &mut file, &mode);
+            Self::write_entry(&entry, &mut writes, &mut reads, &mode);
         }
 
         // Final flush on shutdown
-        if let Some(ref mut f) = file {
+        for f in [&mut writes, &mut reads].into_iter().flatten() {
             if let Err(e) = f.file.flush() {
                 tracing::error!(error = %e, "Audit log final flush failed");
             }
@@ -324,7 +358,12 @@ impl AuditLog {
     }
 
     /// Write a single audit entry to file and/or stderr.
-    fn write_entry(entry: &AuditEntry, file: &mut Option<FileSink>, mode: &AuditMode) {
+    fn write_entry(
+        entry: &AuditEntry,
+        writes: &mut Option<FileSink>,
+        reads: &mut Option<FileSink>,
+        mode: &AuditMode,
+    ) {
         let json = match serde_json::to_string(entry) {
             Ok(j) => j,
             Err(e) => {
@@ -334,7 +373,12 @@ impl AuditLog {
         };
 
         if *mode == AuditMode::File || *mode == AuditMode::Both {
-            if let Some(ref mut f) = file {
+            let file = if is_read_event(&entry.action) {
+                reads
+            } else {
+                writes
+            };
+            if let Some(f) = file {
                 f.write_line(&json);
             }
         }
@@ -346,20 +390,34 @@ impl AuditLog {
 
     /// Send an audit entry to the background writer (#543).
     ///
-    /// Infallible: if the channel is full (extreme backpressure), the entry
-    /// is dropped with a warning. If the channel is closed (shutdown), the
-    /// entry is silently discarded.
+    /// Infallible and non-blocking: if the channel is full (extreme backpressure),
+    /// see [`Self::overflow`]. If the channel is closed (shutdown), the entry is
+    /// silently discarded.
     pub fn log(&self, entry: AuditEntry) {
         if self.mode == AuditMode::Off {
             return;
         }
 
         if let Some(ref sender) = *self.sender.lock() {
-            if let Err(mpsc::error::TrySendError::Full(_)) = sender.try_send(entry) {
-                warn!("Audit log channel full — entry dropped (backpressure)");
+            if let Err(mpsc::error::TrySendError::Full(entry)) = sender.try_send(entry) {
+                Self::overflow(&entry);
             }
             // TrySendError::Closed is silently ignored — happens during shutdown
         }
+    }
+
+    /// An entry the full channel refused: a read is dropped, a write goes to stderr at
+    /// once, so a flood of reads cannot lose a write record. True when it was kept.
+    fn overflow(entry: &AuditEntry) -> bool {
+        if is_read_event(&entry.action) {
+            warn!("Audit log channel full — read entry dropped (backpressure)");
+            return false;
+        }
+        warn!("Audit log channel full — write entry sent to stderr (backpressure)");
+        if let Ok(json) = serde_json::to_string(entry) {
+            eprintln!("{json}");
+        }
+        true
     }
 
     /// Graceful shutdown: close the channel and wait for the writer to drain.
@@ -495,7 +553,7 @@ mod tests {
         log.log(entry);
 
         // Wait for writer to process by shutting down (drains channel)
-        let path = log.path().clone();
+        let path = log.path().with_file_name(READS_FILE);
         log.shutdown().await;
 
         let content = std::fs::read_to_string(&path).unwrap_or_default();
@@ -517,7 +575,10 @@ mod tests {
         log.shutdown().await;
 
         let content = std::fs::read_to_string(&path).unwrap_or_default();
-        assert_eq!(content.lines().count(), 3);
+        let reads = read(&path.with_file_name(READS_FILE));
+        assert_eq!(content.lines().count(), 2, "push and delete: {content}");
+        assert_eq!(reads.lines().count(), 1, "the pull: {reads}");
+        assert!(reads.contains(r#""action":"pull""#));
     }
 
     #[test]
@@ -659,6 +720,124 @@ mod tests {
         assert_eq!(r.keep, 5);
     }
 
+    /// A018: however many reads are logged, a write record stays in `audit.jsonl`;
+    /// the reads rotate in their own bounded chain at half the size.
+    #[tokio::test]
+    async fn reads_cannot_rotate_a_write_record_out() {
+        let tmp = TempDir::new().unwrap();
+        let rotation = Rotation {
+            max_bytes: 4096,
+            keep: 2,
+        };
+        let log = AuditLog::with_rotation(tmp.path().to_str().unwrap(), AuditMode::File, rotation);
+        log.log(AuditEntry::new("push", "alice", "v398/a.txt", "raw", ""));
+        for _ in 0..1000 {
+            // The entry a served raw download writes.
+            log.log(AuditEntry::new("pull", "proxy", "", "raw", ""));
+        }
+        let path = log.path().clone();
+        log.shutdown().await;
+
+        assert!(
+            read(&path).contains(r#""action":"push""#),
+            "write record lost"
+        );
+        let reads = path.with_file_name(READS_FILE);
+        let numbered = |n: u32| PathBuf::from(format!("{}.{n}", reads.display()));
+        assert!(numbered(2).exists(), "1000 reads must have rotated");
+        assert!(!numbered(3).exists(), "reads chain must stay bounded");
+        for f in [reads.clone(), numbered(1), numbered(2)] {
+            let text = read(&f);
+            assert!(!text.contains(r#""action":"push""#), "{}", f.display());
+            assert!(
+                text.len() as u64 <= rotation.max_bytes / 2,
+                "{}",
+                f.display()
+            );
+        }
+    }
+
+    /// Unknown actions count as writes, so a new state-changing action keeps the
+    /// protected budget.
+    #[test]
+    fn only_known_downloads_are_reads() {
+        for read in ["pull", "cache_hit", "proxy_fetch", "curation_block"] {
+            assert!(is_read_event(read), "{read}");
+        }
+        for write in [
+            "push",
+            "delete",
+            "token_mint",
+            "overwrite",
+            "some_new_action",
+        ] {
+            assert!(!is_read_event(write), "{write}");
+        }
+    }
+
+    /// A018: when the channel is full a read is dropped but a write is kept (on
+    /// stderr), so a flood of reads cannot lose a write record.
+    #[tokio::test]
+    async fn a_full_channel_keeps_write_records() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let log = AuditLog {
+            path: PathBuf::from("unused"),
+            mode: AuditMode::File,
+            sender: Mutex::new(Some(tx)),
+            writer_handle: Mutex::new(None),
+        };
+        let pull = || AuditEntry::new("pull", "proxy", "", "raw", "");
+        let push = || AuditEntry::new("push", "alice", "a.txt", "raw", "");
+        log.log(pull());
+        // Channel full from here on.
+        log.log(push());
+        log.log(pull());
+        assert_eq!(rx.recv().await.unwrap().action, "pull");
+        assert!(rx.try_recv().is_err(), "the channel held only one entry");
+        assert!(AuditLog::overflow(&push()), "a write must be kept");
+        assert!(!AuditLog::overflow(&pull()), "a read is dropped");
+    }
+
+    /// B27: audit files are created owner-only whatever the umask, the rotated
+    /// ones too.
+    #[tokio::test]
+    async fn audit_files_are_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let log = AuditLog::with_rotation(
+            tmp.path().to_str().unwrap(),
+            AuditMode::File,
+            Rotation {
+                max_bytes: 1,
+                keep: 1,
+            },
+        );
+        for action in ["push", "push", "pull", "pull"] {
+            log.log(AuditEntry::new(action, "u", "a", "raw", ""));
+        }
+        log.shutdown().await;
+        for name in [
+            "audit.jsonl",
+            "audit.jsonl.1",
+            "audit-reads.jsonl",
+            "audit-reads.jsonl.1",
+        ] {
+            let mode = fs::metadata(tmp.path().join(name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{name} mode {mode:o}");
+        }
+    }
+
+    /// B28: the binary default also writes to stderr, so a non-chart install ships audit
+    /// records off the host through its log pipeline; the two defaults cannot drift.
+    #[test]
+    fn default_audit_mode_is_both() {
+        assert_eq!(AuditMode::default(), AuditMode::Both);
+        assert_eq!(crate::config::AuditConfig::default().mode, AuditMode::Both);
+    }
+
     #[tokio::test]
     async fn test_audit_log_off_mode() {
         let tmp = TempDir::new().unwrap();
@@ -669,7 +848,7 @@ mod tests {
     }
 }
 
-/// A download refused by curation leaves one entry in `audit.jsonl` (who / what /
+/// A download refused by curation leaves one entry in `audit-reads.jsonl` (who / what /
 /// registry / rule), as push, delete, proxy_fetch, cache_hit and pull do. The test context opts into the file audit log the way an
 /// operator does (`NORA_AUDIT_LOG=file`) and requests go through the whole router,
 /// so the test holds wherever the entry is written — handler or middleware.
@@ -721,14 +900,19 @@ mod curation_refusal_audit_tests {
         (ctx, policy)
     }
 
-    /// Drain the writer and parse every line of `audit.jsonl`.
+    /// Drain the writer and parse every line of `audit.jsonl`, then of `audit-reads.jsonl`.
     async fn written_entries(audit: &AuditLog) -> Vec<serde_json::Value> {
         let path = audit.path().clone();
         audit.shutdown().await;
-        std::fs::read_to_string(&path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
+        [path.clone(), path.with_file_name(READS_FILE)]
+            .iter()
+            .flat_map(|p| {
+                std::fs::read_to_string(p)
+                    .unwrap_or_default()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 
@@ -868,7 +1052,8 @@ mod curation_refusal_audit_tests {
 
     /// Control for the test above: the same context and policy, with downloads that
     /// curation allows — each leaves its one existing audit entry, so the harness
-    /// captures what these routes write.
+    /// captures what these routes write. The reads land in `audit-reads.jsonl`, a hosted
+    /// upload in `audit.jsonl` (A018).
     #[tokio::test]
     async fn allowed_downloads_keep_their_audit_entries() {
         let (ctx, _policy) = audited_context().await;
@@ -878,7 +1063,10 @@ mod curation_refusal_audit_tests {
         let uri = format!("{CPAN_AUTHOR}/Foo-Bar-1.0.tar.gz");
         let resp = send(&ctx.app, Method::GET, &uri, "").await;
         assert_eq!(resp.status(), StatusCode::OK);
+        let resp = send(&ctx.app, Method::PUT, "/raw/new.txt", "data").await;
+        assert!(resp.status().is_success(), "{}", resp.status());
 
+        let path = ctx.state.audit.path().clone();
         let entries = written_entries(&ctx.state.audit).await;
         let actions: Vec<(&str, &str)> = entries
             .iter()
@@ -889,7 +1077,13 @@ mod curation_refusal_audit_tests {
                 )
             })
             .collect();
-        assert_eq!(actions, [("raw", "pull"), ("cpan", "cache_hit")]);
+        assert_eq!(
+            actions,
+            [("raw", "push"), ("raw", "pull"), ("cpan", "cache_hit")]
+        );
+        let writes = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(writes.lines().count(), 1, "only the push: {writes}");
+        assert!(writes.contains(r#""action":"push""#));
     }
 }
 
@@ -953,7 +1147,7 @@ mod curation_refusal_audit_kinds {
                 "detail": format!("{}: {}", c["rule"].as_str().unwrap(), c["reason"].as_str().unwrap()),
             }));
         }
-        let path = ctx.state.audit.path().clone();
+        let path = ctx.state.audit.path().with_file_name(READS_FILE);
         ctx.state.audit.shutdown().await;
         let entries: Vec<serde_json::Value> = std::fs::read_to_string(&path)
             .unwrap()
@@ -1044,7 +1238,7 @@ mod curation_refusal_audit_docker {
             text.contains("allowlist:integrity"),
             "integrity case lost: {text}"
         );
-        let path = ctx.state.audit.path().clone();
+        let path = ctx.state.audit.path().with_file_name(READS_FILE);
         ctx.state.audit.shutdown().await;
         let entries: Vec<serde_json::Value> = std::fs::read_to_string(&path)
             .unwrap()

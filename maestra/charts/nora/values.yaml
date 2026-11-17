@@ -288,8 +288,9 @@ config:
       #      - pattern: "repo:myorg/*"
       #        role: read
 
-  # -- Audit log: file ({storage.path}/audit.jsonl, rotated at max_size_mb,
-  # max_files kept; nora defaults 100 and 5), stdout (JSONL to stderr, i.e. the
+  # -- Audit log: file ({storage.path}/audit.jsonl, downloads in
+  # audit-reads.jsonl at half the size; rotated at max_size_mb, max_files kept;
+  # nora defaults 100 and 5; files 0600), stdout (JSONL to stderr, i.e. the
   # pod log), both, off. stdout on Kubernetes: the cluster log pipeline keeps it
   # and nothing grows on the volume. Every key rendered as is. Env
   # NORA_AUDIT_LOG / NORA_AUDIT_MAX_SIZE_MB / NORA_AUDIT_MAX_FILES override.
