@@ -24,11 +24,12 @@ pub struct GoConfig {
     /// content-addressed and always immutable.
     #[serde(default = "super::super::default_metadata_ttl")]
     pub metadata_ttl: i64,
-    /// Date a version NORA has not seen before by the `Last-Modified` of its `.zip` on `proxy`
-    /// (a HEAD, cached once per version), not by NORA's first sight. On proxy.golang.org that
-    /// is the proxy's own first fetch of the version (the index.golang.org `Timestamp`), which
-    /// the publisher cannot set, unlike the `.info` `Time` (A066). Only for a `proxy` whose
-    /// `Last-Modified` means that; off, a new version ages from NORA's first sight.
+    /// Date a version NORA first saw inside the release age by the `Last-Modified` of its
+    /// `.zip` on proxy.golang.org (a HEAD, kept once per version) when that is earlier: the
+    /// proxy's own first fetch of the version (the index.golang.org `Timestamp`), which the
+    /// publisher cannot set, unlike the `.info` `Time` (A066). Read only when `proxy` is
+    /// proxy.golang.org ([`Self::attests_first_fetch`]); elsewhere ignored, with a config
+    /// warning. Off: a new version ages from NORA's first sight.
     #[serde(default)]
     pub attested_dates: bool,
 }
@@ -61,6 +62,18 @@ impl Default for GoConfig {
 }
 
 impl GoConfig {
+    /// Whether `url` is a Go proxy whose zip `Last-Modified` is its own first fetch of the
+    /// version: proxy.golang.org only. Another proxy may relay the publisher's date or a
+    /// placeholder, which would let a back-dated `.info` `Time` through (A066). Unit tests
+    /// serve it from a mock under the path `/proxy.golang.org`.
+    pub fn attests_first_fetch(url: &str) -> bool {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        (parsed.scheme() == "https" && parsed.host_str() == Some("proxy.golang.org"))
+            || (cfg!(test) && parsed.path().starts_with("/proxy.golang.org"))
+    }
+
     pub(in crate::config) fn apply_env_overrides(&mut self) {
         if let Ok(val) = env::var("NORA_GO_ENABLED") {
             self.enabled = val.to_lowercase() == "true" || val == "1";
