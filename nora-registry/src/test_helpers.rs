@@ -1930,3 +1930,22 @@ pub fn functions_containing(
     }
     found
 }
+
+/// A PyPI distribution `filename` holding `payload`, in the archive format its extension names
+/// (a zip for `.whl`, `.zip` and `.egg`, gzip for `.tar.gz` and `.tgz`), as an upload must be.
+pub fn pypi_dist(filename: &str, payload: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    if [".tar.gz", ".tgz"]
+        .iter()
+        .any(|ext| filename.ends_with(ext))
+    {
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(payload).unwrap();
+        return gz.finish().unwrap();
+    }
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zip.start_file("payload", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(payload).unwrap();
+    zip.finish().unwrap().into_inner()
+}

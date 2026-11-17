@@ -189,7 +189,12 @@ async fn tampered_uploaded_file_is_kept_not_refetched() {
         Method::POST,
         "/simple/",
         vec![("content-type", content_type.as_str())],
-        upload_body("ours", "1.0", filename, b"our wheel"),
+        upload_body(
+            "ours",
+            "1.0",
+            filename,
+            &crate::test_helpers::pypi_dist(filename, b"our wheel"),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -223,6 +228,7 @@ async fn tampered_uploaded_file_is_kept_not_refetched() {
 async fn upload_replaces_a_stale_marker_of_the_same_filename() {
     let ctx = create_test_context();
     let filename = "reup-1.0-py3-none-any.whl";
+    let current_bytes = crate::test_helpers::pypi_dist(filename, b"current bytes");
     let stale = digest(b"earlier bytes");
     ctx.state
         .storage
@@ -236,12 +242,12 @@ async fn upload_replaces_a_stale_marker_of_the_same_filename() {
         Method::POST,
         "/simple/",
         vec![("content-type", content_type.as_str())],
-        upload_body("reup", "1.0", filename, b"current bytes"),
+        upload_body("reup", "1.0", filename, &current_bytes),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let current = digest(b"current bytes");
+    let current = digest(&current_bytes);
     let markers = ctx
         .state
         .storage

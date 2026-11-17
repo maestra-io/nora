@@ -288,13 +288,13 @@ pub static PROXY_UPSTREAM_304_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| 
 });
 
 /// PyPI uploads to a project that is neither hosted nor in `curation.internal_namespaces`
-/// while an upstream is configured: its index mixes the uploaded files with the upstream's of
-/// the same name (R4-R04). Label `upstream_lists` (`yes` | `no` | `unknown`): whether the
-/// cached upstream index lists the name already.
+/// while an upstream is configured (R4-R04, A101). Label `upstream_lists`: `yes`, an upstream
+/// lists the name and the upload was refused (409); `no`, no upstream lists it and the upload
+/// claimed it as hosted.
 pub static PYPI_MIXED_PROJECT_UPLOADS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "nora_pypi_mixed_project_uploads_total",
-        "PyPI uploads to a project whose index is merged with an upstream's",
+        "PyPI uploads to a project outside curation.internal_namespaces while an upstream is configured",
         &["upstream_lists"]
     )
     .expect("failed to create PYPI_MIXED_PROJECT_UPLOADS_TOTAL metric at startup")

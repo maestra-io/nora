@@ -1324,6 +1324,9 @@ async fn upload(
 
     // Normalize name and store
     let normalized = normalize_name(&name);
+    if !is_pep503_normalized(&normalized) {
+        return (StatusCode::BAD_REQUEST, "Invalid project name").into_response();
+    }
 
     // The file must be a release of the project and version it is uploaded as, so the
     // storage key, the index and the audit trail agree on what it is.
@@ -1336,19 +1339,18 @@ async fn upload(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    // PEP 658 core metadata, read before put_from_path moves the temp file.
-    let core_meta = if ends_with_ci(&filename, ".whl") {
-        let path = temp_path.clone();
-        tokio::task::spawn_blocking(move || {
-            std::fs::File::open(&path)
-                .ok()
-                .and_then(|f| wheel_core_metadata(std::io::BufReader::new(f)))
-        })
-        .await
-        .ok()
-        .flatten()
-    } else {
-        None
+    // B11: the file is the archive its name says; a wheel's PEP 658 core metadata comes from
+    // the same archive, read before put_from_path moves the temp file.
+    let path = temp_path.clone();
+    let checked_name = filename.clone();
+    let core_meta = match tokio::task::spawn_blocking(move || {
+        read_upload_archive(&path, &checked_name)
+    })
+    .await
+    {
+        Ok(Ok(meta)) => meta,
+        Ok(Err(refusal)) => return refusal.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
     if let Err(response) = claim_uploaded_project(&state, &normalized).await {
@@ -1399,9 +1401,13 @@ async fn upload(
 /// project's own first, and a proxy cache copy is no file of it any more: neither listed nor
 /// served. An internal-namespace project is owned by configuration already and is not claimed.
 ///
-/// When an upstream is configured, the claim logs a `[SECURITY]` WARN and counts in
-/// `nora_pypi_mixed_project_uploads_total`, with whether the cached upstream index lists the name:
-/// a name the upstream lists stops being proxied here.
+/// A101: a name an upstream lists is the upstream's, and an upload does not claim it: with an
+/// upstream configured, the first upload asks the upstreams for the name's index (cached,
+/// single-flight) and is a 409 while one lists a file under it (the opt-in is
+/// `curation.internal_namespaces`), the upstream error while none answered, and claims the name
+/// only when every upstream answered that it has none. Each such upload logs a `[SECURITY]` WARN
+/// and counts in `nora_pypi_mixed_project_uploads_total{upstream_lists}`: `yes` refused, `no`
+/// claimed.
 async fn claim_uploaded_project(state: &AppState, normalized: &str) -> Result<(), Response> {
     let unavailable = || crate::registry::storage_unavailable("pypi", &own_prefix(normalized));
     if crate::curation::is_internal_namespace(
@@ -1418,6 +1424,31 @@ async fn claim_uploaded_project(state: &AppState, normalized: &str) -> Result<()
         return Ok(());
     }
     let prefix = format!("pypi/{normalized}/");
+    let proxied_too = !state.config.pypi.upstreams().is_empty();
+    if proxied_too {
+        let cache_key = format!("{prefix}{UPSTREAM_INDEX_FILE}");
+        let cached_at = state.storage.stat(&cache_key).await.map(|m| m.modified);
+        let ttl = state.config.pypi.metadata_ttl;
+        match upstream_index(state, normalized, cached_at, ttl).await {
+            UpstreamIndex::Files(files) | UpstreamIndex::Stale(files) if !files.is_empty() => {
+                crate::metrics::PYPI_MIXED_PROJECT_UPLOADS_TOTAL
+                    .with_label_values(&["yes"])
+                    .inc();
+                tracing::warn!(
+                    registry = "pypi",
+                    project = %normalized,
+                    "[SECURITY] upload refused: an upstream lists the project and it is outside curation.internal_namespaces"
+                );
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("project {normalized} is served by an upstream; add it to curation.internal_namespaces to publish it here"),
+                )
+                    .into_response());
+            }
+            UpstreamIndex::Failed(response) => return Err(response),
+            UpstreamIndex::Files(_) | UpstreamIndex::Stale(_) => {}
+        }
+    }
     let origins = proxied_marker_key(&prefix);
     // The files first, then their markers: a proxy cache write stores the file before its
     // marker, so the second listing sees the marker of a file the first caught mid-write.
@@ -1447,31 +1478,16 @@ async fn claim_uploaded_project(state: &AppState, normalized: &str) -> Result<()
         tracing::warn!(registry = "pypi", project = %normalized, error = %e, "pypi: failed to make an uploaded project hosted");
         return Err(unavailable());
     }
-    if state.config.pypi.upstreams().is_empty() {
-        return Ok(());
+    if proxied_too {
+        crate::metrics::PYPI_MIXED_PROJECT_UPLOADS_TOTAL
+            .with_label_values(&["no"])
+            .inc();
+        tracing::warn!(
+            registry = "pypi",
+            project = %normalized,
+            "[SECURITY] upload to a project outside curation.internal_namespaces while an upstream is configured: no upstream lists it, the project is now hosted and its name is no longer proxied"
+        );
     }
-    // Only the cached index is read: an upload never sends the name to an upstream.
-    let upstream_lists = match state
-        .storage
-        .get(&format!("{prefix}{UPSTREAM_INDEX_FILE}"))
-        .await
-    {
-        Ok(data) => match serde_json::from_slice::<Vec<FileEntry>>(&data) {
-            Ok(files) if files.is_empty() => "no",
-            Ok(_) => "yes",
-            Err(_) => "unknown",
-        },
-        Err(_) => "unknown",
-    };
-    crate::metrics::PYPI_MIXED_PROJECT_UPLOADS_TOTAL
-        .with_label_values(&[upstream_lists])
-        .inc();
-    tracing::warn!(
-        registry = "pypi",
-        project = %normalized,
-        upstream_lists,
-        "[SECURITY] upload to a project outside curation.internal_namespaces while an upstream is configured: the project is now hosted, its name is no longer proxied (dependency confusion) and files cached from an upstream under it are no longer served"
-    );
     Ok(())
 }
 
@@ -1845,11 +1861,41 @@ fn upload_filename_mismatch(filename: &str, normalized: &str, version: &str) -> 
     None
 }
 
+/// B11: an uploaded file is the archive its extension names, as PyPI requires: a zip for
+/// `.whl`, `.zip` and `.egg`, a gzip stream for `.tar.gz` and `.tgz`. `Ok` carries a wheel's
+/// PEP 658 core metadata ([`zip_core_metadata`]); a wheel without one still uploads.
+fn read_upload_archive(
+    path: &std::path::Path,
+    filename: &str,
+) -> Result<Option<Vec<u8>>, (StatusCode, &'static str)> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "cannot read the upload"))?;
+    if let Some(".tar.gz" | ".tgz") = nora_registry::pypi_files::served_extension(filename) {
+        let mut magic = [0u8; 2];
+        return match file.read_exact(&mut magic) {
+            Ok(()) if magic == [0x1f, 0x8b] => Ok(None),
+            _ => Err((StatusCode::BAD_REQUEST, "file is not a gzip archive")),
+        };
+    }
+    let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
+        .map_err(|_| (StatusCode::BAD_REQUEST, "file is not a valid zip archive"))?;
+    Ok(ends_with_ci(filename, ".whl")
+        .then(|| zip_core_metadata(&mut zip))
+        .flatten())
+}
+
 /// The PEP 658 core metadata of a wheel: its root-level `*.dist-info/METADATA`. `None`
 /// when the archive is not a zip, has no single such entry, or it is too large.
 pub(crate) fn wheel_core_metadata(data: impl std::io::Read + std::io::Seek) -> Option<Vec<u8>> {
+    zip_core_metadata(&mut zip::ZipArchive::new(data).ok()?)
+}
+
+/// [`wheel_core_metadata`] of an opened archive.
+fn zip_core_metadata<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Option<Vec<u8>> {
     use std::io::Read as _;
-    let mut zip = zip::ZipArchive::new(data).ok()?;
     let names: Vec<String> = zip
         .file_names()
         .flatten()
@@ -1947,7 +1993,7 @@ fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str)
             html,
             "<a href=\"{}/simple/{}/{}{}\"{}>{}</a><br>",
             base,
-            normalized,
+            escaped,
             html_escape(&f.filename),
             hash_fragment,
             attrs,
@@ -2191,6 +2237,17 @@ async fn fetch_upstream_dates(
 /// (`curation::pep503_normalize`): lowercase, every run of `-`, `_` and `.` one `-`.
 pub(crate) fn normalize_name(name: &str) -> String {
     crate::curation::pep503_normalize(name)
+}
+
+/// A079: `normalized` is a project name PEP 508 allows, once normalized: `[a-z0-9]` runs joined
+/// by single `-`, so it is the same text in a path, a link and an HTML page.
+fn is_pep503_normalized(normalized: &str) -> bool {
+    !normalized.is_empty()
+        && !normalized.starts_with('-')
+        && !normalized.ends_with('-')
+        && normalized
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// The key of distribution file `filename` of project `normalized` (PEP 503): the one an upload

@@ -47,7 +47,7 @@ async fn upload(ctx: &TestContext, version: &str) {
         "costpkg",
         version,
         &filename,
-        format!("wheel {version}").as_bytes(),
+        &crate::test_helpers::pypi_dist(&filename, format!("wheel {version}").as_bytes()),
     );
     let resp = send_with_headers(
         &ctx.app,
