@@ -575,3 +575,15 @@ workload identity from CI, send the JWT as a `Bearer` token (e.g.
   AWS S3 and Ceph RGW provide it; **Garage** (no consensus layer) and **SeaweedFS**
   (immature) do not — on those, run single-writer. Not every "S3-compatible" backend is
   equivalent here.
+- **Hosted NuGet writes are compare-and-swap (Maestra fork).** The state document
+  (`nuget/hosted-meta/{id}.json`) is rewritten with `If-Match` on its ETag (S3/R2), a
+  generation precondition (GCS), or a hash check under the commit lock (local disk), and
+  re-read and re-applied when another process wrote it first; a package blob is
+  published by a store-side copy with `cf-copy-destination-if-none-match: *` (R2;
+  GCS natively), so two pushes of one version through two servers store one set of
+  bytes. A store that ignores that copy header (AWS S3, MinIO) is checked with a HEAD
+  right before the copy, which narrows but does not close the window. A store that
+  refuses conditional writes outright is written unconditionally and counted in
+  `nora_storage_conditional_fallback_total`. Temp upload objects live under
+  `.nora-uploads/` (hidden from listings); one is left only by a process killed
+  mid-upload, so a lifecycle rule on that prefix collects them.

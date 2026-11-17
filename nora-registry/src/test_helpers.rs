@@ -821,6 +821,39 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         self.inner.get(key).await
     }
 
+    async fn get_versioned(
+        &self,
+        key: &str,
+    ) -> crate::storage::Result<(axum::body::Bytes, Option<String>, String)> {
+        self.counts.hit("get", key);
+        self.counts.wait_get_unstalled(key).await;
+        self.inner.get_versioned(key).await
+    }
+
+    async fn put_if_version(
+        &self,
+        key: &str,
+        data: axum::body::Bytes,
+        sha256: &str,
+        expected: Option<&str>,
+    ) -> crate::storage::Result<bool> {
+        self.counts.hit("put", key);
+        self.counts.put_refused(key)?;
+        self.counts.park_if_held(key).await;
+        self.inner.put_if_version(key, data, sha256, expected).await
+    }
+
+    async fn put_from_path_if_absent(
+        &self,
+        key: &str,
+        src: &std::path::Path,
+        sha256: &str,
+    ) -> crate::storage::Result<bool> {
+        self.counts.hit("put_from_path", key);
+        self.counts.park_if_held(key).await;
+        self.inner.put_from_path_if_absent(key, src, sha256).await
+    }
+
     async fn pin(&self, key: &str) -> Option<String> {
         self.counts.hit("pin", key);
         self.inner.pin(key).await

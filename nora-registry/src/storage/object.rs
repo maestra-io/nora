@@ -6,6 +6,7 @@ use axum::body::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use object_store::aws::AmazonS3Builder;
 use object_store::aws::AwsCredential;
+use object_store::aws::S3CopyIfNotExists;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
 use object_store::CredentialProvider;
@@ -292,9 +293,14 @@ const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 impl ObjectStorage {
     /// One GET of `path` with its whole body, each chunk within GET_BODY_IDLE.
-    async fn get_whole(&self, path: &Path) -> object_store::Result<(Bytes, Option<String>)> {
+    /// Also returns the [`version_token`] of the object read.
+    async fn get_whole(
+        &self,
+        path: &Path,
+    ) -> object_store::Result<(Bytes, Option<String>, String)> {
         let result = bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get(path)).await?;
         let pin = read_pin(&result.attributes);
+        let version = version_token(&result.meta);
         let size = result.meta.size;
         // One buffer of the object's size (no second copy), or the chunk itself when the
         // body arrives in one.
@@ -303,7 +309,7 @@ impl ObjectStorage {
             Some(size),
         );
         let body = bounded(BODY_OP_TIMEOUT, body).await?;
-        Ok((body, pin))
+        Ok((body, pin, version))
     }
 
     /// Create new S3 storage with optional credentials.
@@ -357,7 +363,14 @@ impl ObjectStorage {
             // options with_allow_http would have accumulated.
             .with_client_options(streaming_client_options().with_allow_http(allow_http))
             .with_virtual_hosted_style_request(virtual_hosted)
-            .with_retry(streaming_retry_config());
+            .with_retry(streaming_retry_config())
+            // A store-side copy that refuses an existing destination, for
+            // `put_from_path_if_absent` (R2's CopyObject precondition header). A store
+            // that ignores the header overwrites, after the HEAD that precedes the copy.
+            .with_copy_if_not_exists(S3CopyIfNotExists::Header(
+                "cf-copy-destination-if-none-match".into(),
+                "*".into(),
+            ));
 
         // `s3_credentials_dir = ""` in TOML means unset, as the env override does.
         let credentials_dir = credentials_dir.filter(|d| !d.is_empty());
@@ -559,6 +572,39 @@ fn read_pin(attributes: &Attributes) -> Option<String> {
         .map(|v| v.as_ref().to_string())
 }
 
+/// The version token of an object for [`StorageBackend::put_if_version`]: its ETag
+/// (S3, R2, the in-memory store) and its generation (GCS), one per line. Empty when the
+/// store reports neither; a conditional write is then not possible.
+fn version_token(meta: &object_store::ObjectMeta) -> String {
+    match (&meta.e_tag, &meta.version) {
+        (None, None) => String::new(),
+        (e_tag, version) => format!(
+            "{}\n{}",
+            e_tag.as_deref().unwrap_or(""),
+            version.as_deref().unwrap_or("")
+        ),
+    }
+}
+
+/// [`version_token`] back to the precondition of a conditional PUT.
+fn update_version(token: &str) -> object_store::UpdateVersion {
+    let (e_tag, version) = token.split_once('\n').unwrap_or((token, ""));
+    let some = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    object_store::UpdateVersion {
+        e_tag: some(e_tag),
+        version: some(version),
+    }
+}
+
+/// A conditional write the store cannot do, done unconditionally: counted and logged,
+/// so a push never fails for it and the metric shows a store without the guarantee.
+fn conditional_fallback(operation: &'static str, key: &str, why: &dyn std::fmt::Display) {
+    crate::metrics::STORAGE_CONDITIONAL_FALLBACK
+        .with_label_values(&[operation])
+        .inc();
+    tracing::warn!(key = %key, operation, reason = %why, "object store has no conditional write here; written unconditionally");
+}
+
 /// Map object_store errors to StorageError.
 fn map_err(e: object_store::Error) -> StorageError {
     match e {
@@ -626,7 +672,92 @@ impl StorageBackend for ObjectStorage {
             retry_stalled_body(|| self.get_whole(&path)),
         )
         .await
+        .map(|(data, pin, _)| (data, pin))
         .map_err(map_err)
+    }
+
+    async fn get_versioned(&self, key: &str) -> Result<(Bytes, Option<String>, String)> {
+        let path = Path::from(encode_object_key(key));
+        bounded(
+            BODY_OP_TIMEOUT,
+            retry_stalled_body(|| self.get_whole(&path)),
+        )
+        .await
+        .map_err(map_err)
+    }
+
+    async fn put_if_version(
+        &self,
+        key: &str,
+        data: Bytes,
+        sha256: &str,
+        expected: Option<&str>,
+    ) -> Result<bool> {
+        let Some(expected) = expected else {
+            return self.put_if_absent(key, data, sha256).await;
+        };
+        if expected.is_empty() {
+            conditional_fallback("put_if_version", key, &"the store reported no version");
+            return self.put_bytes(key, data, sha256).await.map(|()| true);
+        }
+        // `PutMode::Update` is `If-Match: <etag>` on S3/R2 and a generation precondition
+        // on GCS: the store refuses the write once another one replaced the object.
+        let path = Path::from(encode_object_key(key));
+        let opts = PutOptions {
+            mode: PutMode::Update(update_version(expected)),
+            attributes: pin_attributes(sha256),
+            ..Default::default()
+        };
+        let payload = PutPayload::from(data.clone());
+        let put = || self.store.put_opts(&path, payload.clone(), opts.clone());
+        match bounded_edge_retry(BODY_OP_TIMEOUT, put).await {
+            Ok(_) => Ok(true),
+            Err(e) if is_cf_edge_error(&e) => Err(map_err(e)),
+            Err(object_store::Error::Precondition { .. })
+            | Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e @ object_store::Error::NotImplemented { .. }) => {
+                conditional_fallback("put_if_version", key, &e);
+                self.put_bytes(key, data, sha256).await.map(|()| true)
+            }
+            Err(e) => Err(map_err(e)),
+        }
+    }
+
+    async fn put_from_path_if_absent(
+        &self,
+        key: &str,
+        src: &std::path::Path,
+        sha256: &str,
+    ) -> Result<bool> {
+        // A multipart upload cannot be made conditional, so the body goes to a key of its
+        // own and a store-side copy that refuses an existing destination publishes it.
+        if self.stat(key).await.is_some() {
+            return Ok(false);
+        }
+        // ponytail: a process killed between the upload and the delete leaves its temp
+        // object under `.nora-uploads/` (hidden from every listing); a lifecycle rule on
+        // that prefix collects them.
+        let tmp = format!(".nora-uploads/{}", uuid::Uuid::new_v4());
+        self.put_from_path(&tmp, src, Some(sha256)).await?;
+        let (from, to) = (
+            Path::from(encode_object_key(&tmp)),
+            Path::from(encode_object_key(key)),
+        );
+        let copy = || self.store.copy_if_not_exists(&from, &to);
+        let outcome = match bounded_edge_retry(BODY_OP_TIMEOUT, copy).await {
+            Ok(()) => Ok(true),
+            Err(e) if is_cf_edge_error(&e) => Err(map_err(e)),
+            Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+            Err(e @ object_store::Error::NotImplemented { .. }) => {
+                conditional_fallback("put_from_path_if_absent", key, &e);
+                self.copy(&tmp, key, Some(sha256)).await.map(|()| true)
+            }
+            Err(e) => Err(map_err(e)),
+        };
+        if let Err(e) = self.delete(&tmp).await {
+            tracing::warn!(key = %tmp, error = %e, "temp upload object not deleted");
+        }
+        outcome
     }
 
     async fn pin(&self, key: &str) -> Option<String> {
@@ -1574,6 +1705,193 @@ mod tests {
             let (body, _) = storage.get(key).await.expect(key);
             assert_eq!(&body[..], key.as_bytes());
             assert!(storage.stat(key).await.is_some(), "{key}");
+        }
+    }
+
+    /// The ETag compare-and-swap: the version read writes once, the same (now stale)
+    /// version is refused, a missing object matches no version (audit A033).
+    #[tokio::test]
+    async fn put_if_version_refuses_a_stale_etag() {
+        let storage = ObjectStorage::in_memory();
+        let key = "nuget/hosted-meta/a.json";
+        let put = |body: &'static [u8], expected: Option<String>| {
+            let storage = &storage;
+            async move {
+                storage
+                    .put_if_version(key, Bytes::from_static(body), "aa", expected.as_deref())
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(!put(b"none", Some("\"1\"\n".into())).await);
+        assert!(put(b"v1", None).await);
+        assert!(!put(b"again", None).await);
+        let (_, _, v1) = storage.get_versioned(key).await.unwrap();
+        assert!(!v1.is_empty());
+        assert!(put(b"v2", Some(v1.clone())).await);
+        assert!(!put(b"lost update", Some(v1)).await);
+        assert_eq!(&storage.get(key).await.unwrap().0[..], b"v2");
+    }
+
+    /// A version token carries the ETag and the generation, and reads back as both.
+    #[test]
+    fn a_version_token_round_trips() {
+        let meta = |e_tag: Option<&str>, version: Option<&str>| object_store::ObjectMeta {
+            location: Path::from("k"),
+            last_modified: chrono::Utc::now(),
+            size: 0,
+            e_tag: e_tag.map(str::to_string),
+            version: version.map(str::to_string),
+        };
+        assert_eq!(version_token(&meta(None, None)), "");
+        for (e, v) in [
+            (Some("\"e\""), None),
+            (None, Some("17")),
+            (Some("\"e\""), Some("17")),
+        ] {
+            let back = update_version(&version_token(&meta(e, v)));
+            assert_eq!((back.e_tag.as_deref(), back.version.as_deref()), (e, v));
+        }
+    }
+
+    /// Of two files published under one key, the first is stored with its pin and the
+    /// second is refused; no temp object is left.
+    #[tokio::test]
+    async fn put_from_path_if_absent_creates_exactly_once() {
+        let storage = ObjectStorage::in_memory();
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = "nuget/hosted/a/1.0.0/a.1.0.0.nupkg";
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        assert!(storage
+            .put_from_path_if_absent(key, &first, "11")
+            .await
+            .unwrap());
+        assert!(!storage
+            .put_from_path_if_absent(key, &second, "22")
+            .await
+            .unwrap());
+        assert_eq!(
+            storage.get(key).await.unwrap(),
+            (Bytes::from_static(b"first"), Some("11".to_string()))
+        );
+        assert!(storage.list(".nora-uploads/").await.unwrap().is_empty());
+    }
+
+    /// A store without conditional writes: the write goes through unconditionally and is
+    /// counted, so a push never fails for it.
+    #[tokio::test]
+    async fn a_store_without_conditional_writes_writes_and_counts() {
+        let storage = over(NoConditional(object_store::memory::InMemory::new()));
+        let count = |op: &str| {
+            crate::metrics::STORAGE_CONDITIONAL_FALLBACK
+                .with_label_values(&[op])
+                .get()
+        };
+        let (versions, copies) = (count("put_if_version"), count("put_from_path_if_absent"));
+        let key = "nuget/hosted-meta/a.json";
+        storage.put(key, b"v1", "aa").await.unwrap();
+        let (_, _, v1) = storage.get_versioned(key).await.unwrap();
+        assert!(storage
+            .put_if_version(key, Bytes::from_static(b"v2"), "bb", Some(&v1))
+            .await
+            .unwrap());
+        assert!(storage
+            .put_if_version(key, Bytes::from_static(b"v3"), "cc", Some(""))
+            .await
+            .unwrap());
+        assert_eq!(&storage.get(key).await.unwrap().0[..], b"v3");
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"blob").unwrap();
+        let blob = "nuget/hosted/a/1.0.0/a.1.0.0.nupkg";
+        assert!(storage
+            .put_from_path_if_absent(blob, &file, "dd")
+            .await
+            .unwrap());
+        assert_eq!(
+            storage.get(blob).await.unwrap(),
+            (Bytes::from_static(b"blob"), Some("dd".to_string()))
+        );
+        assert!(count("put_if_version") >= versions + 2);
+        assert!(count("put_from_path_if_absent") > copies);
+    }
+
+    /// The in-memory store answering "not implemented" for conditional updates and
+    /// create-only copies, as an S3 store configured without them does.
+    #[derive(Debug)]
+    struct NoConditional(object_store::memory::InMemory);
+
+    impl std::fmt::Display for NoConditional {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "NoConditional")
+        }
+    }
+
+    fn not_implemented() -> object_store::Error {
+        object_store::Error::NotImplemented {
+            operation: "conditional".into(),
+            implementer: "NoConditional".into(),
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for NoConditional {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if matches!(opts.mode, PutMode::Update(_)) {
+                return Err(not_implemented());
+            }
+            self.0.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.0.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.0.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.0.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.0.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.0.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            if matches!(options.mode, object_store::CopyMode::Create) {
+                return Err(not_implemented());
+            }
+            self.0.copy_opts(from, to, options).await
         }
     }
 

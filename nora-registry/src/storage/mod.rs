@@ -153,6 +153,49 @@ pub trait StorageBackend: Send + Sync {
     /// Bytes plus the recorded pin, from ONE backend round-trip. `None` means
     /// the object carries no pin (open-world).
     async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)>;
+    /// [`get`](Self::get) plus an opaque version token of the bytes read, for
+    /// [`put_if_version`](Self::put_if_version). The default token is the SHA-256 of
+    /// the bytes; an object store returns its ETag.
+    async fn get_versioned(&self, key: &str) -> Result<(Bytes, Option<String>, String)> {
+        let (data, pin) = self.get(key).await?;
+        let version = sha256_hex(&data);
+        Ok((data, pin, version))
+    }
+    /// Compare-and-swap: write `data` only when the stored object is still the version
+    /// `expected` names (a token of [`get_versioned`](Self::get_versioned)), or, for
+    /// `None`, when nothing is stored under `key`. `Ok(false)`: another write came
+    /// first, nothing written. The default checks, then writes, which two writers can
+    /// interleave; backends with a conditional write make it one step.
+    async fn put_if_version(
+        &self,
+        key: &str,
+        data: Bytes,
+        sha256: &str,
+        expected: Option<&str>,
+    ) -> Result<bool> {
+        let Some(expected) = expected else {
+            return self.put_if_absent(key, data, sha256).await;
+        };
+        match self.get(key).await {
+            Ok((current, _)) if sha256_hex(&current) == expected => {
+                self.put_bytes(key, data, sha256).await.map(|()| true)
+            }
+            Ok(_) | Err(StorageError::NotFound) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+    /// [`put_from_path`](Self::put_from_path) pinned to `sha256`, only when nothing is
+    /// stored under `key` yet; `Ok(false)`: the key existed and was left as is. `src`
+    /// may be consumed either way; the caller removes what is left of it. The default
+    /// checks, then writes.
+    async fn put_from_path_if_absent(&self, key: &str, src: &Path, sha256: &str) -> Result<bool> {
+        if self.stat(key).await.is_some() {
+            return Ok(false);
+        }
+        self.put_from_path(key, src, Some(sha256))
+            .await
+            .map(|()| true)
+    }
     /// The recorded pin for `key` without reading the bytes.
     async fn pin(&self, key: &str) -> Option<String>;
     async fn delete(&self, key: &str) -> Result<()>;
@@ -509,6 +552,39 @@ impl Storage {
         result
     }
 
+    /// Compare-and-swap write of `key` (see [`StorageBackend::put_if_version`]):
+    /// `expected` is the version [`get_versioned`](Self::get_versioned) returned, `None`
+    /// for "create only". `Ok(false)`: another write came first, nothing written.
+    pub async fn put_if_version(
+        &self,
+        key: &str,
+        data: Bytes,
+        expected: Option<&str>,
+    ) -> Result<bool> {
+        let hash = Self::hash_for_put(key, &data).await?;
+        let write = Self::timed("put", self.inner.put_if_version(key, data, &hash, expected));
+        let result = self.writing(key, write).await;
+        Self::count_put(&result);
+        result
+    }
+
+    /// [`put_from_path`](Self::put_from_path) pinned to `sha256`, only when nothing is
+    /// stored under `key` yet (see [`StorageBackend::put_from_path_if_absent`]).
+    /// `Ok(false)`: the key existed, nothing written.
+    pub async fn put_from_path_if_absent(
+        &self,
+        key: &str,
+        src: &Path,
+        sha256: &str,
+    ) -> Result<bool> {
+        validate_storage_key(key)?;
+        let sha256 = sha256.to_ascii_lowercase();
+        let write = Self::timed("put", self.inner.put_from_path_if_absent(key, src, &sha256));
+        let result = self.writing(key, write).await;
+        Self::count_put(&result);
+        result
+    }
+
     /// Validate `key` and hash a body for a put.
     async fn hash_for_put(key: &str, data: &Bytes) -> Result<String> {
         validate_storage_key(key)?;
@@ -625,6 +701,26 @@ impl Storage {
         self.get_pinned(key)
             .await
             .map(nora_registry::verified::GateOutcome::accept_open_world)
+    }
+
+    /// [`get`](Self::get) plus the version token a [`put_if_version`](Self::put_if_version)
+    /// of the same key expects, both of one backend read.
+    pub async fn get_versioned(&self, key: &str) -> Result<(Bytes, String)> {
+        validate_storage_key(key)?;
+        let (data, pin, version) = match Self::timed("get", self.inner.get_versioned(key)).await {
+            Ok(v) => v,
+            Err(e) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["get", "error"])
+                    .inc();
+                return Err(e);
+            }
+        };
+        STORAGE_OPERATIONS.with_label_values(&["get", "ok"]).inc();
+        let data = Self::verify_pinned(key, data, pin)
+            .await
+            .map(nora_registry::verified::GateOutcome::accept_open_world)?;
+        Ok((data, version))
     }
 
     /// Buffered, integrity-gated read returning a compile-time integrity
@@ -2180,6 +2276,7 @@ mod tests {
         "get_reader",
         "get_verified",
         "get_verified_bounded",
+        "get_versioned",
         "list",
         "list_claiming_empty",
         "list_internal",
@@ -2189,7 +2286,9 @@ mod tests {
         "put",
         "put_bytes",
         "put_from_path",
+        "put_from_path_if_absent",
         "put_if_absent",
+        "put_if_version",
         "repin",
         "stat",
     ];
@@ -2233,6 +2332,15 @@ mod tests {
                         refused(&s.get_verified_bounded(key, 1).await),
                     ),
                     ("get", refused(&s.get(key).await)),
+                    ("get_versioned", refused(&s.get_versioned(key).await)),
+                    (
+                        "put_if_version",
+                        refused(&s.put_if_version(key, Bytes::from_static(b"x"), None).await),
+                    ),
+                    (
+                        "put_from_path_if_absent",
+                        refused(&s.put_from_path_if_absent(key, &src_file, "00").await),
+                    ),
                     ("get_verified", refused(&s.get_verified(key).await)),
                     ("get_reader", refused(&s.get_reader(key).await)),
                     ("get_range", refused(&s.get_range(key, 0, 0).await)),
