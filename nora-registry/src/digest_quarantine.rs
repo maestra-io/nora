@@ -217,9 +217,9 @@ impl DigestStore {
     /// [`Self::load`] off the startup path: the store starts empty and serves at
     /// once, the ledger is merged in when the walk over `storage` finishes
     /// (bounded by `LOAD_DEADLINE`; past it the walk is dropped and logged).
-    /// Until then a known digest reads as new, so an enforcing quarantine may
-    /// hold a cached version for one more TTL; the listener never waits on R2. An enforcing
-    /// gate waits for the walk instead ([`ledger_ready`]).
+    /// Until then a digest with no record in memory is not known to be new: an enforcing
+    /// proxy-fetch gate waits for the walk ([`ledger_ready`]), and a cache hit reads that
+    /// digest's own entry ([`Self::read_unknown`]); the listener never waits on R2.
     /// Maestra: on 20.10.2026 the blocking load kept packages.maestra.io from
     /// binding its port for minutes on a slow R2 listing, and the startup probe
     /// killed the pod in a loop.
@@ -306,6 +306,22 @@ impl DigestStore {
             adopt(&self.entries, stored);
         }
         Ok(())
+    }
+
+    /// [`Self::read_through`] for a digest with no record while the ledger is not in memory
+    /// whole (loading, or a walk that failed or timed out): a cache hit is judged by its own
+    /// entry, never served as unrecorded. No-op once loaded or for a digest it knows.
+    // ponytail: a missing entry is not remembered, so an unrecorded digest costs one GET per
+    // request while unloaded; cache negative lookups if the R2 cost shows up.
+    pub(crate) async fn read_unknown(
+        &self,
+        registry: &str,
+        digest: &str,
+    ) -> Result<(), StorageError> {
+        if self.loaded() || !matches!(self.check(registry, digest, 0), QuarantineStatus::New) {
+            return Ok(());
+        }
+        self.read_through(registry, digest).await
     }
 
     /// Record a proxy-fetched digest. Returns the entry (existing or new).

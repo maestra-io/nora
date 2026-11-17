@@ -529,9 +529,13 @@ fn runnable_digests(manifest: &[u8], digest: &str) -> Vec<String> {
     match doc["manifests"].as_array() {
         Some(listed) => listed
             .iter()
+            // Only BuildKit's form of an attestation (unknown/unknown, which no runtime
+            // selects) is left out: any other entry must be among the tag's images.
             .filter(|m| {
                 m["annotations"]["vnd.docker.reference.type"].as_str()
                     != Some("attestation-manifest")
+                    || m["platform"]["os"].as_str() != Some("unknown")
+                    || m["platform"]["architecture"].as_str() != Some("unknown")
             })
             .filter_map(|m| m["digest"].as_str().map(str::to_owned))
             .collect(),
@@ -957,6 +961,21 @@ mod tests {
         .to_string();
         assert_eq!(runnable_digests(index.as_bytes(), D), [P1]);
         assert_eq!(runnable_digests(br#"{"config":{}}"#, D), [D]);
+    }
+
+    /// An entry labelled as an attestation on a platform a runtime selects (or on none) is
+    /// still an image of the index: the tag must list it to date the index.
+    #[test]
+    fn an_attestation_label_on_a_runnable_platform_is_not_left_out() {
+        let index = serde_json::json!({"manifests": [
+            {"digest": P1, "platform": {"architecture": "amd64", "os": "linux"},
+             "annotations": {"vnd.docker.reference.type": "attestation-manifest"}},
+            {"digest": P2, "annotations": {"vnd.docker.reference.type": "attestation-manifest"}},
+            {"digest": D, "platform": {"architecture": "unknown", "os": "unknown"},
+             "annotations": {"vnd.docker.reference.type": "attestation-manifest"}},
+        ]})
+        .to_string();
+        assert_eq!(runnable_digests(index.as_bytes(), D), [P1, P2]);
     }
 
     #[test]
