@@ -34,13 +34,14 @@
 # --- traefik.yml (static configuration) ---
 
 entryPoints:
+  # No entry-point-wide redirect to https on :80: it would also answer API
+  # clients (docker, npm, pip, nuget) configured with http://, whose credentials
+  # have then already crossed the network in cleartext, and hide that mistake.
+  # :80 has no routers, so those clients get a 404 and their owner switches them
+  # to https://. Browsers get the optional nora-ui-redirect router below. Drop
+  # this entry point entirely unless ACME HTTP-01 or that redirect needs it.
   web:
     address: ":80"
-    http:
-      redirections:
-        entryPoint:
-          to: websecure
-          scheme: https
   websecure:
     address: ":443"
     # With its default readTimeout, Traefik v3 (measured on 3.7) ends a request
@@ -73,6 +74,22 @@ log:
 #         - websecure
 #       tls:
 #         certResolver: letsencrypt
+#
+#     # Optional: send browsers that type http:// to the web UI over https.
+#     # API paths on :80 stay unrouted (404).
+#     nora-ui-redirect:
+#       rule: "Host(`registry.example.com`) && (Path(`/`) || PathPrefix(`/ui`))"
+#       service: noop@internal
+#       entryPoints:
+#         - web
+#       middlewares:
+#         - to-https
+#
+#   middlewares:
+#     to-https:
+#       redirectScheme:
+#         scheme: https
+#         permanent: true
 #
 #   services:
 #     nora:

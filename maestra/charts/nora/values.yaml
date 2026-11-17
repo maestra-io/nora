@@ -136,8 +136,9 @@ config:
     # shutdown_timeout: 15
     # -- internal_port: detailed /health and /metrics move to this port, exposed
     # as containerPort and Service port `internal` (scrape it; never route it).
-    # The probes stay on `http`, whose /health then reports the status only.
-    # internal_port: 9100
+    # The probes stay on `http`, whose /health then reports the status only and
+    # whose /metrics answers 404. Set to null to serve both on `http` again.
+    internal_port: 9100
     # -- teleport_port: listener for the Teleport app agent, exposed as
     # containerPort `teleport` (point the Teleport app's Service at it). Same
     # routes as `http`, but X-Forwarded-For / X-Real-IP are never trusted there,

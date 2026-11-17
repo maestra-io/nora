@@ -11,9 +11,10 @@ tests:
       - hasDocuments:
           count: 0
 
-  - it: renders a ServiceMonitor on the http port
+  - it: renders a ServiceMonitor on the http port when internal_port is null
     set:
       metrics.serviceMonitor.enabled: true
+      config.server.internal_port: null
       metrics.serviceMonitor.labels:
         team: platform
     template: templates/servicemonitor.yaml
@@ -40,6 +41,15 @@ tests:
             path: /metrics
             interval: 30s
             scrapeTimeout: 10s
+
+  - it: scrapes the internal port by default (R2-53)
+    set:
+      metrics.serviceMonitor.enabled: true
+    template: templates/servicemonitor.yaml
+    asserts:
+      - equal:
+          path: spec.endpoints[0].port
+          value: internal
 
   - it: scrapes the internal port when server.internal_port is set (R2-53)
     set:

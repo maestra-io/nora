@@ -48,7 +48,18 @@ tests:
             name: internal
 
   # Maestra
-  - it: has only the http port by default
+  - it: has the http and internal ports by default
+    asserts:
+      - equal:
+          path: spec.ports[1].name
+          value: internal
+      - equal:
+          path: spec.ports[1].port
+          value: 9100
+
+  - it: has only the http port when internal_port is null
+    set:
+      config.server.internal_port: null
     asserts:
       - lengthEqual:
           path: spec.ports
