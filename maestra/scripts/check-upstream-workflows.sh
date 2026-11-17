@@ -81,6 +81,9 @@ fi
 
 if [ -n "$states" ]; then
     while read -r path state; do
+        # dynamic/* is run by GitHub itself (Dependency Graph, Dependabot, default code
+        # scanning): no file in this repository, nothing of upstream's.
+        case "$path" in dynamic/*) continue ;; esac
         file=$(basename "$path")
         case "$file" in maestra-*) continue ;; esac
         listed "$file" "$ACTIVE" && continue
