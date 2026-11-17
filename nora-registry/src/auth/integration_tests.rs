@@ -2088,3 +2088,47 @@ async fn concurrent_wrong_passwords_on_a_token_route_cannot_outrun_the_lockout()
         64 - checked
     );
 }
+
+/// B10: the web-surface and /metrics Basic challenge is typed text/plain.
+#[tokio::test]
+async fn web_surface_challenge_is_typed_text() {
+    let ctx = create_test_context_with_auth_and_config(&[("admin", "secret")], |cfg| {
+        cfg.auth.public_metrics = false;
+    });
+    for path in ["/ui/", "/metrics"] {
+        let response = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        let h = response.headers();
+        assert_eq!(h["www-authenticate"], "Basic realm=\"nora\"", "{path}");
+        assert_eq!(h["content-type"], "text/plain; charset=utf-8", "{path}");
+        assert_eq!(body_bytes(response).await, "Authentication required");
+    }
+}
+
+/// A084: `public` becomes `private`; every other directive and header stays.
+#[test]
+fn privatize_cache_control_swaps_only_public() {
+    use axum::http::{header, HeaderMap, HeaderValue};
+    let run = |values: &[&str]| {
+        let mut h = HeaderMap::new();
+        for v in values {
+            h.append(header::CACHE_CONTROL, HeaderValue::from_str(v).unwrap());
+        }
+        super::privatize_cache_control(&mut h);
+        h.get_all(header::CACHE_CONTROL)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        run(&["public, max-age=60, must-revalidate"]),
+        ["private, max-age=60, must-revalidate"]
+    );
+    assert_eq!(
+        run(&["max-age=31536000,PUBLIC, immutable"]),
+        ["max-age=31536000, private, immutable"]
+    );
+    assert_eq!(run(&["no-cache"]), ["no-cache"]);
+    assert_eq!(run(&["public", "max-age=5"]), ["private", "max-age=5"]);
+    assert!(run(&[]).is_empty());
+}

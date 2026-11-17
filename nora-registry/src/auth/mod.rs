@@ -684,15 +684,28 @@ pub async fn auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    if is_cross_site_write(&request) {
+        return (StatusCode::FORBIDDEN, "cross-site request refused").into_response();
+    }
     // Maestra: with the UI behind Teleport, a browser never gets a Basic
     // challenge, so no password dialog on the public hostname.
     let drop_challenge = state.teleport.as_ref().is_some_and(|t| t.require_for_ui())
         && teleport::is_browser(request.headers());
     let presented = presented_credential(&request);
+    // An answer that may depend on a credential is never `public`: a shared
+    // cache must not hand it to a caller without one. Anonymous reads under
+    // `anonymous_read` keep `public`.
+    let privatize = state.config.auth.enabled
+        && (!state.config.auth.anonymous_read
+            || presented.is_some()
+            || request.headers().contains_key("x-nora-bypass-token"));
     let client_ip = extract_client_ip(&request, &state.config.auth.trusted_proxies);
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let mut response = authenticate(state, request, next).await;
+    if privatize {
+        privatize_cache_control(response.headers_mut());
+    }
     if let Some(rej) = response.extensions_mut().remove::<AuthRejection>() {
         if let Some((kind, username)) = presented {
             log_rejection(&rej, kind, username.as_deref(), client_ip, &method, &path);
@@ -702,6 +715,46 @@ pub async fn auth_middleware(
         response.headers_mut().remove(header::WWW_AUTHENTICATE);
     }
     response
+}
+
+/// A state-changing request a browser marks as sent from another site. Package
+/// clients send no `Sec-Fetch-*` headers; the same-origin UI sends `same-origin`.
+fn is_cross_site_write(request: &Request<Body>) -> bool {
+    !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) && request
+        .headers()
+        .get("sec-fetch-site")
+        .is_some_and(|v| v == "cross-site" || v == "same-site")
+}
+
+/// Rewrites the `public` Cache-Control directive to `private` (RFC 9111 §5.2.2.7),
+/// keeping every other directive (max-age, immutable, must-revalidate).
+fn privatize_cache_control(headers: &mut HeaderMap) {
+    let is_public = |d: &str| d.trim().eq_ignore_ascii_case("public");
+    let old: Vec<header::HeaderValue> = headers
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .cloned()
+        .collect();
+    if !old
+        .iter()
+        .any(|v| v.to_str().is_ok_and(|v| v.split(',').any(is_public)))
+    {
+        return;
+    }
+    headers.remove(header::CACHE_CONTROL);
+    for v in old {
+        let rewritten = v.to_str().ok().and_then(|s| {
+            let s: Vec<&str> = s
+                .split(',')
+                .map(|d| if is_public(d) { " private" } else { d })
+                .collect();
+            header::HeaderValue::from_str(s.join(",").trim()).ok()
+        });
+        headers.append(header::CACHE_CONTROL, rewritten.unwrap_or(v));
+    }
 }
 
 fn log_rejection(
@@ -920,11 +973,15 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
                 .get(axum::http::header::AUTHORIZATION)
                 .is_none()
         {
-            return axum::http::Response::builder()
-                .status(axum::http::StatusCode::UNAUTHORIZED)
-                .header("WWW-Authenticate", "Basic realm=\"nora\"")
-                .body(axum::body::Body::from("Authentication required"))
-                .expect("valid response");
+            return (
+                StatusCode::UNAUTHORIZED,
+                [
+                    (header::WWW_AUTHENTICATE, "Basic realm=\"nora\""),
+                    (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                ],
+                "Authentication required",
+            )
+                .into_response();
         }
     }
 
