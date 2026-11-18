@@ -477,13 +477,33 @@ impl TokenStore {
     // ponytail: one GET per record, concurrently; fine for hundreds of tokens, an
     // in-memory index if it ever has to serve thousands.
     pub async fn list_all_tokens(&self) -> Vec<TokenListEntry> {
-        let keys = match self.storage.list_internal(STORAGE_PREFIX).await {
-            Ok(keys) => keys,
-            Err(e) => {
-                tracing::warn!(error = %e, "token list failed");
-                return Vec::new();
-            }
-        };
+        self.collect_tokens(false).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "token list failed");
+            Vec::new()
+        })
+    }
+
+    /// [`Self::list_all_tokens`] for a caller that acts on the answer: a listing
+    /// or a record read the store fails is an error, never a shorter list. A
+    /// record gone meanwhile or unreadable as JSON is left out, as there.
+    pub async fn try_list_all_tokens(&self) -> Result<Vec<TokenListEntry>, TokenError> {
+        self.collect_tokens(true).await
+    }
+
+    /// [`Self::try_list_all_tokens`] for one owner.
+    pub async fn try_list_tokens(&self, user: &str) -> Result<Vec<TokenListEntry>, TokenError> {
+        let mut tokens = self.try_list_all_tokens().await?;
+        tokens.retain(|t| t.user == user);
+        Ok(tokens)
+    }
+
+    /// Every token record; `strict`: a record read the store fails fails all.
+    async fn collect_tokens(&self, strict: bool) -> Result<Vec<TokenListEntry>, TokenError> {
+        let keys = self
+            .storage
+            .list_internal(STORAGE_PREFIX)
+            .await
+            .map_err(|e| TokenError::Storage(e.to_string()))?;
         let ids = keys.iter().filter_map(|k| record_id(k));
         let records = futures::future::join_all(
             ids.map(|id| async move { (id, self.storage.get(&record_key(id)).await) }),
@@ -499,10 +519,13 @@ impl TokenStore {
 
         let mut tokens = Vec::new();
         for (id, content) in records {
-            let Some(info) = content
-                .ok()
-                .and_then(|c| serde_json::from_slice::<TokenInfo>(&c).ok())
-            else {
+            let content = match content {
+                Ok(content) => content,
+                Err(StorageError::NotFound) => continue,
+                Err(e) if strict => return Err(TokenError::Storage(e.to_string())),
+                Err(_) => continue,
+            };
+            let Ok(info) = serde_json::from_slice::<TokenInfo>(&content) else {
                 continue;
             };
             tokens.push(TokenListEntry {
@@ -517,7 +540,7 @@ impl TokenStore {
         }
 
         tokens.sort_by_key(|t| std::cmp::Reverse(t.created_at));
-        tokens
+        Ok(tokens)
     }
 
     /// A small state object: `None` when it does not exist yet.
@@ -637,19 +660,24 @@ impl TokenStore {
         }
     }
 
-    /// Revoke all tokens for a user
-    pub async fn revoke_all_for_user(&self, user: &str) -> usize {
-        let mut count = 0;
-        for token in self.list_tokens(user).await {
+    /// Revoke all tokens for a user: the ids revoked and the ids whose revoke
+    /// the store failed. A listing the store fails is an error.
+    pub async fn revoke_all_for_user(
+        &self,
+        user: &str,
+    ) -> Result<(Vec<String>, Vec<String>), TokenError> {
+        let (mut revoked, mut failed) = (Vec::new(), Vec::new());
+        for token in self.try_list_tokens(user).await? {
             match self.revoke_token(&token.file_id).await {
-                Ok(()) => count += 1,
+                Ok(()) => revoked.push(token.file_id),
                 Err(TokenError::NotFound) => {}
                 Err(e) => {
                     tracing::warn!(id = %token.file_id, error = %e, "token revoke failed");
+                    failed.push(token.file_id);
                 }
             }
         }
-        count
+        Ok((revoked, failed))
     }
 
     /// Maestra: import the token files of the pre-storage layout (`<16hex>.json` in
@@ -1334,7 +1362,10 @@ mod tests {
             store.token_owner(&id).await,
             Err(TokenError::Storage(_))
         ));
-        assert_eq!(store.revoke_all_for_user("ci").await, 0);
+        assert!(matches!(
+            store.revoke_all_for_user("ci").await,
+            Err(TokenError::Storage(_))
+        ));
         outage.end();
 
         assert_eq!(store.token_owner(&id).await.unwrap(), "ci");
@@ -1405,8 +1436,8 @@ mod tests {
             .await
             .unwrap();
 
-        let revoked = store.revoke_all_for_user("user1").await;
-        assert_eq!(revoked, 2);
+        let (revoked, failed) = store.revoke_all_for_user("user1").await.unwrap();
+        assert_eq!((revoked.len(), failed.len()), (2, 0));
 
         assert_eq!(store.list_tokens("user1").await.len(), 0);
         assert_eq!(store.list_tokens("user2").await.len(), 1);
@@ -1557,8 +1588,8 @@ mod tests {
         assert_eq!(store.cache.read().len(), 3);
 
         // Revoke all tokens for alice
-        let revoked = store.revoke_all_for_user("alice").await;
-        assert_eq!(revoked, 2);
+        let (revoked, failed) = store.revoke_all_for_user("alice").await.unwrap();
+        assert_eq!((revoked.len(), failed.len()), (2, 0));
 
         // Alice's cache entries should be gone, bob's should remain
         assert_eq!(store.cache.read().len(), 1);

@@ -243,7 +243,9 @@ config:
     # -- Maestra fork: [auth.teleport], web UI identity from a Teleport app
     # agent's JWT (MAESTRA.md). Rendered when set; trusted_proxies may be a
     # list. Keys: enabled, jwks_url, issuer, audience, trusted_proxies,
-    # write_roles, require_for_ui, leeway_secs (60), jwks_cache_secs (300).
+    # write_roles, require_for_ui, leeway_secs (60), jwks_cache_secs (300),
+    # max_token_ttl_days (unset: no cap below ten years on tokens a Teleport
+    # user mints in the UI).
     teleport: {}
     #  enabled: true
     #  jwks_url: https://teleport.example.com/.well-known/jwks.json

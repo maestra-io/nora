@@ -116,6 +116,18 @@ impl AuditEntry {
         )
     }
 
+    /// The entry of a token revoke: `actor` revoked through `route` the token
+    /// record `file_id` (its 16-hex id, never the token) owned by `owner`.
+    pub fn token_revoke(actor: &str, route: &str, owner: &str, file_id: &str) -> Self {
+        Self::new(
+            "token_revoke",
+            actor,
+            owner,
+            route,
+            &format!("id={file_id}"),
+        )
+    }
+
     pub fn new(action: &str, actor: &str, artifact: &str, registry: &str, detail: &str) -> Self {
         Self {
             ts: Utc::now(),

@@ -20,6 +20,10 @@ use crate::AppState;
 
 use super::{lockout_rule, resolve_client_ip, too_many_failed_attempts, BasicDecision};
 
+/// The body of a mint whose record could not be stored, on every mint route:
+/// the storage error (endpoint, bucket, key) goes to the log only.
+pub const TOKEN_NOT_STORED: &str = "Token could not be stored; see the server log";
+
 #[derive(Deserialize)]
 pub struct CreateTokenRequest {
     pub username: String,
@@ -216,9 +220,10 @@ async fn create_token(
             Json(MintedTokenResponse::from(minted)).into_response()
         }
         Err(e) => {
-            // e.g. a failed storage write: the client only sees the 500.
+            // e.g. a failed storage write: the detail stays in the log, the
+            // client gets a fixed body.
             tracing::error!(user = %req.username, error = %e, "token mint failed: cannot store the token record");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, TOKEN_NOT_STORED).into_response()
         }
     }
 }
@@ -304,7 +309,15 @@ async fn revoke_token(
         Err(e) => Err(e),
     };
     match revoked {
-        Ok(()) => (StatusCode::OK, "Token revoked").into_response(),
+        Ok(()) => {
+            state.audit.log(AuditEntry::token_revoke(
+                &req.username,
+                "api",
+                &req.username,
+                &req.hash_prefix,
+            ));
+            (StatusCode::OK, "Token revoked").into_response()
+        }
         Err(TokenError::Storage(e)) => {
             tracing::error!(error = %e, "token store failed during revoke");
             (StatusCode::SERVICE_UNAVAILABLE, "Token store unavailable").into_response()
@@ -680,6 +693,214 @@ mod mint_tests {
         assert_eq!(
             mint["detail"],
             format!("role=write ttl_secs={}", 30 * 86_400)
+        );
+    }
+
+    async fn send_raw(
+        ctx: &TestContext,
+        uri: &str,
+        headers: Vec<(&str, &str)>,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let resp = send_with_headers(&ctx.app, Method::POST, uri, headers, body.to_string()).await;
+        let status = resp.status();
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        (status, body)
+    }
+
+    // Audit A024: a revoke on the API and UI routes leaves one `token_revoke`
+    // entry naming who revoked whose token by its record id; a refused one
+    // leaves none.
+    #[tokio::test]
+    async fn revoke_is_audited_on_both_routes() {
+        let ctx = audited(&[("alice", "alicepw")]);
+        let store = ctx.state.tokens.as_ref().unwrap();
+        let json = [("content-type", "application/json")];
+        let (status, _) = post_json(
+            &ctx,
+            "/api/tokens",
+            None,
+            r#"{"username":"alice","password":"alicepw","role":"read"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let api_id = store.list_tokens("alice").await[0].file_id.clone();
+        let revoke = |password: &str| {
+            format!(r#"{{"username":"alice","password":"{password}","hash_prefix":"{api_id}"}}"#)
+        };
+        let (status, _) =
+            send_raw(&ctx, "/api/tokens/revoke", json.to_vec(), &revoke("wrong")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = send_raw(
+            &ctx,
+            "/api/tokens/revoke",
+            json.to_vec(),
+            &revoke("alicepw"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let by_admin = store
+            .create_token("alice", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let admin = store
+            .create_token("root", 30, None, Role::Admin)
+            .await
+            .unwrap();
+        let admin_id = store.list_tokens("alice").await[0].file_id.clone();
+        let bearer = format!("Bearer {admin}");
+        let ui_admin = vec![("authorization", bearer.as_str()), ("hx-request", "true")];
+        let (status, _) = send_raw(
+            &ctx,
+            "/api/ui/tokens/0123456789abcdef/revoke",
+            ui_admin.clone(),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send_raw(
+            &ctx,
+            &format!("/api/ui/tokens/{admin_id}/revoke"),
+            ui_admin,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        store
+            .create_token("alice", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let own_id = store.list_tokens("alice").await[0].file_id.clone();
+        let basic = format!("Basic {}", STANDARD.encode("alice:alicepw"));
+        let (status, _) = send_raw(
+            &ctx,
+            &format!("/api/ui/tokens/{own_id}/revoke"),
+            vec![("authorization", basic.as_str()), ("hx-request", "true")],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let entries = audit_entries(&ctx).await;
+        let revokes: Vec<_> = entries
+            .iter()
+            .filter(|e| e["action"] == "token_revoke")
+            .collect();
+        assert_eq!(revokes.len(), 3, "one entry per revoke: {entries:?}");
+        for (entry, (actor, route, id)) in revokes.iter().zip([
+            ("alice", "api", &api_id),
+            ("root", "ui", &admin_id),
+            ("alice", "ui", &own_id),
+        ]) {
+            assert_eq!(entry["actor"], actor);
+            assert_eq!(entry["artifact"], "alice");
+            assert_eq!(entry["registry"], route);
+            assert_eq!(entry["detail"], format!("id={id}"));
+        }
+        for token in [&by_admin, &admin] {
+            assert!(!entries
+                .iter()
+                .any(|e| e.to_string().contains(token.as_str())));
+        }
+    }
+
+    // Audit B26: a mint or revoke the token store fails answers a fixed body
+    // on every route; the storage error stays in the log.
+    #[tokio::test]
+    async fn a_failed_mint_or_revoke_answers_a_fixed_body() {
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_auth_and_storage(&[("alice", "alicepw")], storage);
+        let admin = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("root", 30, None, Role::Admin)
+            .await
+            .unwrap();
+        let bearer = format!("Bearer {admin}");
+        // Verified once, so the refused writes below hit only the mint.
+        ctx.state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .verify_token(&admin)
+            .await
+            .unwrap();
+        ops.fail_puts_ending(Some(".json"));
+        let json = vec![("content-type", "application/json")];
+        let (status, body) = send_raw(
+            &ctx,
+            "/api/tokens",
+            json.clone(),
+            r#"{"username":"alice","password":"alicepw"}"#,
+        )
+        .await;
+        assert_eq!(
+            (status, body.as_str()),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::auth::TOKEN_NOT_STORED
+            )
+        );
+        let mut admin_headers = json.clone();
+        admin_headers.push(("authorization", bearer.as_str()));
+        let (status, body) = send_raw(
+            &ctx,
+            "/api/v1/admin/tokens",
+            admin_headers,
+            r#"{"username":"svc"}"#,
+        )
+        .await;
+        assert_eq!(
+            (status, body.as_str()),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::auth::TOKEN_NOT_STORED
+            )
+        );
+        let basic = format!("Basic {}", STANDARD.encode("alice:alicepw"));
+        let (status, body) = send_raw(
+            &ctx,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", basic.as_str()),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            "description=ci&role=read&ttl_days=30",
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains(crate::auth::TOKEN_NOT_STORED), "{body}");
+        assert!(
+            !body.contains("refused") && !body.contains(".nora-tokens"),
+            "{body}"
+        );
+
+        let (storage, outage) = outage_storage();
+        let ctx = create_test_context_with_auth_and_storage(&[("alice", "alicepw")], storage);
+        let store = ctx.state.tokens.as_ref().unwrap();
+        store
+            .create_token("alice", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let id = store.list_tokens("alice").await[0].file_id.clone();
+        outage.fail_deletes_of(".json");
+        let (status, body) = send_raw(
+            &ctx,
+            &format!("/api/ui/tokens/{id}/revoke"),
+            vec![("authorization", basic.as_str()), ("hx-request", "true")],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("Token store unavailable"), "{body}");
+        assert!(
+            !body.contains("refused") && !body.contains(".nora-tokens"),
+            "{body}"
         );
     }
 

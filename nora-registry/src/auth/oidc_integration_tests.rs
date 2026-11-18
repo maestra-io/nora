@@ -517,6 +517,54 @@ async fn test_oidc_scoped_admin_cannot_mint_unrestricted_token_via_admin_route()
     );
 }
 
+/// Audit A089: the admin token list and revoke routes act on every owner, so a
+/// namespace-scoped admin is refused on each, as on the admin mint.
+#[tokio::test]
+async fn test_oidc_scoped_admin_cannot_list_or_revoke_tokens() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/jwks.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"))
+        .mount(&mock_server)
+        .await;
+    let ctx = create_oidc_test_context(&mock_server.uri());
+    let store = ctx.state.tokens.as_ref().unwrap();
+    store
+        .create_token("svc", 30, None, crate::tokens::Role::Write)
+        .await
+        .unwrap();
+    let id = store.list_tokens("svc").await[0].file_id.clone();
+    let now = now_secs();
+    let scoped = make_jwt(
+        &mock_server.uri(),
+        "repo:myorg/admin-scoped:deploy",
+        "nora",
+        now,
+        now + 600,
+    );
+    let bearer = format!("Bearer {scoped}");
+    for (verb, uri) in [
+        (Method::GET, "/api/v1/admin/tokens".to_string()),
+        (Method::DELETE, "/api/v1/admin/tokens?user=svc".to_string()),
+        (Method::DELETE, format!("/api/v1/admin/tokens/{id}")),
+    ] {
+        let response = send_with_headers(
+            &ctx.app,
+            verb.clone(),
+            &uri,
+            vec![("authorization", &bearer)],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{verb} {uri}");
+    }
+    assert_eq!(
+        store.list_tokens("svc").await.len(),
+        1,
+        "a scoped admin revoked"
+    );
+}
+
 /// #1094: a token minted by an OIDC identity through the UI must not outlive
 /// the provider's `max_token_lifetime_secs` (900s here). An unrestricted
 /// write identity (main-ref rule, provider `["*"]`) may mint — it is not
