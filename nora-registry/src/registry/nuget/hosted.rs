@@ -651,11 +651,11 @@ async fn push(
         return StatusCode::FORBIDDEN.into_response();
     }
     // An ID this feed does not host yet is served from the upstream: its first push would
-    // replace it for every consumer. Only an internal ID, a namespace-scoped caller, an
-    // Admin, or a feed with no upstream (or no auth) claims one; [`store`] decides under
-    // the lock whether the ID is new.
+    // replace it for every consumer. Only an internal ID, an ID inside the caller's
+    // namespace scope, an Admin, or a feed with no upstream (or no auth) claims one;
+    // [`store`] decides under the lock whether the ID is new.
     let may_claim = super::upstream_url(&state).is_none()
-        || !matches!(authority, NamespaceAuthority::Unrestricted)
+        || in_scope(&authority, &parsed.id_lower)
         || role
             .as_ref()
             .is_none_or(|Extension(AuthenticatedRole(r))| r.can_admin())
@@ -902,7 +902,7 @@ async fn store(
             pkg.id.clone_from(&spec.id);
         }
         pkg.versions.push(entry.clone());
-        for v in &adopted {
+        for (v, _) in &adopted {
             if !named(&pkg, &v.version) {
                 pkg.versions.push(v.clone());
             }
@@ -934,7 +934,7 @@ async fn imported_versions(
 }
 
 /// Copy every imported version not in `known` (lowercase) into the pushed feed's blob
-/// dirs and return it, for the document: once the ID has a state document, only the
+/// dirs and return it with its manifest ID, for the document: once the ID has a state document, only the
 /// versions it names are served. A record whose package is gone is skipped (it is not
 /// served either); any storage failure fails the push closed, before the document is
 /// written.
@@ -943,7 +943,7 @@ async fn adopt_imported(
     id_lower: &str,
     imported: &super::imported::Versions,
     known: &[String],
-) -> Result<Vec<HostedVersion>, (StatusCode, String)> {
+) -> Result<Vec<(HostedVersion, String)>, (StatusCode, String)> {
     let mut adopted = Vec::new();
     let missing: Vec<&String> = imported
         .listed()
@@ -988,7 +988,7 @@ async fn adopt_imported(
             Err(e) => return Err(fail("nuspec copy", &e)),
         }
         match version_from_blobs(storage, id_lower, ver, meta, true).await {
-            Ok((v, _)) => adopted.push(v),
+            Ok(found) => adopted.push(found),
             Err(BlobsError::Unusable(why)) => {
                 tracing::warn!(id = %id_lower, version = %ver, why = %why, "nuget hosted: imported version not adopted");
             }
@@ -1023,6 +1023,48 @@ fn scope_allows(authority: &NamespaceAuthority, id_lower: &str) -> bool {
         },
     };
     enforce_namespace_scope(&lowered, id_lower).is_ok()
+}
+
+/// Whether `id_lower` matches every scope set of a scoped caller, whatever its
+/// enforcement mode: an audit-mode scope lets an out-of-scope push through
+/// [`scope_allows`], but it must not let that push claim the ID.
+fn in_scope(authority: &NamespaceAuthority, id_lower: &str) -> bool {
+    match authority {
+        NamespaceAuthority::Unrestricted => false,
+        NamespaceAuthority::Scoped { scopes, .. } => scopes.iter().all(|set| {
+            set.iter()
+                .any(|p| crate::validation::namespace_match(&p.to_lowercase(), id_lower))
+        }),
+    }
+}
+
+/// The imported versions to carry into the state document before `version` is
+/// (un)listed: none when the document already names it or no `nora import` record does.
+async fn adopt_for_listing(
+    storage: &Storage,
+    id_lower: &str,
+    version: &str,
+) -> Result<Vec<(HostedVersion, String)>, (StatusCode, String)> {
+    let ver_lower = version.to_lowercase();
+    let imported = imported_versions(storage, id_lower).await?;
+    if imported.version(&ver_lower) != super::imported::Version::Own {
+        return Ok(Vec::new());
+    }
+    let known: Vec<String> = match load(storage, id_lower).await {
+        Ok(doc) => doc
+            .map(|p| {
+                p.versions
+                    .iter()
+                    .map(|v| v.version.to_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(_) => return Err(unavailable_err()),
+    };
+    if known.contains(&ver_lower) {
+        return Ok(Vec::new());
+    }
+    adopt_imported(storage, id_lower, &imported, &known).await
 }
 
 async fn unlist(
@@ -1067,10 +1109,34 @@ async fn set_listed(
     let key = meta_key(&id_lower);
     let lock = state.publish_lock(&key);
     let _guard = lock.lock().await;
+    // A version brought in by `nora import` and not yet in the state document is carried
+    // into it first, as the first push does in [`store`], so it can be (un)listed.
+    let adopted = match adopt_for_listing(&state.storage, &id_lower, &version).await {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
     let updated = update_doc(&state.storage, Some(&map), &id_lower, |doc| {
-        let Some(mut pkg) = doc else {
-            return Ok((None, None));
+        let mut pkg = match doc {
+            Some(pkg) => pkg,
+            None => match adopted.first() {
+                Some((_, id)) => HostedPackage {
+                    id: id.clone(),
+                    ..Default::default()
+                },
+                None => return Ok((None, None)),
+            },
         };
+        for (v, _) in &adopted {
+            if !pkg
+                .versions
+                .iter()
+                .any(|e| e.version.eq_ignore_ascii_case(&v.version))
+            {
+                pkg.versions.push(v.clone());
+            }
+        }
+        pkg.versions
+            .sort_by(|a, b| compare_versions(&a.version, &b.version));
         let Some(entry) = pkg
             .versions
             .iter_mut()
@@ -3783,6 +3849,13 @@ Jd74nq6dNCjpWG4drIsyhqX+
     /// any maestra-io repo may publish under `Maestra.*`/`Mindbox.*` only, reads need
     /// a token (no anonymous read).
     async fn oidc_ctx() -> (crate::test_helpers::TestContext, wiremock::MockServer) {
+        oidc_ctx_with(|_| {}).await
+    }
+
+    /// [`oidc_ctx`], then `tweak` on the config.
+    async fn oidc_ctx_with(
+        tweak: impl FnOnce(&mut crate::config::Config),
+    ) -> (crate::test_helpers::TestContext, wiremock::MockServer) {
         use crate::config::{OidcConfig, OidcProvider, OidcRoleRule, ScopeEnforcement};
         let jwks = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::path("/.well-known/jwks.json"))
@@ -3820,6 +3893,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
                 }],
                 ..Default::default()
             };
+            tweak(cfg);
         });
         (ctx, jwks)
     }
@@ -3908,6 +3982,46 @@ Jd74nq6dNCjpWG4drIsyhqX+
             push(&ctx.app, &pkg, &[("X-NuGet-ApiKey", &ok)]).await,
             StatusCode::CREATED
         );
+    }
+
+    /// An audit-mode namespace scope lets an out-of-scope push through, but that push
+    /// does not claim an ID the feed proxies; an ID inside the scope is still claimed.
+    #[tokio::test]
+    async fn an_audit_mode_scope_does_not_claim_a_proxied_id() {
+        use wiremock::matchers::path_regex;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(path_regex(r"index\.json$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"versions":["13.0.1"]}"#)
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let (ctx, jwks) = oidc_ctx_with(move |cfg| {
+            cfg.nuget.proxy = Some(uri);
+            cfg.auth.oidc.providers[0].namespace_scope_enforcement =
+                crate::config::ScopeEnforcement::Audit;
+        })
+        .await;
+        let jwt = github_jwt(
+            &jwks.uri(),
+            "repo:maestra-io/app:ref:refs/heads/main",
+            "packages.maestra.io",
+        );
+        let h = [("X-NuGet-ApiKey", jwt.as_str())];
+        let pkg = nupkg("Newtonsoft.Json", "99.0.0", "");
+        assert_eq!(push(&ctx.app, &pkg, &h).await, StatusCode::FORBIDDEN);
+        assert!(ctx
+            .state
+            .storage
+            .stat("nuget/hosted-meta/newtonsoft.json.json")
+            .await
+            .is_none());
+        let own = nupkg("Mindbox.Audit", "1.0.0", "");
+        assert_eq!(push(&ctx.app, &own, &h).await, StatusCode::CREATED);
     }
 
     #[tokio::test]
@@ -4112,6 +4226,67 @@ Jd74nq6dNCjpWG4drIsyhqX+
         // An adopted version stays immutable, its identical re-push idempotent.
         assert_eq!(push(&ctx.app, &other, &h).await, StatusCode::CONFLICT);
         assert_eq!(push(&ctx.app, &imp[1], &h).await, StatusCode::OK);
+    }
+
+    /// A version brought in by `nora import` alone (records, no state document) can be
+    /// unlisted: its imported versions are carried into a document first, as a push does.
+    #[tokio::test]
+    async fn an_imported_only_version_can_be_unlisted() {
+        use super::test_support::nupkg_with_payload;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.nuget.proxy_timeout = 1;
+            cfg.nuget.metadata_proxy_timeout = 1;
+        });
+        let st = &ctx.state.storage;
+        let mut imp = Vec::new();
+        for (ver, payload) in [("1.0.0", "imp-A"), ("2.0.0", "imp-B")] {
+            let bytes = nupkg_with_payload("Imp.Lib", ver, "", payload);
+            let key = crate::registry::nuget::package_key("Imp.Lib", ver).unwrap();
+            let pkg =
+                crate::registry::nuget::imported_package(&key, std::io::Cursor::new(bytes.clone()))
+                    .unwrap();
+            st.put(&pkg.marker_key, b"").await.unwrap();
+            st.put(&key, &bytes).await.unwrap();
+            st.put(&pkg.nuspec_key, &pkg.nuspec).await.unwrap();
+            st.put(&pkg.record_key, &pkg.record).await.unwrap();
+            imp.push(bytes);
+        }
+        let del = |v: &str| format!("/nuget/v3/package/Imp.Lib/{v}");
+        // No record of the version: still nothing to unlist.
+        let resp = send(&ctx.app, Method::DELETE, &del("9.0.0"), "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(st.stat("nuget/hosted-meta/imp.lib.json").await.is_none());
+
+        let resp = send(&ctx.app, Method::DELETE, &del("1.0.0"), "").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let (s, reg) = get_json(&ctx.app, "/nuget/v3/registration/imp.lib/index.json").await;
+        assert_eq!(s, StatusCode::OK);
+        let leaves: Vec<(&str, bool)> = reg["items"][0]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| {
+                let e = &l["catalogEntry"];
+                (
+                    e["version"].as_str().unwrap(),
+                    e["listed"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(leaves, [("1.0.0", false), ("2.0.0", true)]);
+        assert_eq!(reg["items"][0]["items"][1]["catalogEntry"]["id"], "Imp.Lib");
+        for (v, bytes) in [("1.0.0", &imp[0]), ("2.0.0", &imp[1])] {
+            let uri = format!("/nuget/v3/flatcontainer/imp.lib/{v}/imp.lib.{v}.nupkg");
+            assert_eq!(
+                get_bytes(&ctx.app, &uri).await,
+                (StatusCode::OK, bytes.clone())
+            );
+        }
+        // Again, on the document now: the same answer.
+        let resp = send(&ctx.app, Method::DELETE, &del("1.0.0"), "").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
 
     // ── Round two: idempotent re-push, retention, rebuild, UI, index hardening ──

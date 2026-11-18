@@ -239,6 +239,18 @@ def test_npm_integrity_is_checked_before_the_publish():
     assert run.nora.sent("PUT") == [] and run.leftovers() == []
 
 
+def test_an_npm_version_without_a_source_digest_is_not_downloaded_or_published():
+    # The same refusal as NuGet and PyPI: no sha512 integrity and no shasum.
+    run, pkg, _ = npm_run({}, {})
+    pkg["versions"][0].update(integrity=None)
+    pkg["versions"][1].update(integrity="sha1-AAAA")
+    done = run.go(imp.npm_pkg, pkg)
+    assert done == {"npm:@mindbox-cloud/a@1.0.0": "failed", "npm:@mindbox-cloud/a@2.0.0": "failed"}
+    with open(run.state_path) as f:
+        assert all("no source digest" in json.loads(line)["reason"] for line in f)
+    assert run.downloads == [] and run.nora.sent("PUT") == []
+
+
 def test_artifactory_is_read_only():
     s = imp.art
     for method in ("PUT", "POST", "DELETE", "PATCH"):

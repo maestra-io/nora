@@ -184,9 +184,11 @@ def npm_pkg(p, st, a):
             continue
         t0 = time.monotonic()
         try:
+            integ = v.get("integrity") or ""
+            if not integ.startswith("sha512-") and not v.get("shasum"):
+                raise Failed("no source digest")
             path, size, sha1, _, sha512 = download(v["url"], a.workdir)
             try:
-                integ = v.get("integrity") or ""
                 if integ.startswith("sha512-") and base64.b64decode(integ[7:]) != sha512:
                     raise Failed("integrity (sha512) mismatch")
                 if not integ.startswith("sha512-") and v.get("shasum") and v["shasum"] != sha1:
