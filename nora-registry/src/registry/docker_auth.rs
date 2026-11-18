@@ -694,6 +694,9 @@ mod tests {
             (&own, "https://tok.example:8443/token", true),
             (&own, "https://tok.example/token", false),
             (&own, "https://elsewhere.example/token", false),
+            // Audit R07: a realm on a metadata/loopback IP literal is off the origin too.
+            (&own, "http://169.254.169.254/latest/meta-data", false),
+            (&own, "https://127.0.0.1:9100/metrics", false),
         ] {
             assert_eq!(
                 realm_allowed(&url(realm), upstream, &listed),

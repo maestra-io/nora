@@ -504,3 +504,34 @@ fn test_service_index_no_gzip() {
         "service index (with_json) must NOT have Content-Encoding header"
     );
 }
+
+/// Audit R07: a search endpoint the upstream's service index names on a loopback/private IP
+/// literal is not taken unless private upstreams are allowed; one on the feed's own host is.
+#[tokio::test]
+async fn a_discovered_endpoint_on_a_private_address_is_not_taken() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let up = MockServer::start().await;
+    let own = format!("{}/autocomplete", up.uri());
+    let private = "http://169.254.169.254/query";
+    Mock::given(method("GET"))
+        .and(path("/v3/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "version": "3.0.0",
+            "resources": [
+                { "@id": private, "@type": "SearchQueryService/3.0.0-beta" },
+                { "@id": own, "@type": "SearchAutocompleteService" },
+            ],
+        })))
+        .mount(&up)
+        .await;
+    for (allow_private, search) in [(false, DEFAULT_SEARCH), (true, private)] {
+        let mut cfg = crate::config::NugetConfig {
+            proxy: Some(format!("{}/v3/index.json", up.uri())),
+            ..Default::default()
+        };
+        discover_search_endpoints(&reqwest::Client::new(), &mut cfg, allow_private).await;
+        assert_eq!(cfg.search_service, search, "allow_private={allow_private}");
+        assert_eq!(cfg.autocomplete, own, "allow_private={allow_private}");
+    }
+}

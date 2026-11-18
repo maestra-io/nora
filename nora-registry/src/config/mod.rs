@@ -1001,8 +1001,6 @@ impl Config {
     /// Returns `(registry_name, hostname)` pairs extracted from proxy URLs.
     /// Used once at startup to pre-compile substring searchers.
     pub fn upstream_hostnames(&self) -> Vec<(String, String)> {
-        let mut result = Vec::new();
-
         let extract_host = |url: &str| -> Option<String> {
             let without_scheme = url
                 .strip_prefix("https://")
@@ -1015,6 +1013,36 @@ impl Config {
             }
             Some(host.to_lowercase())
         };
+        let mut result: Vec<(String, String)> = self
+            .leak_scanned_upstream_urls()
+            .into_iter()
+            .filter_map(|(name, url)| Some((name.to_string(), extract_host(url)?)))
+            .collect();
+
+        // Deduplicate
+        result.sort();
+        result.dedup();
+        result
+    }
+
+    /// Every upstream URL the server's shared clients fetch from, loopback ones included: the
+    /// leak-scanned ones plus hf, helm and apk.
+    pub(crate) fn outbound_upstream_urls(&self) -> Vec<&str> {
+        let mut urls: Vec<&str> = self
+            .leak_scanned_upstream_urls()
+            .into_iter()
+            .map(|(_, url)| url)
+            .collect();
+        urls.extend(self.hf.proxy.as_deref());
+        for proxies in [&self.helm.proxies, &self.apk.proxies] {
+            urls.extend(proxies.values().map(|entry| entry.url()));
+        }
+        urls
+    }
+
+    /// The configured upstream URLs the leak scan covers, with their registry.
+    fn leak_scanned_upstream_urls(&self) -> Vec<(&'static str, &str)> {
+        let mut result = Vec::new();
 
         // Simple proxy: Option<String>
         let simple = [
@@ -1032,60 +1060,27 @@ impl Config {
             // hands an hf client travel in headers, which the handler lists by name.
         ];
         for (name, url) in simple {
-            if let Some(url) = url {
-                if let Some(host) = extract_host(url) {
-                    result.push((name.to_string(), host));
-                }
-            }
+            result.extend(url.map(|url| (name, url)));
         }
         // npm: every upstream, private ones included (#1055) — a private registry
         // host in a served packument is exactly the leak this list exists to catch.
         for url in self.npm.upstream_urls() {
-            if let Some(host) = extract_host(url) {
-                result.push((RegistryType::Npm.as_str().to_string(), host));
-            }
+            result.push((RegistryType::Npm.as_str(), url));
         }
 
         // NuGet extra search/autocomplete URLs
-        if let Some(host) = extract_host(&self.nuget.search_service) {
-            result.push((
-                crate::registry_type::RegistryType::Nuget
-                    .as_str()
-                    .to_string(),
-                host,
-            ));
-        }
-        if let Some(host) = extract_host(&self.nuget.autocomplete) {
-            result.push((
-                crate::registry_type::RegistryType::Nuget
-                    .as_str()
-                    .to_string(),
-                host,
-            ));
-        }
+        let nuget = RegistryType::Nuget.as_str();
+        result.push((nuget, self.nuget.search_service.as_str()));
+        result.push((nuget, self.nuget.autocomplete.as_str()));
 
         // Docker upstreams: Vec<DockerUpstream>
         for upstream in &self.docker.upstreams {
-            if let Some(host) = extract_host(&upstream.url) {
-                result.push((
-                    crate::registry_type::RegistryType::Docker
-                        .as_str()
-                        .to_string(),
-                    host,
-                ));
-            }
+            result.push((RegistryType::Docker.as_str(), upstream.url.as_str()));
         }
 
         // Maven proxies: Vec<MavenProxyEntry>
         for proxy in &self.maven.proxies {
-            if let Some(host) = extract_host(proxy.url()) {
-                result.push((
-                    crate::registry_type::RegistryType::Maven
-                        .as_str()
-                        .to_string(),
-                    host,
-                ));
-            }
+            result.push((RegistryType::Maven.as_str(), proxy.url()));
         }
 
         // RPM/DEB per-repo proxies: BTreeMap<repo, RepoProxyEntry>
@@ -1093,9 +1088,7 @@ impl Config {
         // `repository`, a chart's `home`), while every chart URL NORA serves is rewritten.
         for (name, proxies) in [("rpm", &self.rpm.proxies), ("deb", &self.deb.proxies)] {
             for entry in proxies.values() {
-                if let Some(host) = extract_host(entry.url()) {
-                    result.push((name.to_string(), host));
-                }
+                result.push((name, entry.url()));
             }
         }
 
@@ -1103,20 +1096,13 @@ impl Config {
         // list (#663) AND the legacy single `proxy` are both registered with the
         // leak detector — otherwise a secondary upstream's host (e.g. an internal
         // mirror with embedded credentials) would be invisible to leak scanning.
-        for up in self.pypi.upstreams() {
-            if let Some(host) = extract_host(up.url()) {
-                result.push((
-                    crate::registry_type::RegistryType::PyPI
-                        .as_str()
-                        .to_string(),
-                    host,
-                ));
-            }
+        // The same list as `upstreams()`, borrowed: `proxies` wins over the legacy `proxy`.
+        let pypi = RegistryType::PyPI.as_str();
+        if self.pypi.proxies.is_empty() {
+            result.extend(self.pypi.proxy.as_deref().map(|url| (pypi, url)));
+        } else {
+            result.extend(self.pypi.proxies.iter().map(|up| (pypi, up.url())));
         }
-
-        // Deduplicate
-        result.sort();
-        result.dedup();
         result
     }
 

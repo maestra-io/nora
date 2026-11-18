@@ -76,9 +76,14 @@ pub(crate) const UPSTREAM_PASSTHROUGH_PATHS: &[&str] = &["/v3/catalog0/"];
 ///
 /// Only runs if search_service/autocomplete are still at their default values
 /// (user overrides via env vars take precedence). Falls back silently on error.
+///
+/// An endpoint is the upstream's content: unless `allow_private` it is not taken when its
+/// host is a loopback/private IP literal other than the configured feed's own host (a name
+/// is refused at connect by the guarded client's resolver).
 pub async fn discover_search_endpoints(
     client: &reqwest::Client,
     config: &mut crate::config::NugetConfig,
+    allow_private: bool,
 ) {
     let proxy_url = match &config.proxy {
         Some(url) => url.clone(),
@@ -164,6 +169,13 @@ pub async fn discover_search_endpoints(
         let rtype = resource.get("@type").and_then(|t| t.as_str()).unwrap_or("");
         let rid = resource.get("@id").and_then(|id| id.as_str()).unwrap_or("");
         if rid.is_empty() || !(rid.starts_with("https://") || rid.starts_with("http://")) {
+            continue;
+        }
+        let host = |url: &str| reqwest::Url::parse(url).ok()?.host_str().map(str::to_owned);
+        if crate::import::http::is_blocked_url_host(rid, allow_private)
+            && host(rid) != host(&proxy_base)
+        {
+            tracing::warn!(url = %crate::import::http::redact_url(rid), "NuGet: service index names an endpoint on a loopback/private address, keeping defaults for it");
             continue;
         }
 
