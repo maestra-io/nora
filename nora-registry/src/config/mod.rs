@@ -1817,6 +1817,20 @@ impl Config {
                 );
             }
         }
+        // An unfiltered apt proxy passes every .deb through by path, judged by no name rule
+        // (audit A045).
+        #[cfg(feature = "deb")]
+        if self.deb.enabled
+            && !self.deb.proxies.is_empty()
+            && self.curation.deb.min_release_age.is_none()
+            && (self.curation.blocklist_path.is_some()
+                || self.curation.allowlist_path.is_some()
+                || !self.curation.internal_namespaces.is_empty())
+        {
+            errors.push(
+                "curation.blocklist_path, allowlist_path and internal_namespaces apply to [deb.proxies] only when curation.deb.min_release_age filters them: set it (\"0d\" holds by rule only)".to_string(),
+            );
+        }
         for u in &self.docker.upstreams {
             let undated = u.date_source().is_none();
             let tokenless =

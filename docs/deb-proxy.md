@@ -127,11 +127,18 @@ serves is dropped.
    upstream checksums, and lists only its own `Packages` / `Packages.gz` with
    `Acquire-By-Hash: yes`. Translations, Contents and other index files are not served.
    It is signed as `InRelease` and `Release.gpg`. A suite is rebuilt when the upstream
-   `InRelease` changes or a held version matures.
+   `InRelease` changes or an age-held version matures.
 4. A `.deb` of a held version is refused (403, curation `enforce`; logged in `audit`),
    unless a published suite serves that file: apt found it in that suite's index. The
    allow list (`[curation.deb] allow`) releases a version early. Packages pass the digest
    quarantine like any proxied file.
+5. A version the curation chain refuses by rule in `enforce` (`internal_namespaces`, the
+   blocklist, the allowlist) is held whatever its age or `allow` exemption: left out of
+   `Packages`, never a stand-in, its `.deb` refused with the rule. Such a hold never
+   matures, so it does not rebuild the suite before `metadata_ttl`. An allowlist with a
+   `*` registry and no `deb` entries empties every index; add rules in `audit` first.
+   Without `min_release_age` no `.deb` is judged by name, so these rules beside
+   `[deb.proxies]` are a configuration error.
 
 Storage per repo: the last upstream `Packages` per index, the ledgers, and the built
 `Packages.gz` of the current and previous build (`by-hash/`).

@@ -1018,10 +1018,7 @@ async fn build_suite(
             }
         }
 
-        let hidden = |s: &Stanza| -> Option<i64> {
-            held_by_policy(engine, &s.name, &s.version, s.first_seen)
-                .then(|| s.first_seen + min_age.unwrap_or(0))
-        };
+        let hidden = |s: &Stanza| held_until(engine, &s.name, &s.version, s.first_seen, min_age);
         let mut cached = HashSet::new();
         for s in &retired {
             if state
@@ -1036,7 +1033,9 @@ async fn build_suite(
         let (chosen, matures) = choose(&current_st, &retired, hidden, |s| {
             cached.contains(&s.filename)
         });
-        if let Some(t) = matures {
+        // Only a hold that matures later: a permanent one or a time already past would
+        // rebuild the suite on every request (audit A042).
+        if let Some(t) = matures.filter(|&t| t > now && t < i64::MAX) {
             matures_at = Some(matures_at.map_or(t, |m: i64| m.min(t)));
         }
         let held: BTreeMap<String, (String, String, i64)> = current_st
@@ -1191,15 +1190,24 @@ fn release_text(
     out
 }
 
-/// Whether curation hides a version first seen at `first_seen` from the indexes.
-fn held_by_policy(
+/// Until when curation hides a version first seen at `first_seen` from the indexes:
+/// `None` served, `Some(t)` a release-age hold maturing at `t`, `Some(i64::MAX)` a rule
+/// on its name or version (internal namespace, blocklist, allowlist) that never matures
+/// (audit A042, A045).
+fn held_until(
     engine: &crate::curation::CurationEngine,
     name: &str,
     version: &str,
     first_seen: i64,
-) -> bool {
-    crate::curation::is_internal_namespace(engine, RegistryType::Deb, name)
-        || engine.hides_from_metadata(RegistryType::Deb, name, version, Some(first_seen))
+    min_age: Option<i64>,
+) -> Option<i64> {
+    if engine.hides_from_metadata(RegistryType::Deb, name, version, Some(first_seen)) {
+        return Some(first_seen + min_age.unwrap_or(0));
+    }
+    // The chain runs the namespace filter first, in every mode.
+    engine
+        .refuses(RegistryType::Deb, name, version, Some(first_seen))
+        .then_some(i64::MAX)
 }
 
 /// The earliest date the ledgers `keys` give each of `files`. A pool file is as old as
@@ -1280,8 +1288,8 @@ async fn update_young(
                         return true;
                     };
                     *seen = (*seen).min(t);
-                    // Held for its name (an internal namespace) whatever its age.
-                    held_by_policy(engine, name, version, *seen)
+                    // Held for a rule on its name or version whatever its age.
+                    held_until(engine, name, version, *seen, min_age).is_some()
                 });
             }
         }
@@ -2113,6 +2121,214 @@ mod integration_tests {
         let files = &young["security/main/amd64"];
         assert!(!files.contains_key(&f), "{files:?}");
         assert!(files.contains_key(&corp), "{files:?}");
+    }
+
+    /// A filtered `debian` proxy of `server`, enforcing, with `customize` on top.
+    fn rule_ctx(
+        server: &MockServer,
+        keydir: &tempfile::TempDir,
+        customize: impl FnOnce(&mut crate::config::Config),
+    ) -> TestContext {
+        let uri = server.uri();
+        let dir = keydir.path().to_str().unwrap().to_string();
+        create_test_context_with_config(move |cfg| {
+            cfg.deb.enabled = true;
+            cfg.deb.upstream_keyring_dir = dir;
+            cfg.deb
+                .proxies
+                .insert("debian".into(), RepoProxyEntry::Simple(uri));
+            cfg.curation.mode = CurationMode::Enforce;
+            customize(cfg);
+        })
+    }
+
+    async fn suite_state(ctx: &TestContext) -> super::SuiteState {
+        super::get_json(
+            &ctx.state,
+            &super::suite_key("debian", "bookworm", "state.json"),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// audit A042: a hold on a name never matures, so it gives the suite no maturity time
+    /// and the suite is reused for metadata_ttl.
+    #[tokio::test]
+    async fn a_permanent_hold_does_not_rebuild_the_suite_on_every_request() {
+        for age in ["3d", "0d"] {
+            let (key, keydir) = upstream_key();
+            let server = MockServer::start().await;
+            publish(&server, &key, &[("corp-x", "1"), ("a", "1")]).await;
+            let ctx = rule_ctx(&server, &keydir, |cfg| {
+                cfg.deb.metadata_ttl = 300;
+                cfg.curation.deb.min_release_age = Some(age.into());
+                cfg.curation.internal_namespaces = vec!["corp-*".to_string()];
+            });
+            let (_, pkgs) = served(&ctx).await;
+            assert_eq!(pkgs, [("a".into(), "1".into())], "{age}");
+            assert_eq!(suite_state(&ctx).await.matures_at, None, "{age}");
+            let inrelease = super::suite_key("debian", "bookworm", "InRelease");
+            let signed = ctx.state.storage.get(&inrelease).await.unwrap();
+            for _ in 0..2 {
+                let at = "/deb/debian/dists/bookworm/InRelease";
+                assert_eq!(status(&ctx, at).await, StatusCode::OK);
+            }
+            let fetched = upstream_paths(&server)
+                .await
+                .into_iter()
+                .filter(|p| p == "/dists/bookworm/InRelease")
+                .count();
+            assert_eq!(fetched, 1, "{age}: one build within metadata_ttl");
+            assert_eq!(ctx.state.storage.get(&inrelease).await.unwrap(), signed);
+        }
+    }
+
+    /// audit A042: an age hold still sets a maturity time, in the future and within
+    /// min_release_age.
+    #[tokio::test]
+    async fn an_age_hold_still_matures_the_suite() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        publish(&server, &key, &[("corp-x", "1"), ("a", "1")]).await;
+        let ctx = rule_ctx(&server, &keydir, |cfg| {
+            cfg.deb.metadata_ttl = 0;
+            cfg.curation.deb.min_release_age = Some("3d".into());
+            cfg.curation.internal_namespaces = vec!["corp-*".to_string()];
+        });
+        served(&ctx).await;
+        publish(&server, &key, &[("corp-x", "2"), ("a", "2")]).await;
+        let now = crate::cache_ttl::now_unix() as i64;
+        served(&ctx).await;
+        let t = suite_state(&ctx).await.matures_at.expect("a 2 is held");
+        assert!(t > now && t <= now + 3 * 86_400 + 5, "{t} vs {now}");
+    }
+
+    fn rules_file(dir: &tempfile::TempDir, file: &str, body: &str) -> String {
+        let path = dir.path().join(file);
+        std::fs::write(&path, body).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    /// audit A045: a blocklisted version is held whatever its age or allow exemption: it is
+    /// not listed, not stood in for a held version, and its download is refused.
+    #[tokio::test]
+    async fn the_blocklist_holds_old_and_allow_exempt_versions() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        publish(&server, &key, &[("evil", "1"), ("bad", "1"), ("a", "1")]).await;
+        let rules = tempfile::tempdir().unwrap();
+        let blocklist = rules_file(
+            &rules,
+            "blocklist.json",
+            r#"{"version": 1, "rules": [
+                {"registry": "deb", "name": "bad", "version": "*", "reason": "test"},
+                {"registry": "*", "name": "evil*", "version": "*", "reason": "test"}]}"#,
+        );
+        let ctx = rule_ctx(&server, &keydir, |cfg| {
+            cfg.deb.metadata_ttl = 0;
+            cfg.curation.deb.min_release_age = Some("3d".into());
+            cfg.curation.deb.allow = vec!["bad".into()];
+            cfg.curation.blocklist_path = Some(blocklist);
+        });
+        let (_, pkgs) = served(&ctx).await;
+        assert_eq!(pkgs, [("a".into(), "1".into())], "first sight");
+        let pool = |n: &str, v: &str| format!("/deb/debian/pool/main/{n}_{v}_amd64.deb");
+        for (n, v) in [("evil", "1"), ("bad", "1")] {
+            let resp = send(&ctx.app, Method::GET, &pool(n, v), "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{n} {v}");
+            let body = String::from_utf8_lossy(&body_bytes(resp).await).to_string();
+            assert!(body.contains("blocklist"), "{body}");
+        }
+        assert_eq!(status(&ctx, &pool("a", "1")).await, StatusCode::OK);
+
+        // evil 1 was cached before the rule: it does not stand in for the held evil 2.
+        let cached = "deb/debian/pool/main/evil_1_amd64.deb";
+        ctx.state.storage.put(cached, b"evil-1").await.unwrap();
+        publish(&server, &key, &[("evil", "2"), ("bad", "2"), ("a", "2")]).await;
+        let now = crate::cache_ttl::now_unix() as i64;
+        let (_, pkgs) = served(&ctx).await;
+        assert!(
+            !pkgs.iter().any(|(n, _)| n == "evil" || n == "bad"),
+            "{pkgs:?}"
+        );
+        assert_eq!(status(&ctx, &pool("bad", "2")).await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            status(&ctx, &pool("evil", "1")).await,
+            StatusCode::FORBIDDEN
+        );
+        let t = suite_state(&ctx).await.matures_at.expect("a 2 is held");
+        assert!(t > now && t < i64::MAX, "{t}");
+    }
+
+    /// audit A045: under an allowlist an unlisted version is held and refused.
+    #[tokio::test]
+    async fn the_allowlist_holds_unlisted_versions() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        publish(&server, &key, &[("a", "1"), ("b", "1")]).await;
+        let rules = tempfile::tempdir().unwrap();
+        let allowlist = rules_file(
+            &rules,
+            "allowlist.json",
+            r#"{"version": 1, "entries": [{"registry": "deb", "name": "a", "version": "1"}]}"#,
+        );
+        let ctx = rule_ctx(&server, &keydir, |cfg| {
+            cfg.deb.metadata_ttl = 300;
+            cfg.curation.deb.min_release_age = Some("3d".into());
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        let (_, pkgs) = served(&ctx).await;
+        assert_eq!(pkgs, [("a".into(), "1".into())]);
+        let b1 = "/deb/debian/pool/main/b_1_amd64.deb";
+        assert_eq!(status(&ctx, b1).await, StatusCode::FORBIDDEN);
+        assert_eq!(suite_state(&ctx).await.matures_at, None);
+    }
+
+    /// audit A045: an unfiltered apt proxy judges no .deb by name, so name rules beside it
+    /// are a configuration error.
+    #[test]
+    fn name_rules_need_a_filtered_apt_proxy() {
+        let rule_errors = |customize: fn(&mut crate::config::Config)| {
+            let mut cfg = crate::config::Config::default();
+            cfg.deb.enabled = true;
+            let entry = RepoProxyEntry::Simple("https://deb.example".into());
+            cfg.deb.proxies.insert("debian".into(), entry);
+            customize(&mut cfg);
+            let (_, errors) = cfg.validate_with_config_path(None);
+            errors
+                .into_iter()
+                .filter(|e| e.contains("apply to [deb.proxies]"))
+                .count()
+        };
+        assert_eq!(rule_errors(|_| {}), 0);
+        assert_eq!(
+            rule_errors(|c| c.curation.blocklist_path = Some("b.json".into())),
+            1
+        );
+        assert_eq!(
+            rule_errors(|c| c.curation.allowlist_path = Some("a.json".into())),
+            1
+        );
+        assert_eq!(
+            rule_errors(|c| c.curation.internal_namespaces = vec!["corp-*".into()]),
+            1
+        );
+        assert_eq!(
+            rule_errors(|c| {
+                c.curation.internal_namespaces = vec!["corp-*".into()];
+                c.curation.deb.min_release_age = Some("0d".into());
+            }),
+            0,
+            "filtered"
+        );
+        assert_eq!(
+            rule_errors(|c| {
+                c.curation.internal_namespaces = vec!["corp-*".into()];
+                c.deb.enabled = false;
+            }),
+            0,
+            "deb off"
+        );
     }
 
     /// A ledger that cannot be read fails the dating, so the build fails and keeps the

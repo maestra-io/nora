@@ -448,6 +448,28 @@ impl CurationEngine {
         }
     }
 
+    /// Whether the chain refuses `name@version` released at `published` (enforced, not
+    /// audit-only), with nothing counted or logged: for an index that leaves out what a
+    /// download of it would be refused (audit A045).
+    pub fn refuses(
+        &self,
+        registry: RegistryType,
+        name: &str,
+        version: &str,
+        published: Option<i64>,
+    ) -> bool {
+        let result = self.decide(&FilterRequest {
+            registry,
+            upstream: None,
+            name: name.to_string(),
+            version: RequestVersion::Known(version.to_string()),
+            integrity: None,
+            bypass: false,
+            publish_date: published,
+        });
+        matches!(result.decision, Decision::Block { .. }) && !result.audited
+    }
+
     fn evaluate_inner(&self, request: &FilterRequest) -> EvaluationResult {
         let result = self.decide(request);
         let namespace_block = matches!(result.decision, Decision::Block { .. })
