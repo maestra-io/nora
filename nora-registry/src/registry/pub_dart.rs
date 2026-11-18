@@ -186,6 +186,60 @@ async fn search_packages(State(state): State<AppState>, RawQuery(raw_query): Raw
     }
 }
 
+/// The upstream URL of `package`'s listing.
+fn listing_url(proxy_url: &str, package: &str) -> String {
+    format!(
+        "{}/api/packages/{}",
+        proxy_url.trim_end_matches('/'),
+        encode_segment(package)
+    )
+}
+
+/// Rewrite an upstream listing of `package` to NORA's URLs and store it with its validators
+/// (body before sidecar); the stored body is returned.
+async fn store_pub_listing(
+    state: &AppState,
+    package: &str,
+    body: Vec<u8>,
+    validators: &Validators,
+) -> Vec<u8> {
+    let key = format!("pub/api/packages/{}.json", package);
+    let nora_base = pub_base_url(state);
+    let rewritten = rewrite_package_response(&body, &nora_base, package).unwrap_or(body);
+    cache_bytes(state, key.clone(), rewritten.clone()).await;
+    write_validators(&state.storage, &key, validators).await;
+    state.repo_index.invalidate("pub");
+    rewritten
+}
+
+/// Fetch `package`'s listing from the upstream and store it, whatever the stored copy's
+/// freshness: the archive download asks for it when the stored listing does not date the
+/// version (A077). Best-effort: a failed fetch leaves the stored copy as it is.
+async fn refresh_pub_listing(state: &AppState, package: &str) {
+    let Some(proxy_url) = &state.config.pub_dart.proxy else {
+        return;
+    };
+    let fetched = proxy_fetch_conditional(
+        &state.http_client,
+        &listing_url(proxy_url, package),
+        Duration::from_secs(state.config.pub_dart.proxy_timeout),
+        expose_opt(&state.config.pub_dart.proxy_auth).map(UpstreamAuth::Basic),
+        &Validators::default(),
+        &state.circuit_breaker,
+        RegistryType::PubDart,
+    )
+    .await;
+    match fetched {
+        Ok(Revalidation::Modified { body, validators }) => {
+            store_pub_listing(state, package, body, &validators).await;
+        }
+        Ok(Revalidation::NotModified) => {}
+        Err(e) => {
+            tracing::warn!(package, error = ?e, "pub listing refresh for a release date failed")
+        }
+    }
+}
+
 async fn package_listing(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -249,11 +303,7 @@ async fn package_listing(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let url = format!(
-        "{}/api/packages/{}",
-        proxy_url.trim_end_matches('/'),
-        encode_segment(&package)
-    );
+    let url = listing_url(proxy_url, &package);
 
     // Revalidate stale metadata with a conditional request when enabled (a cheap
     // 304 — pub.dev returns validators) and fall back to a full fetch otherwise.
@@ -306,12 +356,7 @@ async fn package_listing(
         // New body — rewrite, cache the rewritten body first, then persist the
         // fresh validators (body-before-sidecar ordering).
         Ok(Revalidation::Modified { body, validators }) => {
-            let nora_base = pub_base_url(&state);
-            let rewritten = rewrite_package_response(&body, &nora_base, &package).unwrap_or(body);
-            cache_bytes(&state, key.clone(), rewritten.clone()).await;
-            write_validators(&state.storage, &key, &validators).await;
-            state.repo_index.invalidate("pub");
-            pub_json_response(rewritten)
+            pub_json_response(store_pub_listing(&state, &package, body, &validators).await)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -519,15 +564,6 @@ async fn download_archive(
         );
     }
 
-    // Extract publish date from cached metadata (works for both hosted and proxy)
-    let publish_date = extract_pub_publish_date(
-        &state.storage,
-        &package,
-        version,
-        state.config.server.trust_upstream_dates,
-    )
-    .await;
-
     // Curation check. #733 serve-local: an internal-namespace package is operator-owned — skip
     // curation and serve any local copy below; block the upstream branch separately.
     let internal = crate::curation::is_internal_namespace(
@@ -535,6 +571,23 @@ async fn download_archive(
         crate::curation::RegistryType::PubDart,
         &package,
     );
+
+    // The release date from the stored listing; one that does not date the version is fetched
+    // again from the upstream when curation judges the date (A077).
+    let trust = state.config.server.trust_upstream_dates;
+    let mut publish_date = extract_pub_publish_date(&state.storage, &package, version, trust).await;
+    let judged = !internal
+        && trust
+        && state.config.pub_dart.proxy.is_some()
+        && state
+            .curation()
+            .curation_engine
+            .reads_release_date(crate::curation::RegistryType::PubDart);
+    if publish_date.is_none() && judged {
+        refresh_pub_listing(&state, &package).await;
+        publish_date = extract_pub_publish_date(&state.storage, &package, version, trust).await;
+    }
+
     if !internal {
         if let Some(response) = crate::curation::check_download(
             &state.curation().curation_engine,
@@ -543,7 +596,15 @@ async fn download_archive(
             crate::curation::RegistryType::PubDart,
             &package,
             crate::curation::RequestVersion::Known(version.to_string()),
-            publish_date,
+            if judged {
+                state.curation().curation_engine.judged_release_date(
+                    crate::curation::RegistryType::PubDart,
+                    trust,
+                    publish_date,
+                )
+            } else {
+                publish_date
+            },
         ) {
             return response;
         }
@@ -1054,7 +1115,9 @@ async fn extract_pub_publish_date(
     // A row names the version in its own spelling; pub compares versions by pub_semver's key.
     let wanted = crate::curation::curation_version(crate::curation::RegistryType::PubDart, version);
     for v in versions {
-        let row = v.get("version")?.as_str()?;
+        let Some(row) = v.get("version").and_then(Value::as_str) else {
+            continue;
+        };
         if crate::curation::curation_version(crate::curation::RegistryType::PubDart, row) == wanted
         {
             let date_str = v.get("published")?.as_str()?;
@@ -2252,5 +2315,173 @@ mod one_freshness_rule {
         }
         let asked = upstream.received_requests().await.unwrap();
         assert_eq!(asked.len(), endpoints.len(), "asked upstream: {asked:?}");
+    }
+}
+
+/// A077: an archive whose stored listing does not date its version is dated by the upstream
+/// listing, fetched again and stored; a version the upstream does not date either is judged by
+/// `[curation.pub_dart] unknown_date`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod release_date_refresh {
+    use crate::config::{Config, CurationMode, UnknownDate};
+    use crate::digest_quarantine::QuarantineMode;
+    use crate::test_helpers::{create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const ARCHIVE: &str = "/pub/packages/vpkg/versions/3.2.1.tar.gz";
+    const LISTING_KEY: &str = "pub/api/packages/vpkg.json";
+    const ARCHIVE_KEY: &str = "pub/packages/vpkg/versions/3.2.1.tar.gz";
+
+    fn ago(days: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::hours(1) - chrono::Duration::days(days))
+            .format("%Y-%m-%dT%H:%M:%S.000Z")
+            .to_string()
+    }
+
+    fn listing(row: &str) -> String {
+        format!(r#"{{"name":"vpkg","versions":[{row}]}}"#)
+    }
+
+    /// Enforce, min_release_age 7d, an observing quarantine, trusted dates; the upstream lists
+    /// 3.2.1 as `upstream_row`.
+    async fn context(
+        upstream_row: &str,
+        unknown: Option<UnknownDate>,
+    ) -> (MockServer, TestContext) {
+        let up = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/packages/vpkg/versions/3.2.1.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"VPKG".to_vec()))
+            .mount(&up)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/packages/vpkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(listing(upstream_row)))
+            .mount(&up)
+            .await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg: &mut Config| {
+            cfg.pub_dart.enabled = true;
+            cfg.pub_dart.proxy = Some(uri);
+            cfg.pub_dart.metadata_ttl = 3600;
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+            cfg.curation.quarantine = Some(QuarantineMode::Observe);
+            cfg.curation.quarantine_ttl = Some("7d".to_string());
+            cfg.curation.pub_dart.unknown_date = unknown;
+            cfg.server.trust_upstream_dates = true;
+        });
+        (up, ctx)
+    }
+
+    fn young_row() -> String {
+        format!(r#"{{"version":"3.2.1","published":"{}"}}"#, ago(0))
+    }
+
+    async fn held_and_not_cached(ctx: &TestContext, case: &str) {
+        let resp = send(&ctx.app, Method::GET, ARCHIVE, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{case}");
+        assert!(
+            ctx.state.storage.get(ARCHIVE_KEY).await.is_err(),
+            "{case}: archive cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_archive_with_no_stored_listing_is_dated_by_the_upstream() {
+        let (_up, ctx) = context(&young_row(), None).await;
+        held_and_not_cached(&ctx, "no stored listing").await;
+    }
+
+    #[tokio::test]
+    async fn a_stored_listing_without_the_version_is_fetched_again() {
+        let (_up, ctx) = context(&young_row(), None).await;
+        let old = listing(r#"{"version":"1.0.0","published":"2019-01-01T00:00:00.000Z"}"#);
+        ctx.state
+            .storage
+            .put(LISTING_KEY, old.as_bytes())
+            .await
+            .unwrap();
+        held_and_not_cached(&ctx, "listing names only 1.0.0").await;
+    }
+
+    #[tokio::test]
+    async fn a_stored_row_without_published_is_fetched_again() {
+        let (_up, ctx) = context(&young_row(), None).await;
+        let undated = listing(r#"{"version":"3.2.1"}"#);
+        ctx.state
+            .storage
+            .put(LISTING_KEY, undated.as_bytes())
+            .await
+            .unwrap();
+        held_and_not_cached(&ctx, "row without published").await;
+    }
+
+    /// A row with no `version` before the version's own does not end the lookup.
+    #[tokio::test]
+    async fn a_row_without_a_version_does_not_hide_the_next() {
+        let (up, ctx) = context(&young_row(), None).await;
+        let stored = listing(&format!(
+            r#"{{"published":"2019-01-01T00:00:00.000Z"}},{}"#,
+            young_row()
+        ));
+        ctx.state
+            .storage
+            .put(LISTING_KEY, stored.as_bytes())
+            .await
+            .unwrap();
+        held_and_not_cached(&ctx, "unversioned row first").await;
+        let asked = crate::test_helpers::upstream_paths(&up).await;
+        assert!(asked.is_empty(), "the stored listing dated it: {asked:?}");
+    }
+
+    #[tokio::test]
+    async fn an_upstream_without_a_date_is_held_under_hold() {
+        let (_up, ctx) = context(r#"{"version":"3.2.1"}"#, Some(UnknownDate::Hold)).await;
+        held_and_not_cached(&ctx, "unknown_date = hold").await;
+    }
+
+    /// `log`, the default for pub: left undated, the quarantine (observing here) decides.
+    #[tokio::test]
+    async fn an_upstream_without_a_date_is_served_under_log() {
+        let (_up, ctx) = context(r#"{"version":"3.2.1"}"#, None).await;
+        let resp = send(&ctx.app, Method::GET, ARCHIVE, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_old_release_is_served_and_its_listing_stored() {
+        let row = format!(r#"{{"version":"3.2.1","published":"{}"}}"#, ago(30));
+        let (_up, ctx) = context(&row, None).await;
+        let resp = send(&ctx.app, Method::GET, ARCHIVE, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(ctx.state.storage.get(ARCHIVE_KEY).await.is_ok());
+        let stored = ctx.state.storage.get(LISTING_KEY).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&stored).contains("3.2.1"),
+            "listing stored"
+        );
+    }
+
+    /// An internal package is never asked upstream for a date.
+    #[tokio::test]
+    async fn an_internal_package_is_not_refreshed() {
+        let (up, _) = context(&young_row(), None).await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg: &mut Config| {
+            cfg.pub_dart.enabled = true;
+            cfg.pub_dart.proxy = Some(uri);
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+            cfg.curation.internal_namespaces = vec!["vpkg".to_string()];
+            cfg.server.trust_upstream_dates = true;
+        });
+        let resp = send(&ctx.app, Method::GET, ARCHIVE, "").await;
+        assert_ne!(resp.status(), StatusCode::OK);
+        let asked = crate::test_helpers::upstream_paths(&up).await;
+        assert!(asked.is_empty(), "asked upstream: {asked:?}");
     }
 }
