@@ -27,6 +27,26 @@ pub struct MavenConfig {
     /// non-positive value revalidates every pull. Release artifacts are always immutable.
     #[serde(default = "super::super::default_metadata_ttl")]
     pub metadata_ttl: i64,
+    /// Groups this registry hosts besides `curation.internal_namespaces`, in the same glob
+    /// syntax (`"io.delta.**"`). With proxies configured, an upload (PUT) is for a coordinate
+    /// under one of the two; reads are not affected.
+    #[serde(default)]
+    pub hosted_groups: Vec<String>,
+    /// What an upload outside the hosted groups gets: `warn` stores it and logs a `[SECURITY]`
+    /// WARN, `enforce` answers 403.
+    #[serde(default)]
+    pub hosted_groups_enforcement: HostedGroupsEnforcement,
+}
+
+/// How [`MavenConfig::hosted_groups`] applies to an upload outside them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HostedGroupsEnforcement {
+    /// Store the upload, log it (the first release's default, to list the groups in use).
+    #[default]
+    Warn,
+    /// Refuse the upload with 403.
+    Enforce,
 }
 
 /// Maven upstream proxy configuration
@@ -91,6 +111,8 @@ impl Default for MavenConfig {
             checksum_verify: true,
             immutable_releases: true,
             metadata_ttl: 300,
+            hosted_groups: Vec::new(),
+            hosted_groups_enforcement: HostedGroupsEnforcement::default(),
         }
     }
 }

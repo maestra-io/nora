@@ -179,7 +179,7 @@ pub use self::hashicorp::HashicorpConfig;
 pub use self::helm::HelmConfig;
 pub use self::hf::HfConfig;
 #[allow(unused_imports)]
-pub use self::maven::{MavenConfig, MavenProxy, MavenProxyEntry};
+pub use self::maven::{HostedGroupsEnforcement, MavenConfig, MavenProxy, MavenProxyEntry};
 pub use self::npm::{npm_scope_of, NpmConfig, NpmProxyEntry};
 pub use self::nuget::NugetConfig;
 pub use self::pub_dart::PubDartConfig;

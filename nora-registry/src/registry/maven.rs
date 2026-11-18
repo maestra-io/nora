@@ -1130,17 +1130,36 @@ async fn upload(
 
     // Enforce OIDC namespace_scope on the artifact coordinate (group/artifactId).
     // An unrecognized (Opaque) path yields an empty coordinate → fail-closed (#583).
-    let maven_namespace = match classify_path(&path) {
-        MavenPathKind::VersionFile(c) => format!("{}/{}", c.group_path, c.artifact_id),
+    let kind = classify_path(&path);
+    let coordinate = match &kind {
+        MavenPathKind::VersionFile(c) => Some((c.group_path.as_str(), c.artifact_id.as_str())),
         MavenPathKind::ArtifactMeta {
             group_path,
             artifact_id,
             ..
-        } => format!("{}/{}", group_path, artifact_id),
-        MavenPathKind::Opaque => String::new(),
+        } => Some((group_path.as_str(), artifact_id.as_str())),
+        MavenPathKind::Opaque => None,
     };
+    let maven_namespace = coordinate
+        .map(|(group, artifact)| format!("{group}/{artifact}"))
+        .unwrap_or_default();
     if enforce_namespace_scope(&authority, &maven_namespace).is_err() {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if !upload_allowed(&state, &kind) {
+        let enforce = state.config.maven.hosted_groups_enforcement
+            == crate::config::HostedGroupsEnforcement::Enforce;
+        crate::metrics::MAVEN_UNHOSTED_UPLOADS_TOTAL
+            .with_label_values(&[if enforce { "refused" } else { "warned" }])
+            .inc();
+        tracing::warn!(
+            path = %path,
+            enforce,
+            "[SECURITY] Maven upload outside curation.internal_namespaces and maven.hosted_groups"
+        );
+        if enforce {
+            return (StatusCode::FORBIDDEN, "group not hosted here").into_response();
+        }
     }
     // The body is read only for a caller the coordinate in the URL lets in (A072).
     let body = match super::PublishBody::read(&state, "maven", body).await {
@@ -1160,62 +1179,63 @@ async fn upload(
         .collect::<Vec<_>>()
         .join("/");
 
-    match classify_path(&path) {
+    match kind {
         MavenPathKind::VersionFile(coords) if is_checksum_file(&coords.filename) => {
-            // Client uploading a checksum — verify against our computed value
-            if state.config.maven.checksum_verify {
-                // The lock of the artifact's upload: the comparison and the rollback below
-                // see one upload, never half of a concurrent one.
-                let lock = state.publish_lock(&format!(
-                    "maven/{}/{}/maven-metadata.xml",
-                    coords.group_path, coords.artifact_id
-                ));
-                let _guard = lock.lock().await;
-                if let Ok(computed) = state.storage.get(&key).await {
-                    // A checksum file is the digest, in either case, optionally followed by
-                    // the file name (`<hex>  foo.jar`).
-                    let digest = |raw: &[u8]| {
-                        String::from_utf8_lossy(raw)
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or_default()
-                            .to_ascii_lowercase()
-                    };
-                    let (computed_str, client_str) = (digest(&computed), digest(&body));
-                    if computed_str != client_str {
-                        tracing::warn!(
-                            path = %path,
-                            expected = %computed_str,
-                            received = %client_str,
-                            "SECURITY: Maven checksum mismatch on upload"
-                        );
-                        if roll_back_unvouched_artifact(&state, &key).await {
-                            update_artifact_metadata(
-                                &state,
-                                &coords.group_path,
-                                &coords.artifact_id,
-                            )
-                            .await;
-                            state.repo_index.invalidate("maven");
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                "Checksum mismatch: the artifact was removed, deploy it again",
-                            )
-                                .into_response();
-                        }
-                        return (StatusCode::BAD_REQUEST, "Checksum mismatch").into_response();
-                    }
-                    // The same digest: the stored checksum already says it.
-                    return StatusCode::CREATED.into_response();
-                }
-            }
-            match state.storage.put(&key, &body).await {
-                Ok(()) => StatusCode::CREATED.into_response(),
+            // Client uploading a checksum: the stored value is always the server's own, the
+            // client's is only compared with it (A017).
+            // The lock of the artifact's upload: the comparison and the rollback below
+            // see one upload, never half of a concurrent one.
+            let lock = state.publish_lock(&format!(
+                "maven/{}/{}/maven-metadata.xml",
+                coords.group_path, coords.artifact_id
+            ));
+            let _guard = lock.lock().await;
+            // `deployed`: the checksum was stored with the artifact's upload, so a mismatch is
+            // that upload's to roll back; one computed now is for a file no deploy vouched for.
+            let (computed, deployed) = match state.storage.get(&key).await {
+                Ok(stored) => (stored, true),
+                Err(StorageError::NotFound) => match computed_checksum(&state, &key).await {
+                    Ok(computed) => (computed, false),
+                    Err(response) => return response,
+                },
                 Err(e) => {
-                    tracing::error!(error = %e, key = %key, "Failed to store Maven checksum");
-                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    tracing::error!(error = %e, key = %key, "Failed to read Maven checksum");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            if state.config.maven.checksum_verify {
+                // A checksum file is the digest, in either case, optionally followed by
+                // the file name (`<hex>  foo.jar`).
+                let digest = |raw: &[u8]| {
+                    String::from_utf8_lossy(raw)
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                };
+                let (computed_str, client_str) = (digest(&computed), digest(&body));
+                if computed_str != client_str {
+                    tracing::warn!(
+                        path = %path,
+                        expected = %computed_str,
+                        received = %client_str,
+                        "SECURITY: Maven checksum mismatch on upload"
+                    );
+                    if deployed && roll_back_unvouched_artifact(&state, &key).await {
+                        update_artifact_metadata(&state, &coords.group_path, &coords.artifact_id)
+                            .await;
+                        state.repo_index.invalidate("maven");
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            "Checksum mismatch: the artifact was removed, deploy it again",
+                        )
+                            .into_response();
+                    }
+                    return (StatusCode::BAD_REQUEST, "Checksum mismatch").into_response();
                 }
             }
+            // The same digest (or no verification): the stored checksum already says it.
+            StatusCode::CREATED.into_response()
         }
 
         MavenPathKind::VersionFile(coords) => {
@@ -1231,6 +1251,11 @@ async fn upload(
             );
             let lock = state.publish_lock(&metadata_lock_key);
             let _guard = lock.lock().await;
+            // And the file's own lock, which a proxy fill of the same file takes around its
+            // stat and write (`ProxyBody::cache`): a deploy and a spooled fill never interleave
+            // (A035). Always metadata, then file; a fill takes only the file lock.
+            let file_lock = state.publish_lock(&key);
+            let _file_guard = file_lock.lock().await;
 
             if !snap
                 && state.config.maven.immutable_releases
@@ -1343,6 +1368,73 @@ async fn upload(
 // ============================================================================
 // Checksum helpers
 // ============================================================================
+
+/// Whether an upload may write the coordinate `kind` names (A017). On a hosted-only registry
+/// (no proxies) every coordinate is hosted. With proxies, only one under
+/// `curation.internal_namespaces` or `maven.hosted_groups` is: elsewhere a Write credential would
+/// seat its own file under a coordinate the upstreams serve, before NORA has cached it.
+fn upload_allowed(state: &AppState, kind: &MavenPathKind) -> bool {
+    let maven = &state.config.maven;
+    if maven.proxies.is_empty() {
+        return true;
+    }
+    let names = match kind {
+        MavenPathKind::VersionFile(c) => vec![maven_name(&c.group_path, &c.artifact_id)],
+        // A `maven-metadata.xml` may be a group's (plugin list), whose last segment is no
+        // artifact: the dotted group is a name of it too.
+        MavenPathKind::ArtifactMeta {
+            group_path,
+            artifact_id,
+            ..
+        } => vec![
+            maven_name(group_path, artifact_id),
+            format!("{}.{artifact_id}", group_path.replace('/', ".")),
+        ],
+        MavenPathKind::Opaque => return false,
+    };
+    let engine = &state.curation().curation_engine;
+    names.iter().any(|name| {
+        crate::curation::is_internal_namespace(engine, crate::curation::RegistryType::Maven, name)
+            || maven
+                .hosted_groups
+                .iter()
+                .any(|pattern| crate::curation::glob_match(pattern, name))
+    })
+}
+
+/// `group:artifact`, the name curation and `hosted_groups` match.
+fn maven_name(group_path: &str, artifact_id: &str) -> String {
+    format!("{}:{artifact_id}", group_path.replace('/', "."))
+}
+
+/// The checksum at `checksum_key` computed from the stored artifact, stored on the way: a
+/// checksum file is never the client's value (A017). 404 when the artifact is not stored.
+async fn computed_checksum(state: &AppState, checksum_key: &str) -> Result<Bytes, Response> {
+    let suffix = checksum_key
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let artifact_key = &checksum_key[..checksum_key.len() - suffix.len() - 1];
+    let artifact = match state.storage.get(artifact_key).await {
+        Ok(artifact) => artifact,
+        Err(StorageError::NotFound) => {
+            return Err((StatusCode::NOT_FOUND, "Artifact not deployed").into_response())
+        }
+        Err(e) => {
+            tracing::error!(error = %e, key = %artifact_key, "Failed to read Maven artifact");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+    let Some(hash) = checksum_hex(&suffix, &artifact) else {
+        return Err((StatusCode::BAD_REQUEST, "Unknown checksum").into_response());
+    };
+    if let Err(e) = state.storage.put(checksum_key, hash.as_bytes()).await {
+        tracing::error!(error = %e, key = %checksum_key, "Failed to store Maven checksum");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    Ok(Bytes::from(hash))
+}
 
 fn checksum_hex(suffix: &str, data: &[u8]) -> Option<String> {
     match suffix {

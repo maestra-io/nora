@@ -1275,3 +1275,193 @@ async fn concurrent_deploys_of_one_release_store_it_once() {
         hex::encode(sha2::Sha256::digest(&jar))
     );
 }
+
+/// A context whose `[maven]` proxies to `upstream`, with `ru.mindbox.**` internal and
+/// `io.delta.**` hosted, uploads outside them refused (A017).
+fn hosted_groups_context(
+    upstream: &str,
+    enforcement: crate::config::HostedGroupsEnforcement,
+) -> crate::test_helpers::TestContext {
+    let upstream = upstream.to_string();
+    create_test_context_with_config(move |c| {
+        c.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(upstream)];
+        c.maven.hosted_groups = vec!["io.delta.**".to_string()];
+        c.maven.hosted_groups_enforcement = enforcement;
+        c.curation.internal_namespaces = vec!["ru.mindbox.**".to_string()];
+    })
+}
+
+/// A017: with a proxy configured, an upload is for a coordinate under
+/// `curation.internal_namespaces` or `maven.hosted_groups` only. A Write credential does not
+/// seat its own file under a coordinate the upstream serves, so the upstream's stays served.
+#[tokio::test]
+async fn an_upload_outside_the_hosted_groups_is_refused_and_the_upstream_stays_served() {
+    use crate::config::HostedGroupsEnforcement;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/com/example/lib/1.1.0/lib-1.1.0.jar"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"upstream jar".to_vec()))
+        .mount(&upstream)
+        .await;
+    let ctx = hosted_groups_context(&upstream.uri(), HostedGroupsEnforcement::Enforce);
+    let refused = || {
+        crate::metrics::MAVEN_UNHOSTED_UPLOADS_TOTAL
+            .with_label_values(&["refused"])
+            .get()
+    };
+    let before = refused();
+
+    for uri in [
+        "/maven2/com/example/lib/1.1.0/lib-1.1.0.jar",
+        "/maven2/com/example/lib/2.0.0/lib-2.0.0.jar",
+        "/maven2/com/example/lib/1.1.0/lib-1.1.0.jar.sha1",
+        "/maven2/com/example/lib/maven-metadata.xml",
+        "/maven2/com/example/lib",
+    ] {
+        let resp = send(&ctx.app, Method::PUT, uri, "planted").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+    }
+    assert_eq!(refused() - before, 5);
+    assert!(ctx
+        .state
+        .storage
+        .list("maven/com/example/")
+        .await
+        .unwrap()
+        .is_empty());
+    let get = send(
+        &ctx.app,
+        Method::GET,
+        "/maven2/com/example/lib/1.1.0/lib-1.1.0.jar",
+        "",
+    )
+    .await;
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(&body_bytes(get).await[..], b"upstream jar");
+
+    for uri in [
+        "/maven2/ru/mindbox/x/1.0/x-1.0.jar",
+        "/maven2/io/delta/delta-spark_2.12/3.2.0-mindbox.1/delta-spark_2.12-3.2.0-mindbox.1.jar",
+        "/maven2/io/delta/delta-spark_2.12/maven-metadata.xml",
+        // A group's own (plugin list) metadata names the hosted group itself.
+        "/maven2/io/delta/maven-metadata.xml",
+    ] {
+        let resp = send(&ctx.app, Method::PUT, uri, "hosted").await;
+        assert_eq!(resp.status(), StatusCode::CREATED, "{uri}");
+    }
+}
+
+/// A017: `hosted_groups_enforcement = "warn"` (the default) stores the upload and reports it,
+/// so the groups in use can be listed before `enforce`; a hosted-only registry hosts every
+/// coordinate, also under `enforce`.
+#[tokio::test]
+async fn an_unhosted_upload_is_reported_under_warn_and_any_group_is_hosted_without_proxies() {
+    use crate::config::HostedGroupsEnforcement;
+    assert_eq!(
+        crate::config::MavenConfig::default().hosted_groups_enforcement,
+        HostedGroupsEnforcement::Warn
+    );
+    let ctx = hosted_groups_context("http://127.0.0.1:9", HostedGroupsEnforcement::Warn);
+    let warned = || {
+        crate::metrics::MAVEN_UNHOSTED_UPLOADS_TOTAL
+            .with_label_values(&["warned"])
+            .get()
+    };
+    let before = warned();
+    let (logs, _guard) = crate::test_helpers::LogCapture::start();
+    let uri = "/maven2/com/example/warned/1.0/warned-1.0.jar";
+    let resp = send(&ctx.app, Method::PUT, uri, "jar").await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(warned() > before);
+    let text = logs.text();
+    assert!(
+        text.lines().any(|line| line.contains(" WARN ")
+            && line.contains("[SECURITY] Maven upload outside")
+            && line.contains("com/example/warned")),
+        "{text}"
+    );
+
+    let hosted_only = create_test_context_with_config(|c| {
+        c.maven.proxies = vec![];
+        c.maven.hosted_groups_enforcement = HostedGroupsEnforcement::Enforce;
+    });
+    let resp = send(&hosted_only.app, Method::PUT, uri, "jar").await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+/// A017: a checksum file is the server's own value. The client's is compared with the
+/// stored artifact's digest: 404 with no artifact, 400 on a mismatch (the computed digest is
+/// what gets stored), 201 on a match. With `checksum_verify = false` it is not compared, and
+/// still never stored.
+#[tokio::test]
+async fn a_checksum_upload_never_stores_the_clients_value() {
+    for verify in [true, false] {
+        let ctx = create_test_context_with_config(move |c| c.maven.checksum_verify = verify);
+        let jar_key = "maven/com/example/sum/1.0/sum-1.0.jar";
+        let sidecar = format!("{jar_key}.sha1");
+        let uri = "/maven2/com/example/sum/1.0/sum-1.0.jar.sha1";
+        let zeros = "0000000000000000000000000000000000000000";
+
+        let resp = send(&ctx.app, Method::PUT, uri, zeros).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "verify={verify}");
+        assert!(ctx.state.storage.stat(&sidecar).await.is_none());
+
+        // A file stored without its checksums, as a cache copy can be.
+        crate::test_helpers::put_written_days_ago(&ctx, jar_key, b"jar", 1).await;
+        let sha1 = hex::encode(sha1::Sha1::digest(b"jar"));
+        let want = if verify {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::CREATED
+        };
+        let resp = send(&ctx.app, Method::PUT, uri, zeros).await;
+        assert_eq!(resp.status(), want, "verify={verify}");
+        assert!(ctx.state.storage.stat(jar_key).await.is_some());
+        let stored = ctx.state.storage.get(&sidecar).await.unwrap();
+        assert_eq!(&stored[..], sha1.as_bytes(), "verify={verify}");
+
+        let upper = "/maven2/com/example/sum/1.0/sum-1.0.jar.SHA256";
+        let resp = send(&ctx.app, Method::PUT, upper, zeros).await;
+        assert_eq!(resp.status(), want, "verify={verify}");
+        let stored = ctx.state.storage.get(&format!("{jar_key}.SHA256")).await;
+        assert_eq!(
+            &stored.unwrap()[..],
+            hex::encode(sha2::Sha256::digest(b"jar")).as_bytes()
+        );
+
+        let resp = send(&ctx.app, Method::PUT, uri, sha1.clone()).await;
+        assert_eq!(resp.status(), StatusCode::CREATED, "verify={verify}");
+    }
+}
+
+/// A035: a release deploy takes the file's own lock, the one a proxy fill of the same file
+/// holds across its stat and spooled write (`ProxyBody::cache`). A fill that found nothing
+/// stored finishes before the deploy looks, so the deploy meets `immutable_releases` instead of
+/// having its file and pin replaced by the fill's afterwards.
+#[tokio::test]
+async fn a_release_deploy_waits_for_a_fill_of_the_same_file() {
+    let ctx = create_test_context();
+    let key = "maven/org/race/widget/2.3.4/widget-2.3.4.jar";
+    let uri = "/maven2/org/race/widget/2.3.4/widget-2.3.4.jar";
+    let fill_lock = ctx.state.publish_lock(key);
+    let fill = fill_lock.lock().await;
+
+    let app = ctx.app.clone();
+    let mut deploy =
+        tokio::spawn(async move { send(&app, Method::PUT, uri, "hosted jar").await.status() });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut deploy)
+            .await
+            .is_err(),
+        "the deploy waits while a fill of its file holds the lock"
+    );
+    assert!(ctx.state.storage.stat(key).await.is_none());
+    ctx.state.storage.put(key, b"upstream jar").await.unwrap();
+    drop(fill);
+
+    assert_eq!(deploy.await.unwrap(), StatusCode::CONFLICT);
+    let stored = ctx.state.storage.get(key).await.unwrap();
+    assert_eq!(&stored[..], b"upstream jar");
+}
