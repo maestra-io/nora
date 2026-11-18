@@ -37,8 +37,9 @@ pub fn routes() -> Router<AppState> {
 /// and revision-query (`@v/<branch>.info`) answers of a proxied module offer only versions the
 /// `.zip` gate admits ([`go_version_hidden`]): `go install x@latest` resolved a version the
 /// gate then refused with 403 for its first three days. `@latest` whose version is held moves
-/// to the newest admitted listed version; with none, or a held revision query, 404, which the
-/// GOPROXY protocol reads as "not available on the proxy". Audit mode only logs. Internal
+/// to the newest admitted listed version; with none, or a held revision query, the `.zip`
+/// gate's own 403 (a 404 tells a `GOPROXY=…,direct` client to fetch it elsewhere, go.dev/ref/
+/// mod#goproxy-protocol). Audit mode only logs. Internal
 /// modules and a proxy-less (hosted) setup are never filtered.
 async fn handle_filtered(
     State(state): State<AppState>,
@@ -99,10 +100,26 @@ async fn handle_filtered(
     if !go_version_hidden(&state, &module_encoded, &module_path, &version).await {
         return Response::from_parts(parts, axum::body::Body::from(body));
     }
+    // A held revision query, or a held `@latest` with no admitted version, answers what the
+    // `.zip` gate answers (403, not 404: on 404 a `GOPROXY=…,direct` client would fetch the
+    // held version from elsewhere). The bypass header passes it as it passes the `.zip`.
+    let held = || async {
+        let judged = go_gate_date(&state, &module_encoded, &version).await;
+        crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            RegistryType::Go,
+            &module_path,
+            crate::curation::RequestVersion::of_artifact(Some(&version)),
+            judged,
+        )
+    };
     if file != "@latest" {
-        return go_not_found(format!(
-            "{module_path}@{version} is younger than the minimum release age"
-        ));
+        return match held().await {
+            Some(refused) => refused,
+            None => Response::from_parts(parts, axum::body::Body::from(body)),
+        };
     }
     // `@latest`: the newest admitted listed version, release before pre-release, as the go
     // command itself picks from `@v/list`.
@@ -130,13 +147,14 @@ async fn handle_filtered(
                 .then_with(|| go_semver_cmp(a, b))
         });
     let Some(best) = best else {
-        return go_not_found(format!(
-            "no version of {module_path} is past the minimum release age"
-        ));
+        return match held().await {
+            Some(refused) => refused,
+            None => Response::from_parts(parts, axum::body::Body::from(body)),
+        };
     };
     let mut info = handle(
         State(state.clone()),
-        headers,
+        headers.clone(),
         Path(format!("{module_encoded}/@v/{best}.info")),
     )
     .await;
@@ -146,15 +164,6 @@ async fn handle_filtered(
         HeaderValue::from_static("public, max-age=60, must-revalidate"),
     );
     info
-}
-
-fn go_not_found(message: String) -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        format!("not found: {message}\n"),
-    )
-        .into_response()
 }
 
 /// Whether the `.zip` gate would refuse `ver` for its release age: the same date
@@ -167,13 +176,17 @@ async fn go_version_hidden(
     module_path: &str,
     ver: &str,
 ) -> bool {
-    let date = go_publish_date(state, module_encoded, ver, true).await;
-    let zip_key = format!("go/{module_encoded}/@v/{ver}.zip");
-    let judged = go_judged_date(state, date, &zip_key).await;
+    let judged = go_gate_date(state, module_encoded, ver).await;
     state
         .curation()
         .curation_engine
         .hides_from_metadata(RegistryType::Go, module_path, ver, judged)
+}
+
+/// The date the `.zip` gate judges `ver` by.
+async fn go_gate_date(state: &AppState, module_encoded: &str, ver: &str) -> Option<i64> {
+    let date = go_publish_date(state, module_encoded, ver, true).await;
+    go_judged_date(state, date, &format!("go/{module_encoded}/@v/{ver}.zip")).await
 }
 
 /// The listed versions to leave out of `@v/list`. Versions are grouped by major.minor and
@@ -2613,18 +2626,24 @@ mod metadata_hides_young_versions {
     }
 
     #[tokio::test]
-    async fn latest_with_no_admitted_version_is_not_found() {
+    async fn latest_with_no_admitted_version_is_refused_as_the_zip_is() {
         let (_up, ctx) = context(&YOUNG, CurationMode::Enforce, &[]).await;
         let (status, body, _) = get(&ctx, "@latest").await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        // 403, not 404: a `GOPROXY=…,direct` client falls back to `direct` only after a 404/410.
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("v1.2.0"), "{body}");
         assert_eq!(get(&ctx, "@v/list").await.1, "");
     }
 
     #[tokio::test]
-    async fn a_branch_resolving_to_a_held_pseudo_version_is_not_found() {
+    async fn a_branch_resolving_to_a_held_pseudo_version_is_refused_as_the_zip_is() {
         let (_up, ctx) = context(&all(), CurationMode::Enforce, &[]).await;
         let (status, body, _) = get(&ctx, "@v/main.info").await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(
+            get(&ctx, &format!("@v/{PSEUDO}.zip")).await.0,
+            StatusCode::FORBIDDEN
+        );
         assert!(body.contains(PSEUDO), "{body}");
         let (status, body, _) = get(&ctx, "@v/stable.info").await;
         assert_eq!(status, StatusCode::OK);
