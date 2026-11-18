@@ -50,7 +50,8 @@ pub struct BackupMetadata {
 const LOCAL_PREFIX: &str = ".nora-local/";
 const LOCAL_TOKENS: &str = "tokens/";
 /// Present while a restore writes token records into a store that had none, so a rerun
-/// after a failure writes the rest instead of treating the store as the authority.
+/// after a failure writes the rest instead of treating the store as the authority. Any
+/// finished restore drops it.
 const RESTORE_MARKER: &str = ".nora-tokens/restore_in_progress";
 
 /// Statistics returned after backup
@@ -286,6 +287,29 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
     Ok(stats)
 }
 
+/// Delete every record in `listed` (keys under [`tokens::STORAGE_PREFIX`]) whose token is
+/// marked revoked in the same listing, and return the other keys. Such a record is left
+/// over from a write that raced a revoke in a run that then failed, or was written from an
+/// archive taken between a revoke's mark and its delete (review R20).
+async fn drop_revoked_records(
+    storage: &Storage,
+    listed: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let all: std::collections::HashSet<String> = listed.iter().cloned().collect();
+    let mut kept = Vec::with_capacity(listed.len());
+    for key in listed {
+        if !tokens::revoked_key(&key).is_some_and(|mark| all.contains(&mark)) {
+            kept.push(key);
+            continue;
+        }
+        match storage.delete(&key).await {
+            Ok(()) | Err(crate::storage::StorageError::NotFound) => {}
+            Err(e) => return Err(format!("Failed to drop revoked {key}: {e}")),
+        }
+    }
+    Ok(kept)
+}
+
 /// Write [`RESTORE_MARKER`] once, before the first token record a restore writes.
 async fn mark_token_restore(storage: &Storage, unmarked: &mut bool) -> Result<(), String> {
     if std::mem::take(unmarked) {
@@ -371,20 +395,22 @@ pub async fn restore_backup(
     let mut quarantine_restored = false;
     let write_times = metadata.as_ref().is_some_and(|m| m.write_times);
     let mut writes = digest_quarantine::CarriedWrites::default();
-    let listed = if include_tokens {
-        Vec::new()
-    } else {
-        storage
-            .list_internal(tokens::STORAGE_PREFIX)
-            .await
-            .map_err(|e| format!("storage list failed: {}", e))?
-    };
+    let mut listed = storage
+        .list_internal(tokens::STORAGE_PREFIX)
+        .await
+        .map_err(|e| format!("storage list failed: {}", e))?;
     // A restore that began on a store without token records and was cut short resumes
-    // as one: the records it wrote do not make the store the authority.
-    let resumed = listed.iter().any(|k| k == RESTORE_MARKER);
+    // as one: the records it wrote do not make the store the authority. Whatever mode
+    // this run is, finishing it drops the marker.
+    let found_marker = listed.iter().any(|k| k == RESTORE_MARKER);
+    // A record whose token is marked revoked goes first, and is not one of the store's.
+    if !include_tokens {
+        listed = drop_revoked_records(storage, listed).await?;
+    }
+    let resumed = !include_tokens && found_marker;
     let store_tokens: std::collections::HashSet<String> = listed
         .into_iter()
-        .filter(|k| !resumed && tokens::is_record_key(k))
+        .filter(|k| !include_tokens && !resumed && tokens::is_record_key(k))
         .collect();
     if resumed {
         println!("Resuming a restore that began on a store without token records");
@@ -393,16 +419,10 @@ pub async fn restore_backup(
     let marked = !include_tokens && store_tokens.is_empty();
     let mut unmarked = marked;
     let mut tokens_skipped = 0;
-    // A record the store has is the same (records are immutable); one it lacks is counted.
-    let mut skip_token_state = |key: &str| {
-        if store_tokens.is_empty() {
-            return false;
-        }
-        if tokens::is_record_key(key) && !store_tokens.contains(key) {
-            tokens_skipped += 1;
-        }
-        true
-    };
+    // A store with token records keeps its own token state: a record it has is the same
+    // (records are immutable), one it lacks is counted.
+    let authority = !store_tokens.is_empty();
+    let lacks = |key: &str| tokens::is_record_key(key) && !store_tokens.contains(key);
 
     // Second pass: restore files
     for entry in archive
@@ -443,16 +463,23 @@ pub async fn restore_backup(
         if let Some(name) = path.strip_prefix(LOCAL_PREFIX) {
             // Older archives: a token record goes into storage; anything else is refused.
             match name.strip_prefix(LOCAL_TOKENS) {
-                Some(record)
-                    if skip_token_state(&format!("{}{record}", tokens::STORAGE_PREFIX)) =>
-                {
-                    pb.inc(1);
-                    continue;
-                }
                 Some(record) => {
+                    let key = format!("{}{record}", tokens::STORAGE_PREFIX);
+                    if authority {
+                        tokens_skipped += usize::from(lacks(&key));
+                        pb.inc(1);
+                        continue;
+                    }
                     tokens::check_record(record, &data)?;
                     mark_token_restore(storage, &mut unmarked).await?;
-                    tokens::import_record(storage, record, &data).await?
+                    let write = tokens::import_record(storage, record, &data);
+                    if include_tokens {
+                        write.await?;
+                    } else if !tokens::write_unless_revoked(storage, &key, write).await? {
+                        tokens_skipped += 1;
+                        pb.inc(1);
+                        continue;
+                    }
                 }
                 None => return Err(format!("Unknown local-state entry {path}")),
             }
@@ -464,9 +491,12 @@ pub async fn restore_backup(
             pb.inc(1);
             continue;
         }
-        if path == RESTORE_MARKER
-            || path.starts_with(tokens::STORAGE_PREFIX) && skip_token_state(&path)
-        {
+        if path == RESTORE_MARKER {
+            pb.inc(1);
+            continue;
+        }
+        if authority && path.starts_with(tokens::STORAGE_PREFIX) {
+            tokens_skipped += usize::from(lacks(&path));
             pb.inc(1);
             continue;
         }
@@ -486,10 +516,19 @@ pub async fn restore_backup(
             mark_token_restore(storage, &mut unmarked).await?;
         }
         // Put to storage
-        storage
-            .put(&path, &data)
-            .await
-            .map_err(|e| format!("Failed to store {}: {}", path, e))?;
+        let write = async {
+            storage
+                .put(&path, &data)
+                .await
+                .map_err(|e| format!("Failed to store {}: {}", path, e))
+        };
+        if include_tokens || !tokens::is_record_key(&path) {
+            write.await?;
+        } else if !tokens::write_unless_revoked(storage, &path, write).await? {
+            tokens_skipped += 1;
+            pb.inc(1);
+            continue;
+        }
 
         total_bytes += data.len() as u64;
         artifact_count += 1;
@@ -514,7 +553,17 @@ pub async fn restore_backup(
         }
     }
 
-    if marked && !unmarked {
+    // The archive can hold a record and its token's revocation mark (taken between the
+    // revoke's two writes): the mark is in now, so the record goes.
+    if !include_tokens {
+        let listed = storage
+            .list_internal(tokens::STORAGE_PREFIX)
+            .await
+            .map_err(|e| format!("storage list failed: {}", e))?;
+        drop_revoked_records(storage, listed).await?;
+    }
+
+    if found_marker || (marked && !unmarked) {
         match storage.delete(RESTORE_MARKER).await {
             Ok(()) | Err(crate::storage::StorageError::NotFound) => {}
             Err(e) => return Err(format!("Failed to drop {}: {}", RESTORE_MARKER, e)),
@@ -538,10 +587,16 @@ pub async fn restore_backup(
         stats.local_files
     );
     println!("  Total data: {} bytes", stats.total_bytes);
-    if !store_tokens.is_empty() {
+    if authority {
         println!(
             "  Tokens: the store's own kept; {} token records not in the store were not \
              restored (revoked or lost); rerun with --include-tokens to restore them",
+            stats.tokens_skipped
+        );
+    } else if stats.tokens_skipped > 0 {
+        println!(
+            "  Tokens: {} token records revoked on this store were not restored; rerun \
+             with --include-tokens to restore them",
             stats.tokens_skipped
         );
     }
@@ -1242,6 +1297,198 @@ mod tests {
         assert!(
             storage.stat(RESTORE_MARKER).await.is_none(),
             "a finished restore drops its marker"
+        );
+    }
+
+    /// Review R20: a token revoked after a failed restore stays revoked when a later plain
+    /// restore resumes from the marker that one left: the revoke marked it, the resumed
+    /// restore leaves its record out and counts it, and drops the marker.
+    #[tokio::test]
+    async fn a_revoke_after_an_unfinished_restore_keeps_the_token_revoked() {
+        use crate::tokens::{Role, TokenError, TokenStore};
+        let dir = tempfile::tempdir().unwrap();
+        let src = Storage::new_local(dir.path().join("src").to_str().unwrap());
+        let minted = TokenStore::new(src.clone());
+        let revoked = minted
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let revoked_id = minted.list_tokens("ci").await[0].file_id.clone();
+        let kept = minted
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let backup_file = dir.path().join("backup.tar.gz");
+        create_backup(&src, &backup_file).await.unwrap();
+
+        // A restore that wrote every record and failed after: its marker stays.
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        storage.put(RESTORE_MARKER, b"").await.unwrap();
+        for key in src.list_internal(tokens::STORAGE_PREFIX).await.unwrap() {
+            if tokens::is_record_key(&key) {
+                storage
+                    .put(&key, &src.get(&key).await.unwrap())
+                    .await
+                    .unwrap();
+            }
+        }
+        TokenStore::new(storage.clone())
+            .revoke_token(&revoked_id)
+            .await
+            .unwrap();
+
+        let stats = restore_backup(&storage, &backup_file, false).await.unwrap();
+        assert_eq!(stats.tokens_skipped, 1);
+        assert!(storage.stat(RESTORE_MARKER).await.is_none());
+        let fresh = TokenStore::new(storage.clone());
+        assert!(matches!(
+            fresh.verify_token(&revoked).await,
+            Err(TokenError::NotFound)
+        ));
+        fresh.verify_token(&kept).await.unwrap();
+
+        // `--include-tokens` still brings it back.
+        restore_backup(&storage, &backup_file, true).await.unwrap();
+        TokenStore::new(storage)
+            .verify_token(&revoked)
+            .await
+            .expect("--include-tokens restores every record");
+    }
+
+    /// Review R20: a revoke that leaves the store with no token record does not make it a
+    /// fresh store: a plain restore of an archive that holds the record leaves it out.
+    #[tokio::test]
+    async fn a_store_emptied_by_a_revoke_keeps_the_token_revoked() {
+        use crate::tokens::{Role, TokenError, TokenStore};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let store = TokenStore::new(storage.clone());
+        let only = store
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let id = store.list_tokens("ci").await[0].file_id.clone();
+        let backup_file = dir.path().join("backup.tar.gz");
+        create_backup(&storage, &backup_file).await.unwrap();
+        store.revoke_token(&id).await.unwrap();
+
+        let stats = restore_backup(&storage, &backup_file, false).await.unwrap();
+        assert_eq!(stats.tokens_skipped, 1);
+        assert!(matches!(
+            TokenStore::new(storage.clone()).verify_token(&only).await,
+            Err(TokenError::NotFound)
+        ));
+        // A store that never had it gets it.
+        let fresh = Storage::new_local(dir.path().join("fresh").to_str().unwrap());
+        restore_backup(&fresh, &backup_file, false).await.unwrap();
+        TokenStore::new(fresh).verify_token(&only).await.unwrap();
+    }
+
+    /// Review R20: a revoked record that an earlier, failed run wrote back (its write raced
+    /// the revoke) is dropped by the next plain restore, which leaves it out.
+    #[tokio::test]
+    async fn a_revoked_record_a_failed_restore_left_is_dropped_by_the_rerun() {
+        use crate::tokens::{Role, TokenError, TokenStore};
+        let dir = tempfile::tempdir().unwrap();
+        let src = Storage::new_local(dir.path().join("src").to_str().unwrap());
+        let raw = TokenStore::new(src.clone())
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let backup_file = dir.path().join("backup.tar.gz");
+        create_backup(&src, &backup_file).await.unwrap();
+        let key = src.list_internal(tokens::STORAGE_PREFIX).await.unwrap()[0].clone();
+
+        // What the failed run left: its marker, the revoke's mark and the record put back.
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        storage.put(RESTORE_MARKER, b"").await.unwrap();
+        storage
+            .put(&tokens::revoked_key(&key).unwrap(), b"")
+            .await
+            .unwrap();
+        storage
+            .put(&key, &src.get(&key).await.unwrap())
+            .await
+            .unwrap();
+
+        let stats = restore_backup(&storage, &backup_file, false).await.unwrap();
+        assert_eq!(stats.tokens_skipped, 1);
+        assert!(matches!(
+            TokenStore::new(storage).verify_token(&raw).await,
+            Err(TokenError::NotFound)
+        ));
+    }
+
+    /// Review R20: an archive taken between a revoke's mark and its delete holds both; a
+    /// plain restore of it, even onto an empty store, ends without the record.
+    #[tokio::test]
+    async fn an_archive_with_a_record_and_its_revocation_mark_restores_it_revoked() {
+        use crate::tokens::{Role, TokenError, TokenStore};
+        let dir = tempfile::tempdir().unwrap();
+        let src = Storage::new_local(dir.path().join("src").to_str().unwrap());
+        let raw = TokenStore::new(src.clone())
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let key = src.list_internal(tokens::STORAGE_PREFIX).await.unwrap()[0].clone();
+        src.put(&tokens::revoked_key(&key).unwrap(), b"")
+            .await
+            .unwrap();
+        let backup_file = dir.path().join("backup.tar.gz");
+        create_backup(&src, &backup_file).await.unwrap();
+
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        restore_backup(&storage, &backup_file, false).await.unwrap();
+        assert!(matches!(
+            TokenStore::new(storage).verify_token(&raw).await,
+            Err(TokenError::NotFound)
+        ));
+    }
+
+    /// Review R20: a revoke that lands while a restore writes the record is seen right after
+    /// the write, and the record is dropped again.
+    #[tokio::test]
+    async fn a_revoke_during_the_record_write_drops_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let key = format!("{}0123456789abcdef.json", tokens::STORAGE_PREFIX);
+        let mark = tokens::revoked_key(&key).unwrap();
+        let write = async {
+            storage.put(&key, b"{}").await.unwrap();
+            storage.put(&mark, b"").await.unwrap();
+            Ok(())
+        };
+        assert!(!tokens::write_unless_revoked(&storage, &key, write)
+            .await
+            .unwrap());
+        assert!(storage.stat(&key).await.is_none(), "the record stayed");
+        // Marked before the write: never written.
+        let write = async { Err::<(), String>("a revoked record was written".into()) };
+        assert!(!tokens::write_unless_revoked(&storage, &key, write)
+            .await
+            .unwrap());
+    }
+
+    /// Review R20: an `--include-tokens` run finishes what a failed restore began, so it drops
+    /// that restore's marker too; a later plain restore does not resume.
+    #[tokio::test]
+    async fn an_include_tokens_restore_drops_a_marker_a_failed_restore_left() {
+        use crate::tokens::{Role, TokenStore};
+        let dir = tempfile::tempdir().unwrap();
+        let src = Storage::new_local(dir.path().join("src").to_str().unwrap());
+        TokenStore::new(src.clone())
+            .create_token("ci", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let backup_file = dir.path().join("backup.tar.gz");
+        create_backup(&src, &backup_file).await.unwrap();
+
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        storage.put(RESTORE_MARKER, b"").await.unwrap();
+        restore_backup(&storage, &backup_file, true).await.unwrap();
+        assert!(
+            storage.stat(RESTORE_MARKER).await.is_none(),
+            "an --include-tokens restore left the marker"
         );
     }
 }

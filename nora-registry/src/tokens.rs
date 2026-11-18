@@ -36,6 +36,50 @@ const LAST_USED_KEY: &str = ".nora-tokens/last_used.json";
 /// Ids of the `auth.token_storage` files already imported once, so a token revoked
 /// after the import is not brought back by the next boot.
 const IMPORTED_KEY: &str = ".nora-tokens/legacy_imported.json";
+/// `<REVOKED_PREFIX><16hex>`: an empty object a revoke writes before it deletes the record,
+/// never removed. `nora restore` writes no record that has one (backup.rs), so a revoked token
+/// stays revoked whatever the store held before; `--include-tokens` ignores them.
+const REVOKED_PREFIX: &str = ".nora-tokens/revoked/";
+
+/// The revocation mark of the token whose record is `key`, if `key` is a record key.
+pub fn revoked_key(key: &str) -> Option<String> {
+    record_id(key).map(|id| format!("{REVOKED_PREFIX}{id}"))
+}
+
+/// Whether the token whose record is `key` is marked revoked; a store failure is an error,
+/// never "no".
+async fn marked_revoked(storage: &Storage, key: &str) -> Result<bool, String> {
+    let Some(mark) = revoked_key(key) else {
+        return Ok(false);
+    };
+    match storage.get(&mark).await {
+        Ok(_) => Ok(true),
+        Err(StorageError::NotFound) => Ok(false),
+        Err(e) => Err(format!("Failed to read {mark}: {e}")),
+    }
+}
+
+/// Write the token record `key` with `write` unless its token is marked revoked (review
+/// R20). A revoke marks the token before it deletes the record, so one that lands during
+/// the write is seen right after it, and the record is dropped again, whichever process
+/// wrote it. `Ok(false)`: not written, or dropped.
+pub async fn write_unless_revoked<F>(storage: &Storage, key: &str, write: F) -> Result<bool, String>
+where
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    if marked_revoked(storage, key).await? {
+        return Ok(false);
+    }
+    write.await?;
+    if marked_revoked(storage, key).await? {
+        match storage.delete(key).await {
+            Ok(()) | Err(StorageError::NotFound) => {}
+            Err(e) => return Err(format!("Failed to drop revoked {key}: {e}")),
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
 
 /// A new token secret: 128 random bits from rand's CSPRNG, `nra_` + 32 lowercase hex
 /// (the shape tokens always had, so issued tokens and scanners are unaffected).
@@ -619,7 +663,12 @@ impl TokenStore {
         if self.revocations.load(Ordering::SeqCst) != seen {
             return false;
         }
-        self.storage.put(key, json).await.is_ok()
+        // The count covers this process only: a revoke elsewhere (another replica, or one a
+        // restore's cleanup followed) is seen by its mark.
+        let write = async { self.storage.put(key, json).await.map_err(|e| e.to_string()) };
+        write_unless_revoked(&self.storage, key, write)
+            .await
+            .unwrap_or(false)
     }
 
     /// Remove a token from the in-memory cache (called on revoke).
@@ -645,6 +694,18 @@ impl TokenStore {
         // From the delete to the count: a migration rewrite waits, so it cannot put
         // the record back.
         let _held = self.record_lock.lock().await;
+        // Review R20: marked revoked before the record goes, so no restore, however it
+        // interleaves with this, leaves the record in place (backup.rs). Only a token that
+        // has a record is marked.
+        match self.storage.get(&key).await {
+            Ok(_) => {}
+            Err(StorageError::NotFound) => return Err(TokenError::NotFound),
+            Err(e) => return Err(TokenError::Storage(e.to_string())),
+        }
+        self.storage
+            .put(&format!("{REVOKED_PREFIX}{hash_prefix}"), b"")
+            .await
+            .map_err(|e| TokenError::Storage(e.to_string()))?;
         // `delete` answers NotFound for a missing record on every backend and a
         // store failure as such: a record that could not be reached is not "gone".
         match self.storage.delete(&key).await {
@@ -1904,11 +1965,42 @@ mod tests {
             Err(StorageError::NotFound)
         ));
 
+        // The lock, on a token that is not revoked (a revoked one is never rewritten: its
+        // mark, review R20).
+        let other = store.create_token("u", 30, None, Role::Read).await.unwrap();
+        let key = record_key(&sha256_hex(&other)[..16]);
+        let json = storage.get(&key).await.unwrap();
         let seen = store.revocations.load(Ordering::SeqCst);
         let held = store.record_lock.lock().await;
         assert!(!store.rewrite_unless_revoked(seen, &key, &json).await);
         drop(held);
         assert!(store.rewrite_unless_revoked(seen, &key, &json).await);
         assert!(storage.get(&key).await.is_ok());
+    }
+
+    /// Review R20: a revoke in another process (another replica) does not move this
+    /// process's count, but its mark stops a migration rewrite from putting the record back,
+    /// also when the restore that put it back already dropped it again.
+    #[tokio::test]
+    async fn a_migration_after_a_revoke_elsewhere_leaves_the_token_revoked() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = local(&temp_dir);
+        let store = TokenStore::new(storage.clone());
+        let token = store.create_token("u", 30, None, Role::Read).await.unwrap();
+        let id = sha256_hex(&token)[..16].to_string();
+        let key = record_key(&id);
+        let json = storage.get(&key).await.unwrap();
+
+        let seen = store.revocations.load(Ordering::SeqCst);
+        TokenStore::new(storage.clone())
+            .revoke_token(&id)
+            .await
+            .unwrap();
+        assert_eq!(store.revocations.load(Ordering::SeqCst), seen);
+        assert!(!store.rewrite_unless_revoked(seen, &key, &json).await);
+        assert!(matches!(
+            storage.get(&key).await,
+            Err(StorageError::NotFound)
+        ));
     }
 }

@@ -2586,11 +2586,20 @@ async fn run_server(mut config: Config, storage: Storage) {
         });
     }
 
-    // Maestra: the internal and Teleport listeners, bound here so a taken port fails the start.
-    spawn_side_listeners(&state, &app).await;
-
     // Graceful shutdown on SIGTERM/SIGINT, draining for at most `shutdown_timeout` (#1016)
     let drain = std::time::Duration::from_secs(state.config.server.shutdown_timeout);
+    // Cancelled at the signal: the Teleport listener drains with the main one.
+    let stopping = tokio_util::sync::CancellationToken::new();
+    let shutdown = {
+        let stopping = stopping.clone();
+        async move {
+            shutdown_signal().await;
+            stopping.cancel();
+        }
+    };
+
+    // Maestra: the internal and Teleport listeners, bound here so a taken port fails the start.
+    let side = spawn_side_listeners(&state, &app, &stopping).await;
     let limits = ConnLimits::from_config(&state.config.server);
     info!(
         header_read_timeout_secs = state.config.server.header_read_timeout,
@@ -2601,7 +2610,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     );
     // Exported from the start, at 0.
     std::sync::LazyLock::force(&metrics::CONNECTIONS_STALLED_TOTAL);
-    match serve_with_drain(listener, app, shutdown_signal(), drain, limits)
+    match serve_with_drain(listener, app, shutdown, drain, limits)
         .await
         .expect("Server error")
     {
@@ -2610,6 +2619,10 @@ async fn run_server(mut config: Config, storage: Storage) {
             shutdown_timeout_secs = state.config.server.shutdown_timeout,
             "Connections still open after the shutdown timeout are closed; finishing shutdown"
         ),
+    }
+    // Its drain began at the signal too, so this waits at most what is left of the window.
+    if let Some(teleport) = side.teleport_task {
+        let _ = tokio::time::timeout(drain, teleport).await;
     }
 
     // Signal background schedulers to stop and wait for them (#306)
@@ -3024,17 +3037,29 @@ mod server_supervision_tests;
 #[path = "main_tests/maintenance_storage_tests.rs"]
 mod maintenance_storage_tests;
 
-/// Bind and spawn the side listeners `server` asks for; returns their addresses
-/// (internal, Teleport).
-/// - `internal_port`: detailed /health and /metrics, off the public hostname.
+/// The side listeners a server serves: their addresses, and the Teleport one's task.
+struct SideListeners {
+    // The addresses are for the tests (port 0); the start logs the configured ports.
+    #[cfg_attr(not(test), allow(dead_code))]
+    internal: Option<std::net::SocketAddr>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    teleport: Option<std::net::SocketAddr>,
+    teleport_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Bind and spawn the side listeners `server` asks for.
+/// - `internal_port`: detailed /health and /metrics, off the public hostname; stops with the
+///   schedulers (`state.cancel_token`), after a 1 s drain.
 /// - `teleport_port`: the Teleport app agent's own listener. Same routes as `app`, but
 ///   X-Forwarded-For and X-Real-IP are dropped before anything reads them, so the client
 ///   address is the agent's TCP peer, and auth.teleport reads the identity header here
-///   (auth/teleport.rs).
+///   (auth/teleport.rs). It serves the whole app, so it stops at `stopping` (the shutdown
+///   signal) and drains for `server.shutdown_timeout`, like the main listener.
 async fn spawn_side_listeners(
     state: &AppState,
     app: &Router,
-) -> (Option<std::net::SocketAddr>, Option<std::net::SocketAddr>) {
+    stopping: &tokio_util::sync::CancellationToken,
+) -> SideListeners {
     let server = &state.config.server;
     let limits = ConnLimits::from_config(server);
     let mut internal = None;
@@ -3047,6 +3072,7 @@ async fn spawn_side_listeners(
             port,
             routes,
             stop,
+            std::time::Duration::from_secs(1),
             limits,
         )
         .await;
@@ -3054,30 +3080,35 @@ async fn spawn_side_listeners(
         state.tasks.spawn("internal_listener", serve);
         internal = Some(addr);
     }
-    let mut teleport = None;
+    let (mut teleport, mut teleport_task) = (None, None);
     if let Some(port) = server.teleport_port {
         let routes = app.clone().layer(middleware::map_request(
             auth::teleport::mark_teleport_listener,
         ));
-        let stop = state.cancel_token.clone();
         let (addr, serve) = side_listener(
             "server.teleport_port",
             &server.host,
             port,
             routes,
-            stop,
+            stopping.clone(),
+            std::time::Duration::from_secs(server.shutdown_timeout),
             limits,
         )
         .await;
         info!(port, "Teleport listener: forwarding headers ignored");
-        state.tasks.spawn("teleport_listener", serve);
+        teleport_task = Some(state.tasks.spawn("teleport_listener", serve));
         teleport = Some(addr);
     }
-    (internal, teleport)
+    SideListeners {
+        internal,
+        teleport,
+        teleport_task,
+    }
 }
 
 /// Bind a side listener (internal, Teleport) on `host:port`, so a taken port fails the
-/// start, and return its address and the supervised task serving `app` there until `stop`.
+/// start, and return its address and the supervised task serving `app` there until `stop`,
+/// then giving its requests in flight `drain` to finish.
 /// Each run serves a clone of that socket, so a restart after a panic serves the same port.
 async fn side_listener(
     what: &'static str,
@@ -3085,6 +3116,7 @@ async fn side_listener(
     port: u16,
     app: Router,
     stop: tokio_util::sync::CancellationToken,
+    drain: std::time::Duration,
     limits: ConnLimits,
 ) -> (
     std::net::SocketAddr,
@@ -3104,7 +3136,6 @@ async fn side_listener(
             .and_then(tokio::net::TcpListener::from_std);
         async move {
             let listener = listener.unwrap_or_else(|e| panic!("clone {what} listener: {e}"));
-            let drain = std::time::Duration::from_secs(1);
             if let Err(e) =
                 serve_with_drain(listener, app, stop.cancelled_owned(), drain, limits).await
             {
