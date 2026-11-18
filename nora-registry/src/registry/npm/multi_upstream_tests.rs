@@ -851,7 +851,9 @@ async fn owner_copies_and_local_publishes_are_served_from_cache() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(&body_bytes(resp).await[..], b"OWNER-TGZ");
 
-    // A package published here under the owned scope is ours: served.
+    // A package published here under the owned scope (before the owner served it, A091) is
+    // ours: served.
+    let twin = crate::test_helpers::npm_first_publish_twin(&ctx, "@vendor/local").await;
     let payload = serde_json::json!({
         "name": "@vendor/local",
         "versions": { "1.0.0": { "dist": {} } },
@@ -861,7 +863,7 @@ async fn owner_copies_and_local_publishes_are_served_from_cache() {
         "dist-tags": { "latest": "1.0.0" }
     });
     let resp = send(
-        &ctx.app,
+        &twin.unwrap().app,
         Method::PUT,
         "/npm/@vendor%2flocal",
         Body::from(serde_json::to_vec(&payload).unwrap()),

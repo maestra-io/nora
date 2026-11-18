@@ -54,6 +54,7 @@ NORA_HOST=127.0.0.1 \
 NORA_PORT=$PORT \
 NORA_STORAGE_PATH="$STORAGE_DIR" \
 NORA_RATE_LIMIT_ENABLED=false \
+NORA_CURATION_INTERNAL_NS=smoke-test-pkg,test-pkg \
 NORA_PUBLIC_URL="$BASE" \
 "$NORA_BIN" serve &
 NORA_PID=$!
@@ -125,7 +126,7 @@ fi
 MISMATCH_RESULT=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
     -H "Content-Type: application/json" \
     -d '{"name":"evil-pkg","versions":{"1.0.0":{}},"_attachments":{"a.tgz":{"data":"dGVzdA=="}}}' \
-    "$BASE/npm/lodash")
+    "$BASE/npm/test-pkg")
 if [ "$MISMATCH_RESULT" = "400" ]; then
     pass "npm name mismatch rejected (400)"
 else
@@ -141,6 +142,17 @@ if [ "$TRAVERSAL_RESULT" = "400" ]; then
     pass "npm path traversal rejected (400)"
 else
     fail "npm path traversal returned $TRAVERSAL_RESULT, expected 400"
+fi
+
+# A first publish of a name the upstream serves, outside the internal namespaces (A091)
+CLAIM_RESULT=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+    -H "Content-Type: application/json" \
+    -d '{"name":"smoke-unclaimed-pkg","versions":{"1.0.0":{"name":"smoke-unclaimed-pkg","version":"1.0.0","dist":{}}},"_attachments":{"smoke-unclaimed-pkg-1.0.0.tgz":{"data":"dGVzdA=="}}}' \
+    "$BASE/npm/smoke-unclaimed-pkg")
+if [ "$CLAIM_RESULT" = "403" ]; then
+    pass "npm first publish outside internal namespaces refused (403)"
+else
+    fail "npm first publish outside internal namespaces returned $CLAIM_RESULT, expected 403"
 fi
 
 echo ""

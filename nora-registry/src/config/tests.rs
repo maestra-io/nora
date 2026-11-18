@@ -1009,7 +1009,13 @@ fn test_env_override_npm() {
     std::env::set_var("NORA_NPM_PROXY_AUTH", "user:token");
     std::env::set_var("NORA_NPM_PROXY_TIMEOUT", "60");
     std::env::set_var("NORA_NPM_METADATA_TTL", "600");
+    assert_eq!(config.npm.max_document_kb, 8192);
+    assert_eq!(config.npm.max_packument_mb, 128);
+    std::env::set_var("NORA_NPM_MAX_DOCUMENT_KB", "0");
+    std::env::set_var("NORA_NPM_MAX_PACKUMENT_MB", "256");
     config.apply_env_overrides().unwrap();
+    assert_eq!(config.npm.max_document_kb, 0);
+    assert_eq!(config.npm.max_packument_mb, 256);
     assert_eq!(
         config.npm.proxy,
         Some("https://npm.company.com".to_string())
@@ -1024,6 +1030,8 @@ fn test_env_override_npm() {
     std::env::remove_var("NORA_NPM_PROXY_AUTH");
     std::env::remove_var("NORA_NPM_PROXY_TIMEOUT");
     std::env::remove_var("NORA_NPM_METADATA_TTL");
+    std::env::remove_var("NORA_NPM_MAX_DOCUMENT_KB");
+    std::env::remove_var("NORA_NPM_MAX_PACKUMENT_MB");
 }
 
 #[test]

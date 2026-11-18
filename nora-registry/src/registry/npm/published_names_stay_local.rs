@@ -32,8 +32,9 @@ async fn publish(ctx: &TestContext, name: &str, version: &str) {
             "data": base64::engine::general_purpose::STANDARD.encode(b"published"),
         } },
     });
+    let twin = crate::test_helpers::npm_first_publish_twin(ctx, name).await;
     let resp = send(
-        &ctx.app,
+        &twin.as_ref().unwrap_or(ctx).app,
         Method::PUT,
         &format!("/npm/{name}"),
         Body::from(serde_json::to_vec(&payload).unwrap()),
@@ -450,4 +451,198 @@ async fn a_path_byte_the_url_parser_reinterprets_never_reaches_upstream() {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
     }
     assert!(asked(&upstream).await.is_empty());
+}
+
+const A091_USERS: &[(&str, &str)] = &[("pub", "pw-pub"), ("ro", "pw-ro")];
+
+/// `user`'s request (one of [`A091_USERS`]); the status and body.
+async fn as_user(
+    ctx: &TestContext,
+    m: Method,
+    uri: &str,
+    user: &str,
+    body: Vec<u8>,
+) -> (StatusCode, Vec<u8>) {
+    let pw = A091_USERS.iter().find(|(u, _)| *u == user).unwrap().1;
+    let auth = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pw}"))
+    );
+    let resp = send_with_headers(
+        &ctx.app,
+        m,
+        uri,
+        vec![("authorization", auth.as_str())],
+        Body::from(body),
+    )
+    .await;
+    let status = resp.status();
+    (status, body_bytes(resp).await.to_vec())
+}
+
+fn publish_body(name: &str, version: &str, tarball: &[u8]) -> Vec<u8> {
+    let short = name.rsplit('/').next().unwrap();
+    serde_json::to_vec(&serde_json::json!({
+        "name": name,
+        "versions": { version: { "name": name, "version": version, "dist": {} } },
+        "dist-tags": { "latest": version },
+        "_attachments": { format!("{short}-{version}.tgz"): {
+            "data": base64::engine::general_purpose::STANDARD.encode(tarball),
+        } }
+    }))
+    .unwrap()
+}
+
+/// An upstream serving `is-odd@3.0.1` (released long ago) and its tarball.
+async fn is_odd_upstream() -> MockServer {
+    use wiremock::matchers::{method, path};
+    let up = MockServer::start().await;
+    let doc = serde_json::json!({
+        "name": "is-odd",
+        "dist-tags": { "latest": "3.0.1" },
+        "versions": { "3.0.1": { "name": "is-odd", "version": "3.0.1",
+            "dist": { "tarball": format!("{}/is-odd/-/is-odd-3.0.1.tgz", up.uri()) } } },
+        "time": { "created": "2015-01-01T00:00:00.000Z", "modified": "2018-01-01T00:00:00.000Z",
+                  "3.0.1": "2018-01-01T00:00:00.000Z" }
+    });
+    Mock::given(method("GET"))
+        .and(path("/is-odd"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(doc))
+        .mount(&up)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/is-odd/-/is-odd-3.0.1.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"FROM-UPSTREAM".to_vec()))
+        .mount(&up)
+        .await;
+    up
+}
+
+fn a091_context(up: &MockServer, mode: crate::config::CurationMode) -> TestContext {
+    let uri = up.uri();
+    crate::test_helpers::create_test_context_with_auth_and_config(A091_USERS, move |cfg| {
+        cfg.auth.read_only_users = vec!["ro".to_string()];
+        cfg.server.trust_upstream_dates = true;
+        cfg.curation.mode = mode;
+        cfg.curation.min_release_age = Some("7d".to_string());
+        cfg.curation.internal_namespaces = vec!["@corp/*".to_string()];
+        cfg.npm.proxy = Some(uri);
+    })
+}
+
+const IS_ODD_TGZ: &str = "/npm/is-odd/-/is-odd-3.0.1.tgz";
+
+/// Wait for the background cache write of the proxied `is-odd` tarball and its provenance.
+async fn is_odd_cached(ctx: &TestContext) {
+    let key = super::origin_key("npm/is-odd/tarballs/is-odd-3.0.1.tgz");
+    for _ in 0..250 {
+        if ctx.state.storage.stat(&key).await.is_some() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the proxied tarball was never cached");
+}
+
+/// A091: a Write credential with no namespace scope does not take over a name an upstream
+/// serves. The first publish of such a name is a 403 unless it is in
+/// `curation.internal_namespaces`; the proxied bytes stay; a name already published here
+/// keeps publishing; an unreadable versions listing is a 503.
+#[tokio::test]
+async fn a_first_publish_of_an_upstream_name_outside_internal_namespaces_is_refused() {
+    let up = is_odd_upstream().await;
+    let ctx = a091_context(&up, crate::config::CurationMode::Enforce);
+
+    // (a) The reader gets the upstream's tarball.
+    let (s, t) = as_user(&ctx, Method::GET, IS_ODD_TGZ, "ro", vec![]).await;
+    assert_eq!(
+        (s, t.as_slice()),
+        (StatusCode::OK, b"FROM-UPSTREAM".as_slice())
+    );
+    is_odd_cached(&ctx).await;
+
+    // (b) Neither the proxied version nor a new one is published under the name.
+    for version in ["3.0.1", "99.0.0"] {
+        let body = publish_body("is-odd", version, b"FROM-WRITER");
+        let (s, b) = as_user(&ctx, Method::PUT, "/npm/is-odd", "pub", body).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "is-odd@{version}");
+        let text = String::from_utf8_lossy(&b);
+        assert!(text.contains("curation.internal_namespaces"), "{text}");
+    }
+    // (c) The upstream's bytes are still what readers get; nothing is published.
+    let (s, t) = as_user(&ctx, Method::GET, IS_ODD_TGZ, "ro", vec![]).await;
+    assert_eq!(
+        (s, t.as_slice()),
+        (StatusCode::OK, b"FROM-UPSTREAM".as_slice())
+    );
+    assert!(ctx
+        .state
+        .storage
+        .list("npm/is-odd/versions/")
+        .await
+        .unwrap()
+        .is_empty());
+    // (d) A name the upstream never served here is refused just the same.
+    let body = publish_body("never-seen-pkg", "1.0.0", b"X");
+    let (s, _) = as_user(&ctx, Method::PUT, "/npm/never-seen-pkg", "pub", body).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    // (e) An internal name publishes.
+    let body = publish_body("@corp/lib", "1.0.0", b"CORP");
+    let (s, _) = as_user(&ctx, Method::PUT, "/npm/@corp%2flib", "pub", body).await;
+    assert_eq!(s, StatusCode::CREATED);
+    // (f) A name already published here takes a new version.
+    publish(&ctx, "legacy-pkg", "1.0.0").await;
+    let body = publish_body("legacy-pkg", "1.0.1", b"NEXT");
+    let (s, _) = as_user(&ctx, Method::PUT, "/npm/legacy-pkg", "pub", body).await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    // (h) Whether the name is published cannot be read: unavailable, not decided.
+    let (storage, outage) = outage_storage();
+    let uri = up.uri();
+    let blind = create_test_context_with_storage_and_config(storage, move |cfg| {
+        cfg.npm.proxy = Some(uri);
+        cfg.curation.mode = crate::config::CurationMode::Enforce;
+    });
+    outage.fail_listings_of("npm/is-odd/versions/");
+    let resp = send(
+        &blind.app,
+        Method::PUT,
+        "/npm/is-odd",
+        Body::from(publish_body("is-odd", "99.0.0", b"X")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// A091 with `curation.mode = "audit"`: the first publish of an upstream's name only logs a
+/// `[SECURITY]` WARN, and a tarball cached from the upstream is still not replaced (409).
+#[tokio::test]
+async fn in_audit_mode_a_first_publish_of_an_upstream_name_is_logged_and_never_replaces_its_bytes()
+{
+    let up = is_odd_upstream().await;
+    let ctx = a091_context(&up, crate::config::CurationMode::Audit);
+    let (s, _) = as_user(&ctx, Method::GET, IS_ODD_TGZ, "ro", vec![]).await;
+    assert_eq!(s, StatusCode::OK);
+    is_odd_cached(&ctx).await;
+
+    let (logs, _guard) = crate::test_helpers::LogCapture::start();
+    let body = publish_body("is-odd", "3.0.1", b"FROM-WRITER");
+    let (s, b) = as_user(&ctx, Method::PUT, "/npm/is-odd", "pub", body).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{}", String::from_utf8_lossy(&b));
+    assert!(String::from_utf8_lossy(&b).contains("cached from an upstream"));
+    let body = publish_body("is-odd", "99.0.0", b"FROM-WRITER");
+    let (s, _) = as_user(&ctx, Method::PUT, "/npm/is-odd", "pub", body).await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert!(
+        logs.text().contains("[SECURITY] npm first publish"),
+        "{}",
+        logs.text()
+    );
+    let stored = ctx
+        .state
+        .storage
+        .get("npm/is-odd/tarballs/is-odd-3.0.1.tgz")
+        .await
+        .unwrap();
+    assert_eq!(&stored[..], b"FROM-UPSTREAM");
 }

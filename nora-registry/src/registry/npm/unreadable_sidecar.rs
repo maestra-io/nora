@@ -62,7 +62,9 @@ async fn publish(ctx: &TestContext, name: &str, version: &str) {
         } },
     });
     let body = Body::from(serde_json::to_vec(&payload).unwrap());
-    let resp = send(&ctx.app, Method::PUT, &format!("/npm/{name}"), body).await;
+    let twin = crate::test_helpers::npm_first_publish_twin(ctx, name).await;
+    let app = &twin.as_ref().unwrap_or(ctx).app;
+    let resp = send(app, Method::PUT, &format!("/npm/{name}"), body).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
 }
 

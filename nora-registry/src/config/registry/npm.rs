@@ -39,6 +39,23 @@ pub struct NpmConfig {
     /// ENV: NORA_NPM_IMPORT_EMBEDDED (comma-separated names).
     #[serde(default)]
     pub import_embedded: Vec<String>,
+    /// Largest version document, package-fields document (`description`/`readme`/`license`) or
+    /// `deprecated` message a publish may store, in KiB; 0 = no limit (A092).
+    /// ENV: NORA_NPM_MAX_DOCUMENT_KB.
+    #[serde(default = "default_max_document_kb")]
+    pub max_document_kb: u64,
+    /// Largest packument a publish may assemble, in MiB; 0 = no limit (A092). Packages already
+    /// stored are served whatever their size. ENV: NORA_NPM_MAX_PACKUMENT_MB.
+    #[serde(default = "default_max_packument_mb")]
+    pub max_packument_mb: u64,
+}
+
+fn default_max_document_kb() -> u64 {
+    8192
+}
+
+fn default_max_packument_mb() -> u64 {
+    128
 }
 
 /// One npm upstream: a bare URL, or a table with scopes and a credential.
@@ -171,6 +188,8 @@ impl Default for NpmConfig {
             serve_stale: true,
             revalidate: true,
             import_embedded: Vec::new(),
+            max_document_kb: default_max_document_kb(),
+            max_packument_mb: default_max_packument_mb(),
         }
     }
 }
@@ -323,6 +342,20 @@ impl NpmConfig {
                 .filter(|name| !name.is_empty())
                 .map(str::to_string)
                 .collect();
+        }
+        if let Ok(val) = env::var("NORA_NPM_MAX_DOCUMENT_KB") {
+            super::super::parse_env_warn(
+                "NORA_NPM_MAX_DOCUMENT_KB",
+                &val,
+                &mut self.max_document_kb,
+            );
+        }
+        if let Ok(val) = env::var("NORA_NPM_MAX_PACKUMENT_MB") {
+            super::super::parse_env_warn(
+                "NORA_NPM_MAX_PACKUMENT_MB",
+                &val,
+                &mut self.max_packument_mb,
+            );
         }
         // Bearer tokens are read once, here; validation rejects a missing one.
         for entry in &mut self.proxies {
