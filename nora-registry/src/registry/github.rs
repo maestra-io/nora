@@ -112,13 +112,19 @@ impl Release {
             .into_iter()
             .map(|a| {
                 // The file name clients request is the last segment of the download
-                // URL; GitHub may have rewritten the uploaded `name`.
+                // URL; GitHub may have rewritten the uploaded `name`. The segment is
+                // percent-encoded (`cpython-3.12.16%2B20261110-…`) and the route
+                // matches the decoded name, so it is decoded here.
                 let file = a
                     .browser_download_url
                     .as_deref()
                     .and_then(|u| u.rsplit('/').next())
                     .filter(|f| !f.is_empty())
-                    .map(str::to_string)
+                    .map(|f| {
+                        percent_encoding::percent_decode_str(f)
+                            .decode_utf8_lossy()
+                            .into_owned()
+                    })
                     .unwrap_or(a.name);
                 let sha256 = a
                     .digest
@@ -854,8 +860,14 @@ mod tests {
         let body = br#"{"published_at":"2025-07-20T16:18:38Z","assets":[
             {"name":"a b.txt","browser_download_url":"https://github.com/o/r/releases/download/v1/a.b.txt","digest":"sha256:4EA55CD2E433EDBE3151E0FF49B044DF310E29967A38F38B68B1434A3660DCB8"},
             {"name":"old.tgz","browser_download_url":null,"digest":null},
-            {"name":"bad.tgz","digest":"md5:abc"}]}"#;
+            {"name":"bad.tgz","digest":"md5:abc"},
+            {"name":"cpython-3.12.16+20261110.tar.gz","browser_download_url":"https://github.com/o/r/releases/download/20261110/cpython-3.12.16%2B20261110.tar.gz"}]}"#;
         let release = Release::from_api(body).unwrap();
+        // the decoded name, as the route hands it over (python-build-standalone `+`)
+        assert_eq!(
+            release.assets.get("cpython-3.12.16+20261110.tar.gz"),
+            Some(&None)
+        );
         assert_eq!(
             release.published_at.as_deref(),
             Some("2025-07-20T16:18:38Z")
