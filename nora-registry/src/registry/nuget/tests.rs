@@ -505,33 +505,72 @@ fn test_service_index_no_gzip() {
     );
 }
 
-/// Audit R07: a search endpoint the upstream's service index names on a loopback/private IP
-/// literal is not taken unless private upstreams are allowed; one on the feed's own host is.
+/// Audit R07: a search endpoint the upstream's service index names off the feed's own host,
+/// on a loopback/private IP literal or on the outbound proxy's host, is not taken unless
+/// private upstreams are allowed, and the public default is not kept in its place: the
+/// service is answered locally (empty). One on the feed's own host is taken.
 #[tokio::test]
 async fn a_discovered_endpoint_on_a_private_address_is_not_taken() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     let up = MockServer::start().await;
     let own = format!("{}/autocomplete", up.uri());
-    let private = "http://169.254.169.254/query";
-    Mock::given(method("GET"))
-        .and(path("/v3/index.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "version": "3.0.0",
-            "resources": [
-                { "@id": private, "@type": "SearchQueryService/3.0.0-beta" },
-                { "@id": own, "@type": "SearchAutocompleteService" },
-            ],
-        })))
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for private in [
+        "http://169.254.169.254/query",
+        "http://squid.example:3128/query",
+    ] {
+        up.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/index.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": "3.0.0",
+                "resources": [
+                    { "@id": private, "@type": "SearchQueryService/3.0.0-beta" },
+                    { "@id": own, "@type": "SearchAutocompleteService" },
+                ],
+            })))
+            .mount(&up)
+            .await;
+        for (allow_private, search) in [(false, ""), (true, private)] {
+            let mut cfg = crate::config::NugetConfig {
+                proxy: Some(format!("{}/v3/index.json", up.uri())),
+                ..Default::default()
+            };
+            let proxies = ["Squid.Example".to_string()];
+            discover_search_endpoints(&client, &mut cfg, allow_private, &proxies).await;
+            assert_eq!(
+                cfg.search_service, search,
+                "{private} allow_private={allow_private}"
+            );
+            assert_eq!(
+                cfg.autocomplete, own,
+                "{private} allow_private={allow_private}"
+            );
+        }
+    }
+}
+
+/// An endpoint discovery refused (empty) answers from the local index: the query goes to no
+/// upstream, the public default included.
+#[tokio::test]
+async fn a_refused_search_endpoint_answers_locally() {
+    use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+    let up = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(500))
         .mount(&up)
         .await;
-    for (allow_private, search) in [(false, DEFAULT_SEARCH), (true, private)] {
-        let mut cfg = crate::config::NugetConfig {
-            proxy: Some(format!("{}/v3/index.json", up.uri())),
-            ..Default::default()
-        };
-        discover_search_endpoints(&reqwest::Client::new(), &mut cfg, allow_private).await;
-        assert_eq!(cfg.search_service, search, "allow_private={allow_private}");
-        assert_eq!(cfg.autocomplete, own, "allow_private={allow_private}");
+    let uri = up.uri();
+    let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+        cfg.nuget.enabled = true;
+        cfg.nuget.proxy = Some(uri);
+        cfg.nuget.search_service = String::new();
+        cfg.nuget.autocomplete = String::new();
+    });
+    for uri in ["/nuget/v3/query?q=demo", "/nuget/v3/autocomplete?q=demo"] {
+        let resp = crate::test_helpers::send(&ctx.app, axum::http::Method::GET, uri, "").await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK, "{uri}");
     }
+    assert!(up.received_requests().await.unwrap().is_empty());
 }

@@ -671,17 +671,30 @@ fn proxy_host(val: &str) -> Option<String> {
     Some(url.ok()?.host_str()?.to_string())
 }
 
+/// The host names of the outbound proxies set in the environment: the guarded resolver lets
+/// them through, so a redirect is never followed to one.
+pub(crate) fn outbound_proxy_hosts() -> Vec<String> {
+    outbound_proxy_vars()
+        .filter_map(|(_, val)| proxy_host(&val))
+        .collect()
+}
+
 /// Log detected outbound proxy configuration from environment variables.
 fn log_outbound_proxy(allow_private_upstreams: bool) {
-    if let Some((var, val)) = outbound_proxy_vars().next() {
-        info!(var = %var, proxy = %sanitize_proxy_url(&val), "Outbound proxy detected from environment");
-        if !allow_private_upstreams {
-            warn!(
-                "Outbound proxy set: a host name of a request sent through it is resolved by the \
-                 proxy, which must refuse private destinations itself; a request NORA connects \
-                 directly (a scheme without a proxy, a NO_PROXY host) is refused a private address"
-            );
-        }
+    let mut any = false;
+    for (var, val) in outbound_proxy_vars() {
+        // reqwest picks one per scheme (the scheme's own variable before ALL_PROXY).
+        info!(var = %var, proxy = %sanitize_proxy_url(&val), "Outbound proxy variable set");
+        any = true;
+    }
+    if any && !allow_private_upstreams {
+        warn!(
+            "Outbound proxy set: for a request sent through an http(s) or socks5h proxy, the \
+             proxy resolves the host name and must refuse private destinations itself (a \
+             socks5 proxy is given the address NORA resolved, guarded); a request NORA \
+             connects directly (a scheme without a proxy, a NO_PROXY host) is refused a \
+             private address"
+        );
     }
     let no_proxy = std::env::var("NO_PROXY")
         .or_else(|_| std::env::var("no_proxy"))
@@ -723,9 +736,7 @@ fn build_http_client(
     let proxy_hosts = if no_proxy {
         Vec::new()
     } else {
-        outbound_proxy_vars()
-            .filter_map(|(_, val)| proxy_host(&val))
-            .collect()
+        outbound_proxy_hosts()
     };
     http_client_builder(tls, timeout, no_proxy, redirect, allow_private, proxy_hosts)
         .build()
@@ -744,9 +755,14 @@ fn http_client_builder(
     let redirect = if allow_private {
         redirect
     } else {
+        // The resolver lets the proxies' names through: a hop to one is no proxy connection.
+        let proxies = proxy_hosts.clone();
         reqwest::redirect::Policy::custom(move |attempt| {
+            let host = attempt.url().host_str().unwrap_or_default();
             if import::http::is_blocked_url_host(attempt.url().as_str(), false) {
                 attempt.error("redirect to a loopback/private address refused")
+            } else if proxies.iter().any(|p| p.eq_ignore_ascii_case(host)) {
+                attempt.error("redirect to the outbound proxy's host refused")
             } else {
                 redirect.redirect(attempt)
             }
@@ -881,9 +897,10 @@ async fn warn_private_upstreams(hosts: Vec<String>) -> Vec<String> {
         if blocked {
             warn!(
                 host = %host,
-                "Upstream host resolves only to loopback/private addresses: a fetch from it by \
-                 name, or a redirect to it, fails; set server.allow_private_upstreams \
-                 (NORA_ALLOW_PRIVATE_UPSTREAMS) to allow it"
+                "Upstream host resolves only to loopback/private addresses: NORA refuses it \
+                 when it resolves the name itself or is redirected to it (a request through an \
+                 outbound proxy is left to the proxy's policy); \
+                 server.allow_private_upstreams (NORA_ALLOW_PRIVATE_UPSTREAMS) allows it"
             );
             refused.push(host);
         }
@@ -2154,8 +2171,13 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     // Discover NuGet search endpoints from upstream service index
     if config.nuget.enabled {
-        registry::nuget::discover_search_endpoints(&http_client, &mut config.nuget, allow_private)
-            .await;
+        registry::nuget::discover_search_endpoints(
+            &http_client,
+            &mut config.nuget,
+            allow_private,
+            &outbound_proxy_hosts(),
+        )
+        .await;
     }
 
     // Build curation engine (shared helper, also used by SIGHUP reload).

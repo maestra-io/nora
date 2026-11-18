@@ -330,7 +330,29 @@ async fn r09_startup_check_names_loopback_and_unscanned_upstreams() {
     for host in expected {
         assert!(hosts.iter().any(|h| h == host), "{host} not in {hosts:?}");
     }
-    let mut refused = warn_private_upstreams(hosts).await;
+    // Only the fixture hosts are resolved: a default public upstream is no part of the check.
+    let mut refused = warn_private_upstreams(expected.map(String::from).to_vec()).await;
     refused.sort();
     assert_eq!(refused, expected);
+}
+
+/// The resolver lets a proxy's name through, so a redirect to that host is refused: an
+/// upstream cannot aim a direct connection at the proxy's host.
+#[tokio::test]
+async fn r08_a_redirect_to_the_proxy_host_is_refused() {
+    let inner = internal().await;
+    let upstream = MockServer::start().await;
+    let port = inner.address().port();
+    redirect_all(&upstream, format!("http://LocalHost:{port}/metrics")).await;
+    let client = client_beside(
+        reqwest::Proxy::https(format!("http://localhost:{port}")).unwrap(),
+        &["localhost"],
+    );
+    let err = client
+        .get(format!("{}/x", upstream.uri()))
+        .send()
+        .await
+        .expect_err("the hop to the proxy host");
+    assert!(err.is_redirect(), "{err:?}");
+    assert_eq!(hits(&inner).await, 0);
 }

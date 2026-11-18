@@ -77,13 +77,16 @@ pub(crate) const UPSTREAM_PASSTHROUGH_PATHS: &[&str] = &["/v3/catalog0/"];
 /// Only runs if search_service/autocomplete are still at their default values
 /// (user overrides via env vars take precedence). Falls back silently on error.
 ///
-/// An endpoint is the upstream's content: unless `allow_private` it is not taken when its
-/// host is a loopback/private IP literal other than the configured feed's own host (a name
-/// is refused at connect by the guarded client's resolver).
+/// An endpoint is the upstream's content: unless `allow_private` it is not taken when it sits
+/// off the configured feed's own host on a loopback/private IP literal (a name is refused at
+/// connect by the guarded client's resolver) or on one of `proxy_hosts`, whose names that
+/// resolver lets through. Such a service is then answered from the local index (an empty
+/// endpoint), never by the public default.
 pub async fn discover_search_endpoints(
     client: &reqwest::Client,
     config: &mut crate::config::NugetConfig,
     allow_private: bool,
+    proxy_hosts: &[String],
 ) {
     let proxy_url = match &config.proxy {
         Some(url) => url.clone(),
@@ -172,10 +175,28 @@ pub async fn discover_search_endpoints(
             continue;
         }
         let host = |url: &str| reqwest::Url::parse(url).ok()?.host_str().map(str::to_owned);
-        if crate::import::http::is_blocked_url_host(rid, allow_private)
-            && host(rid) != host(&proxy_base)
+        let off_feed = host(rid) != host(&proxy_base);
+        let on_proxy =
+            || host(rid).is_some_and(|h| proxy_hosts.iter().any(|p| p.eq_ignore_ascii_case(&h)));
+        if !allow_private
+            && off_feed
+            && (crate::import::http::is_blocked_url_host(rid, false) || on_proxy())
         {
-            tracing::warn!(url = %crate::import::http::redact_url(rid), "NuGet: service index names an endpoint on a loopback/private address, keeping defaults for it");
+            // The feed's search stays local: a query for a private feed never goes to the
+            // public default instead.
+            tracing::warn!(url = %crate::import::http::redact_url(rid), "NuGet: service index names an endpoint on a loopback/private address or the outbound proxy, answering it locally");
+            if search_is_default
+                && rtype.starts_with("SearchQueryService")
+                && config.search_service == DEFAULT_SEARCH
+            {
+                config.search_service.clear();
+            }
+            if autocomplete_is_default
+                && rtype.starts_with("SearchAutocompleteService")
+                && config.autocomplete == DEFAULT_AUTOCOMPLETE
+            {
+                config.autocomplete.clear();
+            }
             continue;
         }
 
@@ -391,6 +412,10 @@ async fn proxied_search(
         Search::Query => &state.config.nuget.search_service,
         Search::Autocomplete => &state.config.nuget.autocomplete,
     };
+    // An endpoint discovery refused (`discover_search_endpoints`): the local index answers.
+    if service.is_empty() {
+        return with_json(local().await);
+    }
     let url = format!("{service}?{qs}");
 
     match proxy_fetch_text(
