@@ -1624,7 +1624,7 @@ pub async fn admin_create_token() {}
         (status = 200, description = "`{\"tokens\": [...]}`"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Admin role required; or the caller is namespace-scoped"),
-        (status = 503, description = "Token storage not configured")
+        (status = 503, description = "Token storage not configured or unavailable")
     )
 )]
 pub async fn admin_list_tokens() {}
@@ -1641,11 +1641,11 @@ pub async fn admin_list_tokens() {}
         ("user" = String, Query, description = "The owner whose tokens are revoked")
     ),
     responses(
-        (status = 200, description = "`{\"revoked\": [<file_id>, ...]}`"),
+        (status = 200, description = "`{\"revoked\": [<file_id>, ...], \"failed\": []}`"),
         (status = 400, description = "`user` missing"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Admin role required; or the caller is namespace-scoped"),
-        (status = 503, description = "Token storage not configured")
+        (status = 503, description = "Token storage not configured or unavailable; with a body, `failed` names the tokens the store did not revoke")
     )
 )]
 pub async fn admin_revoke_user_tokens() {}

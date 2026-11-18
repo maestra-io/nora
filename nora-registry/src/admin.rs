@@ -334,10 +334,19 @@ async fn admin_list_tokens(
         Err(refused) => return refused,
     };
     let tokens = match query.user {
-        Some(user) => store.list_tokens(&user).await,
-        None => store.list_all_tokens().await,
+        Some(user) => store.try_list_tokens(&user).await,
+        None => store.try_list_all_tokens().await,
     };
-    Json(serde_json::json!({ "tokens": tokens })).into_response()
+    match tokens {
+        Ok(tokens) => Json(serde_json::json!({ "tokens": tokens })).into_response(),
+        Err(e) => store_unavailable("admin token list", &e),
+    }
+}
+
+/// A store failure on an admin token route: 503, the detail in the log only.
+fn store_unavailable(what: &str, e: &TokenError) -> Response {
+    tracing::error!(error = %e, "{what} failed: token store unavailable");
+    (StatusCode::SERVICE_UNAVAILABLE, "Token store unavailable").into_response()
 }
 
 /// `DELETE /api/v1/admin/tokens/{id}`: revoke one token (204), audited.
@@ -363,16 +372,14 @@ async fn admin_revoke_token(
                 .log(AuditEntry::token_revoke(&caller.0, "admin", &owner, &id));
             StatusCode::NO_CONTENT.into_response()
         }
-        Err(TokenError::Storage(e)) => {
-            tracing::error!(id = %id, error = %e, "admin token revoke failed: token store unavailable");
-            (StatusCode::SERVICE_UNAVAILABLE, "Token store unavailable").into_response()
-        }
+        Err(e @ TokenError::Storage(_)) => store_unavailable("admin token revoke", &e),
         Err(_) => (StatusCode::NOT_FOUND, "Token not found").into_response(),
     }
 }
 
 /// `DELETE /api/v1/admin/tokens?user=<owner>`: revoke every token of one
-/// owner, each audited; answers the ids revoked. `user` is required.
+/// owner, each audited; answers the ids revoked and the ids the store failed
+/// to revoke (then 503). `user` is required; a listing the store fails is 503.
 async fn admin_revoke_user_tokens(
     State(state): State<AppState>,
     Extension(caller): Extension<AuthenticatedUser>,
@@ -386,13 +393,26 @@ async fn admin_revoke_user_tokens(
     let Some(user) = query.user.filter(|u| !u.is_empty()) else {
         return (StatusCode::BAD_REQUEST, "user is required").into_response();
     };
-    let revoked = store.revoke_all_for_user(&user).await;
+    let (revoked, failed) = match store.revoke_all_for_user(&user).await {
+        Ok(outcome) => outcome,
+        Err(e) => return store_unavailable("admin owner token revoke", &e),
+    };
     for id in &revoked {
         state
             .audit
             .log(AuditEntry::token_revoke(&caller.0, "admin", &user, id));
     }
-    Json(serde_json::json!({ "revoked": revoked })).into_response()
+    // Some revokes the store failed: those tokens still work, so not a 200.
+    let status = if failed.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({ "revoked": revoked, "failed": failed })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -720,6 +740,74 @@ mod tests {
         (status, serde_json::from_slice(&body).unwrap_or_default())
     }
 
+    // Audit A089: a store failure on the admin list and revoke routes is 503,
+    // never an empty or partial 200: the tokens it could not reach still work.
+    #[tokio::test]
+    async fn admin_token_routes_report_a_store_failure() {
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        let ctx = crate::test_helpers::create_test_context_with_auth_and_storage(&[], storage);
+        let store = ctx.state.tokens.as_ref().unwrap();
+        let admin = store
+            .create_token("root", 30, None, Role::Admin)
+            .await
+            .unwrap();
+        store.verify_token(&admin).await.unwrap();
+        for _ in 0..2 {
+            store
+                .create_token("dana", 30, None, Role::Write)
+                .await
+                .unwrap();
+        }
+        let ids: Vec<String> = store
+            .list_tokens("dana")
+            .await
+            .into_iter()
+            .map(|t| t.file_id)
+            .collect();
+
+        outage.fail_listings_of(crate::tokens::STORAGE_PREFIX);
+        for (method, uri) in [
+            (Method::GET, TOK_URI.to_string()),
+            (Method::GET, format!("{TOK_URI}?user=dana")),
+            (Method::DELETE, format!("{TOK_URI}?user=dana")),
+        ] {
+            let (status, _) = call(&ctx, method.clone(), &uri, &admin).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{method} {uri}");
+        }
+        outage.end();
+
+        outage.fail_reads_of(&format!("{}.json", ids[0]));
+        let (status, _) = call(&ctx, Method::GET, TOK_URI, &admin).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a record read failed"
+        );
+        outage.end();
+
+        outage.fail_deletes_of(&format!("{}.json", ids[0]));
+        let (status, json) = call(
+            &ctx,
+            Method::DELETE,
+            &format!("{TOK_URI}/{}", ids[0]),
+            &admin,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        let (status, json) = call(
+            &ctx,
+            Method::DELETE,
+            &format!("{TOK_URI}?user=dana"),
+            &admin,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["revoked"], serde_json::json!([ids[1]]));
+        assert_eq!(json["failed"], serde_json::json!([ids[0]]));
+        outage.end();
+        assert_eq!(store.list_tokens("dana").await.len(), 1);
+    }
+
     // Audits A089, A024: an admin lists every token and revokes one or all of an
     // owner's, each revoke audited; a write token reaches none of it.
     #[tokio::test]
@@ -807,6 +895,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["failed"], serde_json::json!([]));
         let mut revoked: Vec<String> = json["revoked"]
             .as_array()
             .unwrap()
