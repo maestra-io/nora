@@ -908,6 +908,8 @@ async fn build_suite(
     let mut matures_at: Option<i64> = None;
     let mut young: BTreeMap<String, BTreeMap<String, (String, String, i64)>> = BTreeMap::new();
     let mut served: HashSet<String> = HashSet::new();
+    // Upstream copy (when changed) and ledger of each index, written once the holds are.
+    let mut ledgers_out = Vec::new();
     // Indexes the upstream did not host this time: their holds stay (audit A049).
     let mut skipped: HashSet<String> = HashSet::new();
     // Every ledger of the repo: one pool file can be listed by several suites, components
@@ -1002,10 +1004,20 @@ async fn build_suite(
                 .filter(|s| first || now - s.first_seen < age)
                 .map(|s| s.filename.clone())
                 .collect();
-            let others: Vec<String> = ledgers.iter().filter(|k| **k != lkey).cloned().collect();
-            let earliest = earliest_seen(state, &others, &wanted)
+            // This build's earlier indexes count as rewritten, though written only later.
+            let pending = |k: &String| ledgers_out.iter().any(|(_, _, p, _)| p == k);
+            let others: Vec<String> = (ledgers.iter())
+                .filter(|k| **k != lkey && !pending(k))
+                .cloned()
+                .collect();
+            let mut earliest = earliest_seen(state, &others, &wanted)
                 .await
                 .map_err(BuildError::Internal)?;
+            for (_, _, k, l) in &ledgers_out {
+                if ledgers.contains(k) {
+                    merge_dates(&mut earliest, l, &wanted);
+                }
+            }
             for s in current_st.iter_mut().chain(retired.iter_mut()) {
                 if let Some(&t) = earliest.get(&s.filename) {
                     if first || t < s.first_seen {
@@ -1083,21 +1095,12 @@ async fn build_suite(
             (gz_sha, gz.len() as u64),
         );
         young.insert(format!("{suite}/{comp}/{arch}"), held);
-        if !unchanged {
-            state
-                .storage
-                .put(&ukey, &data)
-                .await
-                .map_err(|e| BuildError::Internal(e.to_string()))?;
-        }
         let ledger = Ledger {
             upstream: Some((path.clone(), hash)),
             seen,
             retired,
         };
-        put_json(state, &lkey, &ledger)
-            .await
-            .map_err(BuildError::Internal)?;
+        ledgers_out.push((ukey, (!unchanged).then_some(data), lkey, ledger));
     }
 
     if files.is_empty() {
@@ -1107,6 +1110,20 @@ async fn build_suite(
     update_young(state, repo, suite, young, &skipped, min_age, now)
         .await
         .map_err(BuildError::Internal)?;
+    // Then the ledgers: a date the download gate reads always has its hold committed, a
+    // build failing earlier leaves its new files undated (audit A044).
+    for (ukey, data, lkey, ledger) in ledgers_out {
+        if let Some(data) = data {
+            state
+                .storage
+                .put(&ukey, &data)
+                .await
+                .map_err(|e| BuildError::Internal(e.to_string()))?;
+        }
+        put_json(state, &lkey, &ledger)
+            .await
+            .map_err(BuildError::Internal)?;
+    }
     // The download gate's dated files follow the ledgers this build wrote.
     state.deb_dated.lock().remove(repo);
     if let Err(e) = dated(state, repo, true).await {
@@ -1235,19 +1252,24 @@ async fn earliest_seen(
         let Some(ledger) = read_json::<Ledger>(state, key).await? else {
             continue;
         };
-        let dates = ledger
-            .seen
-            .iter()
-            .map(|(f, t)| (f, *t))
-            .chain(ledger.retired.iter().map(|s| (&s.filename, s.first_seen)));
-        for (f, t) in dates {
-            if files.contains(f) {
-                let e = earliest.entry(f.clone()).or_insert(t);
-                *e = (*e).min(t);
-            }
-        }
+        merge_dates(&mut earliest, &ledger, files);
     }
     Ok(earliest)
+}
+
+/// Fold the dates `ledger` gives `files` into `earliest`.
+fn merge_dates(earliest: &mut HashMap<String, i64>, ledger: &Ledger, files: &HashSet<String>) {
+    let dates = ledger
+        .seen
+        .iter()
+        .map(|(f, t)| (f, *t))
+        .chain(ledger.retired.iter().map(|s| (&s.filename, s.first_seen)));
+    for (f, t) in dates {
+        if files.contains(f) {
+            let e = earliest.entry(f.clone()).or_insert(t);
+            *e = (*e).min(t);
+        }
+    }
 }
 
 async fn update_young(
@@ -1415,6 +1437,16 @@ async fn dated(
         .deb_dated
         .lock()
         .insert(repo.to_string(), (Instant::now(), listing, files.clone()));
+    // The holds are read again, none older than these ledgers (kept only as the fallback
+    // of an unreadable set).
+    let key = young_key(repo);
+    let mut young = state.deb_young.lock();
+    let expired =
+        (young.get(&key)).and_then(|(at, y)| Some((at.checked_sub(YOUNG_TTL)?, y.clone())));
+    match expired {
+        Some(e) => young.insert(key, e),
+        None => young.remove(&key),
+    };
     Ok(files)
 }
 
@@ -1440,6 +1472,13 @@ async fn sighting(
         .filter(|r| *r != repo)
         .collect();
     for repos in [&[repo][..], &others] {
+        // Dates before holds: a build commits its holds before its ledgers, so the holds
+        // read next cover every date read here.
+        let mut dates = false;
+        for r in repos {
+            // An unreadable ledger dates nothing: the file is judged as undated.
+            dates |= (dated(state, r, recheck).await).is_ok_and(|f| f.contains(path));
+        }
         for r in repos {
             if let Some((name, version, first_seen)) = load_young(state, r)
                 .await?
@@ -1449,14 +1488,8 @@ async fn sighting(
                 return Ok(Sighting::Held(name.clone(), version.clone(), *first_seen));
             }
         }
-        for r in repos {
-            // An unreadable ledger dates nothing: the file is judged as undated.
-            if dated(state, r, recheck)
-                .await
-                .is_ok_and(|f| f.contains(path))
-            {
-                return Ok(Sighting::Dated);
-            }
+        if dates {
+            return Ok(Sighting::Dated);
         }
     }
     Ok(Sighting::Undated)
@@ -2280,6 +2313,44 @@ mod integration_tests {
             StatusCode::OK
         );
         assert!(counter.get() > before, "a logged undated file is counted");
+    }
+
+    /// A044: a build that fails before it commits its holds leaves the new versions it read
+    /// undated, so they are judged by `unknown_date`, never passed as dated.
+    #[tokio::test]
+    async fn a_failed_build_dates_nothing_it_did_not_hold() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        publish(&server, &key, &[("a", "1")]).await;
+        let ctx = undated_ctx(
+            server.uri(),
+            &keydir,
+            0,
+            Some(crate::config::UnknownDate::Hold),
+        );
+        served(&ctx).await;
+        publish(&server, &key, &[("a", "2")]).await;
+        // An unreadable hold set fails the next build when it commits its holds.
+        let ykey = super::young_key("debian");
+        let young = ctx.state.storage.get(&ykey).await.unwrap();
+        ctx.state.storage.put(&ykey, b"{").await.unwrap();
+        ctx.state.deb_young.lock().clear();
+        let up = ctx.state.config.deb.proxies["debian"].clone();
+        let _ = super::refresh_suite(&ctx.state, "debian", &up, "bookworm", false).await;
+        ctx.state.storage.put(&ykey, &young).await.unwrap();
+        ctx.state.deb_young.lock().clear();
+        ctx.state.deb_dated.lock().clear();
+        // The upstream index is gone: the download's refresh cannot date it either.
+        server.reset().await;
+        mount_pool(&server, &["a_2_amd64.deb"]).await;
+        let res = send(
+            &ctx.app,
+            Method::GET,
+            "/deb/debian/pool/main/a_2_amd64.deb",
+            "",
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
     /// jammy-updates and jammy-security list one pool file, days apart (issues-maestra#1649);
