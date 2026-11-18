@@ -179,29 +179,35 @@ fi
 echo ""
 
 # ── maestra: release supply chain pins (audit A001, A008) ─────────────────
-# Every Dockerfile base is pinned by digest. The RU-vendor stages redos and astra are
-# exempt by name: we do not pull from those registries to resolve their digests.
+# Every Dockerfile base is pinned by digest: the root Dockerfile and every
+# deploy/Dockerfile.* (release.yml builds deploy/Dockerfile.release, audit R28). The
+# RU-vendor stages redos and astra are exempt by name: we do not pull from those
+# registries to resolve their digests.
 
 echo "--- Release Supply Chain Pins ---"
-DOCKERFILE="${COHERENCE_DOCKERFILE:-$REPO_ROOT/Dockerfile}"
+DOCKERFILE_ROOT="${COHERENCE_DOCKERFILE_ROOT:-$REPO_ROOT}"
 FROM_UNPINNED=0
-STAGES=" "
-while read -r -a words; do
-    i=1
-    while [ "${words[$i]:-}" != "${words[$i]#--}" ]; do i=$((i + 1)); done  # --platform=...
-    image="${words[$i]:-}" stage=""
-    if [ "$(echo "${words[$((i + 1))]:-}" | tr '[:upper:]' '[:lower:]')" = as ]; then stage="${words[$((i + 2))]:-}"; fi
-    case "$image|$stage" in
-        scratch\|*|*@sha256:*|*\|redos|*\|astra) ;;
-        *) case "$STAGES" in
-               *" $image "*) ;;  # built on an earlier stage
-               *) fail "Dockerfile FROM $image${stage:+ AS $stage} is not pinned by @sha256: digest"
-                  FROM_UNPINNED=$((FROM_UNPINNED + 1)) ;;
-           esac ;;
-    esac
-    if [ -n "$stage" ]; then STAGES="$STAGES$stage "; fi
-done < <(grep -iE '^FROM[[:space:]]' "$DOCKERFILE")
-if [ "$FROM_UNPINNED" -eq 0 ]; then ok "Dockerfile bases are pinned by digest (redos/astra exempt)"; fi
+for DOCKERFILE in "$DOCKERFILE_ROOT/Dockerfile" "$DOCKERFILE_ROOT"/deploy/Dockerfile.*; do
+    [ -f "$DOCKERFILE" ] || continue
+    STAGES=" "
+    while read -r -a words; do
+        i=1
+        while [ "${words[$i]:-}" != "${words[$i]#--}" ]; do i=$((i + 1)); done  # --platform=...
+        image="${words[$i]:-}" stage=""
+        if [ "$(echo "${words[$((i + 1))]:-}" | tr '[:upper:]' '[:lower:]')" = as ]; then stage="${words[$((i + 2))]:-}"; fi
+        case "$image|$stage" in
+            scratch\|*|*@sha256:*|*\|redos|*\|astra) ;;
+            *) case "$STAGES" in
+                   *" $image "*) ;;  # built on an earlier stage
+                   *) fail "${DOCKERFILE#"$DOCKERFILE_ROOT"/} FROM $image${stage:+ AS $stage} is not pinned by @sha256: digest"
+                      FROM_UNPINNED=$((FROM_UNPINNED + 1)) ;;
+               esac ;;
+        esac
+        if [ -n "$stage" ]; then STAGES="$STAGES$stage "; fi
+    done < <(grep -iE '^FROM[[:space:]]' "$DOCKERFILE")
+done
+[ -f "$DOCKERFILE_ROOT/Dockerfile" ] || { fail "no Dockerfile in $DOCKERFILE_ROOT"; FROM_UNPINNED=1; }
+if [ "$FROM_UNPINNED" -eq 0 ]; then ok "Dockerfile and deploy/Dockerfile.* bases are pinned by digest (redos/astra exempt)"; fi
 
 # One signer identity for every cosign check of upstream release artifacts: release.yml
 # on a v* tag, anchored at both ends.

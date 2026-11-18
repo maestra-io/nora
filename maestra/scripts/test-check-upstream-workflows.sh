@@ -61,6 +61,16 @@ release_variant "an unanchored tag check is reported" \
 # shellcheck disable=SC2016  # $GIT_TAG is matched literally
 release_variant "a tag check only in verify is reported" \
     "do not share one" '/^  image:$/,$ s/\[\[ "\$GIT_TAG" =~ .* \]\]/true/'
+# shellcheck disable=SC2016  # workflow expressions are written literally
+release_variant "an image job that re-reads the tag by name is reported (audit R18)" \
+    'checks out refs/tags/${{ env.GIT_TAG }}, not' '/^  image:$/,$ s/ref: \${{ github.sha }}/ref: refs\/tags\/${{ env.GIT_TAG }}/'
+# shellcheck disable=SC2016  # workflow expressions are written literally
+release_variant "a ci call on the tag name is reported (audit R18)" \
+    'checks out refs/tags/${{ github.ref_name }}, not' '/^  ci:$/,/^  image:$/ s/ref: \${{ github.sha }}/ref: refs\/tags\/${{ github.ref_name }}/'
+release_variant "an OIDC token for every job is reported (audit R04)" \
+    "the workflow (top level) gets id-token: write" 's/^  contents: read$/  contents: read\n  id-token: write/'
+release_variant "an OIDC token for verify is reported (audit R04)" \
+    "job verify gets id-token: write" 's/^    name: Tag is on maestra\/main$/&\n    permissions:\n      id-token: write/'
 rm "$TMP/wf/maestra-release.yml"
 run; expect "a missing maestra-release.yml is reported" 1 "maestra-release.yml is missing"
 cp "$REAL_RELEASE" "$TMP/wf/maestra-release.yml"
@@ -75,5 +85,11 @@ run; expect "a pip install by version only is reported" 1 "maestra-ci.yml:[0-9]*
 cp "$REAL_WF/maestra-ci.yml" "$TMP/wf/maestra-ci.yml"
 sed 's/ --require-hashes//' "$REAL_WF/maestra-sync-public-ids.yml" > "$TMP/wf/maestra-sync-public-ids.yml"
 run; expect "the sync job without --require-hashes is reported" 1 "maestra-sync-public-ids.yml:[0-9]*: pip install without"
+cp "$REAL_WF/maestra-sync-public-ids.yml" "$TMP/wf/maestra-sync-public-ids.yml"
+for pip in pip3 pip3.12 "uv pip" "python3 -m pip"; do # audit R26
+    cp "$REAL_WF/maestra-ci.yml" "$TMP/wf/maestra-ci.yml"
+    printf '      - run: %s install requests==2.32.5\n' "$pip" >> "$TMP/wf/maestra-ci.yml"
+    run; expect "a hash-less '$pip install' is reported" 1 "maestra-ci.yml:[0-9]*: pip install without --require-hashes"
+done
 
 [ "$FAILURES" = 0 ] && echo "check-upstream-workflows self-test PASSED" || exit 1

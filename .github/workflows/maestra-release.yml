@@ -10,12 +10,17 @@ name: Maestra release
 #
 # Nothing is pushed before `verify` (the tag's commit is on maestra/main) and `ci`
 # (every Maestra CI job, run on that commit: a release reuses no earlier result).
-# Both live in the tagged commit's copy of this file, so they stop mistakes, not an
-# edited copy. What an edited copy cannot pass is the `nora-release` environment on
-# `image`, the only job that gets push credentials: the environment admits only
-# v*-maestra.* tags, and the Teleport image-push token admits only that environment
-# (a copy without the key gets no OIDC environment claim). Checked by
-# maestra/scripts/check-upstream-workflows.sh (CI job `coherence`).
+# Every job checks out github.sha, the commit the tag named when this run started, so
+# a tag moved mid-run cannot swap the commit `image` builds for one verify and ci never
+# saw (audit R18). verify and ci live in the tagged commit's own copy of this file, so
+# they stop mistakes, not an edited copy, and neither does the `nora-release`
+# environment on `image`: its deployment rule matches the tag NAME only, so a commit
+# whose copy keeps the environment and drops the gates passes it. What does hold a
+# release to reviewed code is who may create, move or delete v*-maestra.* tags (the
+# tag ruleset) together with a Teleport image-push token that requires the environment
+# claim; both are settings outside this file (audit A016, R04). Only `image` and `ci`
+# get an OIDC token here. Checked by maestra/scripts/check-upstream-workflows.sh (CI job
+# `coherence`).
 
 concurrency: release-nora
 
@@ -28,7 +33,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write  # GitHub OIDC -> Teleport image-push bot -> AWS STS
 
 jobs:
   # A tag on a feature branch, or on a commit that never reached the default branch,
@@ -51,7 +55,7 @@ jobs:
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: refs/tags/${{ env.GIT_TAG }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Tag commit is an ancestor of origin/maestra/main
@@ -74,14 +78,17 @@ jobs:
       id-token: write # `s3 backends` pulls its images through nora with the OIDC token
     uses: ./.github/workflows/maestra-ci.yml
     with:
-      ref: refs/tags/${{ github.ref_name }}
+      ref: ${{ github.sha }}
 
   image:
     name: Build & push image to ECR
     needs: [verify, ci]
-    # Protected environment: deployment rule `v*-maestra.*` tags only; the Teleport
-    # image-push token requires this environment claim.
+    # Deployment rule `v*-maestra.*` tags only (the ref name, not the code: see the
+    # header); the claim the Teleport image-push token is to require.
     environment: nora-release
+    permissions:
+      contents: read
+      id-token: write  # GitHub OIDC -> Teleport image-push bot -> AWS STS
     runs-on: runs-on=${{ github.run_id }}/pool=build
     env:
       GIT_TAG: ${{ github.ref_name }}
@@ -93,7 +100,7 @@ jobs:
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: refs/tags/${{ env.GIT_TAG }}
+          ref: ${{ github.sha }}
 
       - name: Resolve image tag
         id: tag

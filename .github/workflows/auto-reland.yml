@@ -55,9 +55,15 @@ jobs:
             exit 1
           fi
           # Reland exactly the commit the last approval was given on, and only while it
-          # is still the head the label was added on (audit A003).
-          approved=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
-            --jq '.[] | select(.state == "APPROVED") | .commit_id' | tail -n 1)
+          # is still the head the label was added on (audit A003). Only an approval by
+          # someone with write access counts: anyone can approve on a public repo (R27).
+          approved=""
+          while read -r reviewer sha; do
+            case "$(gh api "repos/$REPO/collaborators/$reviewer/permission" --jq .permission || true)" in
+              admin|maintain|write) approved="$sha" ;;
+            esac
+          done < <(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
+            --jq '.[] | select(.state == "APPROVED") | "\(.user.login) \(.commit_id)"')
           if [ -z "$approved" ] || [ "$approved" != "$HEAD_SHA" ]; then
             echo "::error::the last approval is on ${approved:-no commit}, the head is $HEAD_SHA — re-approve the head, then re-add the label"
             exit 1

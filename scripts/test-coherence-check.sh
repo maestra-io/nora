@@ -8,7 +8,7 @@ trap 'rm -rf "$T"' EXIT
 FAILURES=0
 mkdir "$T/signers"
 
-run() { OUT=$(COHERENCE_DOCKERFILE="$T/Dockerfile" COHERENCE_SIGNER_DIRS="$T/signers" bash "$CHECK" 2>&1); RC=$?; }
+run() { OUT=$(COHERENCE_DOCKERFILE_ROOT="$T" COHERENCE_SIGNER_DIRS="$T/signers" bash "$CHECK" 2>&1); RC=$?; }
 expect() { # description, expected exit code, expected output fragment (empty: no FAIL line)
     local hit
     if [ -n "$3" ]; then hit=$(grep -cF -- "$3" <<< "$OUT"); else hit=$((1 - $(grep -c '^FAIL' <<< "$OUT"))); fi
@@ -38,6 +38,15 @@ dockerfile "FROM debian:12 AS redos2"
 run; expect "the exemption is by exact stage name" 1 "FROM debian:12 AS redos2 is not pinned"
 
 dockerfile "FROM alpine:3.23@$D"
+mkdir "$T/deploy"
+printf '%s\n' "FROM alpine:3.23" > "$T/deploy/Dockerfile.release"
+run; expect "an unpinned base in deploy/Dockerfile.release fails (audit R28)" 1 "deploy/Dockerfile.release FROM alpine:3.23 is not pinned"
+printf '%s\n' "FROM alpine:3.23@$D AS certs" "FROM scratch" "FROM certs" > "$T/deploy/Dockerfile.redos"
+printf '%s\n' "FROM alpine:3.23@$D" > "$T/deploy/Dockerfile.release"
+run; expect "pinned deploy/Dockerfile.* bases pass" 0 ""
+printf '%s\n' "FROM builder" > "$T/deploy/Dockerfile.astra"
+run; expect "a stage is local to its own Dockerfile" 1 "deploy/Dockerfile.astra FROM builder is not pinned"
+rm -r "$T/deploy"
 printf '%s\n' 'cosign verify-blob --certificate-identity-regexp "github.com/getnora-io/nora" x' > "$T/signers/loose.sh"
 run; expect "a literal unanchored identity fails" 1 "must be \"\$SIGNER_IDENTITY\""
 rm "$T/signers/loose.sh"

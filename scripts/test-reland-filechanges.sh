@@ -80,6 +80,7 @@ mkdir "$fx/bin" "$fx/tmp"
 cat >"$fx/bin/gh" <<'GH'
 #!/usr/bin/env bash
 case "$*" in
+  *collaborators/outsider/*) echo read ;;
   *collaborators*) echo write ;;
   "pr view"*) echo APPROVED ;;
   *"/reviews"*) while [ "$1" != --jq ]; do shift; done; jq -r "$2" "$REVIEWS" ;;
@@ -88,9 +89,10 @@ esac
 GH
 chmod +x "$fx/bin/gh"
 step_run 'Guard — approved PR + authorized labeler' >"$fx/guard.sh"
-guard() { # head sha, approved commits in order
+guard() { # head sha, approved commits in order (sha or reviewer/sha; default reviewer m)
   local head="$1"; shift
-  printf '%s\n' "$@" | jq -R '{state: "APPROVED", commit_id: .}' | jq -s . >"$fx/reviews.json"
+  printf '%s\n' "$@" | jq -R 'split("/") | {state: "APPROVED", commit_id: .[-1], user: {login: (if length > 1 then .[0] else "m" end)}}' \
+    | jq -s . >"$fx/reviews.json"
   : >"$fx/out"
   PATH="$fx/bin:$PATH" REVIEWS="$fx/reviews.json" GITHUB_OUTPUT="$fx/out" HEAD_SHA="$head" \
     REPO=o/r PR=7 LABELER=m bash "$fx/guard.sh" >/dev/null 2>&1
@@ -99,6 +101,9 @@ guard bbb aaa bbb || fail "guard refused a head that carries the last approval"
 grep -qx 'approved_sha=bbb' "$fx/out" || fail "guard did not hand the approved sha on"
 guard bbb bbb aaa && fail "guard accepted a head pushed after the last approval"
 guard bbb && fail "guard accepted a PR with no approving review"
+guard bbb aaa outsider/bbb && fail "guard counted an approval without write access (audit R27)"
+guard bbb outsider/bbb && fail "guard relanded a head approved only without write access (audit R27)"
+guard bbb aaa bbb outsider/aaa || fail "an approval without write access hid the maintainer's (audit R27)"
 echo "PASS: guard relands only a head that carries the last approval"
 
 # Squash: origin holds the base, the approved commit (which also swaps the builder for
