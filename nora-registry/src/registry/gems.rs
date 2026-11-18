@@ -441,13 +441,14 @@ async fn gem_dates(
         None => None,
     };
     match fetched {
-        Some(dates) => {
+        // A 404's empty answer does not replace what is kept.
+        Some(dates) if !dates.is_empty() => {
             if let Ok(json) = serde_json::to_vec(&dates) {
                 state.spawn_cache("gems", key, Bytes::from(json));
             }
             dates
         }
-        None => kept.unwrap_or_default(),
+        _ => kept.unwrap_or_default(),
     }
 }
 
@@ -455,6 +456,8 @@ async fn gem_dates(
 /// and `<number>-<platform>` otherwise, as the compact index writes its rows. One lookup per
 /// gem for `gems.metadata_ttl`, shared by the index filter and the `.gem` gate
 /// (`upstream_dates`); a `wanted` row missing from a kept answer asks again once a minute.
+/// `None`: no answer (transport error, a non-2xx other than 404, a body that does not parse);
+/// a 404 is an answer with no versions (A063).
 async fn fetch_gem_dates(
     state: &AppState,
     proxy: &str,
@@ -473,10 +476,20 @@ async fn fetch_gem_dates(
         ttl,
         wanted,
         move || async move {
-            let body =
-                super::upstream_dates::get(&fetching, RegistryType::Gems, &proxy, &url, timeout)
-                    .await
-                    .ok()?;
+            let body = match super::upstream_dates::get(
+                &fetching,
+                RegistryType::Gems,
+                &proxy,
+                &url,
+                timeout,
+            )
+            .await
+            {
+                Ok(body) => body,
+                // A name RubyGems does not know: an ambiguous file name has such readings.
+                Err(ProxyError::NotFound) => return Some(Default::default()),
+                Err(_) => return None,
+            };
             let arr: Vec<serde_json::Value> = serde_json::from_slice(&body).ok()?;
             Some(
                 arr.iter()
@@ -502,21 +515,28 @@ fn gem_date_key(number: &str, platform: Option<&str>) -> String {
     }
 }
 
-/// Best-effort per-version `created_at` from the RubyGems API (the compact index
-/// has no dates), by [`fetch_gem_dates`]. Any failure → `None` (quarantine falls back to
-/// NORA's clock).
+/// A version's `created_at` from the RubyGems API (the compact index has no dates), by
+/// [`fetch_gem_dates`]: `Ok(None)` when the API answered without this version or platform,
+/// `Err` when it gave no answer (A063). An answer that dates it is kept at
+/// `gems/dates/<name>.json`, so the gem's other files need no lookup.
 async fn fetch_gems_date(
     state: &AppState,
     proxy: &str,
     name: &str,
     version: &str,
     platform: Option<&str>,
-) -> Option<i64> {
+) -> Result<Option<i64>, ()> {
     let row = gem_date_key(version, platform);
-    fetch_gem_dates(state, proxy, name, &[&row])
-        .await?
-        .get(&row)
-        .copied()
+    let dates = fetch_gem_dates(state, proxy, name, &[&row])
+        .await
+        .ok_or(())?;
+    let date = dates.get(&row).copied();
+    if date.is_some() {
+        if let Ok(json) = serde_json::to_vec(&*dates) {
+            state.spawn_cache("gems", format!("gems/dates/{name}.json"), Bytes::from(json));
+        }
+    }
+    Ok(date)
 }
 
 // ── Gem download (immutable) ───────────────────────────────────────────
@@ -1509,16 +1529,23 @@ async fn upstream_gem_release_dates(
         };
         let date = match proxy {
             Some(_) if kept.is_some() => kept,
-            Some(proxy) => {
-                fetch_gems_date(
-                    state,
-                    proxy,
-                    &identity.name,
-                    &identity.version,
-                    identity.platform.as_deref(),
-                )
-                .await
-            }
+            Some(proxy) => match fetch_gems_date(
+                state,
+                proxy,
+                &identity.name,
+                &identity.version,
+                identity.platform.as_deref(),
+            )
+            .await
+            {
+                Ok(date) => date,
+                // A063: no answer is judged by `[curation.gems] unknown_date`, never undated.
+                Err(()) => state.curation().curation_engine.judged_release_date(
+                    RegistryType::Gems,
+                    state.config.server.trust_upstream_dates,
+                    None,
+                ),
+            },
             None => None,
         };
         dated.push((identity, date));
@@ -2167,9 +2194,9 @@ mod platform_gem_curation {
             let (state, uri) = (ctx.state.clone(), upstream.uri());
             async move { fetch_gems_date(&state, &uri, "nokogiri", "1.13.0", platform).await }
         };
-        assert_eq!(date(None).await, Some(1_640_995_200));
-        assert_eq!(date(Some("x86_64-linux")).await, Some(1_641_081_600));
-        assert_eq!(date(Some("arm64-darwin")).await, None);
+        assert_eq!(date(None).await, Ok(Some(1_640_995_200)));
+        assert_eq!(date(Some("x86_64-linux")).await, Ok(Some(1_641_081_600)));
+        assert_eq!(date(Some("arm64-darwin")).await, Ok(None));
     }
 
     /// A055: a versions answer over the date-lookup cap gives no date instead of being read
@@ -2187,7 +2214,143 @@ mod platform_gem_curation {
             .await;
         let ctx = create_test_context_with_config(|_| {});
         let date = fetch_gems_date(&ctx.state, &upstream.uri(), "a055gem", "1.0.0", None).await;
-        assert_eq!(date, None);
+        assert_eq!(date, Err(()));
+    }
+}
+
+/// A063: a `.gem` or gemspec whose release-date lookup got no answer is judged by
+/// `[curation.gems] unknown_date`, never served undated; a lookup that answered without the
+/// version stays undated, and one that dates it keeps the gem's dates.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod a063_unanswered_date_lookup {
+    use super::gem_file_readings;
+    use crate::test_helpers::{create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{any, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const GEMBYTES: &[u8] = b"GEMBYTES";
+
+    async fn versions(upstream: &MockServer, name: &str, answer: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/versions/{name}.json")))
+            .respond_with(answer)
+            .with_priority(1)
+            .mount(upstream)
+            .await;
+    }
+
+    fn old(number: &str, platform: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"number": number, "platform": platform, "created_at": "2020-01-01T00:00:00Z"}
+        ]))
+    }
+
+    /// The live shape: enforce, gems min_release_age 3d, quarantine observe, trusted dates.
+    async fn upstream_and_nora(hold: bool) -> (MockServer, TestContext) {
+        let upstream = MockServer::start().await;
+        versions(&upstream, "r429", ResponseTemplate::new(429)).await;
+        versions(&upstream, "r503", ResponseTemplate::new(503)).await;
+        versions(
+            &upstream,
+            "html",
+            ResponseTemplate::new(200).set_body_string("<html>rate limited</html>"),
+        )
+        .await;
+        versions(&upstream, "old", old("1.0.0", "ruby")).await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(GEMBYTES.to_vec()))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(uri);
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.gems.min_release_age = Some("3d".to_string());
+            cfg.curation.gems.quarantine = Some(crate::digest_quarantine::QuarantineMode::Observe);
+            cfg.curation.gems.quarantine_ttl = Some("3d".to_string());
+            if hold {
+                cfg.curation.gems.unknown_date = Some(crate::config::UnknownDate::Hold);
+            }
+        });
+        (upstream, ctx)
+    }
+
+    async fn files_asked(upstream: &MockServer) -> Vec<String> {
+        upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .filter(|p| !p.starts_with("/api/"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_lookup_is_held_under_hold() {
+        let (upstream, ctx) = upstream_and_nora(true).await;
+        for (uri, key) in [
+            ("/gems/gems/r429-1.0.0.gem", "gems/gems/r429-1.0.0.gem"),
+            ("/gems/gems/r503-1.0.0.gem", "gems/gems/r503-1.0.0.gem"),
+            ("/gems/gems/html-1.0.0.gem", "gems/gems/html-1.0.0.gem"),
+            (
+                "/gems/quick/Marshal.4.8/r503-1.0.0.gemspec.rz",
+                "gems/quick/Marshal.4.8/r503-1.0.0.gemspec.rz",
+            ),
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+            assert!(ctx.state.storage.get(key).await.is_err(), "{key} cached");
+        }
+        assert!(
+            files_asked(&upstream).await.is_empty(),
+            "a held file was fetched"
+        );
+
+        // A lookup that dates the version: served, and the gem's dates are kept.
+        let holders = ctx.state.storage.holders();
+        let resp = send(&ctx.app, Method::GET, "/gems/gems/old-1.0.0.gem", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
+        let kept: std::collections::HashMap<String, i64> =
+            serde_json::from_slice(&ctx.state.storage.get("gems/dates/old.json").await.unwrap())
+                .unwrap();
+        assert_eq!(kept.get("1.0.0"), Some(&1_577_836_800));
+    }
+
+    /// `log` (the gems default) serves it, and counts it.
+    #[tokio::test]
+    async fn an_unanswered_lookup_is_counted_under_log() {
+        let (_upstream, ctx) = upstream_and_nora(false).await;
+        let counter =
+            crate::metrics::CURATION_UNKNOWN_RELEASE_DATE_TOTAL.with_label_values(&["gems"]);
+        let before = counter.get();
+        let resp = send(&ctx.app, Method::GET, "/gems/gems/r503-1.0.0.gem", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(counter.get() > before);
+    }
+
+    /// A 404 for one reading of an ambiguous file name is an answer: the other reading's old
+    /// date decides, and the file is served.
+    #[tokio::test]
+    async fn a_name_the_api_does_not_know_is_an_answer() {
+        let (upstream, ctx) = upstream_and_nora(true).await;
+        let readings = gem_file_readings("dual-1-2.0-java");
+        assert_eq!(readings.len(), 2, "{readings:?}");
+        versions(&upstream, &readings[0].name, ResponseTemplate::new(404)).await;
+        let known = &readings[1];
+        versions(
+            &upstream,
+            &known.name,
+            old(&known.version, known.platform.as_deref().unwrap_or("ruby")),
+        )
+        .await;
+        let resp = send(&ctx.app, Method::GET, "/gems/gems/dual-1-2.0-java.gem", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
 
