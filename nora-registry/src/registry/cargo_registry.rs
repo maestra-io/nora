@@ -915,7 +915,7 @@ async fn publish(
     let vers = vers.to_string();
 
     // Enforce OIDC namespace_scope on the crate coordinate (#583).
-    if enforce_namespace_scope(&authority, &name).is_err() {
+    if enforce_namespace_scope(&authority, RegistryType::Cargo, &name).is_err() {
         return (StatusCode::FORBIDDEN, "Outside namespace scope").into_response();
     }
 

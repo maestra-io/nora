@@ -1640,7 +1640,13 @@ fn write_gate(
     raw_name: &str,
 ) -> Option<Response> {
     let c = canonicalize(raw_name, &state.config.docker);
-    if enforce_namespace_scope(authority, &c.name).is_err() {
+    if enforce_namespace_scope(
+        authority,
+        crate::registry_type::RegistryType::Docker,
+        &c.name,
+    )
+    .is_err()
+    {
         return Some(StatusCode::FORBIDDEN.into_response());
     }
     let refused = |message: &str| {

@@ -280,7 +280,7 @@ pub(super) fn write_preflight<F: OsRepo>(
     if let Err(msg) = F::validate_package_path(repo, path) {
         return Err((StatusCode::BAD_REQUEST, msg).into_response());
     }
-    if enforce_namespace_scope(authority, repo).is_err() {
+    if enforce_namespace_scope(authority, F::REGISTRY_TYPE, repo).is_err() {
         return Err(StatusCode::FORBIDDEN.into_response());
     }
     Ok(())
@@ -453,7 +453,7 @@ pub(super) async fn reindex<F: OsRepo>(
     if settings.proxies.contains_key(&repo) {
         return proxied_repo_conflict();
     }
-    if enforce_namespace_scope(&authority, &repo).is_err() {
+    if enforce_namespace_scope(&authority, F::REGISTRY_TYPE, &repo).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
 

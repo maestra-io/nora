@@ -16,7 +16,7 @@ pub mod teleport;
 mod token_routes;
 
 pub use htpasswd::HtpasswdAuth;
-pub use namespace::{enforce_namespace_scope, NamespaceAuthority};
+pub use namespace::{enforce_namespace_scope, scope_entry_matches, NamespaceAuthority};
 pub use oidc::OidcValidator;
 pub use teleport::TeleportValidator;
 pub use token_routes::{

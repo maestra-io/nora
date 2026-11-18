@@ -1514,6 +1514,50 @@ impl Config {
                         crate::auth::oidc_session::MAX_SESSION_LIFETIME_SECS
                     ));
                 }
+                // A `<format>:<glob>` scope entry admits writes to that format only;
+                // one without a prefix admits the name in every format (A021).
+                let entries = provider.namespace_scope.iter().chain(
+                    provider
+                        .role_rules
+                        .iter()
+                        .flat_map(|rule| rule.namespace_scope.iter().flatten()),
+                );
+                let mut unbound = Vec::new();
+                for entry in entries {
+                    match entry.split_once(':') {
+                        Some((format, _))
+                            if !RegistryType::all().iter().any(|r| r.as_str() == format) =>
+                        {
+                            errors.push(format!(
+                                "auth.oidc provider \"{}\" has namespace_scope entry \"{entry}\": \
+                                 \"{format}\" is not a registry format, so the entry admits no \
+                                 write. Write <format>:<pattern> with one of: {}",
+                                provider.name,
+                                RegistryType::all()
+                                    .iter()
+                                    .map(|r| r.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+                        }
+                        None if entry != "*" => unbound.push(entry.as_str()),
+                        _ => {}
+                    }
+                }
+                unbound.sort_unstable();
+                unbound.dedup();
+                if provider.namespace_scope_enforcement == ScopeEnforcement::Enforce
+                    && !unbound.is_empty()
+                {
+                    warnings.push(format!(
+                        "auth.oidc provider \"{}\" has namespace_scope entries without a format \
+                         prefix ({}): each admits that name in every registry format. Bind each \
+                         to the format it is written for, e.g. raw:{}",
+                        provider.name,
+                        unbound.join(", "),
+                        unbound[0]
+                    ));
+                }
             }
         }
 

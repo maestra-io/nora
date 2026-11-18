@@ -497,6 +497,9 @@ fn default_teleport_jwks_cache_secs() -> u64 {
 /// # (`myorg/<path>`), npm package (`@myorg/*`), maven group/artifact
 /// # (`com/myorg/**`), pypi/cargo the normalized project/crate name.
 /// # `["*"]` (the default) disables scoping for this issuer.
+/// # `<format>:<pattern>` (`raw:myorg/**`, `npm:@myorg/*`, `nuget:myorg.*`) binds an
+/// # entry to one registry format; an entry without a prefix admits the name in
+/// # every format, and NORA warns about it when the scope is enforced.
 /// namespace_scope = ["myorg/**"]
 /// # "enforce" (default) denies out-of-scope writes with 403; "audit" allows
 /// # but logs+counts them (nora_auth_namespace_scope_total) for staged rollout.
@@ -614,6 +617,9 @@ pub struct OidcProvider {
     pub max_token_lifetime_secs: u64,
     /// Namespace scope — which NORA namespaces this issuer can access.
     /// ["*"] = all, ["github/*"] = only repos under github/ prefix.
+    /// `<format>:<pattern>` (format = a registry name such as `raw`, `npm`,
+    /// `maven`, `nuget`) admits writes to that format only; an unknown format
+    /// prefix is refused at load.
     #[serde(default = "default_namespace_scope")]
     pub namespace_scope: Vec<String>,
     /// How `namespace_scope` is applied on writes: `enforce` (deny with 403,

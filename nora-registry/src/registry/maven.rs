@@ -1211,7 +1211,7 @@ async fn upload(
     let maven_namespace = coordinate
         .map(|(group, artifact)| format!("{group}/{artifact}"))
         .unwrap_or_default();
-    if enforce_namespace_scope(&authority, &maven_namespace).is_err() {
+    if enforce_namespace_scope(&authority, RegistryType::Maven, &maven_namespace).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
     if !upload_allowed(&state, &kind) {
