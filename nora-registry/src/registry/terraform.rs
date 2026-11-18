@@ -394,8 +394,8 @@ async fn provider_download_meta(
 
     // Extract publish date from cached metadata. The download-metadata endpoint is
     // not the artifact serve path (no quarantine here), so the /v2 lookup is not
-    // gated on cache state — `already_cached = false`.
-    let publish_date = extract_terraform_publish_date(&state, &ns, &ptype, &ver, false).await;
+    // gated on cache state (no cached copy named).
+    let publish_date = extract_terraform_publish_date(&state, &ns, &ptype, &ver, None).await;
 
     // Curation check. #733 serve-local: an internal-namespace provider is operator-owned — skip
     // curation and serve any local copy below; block the upstream branch separately.
@@ -522,9 +522,16 @@ async fn provider_download_binary(
 
     // Release date for the quarantine first-seen clock (#748/#750): the cached provider
     // metadata's date (gated internally on trust_upstream_dates; None → NORA's clock).
-    // #754: skip the /v2 round-trip on a cache hit (the digest is already recorded).
+    // #754: a cache hit asks /v2 only when a release age reads the date (A067).
     let already_cached = state.storage.stat(&storage_key).await.is_some();
-    let publish_date = extract_terraform_publish_date(&state, ns, ptype, ver, already_cached).await;
+    let publish_date = extract_terraform_publish_date(
+        &state,
+        ns,
+        ptype,
+        ver,
+        already_cached.then_some(storage_key.as_str()),
+    )
+    .await;
 
     // A provider's files pass the curation its download metadata passes: a client can ask for
     // them directly. An internal provider is operator-owned — served from the cache below and
@@ -716,7 +723,10 @@ async fn module_versions(
             if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
                 state.metrics.record_download("terraform");
                 state.metrics.record_cache_hit("terraform");
-                return with_json(data.to_vec());
+                let module = (ns.as_str(), name.as_str(), provider.as_str());
+                return with_json(
+                    serve_module_versions(&state, module, internal, data.to_vec()).await,
+                );
             }
         }
     }
@@ -774,7 +784,8 @@ async fn module_versions(
                 .log(AuditEntry::new("proxy_fetch", "proxy", "", "terraform", ""));
 
             state.spawn_cache("terraform", storage_key, Bytes::from(text.clone()));
-            with_json(text.into_bytes())
+            let module = (ns.as_str(), name.as_str(), provider.as_str());
+            with_json(serve_module_versions(&state, module, internal, text.into_bytes()).await)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -803,7 +814,13 @@ async fn module_download(
     // The download names the module itself: curation decides on it, and an internal-namespace
     // module (#68/#733) is answered from a cached source URL only, never asked upstream.
     let module = module_identity(&ns, &name, &provider);
-    let internal = match tf_decide(&state, &headers, &module, Some(&ver), None) {
+    let source_url_key = format!(
+        "terraform/modules/{}/{}/{}/{}/_source_url",
+        ns, name, provider, ver
+    );
+    let publish_date =
+        module_publish_date(&state, &ns, &name, &provider, &ver, Some(&source_url_key)).await;
+    let internal = match tf_decide(&state, &headers, &module, Some(&ver), publish_date) {
         Ok(internal) => internal,
         Err(refusal) => return *refusal,
     };
@@ -811,10 +828,6 @@ async fn module_download(
     let base_url = nora_base_url(&state);
 
     // If we have a cached source URL, return the rewritten header immediately
-    let source_url_key = format!(
-        "terraform/modules/{}/{}/{}/{}/_source_url",
-        ns, name, provider, ver
-    );
     let (cached, read_failure) =
         crate::registry::cached_read(state.storage.get(&source_url_key).await);
     // Only an archive source is stored. One an older release stored for a git source (the
@@ -931,15 +944,21 @@ async fn module_source_download(
     // The archive is the module: curation decides on it, and an internal-namespace module is
     // served from the cache only, never fetched from its source URL.
     let module = module_identity(&ns, &name, &provider);
-    let internal = match tf_decide(&state, &headers, &module, Some(&ver), None) {
-        Ok(internal) => internal,
-        Err(refusal) => return *refusal,
-    };
-
     let storage_key = format!(
         "terraform/modules/{}/{}/{}/{}/source.tar.gz",
         ns, name, provider, ver
     );
+    // A cached archive passed the dated download gate when it was fetched: it is served
+    // without asking the registry again.
+    let publish_date = if state.storage.stat(&storage_key).await.is_some() {
+        None
+    } else {
+        module_publish_date(&state, &ns, &name, &provider, &ver, None).await
+    };
+    let internal = match tf_decide(&state, &headers, &module, Some(&ver), publish_date) {
+        Ok(internal) => internal,
+        Err(refusal) => return *refusal,
+    };
 
     // Immutable: if cached, serve directly. get_verified discharges the integrity
     // witness at serve (compile-time guarantee — see crate::verified).
@@ -1200,7 +1219,7 @@ async fn mirror_provider_version(
     // path as well). An internal provider (#68/#733) is answered from the cache only: its version
     // list and each platform's metadata.
     let provider = provider_identity(&ns, &ptype);
-    let publish_date = extract_terraform_publish_date(&state, &ns, &ptype, ver, false).await;
+    let publish_date = extract_terraform_publish_date(&state, &ns, &ptype, ver, None).await;
     let internal = match tf_decide(&state, &headers, &provider, Some(ver), publish_date) {
         Ok(internal) => internal,
         Err(refusal) => return *refusal,
@@ -1522,48 +1541,87 @@ fn terraform_upstream_is_official(state: &AppState) -> bool {
 /// registry.terraform.io `/v2` API, by version. The *standard* provider protocol
 /// exposes no date (neither `versions` nor `download/{os}/{arch}` carry one —
 /// verified against the live API), so this v2 endpoint is the only trusted source,
-/// and it only exists on the official registry. Any failure: no dates. One lookup per
-/// provider for `terraform.metadata_ttl`, shared by every route (`upstream_dates`).
+/// and it only exists on the official registry. One lookup per provider for
+/// `terraform.metadata_ttl`, shared by every route (`upstream_dates`). A dated answer is
+/// kept at [`registry_dates_key`]; when the API gives none, that last answer stands (a
+/// `published-at` never changes), so an outage leaves only never-dated versions undated.
 async fn fetch_terraform_registry_dates(
     state: &AppState,
     ns: &str,
     ptype: &str,
     wanted: &[&str],
 ) -> super::upstream_dates::Answer {
-    let url = format!(
-        "{TERRAFORM_REGISTRY}/v2/providers/{}/{}?include=provider-versions",
-        ns, ptype
-    );
+    let path = format!("providers/{ns}/{ptype}");
+    let kept = registry_dates_key(ns, ptype);
+    v2_dates(state, &path, "provider-versions", wanted, Some(kept)).await
+}
+
+/// The `/v2/<path>?include=<include>` dates (`upstream_dates`, keyed by `path`). With
+/// `kept`, a dated answer is stored there and stands in for no answer.
+async fn v2_dates(
+    state: &AppState,
+    path: &str,
+    include: &str,
+    wanted: &[&str],
+    kept: Option<String>,
+) -> super::upstream_dates::Answer {
+    let api = registry_api();
+    let url = format!("{api}/v2/{path}?include={include}");
     let timeout = Duration::from_secs(state.config.terraform.proxy_timeout);
     let ttl = Duration::from_secs(state.config.terraform.metadata_ttl.max(0) as u64);
     let fetching = state.clone();
-    super::upstream_dates::dates(
+    let keeping = kept.clone();
+    let mut answer = super::upstream_dates::dates(
         state,
         RegistryType::Terraform,
-        &format!("{ns}/{ptype}"),
+        path,
         ttl,
         wanted,
         move || async move {
-            let body = super::upstream_dates::get(
-                &fetching,
-                RegistryType::Terraform,
-                TERRAFORM_REGISTRY,
-                &url,
-                timeout,
-            )
-            .await
-            .ok()?;
+            let body =
+                super::upstream_dates::get(&fetching, RegistryType::Terraform, &api, &url, timeout)
+                    .await
+                    .ok()?;
             let json: serde_json::Value = serde_json::from_slice(&body).ok()?;
-            Some(parse_registry_dates(&json))
+            let dates = parse_registry_dates(&json);
+            if let Some(key) = keeping.filter(|_| !dates.is_empty()) {
+                let stored = serde_json::to_vec(&dates).unwrap_or_default();
+                if let Err(e) = fetching.storage.put(&key, &stored).await {
+                    crate::record_cache_write_error("terraform", &key, &e);
+                }
+            }
+            Some(dates)
         },
     )
-    .await
+    .await;
+    if let (None, Some(key)) = (&answer.dates, kept) {
+        answer.dates = state
+            .storage
+            .get(&key)
+            .await
+            .ok()
+            .and_then(|data| serde_json::from_slice(&data).ok())
+            .map(std::sync::Arc::new);
+    }
+    answer
+}
+
+/// Where the last dated `/v2` answer of a provider is kept: outside its listing tree.
+fn registry_dates_key(ns: &str, ptype: &str) -> String {
+    format!("terraform/_v2-dates/{ns}/{ptype}.json")
 }
 
 /// The only Terraform upstream with a date API.
 const TERRAFORM_REGISTRY: &str = "https://registry.terraform.io";
 
-/// `version → published-at` (unix seconds) from a `/v2/providers/…?include=provider-versions` body.
+/// Where the `/v2` date API is asked: the official registry (tests: see the end of the file).
+#[cfg(not(test))]
+fn registry_api() -> String {
+    TERRAFORM_REGISTRY.to_string()
+}
+
+/// `version → published-at` (unix seconds) from a `/v2/…?include=provider-versions` (or
+/// `module-versions`) body.
 fn parse_registry_dates(json: &serde_json::Value) -> std::collections::HashMap<String, i64> {
     let mut dates = std::collections::HashMap::new();
     for item in json
@@ -1588,22 +1646,31 @@ fn parse_registry_dates(json: &serde_json::Value) -> std::collections::HashMap<S
     dates
 }
 
-/// Release date of one provider version via [`fetch_terraform_registry_dates`]; held as
-/// released now when a kept answer lacking it was reused unasked (R01).
+/// The date min-release-age judges one provider version by: its date from
+/// [`fetch_terraform_registry_dates`], else the write time of its `cached` copy (NORA held
+/// it no later than that). Without either: held as released now when a kept answer lacking
+/// it was reused unasked (R01), otherwise judged (`[curation.terraform] unknown_date`, A082).
 async fn fetch_terraform_registry_date(
     state: &AppState,
     ns: &str,
     ptype: &str,
     ver: &str,
+    cached: Option<&str>,
 ) -> Option<i64> {
+    let engine = &state.curation().curation_engine;
+    let trust = state.config.server.trust_upstream_dates;
     let answer = fetch_terraform_registry_dates(state, ns, ptype, &[ver]).await;
-    if answer.unasked {
-        return state.curation().curation_engine.unasked_release_date(
-            RegistryType::Terraform,
-            state.config.server.trust_upstream_dates,
-        );
+    let mut date = answer
+        .dates
+        .filter(|_| !answer.unasked)
+        .and_then(|dates| dates.get(ver).copied());
+    if let (None, Some(key)) = (date, cached) {
+        date = crate::curation::extract_mtime_as_publish_date(&state.storage, key).await;
     }
-    answer.dates?.get(ver).copied()
+    if date.is_none() && answer.unasked {
+        return engine.unasked_release_date(RegistryType::Terraform, trust);
+    }
+    engine.judged_release_date(RegistryType::Terraform, trust, date)
 }
 
 /// Q04 for Terraform (Maestra): drop the versions `min_release_age` refuses from a
@@ -1611,8 +1678,9 @@ async fn fetch_terraform_registry_date(
 /// constraint picks the newest allowed version instead of failing on the refused
 /// download (Terraform reports that 403 as "rejected the given authentication
 /// credentials"). Dated by the official registry's `/v2` API, regardless of
-/// `trust_upstream_dates` (hiding cannot let a version through); an internal provider,
-/// another upstream or a failed date query hides nothing (the download gate still applies).
+/// `trust_upstream_dates` (hiding cannot let a version through); an internal provider or
+/// another upstream hides nothing (the download gate still applies). A version no answer
+/// dated is hidden when the download gate would hold it.
 async fn hide_young_versions(
     state: &AppState,
     ns: &str,
@@ -1637,41 +1705,91 @@ async fn hide_young_versions(
         .flatten()
         .filter_map(|entry| entry.get("version").and_then(|v| v.as_str()))
         .collect();
-    let Some(dates) = fetch_terraform_registry_dates(state, ns, ptype, &listed)
-        .await
-        .dates
-    else {
-        return versions_json;
+    let answer = fetch_terraform_registry_dates(state, ns, ptype, &listed).await;
+    let dates = answer.dates.unwrap_or_default();
+    // A listed version without a date is judged as the download gate judges it (A082), once
+    // per list: a kept answer reused unasked holds it, else `unknown_date` decides.
+    let trust = state.config.server.trust_upstream_dates;
+    let undated = if listed.iter().all(|v| dates.contains_key(*v)) {
+        None
+    } else if answer.unasked {
+        engine.unasked_release_date(RegistryType::Terraform, trust)
+    } else {
+        engine.judged_release_date(RegistryType::Terraform, trust, None)
     };
     drop_hidden_versions(
         engine,
         &provider_identity(ns, ptype),
-        &mut versions_json,
+        versions_json.get_mut("versions"),
         &dates,
+        undated,
     );
     versions_json
 }
 
-/// Remove from `versions_json` every version `engine` hides from metadata, by `dates`.
+/// A module version list (`{"modules":[{"versions":[{"version":..},..]}]}`) without the
+/// versions `min_release_age` refuses, dated by the official registry's `/v2` module API
+/// (A083). Only a dated young version is hidden; an undated one is left to the download gate.
+async fn serve_module_versions(
+    state: &AppState,
+    module: (&str, &str, &str),
+    internal: bool,
+    data: Vec<u8>,
+) -> Vec<u8> {
+    let engine = &state.curation().curation_engine;
+    let (ns, name, system) = module;
+    if internal
+        || !engine.metadata_filter_active()
+        || engine
+            .min_release_age_secs(RegistryType::Terraform)
+            .is_none()
+        || !terraform_upstream_is_official(state)
+    {
+        return data;
+    }
+    let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&data) else {
+        return data;
+    };
+    let listed: Vec<String> = json
+        .pointer("/modules/0/versions")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("version").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .collect();
+    let wanted: Vec<&str> = listed.iter().map(String::as_str).collect();
+    let path = format!("modules/{ns}/{name}/{system}");
+    let answer = v2_dates(state, &path, "module-versions", &wanted, None).await;
+    drop_hidden_versions(
+        engine,
+        &module_identity(ns, name, system),
+        json.pointer_mut("/modules/0/versions"),
+        &answer.dates.unwrap_or_default(),
+        None,
+    );
+    serde_json::to_vec(&json).unwrap_or(data)
+}
+
+/// Remove from a `versions` array every version `engine` hides from metadata, by `dates`; a
+/// version `dates` lacks is judged by `undated`.
 fn drop_hidden_versions(
     engine: &crate::curation::CurationEngine,
-    provider: &str,
-    versions_json: &mut serde_json::Value,
+    identity: &str,
+    versions: Option<&mut serde_json::Value>,
     dates: &std::collections::HashMap<String, i64>,
+    undated: Option<i64>,
 ) {
-    if let Some(versions) = versions_json
-        .get_mut("versions")
-        .and_then(|v| v.as_array_mut())
-    {
+    if let Some(versions) = versions.and_then(|v| v.as_array_mut()) {
         versions.retain(|entry| {
             let Some(version) = entry.get("version").and_then(|v| v.as_str()) else {
                 return true;
             };
             !engine.hides_from_metadata(
                 crate::curation::RegistryType::Terraform,
-                provider,
+                identity,
                 version,
-                dates.get(version).copied(),
+                dates.get(version).copied().or(undated),
             )
         });
     }
@@ -1706,7 +1824,7 @@ async fn extract_terraform_publish_date(
     ns: &str,
     ptype: &str,
     ver: &str,
-    already_cached: bool,
+    cached: Option<&str>,
 ) -> Option<i64> {
     // Proxy mode: only the official registry has a per-version date, and only when
     // we're configured to trust upstream-provided dates (#513 — an attacker on a
@@ -1722,13 +1840,19 @@ async fn extract_terraform_publish_date(
         ) {
             return None;
         }
-        // #754: only query /v2 on a cache MISS — on a cache hit the digest is already
-        // recorded (idempotent `record` ignores the date), so skip the round-trip.
-        if !already_cached
+        // #754: a cache hit's digest is already recorded (idempotent `record` ignores the
+        // date), so /v2 is asked for it only when a release age reads the date (A067), and
+        // its copy's write time bounds an answer without one.
+        let wanted = cached.is_none()
+            || state
+                .curation()
+                .curation_engine
+                .reads_release_date(RegistryType::Terraform);
+        if wanted
             && state.config.server.trust_upstream_dates
             && terraform_upstream_is_official(state)
         {
-            return fetch_terraform_registry_date(state, ns, ptype, ver).await;
+            return fetch_terraform_registry_date(state, ns, ptype, ver, cached).await;
         }
         return None;
     }
@@ -1745,6 +1869,59 @@ async fn extract_terraform_publish_date(
         }
     }
     None
+}
+
+/// The date min-release-age judges a proxied module version by (A083): `published_at` of the
+/// upstream's `/v1/modules/{ns}/{name}/{system}/{ver}`, else the write time of its `cached`
+/// copy (NORA held it no later than that), else judged (`[curation.terraform] unknown_date`).
+/// `None`, and nothing asked, when no release age reads it: no upstream, an internal module,
+/// untrusted upstream dates or no rule.
+async fn module_publish_date(
+    state: &AppState,
+    ns: &str,
+    name: &str,
+    system: &str,
+    ver: &str,
+    cached: Option<&str>,
+) -> Option<i64> {
+    let engine = &state.curation().curation_engine;
+    let trust = state.config.server.trust_upstream_dates;
+    let proxy_url = upstream_url(state)?;
+    if !trust
+        || !engine.reads_release_date(RegistryType::Terraform)
+        || crate::curation::is_internal_namespace(
+            engine,
+            RegistryType::Terraform,
+            &module_identity(ns, name, system),
+        )
+    {
+        return None;
+    }
+    let url = format!(
+        "{}/v1/modules/{ns}/{name}/{system}/{ver}",
+        proxy_url.trim_end_matches('/')
+    );
+    let mut date = proxy_fetch_text(
+        &state.http_client,
+        &url,
+        Duration::from_secs(state.config.terraform.proxy_timeout),
+        expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
+        None,
+        &state.circuit_breaker,
+        RegistryType::Terraform,
+    )
+    .await
+    .ok()
+    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    .and_then(|json| {
+        json.get("published_at")?
+            .as_str()
+            .and_then(crate::curation::parse_iso8601_to_unix)
+    });
+    if let (None, Some(key)) = (date, cached) {
+        date = crate::curation::extract_mtime_as_publish_date(&state.storage, key).await;
+    }
+    engine.judged_release_date(RegistryType::Terraform, trust, date)
 }
 
 /// Resolve the real upstream download URL for a provider file.
@@ -4747,7 +4924,11 @@ mod terraform_decides_once {
         for (needle, allowed) in [
             (
                 "is_internal_namespace(",
-                &["extract_terraform_publish_date", "tf_decide"][..],
+                &[
+                    "extract_terraform_publish_date",
+                    "module_publish_date",
+                    "tf_decide",
+                ][..],
             ),
             ("check_download(", &["tf_decide"][..]),
             ("check_namespace_isolation(", &["tf_isolation_refusal"][..]),
@@ -4995,6 +5176,392 @@ mod terraform_release_age_decided {
     }
 }
 
+/// A082/A067/A083: a provider version the `/v2` API leaves undated is judged, its last dated
+/// answer standing through an outage; a cached provider file is still dated; a module version
+/// is dated by the registry's `published_at` on its download and on an uncached archive.
+#[cfg(test)]
+mod terraform_dates_judged {
+    use crate::config::UnknownDate;
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Points this thread's `/v2` date API at a mock until dropped.
+    struct Api;
+    impl Api {
+        fn at(uri: &str) -> Self {
+            super::TEST_REGISTRY_API.with(|api| *api.borrow_mut() = Some(uri.to_string()));
+            Api
+        }
+    }
+    impl Drop for Api {
+        fn drop(&mut self) {
+            super::TEST_REGISTRY_API.with(|api| *api.borrow_mut() = None);
+        }
+    }
+
+    fn iso(ago_secs: i64) -> String {
+        let at = crate::cache_ttl::now_unix() as i64 - ago_secs;
+        chrono::DateTime::from_timestamp(at, 0)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+
+    fn ctx(upstream: String, unknown: Option<UnknownDate>) -> TestContext {
+        create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(upstream);
+            cfg.terraform.proxy_timeout = 2;
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Observe);
+            cfg.curation.terraform.min_release_age = Some("3d".into());
+            cfg.curation.terraform.unknown_date = unknown;
+        })
+    }
+
+    /// Sets the write time of every stored file whose path contains `needle` `days` back.
+    fn age(ctx: &TestContext, needle: &str, days: u64) {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+        let mut dirs = vec![ctx._tempdir.path().to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.to_string_lossy().contains(needle) {
+                    std::fs::File::options()
+                        .write(true)
+                        .open(&p)
+                        .unwrap()
+                        .set_modified(old)
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    const META: &str = "/terraform/v1/providers/vfy/fresh/7.7.7/download/linux/amd64";
+    const ZIP: &str =
+        "/terraform/v1/providers/download/vfy/fresh/7.7.7/terraform-provider-fresh_7.7.7_linux_amd64.zip";
+    const ZIP_KEY: &str =
+        "terraform/download/vfy/fresh/7.7.7/terraform-provider-fresh_7.7.7_linux_amd64.zip";
+    const MIRROR: &str = "/terraform/registry.terraform.io/vfy/fresh/7.7.7.json";
+    const LIST: &str = "/terraform/v1/providers/vfy/fresh/versions";
+    const INDEX: &str = "/terraform/registry.terraform.io/vfy/fresh/index.json";
+
+    /// The official-registry stand-in: the v1 protocol under `/registry.terraform.io`, and
+    /// `/v2` answering `v2` (status, versions dated `ago` seconds back).
+    async fn registry(v2: u16, dated: &[(&str, i64)]) -> MockServer {
+        let server = MockServer::start().await;
+        let included: Vec<_> = dated
+            .iter()
+            .map(|(v, ago)| serde_json::json!({"attributes": {"version": v, "published-at": iso(*ago)}}))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/v2/providers/vfy/fresh"))
+            .respond_with(
+                ResponseTemplate::new(v2).set_body_json(serde_json::json!({"included": included})),
+            )
+            .mount(&server)
+            .await;
+        let platforms = r#"[{"os":"linux","arch":"amd64"}]"#;
+        Mock::given(method("GET"))
+            .and(path("/registry.terraform.io/v1/providers/vfy/fresh/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"versions":[{{"version":"1.0.0","platforms":{platforms}}},{{"version":"7.7.7","platforms":{platforms}}}]}}"#
+            )))
+            .mount(&server)
+            .await;
+        for ver in ["1.0.0", "7.7.7", "8.8.8"] {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/registry.terraform.io/v1/providers/vfy/fresh/{ver}/download/linux/amd64"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "os": "linux", "arch": "amd64",
+                    "filename": format!("terraform-provider-fresh_{ver}_linux_amd64.zip"),
+                    "download_url": format!("{}/fresh_{ver}.zip", server.uri()),
+                    "shasum": "00",
+                })))
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    async fn listed(ctx: &TestContext, uri: &str) -> String {
+        String::from_utf8(
+            body_bytes(send(&ctx.app, Method::GET, uri, "").await)
+                .await
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    /// A082: `/v2` failing and no answer ever kept: under `hold` the version is refused on
+    /// every path and hidden from both lists; nothing is cached for it.
+    #[tokio::test]
+    async fn an_undated_provider_version_is_held() {
+        let server = registry(503, &[]).await;
+        let _api = Api::at(&server.uri());
+        let ctx = ctx(
+            format!("{}/registry.terraform.io", server.uri()),
+            Some(UnknownDate::Hold),
+        );
+        for uri in [META, ZIP, MIRROR] {
+            assert_eq!(
+                send(&ctx.app, Method::GET, uri, "").await.status(),
+                StatusCode::FORBIDDEN,
+                "{uri}"
+            );
+        }
+        assert!(ctx.state.storage.stat(ZIP_KEY).await.is_none());
+        assert!(!listed(&ctx, LIST).await.contains("7.7.7"));
+        assert!(!listed(&ctx, INDEX).await.contains("7.7.7"));
+    }
+
+    /// The default `unknown_date = "log"` leaves the version undated: served, and counted.
+    #[tokio::test]
+    async fn an_undated_provider_version_is_logged_by_default() {
+        let server = registry(503, &[]).await;
+        let _api = Api::at(&server.uri());
+        let ctx = ctx(format!("{}/registry.terraform.io", server.uri()), None);
+        let counted = || {
+            crate::metrics::CURATION_UNKNOWN_RELEASE_DATE_TOTAL
+                .with_label_values(&["terraform"])
+                .get()
+        };
+        let before = counted();
+        assert_eq!(
+            send(&ctx.app, Method::GET, META, "").await.status(),
+            StatusCode::OK
+        );
+        assert!(counted() > before);
+        assert!(listed(&ctx, LIST).await.contains("7.7.7"));
+    }
+
+    /// The last dated `/v2` answer is kept: during an outage it still dates (and passes) the
+    /// versions it listed, while one it never listed is held.
+    #[tokio::test]
+    async fn a_kept_answer_dates_versions_through_an_outage() {
+        let server = registry(200, &[("1.0.0", 30 * 86_400), ("7.7.7", 10 * 86_400)]).await;
+        let _api = Api::at(&server.uri());
+        let ctx = ctx(
+            format!("{}/registry.terraform.io", server.uri()),
+            Some(UnknownDate::Hold),
+        );
+        assert_eq!(
+            send(&ctx.app, Method::GET, META, "").await.status(),
+            StatusCode::OK
+        );
+        assert!(ctx
+            .state
+            .storage
+            .stat(&super::registry_dates_key("vfy", "fresh"))
+            .await
+            .is_some());
+
+        server.reset().await;
+        let down = registry(503, &[]).await;
+        drop(_api);
+        let _api = Api::at(&down.uri());
+        ctx.state.upstream_dates.lock().clear();
+        for (uri, expected) in [
+            (META, StatusCode::OK),
+            (
+                "/terraform/v1/providers/vfy/fresh/8.8.8/download/linux/amd64",
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            assert_eq!(
+                send(&ctx.app, Method::GET, uri, "").await.status(),
+                expected,
+                "{uri}"
+            );
+        }
+    }
+
+    /// A067: a cached provider file is dated too: young by `/v2`, it is refused; with `/v2`
+    /// failing, its copy's write time dates it (an old copy passes, a new one is held).
+    #[tokio::test]
+    async fn a_cached_provider_file_is_dated() {
+        let server = registry(200, &[("7.7.7", 3600)]).await;
+        let _api = Api::at(&server.uri());
+        let ctx = ctx(format!("{}/registry.terraform.io", server.uri()), None);
+        ctx.state.storage.put(ZIP_KEY, b"ZIP").await.unwrap();
+        assert_eq!(
+            send(&ctx.app, Method::GET, ZIP, "").await.status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let down = registry(503, &[]).await;
+        drop(_api);
+        let _api = Api::at(&down.uri());
+        let ctx = ctx_hold(&down);
+        ctx.state.storage.put(ZIP_KEY, b"ZIP").await.unwrap();
+        assert_eq!(
+            send(&ctx.app, Method::GET, ZIP, "").await.status(),
+            StatusCode::FORBIDDEN
+        );
+        age(&ctx, "fresh_7.7.7_linux_amd64.zip", 10);
+        assert_eq!(
+            send(&ctx.app, Method::GET, ZIP, "").await.status(),
+            StatusCode::OK
+        );
+    }
+
+    fn ctx_hold(server: &MockServer) -> TestContext {
+        ctx(
+            format!("{}/registry.terraform.io", server.uri()),
+            Some(UnknownDate::Hold),
+        )
+    }
+
+    const MOD_DL: &str = "/terraform/v1/modules/acme/young/aws/9.9.9/download";
+    const MOD_SRC: &str =
+        "/terraform/v1/modules/download/acme/young/aws/9.9.9/source?archive=tar.gz";
+    const MOD_SRC_KEY: &str = "terraform/modules/acme/young/aws/9.9.9/source.tar.gz";
+    const MOD_URL_KEY: &str = "terraform/modules/acme/young/aws/9.9.9/_source_url";
+
+    /// A module registry whose `acme/young/aws/9.9.9` detail is `detail`.
+    async fn modules(detail: serde_json::Value) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/modules/acme/young/aws/9.9.9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(detail))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/modules/acme/young/aws/9.9.9/download"))
+            .respond_with(ResponseTemplate::new(204).insert_header(
+                "x-terraform-get",
+                format!("{}/young.tar.gz", server.uri()).as_str(),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/young.tar.gz"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(vec![0x1f, 0x8b, 0x08, 0x00, 1, 2, 3]),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn module_ctx(server: &MockServer, unknown: Option<UnknownDate>) -> TestContext {
+        let ctx = ctx(server.uri(), unknown);
+        let source = format!("{}/young.tar.gz", server.uri());
+        ctx.state
+            .storage
+            .put(MOD_URL_KEY, source.as_bytes())
+            .await
+            .unwrap();
+        ctx
+    }
+
+    async fn module_answers(ctx: &TestContext) -> (StatusCode, StatusCode) {
+        (
+            send(&ctx.app, Method::GET, MOD_DL, "").await.status(),
+            send(&ctx.app, Method::GET, MOD_SRC, "").await.status(),
+        )
+    }
+
+    /// A083: a module version younger than the minimum age is refused on its download and
+    /// on its archive, and the archive is not cached; an old one is served.
+    #[tokio::test]
+    async fn a_young_module_is_held_on_download_and_source() {
+        let server = modules(serde_json::json!({"published_at": iso(60)})).await;
+        let ctx = module_ctx(&server, None).await;
+        assert_eq!(
+            module_answers(&ctx).await,
+            (StatusCode::FORBIDDEN, StatusCode::FORBIDDEN)
+        );
+        assert!(ctx.state.storage.stat(MOD_SRC_KEY).await.is_none());
+
+        let server = modules(serde_json::json!({"published_at": iso(10 * 86_400)})).await;
+        let ctx = module_ctx(&server, None).await;
+        assert_eq!(
+            module_answers(&ctx).await,
+            (StatusCode::NO_CONTENT, StatusCode::OK)
+        );
+    }
+
+    /// A083: a module version list hides a version the `/v2` module API dates young, keeps an
+    /// old one and an undated one (the download gate judges that), cached or fetched.
+    #[tokio::test]
+    async fn a_young_module_version_is_hidden_from_its_list() {
+        let server = MockServer::start().await;
+        let included = serde_json::json!({"included": [
+            {"attributes": {"version": "1.0.0", "published-at": iso(30 * 86_400)}},
+            {"attributes": {"version": "9.9.9", "published-at": iso(60)}},
+        ]});
+        Mock::given(method("GET"))
+            .and(path("/v2/modules/acme/young/aws"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(included))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/registry.terraform.io/v1/modules/acme/young/aws/versions",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "modules": [{"versions": [
+                    {"version": "1.0.0"}, {"version": "2.0.0"}, {"version": "9.9.9"}
+                ]}]
+            })))
+            .mount(&server)
+            .await;
+        let _api = Api::at(&server.uri());
+        let ctx = ctx(format!("{}/registry.terraform.io", server.uri()), None);
+        let list = "/terraform/v1/modules/acme/young/aws/versions";
+        let holders = ctx.state.storage.holders();
+        for _ in 0..2 {
+            let body: serde_json::Value = serde_json::from_str(&listed(&ctx, list).await).unwrap();
+            let versions: Vec<_> = body["modules"][0]["versions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["version"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(versions, ["1.0.0", "2.0.0"]);
+            crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
+        }
+    }
+
+    /// A083: a module version the registry leaves undated follows `unknown_date`: `hold`
+    /// refuses it unless its cached source address is old, `log` serves it (a cached source
+    /// address still dates it: NORA held it no later than that).
+    #[tokio::test]
+    async fn an_undated_module_follows_unknown_date() {
+        let server = modules(serde_json::json!({"id": "acme/young/aws/9.9.9"})).await;
+        let held = module_ctx(&server, Some(UnknownDate::Hold)).await;
+        assert_eq!(
+            module_answers(&held).await,
+            (StatusCode::FORBIDDEN, StatusCode::FORBIDDEN)
+        );
+        age(&held, "young/aws/9.9.9/_source_url", 10);
+        assert_eq!(
+            send(&held.app, Method::GET, MOD_DL, "").await.status(),
+            StatusCode::NO_CONTENT
+        );
+        // `log`: an uncached archive and a download with no cached source address pass.
+        let logged = module_ctx(&server, None).await;
+        assert_eq!(
+            send(&logged.app, Method::GET, MOD_SRC, "").await.status(),
+            StatusCode::OK
+        );
+        let logged = ctx(server.uri(), None);
+        assert_eq!(
+            send(&logged.app, Method::GET, MOD_DL, "").await.status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+}
+
 /// Maestra: signed package download URLs and young-version hiding.
 #[cfg(test)]
 mod maestra_tests {
@@ -5168,15 +5735,48 @@ mod maestra_tests {
         let mut versions = serde_json::json!({"versions": [
             {"version": "1.0.0"}, {"version": "1.1.0"}, {"version": "1.2.0"}
         ]});
-        drop_hidden_versions(&engine, "hashicorp/null", &mut versions, &dates);
-        let kept: Vec<_> = versions["versions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v["version"].as_str().unwrap())
-            .collect();
+        let listed = versions.clone();
+        let kept = |versions: &serde_json::Value| -> Vec<String> {
+            versions["versions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["version"].as_str().unwrap().to_string())
+                .collect()
+        };
+        drop_hidden_versions(
+            &engine,
+            "hashicorp/null",
+            versions.get_mut("versions"),
+            &dates,
+            None,
+        );
         // The young version is hidden; an undated one is left to the download gate.
-        assert_eq!(kept, ["1.0.0", "1.2.0"]);
+        assert_eq!(kept(&versions), ["1.0.0", "1.2.0"]);
+
+        // A082: an undated version judged as released now (`unknown_date = "hold"`) is hidden
+        // like a young one, and refused by the download gate.
+        let held = engine.unknown_release_date();
+        assert!(held.is_some_and(|at| (at - now).abs() <= 2));
+        let mut versions = listed;
+        drop_hidden_versions(
+            &engine,
+            "hashicorp/null",
+            versions.get_mut("versions"),
+            &dates,
+            held,
+        );
+        assert_eq!(kept(&versions), ["1.0.0"]);
+        assert!(crate::curation::check_download(
+            &engine,
+            None,
+            &axum::http::HeaderMap::new(),
+            crate::curation::RegistryType::Terraform,
+            "hashicorp/null",
+            crate::curation::RequestVersion::Known("1.2.0".into()),
+            held,
+        )
+        .is_some());
     }
 }
 
@@ -5277,3 +5877,18 @@ mod mirror_hostname_cases {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod index_named_urls;
+
+#[cfg(test)]
+thread_local! {
+    /// A test's mock `/v2` date API (requests run on the test's thread).
+    static TEST_REGISTRY_API: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Where the `/v2` date API is asked in tests: the thread's mock, else the official registry.
+#[cfg(test)]
+fn registry_api() -> String {
+    TEST_REGISTRY_API
+        .with(|api| api.borrow().clone())
+        .unwrap_or_else(|| TERRAFORM_REGISTRY.to_string())
+}
