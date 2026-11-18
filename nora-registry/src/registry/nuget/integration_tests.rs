@@ -1915,6 +1915,49 @@ async fn test_q04_search_and_autocomplete_hide_young_versions() {
     assert_eq!(doc["data"], serde_json::json!(["1.0.0", "2.0.0"]));
 }
 
+/// Q04 on the local answer (a refused discovered endpoint, audit R07): search drops the young
+/// versions and autocomplete `?id=` lists that package's allowed cached versions.
+#[tokio::test]
+async fn test_q04_local_search_and_autocomplete_hide_young_versions() {
+    let upstream = wiremock::MockServer::start().await;
+    let up = upstream.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.nuget.enabled = true;
+        cfg.nuget.proxy = Some(up);
+        cfg.nuget.search_service = String::new();
+        cfg.nuget.autocomplete = String::new();
+        cfg.curation.mode = crate::config::CurationMode::Enforce;
+        cfg.curation.min_release_age = Some("7d".to_string());
+    });
+    mount_paged(&upstream).await;
+    let versions = ["1.0.0", "2.0.0", "2.1.0", "3.0.0-beta"];
+    let index = serde_json::json!({ "versions": versions }).to_string();
+    let storage = &ctx.state.storage;
+    storage
+        .put("nuget/flatcontainer/big.pkg/index.json", index.as_bytes())
+        .await
+        .unwrap();
+    for v in versions {
+        let key = format!("nuget/flatcontainer/big.pkg/{v}/big.pkg.{v}.nupkg");
+        storage.put(&key, b"PK").await.unwrap();
+    }
+    let get = |uri: &'static str| {
+        let app = ctx.app.clone();
+        async move { json_body(send(&app, Method::GET, uri, "").await).await }
+    };
+    let doc = get("/nuget/v3/query?q=big&prerelease=true").await;
+    assert_eq!(doc["data"][0]["version"], "2.0.0", "{doc}");
+    assert_eq!(doc["data"][0]["versions"].as_array().unwrap().len(), 2);
+    let doc = get("/nuget/v3/autocomplete?id=big.pkg&prerelease=true").await;
+    assert_eq!(doc["data"], serde_json::json!(["1.0.0", "2.0.0"]));
+    assert!(upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| !r.url.path().contains("query") && !r.url.path().contains("autocomplete")));
+}
+
 /// Q04: a hosted package and an internal-namespace one are served as stored, even
 /// with versions published a minute ago.
 #[tokio::test]

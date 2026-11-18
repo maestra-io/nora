@@ -197,11 +197,23 @@ pub fn redact_url(url: &str) -> String {
 /// rebind/TOCTOU). Used for the initial request and every redirect hop.
 pub(crate) struct GuardedResolver {
     allow_private: bool,
+    /// Names resolved unfiltered: the outbound proxies the operator set, which may sit on a
+    /// private address. Only the proxy's own name is looked up for a request sent through it.
+    proxy_hosts: Vec<String>,
 }
 
 impl GuardedResolver {
     pub(crate) fn new(allow_private: bool) -> Self {
-        Self { allow_private }
+        Self::with_proxy_hosts(allow_private, Vec::new())
+    }
+
+    /// [`GuardedResolver::new`] that resolves each of `proxy_hosts` (exact, case-insensitive)
+    /// without the filter.
+    pub(crate) fn with_proxy_hosts(allow_private: bool, proxy_hosts: Vec<String>) -> Self {
+        Self {
+            allow_private,
+            proxy_hosts,
+        }
     }
 }
 
@@ -223,8 +235,12 @@ pub(crate) async fn resolves_only_to_blocked(host: &str) -> bool {
 
 impl reqwest::dns::Resolve for GuardedResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let allow_private = self.allow_private;
         let host = name.as_str().to_string();
+        let allow_private = self.allow_private
+            || self
+                .proxy_hosts
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(&host));
         Box::pin(async move {
             // Port 0 is a placeholder — reqwest overrides it with the URL/scheme
             // port. The system resolver is the trusted base; we only *filter*.

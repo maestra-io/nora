@@ -640,19 +640,19 @@ fn sanitize_proxy_url(url: &str) -> String {
     url.to_string()
 }
 
-/// The first outbound proxy variable set in the environment, with its value: reqwest sends
-/// every request through it.
-fn outbound_proxy_env() -> Option<(&'static str, String)> {
-    [
-        "ALL_PROXY",
-        "all_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-    ]
-    .into_iter()
-    .find_map(|var| {
+/// The outbound proxy variables reqwest reads, in the order it prefers them.
+const PROXY_VARS: [&str; 6] = [
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+];
+
+/// Each outbound proxy variable set in the environment, with its value.
+fn outbound_proxy_vars() -> impl Iterator<Item = (&'static str, String)> {
+    PROXY_VARS.into_iter().filter_map(|var| {
         std::env::var(var)
             .ok()
             .filter(|val| !val.is_empty())
@@ -660,16 +660,41 @@ fn outbound_proxy_env() -> Option<(&'static str, String)> {
     })
 }
 
+/// The host of a proxy variable's value, which may leave out the scheme (`proxy:3128`), as
+/// reqwest reads it.
+fn proxy_host(val: &str) -> Option<String> {
+    let url = if val.contains("://") {
+        reqwest::Url::parse(val)
+    } else {
+        reqwest::Url::parse(&format!("http://{val}"))
+    };
+    Some(url.ok()?.host_str()?.to_string())
+}
+
+/// The host names of the outbound proxies set in the environment: the guarded resolver lets
+/// them through, so a redirect is never followed to one.
+pub(crate) fn outbound_proxy_hosts() -> Vec<String> {
+    outbound_proxy_vars()
+        .filter_map(|(_, val)| proxy_host(&val))
+        .collect()
+}
+
 /// Log detected outbound proxy configuration from environment variables.
 fn log_outbound_proxy(allow_private_upstreams: bool) {
-    if let Some((var, val)) = outbound_proxy_env() {
-        info!(var = %var, proxy = %sanitize_proxy_url(&val), "Outbound proxy detected from environment");
-        if !allow_private_upstreams {
-            warn!(
-                "Outbound proxy set: NORA refuses redirect hops to loopback/private IP literals, \
-                 but host names are resolved by the proxy, which must refuse private destinations itself"
-            );
-        }
+    let mut any = false;
+    for (var, val) in outbound_proxy_vars() {
+        // reqwest picks one per scheme (the scheme's own variable before ALL_PROXY).
+        info!(var = %var, proxy = %sanitize_proxy_url(&val), "Outbound proxy variable set");
+        any = true;
+    }
+    if any && !allow_private_upstreams {
+        warn!(
+            "Outbound proxy set: for a request sent through an http(s) or socks5h proxy, the \
+             proxy resolves the host name and must refuse private destinations itself (a \
+             socks5 proxy is given the address NORA resolved, guarded); a request NORA \
+             connects directly (a scheme without a proxy, a NO_PROXY host) is refused a \
+             private address"
+        );
     }
     let no_proxy = std::env::var("NO_PROXY")
         .or_else(|_| std::env::var("no_proxy"))
@@ -694,10 +719,13 @@ const USER_AGENT: &str = concat!("nora/", env!("CARGO_PKG_VERSION"));
 ///
 /// Unless `allow_private` (`server.allow_private_upstreams` for the server's clients), the
 /// client never reaches a loopback, private, link-local or metadata address: a redirect hop to
-/// such an IP literal fails before `redirect` is asked, and, when no outbound proxy resolves
-/// names instead of NORA, a host name is connected only to the addresses of it outside those
-/// ranges ([`import::http::GuardedResolver`]). The initial URL is the operator's: an IP literal
-/// there is not checked.
+/// such an IP literal fails before `redirect` is asked, and a host name NORA connects to itself
+/// is connected only to the addresses of it outside those ranges
+/// ([`import::http::GuardedResolver`]), whatever proxy variables are set: reqwest connects
+/// directly for a scheme no variable proxies and for a NO_PROXY host. Only the names of the
+/// proxies themselves are resolved unfiltered; a request sent through one has its host
+/// resolved by the proxy. The initial URL is the operator's: an IP literal there is not
+/// checked, and a URL an upstream's content names is checked where it is read.
 fn build_http_client(
     tls: &TlsConfig,
     timeout: Option<std::time::Duration>,
@@ -705,12 +733,36 @@ fn build_http_client(
     redirect: reqwest::redirect::Policy,
     allow_private: bool,
 ) -> reqwest::Client {
+    let proxy_hosts = if no_proxy {
+        Vec::new()
+    } else {
+        outbound_proxy_hosts()
+    };
+    http_client_builder(tls, timeout, no_proxy, redirect, allow_private, proxy_hosts)
+        .build()
+        .expect("Failed to build HTTP client")
+}
+
+/// [`build_http_client`] before it is built, with the proxy hosts the resolver lets through.
+fn http_client_builder(
+    tls: &TlsConfig,
+    timeout: Option<std::time::Duration>,
+    no_proxy: bool,
+    redirect: reqwest::redirect::Policy,
+    allow_private: bool,
+    proxy_hosts: Vec<String>,
+) -> reqwest::ClientBuilder {
     let redirect = if allow_private {
         redirect
     } else {
+        // The resolver lets the proxies' names through: a hop to one is no proxy connection.
+        let proxies = proxy_hosts.clone();
         reqwest::redirect::Policy::custom(move |attempt| {
+            let host = attempt.url().host_str().unwrap_or_default();
             if import::http::is_blocked_url_host(attempt.url().as_str(), false) {
                 attempt.error("redirect to a loopback/private address refused")
+            } else if proxies.iter().any(|p| p.eq_ignore_ascii_case(host)) {
+                attempt.error("redirect to the outbound proxy's host refused")
             } else {
                 redirect.redirect(attempt)
             }
@@ -735,10 +787,10 @@ fn build_http_client(
         builder = builder.no_proxy();
     }
 
-    if !allow_private && (no_proxy || outbound_proxy_env().is_none()) {
-        builder = builder.dns_resolver(std::sync::Arc::new(import::http::GuardedResolver::new(
-            false,
-        )));
+    if !allow_private {
+        builder = builder.dns_resolver(std::sync::Arc::new(
+            import::http::GuardedResolver::with_proxy_hosts(false, proxy_hosts),
+        ));
     }
 
     if let Some(ref ca_path) = tls.ca_cert {
@@ -763,7 +815,7 @@ fn build_http_client(
         }
     }
 
-    builder.build().expect("Failed to build HTTP client")
+    builder
 }
 
 /// The client that never follows a redirect, for a format whose answer depends on what each
@@ -803,14 +855,9 @@ pub(crate) fn build_same_origin_client(tls: &TlsConfig, allow_private: bool) -> 
 }
 
 /// The hosts the server fetches from on its own: every configured upstream
-/// ([`Config::upstream_hostnames`], which leaves out `localhost` and `127.0.0.1`) and the JWKS
-/// of each token issuer.
+/// ([`Config::outbound_upstream_urls`], loopback ones included) and the JWKS of each token
+/// issuer.
 fn outbound_hosts(config: &Config) -> Vec<String> {
-    let mut hosts: Vec<String> = config
-        .upstream_hostnames()
-        .into_iter()
-        .map(|(_, host)| host)
-        .collect();
     let teleport = &config.auth.teleport;
     let oidc = &config.auth.oidc;
     let jwks = teleport
@@ -824,9 +871,12 @@ fn outbound_hosts(config: &Config) -> Vec<String> {
                 .flat_map(|p| [Some(p.issuer.as_str()), p.jwks_uri.as_deref()])
                 .flatten(),
         );
-    hosts.extend(
-        jwks.filter_map(|url| Some(reqwest::Url::parse(url).ok()?.host_str()?.to_string())),
-    );
+    let mut hosts: Vec<String> = config
+        .outbound_upstream_urls()
+        .into_iter()
+        .chain(jwks)
+        .filter_map(|url| Some(reqwest::Url::parse(url).ok()?.host_str()?.to_string()))
+        .collect();
     hosts.sort();
     hosts.dedup();
     hosts
@@ -847,8 +897,10 @@ async fn warn_private_upstreams(hosts: Vec<String>) -> Vec<String> {
         if blocked {
             warn!(
                 host = %host,
-                "Upstream host resolves only to loopback/private addresses and its fetches fail; \
-                 set server.allow_private_upstreams (NORA_ALLOW_PRIVATE_UPSTREAMS) to allow it"
+                "Upstream host resolves only to loopback/private addresses: NORA refuses it \
+                 when it resolves the name itself or is redirected to it (a request through an \
+                 outbound proxy is left to the proxy's policy); \
+                 server.allow_private_upstreams (NORA_ALLOW_PRIVATE_UPSTREAMS) allows it"
             );
             refused.push(host);
         }
@@ -2119,7 +2171,13 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     // Discover NuGet search endpoints from upstream service index
     if config.nuget.enabled {
-        registry::nuget::discover_search_endpoints(&http_client, &mut config.nuget).await;
+        registry::nuget::discover_search_endpoints(
+            &http_client,
+            &mut config.nuget,
+            allow_private,
+            &outbound_proxy_hosts(),
+        )
+        .await;
     }
 
     // Build curation engine (shared helper, also used by SIGHUP reload).

@@ -240,3 +240,119 @@ async fn a034_startup_warns_about_private_upstream_hosts() {
         ["localhost"]
     );
 }
+
+/// A server client with `proxy_hosts` let through by its resolver and an explicit `proxy`
+/// standing for the proxy variables (no env var is set by a test).
+fn client_beside(proxy: reqwest::Proxy, proxy_hosts: &[&str]) -> reqwest::Client {
+    http_client_builder(
+        &TlsConfig::default(),
+        None,
+        false,
+        reqwest::redirect::Policy::default(),
+        false,
+        proxy_hosts.iter().map(|h| h.to_string()).collect(),
+    )
+    .proxy(proxy)
+    .build()
+    .unwrap()
+}
+
+/// Audit R08: with a proxy for one scheme only, a request of the other scheme is connected
+/// directly, and its host name is refused a loopback address as without any proxy.
+#[tokio::test]
+async fn r08_a_direct_request_beside_a_proxy_is_guarded() {
+    let inner = internal().await;
+    let client = client_beside(
+        reqwest::Proxy::https("http://proxy.invalid:3128").unwrap(),
+        &["proxy.invalid"],
+    );
+    let url = format!("http://localhost:{}/metrics", inner.address().port());
+    let err = client
+        .get(&url)
+        .send()
+        .await
+        .expect_err("a direct loopback connect");
+    assert!(format!("{err:?}").contains("SSRF guard"), "{err:?}");
+    assert_eq!(hits(&inner).await, 0);
+}
+
+/// The proxy's own name is resolved unfiltered: a proxy on a loopback/private address still
+/// carries the requests sent through it.
+#[tokio::test]
+async fn r08_the_proxy_itself_may_sit_on_a_private_address() {
+    let proxy = internal().await;
+    let port = proxy.address().port();
+    let client = client_beside(
+        reqwest::Proxy::http(format!("http://localhost:{port}")).unwrap(),
+        &["localhost"],
+    );
+    let resp = client
+        .get("http://upstream.invalid/metrics")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(hits(&proxy).await, 1);
+}
+
+/// A proxy variable's host, with or without a scheme, as reqwest reads it.
+#[test]
+fn r08_proxy_host_reads_the_variable() {
+    for (val, host) in [
+        ("http://user:pw@squid.svc:3128", Some("squid.svc")),
+        ("squid:3128", Some("squid")),
+        ("socks5h://Proxy.Example:1080", Some("Proxy.Example")),
+        ("http://10.0.0.5:3128/", Some("10.0.0.5")),
+        ("", None),
+    ] {
+        assert_eq!(proxy_host(val).as_deref(), host, "{val}");
+    }
+}
+
+/// Audit R09: the startup check sees every upstream the shared clients fetch from, a loopback
+/// name and the helm, hf and apk upstreams included, and names each as refused.
+#[tokio::test]
+async fn r09_startup_check_names_loopback_and_unscanned_upstreams() {
+    use crate::config::RepoProxyEntry;
+    let mut cfg = Config::default();
+    cfg.npm.proxy = Some("http://localhost:4873".into());
+    cfg.hf.proxy = Some("http://10.0.0.7/hf".into());
+    cfg.helm.proxies.insert(
+        "charts".into(),
+        RepoProxyEntry::Simple("http://10.0.0.8/charts".into()),
+    );
+    cfg.apk.proxies.insert(
+        "main".into(),
+        RepoProxyEntry::Simple("http://10.0.0.9/alpine".into()),
+    );
+    let expected = ["10.0.0.7", "10.0.0.8", "10.0.0.9", "localhost"];
+    let hosts = outbound_hosts(&cfg);
+    for host in expected {
+        assert!(hosts.iter().any(|h| h == host), "{host} not in {hosts:?}");
+    }
+    // Only the fixture hosts are resolved: a default public upstream is no part of the check.
+    let mut refused = warn_private_upstreams(expected.map(String::from).to_vec()).await;
+    refused.sort();
+    assert_eq!(refused, expected);
+}
+
+/// The resolver lets a proxy's name through, so a redirect to that host is refused: an
+/// upstream cannot aim a direct connection at the proxy's host.
+#[tokio::test]
+async fn r08_a_redirect_to_the_proxy_host_is_refused() {
+    let inner = internal().await;
+    let upstream = MockServer::start().await;
+    let port = inner.address().port();
+    redirect_all(&upstream, format!("http://LocalHost:{port}/metrics")).await;
+    let client = client_beside(
+        reqwest::Proxy::https(format!("http://localhost:{port}")).unwrap(),
+        &["localhost"],
+    );
+    let err = client
+        .get(format!("{}/x", upstream.uri()))
+        .send()
+        .await
+        .expect_err("the hop to the proxy host");
+    assert!(err.is_redirect(), "{err:?}");
+    assert_eq!(hits(&inner).await, 0);
+}

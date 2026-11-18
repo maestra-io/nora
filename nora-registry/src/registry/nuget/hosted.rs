@@ -1586,6 +1586,7 @@ async fn merged_search(
         take,
         prerelease: p.prerelease,
         sem_ver_level: p.sem_ver_level.clone(),
+        id: p.id.clone(),
     };
 
     // Autocomplete `?id=`: versions of one package, never package IDs.

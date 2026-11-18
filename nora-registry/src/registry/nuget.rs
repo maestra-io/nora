@@ -55,6 +55,8 @@ struct SearchParams {
     prerelease: Option<bool>,
     #[serde(rename = "semVerLevel")]
     sem_ver_level: Option<String>,
+    /// Autocomplete: the package whose versions are asked for.
+    id: Option<String>,
 }
 
 /// Storage prefix and file suffix for repo index scanning.
@@ -76,9 +78,17 @@ pub(crate) const UPSTREAM_PASSTHROUGH_PATHS: &[&str] = &["/v3/catalog0/"];
 ///
 /// Only runs if search_service/autocomplete are still at their default values
 /// (user overrides via env vars take precedence). Falls back silently on error.
+///
+/// An endpoint is the upstream's content: unless `allow_private` it is not taken when it sits
+/// off the configured feed's own host on a loopback/private IP literal (a name is refused at
+/// connect by the guarded client's resolver) or on one of `proxy_hosts`, whose names that
+/// resolver lets through. Such a service is then answered from the local index (an empty
+/// endpoint), never by the public default.
 pub async fn discover_search_endpoints(
     client: &reqwest::Client,
     config: &mut crate::config::NugetConfig,
+    allow_private: bool,
+    proxy_hosts: &[String],
 ) {
     let proxy_url = match &config.proxy {
         Some(url) => url.clone(),
@@ -164,6 +174,31 @@ pub async fn discover_search_endpoints(
         let rtype = resource.get("@type").and_then(|t| t.as_str()).unwrap_or("");
         let rid = resource.get("@id").and_then(|id| id.as_str()).unwrap_or("");
         if rid.is_empty() || !(rid.starts_with("https://") || rid.starts_with("http://")) {
+            continue;
+        }
+        let host = |url: &str| reqwest::Url::parse(url).ok()?.host_str().map(str::to_owned);
+        let off_feed = host(rid) != host(&proxy_base);
+        let on_proxy =
+            || host(rid).is_some_and(|h| proxy_hosts.iter().any(|p| p.eq_ignore_ascii_case(&h)));
+        if !allow_private
+            && off_feed
+            && (crate::import::http::is_blocked_url_host(rid, false) || on_proxy())
+        {
+            // The feed's search stays local: a query for a private feed never goes to the
+            // public default instead.
+            tracing::warn!(url = %crate::import::http::redact_url(rid), "NuGet: service index names an endpoint on a loopback/private address or the outbound proxy, answering it locally");
+            if search_is_default
+                && rtype.starts_with("SearchQueryService")
+                && config.search_service == DEFAULT_SEARCH
+            {
+                config.search_service.clear();
+            }
+            if autocomplete_is_default
+                && rtype.starts_with("SearchAutocompleteService")
+                && config.autocomplete == DEFAULT_AUTOCOMPLETE
+            {
+                config.autocomplete.clear();
+            }
             continue;
         }
 
@@ -292,20 +327,36 @@ impl Search {
         }
     }
 
+    /// The local answer, curated as an upstream one is: hidden versions dropped, and
+    /// autocomplete `?id=` answered with that package's cached versions.
+    #[allow(clippy::too_many_arguments)]
     async fn local(
         self,
         state: &AppState,
         query: &str,
+        id: Option<&str>,
         skip: usize,
         take: usize,
         prerelease: bool,
         sem_ver_level: Option<&str>,
     ) -> Vec<u8> {
-        match self {
-            Search::Query => {
-                local_search_results(state, query, skip, take, prerelease, sem_ver_level).await
+        match (self, id) {
+            (Search::Query, _) => {
+                let body =
+                    local_search_results(state, query, skip, take, prerelease, sem_ver_level).await;
+                filter_search_results(state, String::from_utf8_lossy(&body).into_owned()).await
             }
-            Search::Autocomplete => {
+            (Search::Autocomplete, Some(id)) => {
+                let versions: Vec<String> = get_cached_versions(&state.storage, id)
+                    .await
+                    .into_iter()
+                    .filter(|v| prerelease || !v.contains('-'))
+                    .filter(|v| sem_ver_level == Some("2.0.0") || !is_semver2_version(v))
+                    .collect();
+                let body = serde_json::json!({ "totalHits": versions.len(), "data": versions });
+                filter_autocomplete_versions(state, id, body.to_string()).await
+            }
+            (Search::Autocomplete, None) => {
                 local_autocomplete_results(state, query, skip, take, prerelease, sem_ver_level)
                     .await
             }
@@ -351,10 +402,12 @@ async fn proxied_search(
     let take = params.take.unwrap_or(20);
     let prerelease = params.prerelease.unwrap_or(false);
     let sem_ver_level = params.sem_ver_level;
+    let id = params.id;
     let local = || {
         kind.local(
             state,
             &query,
+            id.as_deref(),
             skip,
             take,
             prerelease,
@@ -379,6 +432,10 @@ async fn proxied_search(
         Search::Query => &state.config.nuget.search_service,
         Search::Autocomplete => &state.config.nuget.autocomplete,
     };
+    // An endpoint discovery refused (`discover_search_endpoints`): the local index answers.
+    if service.is_empty() {
+        return with_json(local().await);
+    }
     let url = format!("{service}?{qs}");
 
     match proxy_fetch_text(
