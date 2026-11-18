@@ -1107,6 +1107,11 @@ async fn build_suite(
     update_young(state, repo, suite, young, &skipped, min_age, now)
         .await
         .map_err(BuildError::Internal)?;
+    // The download gate's dated files follow the ledgers this build wrote.
+    state.deb_dated.lock().remove(repo);
+    if let Err(e) = dated(state, repo, true).await {
+        tracing::warn!(repo, error = %e, "deb proxy: dated pool files not reloaded");
+    }
 
     let release = release_text(&rel, &state.config.deb.architectures, &files);
     let inrelease = signer.clearsign(&release).map_err(BuildError::Internal)?;
@@ -1351,6 +1356,123 @@ async fn load_young(state: &AppState, repo: &str) -> Result<Arc<Young>, String> 
     Ok(y)
 }
 
+/// Every pool file a ledger of `repo` dates (listed or retired). The cached set is reused
+/// as is; with `recheck`, once it is `YOUNG_TTL` old, only while the ledger listing is
+/// unchanged (another process's builds), so a stream of undated requests lists at most
+/// that often.
+// ponytail: one in-memory set of every ledgered filename per repository (Ubuntu main +
+// universe is ~10^5 names, a few tens of MiB); an on-disk filename index if that grows.
+async fn dated(
+    state: &AppState,
+    repo: &str,
+    recheck: bool,
+) -> Result<Arc<HashSet<String>>, String> {
+    let cached = state.deb_dated.lock().get(repo).cloned();
+    if let Some((at, _, files)) = &cached {
+        if !recheck || at.elapsed() < YOUNG_TTL {
+            return Ok(files.clone());
+        }
+    }
+    let listing: Vec<(String, u64, u64)> = state
+        .storage
+        .list_with_meta(&format!("{}/ledger/", meta(repo)))
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(k, m)| (k, m.size, m.modified))
+        .collect();
+    if let Some((_, seen, files)) = cached {
+        if seen == listing {
+            state
+                .deb_dated
+                .lock()
+                .insert(repo.to_string(), (Instant::now(), listing, files.clone()));
+            return Ok(files);
+        }
+    }
+    let mut files = HashSet::new();
+    for (key, ..) in &listing {
+        let Some(ledger) = read_json::<Ledger>(state, key).await? else {
+            continue;
+        };
+        files.extend(ledger.seen.into_keys());
+        files.extend(ledger.retired.into_iter().map(|s| s.filename));
+    }
+    let files = Arc::new(files);
+    state
+        .deb_dated
+        .lock()
+        .insert(repo.to_string(), (Instant::now(), listing, files.clone()));
+    Ok(files)
+}
+
+/// What NORA knows of a pool file across every `[deb.proxies]` repository: one pool can be
+/// served through an entry other than the one whose suites list it.
+enum Sighting {
+    Held(String, String, i64),
+    Dated,
+    Undated,
+}
+
+/// `Err`: a hold set that cannot be read.
+async fn sighting(
+    state: &AppState,
+    repos: &[&str],
+    path: &str,
+    recheck: bool,
+) -> Result<Sighting, String> {
+    for repo in repos {
+        if let Some((name, version, first_seen)) = load_young(state, repo)
+            .await?
+            .values()
+            .find_map(|m| m.get(path))
+        {
+            return Ok(Sighting::Held(name.clone(), version.clone(), *first_seen));
+        }
+    }
+    for repo in repos {
+        // An unreadable ledger dates nothing: the file is judged as undated.
+        if dated(state, repo, recheck)
+            .await
+            .is_ok_and(|f| f.contains(path))
+        {
+            return Ok(Sighting::Dated);
+        }
+    }
+    Ok(Sighting::Undated)
+}
+
+/// Name and version of a pool `.deb` of a configured architecture or `all`; `None` for
+/// any other file (`.udeb`, other architectures), which keeps the first-sight rule.
+fn judged_package<'a>(path: &'a str, archs: &[String]) -> Option<(&'a str, &'a str)> {
+    let file = path.rsplit('/').next()?.strip_suffix(".deb")?;
+    let mut parts = file.splitn(3, '_');
+    let (name, version, arch) = (parts.next()?, parts.next()?, parts.next()?);
+    (arch == "all" || archs.iter().any(|a| a == arch)).then_some((name, version))
+}
+
+/// Refresh every suite NORA has built, of every repository, at once (each under its
+/// `metadata_ttl`, waiting at most `STALE_AFTER` on one with a previous build).
+async fn refresh_built_suites(state: &AppState) {
+    let mut refreshes = Vec::new();
+    for (repo, up) in &state.config.deb.proxies {
+        let Ok(keys) = state.storage.list(&format!("{}/dists/", meta(repo))).await else {
+            continue;
+        };
+        for key in keys {
+            let suite = key
+                .strip_prefix(&format!("{}/dists/", meta(repo)))
+                .and_then(|k| k.strip_suffix("/state.json"));
+            if let Some(suite) = suite.filter(|s| valid_token(s)).map(str::to_string) {
+                refreshes.push(async move {
+                    let _ = ensure_suite(state, repo, up, &suite).await;
+                });
+            }
+        }
+    }
+    futures::future::join_all(refreshes).await;
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 fn file_response(data: Bytes, content_type: &'static str, immutable: bool) -> Response {
@@ -1455,25 +1577,65 @@ pub(crate) async fn serve(
     }
 }
 
-/// The curation check of a package download: a held version is refused (403 in
-/// enforce, logged in audit).
+/// The curation check of a package download, by the file's date (audit A044): a version
+/// any repository holds is refused (403 in enforce, logged in audit); one a ledger dates
+/// passes; a `.deb` of a configured architecture or `all` that no ledger dates, even after
+/// the built suites are refreshed, is judged by `[curation.deb] unknown_date`.
 pub(crate) async fn package_gate(
     state: &AppState,
     headers: &HeaderMap,
     repo: &str,
     path: &str,
 ) -> Option<Response> {
-    // Unknown holds: no download passes (audit A043).
-    let Ok(young) = load_young(state, repo).await else {
-        return Some(
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(header::RETRY_AFTER, "30")],
+    let repos: Vec<&str> = std::iter::once(repo)
+        .chain(
+            state
+                .config
+                .deb
+                .proxies
+                .keys()
+                .map(String::as_str)
+                .filter(|r| *r != repo),
+        )
+        .collect();
+    let mut found = sighting(state, &repos, path, false).await;
+    let mut judged = None;
+    if matches!(found, Ok(Sighting::Undated)) {
+        judged = judged_package(path, &state.config.deb.architectures).filter(|_| {
+            state
+                .curation()
+                .curation_engine
+                .reads_release_date(RegistryType::Deb)
+        });
+        if judged.is_some() {
+            refresh_built_suites(state).await;
+            found = sighting(state, &repos, path, true).await;
+        }
+    }
+    let (name, version, date) = match found {
+        // Unknown holds: no download passes (audit A043).
+        Err(_) => {
+            return Some(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::RETRY_AFTER, "30")],
+                )
+                    .into_response(),
             )
-                .into_response(),
-        );
+        }
+        Ok(Sighting::Held(name, version, first_seen)) => (name, version, Some(first_seen)),
+        Ok(Sighting::Dated) => return None,
+        Ok(Sighting::Undated) => {
+            let (name, version) = judged?;
+            tracing::warn!(repo, path, "[AUDIT] deb: undated pool file");
+            let date =
+                state
+                    .curation()
+                    .curation_engine
+                    .judged_release_date(RegistryType::Deb, true, None);
+            (name.to_string(), version.to_string(), date)
+        }
     };
-    let (name, version, first_seen) = young.values().find_map(|m| m.get(path))?.clone();
     let engine = &state.curation().curation_engine;
     crate::curation::check_download(
         engine,
@@ -1482,7 +1644,7 @@ pub(crate) async fn package_gate(
         RegistryType::Deb,
         &name,
         crate::curation::RequestVersion::Known(version),
-        Some(first_seen),
+        date,
     )
 }
 
@@ -1973,6 +2135,127 @@ mod integration_tests {
             StatusCode::NOT_FOUND,
             "only the files NORA's Release names"
         );
+    }
+
+    /// A filtered repo `debian` (min_release_age 3d, enforce) and a pool-only `pool` on the
+    /// same upstream; `unknown_date` for deb as given.
+    fn undated_ctx(
+        uri: String,
+        keydir: &tempfile::TempDir,
+        ttl: i64,
+        unknown: Option<crate::config::UnknownDate>,
+    ) -> TestContext {
+        let dir = keydir.path().to_str().unwrap().to_string();
+        create_test_context_with_config(move |cfg| {
+            cfg.deb.enabled = true;
+            cfg.deb.metadata_ttl = ttl;
+            cfg.deb.upstream_keyring_dir = dir;
+            cfg.deb
+                .proxies
+                .insert("debian".into(), RepoProxyEntry::Simple(uri.clone()));
+            cfg.deb
+                .proxies
+                .insert("pool".into(), RepoProxyEntry::Simple(uri));
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.deb.min_release_age = Some("3d".into());
+            cfg.curation.deb.quarantine = Some(QuarantineMode::Observe);
+            cfg.curation.deb.unknown_date = unknown;
+        })
+    }
+
+    async fn mount_pool(server: &MockServer, files: &[&str]) {
+        for f in files {
+            Mock::given(method("GET"))
+                .and(path(format!("/pool/main/{f}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(f.as_bytes().to_vec()))
+                .mount(server)
+                .await;
+        }
+    }
+
+    /// A044: a version published after NORA's last look at a suite is dated by a refresh
+    /// on its download and held, through the repo whose suite lists it and through
+    /// another entry serving the same pool; a file a ledger dates passes through both.
+    #[tokio::test]
+    async fn an_undated_pool_file_of_a_tracked_suite_is_refused() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        publish(&server, &key, &[("a", "1")]).await;
+        let ctx = undated_ctx(server.uri(), &keydir, 0, None);
+        served(&ctx).await;
+        publish(&server, &key, &[("a", "2")]).await;
+        mount_pool(&server, &["a_1_amd64.deb"]).await;
+        let get = |p: &'static str| send(&ctx.app, Method::GET, p, "");
+        let status = |p: &'static str| async move { get(p).await.status() };
+        assert_eq!(
+            status("/deb/debian/pool/main/a_2_amd64.deb").await,
+            StatusCode::FORBIDDEN,
+            "the suite was not asked for since a 2 appeared"
+        );
+        assert_eq!(
+            status("/deb/debian/pool/main/a_1_amd64.deb").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status("/deb/pool/pool/main/a_2_amd64.deb").await,
+            StatusCode::FORBIDDEN,
+            "another entry's hold applies to the same pool"
+        );
+        assert_eq!(
+            status("/deb/pool/pool/main/a_1_amd64.deb").await,
+            StatusCode::OK,
+            "another entry's ledger dates it"
+        );
+    }
+
+    /// A044: a `.deb` of a configured architecture or `all` that no ledger dates after the
+    /// refresh is judged by `unknown_date`: `hold` refuses it, `log` serves and counts it;
+    /// `.udeb` and other architectures keep the first-sight rule.
+    #[tokio::test]
+    async fn an_undated_pool_file_is_judged_by_unknown_date() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        publish(&server, &key, &[("a", "1")]).await;
+        mount_pool(
+            &server,
+            &[
+                "z_1_amd64.deb",
+                "x_1_all.deb",
+                "n_1_i386.deb",
+                "d_1_amd64.udeb",
+            ],
+        )
+        .await;
+        let hold = undated_ctx(
+            server.uri(),
+            &keydir,
+            3600,
+            Some(crate::config::UnknownDate::Hold),
+        );
+        served(&hold).await;
+        let status = |ctx: &TestContext, p: &str| {
+            let (app, p) = (ctx.app.clone(), p.to_string());
+            async move { send(&app, Method::GET, &p, "").await.status() }
+        };
+        for (p, want) in [
+            ("/deb/debian/pool/main/z_1_amd64.deb", StatusCode::FORBIDDEN),
+            ("/deb/pool/pool/main/x_1_all.deb", StatusCode::FORBIDDEN),
+            ("/deb/debian/pool/main/a_1_amd64.deb", StatusCode::OK),
+            ("/deb/debian/pool/main/n_1_i386.deb", StatusCode::OK),
+            ("/deb/debian/pool/main/d_1_amd64.udeb", StatusCode::OK),
+        ] {
+            assert_eq!(status(&hold, p).await, want, "{p}");
+        }
+
+        let log = undated_ctx(server.uri(), &keydir, 3600, None);
+        let counter =
+            crate::metrics::CURATION_UNKNOWN_RELEASE_DATE_TOTAL.with_label_values(&["deb"]);
+        let before = counter.get();
+        assert_eq!(
+            status(&log, "/deb/debian/pool/main/z_1_amd64.deb").await,
+            StatusCode::OK
+        );
+        assert!(counter.get() > before, "a logged undated file is counted");
     }
 
     /// jammy-updates and jammy-security list one pool file, days apart (issues-maestra#1649);

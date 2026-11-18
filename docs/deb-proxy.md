@@ -94,8 +94,8 @@ stored in its storage (`deb/<repo>/.nora-meta/proxy/ledger/`). An index NORA see
 first time dates everything it lists as 0 ("before NORA"), except a file another ledger
 already dates, so switching the hold on, or a build asking for a new suite, never hides a
 whole distribution and never releases a version another suite still holds. A version that appeared
-upstream while nobody asked NORA for that suite is dated by NORA's next look: it is held
-longer, never shorter. One pool file listed by several suites (Ubuntu's `jammy-updates`
+upstream while nobody asked NORA for that suite is dated by NORA's next look, which its
+own download triggers (step 4): it is held longer, never shorter. One pool file listed by several suites (Ubuntu's `jammy-updates`
 and `jammy-security` share a kernel `.deb`, often days apart) is as old as its first
 sighting in any of them: a build dates its young files from every other ledger of the
 repository (other suites, components and architectures: an `_all.deb` is in every arch
@@ -128,10 +128,21 @@ serves is dropped.
    `Acquire-By-Hash: yes`. Translations, Contents and other index files are not served.
    It is signed as `InRelease` and `Release.gpg`. A suite is rebuilt when the upstream
    `InRelease` changes or an age-held version matures.
-4. A `.deb` of a held version is refused (403, curation `enforce`; logged in `audit`),
-   unless a published suite serves that file: apt found it in that suite's index. The
-   allow list (`[curation.deb] allow`) releases a version early. Packages pass the digest
-   quarantine like any proxied file.
+4. A `.deb` download is judged by the file's date, looked up in every `[deb.proxies]`
+   repository (a pool can be served through an entry other than the one whose suites
+   list it, such as a `debian-archive-security` beside `debian-security`). A file any
+   repository holds is refused (403, curation `enforce`; logged in `audit`), unless a
+   published suite serves that file: apt found it in that suite's index. A file a ledger
+   dates passes. A `.deb` of a configured architecture or `_all` that no ledger dates
+   (a version published after NORA's last look at its suite, or a suite NORA never
+   built) first refreshes every suite NORA has built (each under `metadata_ttl`, at once,
+   waiting at most 10 s on one with a previous build), then is judged by
+   `[curation.deb] unknown_date`: `log` (the default) serves it and logs
+   `[AUDIT] deb: undated pool file` with the repo and path plus
+   `nora_curation_unknown_release_date_total{registry="deb"}`; `hold` refuses it as
+   released now. `.udeb` and other architectures are not judged. The allow list
+   (`[curation.deb] allow`) releases a version early, and the bypass token passes a
+   download. Packages pass the digest quarantine like any proxied file.
 5. A version the curation chain refuses by rule in `enforce` (`internal_namespaces`, the
    blocklist, the allowlist) is held whatever its age or `allow` exemption: left out of
    `Packages`, never a stand-in, its `.deb` refused with the rule. Such a hold never

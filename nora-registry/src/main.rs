@@ -462,6 +462,11 @@ pub(crate) type DebYoungCache = HashMap<
     ),
 >;
 
+/// deb proxy dated pool files: repository → (checked at, its ledger listing as (key, size,
+/// modified) when last read, every pool file those ledgers date).
+pub(crate) type DebDatedCache =
+    HashMap<String, (Instant, Vec<(String, u64, u64)>, Arc<HashSet<String>>)>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Storage,
@@ -536,6 +541,9 @@ pub struct AppState {
     /// (registry/deb_proxy.rs). Per state, so two servers in one process never share it.
     #[allow(dead_code)] // read only with the deb feature
     pub(crate) deb_young: Arc<parking_lot::Mutex<DebYoungCache>>,
+    /// deb proxy: pool files some ledger dates, per repository (registry/deb_proxy.rs).
+    #[allow(dead_code)] // read only with the deb feature
+    pub(crate) deb_dated: Arc<parking_lot::Mutex<DebDatedCache>>,
     /// Off-request-path docker pull-stats accumulator (#1114): a manifest GET
     /// bumps the per-key counter here; a background task flushes it in batches
     /// to a `.stats.json` sidecar, so `.meta.json` is never rewritten by a pull.
@@ -2391,6 +2399,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         cancel_token: cancel_token.clone(),
         nuget_hosted: Default::default(),
         deb_young: Default::default(),
+        deb_dated: Default::default(),
         pull_stats: Arc::new(registry::docker::PullStatsAccumulator::default()),
         tasks,
         maintenance,
