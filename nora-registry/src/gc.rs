@@ -22,7 +22,7 @@ use prometheus::{
 };
 use tracing::{info, warn};
 
-use crate::storage::Storage;
+use crate::storage::{FileMeta, Storage};
 use crate::validation::ends_with_ci;
 use crate::PublishLocks;
 
@@ -149,26 +149,91 @@ async fn gc_list(storage: &Storage, prefix: &str) -> Vec<String> {
 /// "this layer exists" skips its upload and references the layer from a manifest it has not
 /// pushed yet, so to GC the blob is as live as one written at that moment: the sweep treats a
 /// confirmation younger than `grace_secs` like an mtime younger than it. In memory, so it
-/// costs the HEAD no storage write; it covers one process: a second replica (or `nora gc` run
-/// from the CLI beside the server) does not see the confirmations of the first.
+/// covers one process; a sweep in another one (a second replica, the other pod of a rollout,
+/// `nora gc --apply`) is held off by the storage handshake ([`durably_confirmed`]).
 static CONFIRMED_BLOBS: LazyLock<parking_lot::Mutex<HashMap<String, Instant>>> =
     LazyLock::new(Default::default);
 
-/// Run `stat`, the existence check behind a blob `HEAD` or mount of `keys`, so that the GC
-/// sweep cannot delete a blob the client is told exists. Each key is recorded under its
-/// publish lock BEFORE the check: the sweep deletes under the same lock, so it either sees the
-/// record and keeps the blob, or has already deleted it and `stat` answers "absent". A key
-/// that turns out absent is forgotten again, so the set holds only existing blobs, and the
-/// maintenance tick drops records older than the grace ([`forget_old_confirmations`]).
-/// `enabled` is `gc.enabled`: with no sweep in this process there is nothing to protect from.
-pub(crate) async fn confirm_blob<T>(
-    enabled: bool,
+/// Storage half of a confirmation (A030): `<prefix><key>` says a client was told `key` exists.
+/// A sweep in any process skips a blob whose marker is younger than the grace.
+const GC_CONFIRMED_PREFIX: &str = ".nora-gc-confirmed/";
+/// `<prefix><key>` says a sweep is about to delete `key`: a confirmation that sees it answers
+/// "absent".
+const GC_DELETING_PREFIX: &str = ".nora-gc-deleting/";
+/// An intent older than this is a crashed sweep's: confirmations ignore it, and a sweep that
+/// took half of it between its intent and its delete keeps the blob.
+const GC_INTENT_TTL_SECS: u64 = 300;
+/// Blobs this close to the grace age are confirmed in storage too: a push checks a blob a
+/// little before a sweep that started earlier judges its age.
+const GC_HANDSHAKE_MARGIN_SECS: u64 = 3600;
+
+/// Keys whose storage confirmation this process wrote, with the time: one write per key per
+/// half grace, which keeps the marker younger than the grace for every sweep that reads it.
+static MARKED_BLOBS: LazyLock<parking_lot::Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(Default::default);
+
+/// The first of `keys` that exists, with its metadata.
+async fn stat_first<'k>(storage: &Storage, keys: &[&'k str]) -> Option<(&'k str, FileMeta)> {
+    for key in keys {
+        if let Some(meta) = storage.stat(key).await {
+            return Some((key, meta));
+        }
+    }
+    None
+}
+
+/// The cross-process half of [`confirm_blob`] for `key`, found with `meta`. Write the
+/// confirmation marker first, then look for a sweep's intent, then at the blob again; the
+/// sweep writes its intent first, then reads the marker. On a strongly consistent store one of
+/// the two sees the other: the sweep keeps the blob, or this answers "absent" and the client
+/// uploads the layer or its push is refused. A blob too young for any sweep needs nothing.
+async fn durably_confirmed(storage: &Storage, key: &str, meta: &FileMeta, grace_secs: u64) -> bool {
+    let age = now_unix_secs().saturating_sub(meta.modified);
+    if age.saturating_add(GC_HANDSHAKE_MARGIN_SECS) < grace_secs {
+        return true;
+    }
+    let marked = MARKED_BLOBS.lock().get(key).copied();
+    if marked.is_some_and(|at| at.elapsed().as_secs() < grace_secs / 2) {
+        return true;
+    }
+    let at = Instant::now();
+    let marker = format!("{GC_CONFIRMED_PREFIX}{key}");
+    if let Err(e) = storage
+        .put(&marker, now_unix_secs().to_string().as_bytes())
+        .await
+    {
+        warn!("GC: cannot record the confirmation of {key}, answering absent: {e}");
+        return false;
+    }
+    if let Some(intent) = storage.stat(&format!("{GC_DELETING_PREFIX}{key}")).await {
+        if now_unix_secs().saturating_sub(intent.modified) < GC_INTENT_TTL_SECS {
+            return false;
+        }
+    }
+    if storage.stat(key).await.is_none() {
+        return false;
+    }
+    MARKED_BLOBS.lock().insert(key.to_string(), at);
+    true
+}
+
+/// The existence check behind a blob `HEAD`, a mount or a manifest push: the first of `keys`
+/// that exists, so that the GC sweep cannot delete a blob the client is told exists. Each key
+/// is recorded under its publish lock BEFORE the check: the sweep of this process deletes under
+/// the same lock, so it either sees the record and keeps the blob, or has already deleted it
+/// and the check answers "absent". A sweep in another process is held off by the storage
+/// handshake ([`durably_confirmed`]). A key that turns out absent is forgotten again, so the
+/// set holds only existing blobs, and the maintenance tick drops records older than the grace
+/// ([`forget_old_confirmations`]). With `gc.enabled` off nothing is recorded, so a
+/// `nora gc --apply` beside such a server is not safe.
+pub(crate) async fn confirm_blob(
+    gc: &crate::config::GcConfig,
+    storage: &Storage,
     publish_locks: &PublishLocks,
     keys: &[&str],
-    stat: impl std::future::Future<Output = Option<T>>,
-) -> Option<T> {
-    if !enabled {
-        return stat.await;
+) -> Option<FileMeta> {
+    if !gc.enabled {
+        return stat_first(storage, keys).await.map(|(_, meta)| meta);
     }
     let at = Instant::now();
     let mut first: Vec<&str> = Vec::new();
@@ -179,7 +244,12 @@ pub(crate) async fn confirm_blob<T>(
             first.push(key);
         }
     }
-    let found = stat.await;
+    let found = match stat_first(storage, keys).await {
+        Some((key, meta)) if durably_confirmed(storage, key, &meta, gc.grace_secs).await => {
+            Some(meta)
+        }
+        _ => None,
+    };
     if found.is_none() {
         // Forget only what this call recorded for the first time and nobody refreshed since.
         // `None` is also what a failed stat answers: it must not take away the confirmation
@@ -212,6 +282,72 @@ pub(crate) fn forget_old_confirmations(grace_secs: u64) {
     CONFIRMED_BLOBS
         .lock()
         .retain(|_, at| at.elapsed().as_secs() < grace_secs);
+    MARKED_BLOBS
+        .lock()
+        .retain(|_, at| at.elapsed().as_secs() < grace_secs / 2);
+}
+
+/// The sweep half of the handshake (see [`durably_confirmed`]) for a Docker orphan, called
+/// under its publish lock: whether a client in any process was told within the grace that it
+/// exists. Outside a dry run the intent is written first, and stays for the caller to remove
+/// after its delete.
+async fn confirmed_in_storage(
+    storage: &Storage,
+    key: &str,
+    grace_secs: u64,
+    dry_run: bool,
+) -> Result<bool, crate::storage::StorageError> {
+    if !dry_run {
+        let intent = format!("{GC_DELETING_PREFIX}{key}");
+        storage
+            .put(&intent, now_unix_secs().to_string().as_bytes())
+            .await?;
+    }
+    let marker = storage.stat(&format!("{GC_CONFIRMED_PREFIX}{key}")).await;
+    Ok(marker.is_some_and(|m| now_unix_secs().saturating_sub(m.modified) < grace_secs))
+}
+
+/// Remove a sweep's own intent. One that stays is ignored after its TTL and purged once its
+/// blob is gone.
+async fn drop_intent(storage: &Storage, intent: &str) {
+    if let Err(e) = storage.delete(intent).await {
+        warn!("GC: deleting the intent {intent} failed, it expires: {e}");
+    }
+}
+
+/// Remove the handshake markers nobody reads any more: a confirmation older than the grace or
+/// an intent older than its TTL, once its blob is gone. A marker of a blob that is still there
+/// stays: nothing could stop a push re-writing it between this look and the delete, and an old
+/// one is ignored by both sides.
+async fn purge_gc_markers(storage: &Storage, grace_secs: u64) {
+    for (prefix, max_age) in [
+        (GC_CONFIRMED_PREFIX, grace_secs),
+        (GC_DELETING_PREFIX, GC_INTENT_TTL_SECS),
+    ] {
+        let markers = match storage.list_internal(prefix).await {
+            Ok(markers) => markers,
+            Err(e) => {
+                warn!("GC: listing {prefix} failed, its markers stay: {e}");
+                GC_LIST_FAILURES.inc();
+                continue;
+            }
+        };
+        for marker in markers {
+            let Some(meta) = storage.stat(&marker).await else {
+                continue;
+            };
+            let Some(blob) = marker.strip_prefix(prefix) else {
+                continue;
+            };
+            if now_unix_secs().saturating_sub(meta.modified) >= max_age
+                && storage.stat(blob).await.is_none()
+            {
+                if let Err(e) = storage.delete(&marker).await {
+                    warn!("GC: deleting the marker {marker} failed: {e}");
+                }
+            }
+        }
+    }
 }
 
 /// Whether `key` was confirmed to a client within `grace_secs`. Read under the key's publish
@@ -298,6 +434,9 @@ pub async fn run_gc(
 
     let mut all_orphans: Vec<String> = Vec::new();
     let mut total_candidates = 0usize;
+    // Ages are judged as of the start of the pass, before the mark: a blob a push checked
+    // after this moment and found younger than the grace is younger than it here too.
+    let now = now_unix_secs();
 
     // Docker orphan detection (existing logic)
     let docker_result = detect_docker_orphans(storage).await;
@@ -354,7 +493,6 @@ pub async fn run_gc(
     let mut skipped_recent = 0usize;
     let mut stat_failures = 0usize;
     let mut delete_failures = 0u64;
-    let now = now_unix_secs();
 
     for key in &all_orphans {
         // Grace period (#584): never reap an orphan whose backing file is
@@ -398,9 +536,40 @@ pub async fn run_gc(
             }
         }
 
+        // A Docker object a client of another process was told exists (A030): the intent is
+        // written first, the confirmation read second (see `durably_confirmed`).
+        let docker = key.starts_with("docker/");
+        let intent = format!("{GC_DELETING_PREFIX}{key}");
+        let intent_at = Instant::now();
+        if docker {
+            match confirmed_in_storage(storage, key, grace_secs, dry_run).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    skipped_recent += 1;
+                    if !dry_run {
+                        drop_intent(storage, &intent).await;
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    warn!("GC: cannot record the delete of {key}, it stays: {e}");
+                    delete_failures += 1;
+                    continue;
+                }
+            }
+        }
+
         if dry_run {
             bytes_freed += meta.size;
             info!("[dry-run] Would delete: {} ({} bytes)", key, meta.size);
+            continue;
+        }
+        // Confirmations ignore an intent older than its TTL: a sweep that stalled that long
+        // keeps the blob rather than delete it unseen.
+        if docker && intent_at.elapsed().as_secs() >= GC_INTENT_TTL_SECS / 2 {
+            warn!("GC: the delete of {key} stalled past half the intent TTL, it stays");
+            skipped_recent += 1;
+            drop_intent(storage, &intent).await;
             continue;
         }
 
@@ -415,8 +584,14 @@ pub async fn run_gc(
                 delete_failures += 1;
             }
         }
+        if docker {
+            drop_intent(storage, &intent).await;
+        }
     }
     GC_DELETE_FAILURES.inc_by(delete_failures);
+    if !dry_run {
+        purge_gc_markers(storage, grace_secs).await;
+    }
 
     if skipped_recent > 0 {
         info!(
@@ -5125,6 +5300,13 @@ mod fail_closed_tests {
         .await
     }
 
+    fn gc_on() -> crate::config::GcConfig {
+        crate::config::GcConfig {
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
     async fn put_all(storage: &Storage, keys: &[&str]) {
         for key in keys {
             storage.put(key, b"0123456789").await.unwrap();
@@ -5368,27 +5550,29 @@ mod fail_closed_tests {
         put_all(&storage, &[reused, unused]).await;
         outage.age_all(30 * DAY);
         let publish_locks = locks();
+        let on = gc_on();
+        let off = crate::config::GcConfig::default();
 
-        let found = confirm_blob(true, &publish_locks, &[reused], storage.stat(reused)).await;
+        let found = confirm_blob(&on, &storage, &publish_locks, &[reused]).await;
         assert!(found.is_some());
         // An absent blob leaves no record behind; a disabled GC records nothing.
         let absent = "docker/c06-unit/blobs/sha256:absent";
-        assert!(
-            confirm_blob(true, &publish_locks, &[absent], storage.stat(absent))
-                .await
-                .is_none()
-        );
-        confirm_blob(false, &publish_locks, &[unused], storage.stat(unused)).await;
+        assert!(confirm_blob(&on, &storage, &publish_locks, &[absent])
+            .await
+            .is_none());
+        confirm_blob(&off, &storage, &publish_locks, &[unused]).await;
         assert!(!recently_confirmed(absent, 7 * DAY));
         assert!(!recently_confirmed(unused, 7 * DAY));
 
         // A later request whose stat fails (`None` is also what a timed-out HEAD answers) does
         // not take away the confirmation the first client was given.
-        let failed = std::future::ready(None::<()>);
-        assert!(confirm_blob(true, &publish_locks, &[reused], failed)
+        outage.fail_stats_of(reused);
+        assert!(confirm_blob(&on, &storage, &publish_locks, &[reused])
             .await
             .is_none());
         assert!(recently_confirmed(reused, 7 * DAY));
+        outage.end();
+        outage.age_all(30 * DAY);
 
         let result = gc(&storage, 7 * DAY).await;
 
@@ -5424,6 +5608,149 @@ mod fail_closed_tests {
         let result = gc(&storage, 7 * DAY).await;
         assert_eq!((result.deleted, result.skipped_recent), (0, 1));
         assert!(storage.stat(&key).await.is_some());
+    }
+
+    /// A030: the sweep of another process (the other pod of a rollout, `nora gc --apply`)
+    /// sees none of the serving process's memory. The confirmation a `HEAD` wrote to storage
+    /// keeps the layer the client was told exists.
+    #[tokio::test]
+    async fn a_blob_head_protects_the_layer_from_a_sweep_in_another_process() {
+        use sha2::Digest;
+        let (storage, outage) = outage_storage();
+        let layer = b"a030 head layer";
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(layer)));
+        let key = format!("docker/a030-head/blobs/{digest}");
+        storage.put(&key, layer).await.unwrap();
+        outage.age_all(30 * DAY);
+        let ctx = crate::test_helpers::create_test_context_with_storage_and_config(
+            storage.clone(),
+            |config| config.gc.enabled = true,
+        );
+
+        let head = crate::test_helpers::send(
+            &ctx.app,
+            axum::http::Method::HEAD,
+            &format!("/v2/a030-head/blobs/{digest}"),
+            "",
+        )
+        .await;
+        assert_eq!(head.status(), axum::http::StatusCode::OK);
+        // The sweeping process has its own, empty memory and its own locks.
+        CONFIRMED_BLOBS.lock().remove(&key);
+
+        let result = gc(&storage, 7 * DAY).await;
+        assert_eq!((result.deleted, result.skipped_recent), (0, 1));
+        assert!(storage.stat(&key).await.is_some());
+    }
+
+    /// A030: a sweep in another process and a manifest push referencing its orphan, in both
+    /// orders of the handshake. The push checks the layer while the sweep waits at its stat of
+    /// the blob (the push wins: 201, the sweep then reads the confirmation and keeps it), or
+    /// after the sweep wrote its intent (the push sees it and is refused). A stored manifest
+    /// never loses its layer. Before, the push got 201 and the sweep deleted the layer.
+    #[tokio::test]
+    async fn a_sweep_in_another_process_racing_a_manifest_push_never_leaves_it_without_its_layer() {
+        use axum::http::StatusCode;
+        use sha2::Digest;
+        for (name, park, expected) in [
+            ("a030-push-first", "docker/", StatusCode::CREATED),
+            (
+                "a030-sweep-first",
+                GC_CONFIRMED_PREFIX,
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let (storage, outage) = outage_storage();
+            let layer = format!("{name} layer");
+            let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&layer)));
+            let key = format!("docker/{name}/blobs/{digest}");
+            storage.put(&key, layer.as_bytes()).await.unwrap();
+            outage.age_all(30 * DAY);
+            let ctx = crate::test_helpers::create_test_context_with_storage_and_config(
+                storage.clone(),
+                |config| config.gc.enabled = true,
+            );
+
+            outage.park_next_stat_of(park);
+            let sweep = tokio::spawn({
+                let storage = storage.clone();
+                async move { gc(&storage, 7 * DAY).await }
+            });
+            while !outage.stat_parked() && !sweep.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let push = crate::test_helpers::send(
+                &ctx.app,
+                axum::http::Method::PUT,
+                &format!("/v2/{name}/manifests/v1"),
+                one_layer_manifest(&digest, layer.len()),
+            )
+            .await;
+            // What the push recorded in memory is not the sweeping process's.
+            CONFIRMED_BLOBS.lock().remove(&key);
+            outage.unpark_stat();
+            let sweep = sweep.await.unwrap();
+
+            let stored = storage
+                .stat(&format!("docker/{name}/manifests/v1.json"))
+                .await
+                .is_some();
+            let layer_left = storage.stat(&key).await.is_some();
+            assert!(
+                !stored || layer_left,
+                "{name}: a stored manifest lost its layer"
+            );
+            assert_eq!((sweep.deleted, push.status()), (0, expected), "{name}");
+            assert!(layer_left, "{name}: the sweep kept the confirmed layer");
+        }
+    }
+
+    /// A030: an intent a crashed sweep left behind blocks the pushes of its blob only for the
+    /// intent TTL; a live one answers "absent". The purge drops the markers whose blob is gone
+    /// once nobody honours them, and keeps the ones of a blob still there.
+    #[tokio::test]
+    async fn a_stale_intent_never_blocks_a_push_and_old_markers_are_purged() {
+        let (storage, outage) = outage_storage();
+        let (stale, live) = (
+            "docker/a030-ttl/blobs/sha256:stale",
+            "docker/a030-ttl/blobs/sha256:live",
+        );
+        put_all(&storage, &[stale, live]).await;
+        outage.age_all(30 * DAY);
+        let intent = |key: &str| format!("{GC_DELETING_PREFIX}{key}");
+        storage.put(&intent(stale), b"0").await.unwrap();
+        outage.age_markers(GC_INTENT_TTL_SECS);
+        assert!(confirm_blob(&gc_on(), &storage, &locks(), &[stale])
+            .await
+            .is_some());
+        outage.age_markers(0);
+        storage.put(&intent(live), b"0").await.unwrap();
+        assert!(confirm_blob(&gc_on(), &storage, &locks(), &[live])
+            .await
+            .is_none());
+
+        let gone = "docker/a030-ttl/blobs/sha256:gone";
+        for marker in [
+            format!("{GC_CONFIRMED_PREFIX}{gone}"),
+            intent(gone),
+            format!("{GC_CONFIRMED_PREFIX}{stale}"),
+        ] {
+            storage.put(&marker, b"0").await.unwrap();
+        }
+        outage.age_markers(8 * DAY);
+        purge_gc_markers(&storage, 7 * DAY).await;
+
+        let mut left = storage.list_internal(GC_CONFIRMED_PREFIX).await.unwrap();
+        left.extend(storage.list_internal(GC_DELETING_PREFIX).await.unwrap());
+        assert_eq!(
+            left,
+            [
+                format!("{GC_CONFIRMED_PREFIX}{live}"),
+                format!("{GC_CONFIRMED_PREFIX}{stale}"),
+                intent(live),
+                intent(stale),
+            ]
+        );
     }
 
     fn one_layer_manifest(digest: &str, size: usize) -> String {
