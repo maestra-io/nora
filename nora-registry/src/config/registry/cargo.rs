@@ -20,7 +20,8 @@ pub struct CargoConfig {
     /// Crates whose stored sparse index, found with no per-version entries beside it, may be
     /// imported as published versions at the next publish. Empty by default: such an index may as
     /// well be an upstream crate an older release cached, and a publish over it is refused until
-    /// the operator decides.
+    /// the operator decides. With `proxy` set, a name listed here (or in
+    /// `curation.internal_namespaces`) is also declared hosted: its first publish is allowed.
     /// ENV: NORA_CARGO_IMPORT_EMBEDDED (comma-separated names).
     #[serde(default)]
     pub import_embedded: Vec<String>,
