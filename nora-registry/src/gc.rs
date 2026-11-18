@@ -715,6 +715,9 @@ struct DockerDetectionResult {
     total: usize,
     orphans: Vec<String>,
     failed: bool,
+    /// Bytes of reference strings the mark graph held (R13: not the documents).
+    #[cfg(test)]
+    retained_bytes: usize,
 }
 
 /// Longest reference a stored manifest key can carry: a sha512 digest (`sha512:` + 128 hex);
@@ -778,6 +781,19 @@ struct ManifestRefs {
     blobs: HashSet<String>,
     children: HashSet<String>,
     subject: Option<String>,
+}
+
+#[cfg(test)]
+impl ManifestRefs {
+    /// Bytes of the reference strings kept for one manifest: what the mark retains of it.
+    fn retained_bytes(&self) -> usize {
+        self.blobs
+            .iter()
+            .chain(&self.children)
+            .chain(&self.subject)
+            .map(String::len)
+            .sum()
+    }
 }
 
 /// The un-namespaced legacy form of a namespaced repository (`docker/docker.io/x` ->
@@ -991,6 +1007,8 @@ async fn detect_docker_orphans(storage: &Storage) -> DockerDetectionResult {
         total,
         orphans,
         failed: !tainted.is_empty(),
+        #[cfg(test)]
+        retained_bytes: manifests.values().map(ManifestRefs::retained_bytes).sum(),
     }
 }
 
@@ -1004,6 +1022,8 @@ fn docker_mark_failure(total: usize, key: &str) -> DockerDetectionResult {
         total,
         orphans: Vec::new(),
         failed: true,
+        #[cfg(test)]
+        retained_bytes: 0,
     }
 }
 
@@ -2344,6 +2364,36 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// Audit A029 (review R13): the mark graph holds the references of each manifest, not the
+    /// manifest. Manifests of megabytes leave only their digest-shaped references behind.
+    #[tokio::test]
+    async fn test_gc_docker_mark_retains_references_not_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let mut expected = 0;
+        for i in 0..4 {
+            let config = format!("sha256:{i:064}");
+            let layer = format!("sha512:{i:0128}");
+            expected += config.len() + layer.len();
+            let manifest = serde_json::json!({
+                "schemaVersion": 2,
+                "config": {"digest": config, "annotations": "p".repeat(1 << 20)},
+                "layers": [{"digest": layer}, {"digest": format!("sha256:{}", "0".repeat(1 << 20))}],
+                "pad": vec![0; 1 << 18],
+            });
+            storage
+                .put(
+                    &format!("docker/big/manifests/v{i}.json"),
+                    manifest.to_string().as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        let result = detect_docker_orphans(&storage).await;
+        assert!(!result.failed);
+        assert_eq!(result.retained_bytes, expected);
     }
 
     #[tokio::test]

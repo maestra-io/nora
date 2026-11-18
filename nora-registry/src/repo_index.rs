@@ -337,10 +337,7 @@ async fn build(reg_type: RegistryType, state: &AppState) -> Option<Vec<RepoInfo>
         RegistryType::Nuget => build_nuget_index(state).await,
         RegistryType::Gems => build_gems_index(storage).await,
         RegistryType::Terraform => build_terraform_index(storage).await,
-        RegistryType::Ansible => {
-            let (p, s) = crate::registry::ansible::INDEX_PATTERN;
-            build_generic_index(storage, p, s).await
-        }
+        RegistryType::Ansible => build_ansible_index(storage).await,
         RegistryType::PubDart => {
             let (p, s) = crate::registry::pub_dart::INDEX_PATTERN;
             build_generic_index(storage, p, s).await
@@ -666,6 +663,37 @@ async fn build_terraform_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
             .map(|(k, (v, size, modified))| (k, (v.len(), size, modified)))
             .collect(),
     ))
+}
+
+/// Ansible: collection tarballs live at `ansible/download/{ns}-{name}-{ver}.tar.gz`, so the repo
+/// is `{ns}/{name}`, which the UI browses as namespace, then collection (A053), and the count is
+/// tarballs. The generic builder took the first segment and showed one repo, "download".
+async fn build_ansible_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let (prefix, suffix) = crate::registry::ansible::INDEX_PATTERN;
+    let prefix = format!("{prefix}download/");
+    let keys = list_keys(storage, &prefix).await?;
+    let mut collections: HashMap<String, (usize, u64, u64)> = HashMap::new();
+    for (key, meta) in &keys {
+        let Some(file) = key
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+            .filter(|file| !file.contains('/'))
+        else {
+            continue;
+        };
+        let mut parts = file.splitn(3, '-');
+        let (Some(ns), Some(name), Some(_)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        if ns.is_empty() || name.is_empty() {
+            continue;
+        }
+        let entry = collections.entry(format!("{ns}/{name}")).or_default();
+        entry.0 += 1;
+        entry.1 += meta.size;
+        entry.2 = entry.2.max(meta.modified);
+    }
+    Some(to_sorted_vec(collections))
 }
 
 /// Generic index builder: groups files under `prefix` by first path segment.

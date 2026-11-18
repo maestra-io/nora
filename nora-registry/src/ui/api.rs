@@ -585,19 +585,52 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
     DockerDetail { tags }
 }
 
-/// A directory browser's root: the first path segments of `registry`'s cached index, so the
-/// root page never lists the whole prefix per request (deeper pages list only their own).
-pub async fn index_root_listing(state: &AppState, registry: &str) -> Vec<RepoInfo> {
+/// What a row of [`index_dir_listing`] counts.
+#[derive(Clone, Copy)]
+pub enum DirCount {
+    /// The versions of the indexed names under the row.
+    Versions,
+    /// The indexed names under the row (Ansible's root: collections per namespace).
+    Names,
+}
+
+/// One level of a directory browser, from `registry`'s cached index: the next path segment of
+/// every indexed name under `path` ("" is the root), summed, and whether `path` is itself an
+/// indexed name. No page above an artifact lists its prefix per request (A053).
+pub async fn index_dir_listing(
+    state: &AppState,
+    registry: &str,
+    path: &str,
+    count: DirCount,
+) -> (Vec<RepoInfo>, bool) {
+    let path = path.trim_matches('/');
     let index = state.repo_index.get(registry, state).await;
     let mut groups: std::collections::BTreeMap<&str, (usize, u64, u64)> = Default::default();
+    let mut indexed = false;
     for repo in index.iter() {
-        let first = repo.name.split('/').next().unwrap_or_default();
-        let group = groups.entry(first).or_default();
-        group.0 += repo.versions;
+        if repo.name == path {
+            indexed = true;
+            continue;
+        }
+        let rest = if path.is_empty() {
+            Some(repo.name.as_str())
+        } else {
+            repo.name
+                .strip_prefix(path)
+                .and_then(|rest| rest.strip_prefix('/'))
+        };
+        let Some(child) = rest.and_then(|rest| rest.split('/').next()) else {
+            continue;
+        };
+        let group = groups.entry(child).or_default();
+        group.0 += match count {
+            DirCount::Versions => repo.versions,
+            DirCount::Names => 1,
+        };
         group.1 += repo.size;
         group.2 = group.2.max(repo.modified);
     }
-    groups
+    let entries = groups
         .into_iter()
         .map(|(name, (versions, size, modified))| RepoInfo {
             name: name.to_string(),
@@ -607,60 +640,8 @@ pub async fn index_root_listing(state: &AppState, registry: &str) -> Vec<RepoInf
             modified,
             ..Default::default()
         })
-        .collect()
-}
-
-/// List immediate children of a Maven namespace path for hierarchical browsing.
-/// Returns (entries, is_leaf_artifact). A leaf artifact has maven-metadata.xml.
-pub async fn get_maven_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>, bool) {
-    let prefix = if path.is_empty() {
-        "maven/".to_string()
-    } else {
-        format!("maven/{}/", path)
-    };
-    let keys = storage.list_with_meta(&prefix).await.unwrap_or_default();
-
-    if keys.is_empty() {
-        return (vec![], false);
-    }
-
-    // Leaf = no subdirectories (only direct files like JARs, POMs, checksums)
-    let has_subdirs = keys.iter().any(|(k, _)| {
-        k.strip_prefix(&prefix)
-            .is_some_and(|r| !r.is_empty() && r.contains('/'))
-    });
-    if !has_subdirs {
-        return (vec![], true);
-    }
-
-    // Group by immediate child segment (skip direct files like maven-metadata.xml)
-    let mut groups: HashMap<String, (usize, u64, u64)> = HashMap::new();
-    for (key, meta) in &keys {
-        if let Some(rest) = key.strip_prefix(&prefix) {
-            if rest.is_empty() || !rest.contains('/') {
-                continue;
-            }
-            let child_name = rest.split('/').next().unwrap_or(rest).to_string();
-            let entry = groups.entry(child_name).or_insert((0, 0, 0));
-            entry.0 += 1;
-            entry.1 += meta.size;
-            entry.2 = entry.2.max(meta.modified);
-        }
-    }
-
-    let mut result: Vec<RepoInfo> = groups
-        .into_iter()
-        .map(|(name, (count, size, modified))| RepoInfo {
-            name,
-            versions: count,
-            size,
-            updated: format_timestamp(modified),
-            ..Default::default()
-        })
         .collect();
-    result.sort_by(|a, b| a.name.cmp(&b.name));
-
-    (result, false)
+    (entries, indexed)
 }
 
 pub async fn get_maven_detail(storage: &Storage, path: &str) -> MavenDetail {
@@ -1002,142 +983,6 @@ pub async fn get_pypi_detail(
         prerelease_count,
         total_stable,
         metadata: PackageMetadata::default(),
-    }
-}
-
-/// List immediate children of a Go namespace path for hierarchical browsing.
-/// Returns (entries, is_leaf_module). A leaf module has an `@v/` subdirectory.
-pub async fn get_go_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>, bool) {
-    let prefix = if path.is_empty() {
-        "go/".to_string()
-    } else {
-        format!("go/{}/", path)
-    };
-    let keys = storage.list_with_meta(&prefix).await.unwrap_or_default();
-
-    if keys.is_empty() {
-        return (vec![], false);
-    }
-
-    // Leaf detection: if any key under this prefix contains /@v/ → this is a module
-    let is_module = keys.iter().any(|(k, _)| {
-        k.strip_prefix(&prefix)
-            .is_some_and(|r| r.starts_with("@v/"))
-    });
-    if is_module {
-        return (vec![], true);
-    }
-
-    // Group by immediate child segment (skip @latest and other direct files)
-    let mut groups: HashMap<String, (usize, u64, u64)> = HashMap::new();
-    for (key, meta) in &keys {
-        if let Some(rest) = key.strip_prefix(&prefix) {
-            if rest.is_empty() || !rest.contains('/') {
-                continue;
-            }
-            let child_name = rest.split('/').next().unwrap_or(rest).to_string();
-            // Skip @v and @latest markers — they are not namespace directories
-            if child_name.starts_with('@') {
-                continue;
-            }
-            let entry = groups.entry(child_name).or_insert((0, 0, 0));
-            entry.0 += 1;
-            entry.1 += meta.size;
-            entry.2 = entry.2.max(meta.modified);
-        }
-    }
-
-    let mut result: Vec<RepoInfo> = groups
-        .into_iter()
-        .map(|(name, (count, size, modified))| RepoInfo {
-            name,
-            versions: count,
-            size,
-            updated: format_timestamp(modified),
-            ..Default::default()
-        })
-        .collect();
-    result.sort_by(|a, b| a.name.cmp(&b.name));
-
-    (result, false)
-}
-
-/// List Ansible Galaxy namespaces or collections within a namespace.
-///
-/// - `path == ""` → group all `ansible/download/*.tar.gz` by namespace, return `Vec<RepoInfo>`
-///   where `name` = namespace, `versions` = collection count.
-/// - `path == "community"` → filter by namespace, group by collection name, return `Vec<RepoInfo>`
-///   where `name` = collection name, `versions` = version count.
-///
-/// Filenames follow the Galaxy convention: `{namespace}-{name}-{version}.tar.gz`.
-/// Namespace and name are `[a-z0-9_]+`, so the first `-` is an unambiguous separator.
-/// Does NOT call `storage.stat` — avoids latency on large collection counts.
-pub async fn get_ansible_namespace_listing(storage: &Storage, path: &str) -> Vec<RepoInfo> {
-    let keys = storage.list("ansible/download/").await.unwrap_or_default();
-
-    if keys.is_empty() {
-        return vec![];
-    }
-
-    // Parse filenames: {ns}-{name}-{version}.tar.gz
-    // splitn(3, '-') → [ns, name, version_with_ext]
-    struct Parsed {
-        namespace: String,
-        collection: String,
-    }
-    let mut parsed: Vec<Parsed> = Vec::new();
-    for key in &keys {
-        if let Some(filename) = key
-            .strip_prefix("ansible/download/")
-            .and_then(|f| f.strip_suffix(".tar.gz"))
-        {
-            let parts: Vec<&str> = filename.splitn(3, '-').collect();
-            if parts.len() == 3 && !parts[0].is_empty() && !parts[1].is_empty() {
-                parsed.push(Parsed {
-                    namespace: parts[0].to_string(),
-                    collection: parts[1].to_string(),
-                });
-            }
-        }
-    }
-
-    if path.is_empty() {
-        // Root: group by namespace, count distinct collections per namespace
-        let mut ns_collections: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
-        for p in &parsed {
-            ns_collections
-                .entry(p.namespace.clone())
-                .or_default()
-                .insert(p.collection.clone());
-        }
-        let mut result: Vec<RepoInfo> = ns_collections
-            .into_iter()
-            .map(|(ns, cols)| RepoInfo {
-                name: ns,
-                versions: cols.len(),
-                ..Default::default()
-            })
-            .collect();
-        result.sort_by(|a, b| a.name.cmp(&b.name));
-        result
-    } else {
-        // Namespace level: filter by namespace, group by collection name, count versions
-        let mut col_counts: HashMap<String, usize> = HashMap::new();
-        for p in &parsed {
-            if p.namespace == path {
-                *col_counts.entry(p.collection.clone()).or_insert(0) += 1;
-            }
-        }
-        let mut result: Vec<RepoInfo> = col_counts
-            .into_iter()
-            .map(|(col, count)| RepoInfo {
-                name: col,
-                versions: count,
-                ..Default::default()
-            })
-            .collect();
-        result.sort_by(|a, b| a.name.cmp(&b.name));
-        result
     }
 }
 
@@ -2716,11 +2561,15 @@ mod registry_stats_cover_every_registry {
     }
 }
 
-/// Audit A053 (UI): the Maven and Go root pages come from the repository index.
+/// Audit A053 (UI): the Maven, Go and Ansible directory pages come from the repository index.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod root_listing_tests {
-    use crate::test_helpers::{create_test_context_with_storage, op_counting_storage};
+    use super::DirCount::Versions;
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_storage, op_counting_storage, send,
+    };
+    use axum::http::{Method, StatusCode};
 
     #[tokio::test]
     async fn root_pages_read_the_index_not_the_whole_prefix() {
@@ -2736,12 +2585,13 @@ mod root_listing_tests {
         ] {
             ctx.state.storage.put(key, b"data").await.unwrap();
         }
+        let root = |registry| super::index_dir_listing(&ctx.state, registry, "", Versions);
         for registry in ["maven", "go"] {
-            super::index_root_listing(&ctx.state, registry).await;
+            root(registry).await;
         }
         ops.reset();
-        let maven = super::index_root_listing(&ctx.state, "maven").await;
-        let go = super::index_root_listing(&ctx.state, "go").await;
+        let (maven, _) = root("maven").await;
+        let (go, _) = root("go").await;
         assert_eq!(ops.total(), 0, "{:?}", ops.snapshot());
         let summary = |v: &[crate::repo_index::RepoInfo]| {
             v.iter()
@@ -2757,5 +2607,96 @@ mod root_listing_tests {
             [("github.com".into(), 1, 4), ("golang.org".into(), 1, 4)]
         );
         assert!(maven.iter().all(|r| r.updated != "N/A"));
+    }
+
+    /// Reviews R22, R23: every page above an artifact reads the index, at any depth; only a leaf
+    /// (one Maven directory of files, one Go module) lists storage, and only under its own prefix.
+    #[tokio::test]
+    async fn directory_pages_read_the_index_at_every_depth() {
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage(storage);
+        for key in [
+            "maven/org/acme/x/1.0/x-1.0.jar",
+            "maven/org/acme/x/1.0/x-1.0.jar.sha1",
+            "maven/org/acme/y/2.0/y-2.0.jar",
+            "maven/org/other/z/3.0/z-3.0.jar",
+            "go/github.com/a/b/@v/v1.0.0.zip",
+            "go/github.com/a/b/@v/v1.1.0.zip",
+            "go/github.com/c/d/@v/v0.1.0.zip",
+            "ansible/download/community-general-1.0.0.tar.gz",
+            "ansible/download/community-general-1.1.0.tar.gz",
+            "ansible/download/community-docker-2.0.0.tar.gz",
+            "ansible/download/acme-tools-0.1.0.tar.gz",
+        ] {
+            ctx.state.storage.put(key, b"data").await.unwrap();
+        }
+        let page = |uri: &'static str| {
+            let app = ctx.app.clone();
+            async move {
+                let resp = send(&app, Method::GET, uri, "").await;
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+                String::from_utf8(body_bytes(resp).await.to_vec()).unwrap()
+            }
+        };
+        for warm in ["/ui/maven", "/ui/go", "/ui/ansible"] {
+            page(warm).await;
+        }
+        for (uri, children) in [
+            ("/ui/maven/org", &["acme", "other"][..]),
+            ("/ui/maven/org/acme", &["x", "y"]),
+            ("/ui/maven/org/acme/x", &["1.0"]),
+            ("/ui/go/github.com", &["a", "c"]),
+            ("/ui/go/github.com/a", &["b"]),
+            ("/ui/ansible", &["acme", "community"]),
+            ("/ui/ansible/community", &["docker", "general"]),
+        ] {
+            ops.reset();
+            let html = page(uri).await;
+            let listed = ops.snapshot();
+            assert!(
+                !listed.contains_key("list") && !listed.contains_key("list_with_meta"),
+                "{uri}: {listed:?}"
+            );
+            for child in children {
+                assert!(
+                    html.contains(&format!("{uri}/{child}")),
+                    "{uri} lists {child}"
+                );
+            }
+        }
+        let (namespaces, _) =
+            super::index_dir_listing(&ctx.state, "ansible", "", super::DirCount::Names).await;
+        let counts: Vec<_> = namespaces
+            .iter()
+            .map(|r| (r.name.as_str(), r.versions))
+            .collect();
+        assert_eq!(counts, [("acme", 1), ("community", 2)]);
+
+        // A leaf lists under its own prefix only.
+        for (uri, file, prefix) in [
+            (
+                "/ui/maven/org/acme/x/1.0",
+                "x-1.0.jar",
+                "maven/org/acme/x/1.0/",
+            ),
+            ("/ui/go/github.com/a/b", "v1.1.0", "go/github.com/a/b/@v/"),
+        ] {
+            ops.reset();
+            let html = page(uri).await;
+            assert!(html.contains(file), "{uri} shows {file}");
+            for method in ["list", "list_with_meta"] {
+                for root in ["maven/", "go/", "maven/org/", "go/github.com/"] {
+                    assert_eq!(ops.calls(method, root), 0, "{uri}: {method} {root}");
+                }
+            }
+            assert!(
+                ops.calls("list", prefix) + ops.calls("list_with_meta", prefix) > 0,
+                "{uri} lists {prefix}"
+            );
+        }
+        // A path the index does not hold lists nothing.
+        ops.reset();
+        page("/ui/maven/missing").await;
+        assert_eq!(ops.calls("list_with_meta", "maven/missing/"), 0);
     }
 }

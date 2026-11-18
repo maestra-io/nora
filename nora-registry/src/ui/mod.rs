@@ -412,7 +412,7 @@ async fn maven_list(
     let auth_enabled = state.auth.is_some();
 
     // Show top-level namespace directories (com, org, io, etc.)
-    let entries = api::index_root_listing(&state, "maven").await;
+    let (entries, _) = api::index_dir_listing(&state, "maven", "", api::DirCount::Versions).await;
     let total = entries.len();
 
     Html(templates::render_maven_dir(
@@ -436,12 +436,17 @@ async fn maven_detail(
     );
     let auth_enabled = state.auth.is_some();
 
-    // Try hierarchical browsing: check if this is a directory or leaf artifact
-    let (entries, is_leaf) = api::get_maven_dir_listing(&state.storage, &path).await;
+    // A directory from the index; a leaf (an indexed directory of files only) lists its own files.
+    let (entries, indexed) =
+        api::index_dir_listing(&state, "maven", &path, api::DirCount::Versions).await;
 
-    if is_leaf || entries.is_empty() {
-        // Leaf artifact — show files (JARs, POMs, etc.)
-        let detail = get_maven_detail(&state.storage, &path).await;
+    if entries.is_empty() {
+        // Leaf artifact — show files (JARs, POMs, etc.); a path the index does not hold has none.
+        let detail = if indexed {
+            get_maven_detail(&state.storage, &path).await
+        } else {
+            api::MavenDetail { artifacts: vec![] }
+        };
         Html(render_maven_detail(&path, &detail, lang, auth_enabled))
     } else {
         // Namespace directory — show children
@@ -645,7 +650,7 @@ async fn go_list(
     let auth_enabled = state.auth.is_some();
 
     // Show top-level namespace directories (github.com, golang.org, etc.)
-    let entries = api::index_root_listing(&state, "go").await;
+    let (entries, _) = api::index_dir_listing(&state, "go", "", api::DirCount::Versions).await;
     let total = entries.len();
 
     Html(templates::render_go_dir(
@@ -674,10 +679,11 @@ async fn go_detail(
     };
     let auth_enabled = state.auth.is_some();
 
-    // Try hierarchical browsing: check if this is a directory or leaf module
-    let (entries, is_leaf) = api::get_go_dir_listing(&state.storage, &name).await;
+    // A directory from the index; a module (an indexed name) or a leaf lists only its own `@v/`.
+    let (entries, is_module) =
+        api::index_dir_listing(&state, "go", &name, api::DirCount::Versions).await;
 
-    if is_leaf || entries.is_empty() {
+    if is_module || entries.is_empty() {
         // Leaf module — show version detail page
         let base_url = resolve_base_url(&state);
         let show_prerelease = query.prerelease.unwrap_or(false);
@@ -961,7 +967,7 @@ async fn ansible_browse_root(
     );
     let auth_enabled = state.auth.is_some();
 
-    let entries = api::get_ansible_namespace_listing(&state.storage, "").await;
+    let (entries, _) = api::index_dir_listing(&state, "ansible", "", api::DirCount::Names).await;
     let total = entries.len();
 
     Html(templates::render_ansible_dir(
@@ -995,7 +1001,8 @@ async fn ansible_browse(
     match segments.len() {
         // /ui/ansible/community → list collections in namespace
         1 => {
-            let entries = api::get_ansible_namespace_listing(&state.storage, &path).await;
+            let (entries, _) =
+                api::index_dir_listing(&state, "ansible", &path, api::DirCount::Versions).await;
             let total = entries.len();
             Html(templates::render_ansible_dir(
                 &path,
