@@ -14,7 +14,8 @@
 //! signature. It is kept as JSON (`apk/index/...json`) with every entry the upstream has
 //! listed and since dropped, while it may still be needed: an Alpine branch lists ONE
 //! version per package and deletes the file of the one it replaces. An index whose newest
-//! build is older than the cached one's is an earlier generation and is not taken. On
+//! build is older than the cached one's is an earlier generation and is not taken (a
+//! build time more than an hour past NORA's clock does not count). On
 //! serve, each package gets its newest version that is older than `min_release_age` by
 //! the later of its build time (`t:`, inside the signed index) and NORA's first sight of
 //! it, and that NORA can still deliver (listed upstream, or a dropped one NORA has
@@ -723,7 +724,10 @@ async fn load_index(
                 let (description, text) = open_upstream_index(&body, &keys.upstream)?;
                 let mut entries = parse_apkindex(&text);
                 let now = crate::cache_ttl::now_unix() as i64;
-                let newest = |e: &[Entry]| e.iter().map(|e| e.built).max();
+                // Build times past the clock (plus skew) do not order generations: one
+                // such entry would otherwise refuse every later index (review R05).
+                let bound = now + crate::cache_ttl::MAX_UPSTREAM_CLOCK_SKEW_SECS;
+                let newest = |e: &[Entry]| e.iter().map(|e| e.built).filter(|&t| t <= bound).max();
                 // An index whose newest build is older than the cached one's is an earlier
                 // generation (a replay or a lagging mirror): keep the cached one.
                 let (cached, older) = match prev_for_merge {
@@ -1918,6 +1922,57 @@ mod integration_tests {
         assert_eq!(
             pairs(index.entries.clone()),
             [pair("lib", "2-r0"), pair("extra", "1-r0")]
+        );
+    }
+
+    /// review R05: an entry built in the future does not pin the cached generation; the
+    /// index that replaces it with a current build is taken.
+    #[tokio::test]
+    async fn a_future_build_time_does_not_freeze_the_index() {
+        let up_keys = key_files("alpine-test.rsa.pub");
+        let own_keys = key_files("nora-test.rsa.pub");
+        let signer = upstream_signer(&up_keys, &own_keys);
+        let now = now();
+        let entry = super::tests::entry;
+        let server = MockServer::start().await;
+        let gen1 = [
+            entry("lib", "1-r0", now - 30 * DAY, "Q1a="),
+            entry("tool", "1-r0", now + 1000 * DAY, "Q1b="),
+        ];
+        mount(&server, INDEX, upstream_index(&signer, &gen1)).await;
+        let mut cfg_apk = config(&up_keys, &own_keys);
+        let ctx = held(&server, &mut cfg_apk, QuarantineMode::Observe);
+        let up = cfg_apk.proxies["alpine"].clone();
+        let path = super::RepoPath::new("alpine".into(), &["v3.22", "main", "x86_64"]).unwrap();
+        let (index, stale) = super::load_index(&ctx.state, &path, &up).await.unwrap();
+        assert!(!stale);
+        assert_eq!(
+            pairs(index.entries.clone()),
+            [pair("lib", "1-r0"), pair("tool", "1-r0")]
+        );
+
+        server.reset().await;
+        let gen2 = [
+            entry("lib", "1-r0", now - 30 * DAY, "Q1a="),
+            entry("tool", "1-r1", now - DAY, "Q1c="),
+        ];
+        mount(&server, INDEX, upstream_index(&signer, &gen2)).await;
+        let (index, stale) = super::load_index(&ctx.state, &path, &up).await.unwrap();
+        assert!(!stale, "the newer generation is taken");
+        assert_eq!(
+            pairs(index.entries.clone()),
+            [pair("lib", "1-r0"), pair("tool", "1-r1")]
+        );
+
+        // An older generation is still refused.
+        server.reset().await;
+        let gen0 = [entry("lib", "0-r0", now - 60 * DAY, "Q1d=")];
+        mount(&server, INDEX, upstream_index(&signer, &gen0)).await;
+        let (index, stale) = super::load_index(&ctx.state, &path, &up).await.unwrap();
+        assert!(stale);
+        assert_eq!(
+            pairs(index.entries.clone()),
+            [pair("lib", "1-r0"), pair("tool", "1-r1")]
         );
     }
 

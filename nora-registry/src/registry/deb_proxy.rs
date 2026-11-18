@@ -205,7 +205,8 @@ pub(crate) fn check_keyring(dir: &str) -> Result<(), String> {
 
 /// The text of a clearsigned `InRelease`, with LF line ends, when one of its signatures
 /// is unexpired and verifies with a key of `keys` that may sign and is unexpired: the
-/// primary key per its newest self-signature, a subkey per its newest binding.
+/// primary key per its newest self-signature, a subkey per its newest binding and the
+/// primary key's.
 fn verify_inrelease(body: &[u8], keys: &[SignedPublicKey]) -> Result<String, String> {
     let text = std::str::from_utf8(body).map_err(|_| "InRelease is not UTF-8".to_string())?;
     let (msg, _) =
@@ -216,11 +217,16 @@ fn verify_inrelease(body: &[u8], keys: &[SignedPublicKey]) -> Result<String, Str
     let ok = msg.signatures().iter().any(|sig| {
         !expired(sig.created(), sig.signature_expiration_time(), now)
             && keys.iter().any(|k| {
-                let by_primary = sig.verify(&k.primary_key, data).is_ok()
-                    && self_signature(k).is_some_and(|s| {
-                        let created = Some(k.primary_key.created_at());
-                        may_sign(s) && !expired(created, s.key_expiration_time(), now)
-                    });
+                // An expired primary key expires its subkeys too, as in gpgv (review R11).
+                let live = self_signature(k).filter(|s| {
+                    !expired(
+                        Some(k.primary_key.created_at()),
+                        s.key_expiration_time(),
+                        now,
+                    )
+                });
+                let Some(live) = live else { return false };
+                let by_primary = sig.verify(&k.primary_key, data).is_ok() && may_sign(live);
                 by_primary
                     || k.public_subkeys.iter().any(|sub| {
                         sig.verify(&sub.key, data).is_ok()
@@ -853,8 +859,15 @@ async fn build_suite(
         .map_err(|e| BuildError::Internal(e.to_string()))?
         .map_err(BuildError::Refused)?;
     let rel = parse_release(&text);
-    // apt's own rule: a signed Release of another suite is not this suite.
-    if rel.field("Suite") != Some(suite) && rel.field("Codename") != Some(suite) {
+    // A signed Release of another suite is not this suite (apt only warns). A Release
+    // naming no suite matches, as in apt; a configured alias (Ubuntu `devel`) may name
+    // its current target (review R12).
+    let (named_suite, codename) = (rel.field("Suite"), rel.field("Codename"));
+    if (named_suite.is_some() || codename.is_some())
+        && named_suite != Some(suite)
+        && codename != Some(suite)
+        && !state.config.deb.is_suite_alias(repo, suite)
+    {
         return Err(BuildError::Refused(format!(
             "{suite}: the upstream Release is for Suite {:?} / Codename {:?}",
             rel.field("Suite"),
@@ -864,7 +877,10 @@ async fn build_suite(
     // An older generation, however validly signed, is not served over a newer one
     // (audit A048, A086). Without a parsable Date there is nothing to compare.
     let upstream_date = release_date(&rel);
-    let served_date = current.and_then(|c| c.upstream_date);
+    // A served Date past the clock (plus skew) is not compared: it would refuse every
+    // later Release until then (review R05).
+    let served_date = (current.and_then(|c| c.upstream_date))
+        .filter(|&d| d <= now + crate::cache_ttl::MAX_UPSTREAM_CLOCK_SKEW_SECS);
     if let (Some(new), Some(old)) = (upstream_date, served_date) {
         if new < old {
             return Err(BuildError::Refused(format!(
@@ -2400,6 +2416,66 @@ mod integration_tests {
         assert!(verify(&good, &ckeys).is_ok(), "third-party certification");
     }
 
+    /// review R11: a signing subkey of an expired primary key does not verify, even
+    /// when its own binding never expires.
+    #[test]
+    fn a_subkey_of_an_expired_primary_key_does_not_verify() {
+        use pgp::composed::SubkeyParamsBuilder;
+        use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
+        use pgp::types::{Duration, KeyDetails, Tag, Timestamp};
+        let text = "Origin: Test\nSuite: stable\n";
+        let born = Timestamp::from_secs(Timestamp::now().as_secs() - 730 * 86_400);
+        let key = SecretKeyParamsBuilder::default()
+            .key_type(KeyType::Ed25519Legacy)
+            .can_sign(false)
+            .can_certify(true)
+            .created_at(born)
+            .primary_user_id("Archive".into())
+            .subkey(
+                SubkeyParamsBuilder::default()
+                    .key_type(KeyType::Ed25519Legacy)
+                    .can_sign(true)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap()
+            .generate(rand::thread_rng())
+            .unwrap();
+        let by_sub = sign_at(text, &key.secret_subkeys[0].key, Timestamp::now(), vec![]);
+        let verify = |public: &SignedPublicKey| {
+            let keys = load(&keyring_dir(&[public])).unwrap();
+            super::verify_inrelease(armored(&by_sub).as_bytes(), &keys)
+        };
+        assert!(verify(&key.to_public_key()).is_ok(), "control");
+
+        // The primary's only self-certification grants one day from its creation.
+        let mut expired = key.to_public_key();
+        let uid = expired.details.users[0].id.clone();
+        let mut cfg =
+            SignatureConfig::from_key(rand::thread_rng(), &*key, SignatureType::CertPositive)
+                .unwrap();
+        cfg.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(born)).unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(key.fingerprint())).unwrap(),
+            Subpacket::regular(SubpacketData::KeyExpirationTime(Duration::from_secs(
+                86_400,
+            )))
+            .unwrap(),
+        ];
+        let cert = cfg
+            .sign_certification(
+                &*key,
+                key.primary_key.public_key(),
+                &Password::empty(),
+                Tag::UserId,
+                &uid,
+            )
+            .unwrap();
+        expired.details.users[0].signatures = vec![cert];
+        assert!(verify(&expired).is_err(), "expired primary key");
+    }
+
     #[test]
     fn a_signing_subkey_verifies_and_a_flagless_primary_signs() {
         use pgp::composed::SubkeyParamsBuilder;
@@ -2548,6 +2624,43 @@ mod integration_tests {
         assert_eq!(served(&ctx).await.1, [("openssl".into(), "3.1".into())]);
     }
 
+    /// review R12: a Release naming no suite builds, as apt accepts it; a configured
+    /// alias suite builds from a Release naming its target, an unconfigured one does not.
+    #[tokio::test]
+    async fn a_nameless_release_and_a_configured_alias_build() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        let z = std::time::Duration::ZERO;
+        let comps: &[(&str, &[(&str, &str)])] = &[("main", &[("openssl", "3.0")])];
+        mount_release(&server, &key, "bookworm", "", DATE, comps, z).await;
+        let target = "Suite: tenacious\nCodename: tenacious\n";
+        mount_release(&server, &key, "devel", target, DATE, comps, z).await;
+        mount_release(&server, &key, "noble", target, DATE, comps, z).await;
+        let (uri, dir) = (server.uri(), keydir.path().to_str().unwrap().to_string());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.deb.enabled = true;
+            cfg.deb.metadata_ttl = 0;
+            cfg.deb.upstream_keyring_dir = dir;
+            cfg.deb
+                .proxies
+                .insert("debian".into(), RepoProxyEntry::Simple(uri));
+            (cfg.deb.suite_aliases).insert("debian".into(), vec!["devel".into()]);
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.deb.min_release_age = Some("0d".into());
+        });
+        assert_eq!(served(&ctx).await.1, [("openssl".into(), "3.0".into())]);
+        assert_eq!(
+            served_in(&ctx, "devel", "main").await.1,
+            [("openssl".into(), "3.0".into())]
+        );
+        let noble = "/deb/debian/dists/noble/InRelease";
+        assert_eq!(
+            status(&ctx, noble).await,
+            StatusCode::BAD_GATEWAY,
+            "not an alias"
+        );
+    }
+
     #[tokio::test]
     async fn a_repository_verifies_only_with_its_own_keyring() {
         let (debian_key, _) = upstream_key();
@@ -2641,6 +2754,21 @@ mod integration_tests {
             .iter()
             .any(|e| e.contains("deb.upstream_keyrings.vendor")));
         assert!(errors.iter().any(|e| e.contains("missing.gpg")));
+
+        // review R12: an alias entry must name a proxy too.
+        let mut alias = base();
+        alias.deb.upstream_keyring_dir = dir.clone();
+        alias
+            .deb
+            .suite_aliases
+            .insert("vendor".into(), vec!["devel".into()]);
+        let (_, errors) = alias.validate_with_config_path(None);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("deb.suite_aliases.vendor")),
+            "{errors:?}"
+        );
     }
 
     // ── Upstream generations (audit A048, A086) and unreadable state (A043, A049) ──
@@ -2725,6 +2853,25 @@ mod integration_tests {
         )
         .await;
         assert_eq!(served(&ctx).await.1, pkgs(&[("a", "4")]));
+    }
+
+    /// review R05: a served Release dated in the future does not refuse the next
+    /// Release with a current Date.
+    #[tokio::test]
+    async fn a_future_release_date_does_not_freeze_the_suite() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        let dir = keydir.path().to_str().unwrap();
+        let ctx = keyring_ctx(&[("debian", server.uri())], dir, &[]);
+        let future = "Mon, 01 Jan 2035 00:00:00 UTC";
+        publish_dated(&server, &key, &[("a", "1")], future).await;
+        assert_eq!(served(&ctx).await.1, pkgs(&[("a", "1")]));
+        publish_dated(&server, &key, &[("a", "2")], DATE).await;
+        assert_eq!(served(&ctx).await.1, pkgs(&[("a", "2")]));
+        // An older one is still refused.
+        let older = "Wed, 01 Jan 2020 00:00:00 UTC";
+        publish_dated(&server, &key, &[("a", "0")], older).await;
+        assert_eq!(served(&ctx).await.1, pkgs(&[("a", "2")]));
     }
 
     /// audit A048: one stale upstream answer neither re-dates known versions as new nor

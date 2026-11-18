@@ -1791,6 +1791,13 @@ impl Config {
                     ));
                 }
             }
+            for repo in self.deb.suite_aliases.keys() {
+                if !self.deb.proxies.contains_key(repo) {
+                    errors.push(format!(
+                        "deb.suite_aliases.{repo} names no [deb.proxies] repository"
+                    ));
+                }
+            }
             if shared.len() > 1 {
                 warnings.push(format!(
                     "deb proxies {shared:?} verify with every key of deb.upstream_keyring_dir: set deb.upstream_keyrings so each repository accepts only its own archive keys"

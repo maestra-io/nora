@@ -9,6 +9,12 @@
 //! - `>0` — TTL in seconds; refetch after this many seconds
 
 /// Current wall-clock time in Unix epoch seconds (saturating to 0 before the epoch).
+/// maestra: how far past NORA's clock an upstream-written time (an apk `t:`, a deb
+/// Release `Date`) may be and still order index generations. A later one is a skewed
+/// or wrong clock; counting it would pin the cached generation and refuse every newer
+/// index until that time.
+pub const MAX_UPSTREAM_CLOCK_SKEW_SECS: i64 = 3600;
+
 pub fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
