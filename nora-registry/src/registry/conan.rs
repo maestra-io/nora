@@ -361,6 +361,8 @@ async fn recipe_file_download(
         chan: &chan,
         what: "recipe",
         rel: format!("revisions/{rrev}/files/{filename}"),
+        listing: String::new(),
+        rev: &rrev,
         artifact,
         proxy_timeout: state.config.conan.proxy_timeout,
     };
@@ -543,6 +545,8 @@ async fn package_file_download(
         chan: &chan,
         what: "package",
         rel: format!("revisions/{rrev}/packages/{pkg_id}/revisions/{prev}/files/{filename}"),
+        listing: format!("revisions/{rrev}/packages/{pkg_id}/"),
+        rev: &prev,
         artifact,
         proxy_timeout: state.config.conan.proxy_timeout_dl,
     };
@@ -559,6 +563,11 @@ struct FileRef<'a> {
     what: &'static str,
     /// The path under the reference, the same in storage and upstream.
     rel: String,
+    /// The prefix under the reference of the `latest`/`revisions` listings that date the
+    /// file: `""` for a recipe, `revisions/{rrev}/packages/{pkg_id}/` for a package.
+    listing: String,
+    /// The revision the date must be of: the rrev of a recipe file, the prev of a package file.
+    rev: &'a str,
     /// The activity-log name.
     artifact: String,
     proxy_timeout: u64,
@@ -574,21 +583,17 @@ async fn file_download(state: &AppState, headers: &HeaderMap, file: FileRef<'_>)
         chan,
         what,
         rel,
+        listing,
+        rev,
         artifact,
         proxy_timeout,
     } = file;
     let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
 
-    // Extract publish date from cached revision metadata
-    let publish_date = extract_conan_publish_date(
-        &state.storage,
-        name,
-        ver,
-        user,
-        chan,
-        state.config.server.trust_upstream_dates,
-    )
-    .await;
+    // The release date of this file's own revision, from the cached listings (A039).
+    let trust = state.config.server.trust_upstream_dates;
+    let publish_date =
+        extract_conan_publish_date(&state.storage, &ref_str, &listing, rev, trust).await;
 
     // Curation check. #733 serve-local: an internal-namespace recipe or package is operator-owned — skip
     // curation and serve any local copy below; block the upstream branch separately.
@@ -605,7 +610,11 @@ async fn file_download(state: &AppState, headers: &HeaderMap, file: FileRef<'_>)
             crate::curation::RegistryType::Conan,
             name,
             crate::curation::RequestVersion::Known(ver.to_string()),
-            publish_date,
+            state.curation().curation_engine.judged_release_date(
+                crate::curation::RegistryType::Conan,
+                trust,
+                publish_date,
+            ),
         ) {
             return response;
         }
@@ -983,30 +992,48 @@ async fn fetch_and_cache_immutable_json(
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/// Extract publish date from cached Conan recipe revision metadata.
+/// The release date of revision `rev` of reference `ref_str`, from the cached listings under
+/// `listing` (`""` for the recipe, `revisions/{rrev}/packages/{pkg_id}/` for a package):
+/// `latest.json` when it names `rev`, else `rev`'s row in `revisions.json`. A date of any other
+/// revision is not this file's (A039), so none is returned.
 ///
-/// Conan v2 `latest.json` contains:
 /// ```json
 /// { "revision": "abc123", "time": "2024-01-15T10:30:00.000+0000" }
+/// { "revisions": [{ "revision": "abc123", "time": "2024-01-15T10:30:00.000+0000" }] }
 /// ```
 async fn extract_conan_publish_date(
     storage: &crate::storage::Storage,
-    name: &str,
-    ver: &str,
-    user: &str,
-    chan: &str,
+    ref_str: &str,
+    listing: &str,
+    rev: &str,
     trust_upstream: bool,
 ) -> Option<i64> {
-    let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
-    let meta_key = format!("conan/{}/latest.json", ref_str);
     // #513: untrusted upstream dates → no date: never upstream time, nor the cache mtime.
     if !trust_upstream {
         return None;
     }
-    let data = storage.get(&meta_key).await.ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
-    let date_str = json.get("time")?.as_str()?;
-    crate::curation::parse_iso8601_to_unix(date_str)
+    let read = |doc: &str| {
+        let key = format!("conan/{ref_str}/{listing}{doc}.json");
+        async move {
+            let data = storage.get(&key).await.ok()?;
+            serde_json::from_slice::<serde_json::Value>(&data).ok()
+        }
+    };
+    let time_of = |entry: &serde_json::Value| {
+        (entry.get("revision")?.as_str()? == rev)
+            .then(|| entry.get("time")?.as_str())
+            .flatten()
+            .and_then(crate::curation::parse_iso8601_to_unix)
+    };
+    if let Some(date) = read("latest").await.as_ref().and_then(time_of) {
+        return Some(date);
+    }
+    read("revisions")
+        .await?
+        .get("revisions")?
+        .as_array()?
+        .iter()
+        .find_map(time_of)
 }
 
 /// What an internal-namespace reference gets once no fresh copy answered it (#68):
@@ -1514,7 +1541,7 @@ mod integration_tests {
             .unwrap();
 
         let result =
-            super::extract_conan_publish_date(&storage, "zlib", "1.3", "_", "_", true).await;
+            super::extract_conan_publish_date(&storage, "zlib/1.3/_/_", "", "abc123", true).await;
         assert!(result.is_some());
     }
 
@@ -1535,9 +1562,9 @@ mod integration_tests {
             .unwrap();
 
         let trusted =
-            super::extract_conan_publish_date(&storage, "zlib", "1.3", "_", "_", true).await;
+            super::extract_conan_publish_date(&storage, "zlib/1.3/_/_", "", "r1", true).await;
         let untrusted =
-            super::extract_conan_publish_date(&storage, "zlib", "1.3", "_", "_", false).await;
+            super::extract_conan_publish_date(&storage, "zlib/1.3/_/_", "", "r1", false).await;
 
         // trust=true honors the (spoofed, old) upstream date
         assert_eq!(trusted, Some(946_684_800)); // 2000-01-01T00:00:00Z
@@ -1552,7 +1579,7 @@ mod integration_tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
         let result =
-            super::extract_conan_publish_date(&storage, "uncached", "1.0", "_", "_", false).await;
+            super::extract_conan_publish_date(&storage, "uncached/1.0/_/_", "", "r1", false).await;
         assert_eq!(result, None);
     }
 
@@ -1570,7 +1597,7 @@ mod integration_tests {
             .unwrap();
 
         let result =
-            super::extract_conan_publish_date(&storage, "zlib", "1.3", "_", "_", true).await;
+            super::extract_conan_publish_date(&storage, "zlib/1.3/_/_", "", "abc123", true).await;
         assert!(result.is_none());
     }
 
@@ -1580,8 +1607,65 @@ mod integration_tests {
         let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
 
         let result =
-            super::extract_conan_publish_date(&storage, "nonexistent", "1.0", "_", "_", true).await;
+            super::extract_conan_publish_date(&storage, "nonexistent/1.0/_/_", "", "r1", true)
+                .await;
         assert!(result.is_none());
+    }
+
+    /// A039: the date is of the requested revision only: `latest.json` naming another revision
+    /// gives none, and a revision `latest.json` does not name is dated by its `revisions.json` row.
+    #[tokio::test]
+    async fn the_date_is_bound_to_the_requested_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let put = |key: &'static str, doc: serde_json::Value| {
+            let storage = storage.clone();
+            async move {
+                storage
+                    .put(key, &serde_json::to_vec(&doc).unwrap())
+                    .await
+                    .unwrap()
+            }
+        };
+        put(
+            "conan/zlib/1.3/_/_/latest.json",
+            serde_json::json!({"revision": "new", "time": "2019-01-01T00:00:00.000+0000"}),
+        )
+        .await;
+        let date = |listing: &'static str, rev: &'static str| {
+            let storage = storage.clone();
+            async move {
+                super::extract_conan_publish_date(&storage, "zlib/1.3/_/_", listing, rev, true)
+                    .await
+            }
+        };
+        assert_eq!(date("", "new").await, Some(1_546_300_800));
+        assert_eq!(
+            date("", "old").await,
+            None,
+            "another revision's latest.json"
+        );
+        put(
+            "conan/zlib/1.3/_/_/revisions.json",
+            serde_json::json!({"revisions": [
+                {"revision": "new", "time": "2019-01-01T00:00:00.000+0000"},
+                {"revision": "old", "time": "2018-01-01T00:00:00.000+0000"},
+            ]}),
+        )
+        .await;
+        assert_eq!(date("", "old").await, Some(1_514_764_800));
+        assert_eq!(date("", "other").await, None, "no row names it");
+        // A package file is dated by its own package listings, never by the recipe's.
+        assert_eq!(date("revisions/new/packages/p/", "new").await, None);
+        put(
+            "conan/zlib/1.3/_/_/revisions/new/packages/p/latest.json",
+            serde_json::json!({"revision": "prev", "time": "2018-01-01T00:00:00.000+0000"}),
+        )
+        .await;
+        assert_eq!(
+            date("revisions/new/packages/p/", "prev").await,
+            Some(1_514_764_800)
+        );
     }
 
     /// #52 acceptance: a stale recipe-revision read revalidates with
@@ -1923,33 +2007,37 @@ mod quarantine_first_seen {
     }
 
     const REV: &str = "0123456789abcdef0123456789abcdef";
+    /// A revision no cached listing names.
+    const NEW: &str = "fedcba9876543210fedcba9876543210";
     const LATEST: &[u8] =
         br#"{"revision":"0123456789abcdef0123456789abcdef","time":"2019-01-01T00:00:00.000+0000"}"#;
 
+    fn recipe_file_of(rrev: &str) -> String {
+        format!("/conan/v2/conans/oldlib/1.0/_/_/revisions/{rrev}/files/conan_export.tgz")
+    }
+
+    fn package_file_of(rrev: &str, prev: &str) -> String {
+        format!(
+            "/conan/v2/conans/oldlib/1.0/_/_/revisions/{rrev}/packages/{REV}/revisions/{prev}/files/conan_package.tgz"
+        )
+    }
+
     fn recipe_file() -> String {
-        format!("/conan/v2/conans/oldlib/1.0/_/_/revisions/{REV}/files/conan_export.tgz")
+        recipe_file_of(REV)
     }
 
     fn package_file() -> String {
-        format!(
-            "/conan/v2/conans/oldlib/1.0/_/_/revisions/{REV}/packages/{REV}/revisions/{REV}/files/conan_package.tgz"
-        )
+        package_file_of(REV, REV)
     }
 
     async fn context(trust: bool) -> (MockServer, TestContext) {
         let up = MockServer::start().await;
-        serve(
-            &up,
-            &format!("/v2/conans/oldlib/1.0/_/_/revisions/{REV}/files/conan_export.tgz"),
-            b"RECIPE".to_vec(),
-        )
-        .await;
-        serve(
-            &up,
-            &format!("/v2/conans/oldlib/1.0/_/_/revisions/{REV}/packages/{REV}/revisions/{REV}/files/conan_package.tgz"),
-            b"PACKAGE".to_vec(),
-        )
-        .await;
+        for (rrev, prev) in [(REV, REV), (NEW, NEW), (REV, NEW)] {
+            let recipe = recipe_file_of(rrev);
+            serve(&up, &recipe["/conan".len()..], b"RECIPE".to_vec()).await;
+            let package = package_file_of(rrev, prev);
+            serve(&up, &package["/conan".len()..], b"PACKAGE".to_vec()).await;
+        }
         let uri = up.uri();
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.conan.enabled = true;
@@ -1958,6 +2046,9 @@ mod quarantine_first_seen {
             quarantine_7d(cfg);
         });
         put_written_days_ago(&ctx, "conan/oldlib/1.0/_/_/latest.json", LATEST, 30).await;
+        let package_latest =
+            format!("conan/oldlib/1.0/_/_/revisions/{REV}/packages/{REV}/latest.json");
+        put_written_days_ago(&ctx, &package_latest, LATEST, 30).await;
         (up, ctx)
     }
 
@@ -2011,6 +2102,33 @@ mod quarantine_first_seen {
             status(&ctx, &package_file()).await,
             StatusCode::OK,
             "package"
+        );
+    }
+
+    /// A039: a recipe revision the cached `latest.json` does not name is not dated by it, nor are
+    /// the package files under it: the quarantine counts them from now.
+    #[tokio::test]
+    async fn a_new_recipe_revision_does_not_borrow_the_reference_date() {
+        let (_up, ctx) = context(true).await;
+        assert_eq!(
+            status(&ctx, &recipe_file_of(NEW)).await,
+            StatusCode::FORBIDDEN,
+            "recipe"
+        );
+        assert_eq!(
+            status(&ctx, &package_file_of(NEW, NEW)).await,
+            StatusCode::FORBIDDEN,
+            "package"
+        );
+    }
+
+    /// A039: a package revision its package listings do not name is not dated by the recipe's.
+    #[tokio::test]
+    async fn a_new_package_revision_does_not_borrow_the_recipe_date() {
+        let (_up, ctx) = context(true).await;
+        assert_eq!(
+            status(&ctx, &package_file_of(REV, NEW)).await,
+            StatusCode::FORBIDDEN
         );
     }
 }
