@@ -63,6 +63,7 @@ async fn the_teleport_listener_drops_forwarding_headers_on_every_run() {
         0,
         app,
         stop.clone(),
+        Duration::from_secs(1),
         LIMITS,
     )
     .await;
@@ -94,6 +95,7 @@ async fn a_taken_side_port_fails_the_start() {
             port,
             Router::new(),
             CancellationToken::new(),
+            Duration::from_secs(1),
             LIMITS,
         )
         .await;
@@ -126,22 +128,73 @@ async fn status_line(addr: std::net::SocketAddr, path: &str) -> String {
 #[tokio::test]
 async fn the_server_serves_the_side_listeners_it_is_configured_with() {
     let off = crate::test_helpers::create_test_context();
-    assert_eq!(
-        super::spawn_side_listeners(&off.state, &off.app).await,
-        (None, None)
-    );
+    let none = super::spawn_side_listeners(&off.state, &off.app, &CancellationToken::new()).await;
+    assert_eq!((none.internal, none.teleport), (None, None));
+    assert!(none.teleport_task.is_none());
 
     let ctx = crate::test_helpers::create_test_context_with_config(|config| {
         config.server.host = "127.0.0.1".to_string();
         config.server.internal_port = Some(0);
         config.server.teleport_port = Some(0);
     });
-    let (internal, teleport) = super::spawn_side_listeners(&ctx.state, &ctx.app).await;
-    assert!(status_line(internal.unwrap(), "/metrics")
+    let stopping = CancellationToken::new();
+    let side = super::spawn_side_listeners(&ctx.state, &ctx.app, &stopping).await;
+    assert!(status_line(side.internal.unwrap(), "/metrics")
         .await
         .contains(" 200 "));
-    assert!(status_line(teleport.unwrap(), "/health")
+    assert!(status_line(side.teleport.unwrap(), "/health")
         .await
         .contains(" 200 "));
+    stopping.cancel();
     ctx.state.cancel_token.cancel();
+}
+
+// Review R15: the Teleport listener serves the whole app, so it stops at the shutdown signal,
+// not after the main listener, and a request in flight there gets `server.shutdown_timeout`
+// to finish, as on the main listener (not the internal listener's 1 s).
+#[tokio::test]
+async fn the_teleport_listener_drains_for_the_shutdown_timeout_from_the_signal() {
+    let ctx = crate::test_helpers::create_test_context_with_config(|config| {
+        config.server.host = "127.0.0.1".to_string();
+        config.server.teleport_port = Some(0);
+        config.server.shutdown_timeout = 10;
+    });
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let entered_in = entered.clone();
+    let slow = Router::new().route(
+        "/slow",
+        get(move || async move {
+            entered_in.notify_one();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            "done"
+        }),
+    );
+    let stopping = CancellationToken::new();
+    let side = super::spawn_side_listeners(&ctx.state, &slow, &stopping).await;
+    let addr = side.teleport.unwrap();
+    let request = tokio::spawn(async move {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).await.unwrap();
+        answer
+    });
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .expect("the request reached the handler");
+    stopping.cancel();
+    let answer = tokio::time::timeout(Duration::from_secs(10), request)
+        .await
+        .expect("the request finished within the drain")
+        .unwrap();
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert!(answer.ends_with("done"), "{answer}");
+    tokio::time::timeout(Duration::from_secs(10), side.teleport_task.unwrap())
+        .await
+        .expect("the listener ends at the signal, without the scheduler stop")
+        .unwrap();
+    assert!(!ctx.state.cancel_token.is_cancelled());
 }

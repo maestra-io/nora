@@ -1356,6 +1356,24 @@ impl Config {
             ));
         }
 
+        // 3e. An hf cache fill is held to proxy_max_artifact_mb and to the spool budget: a
+        // file over the smaller of them (model shards often run past 2 GiB) is fetched from
+        // the upstream on every request, never cached. Named at the start, never silent.
+        if self.hf.enabled {
+            let cap_mb = [self.server.proxy_max_artifact_mb, self.server.spool_max_mb]
+                .into_iter()
+                .filter(|&mb| mb > 0)
+                .min();
+            if let Some(cap_mb) = cap_mb {
+                warnings.push(format!(
+                    "hf is enabled: Hugging Face files larger than {cap_mb} MB (the smaller of \
+                     server.proxy_max_artifact_mb and server.spool_max_mb) are served from the \
+                     upstream on every request and never cached. Raise both (0 = no limit) to \
+                     cache larger model shards"
+                ));
+            }
+        }
+
         // 4. Rate limit values must be > 0 when rate limiting is enabled
         if self.rate_limit.enabled {
             if self.rate_limit.auth_rps == 0 {

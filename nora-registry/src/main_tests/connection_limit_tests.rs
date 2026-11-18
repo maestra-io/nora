@@ -58,6 +58,11 @@ fn app() -> Router {
             "/upload",
             put(|body: axum::body::Bytes| async move { body.len().to_string() }),
         )
+        // 64 MiB in one in-memory frame.
+        .route(
+            "/full",
+            get(|| async { axum::body::Bytes::from(vec![b'x'; 64 * 1024 * 1024]) }),
+        )
         // 64 MiB in 64 KiB pieces, more than the socket buffers hold.
         .route(
             "/big",
@@ -393,6 +398,9 @@ const H2_START: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x
 /// static table.
 const H2_GET: &[u8] = b"\x00\x00\x06\x01\x05\x00\x00\x00\x01\x82\x86\x84\x41\x01x";
 
+/// As [`H2_GET`] for `/full`: the path as a literal with its name indexed.
+const H2_GET_FULL: &[u8] = b"\x00\x00\x0c\x01\x05\x00\x00\x00\x01\x82\x86\x44\x05/full\x41\x01x";
+
 /// Play an HTTP/2 client that is alive: acknowledge each SETTINGS, answer each PING.
 /// Returns how long after `from` the server closed the connection, if it did within
 /// `limit`, and when the response to stream 1 ended, if it came.
@@ -472,6 +480,26 @@ async fn an_idle_http2_connection_is_closed_at_the_keep_alive_timeout() {
     assert!(
         closed.is_some_and(|d| d >= IDLE - HEAD && d < IDLE + HEAD * 4),
         "idle after its stream for {closed:?}, keep-alive {IDLE:?}"
+    );
+}
+
+/// Review R21: an HTTP/2 response of one in-memory frame whose data the peer's window never
+/// admits (it answers every ping but sends no WINDOW_UPDATE) ends its body at once, with
+/// the data still in h2's buffer. The connection is not kept for as long as the peer
+/// answers: it is dropped `body_idle_timeout` after the keep-alive close began.
+#[tokio::test]
+async fn an_unread_single_frame_http2_response_is_closed() {
+    let server = start(16).await;
+    let mut client = TcpStream::connect(server.addr).await.unwrap();
+    let connected = Instant::now();
+    client.write_all(H2_START).await.unwrap();
+    client.write_all(H2_GET_FULL).await.unwrap();
+    let limit = (IDLE + BODY_IDLE) * 4;
+    let (closed, answered) = h2_alive_until_closed(&mut client, connected, limit).await;
+    assert!(answered.is_none(), "the whole response went out");
+    assert!(
+        closed.is_some_and(|d| d < IDLE + BODY_IDLE + HEAD * 4),
+        "an unread HTTP/2 response held its connection: {closed:?}"
     );
 }
 

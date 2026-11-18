@@ -836,6 +836,29 @@ fn test_publish_cap_above_the_inflight_budget_warns() {
     );
 }
 
+/// Review R16: with hf on, the start names the largest file an hf fill caches (the smaller
+/// of `proxy_max_artifact_mb` and `spool_max_mb`, 0 = no limit); hf off, or both 0, is quiet.
+#[test]
+fn test_hf_fill_cap_is_named_at_the_start() {
+    let _lock = env_lock();
+    let mut config = Config::default();
+    let warned = |c: &Config| {
+        let (warnings, _) = c.validate_with_config_path(None);
+        warnings
+            .into_iter()
+            .find(|m| m.starts_with("hf is enabled: Hugging Face files larger than"))
+    };
+    assert_eq!(warned(&config), None, "hf off warned");
+    config.hf.enabled = true;
+    let msg = warned(&config).expect("the default caps were not named");
+    assert!(msg.contains("larger than 2048 MB"), "{msg}");
+    config.server.proxy_max_artifact_mb = 0;
+    let msg = warned(&config).expect("the spool budget was not named");
+    assert!(msg.contains("larger than 4096 MB"), "{msg}");
+    config.server.spool_max_mb = 0;
+    assert_eq!(warned(&config), None, "no limit warned");
+}
+
 /// R4-T10: a `raw.cache_control` that cannot be a header value is a warning (an error
 /// under NORA_CONFIG_STRICT), and the default is what a request sends.
 #[test]

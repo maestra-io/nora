@@ -18,12 +18,16 @@
 //! a peer that stops answering them is closed. A peer that answers them is held to the same
 //! limits as an HTTP/1 client by [`Streams`]: its first stream must open within
 //! `header_read_timeout` from the accept, and with no stream open the connection is idle and
-//! closed after `keep_alive_timeout`.
+//! closed after `keep_alive_timeout`. A response body that ended still has its data in h2's
+//! buffer when the peer's flow-control window does not admit it; the idle close then waits
+//! `body_idle_timeout` at most for that data to go out, and drops the connection.
 //!
 //! Past the head, a connection is closed once the client has moved nothing for
 //! `body_idle_timeout`: while a handler waits for request body bytes that do not come, or a
-//! response frame waits for a client that does not read it ([`ClientWait`]). Time the
-//! server itself takes (a handler, an upstream fetch, a spool fill) is never counted.
+//! response frame waits for a client that does not read it ([`ClientWait`]), or the socket
+//! takes no byte of what hyper has to write (a response body that ended in one frame, still
+//! being flushed: [`CountingIo`]). Time the server itself takes (a handler, an upstream
+//! fetch, a spool fill) is never counted.
 
 use std::future::Future;
 use std::io;
@@ -87,15 +91,16 @@ pub(crate) async fn serve_connection<S>(
             _ => return,
         };
     let is_h2 = preface.is_h2;
+    let streams = Arc::new(Streams::default());
+    let accepted = clock.accepted;
     let io = TokioIo::new(CountingIo {
         inner: stream,
         replay: preface.bytes,
         replayed: 0,
         clock: Arc::clone(&clock),
+        writing: ClientWait::new(&streams, accepted),
     });
-    let streams = Arc::new(Streams::default());
     let open = Arc::clone(&streams);
-    let accepted = clock.accepted;
     let service = hyper::service::service_fn(move |mut request: hyper::Request<Incoming>| {
         use futures::FutureExt;
         use tower::ServiceExt;
@@ -132,6 +137,7 @@ pub(crate) async fn serve_connection<S>(
             stop,
             idle,
             stalled,
+            limits.body_idle_timeout,
             remote,
         )
         .await;
@@ -149,6 +155,7 @@ pub(crate) async fn serve_connection<S>(
             stop,
             idle,
             stalled,
+            limits.body_idle_timeout,
             remote,
         )
         .await;
@@ -157,12 +164,15 @@ pub(crate) async fn serve_connection<S>(
 
 /// Run `connection` to its end, shutting it down gracefully once `stop` turns true or the
 /// connection has been `idle` too long. Once it has `stalled` on its client it is dropped at
-/// once: a graceful shutdown would wait for the very request that stalled.
+/// once: a graceful shutdown would wait for the very request that stalled. An idle one
+/// that still has not closed `body_idle` (non-zero) after its shutdown began is waiting on
+/// its client to take data of a stream that ended, and is dropped too.
 async fn drive<C>(
     connection: C,
     mut stop: tokio::sync::watch::Receiver<bool>,
     idle: impl Future<Output = ()>,
     stalled: impl Future<Output = ()>,
+    body_idle: Duration,
     remote: SocketAddr,
 ) where
     C: hyper_util::server::graceful::GracefulConnection,
@@ -179,17 +189,28 @@ async fn drive<C>(
         }
         () = idle => {
             connection.as_mut().graceful_shutdown();
-            connection.await
+            if body_idle.is_zero() {
+                connection.await
+            } else {
+                // CANCEL-SAFETY: on timeout the connection is dropped, as on a stall.
+                match tokio::time::timeout(body_idle, connection.as_mut()).await {
+                    Ok(served) => served,
+                    Err(_) => return closed_stalled(remote),
+                }
+            }
         }
-        () = stalled => {
-            tracing::info!(peer = %remote, "connection closed: its client moved nothing for server.body_idle_timeout");
-            crate::metrics::CONNECTIONS_STALLED_TOTAL.inc();
-            return;
-        }
+        () = stalled => return closed_stalled(remote),
     };
     if let Err(e) = served {
         tracing::debug!(error = %e, peer = %remote, "connection ended with an error");
     }
+}
+
+/// Log and count a connection dropped because its client moved nothing for
+/// `server.body_idle_timeout`.
+fn closed_stalled(remote: SocketAddr) {
+    tracing::info!(peer = %remote, "connection closed: its client moved nothing for server.body_idle_timeout");
+    crate::metrics::CONNECTIONS_STALLED_TOTAL.inc();
 }
 
 /// Resolves once `stop` turns true or its sender is gone. The guard `wait_for` returns is
@@ -489,12 +510,27 @@ impl HeadClock {
 }
 
 /// The connection's stream: first the bytes [`read_preface`] took, then the socket;
-/// counting the bytes read for [`HeadTimer`].
+/// counting the bytes read for [`HeadTimer`]. A write the socket cannot take waits on the
+/// client until one makes progress: it covers what hyper still has to flush after the
+/// response body is gone (one in-memory frame ends the body at once).
 struct CountingIo<S> {
     inner: S,
     replay: Vec<u8>,
     replayed: usize,
     clock: Arc<HeadClock>,
+    writing: ClientWait,
+}
+
+impl<S> CountingIo<S> {
+    /// `polled` is a write or flush of the socket: pending waits on the client, done ends it.
+    fn wrote<T>(&mut self, polled: Poll<T>) -> Poll<T> {
+        if polled.is_pending() {
+            self.writing.begin();
+        } else {
+            self.writing.end();
+        }
+        polled
+    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for CountingIo<S> {
@@ -527,7 +563,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingIo<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.wrote(polled)
     }
 
     fn poll_write_vectored(
@@ -535,7 +572,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingIo<S> {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+        let polled = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.wrote(polled)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -543,7 +581,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingIo<S> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let polled = Pin::new(&mut self.inner).poll_flush(cx);
+        self.wrote(polled)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -744,7 +783,7 @@ mod tests {
         assert_eq!(streams.client_waits.load(Ordering::Acquire), 0);
     }
 
-    /// An app with a 64 MiB response, a handler that answers after 30 s, and an upload
+    /// An app with a 64 MiB response (streamed, and in one frame), a handler that answers after 30 s, and an upload
     /// that reads its whole body.
     fn stall_app() -> Router {
         use axum::routing::{get, put};
@@ -757,6 +796,10 @@ mod tests {
                         Ok::<_, io::Error>(axum::body::Bytes::from(vec![b'x'; 64 * 1024]))
                     }))
                 }),
+            )
+            .route(
+                "/full",
+                get(|| async { axum::body::Bytes::from(vec![b'x'; 64 * 1024 * 1024]) }),
             )
             .route(
                 "/slow",
@@ -807,6 +850,52 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(3600)).await;
             assert_eq!(task.is_finished(), closes, "{window:?}");
         }
+    }
+
+    /// Review R21: a response of one in-memory frame ends its body before hyper has written
+    /// it; a client that never reads it is closed at the body idle timeout all the same, and
+    /// one that reads it gets it whole.
+    #[tokio::test(start_paused = true)]
+    async fn an_unread_single_frame_response_is_closed_at_the_body_idle_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, task) = serve_stall_app(Duration::from_secs(1));
+        client
+            .write_all(b"GET /full HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(!task.is_finished(), "closed before the window");
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert!(
+            task.is_finished(),
+            "an unflushed response held its connection"
+        );
+
+        let (mut client, task) = serve_stall_app(Duration::from_secs(1));
+        client
+            .write_all(b"GET /full HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        // The head, then every byte of the body.
+        let mut received = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        let body_at = loop {
+            let n = client.read(&mut buf).await.unwrap();
+            assert!(n > 0, "closed in the head");
+            received.extend_from_slice(&buf[..n]);
+            if let Some(at) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at + 4;
+            }
+        };
+        assert!(received.starts_with(b"HTTP/1.1 200"));
+        let mut body = (received.len() - body_at) as u64;
+        while body < 64 * 1024 * 1024 {
+            let n = client.read(&mut buf).await.unwrap();
+            assert!(n > 0, "closed after {body} body bytes");
+            body += n as u64;
+        }
+        assert_eq!(body, 64 * 1024 * 1024);
+        assert!(!task.is_finished(), "a reading client was closed");
     }
 
     /// Audit A087: a request body that stops arriving is closed at the body idle timeout,
