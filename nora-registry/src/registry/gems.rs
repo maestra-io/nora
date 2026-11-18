@@ -437,6 +437,7 @@ async fn gem_dates(
     let fetched = match upstream_url(state) {
         Some(proxy) => fetch_gem_dates(state, &proxy, name, wanted)
             .await
+            .dates
             .map(|dates| (*dates).clone()),
         None => None,
     };
@@ -456,14 +457,14 @@ async fn gem_dates(
 /// and `<number>-<platform>` otherwise, as the compact index writes its rows. One lookup per
 /// gem for `gems.metadata_ttl`, shared by the index filter and the `.gem` gate
 /// (`upstream_dates`); a `wanted` row missing from a kept answer asks again once a minute.
-/// `None`: no answer (transport error, a non-2xx other than 404, a body that does not parse);
+/// No dates: no answer (transport error, a non-2xx other than 404, a body that does not parse);
 /// a 404 is an answer with no versions (A063).
 async fn fetch_gem_dates(
     state: &AppState,
     proxy: &str,
     name: &str,
     wanted: &[&str],
-) -> Option<std::sync::Arc<std::collections::HashMap<String, i64>>> {
+) -> super::upstream_dates::Answer {
     let proxy = proxy.trim_end_matches('/').to_owned();
     let url = format!("{proxy}/api/v1/versions/{name}.json");
     let timeout = Duration::from_secs(state.config.gems.proxy_timeout);
@@ -517,8 +518,9 @@ fn gem_date_key(number: &str, platform: Option<&str>) -> String {
 
 /// A version's `created_at` from the RubyGems API (the compact index has no dates), by
 /// [`fetch_gem_dates`]: `Ok(None)` when the API answered without this version or platform,
-/// `Err` when it gave no answer (A063). An answer that dates it is kept at
-/// `gems/dates/<name>.json`, so the gem's other files need no lookup.
+/// `Err` when it gave no answer (A063); held as released now when a kept answer lacking it was
+/// reused unasked (R01). An answer that dates it is kept at `gems/dates/<name>.json`, so the
+/// gem's other files need no lookup.
 async fn fetch_gems_date(
     state: &AppState,
     proxy: &str,
@@ -527,9 +529,14 @@ async fn fetch_gems_date(
     platform: Option<&str>,
 ) -> Result<Option<i64>, ()> {
     let row = gem_date_key(version, platform);
-    let dates = fetch_gem_dates(state, proxy, name, &[&row])
-        .await
-        .ok_or(())?;
+    let answer = fetch_gem_dates(state, proxy, name, &[&row]).await;
+    if answer.unasked {
+        return Ok(state
+            .curation()
+            .curation_engine
+            .unasked_release_date(RegistryType::Gems, state.config.server.trust_upstream_dates));
+    }
+    let dates = answer.dates.ok_or(())?;
     let date = dates.get(&row).copied();
     if date.is_some() {
         if let Ok(json) = serde_json::to_vec(&*dates) {

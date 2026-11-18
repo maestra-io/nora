@@ -775,9 +775,10 @@ async fn handle_request(
     // Upstream release date of the tarball's version, for curation and to seed the
     // digest quarantine's first_seen (#750). Packuments have no version: `None`
     // without any storage read.
-    let publish_date = match tarball_version.as_deref() {
+    // R19: a packument the lookup fetched for this request is the tarball step's refetch.
+    let (publish_date, fetched_packument) = match tarball_version.as_deref() {
         Some(ver) if !hosted => npm_publish_date(&state, &package_name, ver).await,
-        _ => None,
+        _ => (None, None),
     };
 
     // Curation check — upstream tarball downloads only (metadata passes through).
@@ -1041,6 +1042,7 @@ async fn handle_request(
             &path,
             &key,
             TarballAsk::parse(&path).as_ref(),
+            fetched_packument,
         )
         .await;
         match result {
@@ -1138,7 +1140,8 @@ async fn handle_request(
 /// the upstream's credential: only for a version the owner's trusted packument lists, that
 /// packument fetched again once when it does not (the version may be newer than the copy).
 /// Returns what the download is recorded as, with what it gave; `None` (no tarball of a version)
-/// and a version not listed are `NotFound` without a request for the tarball.
+/// and a version not listed are `NotFound` without a request for the tarball. `fetched` is the
+/// packument (stored form) already fetched for this request, which stands for that refetch.
 ///
 /// The credential goes as far as the upstream's origin, the redirects followed by
 /// [`fetch_following`]. `key` is the tarball's storage key, the download's single-flight.
@@ -1149,6 +1152,7 @@ async fn fetch_upstream_tarball(
     path: &str,
     key: &str,
     ask: Option<&TarballAsk<'_>>,
+    fetched: Option<Bytes>,
 ) -> (String, Result<(ProxyBody, CacheDuty), ProxyError>) {
     let at_upstream = format!("{}/{}", upstream.trim_end_matches('/'), path);
     let Some(ask) = ask else {
@@ -1195,7 +1199,11 @@ async fn fetch_upstream_tarball(
     };
     let mut decided = step(None);
     if matches!(decided, TarballStep::Refetch) {
-        let refetched = match refetch().await {
+        let doc = match fetched {
+            Some(doc) => Ok(doc),
+            None => refetch().await,
+        };
+        let refetched = match doc {
             Ok(doc) => {
                 let listed = npm_links::listed(&doc, ask.version()).unwrap_or_default();
                 expected = listed.digest;
@@ -4649,24 +4657,36 @@ async fn write_dates(
 /// flight for the same name. Best-effort: any failure leaves the date `None`
 /// (fail-safe — the package is held as new). Namespace-safe: an internal-namespace
 /// package, or one published here, is never fetched upstream (#68). Mirrors Cargo's
-/// `ensure_cargo_metadata_cached` and PyPI's `ensure_pypi_dates_cached`.
-async fn npm_publish_date(state: &AppState, name: &str, version: &str) -> Option<i64> {
+/// `ensure_cargo_metadata_cached` and PyPI's `ensure_pypi_dates_cached`. With the date, the
+/// packument fetched upstream for it (stored form), if one was.
+async fn npm_publish_date(
+    state: &AppState,
+    name: &str,
+    version: &str,
+) -> (Option<i64>, Option<Bytes>) {
     if !state.config.server.trust_upstream_dates {
-        return None;
+        return (None, None);
     }
-    let times = npm_release_times(state, name, version).await?;
-    crate::curation::parse_iso8601_to_unix(times.get(version)?.as_str()?)
+    let Some((times, fetched)) = npm_release_times(state, name, version).await else {
+        return (None, None);
+    };
+    let date = times
+        .get(version)
+        .and_then(|t| t.as_str())
+        .and_then(crate::curation::parse_iso8601_to_unix);
+    (date, fetched)
 }
 
 /// The `time` map of `name`: its [`dates_key`], else the cached packument's (stored
 /// as the companion for next time), else the packument fetched upstream and cached.
 /// A cached map that dates other versions but not `version` predates its release:
-/// the upstream's current map judges it, as on a cold cache.
+/// the upstream's current map judges it, as on a cold cache. With the map, the packument this
+/// call fetched and cached (stored form), if it did.
 async fn npm_release_times(
     state: &AppState,
     name: &str,
     version: &str,
-) -> Option<serde_json::Map<String, serde_json::Value>> {
+) -> Option<(serde_json::Map<String, serde_json::Value>, Option<Bytes>)> {
     // An empty map is a dateless upstream, not a stale copy: refetching it adds nothing.
     let covers = |times: &serde_json::Map<String, serde_json::Value>| {
         times.is_empty() || times.contains_key(version)
@@ -4682,7 +4702,7 @@ async fn npm_release_times(
         if let Ok(dates) = state.storage.get(&dates_key(name)).await {
             if let Ok(times) = serde_json::from_slice(&dates) {
                 if covers(&times) {
-                    return Some(times);
+                    return Some((times, None));
                 }
             }
         }
@@ -4697,7 +4717,7 @@ async fn npm_release_times(
             let times = packument_times(&data);
             if covers(&times) {
                 write_dates(&state.storage, name, &times).await;
-                return Some(times);
+                return Some((times, None));
             }
         }
     }
@@ -4725,11 +4745,13 @@ async fn npm_release_times(
         .await
         .ok()?;
     let times = packument_times(&data);
+    let mut stored = None;
     if fetched {
         // Rewrite tarball URLs to point at NORA, exactly as the proxy path and
         // refetch_metadata do, so a subsequent client reading the cached
         // packument is not sent back to the upstream.
         if let Some(rewritten) = rewrite_for_nora(state, &data, proxy_url, name, Links::Stored) {
+            let rewritten = Bytes::from(rewritten);
             // LOCK-SAFE: the package lock retention holds while it prunes this cache.
             let lock = state.publish_lock(&package_lock_key(name));
             let _guard = lock.lock().await;
@@ -4737,13 +4759,14 @@ async fn npm_release_times(
                 &state.storage,
                 name,
                 &key,
-                rewritten.into(),
+                rewritten.clone(),
                 &origin_of(proxy_url),
             )
             .await;
+            stored = Some(rewritten);
         }
     }
-    Some(times)
+    Some((times, stored))
 }
 
 /// npm's abbreviated packument — `application/vnd.npm.install-v1+json`, the

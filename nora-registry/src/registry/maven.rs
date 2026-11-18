@@ -407,20 +407,26 @@ async fn maven_central_publish_date(
 
 /// [`maven_central_publish_date`] of `path` on the configured Central proxy; `None` with no
 /// Central proxy, so a private mirror's coordinates never reach Central (#68/#733). One
-/// lookup per file for `maven.metadata_ttl`, a miss for a minute (`upstream_dates`).
+/// lookup per file for `maven.metadata_ttl`, a miss for a minute (`upstream_dates`). The flag:
+/// a kept "not on Central" was reused without asking, so the file may be newer than it (R01).
 async fn central_publish_date(
     state: &AppState,
     path: &str,
     maven_name: &str,
     version: &str,
-) -> Option<i64> {
-    let central = state
+) -> (Option<i64>, bool) {
+    let Some(central) = state
         .config
         .maven
         .proxies
         .iter()
-        .find(|p| url_is_maven_central(p.url()))?;
-    let (group, artifact) = maven_name.split_once(':')?;
+        .find(|p| url_is_maven_central(p.url()))
+    else {
+        return (None, false);
+    };
+    let Some((group, artifact)) = maven_name.split_once(':') else {
+        return (None, false);
+    };
     let base = central.url().trim_end_matches('/').to_owned();
     let file_url = format!("{base}/{path}");
     let auth = central.auth().map(str::to_owned);
@@ -430,14 +436,14 @@ async fn central_publish_date(
     let fetching = state.clone();
     let key = file_url.clone();
     let dated = version.clone();
-    super::upstream_dates::dates(
+    let answer = super::upstream_dates::dates(
         state,
         RegistryType::Maven,
         &key,
         ttl,
-        &[],
+        &[&dated],
         move || async move {
-            let at = maven_central_publish_date(
+            match maven_central_publish_date(
                 &fetching,
                 &base,
                 &file_url,
@@ -447,13 +453,17 @@ async fn central_publish_date(
                 budget,
             )
             .await
-            .ok()?;
-            Some(std::collections::HashMap::from([(version, at)]))
+            {
+                Ok(at) => Some(std::collections::HashMap::from([(version, at)])),
+                // Not on Central: an answer without the version.
+                Err(DateMiss::NotFound) => Some(Default::default()),
+                Err(_) => None,
+            }
         },
     )
-    .await?
-    .get(&dated)
-    .copied()
+    .await;
+    let date = answer.dates.and_then(|dates| dates.get(&dated).copied());
+    (date, answer.unasked)
 }
 
 /// A held digest is dated again at most once per this many seconds.
@@ -590,6 +600,7 @@ async fn download(
     let cached_meta = state.storage.stat(&key).await;
     let already_cached = cached_meta.is_some();
     let mut central_asked = false;
+    let mut central_unasked = false;
     let publish_date: Option<i64> =
         if let Some((ref maven_name, ref maven_version)) = curation_coords {
             if state.config.maven.proxies.is_empty() {
@@ -598,7 +609,10 @@ async fn download(
                 // #68/#733: never send an internal-namespace GAV to Central — that would
                 // leak operator-internal coordinates.
                 central_asked = true;
-                central_publish_date(&state, &path, maven_name, maven_version).await
+                let (date, unasked) =
+                    central_publish_date(&state, &path, maven_name, maven_version).await;
+                central_unasked = unasked;
+                date
             } else {
                 None
             }
@@ -731,8 +745,10 @@ async fn download(
                     .as_ref()
                     .filter(|_| !internal && state.config.server.trust_upstream_dates)
                 {
-                    redate_held(&state.digest_store, digest, q_secs, || {
+                    redate_held(&state.digest_store, digest, q_secs, || async {
                         central_publish_date(&state, &path, maven_name, maven_version)
+                            .await
+                            .0
                     })
                     .await;
                 }
@@ -989,11 +1005,18 @@ async fn download(
                     .filter(|_| central_asked && publish_date.is_none())
                     .filter(|_| url_is_maven_central(proxy.url()))
                 {
-                    if let Some(judged) = engine.judged_release_date(
-                        crate::curation::RegistryType::Maven,
-                        state.config.server.trust_upstream_dates,
-                        None,
-                    ) {
+                    // R01: a kept "not on Central" that Central now serves is held, not logged.
+                    let trust = state.config.server.trust_upstream_dates;
+                    let judged = if central_unasked {
+                        engine.unasked_release_date(crate::curation::RegistryType::Maven, trust)
+                    } else {
+                        engine.judged_release_date(
+                            crate::curation::RegistryType::Maven,
+                            trust,
+                            None,
+                        )
+                    };
+                    if let Some(judged) = judged {
                         if let Some(response) = crate::curation::check_download(
                             engine,
                             state.bypass_token().as_deref(),

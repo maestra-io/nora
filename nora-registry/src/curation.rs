@@ -286,6 +286,17 @@ impl CurationEngine {
         None
     }
 
+    /// The date min-release-age judges a proxied `registry` version by when a kept upstream
+    /// answer lacks it and was reused without asking again (`upstream_dates`): the version
+    /// may be newer than the answer, so it is held as released now whatever `unknown_date`
+    /// says, until the next lookup dates it (R01).
+    pub fn unasked_release_date(&self, registry: RegistryType, trust: bool) -> Option<i64> {
+        if !trust || !self.reads_release_date(registry) {
+            return None;
+        }
+        self.unknown_release_date()
+    }
+
     /// Whether `name@version` has not logged its audit hiding line within
     /// [`AUDIT_HIDDEN_LOG_SECS`]; records it as logged now if so.
     fn first_audit_hidden_log(&self, registry: RegistryType, name: &str, version: &str) -> bool {

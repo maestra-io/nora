@@ -211,3 +211,40 @@ async fn a_version_newer_than_the_cached_dates_is_judged_by_its_own_date() {
         StatusCode::OK
     );
 }
+
+/// R19: a version the upstream's packument does not list costs one packument fetch: the one
+/// the date lookup made for the request stands for the tarball step's refetch.
+#[tokio::test]
+async fn an_unlisted_version_fetches_the_packument_once() {
+    let server = upstream().await;
+    let uri = server.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.npm.proxy = Some(uri);
+        cfg.server.trust_upstream_dates = true;
+    });
+    assert_eq!(
+        send(&ctx.app, Method::GET, "/npm/agepkg", "")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    server.reset().await;
+    mount(&server, true).await;
+
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/npm/agepkg/-/agepkg-0.0.0-nope.tgz",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let packuments = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/agepkg")
+        .count();
+    assert_eq!(packuments, 1);
+}
