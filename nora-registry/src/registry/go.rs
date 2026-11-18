@@ -111,7 +111,7 @@ async fn handle_filtered(
             &headers,
             RegistryType::Go,
             &module_path,
-            crate::curation::RequestVersion::of_artifact(Some(&version)),
+            crate::curation::RequestVersion::of_artifact(Some(&encode_module_path(&version))),
             judged,
         )
     };
@@ -129,41 +129,55 @@ async fn handle_filtered(
         Path(format!("{module_encoded}/@v/list")),
     )
     .await;
-    if list.status() != StatusCode::OK {
-        return list;
-    }
-    let Ok(list) = axum::body::to_bytes(list.into_body(), usize::MAX).await else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    // A missing list is no candidate (the gate's refusal below, never the absence a
+    // `,direct` client would fall back on); another failure stops here.
+    let text = match list.status() {
+        StatusCode::OK => match axum::body::to_bytes(list.into_body(), usize::MAX).await {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        StatusCode::NOT_FOUND | StatusCode::GONE => String::new(),
+        _ => return list,
     };
-    let text = String::from_utf8_lossy(&list);
     let versions: Vec<&str> = text.lines().map(str::trim).collect();
     let hidden = go_hidden_versions(&state, &module_encoded, &module_path, &versions).await;
-    let best = versions
+    let mut candidates: Vec<&str> = versions
         .iter()
-        .filter(|v| is_canonical_go_version(v) && !hidden.contains(**v))
-        .max_by(|a, b| {
-            (!a.contains('-'))
-                .cmp(&!b.contains('-'))
-                .then_with(|| go_semver_cmp(a, b))
-        });
-    let Some(best) = best else {
-        return match held().await {
-            Some(refused) => refused,
-            None => Response::from_parts(parts, axum::body::Body::from(body)),
-        };
-    };
-    let mut info = handle(
-        State(state.clone()),
-        headers.clone(),
-        Path(format!("{module_encoded}/@v/{best}.info")),
-    )
-    .await;
-    // The `.info` of a canonical version is immutable; `@latest` is not.
-    info.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=60, must-revalidate"),
-    );
-    info
+        .copied()
+        .filter(|v| is_canonical_go_version(v) && !hidden.contains(*v))
+        .collect();
+    candidates.sort_by(|a, b| {
+        (!b.contains('-'))
+            .cmp(&!a.contains('-'))
+            .then_with(|| go_semver_cmp(b, a))
+    });
+    for best in candidates {
+        let mut info = handle(
+            State(state.clone()),
+            headers.clone(),
+            Path(format!(
+                "{module_encoded}/@v/{}.info",
+                encode_module_path(best)
+            )),
+        )
+        .await;
+        match info.status() {
+            // The `.info` of a canonical version is immutable; `@latest` is not.
+            StatusCode::OK => {
+                info.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("public, max-age=60, must-revalidate"),
+                );
+                return info;
+            }
+            StatusCode::NOT_FOUND | StatusCode::GONE => continue,
+            _ => return info,
+        }
+    }
+    match held().await {
+        Some(refused) => refused,
+        None => Response::from_parts(parts, axum::body::Body::from(body)),
+    }
 }
 
 /// Whether the `.zip` gate would refuse `ver` for its release age: the same date
@@ -177,14 +191,18 @@ async fn go_version_hidden(
     ver: &str,
 ) -> bool {
     let judged = go_gate_date(state, module_encoded, ver).await;
-    state
-        .curation()
-        .curation_engine
-        .hides_from_metadata(RegistryType::Go, module_path, ver, judged)
+    state.curation().curation_engine.hides_from_metadata(
+        RegistryType::Go,
+        module_path,
+        &encode_module_path(ver),
+        judged,
+    )
 }
 
-/// The date the `.zip` gate judges `ver` by.
+/// The date the `.zip` gate judges `ver` by, under the version's escaped spelling
+/// (`v1.0.0-RC` → `v1.0.0-!r!c`), the one the go command requests and the gate keys by.
 async fn go_gate_date(state: &AppState, module_encoded: &str, ver: &str) -> Option<i64> {
+    let ver = &encode_module_path(ver);
     let date = go_publish_date(state, module_encoded, ver, true).await;
     go_judged_date(state, date, &format!("go/{module_encoded}/@v/{ver}.zip")).await
 }
@@ -193,8 +211,8 @@ async fn go_gate_date(state: &AppState, module_encoded: &str, ver: &str) -> Opti
 /// release vs pre-release, and each group is dated from its newest version down to the first
 /// one admitted: the go command picks the newest of a group (`latest`, `v1.2`, `upgrade`,
 /// `patch`), so every group's newest offered version is one the gate admits.
-// ponytail: a held version below an admitted one in its group stays listed (reachable only by
-// `<`/`<=` queries); dating every listed version costs one `.info` + HEAD per version on a
+// ponytail: a held version below an admitted (or `allow`ed) one in its group stays listed
+// (reachable by `<`/`<=`/`>=` queries, then 403 on its `.zip`); dating every listed version costs one `.info` + HEAD per version on a
 // module's first listing (k8s.io/client-go: ~700). Date them all if such queries matter.
 async fn go_hidden_versions(
     state: &AppState,
@@ -203,7 +221,8 @@ async fn go_hidden_versions(
     versions: &[&str],
 ) -> std::collections::HashSet<String> {
     use futures::StreamExt;
-    let mut groups: std::collections::BTreeMap<(u64, u64, bool), Vec<String>> = Default::default();
+    let mut groups: std::collections::BTreeMap<(&str, &str, bool), Vec<String>> =
+        Default::default();
     for v in versions
         .iter()
         .copied()
@@ -234,23 +253,32 @@ async fn go_hidden_versions(
 }
 
 /// A canonical Go version's `[major, minor, patch]` and pre-release (build metadata dropped).
-fn go_semver_parts(v: &str) -> ([u64; 3], Option<&str>) {
+fn go_semver_parts(v: &str) -> ([&str; 3], Option<&str>) {
     let v = v.trim_start_matches('v');
     let v = v.split('+').next().unwrap_or(v);
     let (core, pre) = match v.split_once('-') {
         Some((core, pre)) => (core, Some(pre)),
         None => (v, None),
     };
-    let mut n = core.split('.').map(|s| s.parse().unwrap_or(0));
-    let mut next = || n.next().unwrap_or(0);
+    let mut n = core.split('.');
+    let mut next = || n.next().unwrap_or("0");
     ([next(), next(), next()], pre)
+}
+
+/// Order of two decimal digit runs without leading zeros, of any length (semver `compareInt`).
+fn go_cmp_int(x: &str, y: &str) -> std::cmp::Ordering {
+    x.len().cmp(&y.len()).then_with(|| x.cmp(y))
 }
 
 /// Semantic version order of two canonical Go versions (golang.org/x/mod/semver `Compare`).
 fn go_semver_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering::{Equal, Greater, Less};
     let ((ca, pa), (cb, pb)) = (go_semver_parts(a), go_semver_parts(b));
-    ca.cmp(&cb).then_with(|| match (pa, pb) {
+    let core = ca
+        .iter()
+        .zip(&cb)
+        .fold(Equal, |o, (x, y)| o.then_with(|| go_cmp_int(x, y)));
+    core.then_with(|| match (pa, pb) {
         (None, None) => Equal,
         (None, Some(_)) => Greater,
         (Some(_), None) => Less,
@@ -263,10 +291,11 @@ fn go_semver_cmp(a: &str, b: &str) -> std::cmp::Ordering {
                     (Some(_), None) => return Greater,
                     (Some(x), Some(y)) => (x, y),
                 };
-                let order = match (x.parse::<u64>(), y.parse::<u64>()) {
-                    (Ok(x), Ok(y)) => x.cmp(&y),
-                    (Ok(_), Err(_)) => Less,
-                    (Err(_), Ok(_)) => Greater,
+                let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+                let order = match (numeric(x), numeric(y)) {
+                    (true, true) => go_cmp_int(x, y),
+                    (true, false) => Less,
+                    (false, true) => Greater,
                     _ => x.cmp(y),
                 };
                 if order != Equal {
@@ -956,8 +985,7 @@ fn decode_module_path(encoded: &str) -> Result<String, ()> {
     Ok(result)
 }
 
-/// Encode Go module path: `X` → `!x`
-#[cfg(test)]
+/// Encode a Go module path or version: `X` → `!x`
 fn encode_module_path(path: &str) -> String {
     let mut result = String::with_capacity(path.len() + 8);
     for c in path.chars() {
@@ -1058,6 +1086,10 @@ fn format_artifact(module: &str, file: &str) -> String {
 /// all of which resolve to a moving target. When in doubt this returns `false` (treat as mutable
 /// → revalidate), which is the fail-safe for freshness.
 fn is_canonical_go_version(v: &str) -> bool {
+    // One path segment: an upstream `@v/list` entry becomes a storage key and a request path.
+    if v.contains('/') {
+        return false;
+    }
     let Some(rest) = v.strip_prefix('v') else {
         return false;
     };
@@ -2249,19 +2281,18 @@ mod release_date_judged {
         std::str::from_utf8(&data).ok()?.trim().parse().ok()
     }
 
-    fn days_ago(days: i64) -> i64 {
-        (chrono::Utc::now() - chrono::Duration::days(days)).timestamp()
-    }
-
     // An old version NORA first sees now is dated by the proxy's first fetch, asked once and kept.
     #[tokio::test]
     async fn an_attested_old_version_first_seen_now_is_served() {
-        // Taken with the header, not after the test: under a parallel run the pooled mock
-        // server can take seconds to start, which a later `days_ago(30)` would count.
-        let last_modified_at = days_ago(30);
+        // The header is built from this one instant: under a parallel run the pooled mock
+        // server can take seconds to start, which a second clock read would count.
+        let last_modified_at = chrono::Utc::now() - chrono::Duration::days(30);
+        let header = last_modified_at
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
         let (up, ctx) = attested(
             chrono::Duration::days(30),
-            last_modified(chrono::Duration::days(30)),
+            ResponseTemplate::new(200).insert_header("last-modified", header),
         )
         .await;
         info_through_nora(&ctx).await;
@@ -2271,8 +2302,7 @@ mod release_date_judged {
         assert_eq!(status(&ctx, ZIP).await, StatusCode::OK);
         assert_eq!(heads(&up).await, 1, "one HEAD, then the kept date");
         let at = kept(&ctx).await.expect("attested date kept");
-        // The header has one-second resolution.
-        assert!((at - last_modified_at).abs() <= 1, "kept the Last-Modified");
+        assert_eq!(at, last_modified_at.timestamp(), "kept the Last-Modified");
     }
 
     // A066 holds: a back-dated `Time` does not age a version the proxy fetched an hour ago.
@@ -2635,6 +2665,28 @@ mod metadata_hides_young_versions {
         assert_eq!(get(&ctx, "@v/list").await.1, "");
     }
 
+    // A held `@latest` whose replacement list is missing keeps the gate's refusal: a 404
+    // would let a `GOPROXY=…,direct` client fetch the held version from `direct`.
+    #[tokio::test]
+    async fn latest_with_a_missing_list_is_refused_as_the_zip_is() {
+        let (up, ctx) = context(&all(), CurationMode::Enforce, &[]).await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{MODULE}/@v/list")))
+            .respond_with(ResponseTemplate::new(404))
+            .with_priority(1)
+            .mount(&up)
+            .await;
+        let (status, body, _) = get(&ctx, "@latest").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    }
+
+    #[test]
+    fn a_listed_version_is_one_path_segment() {
+        assert!(super::is_canonical_go_version("v1.2.3-rc.1"));
+        assert!(!super::is_canonical_go_version("v1.2.3-rc/extra"));
+        assert_eq!(super::encode_module_path("v1.2.3-RC.1"), "v1.2.3-!r!c.1");
+    }
+
     #[tokio::test]
     async fn a_branch_resolving_to_a_held_pseudo_version_is_refused_as_the_zip_is() {
         let (_up, ctx) = context(&all(), CurationMode::Enforce, &[]).await;
@@ -2681,5 +2733,13 @@ mod metadata_hides_young_versions {
         assert_eq!(go_semver_cmp("v1.0.0-alpha", "v1.0.0-alpha.1"), Less);
         assert_eq!(go_semver_cmp("v1.0.0-1", "v1.0.0-alpha"), Less);
         assert_eq!(go_semver_cmp("v2.0.0+incompatible", "v2.0.0"), Equal);
+        assert_eq!(
+            go_semver_cmp("v1.2.18446744073709551616", "v1.2.1"),
+            Greater
+        );
+        assert_eq!(
+            go_semver_cmp("v1.0.0-18446744073709551617", "v1.0.0-18446744073709551616"),
+            Greater
+        );
     }
 }
