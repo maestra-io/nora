@@ -293,6 +293,7 @@ fn build_context_full(
             upstreams: vec![],
             quarantine_exceptions: None,
             quarantine_exempt: Vec::new(),
+            proxy_spool_max_mb: 0,
         },
         raw: RawConfig {
             enabled: true,
@@ -487,6 +488,7 @@ fn build_context_full(
     let state = AppState {
         storage: storage.clone(),
         spool: Arc::new(crate::registry::SpoolBudget::new(&config)),
+        docker_spool: Arc::new(crate::registry::docker::proxy_spool_budget(&config)),
         publish_budget: crate::registry::publish_budget(&config),
         config: Arc::new(config),
         enabled_registries: enabled_registries.clone(),

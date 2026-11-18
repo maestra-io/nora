@@ -591,3 +591,54 @@ async fn client_range_past_end_on_cache_miss_is_416() {
         format!("bytes */{}", blob.len())
     );
 }
+
+/// Audit A061: a range of a fill whose upstream body does not hash to the digest gets
+/// 206 headers but not one body byte, for a range that ends inside the blob as well as
+/// one that runs to its end, paced or sent at once; nothing is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a061_range_of_a_poisoned_fill_gets_no_byte() {
+    let paced = |len: usize| Plan {
+        piece: len.div_ceil(8),
+        delay: Duration::from_millis(20),
+        ..Plan::fast()
+    };
+    for len in [4 * 1024, 64 * 1024] {
+        for plan in [paced(len), Plan::fast()] {
+            for range in ["bytes=0-", "bytes=100-199"] {
+                let (mut poisoned, digest) = layer(len);
+                poisoned[len / 2] ^= 0xff;
+                let upstream = scripted_upstream(poisoned, vec![plan], None).await;
+                let ctx = ctx_for(&upstream, 5);
+                let response = send_with_headers(
+                    &ctx.app,
+                    Method::GET,
+                    &format!("/v2/library/test/blobs/{digest}"),
+                    vec![("range", range)],
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT, "{range}");
+                let mut body = response.into_body().into_data_stream();
+                let (mut bytes, mut failed) = (0, false);
+                while let Some(frame) = body.next().await {
+                    match frame {
+                        Ok(chunk) => bytes += chunk.len(),
+                        Err(_) => {
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+                assert_eq!(bytes, 0, "{len} B, {range}: bytes before the verdict");
+                assert!(failed, "{len} B, {range}: the body must fail");
+                let started = std::time::Instant::now();
+                while proxy_temp_count(&ctx) > 0 && started.elapsed() < Duration::from_secs(5) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                let c = canonicalize("library/test", &ctx.state.config.docker);
+                let key = blob_key(c.namespace.as_deref(), &c.name, &digest);
+                assert!(ctx.state.storage.get(&key).await.is_err(), "not stored");
+            }
+        }
+    }
+}

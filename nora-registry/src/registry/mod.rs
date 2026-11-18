@@ -1258,7 +1258,8 @@ const SPOOL_FREE_FLOOR: u64 = 64 * MIB;
 /// Why a body could not be spooled. Never an upstream failure.
 #[derive(Debug)]
 pub(crate) enum SpoolError {
-    /// `server.spool_max_mb` is in use by other transfers: retry shortly.
+    /// The budget (`server.spool_max_mb`, `docker.proxy_spool_max_mb`) is in use by
+    /// other transfers: retry shortly.
     Busy,
     /// Larger than the cap (bytes) or than the whole budget: no retry can fit it.
     TooLarge(u64),
@@ -1358,12 +1359,17 @@ pub(crate) struct SpoolBudget {
 
 impl SpoolBudget {
     pub(crate) fn new(config: &crate::config::Config) -> Self {
-        let total_mib = config
-            .server
-            .spool_max_mb
-            .min(tokio::sync::Semaphore::MAX_PERMITS as u64);
+        Self::at(
+            config.server.spool_dir(&config.storage.path),
+            config.server.spool_max_mb,
+        )
+    }
+
+    /// A budget of `total_mib` MiB (0 = none) for spools under `dir`.
+    pub(crate) fn at(dir: std::path::PathBuf, total_mib: u64) -> Self {
+        let total_mib = total_mib.min(tokio::sync::Semaphore::MAX_PERMITS as u64);
         Self {
-            dir: config.server.spool_dir(&config.storage.path),
+            dir,
             permits: (total_mib > 0)
                 .then(|| std::sync::Arc::new(tokio::sync::Semaphore::new(total_mib as usize))),
             total_mib,
@@ -2452,7 +2458,13 @@ where
                 Duration::from_secs(timeout_secs.saturating_mul(2)) + Duration::from_secs(30);
             Ok(Served::Live(LiveFill {
                 len: start.len,
-                bytes: Box::pin(docker::spool_follower(start.file, start.progress, 0, stall)),
+                bytes: Box::pin(docker::spool_follower(
+                    start.file,
+                    start.progress,
+                    0,
+                    stall,
+                    false,
+                )),
                 task,
                 hold,
             }))

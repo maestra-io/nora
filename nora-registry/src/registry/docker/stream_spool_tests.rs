@@ -254,13 +254,31 @@ async fn follower_over(
     tokio::sync::watch::Sender<super::SpoolStatus>,
     tempfile::TempDir,
 ) {
+    follower_over_gated(bytes, status, false).await
+}
+
+async fn follower_over_gated(
+    bytes: &[u8],
+    status: super::SpoolStatus,
+    gate_all: bool,
+) -> (
+    std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
+    tokio::sync::watch::Sender<super::SpoolStatus>,
+    tempfile::TempDir,
+) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("spool");
     tokio::fs::write(&path, bytes).await.unwrap();
     let file = tokio::fs::File::open(&path).await.unwrap();
     let (tx, rx) = tokio::sync::watch::channel(status);
     (
-        Box::pin(super::spool_follower(file, rx, 0, Duration::from_secs(60))),
+        Box::pin(super::spool_follower(
+            file,
+            rx,
+            0,
+            Duration::from_secs(60),
+            gate_all,
+        )),
         tx,
         dir,
     )
@@ -283,6 +301,7 @@ async fn spool_follower_fails_past_the_stall_ceiling() {
         rx,
         0,
         Duration::from_millis(100),
+        false,
     ));
     // Two bytes are released (one held back), then nothing more ever comes.
     let first = tokio::time::timeout(Duration::from_secs(1), follower.next())
@@ -518,4 +537,226 @@ async fn test_docker_proxy_blob_new_digest_held_on_streaming_path() {
         StatusCode::FORBIDDEN,
         "still held from the cache"
     );
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// Upstream that answers every blob path with `blob` in `pieces` pieces `delay` apart
+/// (`Content-Length` when `declare_length`), counting the blob GETs.
+async fn counting_blob_upstream(
+    blob: Vec<u8>,
+    pieces: usize,
+    delay: Duration,
+    declare_length: bool,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::routing::get;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (blob, h) = (Arc::new(blob), hits.clone());
+    let app = Router::new().route(
+        "/v2/{*rest}",
+        get(move || {
+            let (blob, hits) = (blob.clone(), h.clone());
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let piece = blob.len().div_ceil(pieces).max(1);
+                let parts: Vec<Bytes> = blob.chunks(piece).map(Bytes::copy_from_slice).collect();
+                let body = futures::stream::iter(parts).then(move |p| async move {
+                    tokio::time::sleep(delay).await;
+                    Ok::<_, std::io::Error>(p)
+                });
+                let mut builder = Response::builder().status(StatusCode::OK);
+                if declare_length {
+                    builder = builder.header(header::CONTENT_LENGTH, blob.len());
+                }
+                builder.body(Body::from_stream(body)).unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// A context whose Docker fills share a `budget_mb` proxy spool, with a breaker that
+/// opens on the first failure.
+fn budget_ctx(upstream: String, budget_mb: u64) -> TestContext {
+    use crate::config::DockerUpstream;
+    create_test_context_with_config(move |cfg| {
+        cfg.circuit_breaker.enabled = true;
+        cfg.circuit_breaker.failure_threshold = 1;
+        cfg.docker.proxy_spool_max_mb = budget_mb;
+        cfg.docker.upstreams = vec![DockerUpstream {
+            trust_upstream_dates: false,
+            date_token_file: None,
+            token_hosts: Vec::new(),
+            url: upstream,
+            auth: None,
+            auth_env: None,
+            namespace: None,
+            prefix: None,
+            namespaces: Vec::new(),
+        }];
+    })
+}
+
+fn proxy_temp_bytes(ctx: &TestContext) -> u64 {
+    let proxy_tmp = std::path::Path::new(&ctx.state.config.storage.path).join("tmp/docker-proxy");
+    std::fs::read_dir(&proxy_tmp)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok()?.metadata().ok())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// Samples the proxy spool until it is empty (bounded); the largest total seen.
+async fn peak_proxy_temp_bytes(ctx: &TestContext) -> u64 {
+    let (started, mut peak) = (std::time::Instant::now(), 0);
+    loop {
+        peak = peak.max(proxy_temp_bytes(ctx));
+        if proxy_temp_count(ctx) == 0 || started.elapsed() > Duration::from_secs(15) {
+            return peak;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn get_blob(ctx: &TestContext, digest: &str) -> Response<Body> {
+    send(
+        &ctx.app,
+        Method::GET,
+        &format!("/v2/library/test/blobs/{digest}"),
+        Body::empty(),
+    )
+    .await
+}
+
+/// Audit A060: a blob whose declared length exceeds `docker.proxy_spool_max_mb` is a 507
+/// before any byte is spooled, and the upstream's breaker probe goes back as alive.
+#[tokio::test]
+async fn a060_blob_declared_over_the_proxy_spool_budget_is_507() {
+    let blob = vec![7u8; 4 * MIB as usize];
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob)));
+    let (upstream, _hits) = counting_blob_upstream(blob, 8, Duration::ZERO, true).await;
+    let ctx = budget_ctx(upstream.clone(), 1);
+
+    for _ in 0..2 {
+        let response = get_blob(&ctx, &digest).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::INSUFFICIENT_STORAGE,
+            "a blob over the budget is refused, and an open breaker would make it a 502"
+        );
+        assert_eq!(proxy_temp_count(&ctx), 0, "no spool file is left");
+    }
+    let cb_key = crate::circuit_breaker::upstream_key("docker", &upstream);
+    assert!(ctx.state.circuit_breaker.check(&cb_key).is_ok());
+    let c = canonicalize("library/test", &ctx.state.config.docker);
+    let key = blob_key(c.namespace.as_deref(), &c.name, &digest);
+    assert!(ctx.state.storage.get(&key).await.is_err());
+}
+
+/// Audit A060: while other fills hold the whole budget a new fill is a 503 with
+/// `Retry-After`, answered before upstream is asked; once released, the pull works.
+#[tokio::test]
+async fn a060_busy_proxy_spool_budget_is_503_before_upstream() {
+    use std::sync::atomic::Ordering;
+    let blob: Vec<u8> = (0..4096).map(|i| (i % 233) as u8).collect();
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob)));
+    let (upstream, hits) = counting_blob_upstream(blob.clone(), 1, Duration::ZERO, true).await;
+    let ctx = budget_ctx(upstream, 1);
+
+    let held = ctx.state.docker_spool.reserve(MIB).unwrap();
+    let response = get_blob(&ctx, &digest).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response.headers().contains_key(header::RETRY_AFTER));
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "upstream is not asked");
+
+    drop(held);
+    let response = get_blob(&ctx, &digest).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await.as_ref(), &blob[..]);
+}
+
+/// Audit A060: a chunked body (no `Content-Length`) stops at the budget even with no
+/// client left: the spool never holds more than the budget, then it is removed, nothing
+/// is stored and the budget is free again.
+#[tokio::test]
+async fn a060_chunked_body_stops_at_the_proxy_spool_budget() {
+    let blob = vec![9u8; 4 * MIB as usize];
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob)));
+    let (upstream, _hits) =
+        counting_blob_upstream(blob, 16, Duration::from_millis(20), false).await;
+    let ctx = budget_ctx(upstream, 1);
+
+    let response = get_blob(&ctx, &digest).await;
+    assert_eq!(response.status(), StatusCode::OK, "headers go out first");
+    drop(response);
+    let peak = peak_proxy_temp_bytes(&ctx).await;
+    assert!(peak <= MIB, "the spool grew to {peak} bytes");
+    assert_eq!(proxy_temp_count(&ctx), 0, "the failed fill is removed");
+    let c = canonicalize("library/test", &ctx.state.config.docker);
+    let key = blob_key(c.namespace.as_deref(), &c.name, &digest);
+    assert!(ctx.state.storage.get(&key).await.is_err());
+    assert!(
+        ctx.state.docker_spool.reserve(MIB).is_ok(),
+        "the failed fill released its budget"
+    );
+}
+
+/// Audit A060: fills of distinct blobs whose clients all left never hold more than the
+/// budget between them; the ones that do not fit are refused.
+#[tokio::test]
+async fn a060_dropped_fills_never_outgrow_the_proxy_spool_budget() {
+    let blob = vec![0x5a_u8; 4 * MIB as usize];
+    let (upstream, _hits) = counting_blob_upstream(blob, 8, Duration::from_millis(100), true).await;
+    let ctx = budget_ctx(upstream, 5);
+
+    let mut statuses = Vec::new();
+    for i in 0..5 {
+        let response = get_blob(&ctx, &format!("sha256:{:064x}", i + 1)).await;
+        statuses.push(response.status());
+        drop(response);
+    }
+    assert_eq!(statuses[0], StatusCode::OK);
+    assert!(
+        statuses.contains(&StatusCode::SERVICE_UNAVAILABLE),
+        "{statuses:?}"
+    );
+    let peak = peak_proxy_temp_bytes(&ctx).await;
+    assert!(peak <= 5 * MIB, "the spools held {peak} bytes");
+}
+
+/// Audit A061: a gated follower (a range) releases nothing until the spool reports a
+/// verified end, then everything; a failed spool fails it before its first byte.
+#[tokio::test]
+async fn a061_gated_follower_releases_nothing_before_the_verdict() {
+    let data = b"0123456789";
+    let pending = super::SpoolStatus {
+        written: data.len() as u64,
+        done: None,
+    };
+    let (mut follower, tx, _dir) = follower_over_gated(data, pending.clone(), true).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), follower.next())
+            .await
+            .is_err(),
+        "no byte before the verdict"
+    );
+    tx.send_modify(|s| s.done = Some(Ok(())));
+    let mut got = Vec::new();
+    while let Some(chunk) = follower.next().await {
+        got.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(got, data);
+
+    let (mut follower, tx, _dir) = follower_over_gated(data, pending, true).await;
+    tx.send_modify(|s| s.done = Some(Err("SHA-256 mismatch".to_string())));
+    let first = follower.next().await.unwrap();
+    assert!(first.is_err(), "the first item is the failure");
 }

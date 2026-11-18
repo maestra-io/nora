@@ -596,6 +596,21 @@ fn proxy_temp_dir(data_dir: &str) -> std::path::PathBuf {
     dir
 }
 
+/// The byte budget of proxied blob fills, rooted at their spool directory under `/data`
+/// (`docker.proxy_spool_max_mb`); unset, only the free-space floor bounds them.
+pub(crate) fn proxy_spool_budget(config: &crate::config::Config) -> super::SpoolBudget {
+    let docker = &config.docker;
+    if docker.enabled && !docker.upstreams.is_empty() && docker.proxy_spool_max_mb == 0 {
+        tracing::warn!(
+            "docker.proxy_spool_max_mb is 0: proxied blob fills have no byte budget; set it below the free space of storage.path"
+        );
+    }
+    super::SpoolBudget::at(
+        std::path::PathBuf::from(&config.storage.path).join("tmp/docker-proxy"),
+        docker.proxy_spool_max_mb,
+    )
+}
+
 /// Remove expired upload sessions and their temp files (called by background task)
 pub fn cleanup_expired_sessions(sessions: &RwLock<HashMap<String, UploadSession>>) {
     let mut guard = sessions.write();
@@ -2151,6 +2166,7 @@ async fn download_blob(
                         Some(FillStartError::Spool) => {
                             return StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }
+                        Some(FillStartError::Budget(e)) => return e.response("docker"),
                         // An open breaker skips this upstream for the next, as a failure
                         // does (#1198).
                         Some(FillStartError::Upstream(e)) => {

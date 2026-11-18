@@ -56,6 +56,19 @@ data:
     {{- end }}
     {{- end }}
 
+    {{- $dockerSpool := int64 (.Values.config.docker.proxy_spool_max_mb | default 0) }}
+    {{- if and (gt $dockerSpool 0) (not .Values.persistence.enabled) }}
+    {{- $eph := dig "limits" "ephemeral-storage" "" (.Values.resources | default dict) | toString }}
+    {{- $limitMb := int64 0 }}
+    {{- if $eph }}
+    {{- $limitMb = include "nora.quantityMi" $eph | int64 }}
+    {{- else if .Values.spool.enabled }}
+    {{- $limitMb = add (int .Values.spool.sizeLimitMb) 1024 | int64 }}
+    {{- end }}
+    {{- if and (gt $limitMb 0) (ge $dockerSpool $limitMb) }}
+    {{- fail (printf "config.docker.proxy_spool_max_mb (%d) must be below the ephemeral-storage limit (%d Mi): /data is an emptyDir, and a fill that reaches the limit gets the pod evicted" $dockerSpool $limitMb) }}
+    {{- end }}
+    {{- end }}
     {{- if or .Values.config.docker.upstreams .Values.config.docker.proxy_timeout }}
     [docker]
     proxy_timeout = {{ .Values.config.docker.proxy_timeout | default 60 }}

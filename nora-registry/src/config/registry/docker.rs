@@ -59,6 +59,12 @@ pub struct DockerConfig {
     /// start: an invalid entry stops NORA.
     #[serde(default)]
     pub quarantine_exempt: Vec<QuarantineExempt>,
+    /// Maestra: MiB that proxied blob fills may hold under `{storage.path}/tmp/docker-proxy`
+    /// at once (env `NORA_DOCKER_PROXY_SPOOL_MAX_MB`). A fill that does not fit is refused:
+    /// 503 + `Retry-After` while other fills hold the budget, 507 for a blob larger than it.
+    /// 0 (default) = no budget; the free-space floor still applies.
+    #[serde(default)]
+    pub proxy_spool_max_mb: u64,
 }
 
 /// One `[[docker.quarantine_exempt]]` entry.
@@ -354,6 +360,7 @@ impl Default for DockerConfig {
             upstreams: default_docker_upstreams(),
             quarantine_exceptions: None,
             quarantine_exempt: Vec::new(),
+            proxy_spool_max_mb: 0,
         }
     }
 }
@@ -490,6 +497,13 @@ impl DockerConfig {
         }
         if let Ok(val) = env::var("NORA_DOCKER_READ_TIMEOUT") {
             super::super::parse_env_warn("NORA_DOCKER_READ_TIMEOUT", &val, &mut self.read_timeout);
+        }
+        if let Ok(val) = env::var("NORA_DOCKER_PROXY_SPOOL_MAX_MB") {
+            super::super::parse_env_warn(
+                "NORA_DOCKER_PROXY_SPOOL_MAX_MB",
+                &val,
+                &mut self.proxy_spool_max_mb,
+            );
         }
         if let Ok(val) = env::var("NORA_DOCKER_METADATA_TTL") {
             super::super::parse_env_warn("NORA_DOCKER_METADATA_TTL", &val, &mut self.metadata_ttl);

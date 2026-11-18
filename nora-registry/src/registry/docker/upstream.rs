@@ -14,6 +14,8 @@ pub struct FetchedBlob {
     pub sha256: String,
     /// RAII guard — deletes temp file on drop unless disarmed.
     pub _guard: TempFileGuard,
+    /// The fill's share of `docker.proxy_spool_max_mb`, held until the file is stored.
+    pub(crate) _budget: Option<crate::registry::SpoolReservation>,
 }
 
 /// An upstream blob whose response headers have arrived but whose body has not been
@@ -47,16 +49,26 @@ pub(crate) struct SpoolFile {
     pub(super) path: std::path::PathBuf,
     pub(super) file: tokio::fs::File,
     pub(super) guard: TempFileGuard,
+    /// Budget the spool grows within before each write; `None` = unbudgeted (mirror).
+    pub(super) budget: Option<crate::registry::SpoolReservation>,
 }
 
 impl SpoolFile {
-    pub(crate) async fn create(temp_dir: &std::path::Path) -> Result<Self, ProxyError> {
+    pub(crate) async fn create(
+        temp_dir: &std::path::Path,
+        budget: Option<crate::registry::SpoolReservation>,
+    ) -> Result<Self, ProxyError> {
         let path = temp_dir.join(format!("proxy-{}", uuid::Uuid::new_v4()));
         let guard = TempFileGuard::new(path.clone());
         let file = tokio::fs::File::create(&path)
             .await
             .map_err(|e| ProxyError::Network(format!("temp file create: {}", e)))?;
-        Ok(Self { path, file, guard })
+        Ok(Self {
+            path,
+            file,
+            guard,
+            budget,
+        })
     }
 
     /// A second, read-only handle on the spool file for a response to follow.
@@ -76,11 +88,15 @@ impl SpoolFile {
 ///
 /// `file` is positioned at byte `start` of the blob: a ranged response follows the
 /// spool from there. A spool that reports nothing for `stall` fails the read.
+///
+/// `gate_all` releases nothing until the spool reports a verified end: for a body whose
+/// last byte is not the blob's (a range), the one-byte holdback gates nothing.
 pub(crate) fn spool_follower(
     file: tokio::fs::File,
     status: tokio::sync::watch::Receiver<SpoolStatus>,
     start: u64,
     stall: Duration,
+    gate_all: bool,
 ) -> impl futures::Stream<Item = std::io::Result<Bytes>> + Send {
     const READ_BUF: usize = 256 * 1024;
     const HOLDBACK_BYTES: u64 = 1;
@@ -100,6 +116,7 @@ pub(crate) fn spool_follower(
                             std::io::Error::other(format!("upstream blob fetch failed: {reason}"));
                         return Some((Err(err), (file, status, offset, empty_reads)));
                     }
+                    None if gate_all => 0,
                     None => current.written.saturating_sub(HOLDBACK_BYTES),
                 };
                 if offset < released {
@@ -162,9 +179,10 @@ pub(crate) fn spool_follower(
 /// length upstream declared is served 206 from that offset, or 416 past the end, the
 /// way the cache-hit path does: a client resuming a broken pull (containerd sends
 /// `bytes=N-`) gets the tail, not the blob again from byte zero, which it would have to
-/// read and discard up to N. A ranged body is partial, so it has no whole-blob digest to
-/// verify (as on the cache-hit path). Without a declared length, or for a range that
-/// does not parse, the whole blob goes out as 200.
+/// read and discard up to N. A range cannot be verified on its own, so its body waits for
+/// the spool's whole-blob verdict: the headers go out at once, the first byte only once
+/// the digest matched, and a failed fill fails the body before any byte. Without a
+/// declared length, or for a range that does not parse, the whole blob goes out as 200.
 async fn spool_response(
     mut follower: tokio::fs::File,
     status: tokio::sync::watch::Receiver<SpoolStatus>,
@@ -206,7 +224,7 @@ async fn spool_response(
             }
             let wanted = end - start + 1;
             let reader = tokio_util::io::StreamReader::new(Box::pin(spool_follower(
-                follower, status, start, stall,
+                follower, status, start, stall, true,
             )))
             .take(wanted);
             builder
@@ -220,7 +238,7 @@ async fn spool_response(
         }
         _ => {
             let reader = tokio_util::io::StreamReader::new(Box::pin(spool_follower(
-                follower, status, 0, stall,
+                follower, status, 0, stall, false,
             )));
             let stream = blob_verifying_stream(
                 Box::pin(reader),
@@ -262,13 +280,16 @@ pub(super) struct LeaderFill {
 pub(super) enum FillStartError {
     /// The local spool file could not be created or reopened.
     Spool,
+    /// `docker.proxy_spool_max_mb` or the free-space floor has no room for the blob.
+    Budget(crate::registry::SpoolError),
     /// Upstream refused or failed before answering headers.
     Upstream(ProxyError),
 }
 
-/// Open a fill: the spool file and its first read handle, then the upstream request. The
-/// spool exists before upstream answers, so once a circuit-breaker probe is taken the
-/// only exits left are the ones the spool task records.
+/// Open a fill: its budget, the spool file and its first read handle, then the upstream
+/// request. The spool exists before upstream answers, so once a circuit-breaker probe is
+/// taken the only exits left are the ones the spool task records, and a budget too small
+/// for the declared length, which returns the probe as alive.
 pub(super) async fn start_fill(
     state: &AppState,
     upstream_url: &str,
@@ -278,7 +299,15 @@ pub(super) async fn start_fill(
     temp_dir: &std::path::Path,
     failure: &mut Option<FillStartError>,
 ) -> Option<(SpoolShare, LeaderFill)> {
-    let spool = match SpoolFile::create(temp_dir).await {
+    // A busy budget is answered before upstream is asked (or a breaker probe taken).
+    let budget = match state.docker_spool.reserve(1) {
+        Ok(budget) => budget,
+        Err(e) => {
+            *failure = Some(FillStartError::Budget(e));
+            return None;
+        }
+    };
+    let mut spool = match SpoolFile::create(temp_dir, Some(budget)).await {
         Ok(spool) => spool,
         Err(e) => {
             tracing::error!(error = ?e, "Failed to create proxy spool file");
@@ -307,6 +336,12 @@ pub(super) async fn start_fill(
     .await
     {
         Ok(blob) => {
+            let declared = blob.content_length.unwrap_or(0);
+            if let Some(Err(e)) = spool.budget.as_mut().map(|b| b.grow(declared)) {
+                state.circuit_breaker.record_alive(&blob.cb_key, blob.probe);
+                *failure = Some(FillStartError::Budget(e));
+                return None;
+            }
             let (progress, status) = tokio::sync::watch::channel(SpoolStatus::default());
             let share = SpoolShare {
                 path: spool.path.clone(),
@@ -902,6 +937,7 @@ pub(crate) async fn spool_upstream_blob(
         path: temp_path,
         mut file,
         guard,
+        mut budget,
     } = spool;
     let mut hasher = sha2::Sha256::new();
     let chunk_timeout = Duration::from_secs(read_timeout);
@@ -926,6 +962,17 @@ pub(crate) async fn spool_upstream_blob(
                         }
                     }
                     stalls = 0;
+                    // A chunked or over-long body stops at the budget, before the write.
+                    if let Some(Err(e)) = budget
+                        .as_mut()
+                        .map(|b| b.grow(bytes_written + chunk.len() as u64))
+                    {
+                        cb.record_alive(&cb_key, probe);
+                        // Logged and counted in nora_spool_failures_total; the response
+                        // already went out, so only its body aborts.
+                        drop(e.response("docker"));
+                        return Err(ProxyError::Spool(e));
+                    }
                     hasher.update(&chunk);
                     if let Err(e) = file.write_all(&chunk).await {
                         return Err(spool_write_failed(cb, &cb_key, probe, "write", e));
@@ -1000,6 +1047,7 @@ pub(crate) async fn spool_upstream_blob(
         path: temp_path,
         sha256,
         _guard: guard,
+        _budget: budget,
     })
 }
 
@@ -1022,7 +1070,7 @@ pub async fn fetch_blob_from_upstream(
 ) -> Result<FetchedBlob, ProxyError> {
     // The spool first, as in `start_fill`: once `open_blob_from_upstream` takes a
     // circuit-breaker probe, the only exits left are the ones the spool records.
-    let spool = SpoolFile::create(temp_dir).await?;
+    let spool = SpoolFile::create(temp_dir, None).await?;
     let blob = open_blob_from_upstream(
         client,
         upstream_url,

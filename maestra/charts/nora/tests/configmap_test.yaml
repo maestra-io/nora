@@ -671,6 +671,47 @@ tests:
       - failedTemplate:
           errorPattern: "spool_max_mb \\(4096\\) must be between 1 and spool.sizeLimitMb \\(4096\\)"
 
+  - it: renders the docker proxy spool budget below the ephemeral-storage limit
+    set:
+      persistence.enabled: false
+      persistence.allowEphemeral: true
+      resources.limits.ephemeral-storage: 40Gi
+      config.docker.proxy_spool_max_mb: 32768
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\nproxy_spool_max_mb = 32768\n'
+
+  - it: refuses a docker proxy spool budget that reaches the ephemeral-storage limit
+    set:
+      persistence.enabled: false
+      persistence.allowEphemeral: true
+      resources.limits.ephemeral-storage: 40Gi
+      config.docker.proxy_spool_max_mb: 40960
+    asserts:
+      - failedTemplate:
+          errorPattern: "proxy_spool_max_mb \\(40960\\) must be below the ephemeral-storage limit \\(40960 Mi\\)"
+
+  - it: refuses a docker proxy spool budget over the limit the spool sets
+    set:
+      persistence.enabled: false
+      persistence.allowEphemeral: true
+      spool.enabled: true
+      config.docker.proxy_spool_max_mb: 6000
+    asserts:
+      - failedTemplate:
+          errorPattern: "proxy_spool_max_mb \\(6000\\) must be below the ephemeral-storage limit \\(5120 Mi\\)"
+
+  - it: refuses an ephemeral-storage limit it cannot read
+    set:
+      persistence.enabled: false
+      persistence.allowEphemeral: true
+      resources.limits.ephemeral-storage: 1.5Gi
+      config.docker.proxy_spool_max_mb: 100
+    asserts:
+      - failedTemplate:
+          errorPattern: 'cannot read quantity "1.5Gi"'
+
   - it: refuses an array of tables where the chart renders scalars
     set:
       config.pypi.proxies:
