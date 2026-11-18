@@ -34,6 +34,14 @@ kept at `gems/dates/<name>.json` and asked again when a listed version is not in
 once per `metadata_ttl`. An undated version is listed; its download still meets the `.gem`
 gate and the digest quarantine.
 
+A `.gem` or gemspec NORA has no copy of is dated by that kept row, else by one API lookup whose
+answer is kept for the gem's other files. A lookup the API does not answer (a transport error,
+a non-2xx other than 404, a body that does not parse) goes through `[curation.gems]
+unknown_date`: `log` (the default) serves the file undated with a `[SECURITY] min-release-age
+unknown date` line and `nora_curation_unknown_release_date_total{registry="gems"}`, `hold`
+refuses it (403) until the API answers. A 404, or an answer without that version or platform,
+leaves the file undated: an ambiguous file name has readings RubyGems does not know.
+
 `versions` and `info/<name>` carry `ETag` = the quoted MD5 of the body NORA serves: Bundler 1.x
 takes the compact index only then, and otherwise falls back to the full Marshal index. The
 checksum column of `versions` stays upstream's, so Bundler re-fetches a filtered `info` file
