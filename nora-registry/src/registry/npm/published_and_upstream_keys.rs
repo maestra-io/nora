@@ -72,8 +72,9 @@ async fn publish(ctx: &TestContext, name: &str, version: &str) {
             "data": base64::engine::general_purpose::STANDARD.encode(b"local-tarball"),
         } }
     });
+    let twin = crate::test_helpers::npm_first_publish_twin(ctx, name).await;
     let resp = send(
-        &ctx.app,
+        &twin.as_ref().unwrap_or(ctx).app,
         Method::PUT,
         &format!("/npm/{name}"),
         axum::body::Body::from(serde_json::to_vec(&payload).unwrap()),
@@ -1162,7 +1163,13 @@ async fn a_publish_over_an_upstream_copy_imports_none_of_it() {
 async fn a_publish_over_a_packument_of_unknown_origin_waits_for_the_operator() {
     let server = upstream("corp-lib", &["9.9.9"]).await;
     let unknown = serde_json::to_vec(&doc("corp-lib", &["9.9.9"])).unwrap();
-    let ctx = context(&server, 3600);
+    // The name is the operator's (A091 refuses a first publish of any other name).
+    let internal = || vec!["corp-lib".to_string()];
+    let uri = server.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.npm.proxy = Some(uri);
+        cfg.curation.internal_namespaces = internal();
+    });
     ctx.state
         .storage
         .put("npm/corp-lib/metadata.json", &unknown)
@@ -1217,6 +1224,7 @@ async fn a_publish_over_a_packument_of_unknown_origin_waits_for_the_operator() {
         move |cfg| {
             cfg.npm.proxy = Some(uri);
             cfg.npm.import_embedded = vec!["corp".to_string()];
+            cfg.curation.internal_namespaces = internal();
         },
     );
     assert_eq!(put(&prefix).await.status(), StatusCode::CONFLICT);
@@ -1243,6 +1251,7 @@ async fn a_publish_over_a_packument_of_unknown_origin_waits_for_the_operator() {
         move |cfg| {
             cfg.npm.proxy = Some(uri);
             cfg.npm.import_embedded = vec!["corp-lib".to_string()];
+            cfg.curation.internal_namespaces = internal();
         },
     );
     assert_eq!(put(&allowed).await.status(), StatusCode::CREATED);
@@ -1350,7 +1359,6 @@ fn the_published_key_is_reached_only_from_the_published_side() {
             "unpublish",
             "unpublish_put",
             "unpublish_tarball",
-            "write_publish",
         ]
     );
     assert_eq!(

@@ -3276,6 +3276,9 @@ async fn handle_publish(
     if enforce_namespace_scope(&authority, &package_name).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
+    if let Err(refused) = claim_publish(&state, &user, &package_name).await {
+        return refused;
+    }
     // The body is read only for a caller the name in the URL lets in (A072).
     let body = match read(body).await {
         Ok(body) => body.0,
@@ -3363,14 +3366,19 @@ async fn handle_publish(
     // Lock per package to serialize the packument regeneration within one process.
     let lock = state.publish_lock(&published_packument_key(&package_name));
     let _guard = lock.lock().await;
-    let import_embedded = state.config.npm.import_embedded.contains(&package_name);
+    let policy = PublishPolicy {
+        import_embedded: state.config.npm.import_embedded.contains(&package_name),
+        internal: is_internal(&state, &package_name),
+        max_document: max_document(&state),
+        max_packument: kib_limit(state.config.npm.max_packument_mb.saturating_mul(1024)),
+    };
     if let Err(e) = publish_versions(
         &state.storage,
         &state.publish_locks,
         &package_name,
         &payload,
         tarballs,
-        import_embedded,
+        policy,
     )
     .await
     {
@@ -3396,6 +3404,109 @@ async fn handle_publish(
     StatusCode::CREATED.into_response()
 }
 
+/// A091: a name an upstream serves belongs to the upstream until it is published here. The
+/// first publish of such a name passes only when it is in `curation.internal_namespaces`;
+/// otherwise it is a 403 (with `curation.mode = "audit"`, a WARN only), and a 503 when the
+/// published versions cannot be listed. A name no upstream serves is anyone's to publish.
+async fn claim_publish(
+    state: &AppState,
+    user: &Option<Extension<AuthenticatedUser>>,
+    name: &str,
+) -> Result<(), Response> {
+    if state.config.npm.route(name).is_none() || is_internal(state, name) {
+        return Ok(());
+    }
+    match published_state(&state.storage, name).await {
+        Published::Yes(_) => Ok(()),
+        Published::Unknown => Err(crate::registry::storage_unavailable(
+            "npm",
+            &format!("npm/{name}/versions/"),
+        )),
+        Published::No => {
+            let audit_only =
+                *state.curation().curation_engine.mode() == crate::config::CurationMode::Audit;
+            tracing::warn!(
+                registry = "npm",
+                package = %name,
+                audit_only,
+                "[SECURITY] npm first publish of a name an upstream serves, outside curation.internal_namespaces"
+            );
+            if audit_only {
+                return Ok(());
+            }
+            state.audit.log(AuditEntry::new(
+                "publish_refused",
+                crate::auth::audit_actor(user),
+                name,
+                "npm",
+                "outside curation.internal_namespaces",
+            ));
+            Err(audit_refused(
+                StatusCode::FORBIDDEN,
+                &format!("{name} is served by an upstream and was never published here; add it or its scope to curation.internal_namespaces to publish it"),
+            ))
+        }
+    }
+}
+
+/// What the configuration lets one publish do.
+#[derive(Clone, Copy, Default)]
+struct PublishPolicy {
+    /// `npm.import_embedded` names the package: a packument of unknown origin at its key is
+    /// its own, and its embedded versions are imported.
+    import_embedded: bool,
+    /// The name is in `curation.internal_namespaces`: a tarball cached from an upstream under
+    /// it is replaced by the publish (C54). Under any other name it is a 409 (A091).
+    internal: bool,
+    /// Largest version or package-fields document, in bytes; 0 = no limit (A092).
+    max_document: usize,
+    /// Largest assembled packument, in bytes; 0 = no limit (A092).
+    max_packument: usize,
+}
+
+/// A limit in KiB as bytes; 0 stays 0 (no limit).
+fn kib_limit(kib: u64) -> usize {
+    usize::try_from(kib.saturating_mul(1024)).unwrap_or(usize::MAX)
+}
+
+/// `npm.max_document_kb` in bytes.
+fn max_document(state: &AppState) -> usize {
+    kib_limit(state.config.npm.max_document_kb)
+}
+
+/// A092: refuse a document a publish would store when it is over `max_document` bytes.
+fn check_document_size(
+    what: &str,
+    doc: &serde_json::Value,
+    max_document: usize,
+) -> Result<(), (StatusCode, String)> {
+    if max_document == 0 {
+        return Ok(());
+    }
+    let size = serde_json::to_vec(doc).map_or(usize::MAX, |b| b.len());
+    if size <= max_document {
+        return Ok(());
+    }
+    Err((
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!(
+            "{what} is {size} bytes, over the {} KiB limit (npm.max_document_kb, NORA_NPM_MAX_DOCUMENT_KB)",
+            max_document / 1024
+        ),
+    ))
+}
+
+/// The package-level fields of a publish payload, stored as `pkg.json`.
+fn package_fields(payload: &serde_json::Value) -> serde_json::Value {
+    let mut pkg_fields = serde_json::Map::new();
+    for field in &["name", "_id", "description", "readme", "license"] {
+        if let Some(val) = payload.get(*field) {
+            pkg_fields.insert(field.to_string(), val.clone());
+        }
+    }
+    serde_json::Value::Object(pkg_fields)
+}
+
 /// The storage half of `npm publish`: refuse on a corrupt
 /// packument or a version that exists or existed, then write the tarballs (attachment
 /// name, bytes), each new version as its own key with its publish time, the dist-tags
@@ -3403,15 +3514,14 @@ async fn handle_publish(
 /// the new versions; on a failure after the first write, undo them (R2-21). The
 /// caller holds the package's publish lock.
 ///
-/// `import_embedded`: the operator said a packument of unknown origin at the package's
-/// key is its own (`npm.import_embedded`): its embedded versions are imported.
+/// `policy`: what the configuration allows ([`PublishPolicy`]).
 async fn publish_versions(
     storage: &crate::storage::Storage,
     locks: &crate::PublishLocks,
     package_name: &str,
     payload: &serde_json::Value,
     tarballs: Vec<(String, Bytes)>,
-    import_embedded: bool,
+    policy: PublishPolicy,
 ) -> Result<(), (StatusCode, String)> {
     let new_versions = match payload.get("versions").and_then(|v| v.as_object()) {
         Some(v) => v,
@@ -3459,7 +3569,7 @@ async fn publish_versions(
     // says which it is.
     if existing_meta.is_some()
         && matches!(published_state(storage, package_name).await, Published::No)
-        && !import_embedded
+        && !policy.import_embedded
     {
         tracing::warn!(
             registry = "npm",
@@ -3519,6 +3629,16 @@ async fn publish_versions(
         ));
     }
 
+    // A092: every document this publish stores is bounded before the first write.
+    for (ver, doc) in new_versions {
+        check_document_size(&format!("version {ver}"), doc, policy.max_document)?;
+    }
+    check_document_size(
+        "the package fields (description, readme, license)",
+        &package_fields(payload),
+        policy.max_document,
+    )?;
+
     // Lazily migrate an old embedded-packument package to per-version keys BEFORE writing the new
     // version, so the regenerate below lists both the migrated and the new versions (no loss).
     if let Some(existing) = &existing_meta {
@@ -3526,7 +3646,17 @@ async fn publish_versions(
     }
 
     let mut writes = PublishWrites::default();
-    match write_publish(storage, locks, package_name, payload, tarballs, &mut writes).await {
+    match write_publish(
+        storage,
+        locks,
+        package_name,
+        payload,
+        tarballs,
+        policy,
+        &mut writes,
+    )
+    .await
+    {
         Ok(()) => {}
         Err(e) => {
             writes.undo(storage, package_name).await;
@@ -3547,7 +3677,7 @@ async fn publish_versions(
 struct PublishWrites {
     /// Keys this publish created.
     created: Vec<String>,
-    /// Dist-tag pointers it moved, with the target they had.
+    /// Dist-tag pointers it moved and the package fields it replaced, with what they held.
     tags: Vec<(String, Option<Bytes>)>,
 }
 
@@ -3586,6 +3716,7 @@ async fn write_publish(
     package_name: &str,
     payload: &serde_json::Value,
     tarballs: Vec<(String, Bytes)>,
+    policy: PublishPolicy,
     writes: &mut PublishWrites,
 ) -> Result<(), (StatusCode, String)> {
     let internal_error = || {
@@ -3598,7 +3729,6 @@ async fn write_publish(
         .get("versions")
         .and_then(|v| v.as_object())
         .ok_or_else(internal_error)?;
-    let metadata_key = published_packument_key(package_name);
 
     // Store tarballs.
     for (name, tarball_bytes) in tarballs {
@@ -3615,6 +3745,14 @@ async fn write_publish(
         let lock = crate::acquire_publish_lock(locks, &tarball_key);
         let guard = lock.lock().await;
         let proxied_copy = storage.stat(&origin_key(&tarball_key)).await.is_some();
+        // A091: only an internal name replaces what an upstream delivered under it.
+        if proxied_copy && !policy.internal {
+            tracing::warn!(key = %tarball_key, "[SECURITY] npm publish refused: the tarball was cached from an upstream");
+            return Err((
+                StatusCode::CONFLICT,
+                format!("{name} is cached from an upstream; add the package or its scope to curation.internal_namespaces to publish over it"),
+            ));
+        }
         if proxied_copy {
             match storage.delete(&origin_key(&tarball_key)).await {
                 Ok(()) | Err(crate::storage::StorageError::NotFound) => {}
@@ -3731,23 +3869,46 @@ async fn write_publish(
         }
     }
 
-    // Package-level descriptive fields (not per-version) — overwrite (last-writer-wins is fine).
-    let mut pkg_fields = serde_json::Map::new();
-    for field in &["name", "_id", "description", "readme", "license"] {
-        if let Some(val) = payload.get(*field) {
-            pkg_fields.insert(field.to_string(), val.clone());
-        }
-    }
-    if let Ok(bytes) = serde_json::to_vec(&serde_json::Value::Object(pkg_fields)) {
+    // Package-level descriptive fields (not per-version) — overwrite (last-writer-wins is fine);
+    // a failed publish puts the earlier ones back.
+    if let Ok(bytes) = serde_json::to_vec(&package_fields(payload)) {
         let pkg_key = format!("npm/{}/pkg.json", package_name);
+        let old = match storage.get(&pkg_key).await {
+            Ok(fields) => Some(fields),
+            Err(crate::storage::StorageError::NotFound) => None,
+            Err(e) => {
+                tracing::error!(key = %pkg_key, error = %e, "npm publish: failed to read package fields");
+                return Err(internal_error());
+            }
+        };
         if let Err(e) = storage.put(&pkg_key, &bytes).await {
             tracing::warn!(key = %pkg_key, error = ?e, "npm publish: failed to store package fields");
         }
+        writes.tags.push((pkg_key, old));
     }
 
-    // Regenerate the packument (metadata.json) by listing the immutable per-version keys.
-    if regenerate_packument(storage, package_name).await.is_err() {
-        tracing::error!(package = %package_name, "npm publish: failed to regenerate packument");
+    // Assemble the packument (metadata.json) by listing the immutable per-version keys. A092:
+    // one over `max_packument` is refused, so no reader is ever handed a bigger one.
+    let bytes = match assemble_packument(storage, package_name).await {
+        Ok(bytes) => bytes,
+        Err(unassembled) => {
+            tracing::error!(package = %package_name, reason = %unassembled, "npm publish: failed to regenerate packument");
+            return Err(internal_error());
+        }
+    };
+    if policy.max_packument > 0 && bytes.len() > policy.max_packument {
+        tracing::warn!(package = %package_name, bytes = bytes.len(), "npm publish refused: packument over npm.max_packument_mb");
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "the packument of {package_name} would be {} bytes, over the {} MiB limit (npm.max_packument_mb, NORA_NPM_MAX_PACKUMENT_MB)",
+                bytes.len(),
+                policy.max_packument / (1024 * 1024)
+            ),
+        ));
+    }
+    if let Err(e) = store_assembled_packument(storage, package_name, &bytes).await {
+        tracing::error!(package = %package_name, error = %e, "npm publish: failed to store packument");
         return Err(internal_error());
     }
 
@@ -3756,20 +3917,10 @@ async fn write_publish(
     // and reading each back; a storage key-encoding round-trip bug (the object_store
     // `%40`->`%2540` double-encoding for `@scope/...` keys) silently produced an empty
     // `versions` map, yet publish still returned 201 and `npm install` then failed
-    // ENOVERSIONS. Read the regenerated packument back and refuse (500) unless every
-    // just-published version is present, so a regen round-trip defect can never again
-    // hide behind a 201.
-    let published_visible = match storage.get(&metadata_key).await {
-        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|m| {
-                m.get("versions")
-                    .and_then(|v| v.as_object())
-                    .map(|vs| new_versions.keys().all(|v| vs.contains_key(v)))
-            })
-            .unwrap_or(false),
-        Err(_) => false,
-    };
+    // ENOVERSIONS. Refuse (500) unless the assembled packument lists every just-published
+    // version, so a regen round-trip defect can never again hide behind a 201.
+    let published_visible =
+        listed_versions(&bytes).is_some_and(|vs| new_versions.keys().all(|v| vs.contains(v)));
     if !published_visible {
         tracing::error!(
             package = %package_name,
@@ -4073,6 +4224,15 @@ async fn deprecate_versions(
     let Some(versions) = payload.get("versions").and_then(|v| v.as_object()) else {
         return (StatusCode::BAD_REQUEST, "Missing versions").into_response();
     };
+    // A092: the message lands in a stored version document.
+    for (ver, data) in versions {
+        if let Some(message) = data.get("deprecated") {
+            let what = format!("the deprecation message of {ver}");
+            if let Err(refused) = check_document_size(&what, message, max_document(state)) {
+                return refused.into_response();
+            }
+        }
+    }
     let lock = state.publish_lock(&published_packument_key(name));
     let _guard = lock.lock().await;
     for (ver, data) in versions {

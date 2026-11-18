@@ -87,6 +87,28 @@ pub fn create_test_context_with_storage(storage: Storage) -> TestContext {
     build_context_with(false, &[], false, |_| {}, Some(storage))
 }
 
+/// For a first publish of `name` on `ctx`, which an upstream serves outside the internal
+/// namespaces (A091 refuses it): a context over the same storage with no upstream. What it
+/// publishes is a package published here before an upstream served its name, and `ctx` serves
+/// it as published. `None` when `ctx` itself accepts the publish.
+pub async fn npm_first_publish_twin(ctx: &TestContext, name: &str) -> Option<TestContext> {
+    let internal = crate::curation::is_internal_namespace(
+        &ctx.state.curation().curation_engine,
+        crate::curation::RegistryType::Npm,
+        name,
+    );
+    let prefix = format!("npm/{name}/versions/");
+    let published = ctx.state.storage.list(&prefix).await.is_ok_and(|keys| {
+        keys.iter()
+            .filter_map(|k| k.strip_prefix(&prefix))
+            .any(|rest| !rest.contains('/'))
+    });
+    if internal || published || ctx.state.config.npm.route(name).is_none() {
+        return None;
+    }
+    Some(create_test_context_with_storage(ctx.state.storage.clone()))
+}
+
 /// Build a test context with custom config tweaks.
 pub fn create_test_context_with_config(customize: impl FnOnce(&mut Config)) -> TestContext {
     build_context(false, &[], false, customize)
@@ -219,6 +241,8 @@ fn build_context_full(
             serve_stale: true,
             revalidate: true,
             import_embedded: Vec::new(),
+            max_document_kb: 8192,
+            max_packument_mb: 128,
         },
         pypi: PypiConfig {
             enabled: true,

@@ -1779,8 +1779,9 @@ async fn hosted_packument_is_never_revalidated_upstream() {
         cfg.npm.proxy = Some(upstream.uri());
         cfg.npm.metadata_ttl = 0; // every cache hit is stale
     });
+    let twin = crate::test_helpers::npm_first_publish_twin(&ctx, "corp-pkg").await;
     assert_eq!(
-        publish(&ctx.app, "corp-pkg", "1.0.0").await,
+        publish(&twin.unwrap().app, "corp-pkg", "1.0.0").await,
         StatusCode::CREATED
     );
 
@@ -2118,8 +2119,9 @@ async fn hosted_version_is_exempt_from_min_release_age() {
         cfg.curation.min_release_age = Some("7d".to_string());
         cfg.server.trust_upstream_dates = true;
     });
+    let twin = crate::test_helpers::npm_first_publish_twin(&ctx, "ours").await;
     assert_eq!(
-        publish(&ctx.app, "ours", "1.0.0").await,
+        publish(&twin.unwrap().app, "ours", "1.0.0").await,
         StatusCode::CREATED
     );
     let resp = send(&ctx.app, Method::GET, "/npm/ours/-/ours-1.0.0.tgz", "").await;
@@ -2203,8 +2205,9 @@ async fn hosted_package_never_reaches_upstream() {
         cfg.curation.mode = crate::config::CurationMode::Enforce;
         cfg.curation.internal_namespaces = vec!["@corp/*".to_string()];
     });
+    let twin = crate::test_helpers::npm_first_publish_twin(&ctx, "owned").await;
     assert_eq!(
-        publish(&ctx.app, "owned", "1.0.0").await,
+        publish(&twin.unwrap().app, "owned", "1.0.0").await,
         StatusCode::CREATED
     );
 
@@ -2278,8 +2281,9 @@ async fn tarball_urls_follow_public_url() {
     let storage = old.state.storage.clone();
     let tarball = |json: &serde_json::Value| json["versions"]["1.0.0"]["dist"]["tarball"].clone();
 
+    let twin = crate::test_helpers::npm_first_publish_twin(&old, "hosted").await;
     assert_eq!(
-        publish(&old.app, "hosted", "1.0.0").await,
+        publish(&twin.unwrap().app, "hosted", "1.0.0").await,
         StatusCode::CREATED
     );
     assert_eq!(
@@ -2431,8 +2435,9 @@ async fn tampered_hosted_tarball_is_kept_not_refetched() {
         cfg.server.stream_threshold_mb = 1;
     });
     let root = std::path::Path::new(&ctx.state.config.storage.path).to_path_buf();
+    let twin = crate::test_helpers::npm_first_publish_twin(&ctx, "corp").await;
     assert_eq!(
-        publish(&ctx.app, "corp", "1.0.0").await,
+        publish(&twin.unwrap().app, "corp", "1.0.0").await,
         StatusCode::CREATED
     );
     let small = "npm/corp/tarballs/corp-1.0.0.tgz";
@@ -2469,7 +2474,8 @@ async fn tampered_hosted_tarball_is_kept_not_refetched() {
 
 /// C54: a proxied tarball (provenance recorded for the bytes it holds) that fails
 /// its pin is dropped and refetched. A publish over a proxied copy drops that
-/// provenance, so the published tarball is never taken for one.
+/// provenance, so the published tarball is never taken for one; only once the operator
+/// made the name internal (A091).
 #[tokio::test]
 async fn tampered_proxied_tarball_is_refetched() {
     use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
@@ -2523,6 +2529,19 @@ async fn tampered_proxied_tarball_is_refetched() {
 
     assert_eq!(
         publish(&ctx.app, "prox", "1.0.0").await,
+        StatusCode::FORBIDDEN
+    );
+    assert!(ctx.state.storage.get(&origin).await.is_ok());
+    let uri = upstream.uri();
+    let internal = crate::test_helpers::create_test_context_with_storage_and_config(
+        ctx.state.storage.clone(),
+        move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["prox".to_string()];
+        },
+    );
+    assert_eq!(
+        publish(&internal.app, "prox", "1.0.0").await,
         StatusCode::CREATED
     );
     assert!(ctx.state.storage.get(&origin).await.is_err());

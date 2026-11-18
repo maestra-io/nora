@@ -300,3 +300,125 @@ async fn a_scoped_publish_carries_its_own_tarball_only() {
         b"next"
     );
 }
+
+/// PUT a publish of `name@version` whose version document carries `filler` bytes and whose
+/// package fields carry a `readme` of `readme` bytes.
+async fn publish_sized(
+    ctx: &TestContext,
+    name: &str,
+    version: &str,
+    filler: usize,
+    readme: usize,
+) -> StatusCode {
+    let payload = serde_json::json!({
+        "name": name,
+        "readme": "r".repeat(readme),
+        "versions": { version: {
+            "name": name, "version": version, "dist": {}, "filler": "f".repeat(filler)
+        } },
+        "_attachments": { format!("{name}-{version}.tgz"): {
+            "data": base64::engine::general_purpose::STANDARD.encode(version.as_bytes())
+        } },
+    });
+    let body = Body::from(serde_json::to_vec(&payload).unwrap());
+    send(&ctx.app, Method::PUT, &format!("/npm/{name}"), body)
+        .await
+        .status()
+}
+
+/// `npm deprecate` of `name@version` with a message of `len` bytes.
+async fn deprecate(ctx: &TestContext, name: &str, version: &str, len: usize) -> StatusCode {
+    let payload = serde_json::json!({
+        "name": name,
+        "versions": { version: { "name": name, "version": version, "deprecated": "d".repeat(len) } },
+    });
+    let body = Body::from(serde_json::to_vec(&payload).unwrap());
+    send(&ctx.app, Method::PUT, &format!("/npm/{name}"), body)
+        .await
+        .status()
+}
+
+fn limited(document_kb: u64, packument_mb: u64) -> TestContext {
+    crate::test_helpers::create_test_context_with_config(move |cfg| {
+        cfg.npm.max_document_kb = document_kb;
+        cfg.npm.max_packument_mb = packument_mb;
+    })
+}
+
+/// A092: a publish stores no version document, package fields or deprecation message over
+/// `npm.max_document_kb`, and assembles no packument over `npm.max_packument_mb`; the
+/// refused publish leaves the package as it was. 0 turns either limit off.
+#[tokio::test]
+async fn a_publish_stores_no_document_or_packument_over_its_limit() {
+    const KIB: usize = 1024;
+    let ctx = limited(64, 1);
+    // (a) An oversized version document; (b) an oversized readme.
+    assert_eq!(
+        publish_sized(&ctx, "big", "1.0.0", 65 * KIB, 0).await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        publish_sized(&ctx, "big", "1.0.0", 0, 65 * KIB).await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert!(stored(&ctx, "big").await.is_empty());
+
+    // (c) Versions under the document limit publish until the packument would pass 1 MiB.
+    let mut published = Vec::new();
+    let refused = loop {
+        let version = format!("1.0.{}", published.len());
+        let before = stored(&ctx, "big").await;
+        match publish_sized(&ctx, "big", &version, 60 * KIB, 0).await {
+            StatusCode::CREATED => published.push(version),
+            status => break (status, before, version),
+        }
+        assert!(published.len() < 40, "the packument limit never applied");
+    };
+    let (status, before, version) = refused;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{version}");
+    assert!(published.len() >= 10, "{published:?}");
+    assert_eq!(
+        stored(&ctx, "big").await,
+        before,
+        "{version} was rolled back"
+    );
+    let resp = send(&ctx.app, Method::GET, "/npm/big", "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let doc: serde_json::Value =
+        serde_json::from_slice(&crate::test_helpers::body_bytes(resp).await).unwrap();
+    let mut listed: Vec<String> = doc["versions"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    listed.sort();
+    published.sort();
+    assert_eq!(listed, published);
+
+    // (d) An oversized deprecation message.
+    assert_eq!(
+        deprecate(&ctx, "big", "1.0.0", 65 * KIB).await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(deprecate(&ctx, "big", "1.0.0", 10).await, StatusCode::OK);
+
+    // (e) With both limits off the same documents are stored.
+    let off = limited(0, 0);
+    assert_eq!(
+        publish_sized(&off, "big", "1.0.0", 65 * KIB, 65 * KIB).await,
+        StatusCode::CREATED
+    );
+    for i in 1..20 {
+        let version = format!("1.0.{i}");
+        assert_eq!(
+            publish_sized(&off, "big", &version, 60 * KIB, 0).await,
+            StatusCode::CREATED,
+            "{version}"
+        );
+    }
+    assert_eq!(
+        deprecate(&off, "big", "1.0.0", 65 * KIB).await,
+        StatusCode::OK
+    );
+}
