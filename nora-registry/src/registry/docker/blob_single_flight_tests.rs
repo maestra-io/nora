@@ -297,6 +297,7 @@ async fn follower_of_a_moved_spool_is_served_from_storage() {
             path: std::path::PathBuf::from("/nonexistent/spool-moved-into-storage"),
             status,
             content_length: Some(blob.len() as u64),
+            budget: None,
         }
     };
     let target = super::BlobTarget {

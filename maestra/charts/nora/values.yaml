@@ -173,6 +173,12 @@ config:
     # 403 for a name no upstream prefix/namespace matches), read_timeout,
     # metadata_ttl, serve_stale. Enable the registry in registries.enable.
     # default_action: deny
+    # -- proxy_spool_max_mb (Maestra): MiB that proxied blob fills may hold
+    # under /data/tmp/docker-proxy at once; a fill that does not fit is a 503 +
+    # Retry-After (budget busy) or a 507 (blob larger than the budget). 0 or
+    # unset = no budget. With persistence.enabled=false the render fails when it
+    # reaches the ephemeral-storage limit.
+    # proxy_spool_max_mb: 32768
     # -- Docker upstream registries for proxy/cache: url, prefix (first path
     # segment that routes to it: packages.example/<prefix>/<image>), namespace
     # (storage namespace and hostname form; default = host without

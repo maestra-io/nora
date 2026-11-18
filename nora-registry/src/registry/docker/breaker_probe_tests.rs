@@ -155,6 +155,7 @@ async fn spool_into_unwritable(
             path: path.clone(),
             file: tokio::fs::File::open(&path).await.unwrap(),
             guard: TempFileGuard::new(path),
+            budget: None,
         };
         let (tx, _rx) = tokio::sync::watch::channel(SpoolStatus::default());
         let outcome = spool_upstream_blob(blob, spool, 5, &cb, progress.then_some(&tx)).await;
