@@ -90,6 +90,13 @@ spec:
   have for the whole window, so trust is per repo and off by default. For a trusted repo
   younger versions are left out of the index and refused on download; with
   `server.trust_upstream_dates` the quarantine clock is also seeded from `created`.
+  The publisher writes `created`, so for a trusted repo NORA also keeps when it first saw
+  each version's digest (`.nora-first-seen/helm/index/{repo}.json`, carried by backup and
+  migrate): a version that appears in a refreshed index, or whose digest changes, is
+  dated no earlier than that sighting, whatever its `created` says or when it has none.
+  The repo's first fetch records nothing, so adding a repo holds none of its history.
+  The ledger is written before the refreshed index; if it cannot be, the cached index
+  stays in service (stale, with `serve_stale`) until it can.
 - **Cached charts and the index**: a cached chart of a repo outside `trust_created` is
   served without asking the upstream; in a `trust_created` repo it needs the index (a
   stale copy will do) for its date, and without one the request fails rather than skip
