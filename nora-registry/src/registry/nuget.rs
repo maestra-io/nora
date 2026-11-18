@@ -55,6 +55,8 @@ struct SearchParams {
     prerelease: Option<bool>,
     #[serde(rename = "semVerLevel")]
     sem_ver_level: Option<String>,
+    /// Autocomplete: the package whose versions are asked for.
+    id: Option<String>,
 }
 
 /// Storage prefix and file suffix for repo index scanning.
@@ -325,20 +327,36 @@ impl Search {
         }
     }
 
+    /// The local answer, curated as an upstream one is: hidden versions dropped, and
+    /// autocomplete `?id=` answered with that package's cached versions.
+    #[allow(clippy::too_many_arguments)]
     async fn local(
         self,
         state: &AppState,
         query: &str,
+        id: Option<&str>,
         skip: usize,
         take: usize,
         prerelease: bool,
         sem_ver_level: Option<&str>,
     ) -> Vec<u8> {
-        match self {
-            Search::Query => {
-                local_search_results(state, query, skip, take, prerelease, sem_ver_level).await
+        match (self, id) {
+            (Search::Query, _) => {
+                let body =
+                    local_search_results(state, query, skip, take, prerelease, sem_ver_level).await;
+                filter_search_results(state, String::from_utf8_lossy(&body).into_owned()).await
             }
-            Search::Autocomplete => {
+            (Search::Autocomplete, Some(id)) => {
+                let versions: Vec<String> = get_cached_versions(&state.storage, id)
+                    .await
+                    .into_iter()
+                    .filter(|v| prerelease || !v.contains('-'))
+                    .filter(|v| sem_ver_level == Some("2.0.0") || !is_semver2_version(v))
+                    .collect();
+                let body = serde_json::json!({ "totalHits": versions.len(), "data": versions });
+                filter_autocomplete_versions(state, id, body.to_string()).await
+            }
+            (Search::Autocomplete, None) => {
                 local_autocomplete_results(state, query, skip, take, prerelease, sem_ver_level)
                     .await
             }
@@ -384,10 +402,12 @@ async fn proxied_search(
     let take = params.take.unwrap_or(20);
     let prerelease = params.prerelease.unwrap_or(false);
     let sem_ver_level = params.sem_ver_level;
+    let id = params.id;
     let local = || {
         kind.local(
             state,
             &query,
+            id.as_deref(),
             skip,
             take,
             prerelease,
