@@ -293,6 +293,29 @@ pub async fn transfer_artifact(
             };
         }
     }
+    // An npm tarball or PyPI file shares its key with what a proxy fill caches: it is committed
+    // with all its records under the key's publish lock, which uploads, publishes, fills and gc
+    // eviction take, and the fill's provenance record goes first, so nothing left by a cached
+    // copy (the record, npm's `.sha256`) ever describes the imported bytes.
+    let commit_lock = matches!(rt, RegistryType::Npm | RegistryType::PyPI)
+        .then(|| crate::acquire_publish_lock(locks, key));
+    let _commit = match &commit_lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+    if commit_lock.is_some() {
+        match storage.delete(&crate::registry::npm::origin_key(key)).await {
+            Ok(()) | Err(crate::storage::StorageError::NotFound) => {}
+            Err(e) => {
+                return Outcome::Failed {
+                    reason: format!(
+                        "{}: removing the cache provenance of {key}: {e}",
+                        artifact.path
+                    ),
+                }
+            }
+        }
+    }
     if let Err(e) = storage.put_from_path(key, &temp_path, Some(&sha256)).await {
         return Outcome::Failed {
             reason: format!("commit {key}: {e}"),
@@ -301,6 +324,17 @@ pub async fn transfer_artifact(
     // Storage moved the temp file into place (local) or copied it (S3): either way the
     // guard's delete is the cleanup or a harmless NotFound.
     drop(guard);
+    // An npm tarball's `.sha256` names the imported bytes, as a fill's names its own.
+    if npm_version.is_some() {
+        if let Err(e) = storage
+            .put(&format!("{key}.sha256"), sha256.as_bytes())
+            .await
+        {
+            return Outcome::Failed {
+                reason: format!("commit {key}.sha256: {e}"),
+            };
+        }
+    }
     // The tarball first, as a publish writes it: a version document always names bytes that are
     // there. A failed document write is retried by the next run, which transfers the
     // tarball again: a tarball without its document is not taken for the import's.

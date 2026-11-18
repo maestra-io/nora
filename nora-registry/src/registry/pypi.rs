@@ -992,13 +992,29 @@ async fn download_file(
                         // Create-only under the file's publish lock: an upload that
                         // got there first wins (C53).
                         if let Ok(true) = data_clone.cache(&cache_state, &key_clone, true).await {
+                            // The records under the file's lock again, as `store_file` writes
+                            // its own, and only while the stored bytes are still these: an
+                            // upload that replaced them in between keeps its records.
+                            // LOCK-SAFE: nothing else is taken under it.
+                            let lock = cache_state.publish_lock(&key_clone);
+                            let _guard = lock.lock().await;
+                            if storage.pin(&key_clone).await.as_deref() != Some(hash.as_str()) {
+                                tracing::info!(key = %key_clone, "pypi proxy: file replaced while caching, its records kept");
+                                return;
+                            }
                             let _ = storage
                                 .put(&format!("{}.sha256", key_clone), hash.as_bytes())
                                 .await;
-                            // Provenance: cached from upstream, so GC may evict it (C22).
-                            let _ = storage
-                                .put(&proxied_marker_key(&key_clone), hash.as_bytes())
-                                .await;
+                            // Provenance: cached from upstream, so GC may evict it (C22). Not
+                            // for a file an upload of the same bytes made the project's own.
+                            let own = own_records(&storage, &project)
+                                .await
+                                .is_some_and(|r| r.file(&file_name) == own::File::Own);
+                            if !own {
+                                let _ = storage
+                                    .put(&proxied_marker_key(&key_clone), hash.as_bytes())
+                                    .await;
+                            }
                             put_hash_marker(&storage, &project, &file_name, &hash).await;
                             if let Some(meta) = core_meta {
                                 put_core_metadata(&storage, &project, &file_name, &meta).await;
@@ -1550,7 +1566,8 @@ async fn claim_uploaded_project(state: &AppState, normalized: &str) -> Result<()
 /// Store a validated distribution file of `project` as an upload does, under the file's
 /// publish lock: the file itself (immutable: an existing name is a 409), its `.sha256`
 /// sidecar and hash marker, a wheel's core metadata as `<file>.metadata`, and its
-/// `Requires-Python` (empty = none). Shared with `nora import`.
+/// `Requires-Python` (empty = none). `nora import` commits its files in `transfer_artifact`,
+/// under the same lock.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn store_file(
     storage: &crate::storage::Storage,

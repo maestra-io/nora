@@ -1075,7 +1075,7 @@ async fn handle_request(
                 state.metrics.record_cache_miss("npm");
                 state.activity.push(ActivityEntry::new(
                     ActionType::ProxyFetch,
-                    package_name,
+                    package_name.clone(),
                     crate::registry_type::RegistryType::Npm,
                     "PROXY",
                 ));
@@ -1085,25 +1085,13 @@ async fn handle_request(
 
                 // A concurrent request that fetched these bytes caches them.
                 if fetched {
-                    // LOCK-SAFE: a tarball is immutable; no lock is held here.
-                    let hash = hex::encode(sha2::Sha256::digest(&data));
-                    let hash_key = format!("{}.sha256", key);
-                    let storage = state.storage.clone();
-                    let key_clone = key.clone();
-                    let body = data.clone();
-                    let repo_index = Arc::clone(&state.repo_index);
-                    let origin = origin_of(proxy_url);
-                    tokio::spawn(async move {
-                        if let Err(e) = storage.put(&hash_key, hash.as_bytes()).await {
-                            tracing::warn!(key = %hash_key, error = ?e, "npm proxy: failed to cache hash sidecar");
-                        }
-                        // Cache, then invalidate the index AFTER the write completes.
-                        if let Err(e) = put_with_origin(&storage, &key_clone, body, &origin).await {
-                            tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache artifact");
-                        } else {
-                            repo_index.invalidate("npm");
-                        }
-                    });
+                    spawn_fill_tarball(
+                        &state,
+                        &key,
+                        &package_name,
+                        ProxyBody::Mem(data.clone()),
+                        origin_of(proxy_url),
+                    );
                 }
 
                 if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
@@ -1589,6 +1577,44 @@ async fn put_with_origin(
     Ok(())
 }
 
+/// Cache a proxied tarball in the background: the bytes, their `.sha256` sidecar and the
+/// provenance record, then the index invalidated. The client is served from `body` either way.
+fn spawn_fill_tarball(state: &AppState, key: &str, name: &str, body: ProxyBody, origin: String) {
+    let (state, key, name) = (state.clone(), key.to_string(), name.to_string());
+    tokio::spawn(async move { fill_tarball(&state, &key, &name, body, &origin).await });
+}
+
+/// The write of [`spawn_fill_tarball`], under the package lock and then the tarball's, in the
+/// order `write_publish` takes them, so it never interleaves with a publish, an import, gc
+/// eviction or the drop of a failing copy. Only a package still not published here is cached:
+/// a version published (or imported) while the upstream was asked keeps its own bytes, and
+/// none of the fill's records lands beside them.
+async fn fill_tarball(state: &AppState, key: &str, name: &str, body: ProxyBody, origin: &str) {
+    // LOCK-SAFE: package lock, then tarball lock, as publish; nothing else is taken under them.
+    let package_lock = state.publish_lock(&package_lock_key(name));
+    let _package = package_lock.lock().await;
+    let tarball_lock = state.publish_lock(key);
+    let _tarball = tarball_lock.lock().await;
+    if !matches!(published_state(&state.storage, name).await, Published::No) {
+        tracing::info!(key = %key, "npm proxy: package published here (or unknown), fetched tarball not cached");
+        return;
+    }
+    let sha = body.sha256();
+    if let Err(e) = body.cache(state, key, false).await {
+        tracing::warn!(key = %key, error = ?e, "npm proxy: failed to cache artifact");
+        return;
+    }
+    let storage = &state.storage;
+    if let Err(e) = storage.put(&format!("{key}.sha256"), sha.as_bytes()).await {
+        tracing::warn!(key = %key, error = ?e, "npm proxy: failed to cache hash sidecar");
+    }
+    let record = format!("{origin}\n{sha}");
+    if let Err(e) = storage.put(&origin_key(key), record.as_bytes()).await {
+        tracing::warn!(key = %key, error = ?e, "npm: failed to record cache provenance");
+    }
+    state.repo_index.invalidate("npm");
+}
+
 /// Inputs of the tarball gates (curation integrity, digest quarantine).
 struct TarballGates<'a> {
     package_name: &'a str,
@@ -1720,21 +1746,7 @@ async fn serve_spooled_tarball(
         }
     }
     if let Some(origin) = origin {
-        let state = state.clone();
-        let (key, body, sha) = (key.to_string(), body.clone(), body.sha256());
-        tokio::spawn(async move {
-            let (storage, repo_index) = (&state.storage, &state.repo_index);
-            if let Err(e) = body.cache(&state, &key, false).await {
-                tracing::warn!(key = %key, error = ?e, "npm proxy: failed to cache artifact");
-                return;
-            }
-            let _ = storage.put(&format!("{key}.sha256"), sha.as_bytes()).await;
-            let record = format!("{origin}\n{sha}");
-            if let Err(e) = storage.put(&origin_key(&key), record.as_bytes()).await {
-                tracing::warn!(key = %key, error = ?e, "npm: failed to record cache provenance");
-            }
-            repo_index.invalidate("npm");
-        });
+        spawn_fill_tarball(state, key, gates.package_name, body.clone(), origin);
     }
     state.metrics.record_download("npm");
     state.metrics.record_cache_miss("npm");
@@ -5228,6 +5240,11 @@ mod rewrite_both_schemes;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod unreadable_sidecar;
+
+/// A075: a version published while its tarball is fetched from an upstream keeps its bytes.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod fill_publish_race;
 
 /// A version whose tarball an upstream document places outside that upstream (another host, or
 /// a URL that only starts like the upstream's) is no version NORA serves: npm would download it
