@@ -60,12 +60,15 @@ data:
     {{- if and (gt $dockerSpool 0) (not .Values.persistence.enabled) }}
     {{- $eph := dig "limits" "ephemeral-storage" "" (.Values.resources | default dict) | toString }}
     {{- $limitMb := int64 0 }}
+    {{- $hasLimit := true }}
     {{- if $eph }}
     {{- $limitMb = include "nora.quantityMi" $eph | int64 }}
     {{- else if .Values.spool.enabled }}
     {{- $limitMb = add (int .Values.spool.sizeLimitMb) 1024 | int64 }}
+    {{- else }}
+    {{- $hasLimit = false }}
     {{- end }}
-    {{- if and (gt $limitMb 0) (ge $dockerSpool $limitMb) }}
+    {{- if and $hasLimit (ge $dockerSpool $limitMb) }}
     {{- fail (printf "config.docker.proxy_spool_max_mb (%d) must be below the ephemeral-storage limit (%d Mi): /data is an emptyDir, and a fill that reaches the limit gets the pod evicted" $dockerSpool $limitMb) }}
     {{- end }}
     {{- end }}

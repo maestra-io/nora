@@ -712,6 +712,26 @@ tests:
       - failedTemplate:
           errorPattern: 'cannot read quantity "1.5Gi"'
 
+  - it: refuses a docker proxy spool budget over a limit below one MiB
+    set:
+      persistence.enabled: false
+      persistence.allowEphemeral: true
+      resources.limits.ephemeral-storage: "524288"
+      config.docker.proxy_spool_max_mb: 1
+    asserts:
+      - failedTemplate:
+          errorPattern: "proxy_spool_max_mb \\(1\\) must be below the ephemeral-storage limit \\(0 Mi\\)"
+
+  - it: refuses a quantity with a leading zero
+    set:
+      persistence.enabled: false
+      persistence.allowEphemeral: true
+      resources.limits.ephemeral-storage: 08Gi
+      config.docker.proxy_spool_max_mb: 16384
+    asserts:
+      - failedTemplate:
+          errorPattern: 'cannot read quantity "08Gi"'
+
   - it: refuses an array of tables where the chart renders scalars
     set:
       config.pypi.proxies:

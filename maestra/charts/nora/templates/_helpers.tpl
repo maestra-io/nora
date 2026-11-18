@@ -149,11 +149,12 @@ explicit auth_env, or NORA_DOCKER_UPSTREAM_AUTH_<index> filled from authSecret.
 {{- end }}
 
 {{/*
-A Kubernetes quantity (plain bytes, or Mi/Gi/Ti) in MiB.
+A Kubernetes quantity (plain bytes, or Mi/Gi/Ti) in whole MiB, rounded down. No leading
+zero: int64 would read the digits as octal.
 */}}
 {{- define "nora.quantityMi" -}}
 {{- $q := toString . -}}
-{{- if not (regexMatch "^[0-9]+(Mi|Gi|Ti)?$" $q) -}}
+{{- if not (regexMatch "^(0|[1-9][0-9]*)(Mi|Gi|Ti)?$" $q) -}}
 {{- fail (printf "cannot read quantity %q: use bytes or a Mi, Gi or Ti suffix" $q) -}}
 {{- else if hasSuffix "Ti" $q -}}
 {{- mul (trimSuffix "Ti" $q | int64) 1048576 -}}
