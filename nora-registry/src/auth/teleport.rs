@@ -6,7 +6,9 @@
 //! A Teleport app agent adds `Teleport-Jwt-Assertion` (a JWT signed by the
 //! cluster's JWT CA) to every request it proxies. On UI paths, from a peer in
 //! `auth.teleport.trusted_proxies`, nora verifies it against the proxy JWKS and
-//! takes `username` as the identity; `roles` ∩ `write_roles` decides write vs read.
+//! takes `teleport:<username>` as the identity; `roles` ∩ `write_roles` decides
+//! write vs read. The prefix keeps Teleport users out of the owner names other
+//! sources give tokens (htpasswd, admin mints): see [`TELEPORT_OWNER_PREFIX`].
 //! Registry paths never look at the header: they keep token / OIDC auth.
 //!
 //! The agent is served on its own listener (`server.teleport_port`), which never
@@ -31,6 +33,10 @@ use crate::config::TeleportConfig;
 use crate::tokens::Role;
 
 const HEADER: &str = "teleport-jwt-assertion";
+/// Prefix of every Teleport identity, and so of every token owner it mints.
+/// No other source can produce it: htpasswd names cannot hold ':', and the
+/// admin mint route refuses an owner that starts with it.
+pub(crate) const TELEPORT_OWNER_PREFIX: &str = "teleport:";
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// On an unknown `kid`, refetch the JWKS if the cached set is older than this.
 const KID_MISS_REFETCH: Duration = Duration::from_secs(60);
@@ -95,6 +101,11 @@ impl TeleportValidator {
 
     pub fn require_for_ui(&self) -> bool {
         self.config.require_for_ui
+    }
+
+    /// `auth.teleport.max_token_ttl_days` in seconds, when set.
+    pub fn mint_ceiling_secs(&self) -> Option<u64> {
+        self.config.mint_ceiling_secs()
     }
 
     /// The verified identity behind a `trusted_header`, or `None` (logged).
@@ -179,7 +190,7 @@ impl TeleportValidator {
             .iter()
             .any(|r| self.config.write_roles.contains(r));
         Ok(TeleportIdentity {
-            username: claims.username,
+            username: format!("{TELEPORT_OWNER_PREFIX}{}", claims.username),
             role: if write { Role::Write } else { Role::Read },
         })
     }
@@ -346,7 +357,7 @@ AJvDZc4Bbdm5PNsOvQZYEIacnJLnu7vP0RqnkhSbTJ0lRhSmCMjFDCjQ
         assert_eq!(
             v.validate(&jwt).await.unwrap(),
             TeleportIdentity {
-                username: "alice".into(),
+                username: "teleport:alice".into(),
                 role: Role::Write
             }
         );
@@ -358,7 +369,7 @@ AJvDZc4Bbdm5PNsOvQZYEIacnJLnu7vP0RqnkhSbTJ0lRhSmCMjFDCjQ
     async fn accepts_a_jwt_without_kid() {
         let (_s, v) = validator().await;
         let jwt = make_jwt(None, claims("alice", &["apps"]));
-        assert_eq!(v.validate(&jwt).await.unwrap().username, "alice");
+        assert_eq!(v.validate(&jwt).await.unwrap().username, "teleport:alice");
     }
 
     #[tokio::test]
@@ -603,13 +614,13 @@ AJvDZc4Bbdm5PNsOvQZYEIacnJLnu7vP0RqnkhSbTJ0lRhSmCMjFDCjQ
             .verify_token(&token)
             .await
             .unwrap();
-        assert_eq!((owner.as_str(), role), ("alice", Role::Write));
+        assert_eq!((owner.as_str(), role), ("teleport:alice", Role::Write));
         let mine = ctx
             .state
             .tokens
             .as_ref()
             .unwrap()
-            .list_tokens("alice")
+            .list_tokens("teleport:alice")
             .await;
         assert_eq!(mine.len(), 1);
 
@@ -657,6 +668,114 @@ AJvDZc4Bbdm5PNsOvQZYEIacnJLnu7vP0RqnkhSbTJ0lRhSmCMjFDCjQ
             .is_err());
     }
 
+    // Audit A023: a Teleport username never owns a token another source minted
+    // under the same bare name; what it mints is owned by `teleport:<name>`.
+    #[tokio::test]
+    async fn teleport_username_does_not_own_service_tokens() {
+        let (_s, ctx) = setup("127.0.0.1", |_| {}).await;
+        let store = ctx.state.tokens.as_ref().unwrap();
+        let service = store
+            .create_token("svc-ci", 30, None, Role::Write)
+            .await
+            .unwrap();
+        let service_id = store.list_tokens("svc-ci").await[0].file_id.clone();
+        let jwt = make_jwt(Some(KID), claims("svc-ci", &["apps-ai"]));
+        let send = |method: Method, uri: String, body: &'static str| {
+            let app = ctx.app.clone();
+            let jwt = jwt.clone();
+            async move {
+                send_with_headers(
+                    &app,
+                    method,
+                    &uri,
+                    vec![
+                        (HEADER, jwt.as_str()),
+                        ("hx-request", "true"),
+                        ("content-type", "application/x-www-form-urlencoded"),
+                    ],
+                    body.as_bytes().to_vec(),
+                )
+                .await
+            }
+        };
+
+        let list = send(Method::GET, "/api/ui/tokens/list".into(), "").await;
+        assert_eq!(list.status(), StatusCode::OK);
+        let html = String::from_utf8(body_bytes(list).await.to_vec()).unwrap();
+        assert!(!html.contains(&service_id), "the service token is listed");
+        let revoke = send(
+            Method::POST,
+            format!("/api/ui/tokens/{service_id}/revoke"),
+            "",
+        )
+        .await;
+        assert_eq!(revoke.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            store.verify_token(&service).await.unwrap(),
+            ("svc-ci".to_string(), Role::Write)
+        );
+
+        let mint = send(
+            Method::POST,
+            "/api/ui/tokens/create".into(),
+            "description=x&role=read&ttl_days=7",
+        )
+        .await;
+        assert_eq!(mint.status(), StatusCode::OK);
+        let mine = store.list_tokens("teleport:svc-ci").await;
+        assert_eq!(mine.len(), 1, "the UI mint is owned by teleport:svc-ci");
+        assert_eq!(store.list_tokens("svc-ci").await.len(), 1);
+        let html = String::from_utf8(
+            body_bytes(send(Method::GET, "/api/ui/tokens/list".into(), "").await)
+                .await
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains(&mine[0].file_id) && !html.contains(&service_id));
+    }
+
+    // Audit A089: `auth.teleport.max_token_ttl_days` caps what a Teleport
+    // identity mints in the UI; unset, the global cap holds.
+    #[tokio::test]
+    async fn teleport_mint_is_capped_by_max_token_ttl_days() {
+        for (ceiling, lifetime) in [
+            (Some(30), 30 * 86_400),
+            (None, crate::tokens::MAX_TOKEN_TTL_DAYS * 86_400),
+        ] {
+            let (_s, ctx) = setup("127.0.0.1", |cfg| {
+                cfg.auth.teleport.max_token_ttl_days = ceiling;
+            })
+            .await;
+            let alice = jwt_header("alice", &["apps"]);
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::POST,
+                "/api/ui/tokens/create",
+                vec![
+                    (alice.0, alice.1.as_str()),
+                    ("hx-request", "true"),
+                    ("content-type", "application/x-www-form-urlencoded"),
+                ],
+                b"description=ci&role=write&ttl_days=500000".to_vec(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{ceiling:?}");
+            let mine = ctx
+                .state
+                .tokens
+                .as_ref()
+                .unwrap()
+                .list_tokens("teleport:alice")
+                .await;
+            assert_eq!(mine.len(), 1);
+            assert_eq!(
+                mine[0].expires_at - mine[0].created_at,
+                lifetime,
+                "{ceiling:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn read_identity_cannot_mint_a_write_token() {
         let (_s, ctx) = setup("127.0.0.1", |_| {}).await;
@@ -699,7 +818,7 @@ AJvDZc4Bbdm5PNsOvQZYEIacnJLnu7vP0RqnkhSbTJ0lRhSmCMjFDCjQ
         };
         let a = String::from_utf8(page(&alice).await.to_vec()).unwrap();
         assert!(a.contains(r#"id="ds-mint""#) && a.contains(r#"<option value="write">"#));
-        assert!(a.contains("dev setup alice"));
+        assert!(a.contains("dev setup teleport:alice"));
         let b = String::from_utf8(page(&bob).await.to_vec()).unwrap();
         assert!(b.contains(r#"id="ds-mint""#) && !b.contains(r#"<option value="write">"#));
 
@@ -740,7 +859,7 @@ AJvDZc4Bbdm5PNsOvQZYEIacnJLnu7vP0RqnkhSbTJ0lRhSmCMjFDCjQ
             .verify_token(token)
             .await
             .unwrap();
-        assert_eq!((owner.as_str(), role), ("alice", Role::Write));
+        assert_eq!((owner.as_str(), role), ("teleport:alice", Role::Write));
 
         // A read identity: write refused (JSON error), read minted.
         let resp = mint(&bob, "write", js.clone()).await;

@@ -109,6 +109,15 @@ pub async fn npm_first_publish_twin(ctx: &TestContext, name: &str) -> Option<Tes
     Some(create_test_context_with_storage(ctx.state.storage.clone()))
 }
 
+/// Build a test context with auth **enabled** over a caller-supplied backend, so a
+/// token-route test can make the token store fail.
+pub fn create_test_context_with_auth_and_storage(
+    users: &[(&str, &str)],
+    storage: Storage,
+) -> TestContext {
+    build_context_with(true, users, false, |_| {}, Some(storage))
+}
+
 /// Build a test context with custom config tweaks.
 pub fn create_test_context_with_config(customize: impl FnOnce(&mut Config)) -> TestContext {
     build_context(false, &[], false, customize)

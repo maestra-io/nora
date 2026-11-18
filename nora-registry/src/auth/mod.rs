@@ -19,7 +19,9 @@ pub use htpasswd::HtpasswdAuth;
 pub use namespace::{enforce_namespace_scope, NamespaceAuthority};
 pub use oidc::OidcValidator;
 pub use teleport::TeleportValidator;
-pub use token_routes::{token_routes, MintedTokenResponse, TokenListItem, TokenListResponse};
+pub use token_routes::{
+    token_routes, MintedTokenResponse, TokenListItem, TokenListResponse, TOKEN_NOT_STORED,
+};
 
 /// Authenticated username carried in request extensions after successful auth.
 #[derive(Clone, Debug)]
@@ -33,11 +35,12 @@ pub struct AuthenticatedUser(pub String);
 pub struct AuthenticatedRole(pub crate::tokens::Role);
 
 /// The lifetime ceiling (seconds) the caller's own credential imposes on any
-/// token it mints. Inserted ONLY for OIDC identities: the shorter of the
+/// token it mints. Inserted for OIDC identities: the shorter of the
 /// provider's `max_token_lifetime_secs` and what is left of the JWT until its
 /// `exp`, so a minted token never outlives the JWT that minted it (0 once the
-/// JWT has expired, inside the validator's leeway). Absent for Basic and opaque
-/// (`nra_`) callers, which carry no such ceiling. Every mint route an OIDC
+/// JWT has expired, inside the validator's leeway). Inserted for Teleport
+/// identities when `auth.teleport.max_token_ttl_days` is set. Absent for Basic
+/// and opaque (`nra_`) callers, which carry no such ceiling. Every mint route an OIDC
 /// identity reaches (the UI and the admin route) reads it to cap the new token
 /// so a short-lived federated identity cannot bootstrap a long-lived static one
 /// (#1094).
@@ -819,6 +822,9 @@ async fn authenticate(state: AppState, mut request: Request<Body>, next: Next) -
                     .extensions_mut()
                     .insert(AuthenticatedUser(id.username));
                 request.extensions_mut().insert(AuthenticatedRole(id.role));
+                if let Some(secs) = teleport.mint_ceiling_secs() {
+                    request.extensions_mut().insert(MintLifetimeCeiling(secs));
+                }
                 return next.run(request).await;
             }
             if teleport.require_for_ui() {

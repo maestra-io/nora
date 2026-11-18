@@ -11,18 +11,19 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{delete, post},
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditEntry;
+use crate::auth::teleport::TELEPORT_OWNER_PREFIX;
 use crate::auth::{AuthenticatedUser, MintLifetimeCeiling, NamespaceAuthority};
 use crate::registry_type::RegistryType;
-use crate::tokens::{MintLifetime, Role};
+use crate::tokens::{MintLifetime, Role, TokenError};
 use crate::AppState;
 
 /// Minimum seconds between two accepted reindex calls. A reindex flips dirty
@@ -34,7 +35,13 @@ const REINDEX_MIN_INTERVAL_SECS: u64 = 10;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/v1/admin/reindex", post(reindex))
-        .route("/api/v1/admin/tokens", post(admin_create_token))
+        .route(
+            "/api/v1/admin/tokens",
+            post(admin_create_token)
+                .get(admin_list_tokens)
+                .delete(admin_revoke_user_tokens),
+        )
+        .route("/api/v1/admin/tokens/{id}", delete(admin_revoke_token))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -212,6 +219,16 @@ async fn admin_create_token(
             .into_response();
     }
 
+    // Teleport identities own the `teleport:` names: an admin mint never lands
+    // in one, so a Teleport user lists and revokes only what it minted itself.
+    if req.username.starts_with(TELEPORT_OWNER_PREFIX) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Owners starting with 'teleport:' are reserved for Teleport identities",
+        )
+            .into_response();
+    }
+
     let role = match req.role.as_str() {
         "read" => Role::Read,
         "write" => Role::Write,
@@ -267,9 +284,115 @@ async fn admin_create_token(
         }
         Err(e) => {
             tracing::error!(user = %req.username, error = %e, "admin token mint failed: cannot store the token record");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::auth::TOKEN_NOT_STORED,
+            )
+                .into_response()
         }
     }
+}
+
+#[derive(Deserialize)]
+struct OwnerQuery {
+    user: Option<String>,
+}
+
+/// The admin token routes act on every owner's tokens: a namespace-scoped
+/// admin is refused, as on the mint; no token store is 503.
+#[allow(clippy::result_large_err)] // the Err is the response returned at once
+fn admin_token_store<'a>(
+    state: &'a AppState,
+    authority: &NamespaceAuthority,
+) -> Result<&'a crate::tokens::TokenStore, Response> {
+    if authority.is_scoped() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "A namespace-scoped identity cannot manage other owners' tokens",
+        )
+            .into_response());
+    }
+    state.tokens.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Token storage not configured",
+        )
+            .into_response()
+    })
+}
+
+/// `GET /api/v1/admin/tokens[?user=<owner>]`: token metadata (id, owner, role,
+/// lifetime, last use, description), never a hash. List before revoking by
+/// owner: CI tokens can share one.
+async fn admin_list_tokens(
+    State(state): State<AppState>,
+    Extension(authority): Extension<NamespaceAuthority>,
+    Query(query): Query<OwnerQuery>,
+) -> Response {
+    let store = match admin_token_store(&state, &authority) {
+        Ok(store) => store,
+        Err(refused) => return refused,
+    };
+    let tokens = match query.user {
+        Some(user) => store.list_tokens(&user).await,
+        None => store.list_all_tokens().await,
+    };
+    Json(serde_json::json!({ "tokens": tokens })).into_response()
+}
+
+/// `DELETE /api/v1/admin/tokens/{id}`: revoke one token (204), audited.
+async fn admin_revoke_token(
+    State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedUser>,
+    Extension(authority): Extension<NamespaceAuthority>,
+    Path(id): Path<String>,
+) -> Response {
+    let store = match admin_token_store(&state, &authority) {
+        Ok(store) => store,
+        Err(refused) => return refused,
+    };
+    // The owner is for the audit entry only: an unreadable record still revokes.
+    let owner = store
+        .token_owner(&id)
+        .await
+        .unwrap_or_else(|_| "unknown".to_string());
+    match store.revoke_token(&id).await {
+        Ok(()) => {
+            state
+                .audit
+                .log(AuditEntry::token_revoke(&caller.0, "admin", &owner, &id));
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(TokenError::Storage(e)) => {
+            tracing::error!(id = %id, error = %e, "admin token revoke failed: token store unavailable");
+            (StatusCode::SERVICE_UNAVAILABLE, "Token store unavailable").into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "Token not found").into_response(),
+    }
+}
+
+/// `DELETE /api/v1/admin/tokens?user=<owner>`: revoke every token of one
+/// owner, each audited; answers the ids revoked. `user` is required.
+async fn admin_revoke_user_tokens(
+    State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedUser>,
+    Extension(authority): Extension<NamespaceAuthority>,
+    Query(query): Query<OwnerQuery>,
+) -> Response {
+    let store = match admin_token_store(&state, &authority) {
+        Ok(store) => store,
+        Err(refused) => return refused,
+    };
+    let Some(user) = query.user.filter(|u| !u.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, "user is required").into_response();
+    };
+    let revoked = store.revoke_all_for_user(&user).await;
+    for id in &revoked {
+        state
+            .audit
+            .log(AuditEntry::token_revoke(&caller.0, "admin", &user, id));
+    }
+    Json(serde_json::json!({ "revoked": revoked })).into_response()
 }
 
 #[cfg(test)]
@@ -568,5 +691,165 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(json["expires_in_days"], crate::tokens::MAX_TOKEN_TTL_DAYS);
+    }
+
+    // Audit A023: an admin mint never lands in a Teleport identity's names.
+    #[tokio::test]
+    async fn admin_mint_refuses_a_teleport_owner() {
+        let ctx = create_test_context_with_auth(&[]);
+        let tok = mint(&ctx, Role::Admin).await;
+        assert_eq!(
+            post_json_bearer(&ctx, &tok, r#"{"username":"teleport:alice","role":"read"}"#).await,
+            StatusCode::BAD_REQUEST
+        );
+        let store = ctx.state.tokens.as_ref().unwrap();
+        assert!(store.list_tokens("teleport:alice").await.is_empty());
+    }
+
+    async fn call(
+        ctx: &TestContext,
+        method: Method,
+        uri: &str,
+        token: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let auth = format!("Bearer {token}");
+        let resp =
+            send_with_headers(&ctx.app, method, uri, vec![("Authorization", &auth)], "").await;
+        let status = resp.status();
+        let body = crate::test_helpers::body_bytes(resp).await;
+        (status, serde_json::from_slice(&body).unwrap_or_default())
+    }
+
+    // Audits A089, A024: an admin lists every token and revokes one or all of an
+    // owner's, each revoke audited; a write token reaches none of it.
+    #[tokio::test]
+    async fn admin_lists_and_revokes_tokens() {
+        let ctx = crate::test_helpers::create_test_context_with_auth_and_config(&[], |cfg| {
+            cfg.audit.mode = crate::audit::AuditMode::File;
+        });
+        let store = ctx.state.tokens.as_ref().unwrap();
+        let mut dana = Vec::new();
+        for _ in 0..2 {
+            dana.push(
+                store
+                    .create_token("dana", 30, None, Role::Write)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let erin = store
+            .create_token("erin", 30, None, Role::Read)
+            .await
+            .unwrap();
+        let admin = store
+            .create_token("root", 30, None, Role::Admin)
+            .await
+            .unwrap();
+        let writer = store
+            .create_token("dana", 30, None, Role::Write)
+            .await
+            .unwrap();
+        let ids: Vec<String> = store
+            .list_tokens("dana")
+            .await
+            .into_iter()
+            .map(|t| t.file_id)
+            .collect();
+        assert_eq!(ids.len(), 3);
+
+        for (method, uri) in [
+            (Method::GET, TOK_URI.to_string()),
+            (Method::DELETE, format!("{TOK_URI}?user=dana")),
+            (Method::DELETE, format!("{TOK_URI}/{}", ids[0])),
+        ] {
+            let (status, _) = call(&ctx, method.clone(), &uri, &writer).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+
+        let (status, json) = call(&ctx, Method::GET, TOK_URI, &admin).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["tokens"].as_array().unwrap().len(), 5);
+        assert!(!json.to_string().contains("token_hash") && !json.to_string().contains("argon2"));
+        let (_, json) = call(&ctx, Method::GET, &format!("{TOK_URI}?user=dana"), &admin).await;
+        let listed: Vec<&str> = json["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["file_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed.len(), 3);
+        assert!(ids.iter().all(|id| listed.contains(&id.as_str())));
+
+        // One by id: 204, the token stops working, a second revoke is 404.
+        let one = &ids[0];
+        let by_id = format!("{TOK_URI}/{one}");
+        let (status, _) = call(&ctx, Method::DELETE, &by_id, &admin).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = call(&ctx, Method::DELETE, &by_id, &admin).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = call(
+            &ctx,
+            Method::DELETE,
+            &format!("{TOK_URI}/not-an-id"),
+            &admin,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // All of an owner's: needs `user`, answers the ids revoked.
+        let (status, _) = call(&ctx, Method::DELETE, TOK_URI, &admin).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, json) = call(
+            &ctx,
+            Method::DELETE,
+            &format!("{TOK_URI}?user=dana"),
+            &admin,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mut revoked: Vec<String> = json["revoked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        revoked.sort();
+        let mut rest = ids[1..].to_vec();
+        rest.sort();
+        assert_eq!(revoked, rest);
+        for token in dana.iter().chain([&writer]) {
+            assert!(store.verify_token(token).await.is_err());
+        }
+        assert_eq!(store.verify_token(&erin).await.unwrap().0, "erin");
+
+        let path = ctx.state.audit.path().clone();
+        ctx.state.audit.shutdown().await;
+        let entries: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let mut audited: Vec<String> = entries
+            .iter()
+            .filter(|e| e["action"] == "token_revoke")
+            .inspect(|e| {
+                assert_eq!(e["actor"], "root");
+                assert_eq!(e["artifact"], "dana");
+                assert_eq!(e["registry"], "admin");
+            })
+            .map(|e| e["detail"].as_str().unwrap().to_string())
+            .collect();
+        audited.sort();
+        let mut expected: Vec<String> = ids.iter().map(|id| format!("id={id}")).collect();
+        expected.sort();
+        assert_eq!(
+            audited, expected,
+            "one entry per revoked token: {entries:?}"
+        );
+        for token in dana.iter().chain([&writer, &erin, &admin]) {
+            assert!(!entries
+                .iter()
+                .any(|e| e.to_string().contains(token.as_str())));
+        }
     }
 }

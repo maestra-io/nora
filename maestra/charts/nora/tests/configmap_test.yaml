@@ -800,6 +800,18 @@ tests:
           path: data["config.toml"]
           pattern: '\[curation\.npm\]\nquarantine = "enforce"\n'
 
+  - it: renders the Teleport mint lifetime ceiling (audit A089)
+    set:
+      config.auth.enabled: true
+      config.auth.htpasswd.existingSecret: nora-htpasswd
+      config.auth.teleport:
+        enabled: true
+        max_token_ttl_days: 365
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[auth\.teleport\]\n(.*\n)*max_token_ttl_days = 365\n'
+
   - it: appends extraToml verbatim at the end
     set:
       config.extraToml: |

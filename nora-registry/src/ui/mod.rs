@@ -1268,7 +1268,10 @@ async fn tokens_create(
         }
         Err(e) => {
             tracing::error!(user = %user, error = %e, "UI token mint failed: cannot store the token record");
-            error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Error: {e}"))
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::auth::TOKEN_NOT_STORED,
+            )
         }
     }
 }
@@ -1331,22 +1334,30 @@ async fn tokens_revoke(
     // (GHSA-78cx-cfhm-rgmx — cross-user token revocation).
     // A store that cannot be read is 503, never "not found": the token is still
     // there and still works.
+    // An admin revokes whatever the record says, readable or not: its owner is
+    // read for the audit entry only.
     let is_admin = role.0.can_admin();
     let owned = if is_admin {
-        Ok(())
+        Ok(store
+            .token_owner(&file_id)
+            .await
+            .unwrap_or_else(|_| "unknown".to_string()))
     } else {
         match store.token_owner(&file_id).await {
-            Ok(owner) if owner == user.0 => Ok(()),
+            Ok(owner) if owner == user.0 => Ok(owner),
             Ok(_) => Err(crate::tokens::TokenError::NotFound),
             Err(e) => Err(e),
         }
     };
     let revoked = match owned {
-        Ok(()) => store.revoke_token(&file_id).await,
+        Ok(owner) => store.revoke_token(&file_id).await.map(|()| owner),
         Err(e) => Err(e),
     };
     match revoked {
-        Ok(()) => {
+        Ok(owner) => {
+            state
+                .audit
+                .log(AuditEntry::token_revoke(&user.0, "ui", &owner, &file_id));
             // Return refreshed token list (same owner-scope as the list view)
             let tokens = if is_admin {
                 store.list_all_tokens().await
@@ -1362,11 +1373,9 @@ async fn tokens_revoke(
             (StatusCode::NOT_FOUND, Html("Token not found".to_string()))
         }
         Err(e) => {
-            let html = format!(
-                r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Error: {}</div>"##,
-                components::html_escape(&e.to_string())
-            );
-            (StatusCode::SERVICE_UNAVAILABLE, Html(html))
+            tracing::error!(id = %file_id, error = %e, "UI token revoke failed: token store unavailable");
+            let html = r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Token store unavailable</div>"##;
+            (StatusCode::SERVICE_UNAVAILABLE, Html(html.to_string()))
         }
     }
 }

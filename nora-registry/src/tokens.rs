@@ -637,19 +637,19 @@ impl TokenStore {
         }
     }
 
-    /// Revoke all tokens for a user
-    pub async fn revoke_all_for_user(&self, user: &str) -> usize {
-        let mut count = 0;
+    /// Revoke all tokens for a user; the ids revoked.
+    pub async fn revoke_all_for_user(&self, user: &str) -> Vec<String> {
+        let mut revoked = Vec::new();
         for token in self.list_tokens(user).await {
             match self.revoke_token(&token.file_id).await {
-                Ok(()) => count += 1,
+                Ok(()) => revoked.push(token.file_id),
                 Err(TokenError::NotFound) => {}
                 Err(e) => {
                     tracing::warn!(id = %token.file_id, error = %e, "token revoke failed");
                 }
             }
         }
-        count
+        revoked
     }
 
     /// Maestra: import the token files of the pre-storage layout (`<16hex>.json` in
@@ -1334,7 +1334,7 @@ mod tests {
             store.token_owner(&id).await,
             Err(TokenError::Storage(_))
         ));
-        assert_eq!(store.revoke_all_for_user("ci").await, 0);
+        assert_eq!(store.revoke_all_for_user("ci").await.len(), 0);
         outage.end();
 
         assert_eq!(store.token_owner(&id).await.unwrap(), "ci");
@@ -1406,7 +1406,7 @@ mod tests {
             .unwrap();
 
         let revoked = store.revoke_all_for_user("user1").await;
-        assert_eq!(revoked, 2);
+        assert_eq!(revoked.len(), 2);
 
         assert_eq!(store.list_tokens("user1").await.len(), 0);
         assert_eq!(store.list_tokens("user2").await.len(), 1);
@@ -1558,7 +1558,7 @@ mod tests {
 
         // Revoke all tokens for alice
         let revoked = store.revoke_all_for_user("alice").await;
-        assert_eq!(revoked, 2);
+        assert_eq!(revoked.len(), 2);
 
         // Alice's cache entries should be gone, bob's should remain
         assert_eq!(store.cache.read().len(), 1);

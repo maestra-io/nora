@@ -347,6 +347,7 @@ pub struct AuthConfig {
 /// trusted_proxies = "10.62.0.0/16"                     # the app agent pods
 /// write_roles = ["apps"]                               # Teleport roles -> write
 /// require_for_ui = true
+/// max_token_ttl_days = 365                             # cap on UI mints (unset: none)
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeleportConfig {
@@ -382,6 +383,10 @@ pub struct TeleportConfig {
     pub leeway_secs: u64,
     #[serde(default = "default_teleport_jwks_cache_secs")]
     pub jwks_cache_secs: u64,
+    /// Longest lifetime, in days, of a token a Teleport identity mints in the
+    /// UI. Unset (or 0): only the global ten-year cap.
+    #[serde(default)]
+    pub max_token_ttl_days: Option<u64>,
 }
 
 impl Default for TeleportConfig {
@@ -397,6 +402,7 @@ impl Default for TeleportConfig {
             accept_on_main_port: true,
             leeway_secs: default_oidc_leeway(),
             jwks_cache_secs: default_teleport_jwks_cache_secs(),
+            max_token_ttl_days: None,
         }
     }
 }
@@ -447,6 +453,18 @@ impl TeleportConfig {
                 &mut self.jwks_cache_secs,
             );
         }
+        if let Ok(val) = env::var("NORA_AUTH_TELEPORT_MAX_TOKEN_TTL_DAYS") {
+            let mut days = self.max_token_ttl_days.unwrap_or(0);
+            super::parse_env_warn("NORA_AUTH_TELEPORT_MAX_TOKEN_TTL_DAYS", &val, &mut days);
+            self.max_token_ttl_days = (days > 0).then_some(days);
+        }
+    }
+
+    /// The `max_token_ttl_days` ceiling in seconds; `None` when unset or 0.
+    pub fn mint_ceiling_secs(&self) -> Option<u64> {
+        self.max_token_ttl_days
+            .filter(|&days| days > 0)
+            .map(|days| days.saturating_mul(86_400))
     }
 }
 
@@ -953,6 +971,7 @@ mod tests {
             ("NORA_AUTH_TELEPORT_LEEWAY_SECS", "30"),
             ("NORA_AUTH_TELEPORT_JWKS_CACHE_SECS", "120"),
             ("NORA_AUTH_TELEPORT_ACCEPT_ON_MAIN_PORT", "false"),
+            ("NORA_AUTH_TELEPORT_MAX_TOKEN_TTL_DAYS", "365"),
         ];
         for (k, v) in vars {
             std::env::set_var(k, v);
@@ -974,7 +993,20 @@ mod tests {
         assert_eq!(t.leeway_secs, 30);
         assert_eq!(t.jwks_cache_secs, 120);
         assert!(!t.accept_on_main_port);
+        assert_eq!(t.max_token_ttl_days, Some(365));
+        assert_eq!(t.mint_ceiling_secs(), Some(365 * 86_400));
         assert!(AuthConfig::default().teleport.accept_on_main_port);
+        assert_eq!(AuthConfig::default().teleport.mint_ceiling_secs(), None);
+        // 0 unsets the ceiling, from the environment as from the file.
+        std::env::set_var("NORA_AUTH_TELEPORT_MAX_TOKEN_TTL_DAYS", "0");
+        cfg.apply_env_overrides();
+        std::env::remove_var("NORA_AUTH_TELEPORT_MAX_TOKEN_TTL_DAYS");
+        assert_eq!(cfg.teleport.max_token_ttl_days, None);
+        let zero = TeleportConfig {
+            max_token_ttl_days: Some(0),
+            ..TeleportConfig::default()
+        };
+        assert_eq!(zero.mint_ceiling_secs(), None);
     }
 
     #[test]

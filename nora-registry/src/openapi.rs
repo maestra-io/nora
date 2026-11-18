@@ -155,6 +155,9 @@ use crate::AppState;
         // Admin
         crate::openapi::admin_reindex,
         crate::openapi::admin_create_token,
+        crate::openapi::admin_list_tokens,
+        crate::openapi::admin_revoke_user_tokens,
+        crate::openapi::admin_revoke_token,
     ),
     components(
         schemas(
@@ -1596,13 +1599,76 @@ pub async fn admin_reindex() {}
     request_body = AdminTokenRequest,
     responses(
         (status = 200, description = "Token created", body = MintedTokenResponse),
-        (status = 400, description = "Invalid role or ttl_days"),
+        (status = 400, description = "Invalid role or ttl_days; or an owner starting with `teleport:` (reserved for Teleport identities)"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Admin role required; or the caller is namespace-scoped; or its credential has expired"),
+        (status = 500, description = "The token record could not be stored"),
         (status = 503, description = "Token storage not configured")
     )
 )]
 pub async fn admin_create_token() {}
+
+/// List API tokens of every owner, or of one (admin only)
+///
+/// Token metadata: `file_id`, owner (`user`), role, `created_at`, `expires_at`,
+/// `last_used`, description; never a hash. Requires an `Admin`-role token that is
+/// not namespace-scoped.
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/tokens",
+    tag = "admin",
+    params(
+        ("user" = Option<String>, Query, description = "Only this owner's tokens")
+    ),
+    responses(
+        (status = 200, description = "`{\"tokens\": [...]}`"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin role required; or the caller is namespace-scoped"),
+        (status = 503, description = "Token storage not configured")
+    )
+)]
+pub async fn admin_list_tokens() {}
+
+/// Revoke every API token of one owner (admin only)
+///
+/// Each revoke is audited. List first: tokens of different pipelines can share
+/// an owner.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/admin/tokens",
+    tag = "admin",
+    params(
+        ("user" = String, Query, description = "The owner whose tokens are revoked")
+    ),
+    responses(
+        (status = 200, description = "`{\"revoked\": [<file_id>, ...]}`"),
+        (status = 400, description = "`user` missing"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin role required; or the caller is namespace-scoped"),
+        (status = 503, description = "Token storage not configured")
+    )
+)]
+pub async fn admin_revoke_user_tokens() {}
+
+/// Revoke one API token by its id (admin only)
+///
+/// The revoke is audited.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/admin/tokens/{id}",
+    tag = "admin",
+    params(
+        ("id" = String, Path, description = "The token's `file_id` (16 hex characters)")
+    ),
+    responses(
+        (status = 204, description = "Revoked"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin role required; or the caller is namespace-scoped"),
+        (status = 404, description = "No such token"),
+        (status = 503, description = "Token storage not configured or unavailable")
+    )
+)]
+pub async fn admin_revoke_token() {}
 
 // ============ Routes ============
 
