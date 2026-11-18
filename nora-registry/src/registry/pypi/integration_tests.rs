@@ -3102,3 +3102,67 @@ async fn an_upload_replacing_a_file_mid_fill_keeps_its_records() {
 async fn an_upload_of_the_cached_bytes_mid_fill_leaves_no_provenance_marker() {
     fill_racing_an_upload(true).await;
 }
+
+/// A078: a pin the store does not answer when the fill comes back for the file's records may
+/// hide an upload's bytes, so the records an upload also writes (sidecar, hash marker, core
+/// metadata) are left unwritten. The provenance marker is written: the copy stays cache.
+#[tokio::test]
+async fn an_unanswered_pin_leaves_a_fills_upload_records_unwritten() {
+    use crate::test_helpers::{
+        background_writes_done, create_test_context_with_storage_and_config, outage_storage,
+    };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const FILE: &str = "vfour-1.0-py3-none-any.whl";
+    const KEY: &str = "pypi/vfour/vfour-1.0-py3-none-any.whl";
+    let whl = wheel(
+        "vfour-1.0.dist-info",
+        "Metadata-Version: 2.1\nName: vfour\nVersion: 1.0\n",
+    );
+    let upstream = MockServer::start().await;
+    let index = format!(
+        r#"<a href="{}/f/{FILE}#sha256={}">{FILE}</a>"#,
+        upstream.uri(),
+        sha256_hex(&whl)
+    );
+    Mock::given(method("GET"))
+        .and(path("/vfour/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(index))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/f/{FILE}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(whl.clone()))
+        .mount(&upstream)
+        .await;
+    let (storage, outage) = outage_storage();
+    outage.fail_pins_of(KEY);
+    let uri = upstream.uri();
+    let ctx =
+        create_test_context_with_storage_and_config(storage, move |cfg| cfg.pypi.proxy = Some(uri));
+    let storage = ctx.state.storage.clone();
+    let holders = storage.holders();
+
+    let resp = send(&ctx.app, Method::GET, &format!("/simple/vfour/{FILE}"), "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(&body_bytes(resp).await[..], &whl[..]);
+    background_writes_done(&storage, holders).await;
+
+    assert!(storage.stat(KEY).await.is_some(), "cached");
+    for key in [format!("{KEY}.sha256"), format!("{KEY}.metadata")] {
+        assert!(storage.stat(&key).await.is_none(), "{key} written");
+    }
+    let markers = storage
+        .list(&format!("{}vfour/{FILE}/", super::HASH_MARKER_PREFIX))
+        .await
+        .unwrap();
+    assert!(markers.is_empty(), "{markers:?}");
+    assert!(
+        storage
+            .stat(&super::proxied_marker_key(KEY))
+            .await
+            .is_some(),
+        "provenance"
+    );
+}

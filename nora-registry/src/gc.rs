@@ -1887,9 +1887,10 @@ async fn evict_proxy_cache(
 
 /// Whether the npm tarball or PyPI file at `key` is still the proxy fill its provenance record
 /// names: no version document (npm) or own-file record (PyPI) claims it, and its pin is the
-/// digest the record cached. A copy from before pins, or a record without a digest (npm's from
-/// before digests is one line), is taken at the record's word as before. Anything the store
-/// does not answer keeps it. Keys of other formats are not asked.
+/// digest the record cached. A copy the store reports without a pin, or a record without a
+/// digest (npm's from before digests is one line), is taken at the record's word as before.
+/// Anything the store does not answer, a pin read included, keeps it. Keys of other formats are
+/// not asked.
 async fn still_cached(storage: &Storage, key: &str) -> bool {
     use crate::storage::StorageError;
     let npm = key.starts_with("npm/");
@@ -1917,9 +1918,13 @@ async fn still_cached(storage: &Storage, key: &str) -> bool {
         Some(record.trim())
     }
     .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()));
-    match (cached, storage.pin(key).await) {
-        (Some(cached), Some(pin)) => cached == pin,
-        _ => true,
+    let Some(cached) = cached else {
+        return true;
+    };
+    match storage.try_pin(key).await {
+        Ok(Some(pin)) => cached == pin,
+        Ok(None) => true,
+        Err(_) => false,
     }
 }
 
@@ -1951,7 +1956,7 @@ async fn evict_oldest(
     let mut evicted = 0usize;
     let mut failed = 0u64;
     let mut kept = 0usize;
-    let bytes_to_free = total_bytes - max_bytes;
+    let mut bytes_to_free = total_bytes - max_bytes;
 
     for (key, size, _mtime) in &proxy_files {
         if bytes_freed >= bytes_to_free {
@@ -1962,8 +1967,13 @@ async fn evict_oldest(
         // Asked again under the lock, so a publish, upload or import that landed after the
         // listing is never what is deleted, nor what a dry run lists.
         if !still_cached(storage, key).await {
-            info!("proxy-cache: {} is published or replaced, kept", key);
+            info!(
+                "proxy-cache: {} is published, replaced or unanswered, kept",
+                key
+            );
             kept += 1;
+            // No longer cache: its bytes leave the total the cap is measured against.
+            bytes_to_free = bytes_to_free.saturating_sub(*size);
             continue;
         }
         if dry_run {
@@ -5148,6 +5158,72 @@ mod tests {
         for key in [uploaded, replaced] {
             assert!(storage.stat(key).await.is_some(), "{key} kept");
         }
+    }
+
+    /// A075/A078: a pin read the store does not answer is not a copy from before pins: the
+    /// npm tarball or PyPI file is kept, since it may be a replacement. One whose pin the store
+    /// answers is evicted.
+    #[tokio::test]
+    async fn test_evict_oldest_keeps_a_file_whose_pin_is_unanswered() {
+        use crate::registry::npm::origin_key;
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        let npm = "npm/un/tarballs/un-1.0.0.tgz";
+        let pypi = "pypi/un/un-1.0.tar.gz";
+        let cached = "pypi/ca/ca-1.0.tar.gz";
+        let digest = sha_hex(b"x");
+        for key in [npm, pypi, cached] {
+            storage.put(key, b"x").await.unwrap();
+            let record = if key == npm {
+                format!("npm:https://registry.npmjs.org\n{digest}")
+            } else {
+                digest.clone()
+            };
+            storage
+                .put(&origin_key(key), record.as_bytes())
+                .await
+                .unwrap();
+        }
+        outage.fail_pins_of(npm);
+        outage.fail_pins_of(pypi);
+        let files = [npm, pypi, cached]
+            .iter()
+            .map(|k| (k.to_string(), 1, 0))
+            .collect();
+        let result = evict_oldest(&storage, &test_publish_locks(), files, 0, false, "test").await;
+        assert_eq!(result.evicted_files, 1);
+        assert!(storage.stat(cached).await.is_none());
+        for key in [npm, pypi] {
+            assert!(storage.stat(key).await.is_some(), "{key} kept");
+        }
+    }
+
+    /// A032: a candidate kept under the lock leaves the cache, so the bytes eviction must free
+    /// shrink by its size: once what is left is within the cap, nothing more is evicted.
+    #[tokio::test]
+    async fn test_evict_oldest_counts_a_kept_candidate_off_the_target() {
+        use crate::registry::npm::origin_key;
+        let storage = Storage::from_backend(Arc::new(crate::storage::ObjectStorage::in_memory()));
+        let claimed = "pypi/cl/cl-1.0.tar.gz";
+        let cached = "pypi/ca/ca-1.0.tar.gz";
+        for key in [claimed, cached] {
+            storage.put(key, b"x").await.unwrap();
+            storage
+                .put(&origin_key(key), sha_hex(b"x").as_bytes())
+                .await
+                .unwrap();
+        }
+        // Imported after the listing chose it.
+        storage
+            .put(
+                &crate::registry::pypi::own_file_key("cl", "cl-1.0.tar.gz"),
+                b"",
+            )
+            .await
+            .unwrap();
+        let files = vec![(claimed.to_string(), 200, 0), (cached.to_string(), 100, 1)];
+        let result = evict_oldest(&storage, &test_publish_locks(), files, 150, false, "test").await;
+        assert_eq!((result.evicted_files, result.bytes_freed), (0, 0));
+        assert!(storage.stat(cached).await.is_some(), "within the cap");
     }
 
     /// A032: when the own-file records cannot be listed, no PyPI file is evicted this pass.

@@ -1024,6 +1024,8 @@ struct Faults {
     stats: Vec<String>,
     /// Key suffixes whose delete fails.
     deletes: Vec<String>,
+    /// Key suffixes whose pin read fails.
+    pins: Vec<String>,
     /// Seconds every object's reported modification time lies in the past.
     age_secs: u64,
     /// Seconds the GC handshake markers' (`.nora-gc-`) modification time lies in the past.
@@ -1106,6 +1108,12 @@ impl StorageOutage {
         self.faults().deletes.push(suffix.to_string());
     }
 
+    /// Fail the pin reads of the keys ending with `suffix` with a network error; reads,
+    /// `stat` and listings answer.
+    pub fn fail_pins_of(&self, suffix: &str) {
+        self.faults().pins.push(suffix.to_string());
+    }
+
     /// Report every object as last modified `secs` ago: an in-memory store stamps "now", and
     /// age-based cleanup needs old objects. The GC handshake markers (`.nora-gc-`) are aged by
     /// [`Self::age_markers`] instead: the code under test writes them during the test.
@@ -1165,6 +1173,10 @@ impl StorageOutage {
             .stats
             .iter()
             .any(|s| key.ends_with(s.as_str()))
+    }
+
+    fn pin_fails(&self, key: &str) -> bool {
+        self.faults().pins.iter().any(|s| key.ends_with(s.as_str()))
     }
 
     fn delete_fails(&self, key: &str) -> bool {
@@ -1282,9 +1294,16 @@ impl crate::storage::StorageBackend for OutageBackend {
     }
 
     async fn pin(&self, key: &str) -> Option<String> {
+        self.try_pin(key).await.ok().flatten()
+    }
+
+    async fn try_pin(&self, key: &str) -> crate::storage::Result<Option<String>> {
         self.outage.wait_answer().await;
-        self.check().ok()?;
-        self.inner.pin(key).await
+        self.check()?;
+        if self.outage.pin_fails(key) {
+            return Err(network_error());
+        }
+        self.inner.try_pin(key).await
     }
 
     async fn delete(&self, key: &str) -> crate::storage::Result<()> {

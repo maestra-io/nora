@@ -995,29 +995,43 @@ async fn download_file(
                             // The records under the file's lock again, as `store_file` writes
                             // its own, and only while the stored bytes are still these: an
                             // upload that replaced them in between (it pins other bytes) keeps
-                            // its records. A pin that cannot be read is no replacement: the
-                            // records are written, as without the check.
+                            // its records.
                             // LOCK-SAFE: nothing else is taken under it.
                             let lock = cache_state.publish_lock(&key_clone);
                             let _guard = lock.lock().await;
-                            let pin = storage.pin(&key_clone).await;
-                            if pin.is_some_and(|pin| pin != hash) {
+                            let pin = storage.try_pin(&key_clone).await;
+                            if pin
+                                .as_ref()
+                                .is_ok_and(|pin| pin.as_deref() != Some(hash.as_str()))
+                            {
                                 tracing::info!(key = %key_clone, "pypi proxy: file replaced while caching, its records kept");
+                                return;
+                            }
+                            // A file an upload of the same bytes made the project's own keeps
+                            // the upload's records, and gets no provenance marker.
+                            if own_records(&storage, &project)
+                                .await
+                                .is_some_and(|r| r.file(&file_name) == own::File::Own)
+                            {
+                                tracing::info!(key = %key_clone, "pypi proxy: file uploaded while caching, its records kept");
+                                return;
+                            }
+                            // Provenance: cached from upstream, so GC may evict it (C22) and the
+                            // quarantine holds it. Own records that cannot be listed leave the
+                            // marker too: on an own file it is inert (an own file is neither
+                            // evicted nor quarantined), on a cached one its absence is not.
+                            let _ = storage
+                                .put(&proxied_marker_key(&key_clone), hash.as_bytes())
+                                .await;
+                            // The records an upload also writes only over bytes known to be
+                            // these: an unanswered pin may hide an upload's.
+                            if pin.is_err() {
+                                tracing::warn!(key = %key_clone, "pypi proxy: pin unanswered, the file's records left unwritten");
                                 return;
                             }
                             let _ = storage
                                 .put(&format!("{}.sha256", key_clone), hash.as_bytes())
                                 .await;
-                            // Provenance: cached from upstream, so GC may evict it (C22). Not
-                            // for a file an upload of the same bytes made the project's own.
-                            let own = own_records(&storage, &project)
-                                .await
-                                .is_some_and(|r| r.file(&file_name) == own::File::Own);
-                            if !own {
-                                let _ = storage
-                                    .put(&proxied_marker_key(&key_clone), hash.as_bytes())
-                                    .await;
-                            }
                             put_hash_marker(&storage, &project, &file_name, &hash).await;
                             if let Some(meta) = core_meta {
                                 put_core_metadata(&storage, &project, &file_name, &meta).await;
