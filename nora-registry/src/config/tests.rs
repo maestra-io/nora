@@ -2209,6 +2209,50 @@ fn test_validate_oidc_empty_audience_is_refused() {
     );
 }
 
+/// Audit A021: a scope entry whose prefix names no registry format is refused; an
+/// enforced provider with entries bound to no format is warned about; bound entries
+/// and the bare `*` pass silently.
+#[test]
+fn test_validate_oidc_scope_format_prefix() {
+    let _lock = env_lock();
+    let mut config = Config::default();
+    config.auth.oidc = toml::from_str(
+        "enabled = true\n[[providers]]\nname = \"gha\"\nissuer = \"https://issuer.example\"\n\
+         audience = \"nora\"\nnamespace_scope = [\"raw:vscode/**\", \"*\"]\n\
+         [[providers.role_rules]]\npattern = \"repo:o/*\"\nrole = \"write\"\n\
+         namespace_scope = [\"maven:io/delta/**\", \"nuget:mindbox.*\"]",
+    )
+    .unwrap();
+    let (warnings, errors) = config.validate_with_config_path(None);
+    let scope = |m: &&String| m.contains("namespace_scope");
+    assert!(
+        !warnings.iter().chain(&errors).any(|m| scope(&m)),
+        "{warnings:?} {errors:?}"
+    );
+
+    config.auth.oidc.providers[0].role_rules[0].namespace_scope =
+        Some(vec!["foo:x".into(), "mindbox.*".into()]);
+    let (warnings, errors) = config.validate_with_config_path(None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("\"foo:x\"") && e.contains("not a registry format")),
+        "{errors:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("without a format prefix (mindbox.*)")),
+        "{warnings:?}"
+    );
+
+    // Audit mode: still refused for the unknown prefix, no warning for the unbound entry.
+    config.auth.oidc.providers[0].namespace_scope_enforcement = ScopeEnforcement::Audit;
+    let (warnings, errors) = config.validate_with_config_path(None);
+    assert!(errors.iter().any(|e| e.contains("\"foo:x\"")), "{errors:?}");
+    assert!(!warnings.iter().any(|w| scope(&w)), "{warnings:?}");
+}
+
 #[test]
 fn test_validate_port_zero() {
     let _lock = env_lock();

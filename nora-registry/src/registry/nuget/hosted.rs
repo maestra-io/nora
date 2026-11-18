@@ -1022,7 +1022,7 @@ fn scope_allows(authority: &NamespaceAuthority, id_lower: &str) -> bool {
             mode: *mode,
         },
     };
-    enforce_namespace_scope(&lowered, id_lower).is_ok()
+    enforce_namespace_scope(&lowered, RegistryType::Nuget, id_lower).is_ok()
 }
 
 /// Whether `id_lower` matches every scope set of a scoped caller, whatever its
@@ -1032,8 +1032,9 @@ fn in_scope(authority: &NamespaceAuthority, id_lower: &str) -> bool {
     match authority {
         NamespaceAuthority::Unrestricted => false,
         NamespaceAuthority::Scoped { scopes, .. } => scopes.iter().all(|set| {
-            set.iter()
-                .any(|p| crate::validation::namespace_match(&p.to_lowercase(), id_lower))
+            set.iter().any(|p| {
+                crate::auth::scope_entry_matches(&p.to_lowercase(), RegistryType::Nuget, id_lower)
+            })
         }),
     }
 }
@@ -3034,6 +3035,21 @@ mod tests {
         assert!(scope_allows(&scoped, "maestra.core"));
         assert!(scope_allows(&scoped, "maestra.core.abstractions"));
         assert!(!scope_allows(&scoped, "newtonsoft.json"));
+    }
+
+    /// Audit A021: a NuGet-bound entry is matched case-insensitively; an entry bound to
+    /// another format admits no NuGet ID, neither for the push nor for the claim.
+    #[test]
+    fn scope_honours_the_format_prefix() {
+        let scoped = NamespaceAuthority::from_oidc_scope(
+            "ci",
+            &["nuget:Maestra.*".to_string(), "raw:vscode/**".to_string()],
+            crate::config::ScopeEnforcement::Enforce,
+        );
+        assert!(scope_allows(&scoped, "maestra.core"));
+        assert!(in_scope(&scoped, "maestra.core"));
+        assert!(!scope_allows(&scoped, "vscode"));
+        assert!(!in_scope(&scoped, "vscode"));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use crate::config::ScopeEnforcement;
 use crate::metrics::NAMESPACE_SCOPE_DECISIONS;
+use crate::registry_type::RegistryType;
 use crate::validation::namespace_match;
 
 /// Per-request namespace authorization, derived from the authenticated identity.
@@ -96,8 +97,21 @@ impl NamespaceAuthority {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceDenied;
 
+/// Whether one `namespace_scope` entry admits `namespace` for a write to `registry`.
+///
+/// `<format>:<glob>`, where `<format>` is a [`RegistryType::as_str`] (`raw:vscode/**`,
+/// `nuget:mindbox.*`), admits only writes to that format. An entry without a `:`
+/// admits every format (the meaning it had before formats could be named). An entry
+/// whose prefix names no format admits nothing; config validation refuses it.
+pub fn scope_entry_matches(entry: &str, registry: RegistryType, namespace: &str) -> bool {
+    match entry.split_once(':') {
+        Some((format, glob)) => format == registry.as_str() && namespace_match(glob, namespace),
+        None => namespace_match(entry, namespace),
+    }
+}
+
 /// Enforce an OIDC `namespace_scope` against the artifact `namespace` coordinate
-/// a write handler is about to act on.
+/// a write handler is about to act on, in the format `registry` it writes.
 ///
 /// `namespace` MUST be the canonical artifact coordinate the handler derived
 /// (docker image name, npm package, raw path, …) — never the raw URL path and
@@ -111,6 +125,7 @@ pub struct NamespaceDenied;
 /// enforced mismatch. Every decision increments `nora_auth_namespace_scope_total`.
 pub fn enforce_namespace_scope(
     authority: &NamespaceAuthority,
+    registry: RegistryType,
     namespace: &str,
 ) -> Result<(), NamespaceDenied> {
     let (scopes, provider, mode) = match authority {
@@ -127,10 +142,11 @@ pub fn enforce_namespace_scope(
     // explicit deref makes both elements `&str` and compiles under both toolchains.
     let provider: &str = provider;
 
-    if scopes
-        .iter()
-        .all(|scope| scope.iter().any(|p| namespace_match(p, namespace)))
-    {
+    if scopes.iter().all(|scope| {
+        scope
+            .iter()
+            .any(|p| scope_entry_matches(p, registry, namespace))
+    }) {
         NAMESPACE_SCOPE_DECISIONS
             .with_label_values(&[provider, "allow"])
             .inc();
@@ -144,6 +160,7 @@ pub fn enforce_namespace_scope(
                 .inc();
             tracing::warn!(
                 provider = %provider,
+                registry = registry.as_str(),
                 namespace = %namespace,
                 scopes = ?scopes,
                 "OIDC namespace_scope denied write outside provider scope"
@@ -156,6 +173,7 @@ pub fn enforce_namespace_scope(
                 .inc();
             tracing::warn!(
                 provider = %provider,
+                registry = registry.as_str(),
                 namespace = %namespace,
                 scopes = ?scopes,
                 "OIDC namespace_scope (audit) would have denied write outside provider scope"
@@ -180,7 +198,7 @@ mod tests {
         let auth =
             NamespaceAuthority::from_oidc_scope("ci", &scope(&["*"]), ScopeEnforcement::Enforce);
         assert!(matches!(auth, NamespaceAuthority::Unrestricted));
-        assert!(enforce_namespace_scope(&auth, "anyorg/whatever").is_ok());
+        assert!(enforce_namespace_scope(&auth, RegistryType::Raw, "anyorg/whatever").is_ok());
         // A `*` anywhere in the list is enough to be unrestricted.
         let auth = NamespaceAuthority::from_oidc_scope(
             "ci",
@@ -192,8 +210,16 @@ mod tests {
 
     #[test]
     fn unrestricted_authority_always_allows() {
-        assert!(enforce_namespace_scope(&NamespaceAuthority::Unrestricted, "").is_ok());
-        assert!(enforce_namespace_scope(&NamespaceAuthority::Unrestricted, "a/b/c").is_ok());
+        assert!(
+            enforce_namespace_scope(&NamespaceAuthority::Unrestricted, RegistryType::Raw, "")
+                .is_ok()
+        );
+        assert!(enforce_namespace_scope(
+            &NamespaceAuthority::Unrestricted,
+            RegistryType::Raw,
+            "a/b/c"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -203,15 +229,15 @@ mod tests {
             &scope(&["myorg/**"]),
             ScopeEnforcement::Enforce,
         );
-        assert!(enforce_namespace_scope(&auth, "myorg/repo").is_ok());
-        assert!(enforce_namespace_scope(&auth, "myorg/team/repo").is_ok());
+        assert!(enforce_namespace_scope(&auth, RegistryType::Raw, "myorg/repo").is_ok());
+        assert!(enforce_namespace_scope(&auth, RegistryType::Raw, "myorg/team/repo").is_ok());
         assert_eq!(
-            enforce_namespace_scope(&auth, "other/repo"),
+            enforce_namespace_scope(&auth, RegistryType::Raw, "other/repo"),
             Err(NamespaceDenied)
         );
         // The #583 lookalike must be denied, not allowed.
         assert_eq!(
-            enforce_namespace_scope(&auth, "myorg-evil/repo"),
+            enforce_namespace_scope(&auth, RegistryType::Raw, "myorg-evil/repo"),
             Err(NamespaceDenied)
         );
     }
@@ -224,8 +250,8 @@ mod tests {
             ScopeEnforcement::Audit,
         );
         // Inside scope: allowed. Outside scope: still allowed (only counted/logged).
-        assert!(enforce_namespace_scope(&auth, "myorg/repo").is_ok());
-        assert!(enforce_namespace_scope(&auth, "other/repo").is_ok());
+        assert!(enforce_namespace_scope(&auth, RegistryType::Raw, "myorg/repo").is_ok());
+        assert!(enforce_namespace_scope(&auth, RegistryType::Raw, "other/repo").is_ok());
     }
 
     #[test]
@@ -236,9 +262,9 @@ mod tests {
             [&scope(&["*"])[..], &scope(&["ci-transport/**"])[..]],
             ScopeEnforcement::Enforce,
         );
-        assert!(enforce_namespace_scope(&auth, "ci-transport/run1").is_ok());
+        assert!(enforce_namespace_scope(&auth, RegistryType::Raw, "ci-transport/run1").is_ok());
         assert_eq!(
-            enforce_namespace_scope(&auth, "other/repo"),
+            enforce_namespace_scope(&auth, RegistryType::Raw, "other/repo"),
             Err(NamespaceDenied)
         );
 
@@ -248,9 +274,9 @@ mod tests {
             [&scope(&["myorg/**"])[..], &scope(&["myorg/ci/**"])[..]],
             ScopeEnforcement::Enforce,
         );
-        assert!(enforce_namespace_scope(&auth, "myorg/ci/x").is_ok());
+        assert!(enforce_namespace_scope(&auth, RegistryType::Raw, "myorg/ci/x").is_ok());
         assert_eq!(
-            enforce_namespace_scope(&auth, "myorg/other"),
+            enforce_namespace_scope(&auth, RegistryType::Raw, "myorg/other"),
             Err(NamespaceDenied)
         );
     }
@@ -265,9 +291,9 @@ mod tests {
             [&scope(&["myorg/**"])[..], &scope(&["*"])[..]],
             ScopeEnforcement::Enforce,
         );
-        assert!(enforce_namespace_scope(&auth, "myorg/repo").is_ok());
+        assert!(enforce_namespace_scope(&auth, RegistryType::Raw, "myorg/repo").is_ok());
         assert_eq!(
-            enforce_namespace_scope(&auth, "other/repo"),
+            enforce_namespace_scope(&auth, RegistryType::Raw, "other/repo"),
             Err(NamespaceDenied)
         );
         // A disjoint rule scope yields an empty intersection: deny-all,
@@ -278,11 +304,11 @@ mod tests {
             ScopeEnforcement::Enforce,
         );
         assert_eq!(
-            enforce_namespace_scope(&auth, "myorg/repo"),
+            enforce_namespace_scope(&auth, RegistryType::Raw, "myorg/repo"),
             Err(NamespaceDenied)
         );
         assert_eq!(
-            enforce_namespace_scope(&auth, "elsewhere/repo"),
+            enforce_namespace_scope(&auth, RegistryType::Raw, "elsewhere/repo"),
             Err(NamespaceDenied)
         );
     }
@@ -307,7 +333,7 @@ mod tests {
             ScopeEnforcement::Enforce,
         );
         assert_eq!(
-            enforce_namespace_scope(&auth, "anything"),
+            enforce_namespace_scope(&auth, RegistryType::Raw, "anything"),
             Err(NamespaceDenied)
         );
     }
@@ -318,7 +344,96 @@ mod tests {
         let auth =
             NamespaceAuthority::from_oidc_scope("ci", &scope(&[]), ScopeEnforcement::Enforce);
         assert_eq!(
-            enforce_namespace_scope(&auth, "anything"),
+            enforce_namespace_scope(&auth, RegistryType::Raw, "anything"),
+            Err(NamespaceDenied)
+        );
+    }
+
+    /// Audit A021: an entry bound to a format admits that format only; an unknown prefix
+    /// admits nothing; an unbound entry keeps admitting every format.
+    #[test]
+    fn format_bound_entry_admits_only_its_format() {
+        let auth = NamespaceAuthority::from_oidc_scope(
+            "ci",
+            &scope(&["raw:vscode/**"]),
+            ScopeEnforcement::Enforce,
+        );
+        assert!(
+            enforce_namespace_scope(&auth, RegistryType::Raw, "vscode/abc/server.tar.gz").is_ok()
+        );
+        assert!(enforce_namespace_scope(&auth, RegistryType::Raw, "vscode").is_ok());
+        assert_eq!(
+            enforce_namespace_scope(&auth, RegistryType::Raw, "tools/x"),
+            Err(NamespaceDenied)
+        );
+        for other in RegistryType::all()
+            .iter()
+            .filter(|r| **r != RegistryType::Raw)
+        {
+            assert_eq!(
+                enforce_namespace_scope(&auth, *other, "vscode"),
+                Err(NamespaceDenied),
+                "{}",
+                other.as_str()
+            );
+        }
+
+        let unknown = NamespaceAuthority::from_oidc_scope(
+            "ci",
+            &scope(&["foo:x"]),
+            ScopeEnforcement::Enforce,
+        );
+        for registry in RegistryType::all() {
+            assert_eq!(
+                enforce_namespace_scope(&unknown, *registry, "x"),
+                Err(NamespaceDenied)
+            );
+            assert_eq!(
+                enforce_namespace_scope(&unknown, *registry, "foo:x"),
+                Err(NamespaceDenied)
+            );
+        }
+
+        let legacy = NamespaceAuthority::from_oidc_scope(
+            "ci",
+            &scope(&["mindbox.*"]),
+            ScopeEnforcement::Enforce,
+        );
+        for registry in RegistryType::all() {
+            assert!(enforce_namespace_scope(&legacy, *registry, "mindbox.core").is_ok());
+        }
+    }
+
+    #[test]
+    fn format_bound_entries_keep_the_provider_rule_conjunction() {
+        let auth = NamespaceAuthority::from_oidc_scopes(
+            "ci",
+            [
+                &scope(&["maven:io/delta/**", "nuget:mindbox.*"])[..],
+                &scope(&["maven:io/delta/**"])[..],
+            ],
+            ScopeEnforcement::Enforce,
+        );
+        assert!(enforce_namespace_scope(&auth, RegistryType::Maven, "io/delta/delta-core").is_ok());
+        // The provider admits it, the rule does not.
+        assert_eq!(
+            enforce_namespace_scope(&auth, RegistryType::Nuget, "mindbox.core"),
+            Err(NamespaceDenied)
+        );
+        assert_eq!(
+            enforce_namespace_scope(&auth, RegistryType::Raw, "io/delta/x"),
+            Err(NamespaceDenied)
+        );
+        // `raw:*` is bound, so it does not collapse to Unrestricted.
+        let auth = NamespaceAuthority::from_oidc_scope(
+            "ci",
+            &scope(&["raw:*"]),
+            ScopeEnforcement::Enforce,
+        );
+        assert!(auth.is_scoped());
+        assert!(enforce_namespace_scope(&auth, RegistryType::Raw, "x").is_ok());
+        assert_eq!(
+            enforce_namespace_scope(&auth, RegistryType::Npm, "x"),
             Err(NamespaceDenied)
         );
     }
@@ -331,6 +446,9 @@ mod tests {
             &scope(&["myorg/**"]),
             ScopeEnforcement::Enforce,
         );
-        assert_eq!(enforce_namespace_scope(&auth, ""), Err(NamespaceDenied));
+        assert_eq!(
+            enforce_namespace_scope(&auth, RegistryType::Raw, ""),
+            Err(NamespaceDenied)
+        );
     }
 }

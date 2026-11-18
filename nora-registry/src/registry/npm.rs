@@ -3246,7 +3246,7 @@ async fn handle_publish(
         let Some((name, _)) = rest.rsplit_once("/dist-tags/") else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        if enforce_namespace_scope(&authority, name).is_err() {
+        if enforce_namespace_scope(&authority, RegistryType::Npm, name).is_err() {
             return StatusCode::FORBIDDEN.into_response();
         }
         let body = match read(body).await {
@@ -3264,7 +3264,7 @@ async fn handle_publish(
         return set_dist_tag(&state, &authority, &user, rest, Some(&version)).await;
     }
     if let Some((name, _rev)) = path.rsplit_once("/-rev/") {
-        if enforce_namespace_scope(&authority, name).is_err() {
+        if enforce_namespace_scope(&authority, RegistryType::Npm, name).is_err() {
             return StatusCode::FORBIDDEN.into_response();
         }
         let body = match read(body).await {
@@ -3281,7 +3281,7 @@ async fn handle_publish(
     }
 
     // Enforce OIDC namespace_scope on the package coordinate (#583).
-    if enforce_namespace_scope(&authority, &package_name).is_err() {
+    if enforce_namespace_scope(&authority, RegistryType::Npm, &package_name).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
     if let Err(refused) = claim_publish(&state, &user, &package_name).await {
@@ -3963,7 +3963,7 @@ async fn handle_npm_delete(
         return unpublish_tarball(&state, &authority, prefix, file).await;
     }
     let name = target;
-    if enforce_namespace_scope(&authority, name).is_err() {
+    if enforce_namespace_scope(&authority, RegistryType::Npm, name).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let lock = state.publish_lock(&published_packument_key(name));
@@ -3987,7 +3987,7 @@ async fn unpublish_put(
     name: &str,
     body: &[u8],
 ) -> Response {
-    if enforce_namespace_scope(authority, name).is_err() {
+    if enforce_namespace_scope(authority, RegistryType::Npm, name).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(body) else {
@@ -4111,7 +4111,7 @@ async fn unpublish_tarball(
         (Some(last), _) => last.to_string(),
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    if enforce_namespace_scope(authority, &name).is_err() {
+    if enforce_namespace_scope(authority, RegistryType::Npm, &name).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let version = crate::curation::parse_npm_tarball_version(&name, file);
@@ -4181,7 +4181,7 @@ async fn set_dist_tag(
     let Some((name, tag)) = rest.rsplit_once("/dist-tags/") else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if enforce_namespace_scope(authority, name).is_err() {
+    if enforce_namespace_scope(authority, RegistryType::Npm, name).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
     // npm refuses to remove `latest`; the tag is a storage key segment.

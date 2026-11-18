@@ -1800,3 +1800,110 @@ async fn test_oidc_role_inner_star_stays_in_one_sub_field() {
         assert_eq!(status, want, "sub {sub}");
     }
 }
+
+/// Audit A021: a `<format>:<glob>` scope entry grants writes in that format only. A
+/// rule scoped to raw `vscode/**` writes raw files under `vscode/` through the full
+/// router, and the same identity is refused the name `vscode` in npm, cargo, Maven and
+/// docker, with nothing stored.
+#[tokio::test]
+async fn test_oidc_format_bound_scope_admits_only_its_format() {
+    let mock_server = jwks_server().await;
+    let issuer = mock_server.uri();
+    let iss = issuer.clone();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.auth.enabled = true;
+        cfg.auth.anonymous_read = false;
+        cfg.auth.oidc = OidcConfig {
+            enabled: true,
+            leeway_secs: 60,
+            jwks_cache_secs: 300,
+            providers: vec![OidcProvider {
+                name: "test-ci".to_string(),
+                issuer: iss,
+                jwks_uri: None,
+                audience: "nora".to_string(),
+                any_audience: false,
+                algorithms: vec!["RS256".to_string()],
+                max_token_lifetime_secs: 900,
+                session_lifetime_secs: 0,
+                namespace_scope: vec!["*".to_string()],
+                namespace_scope_enforcement: crate::config::ScopeEnforcement::Enforce,
+                enabled: true,
+                role_rules: vec![OidcRoleRule {
+                    pattern: "repo:myorg/dockerfiles:ref:refs/heads/master".to_string(),
+                    role: "write".to_string(),
+                    namespace_scope: Some(vec!["raw:vscode/**".to_string()]),
+                }],
+            }],
+        };
+    });
+    let now = now_secs();
+    let jwt = make_jwt(
+        &issuer,
+        "repo:myorg/dockerfiles:ref:refs/heads/master",
+        "nora",
+        now,
+        now + 300,
+    );
+    let bearer = format!("Bearer {jwt}");
+    let put = |uri: &'static str, method: Method, body: Vec<u8>| {
+        let app = ctx.app.clone();
+        let bearer = bearer.clone();
+        async move {
+            send_with_headers(
+                &app,
+                method,
+                uri,
+                vec![("authorization", bearer.as_str())],
+                body,
+            )
+            .await
+            .status()
+        }
+    };
+
+    assert_eq!(
+        put(
+            "/raw/vscode/abc123/server.tar.gz",
+            Method::PUT,
+            b"x".to_vec()
+        )
+        .await,
+        StatusCode::OK,
+        "the raw write the rule is written for"
+    );
+
+    let meta = br#"{"name":"vscode","vers":"99.0.0"}"#;
+    let mut cargo = (meta.len() as u32).to_le_bytes().to_vec();
+    cargo.extend_from_slice(meta);
+    cargo.extend_from_slice(&1u32.to_le_bytes());
+    cargo.push(0);
+    let refused = [
+        ("/npm/vscode", Method::PUT, b"{}".to_vec()),
+        ("/cargo/api/v1/crates/new", Method::PUT, cargo),
+        (
+            "/maven2/vscode/evil/1.0/evil-1.0.jar",
+            Method::PUT,
+            b"x".to_vec(),
+        ),
+        ("/v2/vscode/blobs/uploads/", Method::POST, Vec::new()),
+    ];
+    for (uri, method, body) in refused {
+        assert_eq!(
+            put(uri, method, body).await,
+            StatusCode::FORBIDDEN,
+            "{uri}: a raw-bound scope must not admit another format"
+        );
+    }
+    for prefix in [
+        "npm/vscode",
+        "cargo/vscode",
+        "maven/vscode",
+        "docker/vscode",
+    ] {
+        assert!(
+            ctx.state.storage.list(prefix).await.unwrap().is_empty(),
+            "{prefix}: a refused write stored something"
+        );
+    }
+}

@@ -246,7 +246,8 @@ async fn upload(
     }
 
     // Enforce OIDC namespace_scope on the artifact coordinate (#583).
-    if enforce_namespace_scope(&authority, &path).is_err() {
+    if enforce_namespace_scope(&authority, crate::registry_type::RegistryType::Raw, &path).is_err()
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -555,7 +556,8 @@ async fn delete_file(
     }
 
     // Enforce OIDC namespace_scope on the artifact coordinate (#583).
-    if enforce_namespace_scope(&authority, &path).is_err() {
+    if enforce_namespace_scope(&authority, crate::registry_type::RegistryType::Raw, &path).is_err()
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
     // The lock an upload holds from its precondition check to its put: a delete never lands

@@ -1377,7 +1377,7 @@ async fn upload(
     }
 
     // Enforce OIDC namespace_scope on the project coordinate (#583).
-    if enforce_namespace_scope(&authority, &normalized).is_err() {
+    if enforce_namespace_scope(&authority, RegistryType::PyPI, &normalized).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
 
