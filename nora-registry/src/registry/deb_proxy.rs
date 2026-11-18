@@ -1367,12 +1367,24 @@ async fn dated(
     repo: &str,
     recheck: bool,
 ) -> Result<Arc<HashSet<String>>, String> {
-    let cached = state.deb_dated.lock().get(repo).cloned();
-    if let Some((at, _, files)) = &cached {
-        if !recheck || at.elapsed() < YOUNG_TTL {
-            return Ok(files.clone());
+    let usable = || {
+        let cached = state.deb_dated.lock().get(repo).cloned();
+        match &cached {
+            Some((at, _, files)) if !recheck || at.elapsed() < YOUNG_TTL => Ok(files.clone()),
+            _ => Err(cached),
         }
+    };
+    if let Ok(files) = usable() {
+        return Ok(files);
     }
+    // One reload per repository at a time: a burst of downloads after a restart parses the
+    // ledgers once.
+    let lock = state.publish_lock(&format!("{}/dated", meta(repo)));
+    let _g = lock.lock().await;
+    let cached = match usable() {
+        Ok(files) => return Ok(files),
+        Err(cached) => cached,
+    };
     let listing: Vec<(String, u64, u64)> = state
         .storage
         .list_with_meta(&format!("{}/ledger/", meta(repo)))
@@ -1414,29 +1426,37 @@ enum Sighting {
     Undated,
 }
 
+/// The requesting repository decides a file it knows (its index may serve a file another
+/// entry still holds); otherwise any other repository's hold, then any one's date.
 /// `Err`: a hold set that cannot be read.
 async fn sighting(
     state: &AppState,
-    repos: &[&str],
+    repo: &str,
     path: &str,
     recheck: bool,
 ) -> Result<Sighting, String> {
-    for repo in repos {
-        if let Some((name, version, first_seen)) = load_young(state, repo)
-            .await?
-            .values()
-            .find_map(|m| m.get(path))
-        {
-            return Ok(Sighting::Held(name.clone(), version.clone(), *first_seen));
+    let others: Vec<&str> = (state.config.deb.proxies.keys())
+        .map(String::as_str)
+        .filter(|r| *r != repo)
+        .collect();
+    for repos in [&[repo][..], &others] {
+        for r in repos {
+            if let Some((name, version, first_seen)) = load_young(state, r)
+                .await?
+                .values()
+                .find_map(|m| m.get(path))
+            {
+                return Ok(Sighting::Held(name.clone(), version.clone(), *first_seen));
+            }
         }
-    }
-    for repo in repos {
-        // An unreadable ledger dates nothing: the file is judged as undated.
-        if dated(state, repo, recheck)
-            .await
-            .is_ok_and(|f| f.contains(path))
-        {
-            return Ok(Sighting::Dated);
+        for r in repos {
+            // An unreadable ledger dates nothing: the file is judged as undated.
+            if dated(state, r, recheck)
+                .await
+                .is_ok_and(|f| f.contains(path))
+            {
+                return Ok(Sighting::Dated);
+            }
         }
     }
     Ok(Sighting::Undated)
@@ -1587,18 +1607,7 @@ pub(crate) async fn package_gate(
     repo: &str,
     path: &str,
 ) -> Option<Response> {
-    let repos: Vec<&str> = std::iter::once(repo)
-        .chain(
-            state
-                .config
-                .deb
-                .proxies
-                .keys()
-                .map(String::as_str)
-                .filter(|r| *r != repo),
-        )
-        .collect();
-    let mut found = sighting(state, &repos, path, false).await;
+    let mut found = sighting(state, repo, path, false).await;
     let mut judged = None;
     if matches!(found, Ok(Sighting::Undated)) {
         judged = judged_package(path, &state.config.deb.architectures).filter(|_| {
@@ -1609,7 +1618,7 @@ pub(crate) async fn package_gate(
         });
         if judged.is_some() {
             refresh_built_suites(state).await;
-            found = sighting(state, &repos, path, true).await;
+            found = sighting(state, repo, path, true).await;
         }
     }
     let (name, version, date) = match found {
@@ -2205,6 +2214,21 @@ mod integration_tests {
             status("/deb/pool/pool/main/a_1_amd64.deb").await,
             StatusCode::OK,
             "another entry's ledger dates it"
+        );
+        // Once `pool`'s own suite has listed a 2 for 4 days, its index serves it: its own
+        // date decides over `debian`'s hold.
+        let ledger = super::Ledger {
+            upstream: None,
+            seen: [("pool/main/a_2_amd64.deb".to_string(), 0)].into(),
+            retired: Vec::new(),
+        };
+        let lkey = super::ledger_key("pool", "updates", "main", "amd64");
+        super::put_json(&ctx.state, &lkey, &ledger).await.unwrap();
+        ctx.state.deb_dated.lock().remove("pool");
+        assert_eq!(
+            status("/deb/pool/pool/main/a_2_amd64.deb").await,
+            StatusCode::OK,
+            "the requesting entry's own date decides"
         );
     }
 
