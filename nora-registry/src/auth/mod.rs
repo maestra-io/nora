@@ -697,11 +697,11 @@ pub async fn auth_middleware(
     let presented = presented_credential(&request);
     // An answer that may depend on a credential is never `public`: a shared
     // cache must not hand it to a caller without one. Anonymous reads under
-    // `anonymous_read` keep `public`.
-    let privatize = state.config.auth.enabled
-        && (!state.config.auth.anonymous_read
-            || presented.is_some()
-            || request.headers().contains_key("x-nora-bypass-token"));
+    // `anonymous_read` keep `public`. A bypass token is honoured with auth off too, so
+    // an answer to one is private in every auth mode.
+    let privatize = request.headers().contains_key("x-nora-bypass-token")
+        || (state.config.auth.enabled
+            && (!state.config.auth.anonymous_read || presented.is_some()));
     let client_ip = extract_client_ip(&request, &state.config.auth.trusted_proxies);
     let method = request.method().clone();
     let path = request.uri().path().to_string();

@@ -95,6 +95,19 @@ pub enum ConfigLoadError {
 /// The config file read from the working directory when `NORA_CONFIG_PATH` is unset.
 const DEFAULT_CONFIG_FILE: &str = "config.toml";
 
+/// The file a SIGHUP reloads, fixed by [`Config::load`] at start: `NORA_CONFIG_PATH`, else
+/// `config.toml` when start read it, else none (env-only).
+static RELOAD_FILE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// The file a start with `env_path` (`NORA_CONFIG_PATH`) and `fallback` reads, if any.
+fn start_file(env_path: Option<String>, fallback: &str) -> Option<String> {
+    env_path.or_else(|| {
+        std::path::Path::new(fallback)
+            .exists()
+            .then(|| fallback.to_string())
+    })
+}
+
 /// Whether `NORA_CONFIG_STRICT` asks to refuse a config file with unknown keys.
 fn config_strict_from_env() -> bool {
     env::var("NORA_CONFIG_STRICT").is_ok_and(|val| val.to_lowercase() == "true" || val == "1")
@@ -1342,6 +1355,21 @@ impl Config {
             ));
         }
 
+        // 3d. A buffered publish bigger than the whole in-flight budget is a 413, so a
+        // publish cap above the budget is cut to it: named, never silent.
+        let publish_mb = self.server.publish_body_limit() / (1024 * 1024);
+        if self.server.publish_inflight_mb > 0
+            && (self.server.publish_inflight_mb as usize) < publish_mb
+        {
+            warnings.push(format!(
+                "server.publish_body_limit_mb ({publish_mb} MB, bounded by body_limit_mb) \
+                 exceeds server.publish_inflight_mb ({} MB): buffered publishes (npm, Maven, \
+                 Cargo, deb, rpm) above {} MB are refused with 413. Raise \
+                 publish_inflight_mb (or set it to 0) to keep the larger cap",
+                self.server.publish_inflight_mb, self.server.publish_inflight_mb
+            ));
+        }
+
         // 4. Rate limit values must be > 0 when rate limiting is enabled
         if self.rate_limit.enabled {
             if self.rate_limit.auth_rps == 0 {
@@ -1926,6 +1954,7 @@ impl Config {
     /// A configuration NORA cannot start with is an error, for the caller to report and
     /// exit on with [`EXIT_CONFIG`].
     pub fn load() -> Result<Self, ConfigLoadError> {
+        let _ = RELOAD_FILE.set(start_file(Self::path_from_env(), DEFAULT_CONFIG_FILE));
         let (config, _unknown_keys) = Self::load_from(
             Self::path_from_env(),
             DEFAULT_CONFIG_FILE,
@@ -2023,25 +2052,53 @@ impl Config {
         env::var("NORA_CONFIG_PATH").ok()
     }
 
+    /// The file a SIGHUP reloads: the one start read, so a file gone since start is
+    /// refused, while an env-only start (no file) keeps reloading defaults + env.
+    pub fn reload_path() -> Option<String> {
+        RELOAD_FILE
+            .get()
+            .cloned()
+            .unwrap_or_else(Self::path_from_env)
+    }
+
     /// Non-panicking config reload for SIGHUP handler, of the file at `path` (see
     /// [`Config::path_from_env`]), passed in so a test reloads a file of its own without
     /// setting process-wide state. Returns Err on invalid file/TOML/validation instead of
     /// panicking.
     ///
-    /// Without `NORA_CONFIG_PATH` the reload reads `./config.toml` and refuses when it
-    /// cannot, absent included: the environment cannot change after start, so there is
-    /// nothing new to apply, and defaults must never replace the running policy.
+    /// A named `path` ([`Config::reload_path`]: the file start read) must be readable,
+    /// absent included, so defaults never replace a file-defined policy (A027). `None`
+    /// is an env-only start: `./config.toml` when one has appeared, else defaults + env as
+    /// at start, which re-reads the curation lists the environment names.
     pub fn try_load_from(path: Option<String>) -> Result<Self, String> {
-        let path = path.unwrap_or_else(|| DEFAULT_CONFIG_FILE.to_string());
-        let content =
-            fs::read_to_string(&path).map_err(|e| format!("Cannot read {}: {}", path, e))?;
-        // one path for both sources, so neither can skip the unknown-key check
-        let (mut config, unknown) =
-            parse_config(&content).map_err(|e| format!("Invalid TOML in {}: {}", path, e))?;
-        // As at start: `[curation.hf]` is refused, not ignored as an unknown key.
-        refuse_hf_curation_keys(&path, &unknown).map_err(|e| format!("Reload refused: {}", e))?;
-        surface_unknown_keys(&path, unknown, config_strict_from_env())
-            .map_err(|e| format!("Reload refused: {}", e))?;
+        let (path, content) = match path {
+            Some(path) => {
+                let content = fs::read_to_string(&path)
+                    .map_err(|e| format!("Cannot read {}: {}", path, e))?;
+                (path, Some(content))
+            }
+            None => match fs::read_to_string(DEFAULT_CONFIG_FILE) {
+                Ok(content) => (DEFAULT_CONFIG_FILE.to_string(), Some(content)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    (DEFAULT_CONFIG_FILE.to_string(), None)
+                }
+                Err(e) => return Err(format!("Cannot read {}: {}", DEFAULT_CONFIG_FILE, e)),
+            },
+        };
+        let mut config = match content {
+            None => Config::default(),
+            Some(content) => {
+                // one path for both sources, so neither can skip the unknown-key check
+                let (config, unknown) = parse_config(&content)
+                    .map_err(|e| format!("Invalid TOML in {}: {}", path, e))?;
+                // As at start: `[curation.hf]` is refused, not ignored as an unknown key.
+                refuse_hf_curation_keys(&path, &unknown)
+                    .map_err(|e| format!("Reload refused: {}", e))?;
+                surface_unknown_keys(&path, unknown, config_strict_from_env())
+                    .map_err(|e| format!("Reload refused: {}", e))?;
+                config
+            }
+        };
         config.apply_env_overrides()?;
         // As in `load`: validation judges the registries the enable-set mounts (#1098).
         let set = config.enabled_registries_quiet();

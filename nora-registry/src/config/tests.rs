@@ -805,6 +805,37 @@ fn test_raw_max_file_size_above_the_spool_budget_warns() {
     assert!(!hit(&config), "raw disabled warned");
 }
 
+/// Review R10: a publish cap above a non-zero `publish_inflight_mb` is cut to the budget
+/// (a 413 above it), so the start names it; the defaults, a cap within the budget and no
+/// budget (0) stay quiet.
+#[test]
+fn test_publish_cap_above_the_inflight_budget_warns() {
+    let _lock = env_lock();
+    let mut config = Config::default();
+    let hit = |c: &Config| {
+        let (warnings, errors) = c.validate_with_config_path(None);
+        assert!(!errors.iter().any(|m| m.contains("publish_inflight_mb")));
+        warnings.iter().any(|m| m.contains("publish_inflight_mb"))
+    };
+    assert!(!hit(&config), "the defaults warned");
+    config.server.body_limit_mb = 4096;
+    config.server.publish_body_limit_mb = 4096;
+    assert!(
+        hit(&config),
+        "a 4096 MB cap over the 2048 MB default budget did not warn"
+    );
+    config.server.publish_inflight_mb = 4096;
+    assert!(!hit(&config), "a cap equal to the budget warned");
+    config.server.publish_inflight_mb = 0;
+    assert!(!hit(&config), "no budget warned");
+    config.server.publish_inflight_mb = 2048;
+    config.server.body_limit_mb = 2048;
+    assert!(
+        !hit(&config),
+        "a cap bounded by body_limit_mb to the budget warned"
+    );
+}
+
 /// R4-T10: a `raw.cache_control` that cannot be a header value is a warning (an error
 /// under NORA_CONFIG_STRICT), and the default is what a request sends.
 #[test]
@@ -1847,8 +1878,9 @@ fn fallback_file_errors_refuse_start() {
     Config::load_from(None, NO_FALLBACK, false).expect("an absent file starts on defaults");
 }
 
-/// A reload without `NORA_CONFIG_PATH` never swaps the running policy for defaults: it is
-/// refused when `./config.toml` is absent or cannot be read (audit A027).
+/// A reload never swaps a file-defined policy for defaults (audit A027): a start that read
+/// `./config.toml` reloads that file, and refuses when it is gone or cannot be read.
+/// An env-only start (no file) reloads defaults + env as it started (review R03).
 #[test]
 fn reload_without_readable_fallback_keeps_engine() {
     let _lock = env_lock();
@@ -1857,12 +1889,31 @@ fn reload_without_readable_fallback_keeps_engine() {
         !std::path::Path::new("config.toml").exists(),
         "the test runs in a directory without config.toml"
     );
-    let absent = Config::try_load_from(None).expect_err("no file: nothing to reload");
-    assert!(absent.contains("config.toml"), "{absent}");
-
+    // The file start read is the file the reload names.
     let dir = tempfile::TempDir::new().unwrap();
+    let fallback = dir.path().join("config.toml");
+    let fallback = fallback.to_string_lossy().into_owned();
+    assert_eq!(
+        super::start_file(None, &fallback),
+        None,
+        "no file: env-only"
+    );
+    std::fs::write(&fallback, "[curation]\nmode = \"enforce\"\n").unwrap();
+    assert_eq!(super::start_file(None, &fallback), Some(fallback.clone()));
+    assert_eq!(
+        super::start_file(Some("named.toml".into()), &fallback),
+        Some("named.toml".into())
+    );
+    // Gone since start: refused.
+    let absent = Config::try_load_from(Some("config.toml".into()))
+        .expect_err("a file gone since start is refused");
+    assert!(absent.contains("config.toml"), "{absent}");
     let unreadable = dir.path().to_string_lossy().into_owned();
     Config::try_load_from(Some(unreadable)).expect_err("an unreadable file is refused");
+
+    // Env-only: defaults + env, as at start.
+    let env_only = Config::try_load_from(None).expect("an env-only start reloads");
+    assert_eq!(env_only.curation.mode, CurationMode::Off);
 }
 
 /// OIDC config text with a provider `gh` (extra keys appended) and a

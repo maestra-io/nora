@@ -94,7 +94,8 @@ pub struct ServerConfig {
     #[serde(default)]
     pub teleport_port: Option<u16>,
     /// Maximum body in MB of a publish that is buffered in memory (npm, Maven,
-    /// Cargo, deb, rpm); a bigger one is answered 413. Bounded by `body_limit_mb`.
+    /// Cargo, deb, rpm); a bigger one is answered 413. Bounded by `body_limit_mb` and by
+    /// a non-zero `publish_inflight_mb` (a warning at start names that cut).
     /// Streamed uploads (Docker blobs, raw, NuGet push, PyPI upload) have their own
     /// caps. Default 512.
     #[serde(default = "default_publish_body_limit_mb")]

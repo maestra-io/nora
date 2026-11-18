@@ -219,4 +219,27 @@ mod authenticated_caching {
         let resp = get_as(&ctx, jar, Some(&auth), None).await;
         assert_private(&resp, jar);
     }
+
+    // A084 / review R17: the bypass token is honoured with auth off too, so its answer is
+    // `private` there as well; a plain read with auth off stays `public`.
+    #[tokio::test]
+    async fn bypass_answers_are_private_with_auth_off() {
+        let ctx = create_test_context();
+        assert!(!ctx.state.config.auth.enabled);
+        let jar = "/maven2/com/example/lib/1.0/lib-1.0.jar";
+        let put = send(&ctx.app, Method::PUT, jar, Body::from(&b"jar"[..])).await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+        let resp = get_as(&ctx, jar, None, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(cache_control(&resp).contains("public"));
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            jar,
+            vec![("x-nora-bypass-token", "dummy-token")],
+            "",
+        )
+        .await;
+        assert_private(&resp, jar);
+    }
 }
