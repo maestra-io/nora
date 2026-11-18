@@ -62,7 +62,8 @@ read it from a BuildKit secret mount inside the `RUN` that uses it.
    whenever the index carries one; SHA-1 `.SIGN.RSA.` is accepted alone only because
    Alpine v2 indexes are signed that way.
    An index whose newest build time is older than the cached index's is an earlier
-   generation (a replayed or lagging copy): NORA keeps serving the cached one, marked
+   generation (a replayed or lagging copy; a build time more than an hour past NORA's
+   clock counts on neither side): NORA keeps serving the cached one, marked
    `x-nora-stale: true` whatever `serve_stale` says, stores it again so the next refetch
    waits `metadata_ttl`, and counts the refusal in
    `nora_upstream_index_older_refused_total{registry="apk"}`. When the upstream removes

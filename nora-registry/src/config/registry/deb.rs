@@ -38,6 +38,11 @@ pub struct DebConfig {
     /// falls back to `upstream_keyring_dir`.
     #[serde(default)]
     pub upstream_keyrings: BTreeMap<String, String>,
+    /// maestra: per-repository alias suites, repo of `proxies` → suite names whose
+    /// upstream `Release` names another suite (Ubuntu `devel` names the current
+    /// series). Any other suite's `Release` must name it in `Suite` or `Codename`.
+    #[serde(default)]
+    pub suite_aliases: BTreeMap<String, Vec<String>>,
 }
 
 fn default_deb_architectures() -> Vec<String> {
@@ -59,6 +64,7 @@ impl Default for DebConfig {
             architectures: default_deb_architectures(),
             upstream_keyring_dir: String::new(),
             upstream_keyrings: BTreeMap::new(),
+            suite_aliases: BTreeMap::new(),
         }
     }
 }
@@ -69,6 +75,13 @@ impl DebConfig {
         self.upstream_keyrings
             .get(repo)
             .map_or(&self.upstream_keyring_dir, |k| k)
+    }
+
+    /// Whether `suite` of `repo` is a configured alias (`suite_aliases`).
+    pub fn is_suite_alias(&self, repo: &str, suite: &str) -> bool {
+        self.suite_aliases
+            .get(repo)
+            .is_some_and(|s| s.iter().any(|a| a == suite))
     }
 
     pub(in crate::config) fn apply_env_overrides(&mut self) {

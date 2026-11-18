@@ -24,6 +24,9 @@ debian-security = "/etc/nora/deb-keyrings/debian-archive-keyring.pgp"
 ubuntu = "/etc/nora/deb-keyrings/ubuntu-archive-keyring.gpg"
 ubuntu-ports = "/etc/nora/deb-keyrings/ubuntu-archive-keyring.gpg"
 
+[deb.suite_aliases]   # per repository: suites whose Release names another suite
+ubuntu = ["devel"]
+
 [deb.proxies]
 debian = "https://deb.debian.org/debian"
 debian-security = "https://deb.debian.org/debian-security"
@@ -49,8 +52,9 @@ others share `upstream_keyring_dir`, and NORA warns at startup when more than on
 repository does. Each keyring must load, and each `upstream_keyrings` entry must name a
 `[deb.proxies]` repository, or NORA does not start. A key is used as gpgv would use it: a
 key with a valid revocation self-signature is left out (logged), a subkey signs only with a
-valid binding that carries the sign flag (and its back-signature), and the primary key only
-when its newest self-signature has the sign flag or no key flags at all. Signing key: any
+valid binding that carries the sign flag (and its back-signature) while neither it nor the
+primary key has expired, and the primary key only when its newest self-signature has the
+sign flag or no key flags at all. Signing key: any
 armored Ed25519 secret key without a passphrase (`gpg --quick-gen-key 'NORA apt' ed25519
 sign never`, then `gpg --export-secret-keys --armor`).
 
@@ -102,9 +106,11 @@ serves is dropped.
 1. `dists/<suite>/InRelease` is fetched under `metadata_ttl` and refused unless one of
    its signatures is unexpired and was made by an unexpired signing key of the
    repository's keyring, and unless its `Suite` or `Codename` is the requested suite
-   (apt's own rule), or when its `Date` is older than the `Date` of the build NORA serves
+   (stricter than apt, which only warns; a `Release` with neither field matches, and a
+   suite listed in `deb.suite_aliases.<repo>`, such as Ubuntu's `devel`, may name its
+   current target), or when its `Date` is older than the `Date` of the build NORA serves
    (a mirror or replay answering an older generation; a missing or unparsable `Date` is
-   not compared). A refused refresh keeps the last good build served. Each `<component>/binary-<arch>/Packages` it lists
+   not compared, nor a served `Date` more than an hour past NORA's clock). A refused refresh keeps the last good build served. Each `<component>/binary-<arch>/Packages` it lists
    (gz, else xz, else plain; `by-hash` when the upstream offers it) is fetched and refused
    on a SHA-256 other than the Release's. An index the Release lists but the mirror does
    not host (Ubuntu's archive and ports list every architecture) is left out; the
