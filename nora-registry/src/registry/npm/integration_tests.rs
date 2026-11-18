@@ -685,7 +685,7 @@ async fn test_npm_tarball_self_primes_metadata_on_cache_miss() {
         .unwrap();
     let dates: serde_json::Value = serde_json::from_slice(&dates).unwrap();
     assert_eq!(dates["1.0.0"], "2020-01-15T10:30:00.000Z");
-    let date = super::npm_publish_date(&ctx.state, "testpkg", "1.0.0").await;
+    let (date, _) = super::npm_publish_date(&ctx.state, "testpkg", "1.0.0").await;
     assert_eq!(
         date,
         Some(1579084200),
@@ -703,7 +703,7 @@ async fn test_extract_npm_publish_date_untrusted_ignores_mtime() {
         });
         let meta = serde_json::json!({ "time": { "1.0.0": "2020-01-15T10:30:00.000Z" } });
         ctx_seed_metadata(&ctx, "p", &meta).await;
-        let date = super::npm_publish_date(&ctx.state, "p", "1.0.0").await;
+        let (date, _) = super::npm_publish_date(&ctx.state, "p", "1.0.0").await;
         assert_eq!(date, trust.then_some(1579084200), "trust={trust}");
     }
 }

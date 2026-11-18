@@ -7,7 +7,11 @@
 //! A key is fetched once at a time: concurrent callers await the same fetch. An answer is
 //! kept for the format's `metadata_ttl`, a miss (404, 429, 5xx, timeout, an open breaker) for
 //! [`RETRY`]. A version missing from a kept answer fetches the key again at most once per
-//! [`RETRY`], so a release published after the answer is dated without waiting out the TTL.
+//! [`RETRY`], so a release published after the answer is dated without waiting out the TTL;
+//! inside that window the answer comes back [`Answer::unasked`]: the version was never asked
+//! about, and callers hold it as released now rather than leave it undated (R01).
+//! Each registry keeps at most [`KEYS`] keys: past it its expired ones go, then its
+//! longest-finished one, never one in flight, nor another registry's (R06).
 //! The fetches read through [`get`]: capped at [`MAX_BODY`] and reported to a breaker of
 //! their own (`<upstream>#dates`), so a throttled date API never opens the download breaker.
 //! [`crate::metrics::UPSTREAM_DATE_LOOKUP_TOTAL`] counts answers from the memo, fetches and
@@ -32,7 +36,7 @@ const RETRY: Duration = Duration::from_secs(60);
 /// One fetch, retry included; it runs on its own task, so a caller that gives up leaves it
 /// to the next one.
 const DEADLINE: Duration = Duration::from_secs(120);
-/// Keys kept; past it the expired ones go, then all.
+/// Keys kept per registry.
 const KEYS: usize = 1024;
 
 /// Version (as the format keys it) -> its release date, unix seconds.
@@ -41,9 +45,18 @@ type Lookup = Shared<BoxFuture<'static, Option<Arc<Dates>>>>;
 /// When a lookup started, then when it finished: what its answer's age is counted from.
 type Stamp = Arc<Mutex<Instant>>;
 
-/// Lookups by key (`AppState::upstream_dates`): their [`Stamp`], and the fetch every caller
-/// of that key awaits.
-pub type Memo = Mutex<HashMap<String, (Stamp, Lookup)>>;
+/// Lookups by registry, then key (`AppState::upstream_dates`): their [`Stamp`], and the fetch
+/// every caller of that key awaits.
+pub type Memo = Mutex<HashMap<RegistryType, HashMap<String, (Stamp, Lookup)>>>;
+
+/// What [`dates`] gives.
+pub(super) struct Answer {
+    /// The dates fetched or kept; `None`: no answer.
+    pub dates: Option<Arc<Dates>>,
+    /// A kept answer lacking a wanted version, given without asking the upstream again: a
+    /// version it lacks may be newer than the answer, so it is held, never left undated.
+    pub unasked: bool,
+}
 
 /// The dates of `key` of `registry`: the kept answer while it is fresh (`ttl` for an answer
 /// holding every `wanted` version, [`RETRY`] for a miss or one lacking a wanted version),
@@ -55,36 +68,33 @@ pub(super) async fn dates<F, Fut>(
     ttl: Duration,
     wanted: &[&str],
     fetch: F,
-) -> Option<Arc<Dates>>
+) -> Answer
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Option<Dates>> + Send + 'static,
 {
-    let key = format!("{}:{key}", registry.as_str());
-    let lookup = {
+    let (lookup, unasked) = {
         let mut memo = state.upstream_dates.lock();
-        let kept = memo.get(&key).and_then(|(stamp, lookup)| {
-            let fresh_for = match lookup.peek() {
+        let keys = memo.entry(registry).or_default();
+        let kept = keys.get(key).and_then(|(stamp, lookup)| {
+            let (fresh_for, unasked) = match lookup.peek() {
                 // In flight: join it.
-                None => return Some(lookup.clone()),
-                Some(Some(dates)) if wanted.iter().all(|w| dates.contains_key(*w)) => ttl,
-                Some(_) => RETRY,
+                None => return Some((lookup.clone(), false)),
+                Some(Some(dates)) if wanted.iter().all(|w| dates.contains_key(*w)) => (ttl, false),
+                Some(Some(_)) => (RETRY, true),
+                Some(None) => (RETRY, false),
             };
-            (stamp.lock().elapsed() < fresh_for).then(|| lookup.clone())
+            (stamp.lock().elapsed() < fresh_for).then(|| (lookup.clone(), unasked))
         });
         match kept {
-            Some(lookup) => {
+            Some(kept) => {
                 count(registry, "memo");
-                lookup
+                kept
             }
             None => {
                 count(registry, "fetch");
-                if memo.len() >= KEYS {
-                    memo.retain(|_, (stamp, _)| stamp.lock().elapsed() < ttl.max(RETRY));
-                }
-                if memo.len() >= KEYS {
-                    // ponytail: drops every key at once; an LRU if 1024 keys churn in a TTL.
-                    memo.clear();
+                if !keys.contains_key(key) && keys.len() >= KEYS {
+                    make_room(keys, ttl.max(RETRY));
                 }
                 let stamp: Stamp = Arc::new(Mutex::new(Instant::now()));
                 let finished = Arc::clone(&stamp);
@@ -98,12 +108,34 @@ where
                 .map(|done| done.ok().and_then(Result::ok).flatten().map(Arc::new))
                 .boxed()
                 .shared();
-                memo.insert(key, (stamp, lookup.clone()));
-                lookup
+                keys.insert(key.to_owned(), (stamp, lookup.clone()));
+                (lookup, false)
             }
         }
     };
-    lookup.await
+    Answer {
+        dates: lookup.await,
+        unasked,
+    }
+}
+
+/// One registry's keys at [`KEYS`]: the finished ones older than `kept_for` go, else the
+/// longest-finished one. A lookup in flight stays (its next caller would fetch it twice).
+// ponytail: a scan per insert at the bound; an LRU list if 1024 keys churn inside a TTL.
+fn make_room(keys: &mut HashMap<String, (Stamp, Lookup)>, kept_for: Duration) {
+    let finished = |lookup: &Lookup| lookup.peek().is_some();
+    keys.retain(|_, (stamp, lookup)| !finished(lookup) || stamp.lock().elapsed() < kept_for);
+    if keys.len() < KEYS {
+        return;
+    }
+    let oldest = keys
+        .iter()
+        .filter(|(_, (_, lookup))| finished(lookup))
+        .max_by_key(|(_, (stamp, _))| stamp.lock().elapsed())
+        .map(|(key, _)| key.clone());
+    if let Some(oldest) = oldest {
+        keys.remove(&oldest);
+    }
 }
 
 /// GET `url` of `upstream` for a date lookup: at most [`MAX_BODY`], on the breaker
@@ -149,6 +181,7 @@ pub(super) fn count(registry: RegistryType, outcome: &str) {
 
 /// A085: a date lookup is asked once per key and window, whatever the number or order of
 /// requests that need it; a refusing API opens its own breaker. A055: its answer is capped.
+/// R01: a kept answer never passes a version it lacks. R06: each registry has its own bound.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -172,7 +205,12 @@ mod tests {
 
     /// Moves every kept lookup `by` into the past.
     fn age(state: &AppState, by: Duration) {
-        for (stamp, _) in state.upstream_dates.lock().values() {
+        for (stamp, _) in state
+            .upstream_dates
+            .lock()
+            .values()
+            .flat_map(|keys| keys.values())
+        {
             let mut at = stamp.lock();
             *at = at.checked_sub(by).unwrap();
         }
@@ -363,6 +401,149 @@ mod tests {
         assert_eq!(hits(&central, "HEAD", head).await, 1);
     }
 
+    /// R01: a version a kept answer lacks, published inside the retry window, is held as
+    /// released now, never served (and cached) undated on the strength of that answer.
+    #[tokio::test]
+    async fn r01_gems_a_release_inside_the_retry_window_is_held() {
+        const API: &str = "/api/v1/versions/r01gem.json";
+        let upstream = MockServer::start().await;
+        let old = "2022-01-01T00:00:00Z".to_string();
+        Mock::given(method("GET"))
+            .and(path(API))
+            .respond_with(versions(&[("7.0.0", old.clone())]))
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(uri);
+            enforce_age(cfg);
+        });
+        let gem = "/gems/gems/r01gem-9.9.9.gem";
+        assert_eq!(
+            send(&ctx.app, Method::GET, gem, "").await.status(),
+            StatusCode::NOT_FOUND
+        );
+
+        // 9.9.9 is published seconds later.
+        upstream.reset().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        Mock::given(method("GET"))
+            .and(path(API))
+            .respond_with(versions(&[("7.0.0", old), ("9.9.9", now)]))
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"GEM".to_vec()))
+            .mount(&upstream)
+            .await;
+        let resp = send(&ctx.app, Method::GET, gem, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "held, not undated");
+        assert!(ctx
+            .state
+            .storage
+            .get("gems/gems/r01gem-9.9.9.gem")
+            .await
+            .is_err());
+        assert_eq!(hits(&upstream, "GET", API).await, 0, "the kept answer");
+    }
+
+    /// R01 for Maven: a kept "not on Central" does not date a file Central serves a few
+    /// seconds later; the file is held, not served and cached undated.
+    #[tokio::test]
+    async fn r01_maven_a_file_on_central_inside_the_retry_window_is_held() {
+        let central = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&central)
+            .await;
+        let proxy = format!("{}/repo1.maven.org/maven2", central.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.maven.proxies = vec![MavenProxyEntry::Simple(proxy)];
+            enforce_age(cfg);
+        });
+        let jar = "/maven2/com/example/r01/1.0/r01-1.0.jar";
+        assert_eq!(
+            send(&ctx.app, Method::GET, jar, "").await.status(),
+            StatusCode::NOT_FOUND
+        );
+
+        central.reset().await;
+        let now = chrono::Utc::now().to_rfc2822();
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Last-Modified", now.as_str())
+                    .set_body_bytes(b"JAR".to_vec()),
+            )
+            .mount(&central)
+            .await;
+        let resp = send(&ctx.app, Method::GET, jar, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "held, not undated");
+        let key = crate::registry::maven::storage_key("com/example/r01/1.0/r01-1.0.jar");
+        assert!(ctx.state.storage.stat(&key).await.is_none());
+        let head = "/repo1.maven.org/maven2/com/example/r01/1.0/r01-1.0.jar";
+        assert_eq!(hits(&central, "HEAD", head).await, 0, "the kept miss");
+    }
+
+    /// R06: each registry keeps its own keys. Another registry's churn never drops them, and
+    /// a registry at its bound drops its longest-finished key, never one in flight.
+    #[tokio::test]
+    async fn r06_a_full_registry_keeps_other_registries_and_lookups_in_flight() {
+        use crate::registry_type::RegistryType::{Gems, Maven};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let ctx = create_test_context_with_config(|_| {});
+        let ttl = Duration::from_secs(300);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let counted = |gate: Option<Arc<tokio::sync::Notify>>| {
+            let fetches = Arc::clone(&fetches);
+            move || async move {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                Some(super::Dates::new())
+            }
+        };
+        super::dates(&ctx.state, Gems, "kept", ttl, &[], counted(None)).await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut slow = Box::pin(super::dates(
+            &ctx.state,
+            Maven,
+            "slow",
+            ttl,
+            &[],
+            counted(Some(Arc::clone(&gate))),
+        ));
+        assert!(futures::poll!(&mut slow).is_pending());
+        for n in 0..super::KEYS + 8 {
+            super::dates(&ctx.state, Maven, &format!("k{n}"), ttl, &[], || async {
+                Some(super::Dates::new())
+            })
+            .await;
+        }
+        assert!(ctx.state.upstream_dates.lock()[&Maven].len() <= super::KEYS);
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+
+        super::dates(&ctx.state, Gems, "kept", ttl, &[], counted(None)).await;
+        let joined = super::dates(&ctx.state, Maven, "slow", ttl, &[], counted(None));
+        gate.notify_one();
+        let (first, second) = futures::join!(slow, joined);
+        assert!(first.dates.is_some() && second.dates.is_some());
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            2,
+            "kept, and joined in flight"
+        );
+    }
+
     /// A miss is kept for its window from when the fetch ended, not when it began: a slow
     /// failure is not asked again by the next request.
     #[tokio::test]
@@ -382,9 +563,11 @@ mod tests {
             fetch,
         )
         .await;
-        assert!(got.is_none());
+        assert!(got.dates.is_none());
         let memo = ctx.state.upstream_dates.lock();
-        let (stamp, _) = memo.get("gems:slow").unwrap();
+        let (stamp, _) = memo[&crate::registry_type::RegistryType::Gems]
+            .get("slow")
+            .unwrap();
         let age = stamp.lock().elapsed();
         assert!(
             age + Duration::from_millis(300) < begun.elapsed(),

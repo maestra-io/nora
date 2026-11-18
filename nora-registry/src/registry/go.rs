@@ -536,7 +536,7 @@ async fn go_attested_date(state: &AppState, module_encoded: &str, ver: &str) -> 
         format_upstream_path(module_encoded, &format!("@v/{ver}.zip"))
     );
     // A good answer is kept in storage; the memo only joins concurrent requests and paces
-    // misses, so it holds one a minute (the shared memo has 1024 keys, one per version here).
+    // misses, so it holds one a minute (Go's 1024 memo keys, one per version here).
     let ttl = Duration::from_secs(60);
     let fetching = state.clone();
     let memo_key = url.clone();
@@ -557,7 +557,8 @@ async fn go_attested_date(state: &AppState, module_encoded: &str, ver: &str) -> 
             }
         },
     )
-    .await?
+    .await
+    .dates?
     .get(ver)
     .copied()?;
     let bytes = Bytes::from(at.to_string().into_bytes());

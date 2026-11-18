@@ -1522,14 +1522,14 @@ fn terraform_upstream_is_official(state: &AppState) -> bool {
 /// registry.terraform.io `/v2` API, by version. The *standard* provider protocol
 /// exposes no date (neither `versions` nor `download/{os}/{arch}` carry one —
 /// verified against the live API), so this v2 endpoint is the only trusted source,
-/// and it only exists on the official registry. Any failure → `None`. One lookup per
+/// and it only exists on the official registry. Any failure: no dates. One lookup per
 /// provider for `terraform.metadata_ttl`, shared by every route (`upstream_dates`).
 async fn fetch_terraform_registry_dates(
     state: &AppState,
     ns: &str,
     ptype: &str,
     wanted: &[&str],
-) -> Option<std::sync::Arc<std::collections::HashMap<String, i64>>> {
+) -> super::upstream_dates::Answer {
     let url = format!(
         "{TERRAFORM_REGISTRY}/v2/providers/{}/{}?include=provider-versions",
         ns, ptype
@@ -1588,17 +1588,22 @@ fn parse_registry_dates(json: &serde_json::Value) -> std::collections::HashMap<S
     dates
 }
 
-/// Release date of one provider version via [`fetch_terraform_registry_dates`].
+/// Release date of one provider version via [`fetch_terraform_registry_dates`]; held as
+/// released now when a kept answer lacking it was reused unasked (R01).
 async fn fetch_terraform_registry_date(
     state: &AppState,
     ns: &str,
     ptype: &str,
     ver: &str,
 ) -> Option<i64> {
-    fetch_terraform_registry_dates(state, ns, ptype, &[ver])
-        .await?
-        .get(ver)
-        .copied()
+    let answer = fetch_terraform_registry_dates(state, ns, ptype, &[ver]).await;
+    if answer.unasked {
+        return state.curation().curation_engine.unasked_release_date(
+            RegistryType::Terraform,
+            state.config.server.trust_upstream_dates,
+        );
+    }
+    answer.dates?.get(ver).copied()
 }
 
 /// Q04 for Terraform (Maestra): drop the versions `min_release_age` refuses from a
@@ -1632,7 +1637,10 @@ async fn hide_young_versions(
         .flatten()
         .filter_map(|entry| entry.get("version").and_then(|v| v.as_str()))
         .collect();
-    let Some(dates) = fetch_terraform_registry_dates(state, ns, ptype, &listed).await else {
+    let Some(dates) = fetch_terraform_registry_dates(state, ns, ptype, &listed)
+        .await
+        .dates
+    else {
         return versions_json;
     };
     drop_hidden_versions(
