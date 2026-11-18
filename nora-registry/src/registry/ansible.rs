@@ -113,15 +113,7 @@ async fn collection_list(State(state): State<AppState>, RawQuery(raw_query): Raw
     // proxy_json answers from storage alone when the upstream is switched off.
     let proxy_url = upstream_url(&state).unwrap_or_default();
     let base = format!("{}{}/", proxy_url.trim_end_matches('/'), API_PREFIX);
-    // `fields`/`exclude_fields` never go upstream: the cache key ignores them, and a
-    // projected body without `created_at` would slip young versions past the Q04 filter.
-    let raw_query = without_projection(raw_query.as_deref());
-    let url = append_query(&base, raw_query.as_deref());
-
-    let cache_key = match extract_page_param(raw_query.as_deref()) {
-        Some(page) => format!("ansible/metadata/collections-page-{}.json", page),
-        None => "ansible/metadata/collections.json".to_string(),
-    };
+    let (url, cache_key) = paged(&base, "ansible/metadata/collections", raw_query.as_deref());
 
     proxy_json(&state, &url, "ansible-collections", &cache_key, None).await
 }
@@ -177,18 +169,11 @@ async fn version_list(
         ns,
         name
     );
-    // Same as the collection list: the cache key ignores a projection, and a page
-    // without `created_at` would slip young versions past the Q04 filter below.
-    let raw_query = without_projection(raw_query.as_deref());
-    let url = append_query(&base, raw_query.as_deref());
-
-    let cache_key = match extract_page_param(raw_query.as_deref()) {
-        Some(page) => format!(
-            "ansible/metadata/{}/{}/versions-page-{}.json",
-            ns, name, page
-        ),
-        None => format!("ansible/metadata/{}/{}/versions.json", ns, name),
-    };
+    let (url, cache_key) = paged(
+        &base,
+        &format!("ansible/metadata/{}/{}/versions", ns, name),
+        raw_query.as_deref(),
+    );
 
     let package = format!("{}.{}", ns, name);
     let resp = proxy_json(
@@ -249,8 +234,14 @@ async fn version_detail(
         }
     }
 
-    // proxy_json answers from storage alone when the upstream is switched off.
-    let proxy_url = upstream_url(&state).unwrap_or_default();
+    proxy_version_detail(&state, &ns, &name, &ver).await
+}
+
+/// The Galaxy version detail through [`proxy_json`], cached under the one key both
+/// `version_detail` and `download_tarball` read. With the upstream switched off it answers
+/// from storage alone.
+async fn proxy_version_detail(state: &AppState, ns: &str, name: &str, ver: &str) -> Response {
+    let proxy_url = upstream_url(state).unwrap_or_default();
     let url = format!(
         "{}{}/{}/{}/versions/{}/",
         proxy_url.trim_end_matches('/'),
@@ -259,16 +250,55 @@ async fn version_detail(
         name,
         ver
     );
-
-    let cache_key = format!("ansible/metadata/{}/{}/{}.json", ns, name, ver);
     proxy_json(
-        &state,
+        state,
         &url,
         &format!("{}.{} v{}", ns, name, ver),
-        &cache_key,
+        &version_detail_key(ns, name, ver),
         Some(&format!("{}.{}", ns, name)),
     )
     .await
+}
+
+fn version_detail_key(ns: &str, name: &str, ver: &str) -> String {
+    format!("ansible/metadata/{}/{}/{}.json", ns, name, ver)
+}
+
+/// `created_at` (else `created`) of a Galaxy version detail or listing entry.
+fn detail_date(entry: &serde_json::Value) -> Option<i64> {
+    let date = entry.get("created_at").or_else(|| entry.get("created"))?;
+    crate::curation::parse_iso8601_to_unix(date.as_str()?)
+}
+
+/// The release date of a version NORA has no cached metadata for: its version detail fetched
+/// now, the request `ansible-galaxy` makes before a tarball (audit A036). The body is read
+/// from the response: `proxy_json` caches it in the background.
+async fn fetched_publish_date(state: &AppState, ns: &str, name: &str, ver: &str) -> Option<i64> {
+    let resp = proxy_version_detail(state, ns, name, ver).await;
+    if resp.status() != StatusCode::OK {
+        return None;
+    }
+    // The body is already in memory (`with_json`): no limit to enforce here.
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .ok()?;
+    detail_date(&serde_json::from_slice(&body).ok()?)
+}
+
+/// The date min-release-age judges a tarball by: `date`, else the write time of NORA's copy
+/// (never earlier than the release), then what `[curation.ansible] unknown_date` makes of a
+/// date still unknown. Not the quarantine's seed (R4-C05).
+async fn judged_date(state: &AppState, date: Option<i64>, tarball_key: &str) -> Option<i64> {
+    let trust = state.config.server.trust_upstream_dates;
+    let curation = state.curation();
+    let engine = &curation.curation_engine;
+    let date = match date {
+        None if trust && engine.reads_release_date(RegistryType::Ansible) => {
+            crate::curation::extract_mtime_as_publish_date(&state.storage, tarball_key).await
+        }
+        date => date,
+    };
+    engine.judged_release_date(RegistryType::Ansible, trust, date)
 }
 
 /// Per-version `created_at` from cached Galaxy metadata (#748/#750).
@@ -286,18 +316,13 @@ async fn extract_ansible_publish_date(
     ver: &str,
 ) -> Option<i64> {
     // Per-version detail (top-level created_at; works for any version).
-    let ver_key = format!("ansible/metadata/{}/{}/{}.json", ns, name, ver);
-    if let Ok(data) = storage.get(&ver_key).await {
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
-            if let Some(date_str) = json
-                .get("created_at")
-                .or_else(|| json.get("created"))
-                .and_then(|v| v.as_str())
-            {
-                if let Some(ts) = crate::curation::parse_iso8601_to_unix(date_str) {
-                    return Some(ts);
-                }
-            }
+    if let Ok(data) = storage.get(&version_detail_key(ns, name, ver)).await {
+        if let Some(ts) = serde_json::from_slice(&data)
+            .ok()
+            .as_ref()
+            .and_then(detail_date)
+        {
+            return Some(ts);
         }
     }
 
@@ -309,11 +334,7 @@ async fn extract_ansible_publish_date(
     let entry = entries
         .iter()
         .find(|e| e.get("version").and_then(|v| v.as_str()) == Some(ver))?;
-    let date_str = entry
-        .get("created_at")
-        .or_else(|| entry.get("created"))?
-        .as_str()?;
-    crate::curation::parse_iso8601_to_unix(date_str)
+    detail_date(entry)
 }
 
 // ── Tarball download (immutable) ───────────────────────────────────────
@@ -342,17 +363,6 @@ async fn download_tarball(
 
     let storage_key = format!("ansible/download/{}", filename);
 
-    // Release date for the digest-quarantine first-seen clock (#748/#750): the
-    // Galaxy versions metadata (cached by version_list) carries per-version
-    // created_at. Hosted-only uses mtime.
-    let publish_date = if upstream_url(&state).is_none() {
-        crate::curation::extract_mtime_as_publish_date(&state.storage, &storage_key).await
-    } else if state.config.server.trust_upstream_dates {
-        extract_ansible_publish_date(&state.storage, ns, name, ver).await
-    } else {
-        None
-    };
-
     // Curation check. #733 serve-local: an internal-namespace collection is operator-owned — skip
     // curation and serve any local copy below; block the upstream branch separately.
     let internal = crate::curation::is_internal_namespace(
@@ -360,7 +370,30 @@ async fn download_tarball(
         crate::curation::RegistryType::Ansible,
         &format!("{}.{}", ns, name),
     );
+
+    // Release date for min-release-age and the digest-quarantine first-seen clock
+    // (#748/#750): the cached version detail or first listing page, else (when a release
+    // age reads it) the version detail fetched now (A036). Hosted-only uses mtime.
+    let publish_date = if upstream_url(&state).is_none() {
+        crate::curation::extract_mtime_as_publish_date(&state.storage, &storage_key).await
+    } else if state.config.server.trust_upstream_dates {
+        match extract_ansible_publish_date(&state.storage, ns, name, ver).await {
+            None if !internal
+                && state
+                    .curation()
+                    .curation_engine
+                    .reads_release_date(RegistryType::Ansible) =>
+            {
+                fetched_publish_date(&state, ns, name, ver).await
+            }
+            date => date,
+        }
+    } else {
+        None
+    };
+
     if !internal {
+        let judged = judged_date(&state, publish_date, &storage_key).await;
         if let Some(response) = crate::curation::check_download(
             &state.curation().curation_engine,
             state.bypass_token().as_deref(),
@@ -368,7 +401,7 @@ async fn download_tarball(
             crate::curation::RegistryType::Ansible,
             &format!("{}.{}", ns, name),
             crate::curation::RequestVersion::Known(ver.to_string()),
-            publish_date,
+            judged,
         ) {
             return response;
         }
@@ -779,39 +812,50 @@ fn serve_stale_or_bad_gateway(
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-/// Append query string to a URL, rejecting oversized or malformed values.
-fn append_query(base_url: &str, raw_query: Option<&str>) -> String {
-    match raw_query {
-        Some(q) if !q.is_empty() && q.len() <= 256 && !q.contains('#') && !q.contains('\0') => {
-            format!("{}?{}", base_url, q)
-        }
-        _ => base_url.to_string(),
+/// The paging parameters of a Galaxy listing query (`limit`, `offset`, `page`), sorted: names
+/// and values percent-decoded, the first all-digit `u32` value of each name. Everything else
+/// (the `fields`/`exclude_fields` projections, filters) is dropped (audit A037).
+fn galaxy_paging(raw_query: Option<&str>) -> Vec<(&'static str, u32)> {
+    fn decode(s: &str) -> Option<std::borrow::Cow<'_, str>> {
+        percent_encoding::percent_decode_str(s).decode_utf8().ok()
     }
-}
-
-/// Drop the Galaxy NG projection parameters (`fields`, `exclude_fields`) from a query string.
-fn without_projection(raw_query: Option<&str>) -> Option<String> {
-    let kept: Vec<&str> = raw_query?
-        .split('&')
-        .filter(|p| !p.starts_with("fields=") && !p.starts_with("exclude_fields="))
-        .collect();
-    (!kept.is_empty()).then(|| kept.join("&"))
-}
-
-/// Extract `page` or `offset` parameter from a query string for cache key differentiation.
-fn extract_page_param(raw_query: Option<&str>) -> Option<String> {
-    let q = raw_query?;
-    for pair in q.split('&') {
-        if let Some(val) = pair
-            .strip_prefix("page=")
-            .or_else(|| pair.strip_prefix("offset="))
+    let mut pairs: Vec<(&'static str, u32)> = Vec::new();
+    for part in raw_query.unwrap_or_default().split('&') {
+        let (name, value) = part.split_once('=').unwrap_or((part, ""));
+        let (Some(name), Some(value)) = (decode(name), decode(value)) else {
+            continue;
+        };
+        let Some(name) = ["limit", "offset", "page"].into_iter().find(|n| *n == name) else {
+            continue;
+        };
+        if pairs.iter().any(|(seen, _)| *seen == name)
+            || value.is_empty()
+            || !value.bytes().all(|b| b.is_ascii_digit())
         {
-            if !val.is_empty() && val.len() <= 10 && val.chars().all(|c| c.is_ascii_digit()) {
-                return Some(val.to_string());
-            }
+            continue;
+        }
+        if let Ok(n) = value.parse() {
+            pairs.push((name, n));
         }
     }
-    None
+    pairs.sort_unstable();
+    pairs
+}
+
+/// The upstream URL and the cache key of a listing page, both built from its
+/// [`galaxy_paging`] pairs, so what is cached under a key is what that key names: a
+/// projected body without `created_at` would slip young versions past the Q04 filter.
+fn paged(base_url: &str, base_key: &str, raw_query: Option<&str>) -> (String, String) {
+    let pairs = galaxy_paging(raw_query);
+    if pairs.is_empty() {
+        return (base_url.to_string(), format!("{base_key}.json"));
+    }
+    let query: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let key: String = pairs.iter().map(|(k, v)| format!("-{k}-{v}")).collect();
+    (
+        format!("{base_url}?{}", query.join("&")),
+        format!("{base_key}{key}.json"),
+    )
 }
 
 /// The configured upstream, or None when the operator switched it off with an empty
@@ -888,12 +932,71 @@ fn is_safe_filename(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn without_projection_drops_fields_params() {
-        assert_eq!(without_projection(None), None);
-        assert_eq!(without_projection(Some("exclude_fields=created_at")), None);
+    fn galaxy_paging_drops_fields_params() {
+        assert_eq!(galaxy_paging(None), []);
+        assert_eq!(galaxy_paging(Some("exclude_fields=created_at")), []);
         assert_eq!(
-            without_projection(Some("limit=100&fields=version&offset=100&exclude_fields=x")),
-            Some("limit=100&offset=100".to_string())
+            galaxy_paging(Some("limit=100&fields=version&offset=100&exclude_fields=x")),
+            [("limit", 100), ("offset", 100)]
+        );
+    }
+
+    /// A037: the paging pairs are read as Galaxy decodes them, normalised, and nothing else
+    /// survives, so a spelling the key would not see cannot reach the upstream.
+    #[test]
+    fn galaxy_paging_decodes_normalises_and_drops_the_rest() {
+        assert_eq!(galaxy_paging(Some("%6Fffset=50")), [("offset", 50)]);
+        assert_eq!(galaxy_paging(Some("offset=%35%30")), [("offset", 50)]);
+        assert_eq!(galaxy_paging(Some("offset=00000000050")), [("offset", 50)]);
+        for dropped in [
+            "%66ields=version",
+            "exclude_fields=created_at",
+            "foo=1",
+            "page=abc",
+            "offset=99999999999",
+            "offset=+5",
+            "offset=-5",
+            "offset=",
+            "offset",
+            "offset=%FF",
+            "%FF=1",
+        ] {
+            assert_eq!(galaxy_paging(Some(dropped)), [], "{dropped}");
+        }
+        assert_eq!(
+            galaxy_paging(Some("offset=200&limit=100")),
+            [("limit", 100), ("offset", 200)]
+        );
+        assert_eq!(
+            galaxy_paging(Some("offset=5&offset=7")),
+            [("offset", 5)],
+            "the first occurrence"
+        );
+        assert_eq!(galaxy_paging(Some("offset=x&offset=7")), [("offset", 7)]);
+    }
+
+    /// A037: the upstream query and the cache key come from the same pairs.
+    #[test]
+    fn paged_url_and_key_agree() {
+        let base = "https://galaxy.test/v/";
+        assert_eq!(
+            paged(
+                base,
+                "k/versions",
+                Some("offset=200&%6Cimit=100&exclude_fields=x")
+            ),
+            (
+                "https://galaxy.test/v/?limit=100&offset=200".to_string(),
+                "k/versions-limit-100-offset-200.json".to_string()
+            )
+        );
+        assert_eq!(
+            paged(base, "k/versions", Some("%66ields=version")),
+            (base.to_string(), "k/versions.json".to_string())
+        );
+        assert_eq!(
+            paged(base, "k/versions", Some("limit=10")).1,
+            "k/versions-limit-10.json"
         );
     }
 
@@ -1032,53 +1135,61 @@ mod tests {
         assert!(!result.contains("galaxy.ansible.com"));
     }
 
+    fn paged_url(raw_query: Option<&str>) -> String {
+        paged(
+            "https://galaxy.ansible.com/api/v3/versions/",
+            "k",
+            raw_query,
+        )
+        .0
+    }
+
     #[test]
-    fn test_append_query_basic() {
-        let base = "https://galaxy.ansible.com/api/v3/versions/";
+    fn test_paged_query_basic() {
         assert_eq!(
-            append_query(base, Some("limit=10&offset=20")),
+            paged_url(Some("limit=10&offset=20")),
             "https://galaxy.ansible.com/api/v3/versions/?limit=10&offset=20"
         );
     }
 
     #[test]
-    fn test_append_query_empty() {
+    fn test_paged_query_empty() {
         let base = "https://galaxy.ansible.com/api/v3/versions/";
-        assert_eq!(append_query(base, None), base);
-        assert_eq!(append_query(base, Some("")), base);
+        assert_eq!(paged_url(None), base);
+        assert_eq!(paged_url(Some("")), base);
     }
 
     #[test]
-    fn test_append_query_rejects_oversized() {
+    fn test_paged_query_rejects_oversized() {
         let base = "https://galaxy.ansible.com/api/v3/versions/";
         let huge = "a".repeat(257);
-        assert_eq!(append_query(base, Some(&huge)), base);
+        assert_eq!(paged_url(Some(&huge)), base);
     }
 
     #[test]
-    fn test_append_query_rejects_fragment() {
+    fn test_paged_query_rejects_fragment() {
         let base = "https://galaxy.ansible.com/api/v3/versions/";
-        assert_eq!(append_query(base, Some("page=1#evil")), base);
+        assert_eq!(paged_url(Some("page=1#evil")), base);
     }
 
     #[test]
-    fn test_append_query_rejects_null_byte() {
+    fn test_paged_query_rejects_null_byte() {
         let base = "https://galaxy.ansible.com/api/v3/versions/";
-        assert_eq!(append_query(base, Some("page=1\0")), base);
+        assert_eq!(paged_url(Some("page=1\0")), base);
+        assert_eq!(paged_url(Some("page=1%00")), base);
     }
 
     #[test]
-    fn test_extract_page_param() {
-        assert_eq!(extract_page_param(Some("page=2")), Some("2".to_string()));
-        assert_eq!(
-            extract_page_param(Some("limit=10&offset=20")),
-            Some("20".to_string())
-        );
-        assert_eq!(extract_page_param(Some("limit=10")), None);
-        assert_eq!(extract_page_param(None), None);
-        assert_eq!(extract_page_param(Some("")), None);
+    fn test_paged_cache_key() {
+        let key = |q| paged("u", "k", q).1;
+        assert_eq!(key(Some("page=2")), "k-page-2.json");
+        // `limit` is keyed too (A037): two page sizes never share an entry.
+        assert_eq!(key(Some("limit=10&offset=20")), "k-limit-10-offset-20.json");
+        assert_eq!(key(Some("limit=10")), "k-limit-10.json");
+        assert_eq!(key(None), "k.json");
+        assert_eq!(key(Some("")), "k.json");
         // Reject non-numeric
-        assert_eq!(extract_page_param(Some("page=abc")), None);
+        assert_eq!(key(Some("page=abc")), "k.json");
     }
 
     #[test]
@@ -1837,5 +1948,148 @@ mod per_ansible_galaxy {
         }
         let sent = upstream_paths(&up).await;
         assert!(sent.is_empty(), "{sent:?}");
+    }
+}
+
+/// A Galaxy tarball's release date under trusted upstream dates (audit A036, A067): a
+/// tarball asked for with no cached metadata fetches its version detail, a cached copy
+/// without one is dated by its write time, and a date still unknown is judged by
+/// `[curation.ansible] unknown_date`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod release_date_judged {
+    use super::API_PREFIX;
+    use crate::test_helpers::{
+        background_writes_done, create_test_context_with_config, put_written_days_ago, send,
+        upstream_paths, TestContext,
+    };
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const TARBALL: &str = "/ansible/download/acme-tools-7.0.0.tar.gz";
+    const ARTIFACT: &str =
+        "/ansible/api/v3/plugin/ansible/content/published/collections/artifacts/acme-tools-7.0.0.tar.gz";
+    const TARBALL_KEY: &str = "ansible/download/acme-tools-7.0.0.tar.gz";
+    const DETAIL_KEY: &str = "ansible/metadata/acme/tools/7.0.0.json";
+
+    fn up_detail() -> String {
+        format!("{API_PREFIX}/acme/tools/versions/7.0.0/")
+    }
+
+    /// An upstream serving the tarball and, when `age` is set, a version detail dated that
+    /// long ago (else 500).
+    async fn upstream(age: Option<chrono::Duration>) -> MockServer {
+        let up = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/acme-tools-7.0.0.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"TARBALL".to_vec()))
+            .mount(&up)
+            .await;
+        let detail = match age {
+            Some(age) => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "namespace": "acme", "name": "tools", "version": "7.0.0",
+                "created_at": (chrono::Utc::now() - age).to_rfc3339(),
+            })),
+            None => ResponseTemplate::new(500),
+        };
+        Mock::given(method("GET"))
+            .and(path(up_detail()))
+            .respond_with(detail)
+            .mount(&up)
+            .await;
+        up
+    }
+
+    /// Live shape: enforce, ansible min_release_age 3d, quarantine observe, trusted dates.
+    fn min_age(up: &MockServer, hold: bool) -> TestContext {
+        let uri = up.uri();
+        create_test_context_with_config(move |cfg| {
+            cfg.ansible.enabled = true;
+            cfg.ansible.proxy = Some(uri);
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.ansible.min_release_age = Some("3d".to_string());
+            cfg.curation.ansible.quarantine =
+                Some(crate::digest_quarantine::QuarantineMode::Observe);
+            cfg.curation.ansible.quarantine_ttl = Some("3d".to_string());
+            if hold {
+                cfg.curation.ansible.unknown_date = Some(crate::config::UnknownDate::Hold);
+            }
+        })
+    }
+
+    async fn status(ctx: &TestContext, uri: &str) -> StatusCode {
+        send(&ctx.app, Method::GET, uri, "").await.status()
+    }
+
+    // A036: a tarball asked for first is dated by the version detail fetched for it, on
+    // both routes, and the detail lands under the key `version_detail` reads.
+    #[tokio::test]
+    async fn a_tarball_first_is_dated_by_its_fetched_detail() {
+        let up = upstream(Some(chrono::Duration::hours(1))).await;
+        let ctx = min_age(&up, false);
+        let holders = ctx.state.storage.holders();
+        assert_eq!(status(&ctx, TARBALL).await, StatusCode::FORBIDDEN);
+        assert_eq!(upstream_paths(&up).await, [up_detail()]);
+        background_writes_done(&ctx.state.storage, holders).await;
+        assert!(ctx.state.storage.get(DETAIL_KEY).await.is_ok());
+        assert_eq!(status(&ctx, ARTIFACT).await, StatusCode::FORBIDDEN);
+        assert_eq!(upstream_paths(&up).await, [up_detail()], "detail cached");
+    }
+
+    // A036 (b): an old version, with no listing cached, is served.
+    #[tokio::test]
+    async fn an_old_version_without_cached_metadata_is_served() {
+        let up = upstream(Some(chrono::Duration::days(30))).await;
+        let ctx = min_age(&up, true);
+        assert_eq!(status(&ctx, TARBALL).await, StatusCode::OK);
+        assert_eq!(status(&ctx, ARTIFACT).await, StatusCode::OK);
+    }
+
+    // A067: a tarball NORA cached without its metadata is not served undated.
+    #[tokio::test]
+    async fn a_cached_tarball_without_metadata_is_dated() {
+        let up = upstream(Some(chrono::Duration::hours(1))).await;
+        let ctx = min_age(&up, false);
+        ctx.state
+            .storage
+            .put(TARBALL_KEY, b"TARBALL")
+            .await
+            .unwrap();
+        assert_eq!(status(&ctx, TARBALL).await, StatusCode::FORBIDDEN);
+    }
+
+    // A036 (c): with no detail to be had, `hold` refuses a version NORA has no copy of.
+    #[tokio::test]
+    async fn an_unknown_date_is_held_under_hold() {
+        let up = upstream(None).await;
+        let ctx = min_age(&up, true);
+        assert_eq!(status(&ctx, TARBALL).await, StatusCode::FORBIDDEN);
+        assert!(!upstream_paths(&up)
+            .await
+            .iter()
+            .any(|p| p.contains("/download/")));
+    }
+
+    // A036 (d): a copy NORA cached 30 days ago is dated by that write and stays served.
+    #[tokio::test]
+    async fn an_old_cached_copy_is_served_while_the_detail_fails() {
+        let up = upstream(None).await;
+        let ctx = min_age(&up, true);
+        put_written_days_ago(&ctx, TARBALL_KEY, b"TARBALL", 30).await;
+        assert_eq!(status(&ctx, TARBALL).await, StatusCode::OK);
+    }
+
+    /// `log` (Ansible's default) serves an undated version, and counts it.
+    #[tokio::test]
+    async fn an_unknown_date_is_counted_under_log() {
+        let up = upstream(None).await;
+        let ctx = min_age(&up, false);
+        let counter =
+            crate::metrics::CURATION_UNKNOWN_RELEASE_DATE_TOTAL.with_label_values(&["ansible"]);
+        let before = counter.get();
+        assert_eq!(status(&ctx, TARBALL).await, StatusCode::OK);
+        assert!(counter.get() > before);
     }
 }

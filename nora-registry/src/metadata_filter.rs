@@ -709,6 +709,95 @@ mod tests {
         assert_eq!(sent[0].url.query(), Some("limit=100"));
     }
 
+    const GALAXY_VERSIONS: &str = "/ansible/v3/collections/community/general/versions/";
+
+    /// A037: a listing query reaches the upstream only as its re-serialised paging pairs, so
+    /// no spelling of a projection, filter or padded page is fetched under a key that does
+    /// not name it; the plain listing that follows is still filtered.
+    #[tokio::test]
+    async fn ansible_listing_is_forwarded_by_its_paging_pairs_only() {
+        for (query, forwarded) in [
+            ("%66ields=version", None),
+            ("exclude_fields=created_at", None),
+            ("foo=1", None),
+            ("offset=00000000000000050", Some("offset=50")),
+        ] {
+            let (up, ctx) = galaxy_ctx(CurationMode::Enforce).await;
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                &format!("{GALAXY_VERSIONS}?{query}"),
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{query}");
+            let sent = up.received_requests().await.unwrap();
+            assert_eq!(sent.len(), 1, "{query}");
+            assert_eq!(sent[0].url.query(), forwarded, "{query}");
+            assert_eq!(galaxy_versions(&ctx).await, ["13.5.0", "12.0.0"], "{query}");
+        }
+    }
+
+    /// A037: `limit` is part of the key, so a page of one size never answers for another.
+    #[tokio::test]
+    async fn ansible_listing_limit_is_keyed() {
+        let (up, ctx) = galaxy_ctx(CurationMode::Enforce).await;
+        let holders = ctx.state.storage.holders();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("{GALAXY_VERSIONS}?limit=1"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
+        assert_eq!(galaxy_versions(&ctx).await, ["13.5.0", "12.0.0"]);
+        let queries: Vec<Option<String>> = up
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.query().map(str::to_string))
+            .collect();
+        assert_eq!(queries, [Some("limit=1".to_string()), None]);
+    }
+
+    /// A037: the collection catalog is keyed and forwarded the same way.
+    #[tokio::test]
+    async fn ansible_collection_list_is_forwarded_by_its_paging_pairs_only() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v3/plugin/ansible/content/published/collections/index/",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [] })))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.ansible.enabled = true;
+            cfg.ansible.proxy = Some(uri);
+        });
+        let holders = ctx.state.storage.holders();
+        for uri in [
+            "/ansible/v3/collections/?%6Fffset=50",
+            "/ansible/v3/collections/",
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
+        }
+        let queries: Vec<Option<String>> = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.query().map(str::to_string))
+            .collect();
+        assert_eq!(queries, [Some("offset=50".to_string()), None]);
+    }
+
     #[tokio::test]
     async fn ansible_versions_audit_mode_keeps_young_collections() {
         let (_up, ctx) = galaxy_ctx(CurationMode::Audit).await;
