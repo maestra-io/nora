@@ -2517,7 +2517,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                 loop {
                     sighup.recv().await;
                     info!("SIGHUP received — reloading curation policy");
-                    match reload_curation(&slot, &held, Config::path_from_env()) {
+                    match reload_curation(&slot, &held, Config::reload_path()) {
                         Ok(()) => info!("Curation policy reloaded successfully"),
                         Err(e) => {
                             error!(error = %e, "Curation policy reload failed, keeping previous config")

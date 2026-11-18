@@ -384,3 +384,54 @@ fn a_reload_installs_the_engine_of_the_file_it_reads() {
         .curation_engine
         .reads_release_date(RegistryType::Npm));
 }
+
+/// Review R03: an env-only start (no config file, curation from `NORA_CURATION_*`) keeps
+/// reloading on SIGHUP: the reload re-reads the blocklist the environment names, so a rule
+/// added to that file applies without a restart.
+#[test]
+fn an_env_only_reload_applies_a_changed_blocklist() {
+    use crate::curation::{Decision, FilterRequest, RegistryType, RequestVersion};
+    let _lock = crate::test_env::env_lock();
+    assert!(
+        !std::path::Path::new("config.toml").exists(),
+        "the test runs in a directory without config.toml"
+    );
+    let dir = tempfile::TempDir::new().unwrap();
+    let list = dir.path().join("blocklist.json");
+    std::fs::write(&list, r#"{"version": 1, "rules": []}"#).unwrap();
+    std::env::remove_var("NORA_CONFIG_PATH");
+    std::env::set_var("NORA_CURATION_MODE", "enforce");
+    std::env::set_var("NORA_CURATION_BLOCKLIST_PATH", &list);
+    let started = Config::try_load_from(None);
+    let slot = arc_swap::ArcSwap::from_pointee(super::ReloadableConfig {
+        curation_engine: build_curation_engine(started.as_ref().unwrap()).unwrap(),
+        bypass_token: None,
+    });
+    let held = super::HeldQuarantine::of(&started.as_ref().unwrap().curation);
+    let blocked = |slot: &arc_swap::ArcSwap<super::ReloadableConfig>| {
+        let request = FilterRequest {
+            registry: RegistryType::Npm,
+            upstream: None,
+            name: "evil-pkg".into(),
+            version: RequestVersion::Known("1.0.0".into()),
+            integrity: None,
+            bypass: false,
+            publish_date: None,
+        };
+        matches!(
+            slot.load().curation_engine.evaluate(&request).decision,
+            Decision::Block { .. }
+        )
+    };
+    assert!(!blocked(&slot), "started without the rule");
+    std::fs::write(
+        &list,
+        r#"{"version": 1, "rules": [{"registry": "npm", "name": "evil-pkg", "version": "*", "reason": "blocked"}]}"#,
+    )
+    .unwrap();
+    let reloaded = super::reload_curation(&slot, &held, None);
+    std::env::remove_var("NORA_CURATION_MODE");
+    std::env::remove_var("NORA_CURATION_BLOCKLIST_PATH");
+    reloaded.expect("an env-only reload loads");
+    assert!(blocked(&slot), "the rule added to the blocklist applies");
+}
