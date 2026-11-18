@@ -15,8 +15,13 @@ pub struct FetchedBlob {
     /// RAII guard — deletes temp file on drop unless disarmed.
     pub _guard: TempFileGuard,
     /// The fill's share of `docker.proxy_spool_max_mb`, held until the file is stored.
-    pub(crate) _budget: Option<crate::registry::SpoolReservation>,
+    pub(crate) _budget: Option<SharedBudget>,
 }
+
+/// A fill's reservation of `docker.proxy_spool_max_mb`, held by the fill and by every
+/// response reading its spool: an open read handle keeps the file's bytes on disk after
+/// the spool is removed, so the budget is released only once the last handle is gone.
+pub(crate) type SharedBudget = Arc<parking_lot::Mutex<crate::registry::SpoolReservation>>;
 
 /// An upstream blob whose response headers have arrived but whose body has not been
 /// read: the point at which `download_blob` can answer the client, before the bytes
@@ -50,13 +55,13 @@ pub(crate) struct SpoolFile {
     pub(super) file: tokio::fs::File,
     pub(super) guard: TempFileGuard,
     /// Budget the spool grows within before each write; `None` = unbudgeted (mirror).
-    pub(super) budget: Option<crate::registry::SpoolReservation>,
+    pub(super) budget: Option<SharedBudget>,
 }
 
 impl SpoolFile {
     pub(crate) async fn create(
         temp_dir: &std::path::Path,
-        budget: Option<crate::registry::SpoolReservation>,
+        budget: Option<SharedBudget>,
     ) -> Result<Self, ProxyError> {
         let path = temp_dir.join(format!("proxy-{}", uuid::Uuid::new_v4()));
         let guard = TempFileGuard::new(path.clone());
@@ -190,6 +195,7 @@ async fn spool_response(
     digest: &str,
     headers: &axum::http::HeaderMap,
     stall: Duration,
+    hold: Option<SharedBudget>,
 ) -> Response {
     use crate::registry::range::{parse_byte_range, ParsedRange};
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -223,8 +229,9 @@ async fn spool_response(
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
             let wanted = end - start + 1;
-            let reader = tokio_util::io::StreamReader::new(Box::pin(spool_follower(
-                follower, status, start, stall, true,
+            let reader = tokio_util::io::StreamReader::new(Box::pin(holding(
+                spool_follower(follower, status, start, stall, true),
+                hold,
             )))
             .take(wanted);
             builder
@@ -237,8 +244,9 @@ async fn spool_response(
                 ))
         }
         _ => {
-            let reader = tokio_util::io::StreamReader::new(Box::pin(spool_follower(
-                follower, status, 0, stall, false,
+            let reader = tokio_util::io::StreamReader::new(Box::pin(holding(
+                spool_follower(follower, status, 0, stall, false),
+                hold,
             )));
             let stream = blob_verifying_stream(
                 Box::pin(reader),
@@ -257,6 +265,17 @@ async fn spool_response(
     response.unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// `stream`, keeping `hold` until the stream is dropped.
+fn holding<S: futures::Stream>(
+    stream: S,
+    hold: Option<SharedBudget>,
+) -> impl futures::Stream<Item = S::Item> {
+    stream.map(move |item| {
+        let _hold = &hold;
+        item
+    })
+}
+
 /// What a request joining a running blob fill needs — the value a fill's leader publishes
 /// through `blob_flights` (#1003): the spool file to open its own read handle on, the fill's
 /// progress, and upstream's declared length for `Range`.
@@ -265,6 +284,8 @@ pub(crate) struct SpoolShare {
     pub(super) path: std::path::PathBuf,
     pub(super) status: tokio::sync::watch::Receiver<SpoolStatus>,
     pub(super) content_length: Option<u64>,
+    /// Held by each response that reads the spool.
+    pub(super) budget: Option<SharedBudget>,
 }
 
 /// The leader's own part of a fill, never shared: what the spool task consumes and the
@@ -301,13 +322,13 @@ pub(super) async fn start_fill(
 ) -> Option<(SpoolShare, LeaderFill)> {
     // A busy budget is answered before upstream is asked (or a breaker probe taken).
     let budget = match state.docker_spool.reserve(1) {
-        Ok(budget) => budget,
+        Ok(budget) => Arc::new(parking_lot::Mutex::new(budget)),
         Err(e) => {
             *failure = Some(FillStartError::Budget(e));
             return None;
         }
     };
-    let mut spool = match SpoolFile::create(temp_dir, Some(budget)).await {
+    let spool = match SpoolFile::create(temp_dir, Some(Arc::clone(&budget))).await {
         Ok(spool) => spool,
         Err(e) => {
             tracing::error!(error = ?e, "Failed to create proxy spool file");
@@ -337,7 +358,7 @@ pub(super) async fn start_fill(
     {
         Ok(blob) => {
             let declared = blob.content_length.unwrap_or(0);
-            if let Some(Err(e)) = spool.budget.as_mut().map(|b| b.grow(declared)) {
+            if let Err(e) = budget.lock().grow(declared) {
                 state.circuit_breaker.record_alive(&blob.cb_key, blob.probe);
                 *failure = Some(FillStartError::Budget(e));
                 return None;
@@ -347,6 +368,7 @@ pub(super) async fn start_fill(
                 path: spool.path.clone(),
                 status,
                 content_length: blob.content_length,
+                budget: Some(budget),
             };
             Some((
                 share,
@@ -407,6 +429,7 @@ pub(super) async fn lead_fill(
         digest,
         headers,
         fill_stall_ceiling(state.config.docker.read_timeout),
+        share.budget,
     )
     .await
 }
@@ -438,6 +461,7 @@ async fn join_fill(
             digest,
             headers,
             fill_stall_ceiling(state.config.docker.read_timeout),
+            share.budget,
         )
         .await,
     )
@@ -937,7 +961,7 @@ pub(crate) async fn spool_upstream_blob(
         path: temp_path,
         mut file,
         guard,
-        mut budget,
+        budget,
     } = spool;
     let mut hasher = sha2::Sha256::new();
     let chunk_timeout = Duration::from_secs(read_timeout);
@@ -964,8 +988,8 @@ pub(crate) async fn spool_upstream_blob(
                     stalls = 0;
                     // A chunked or over-long body stops at the budget, before the write.
                     if let Some(Err(e)) = budget
-                        .as_mut()
-                        .map(|b| b.grow(bytes_written + chunk.len() as u64))
+                        .as_ref()
+                        .map(|b| b.lock().grow(bytes_written + chunk.len() as u64))
                     {
                         cb.record_alive(&cb_key, probe);
                         // Logged and counted in nora_spool_failures_total; the response

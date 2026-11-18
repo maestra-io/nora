@@ -760,3 +760,36 @@ async fn a061_gated_follower_releases_nothing_before_the_verdict() {
     let first = follower.next().await.unwrap();
     assert!(first.is_err(), "the first item is the failure");
 }
+
+/// Audit A060: a response that still holds its read handle on a failed fill keeps the
+/// fill's budget, since the unlinked file stays on disk until that handle closes; the
+/// budget returns once the response is dropped.
+#[tokio::test]
+async fn a060_an_unread_response_keeps_the_failed_fill_budget() {
+    let poisoned = vec![3u8; 256 * 1024];
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"other")));
+    let (upstream, _hits) =
+        counting_blob_upstream(poisoned, 4, Duration::from_millis(20), true).await;
+    let ctx = budget_ctx(upstream, 1);
+
+    let response = get_blob(&ctx, &digest).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let started = std::time::Instant::now();
+    while proxy_temp_count(&ctx) > 0 && started.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        proxy_temp_count(&ctx),
+        0,
+        "the failed fill removed its spool"
+    );
+    assert!(
+        matches!(
+            ctx.state.docker_spool.reserve(MIB),
+            Err(crate::registry::SpoolError::Busy)
+        ),
+        "the unread response still holds the spool's bytes"
+    );
+    drop(response);
+    assert!(ctx.state.docker_spool.reserve(MIB).is_ok());
+}
