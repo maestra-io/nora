@@ -1800,6 +1800,65 @@ pub fn quarantine_7d(cfg: &mut Config) {
     cfg.curation.quarantine_ttl = Some("7d".to_string());
 }
 
+/// A wiremock server that shuts down off the runtime thread.
+///
+/// `MockServer`'s drop verifies its mocks with `futures::executor::block_on`, which polls
+/// tokio locks on the test's runtime thread. Once the task has spent its coop budget those
+/// locks answer `Pending` and leave their wake-up to the scheduler parked in that very
+/// `block_on`, so the test hangs. On its own thread the drop has no budget to spend.
+pub struct MockUpstream(Option<wiremock::MockServer>);
+
+impl MockUpstream {
+    pub async fn start() -> Self {
+        Self(Some(wiremock::MockServer::start().await))
+    }
+}
+
+impl std::ops::Deref for MockUpstream {
+    type Target = wiremock::MockServer;
+    fn deref(&self) -> &wiremock::MockServer {
+        self.0.as_ref().unwrap()
+    }
+}
+
+impl Drop for MockUpstream {
+    fn drop(&mut self) {
+        let server = self.0.take();
+        // A mock whose expectation failed panics in the verification: that fails the test
+        // here, as it would have on this thread, unless the test is unwinding already.
+        if let Err(panic) = std::thread::spawn(move || drop(server)).join() {
+            if !std::thread::panicking() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+}
+
+/// A mock upstream dropped once its task has spent the whole coop budget shuts down.
+#[test]
+fn a_mock_upstream_dropped_with_its_budget_spent_shuts_down() {
+    let (done, dropped) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let upstream = MockUpstream::start().await;
+            let ready = tokio::sync::Semaphore::new(1);
+            while tokio::task::coop::has_budget_remaining() {
+                drop(ready.acquire().await.unwrap());
+            }
+            drop(upstream);
+        });
+        done.send(()).unwrap();
+    });
+    // A drop that waits on the parked runtime never returns; this bounds the failure only.
+    dropped
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the server dropped with the budget spent shut down");
+}
+
 /// The path of every request an upstream mock has received, in order.
 pub async fn upstream_paths(upstream: &wiremock::MockServer) -> Vec<String> {
     upstream

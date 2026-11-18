@@ -4,7 +4,7 @@
 
 use crate::test_helpers::{
     body_bytes, create_test_context_with_config, create_test_context_with_storage_and_config,
-    outage_storage, send, send_with_headers, TestContext,
+    outage_storage, send, send_with_headers, MockUpstream, TestContext,
 };
 use axum::body::Body;
 use axum::http::{Method, StatusCode};
@@ -14,8 +14,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const BULK: &str = "/npm/-/npm/v1/security/advisories/bulk";
 
-async fn recording_upstream() -> MockServer {
-    let upstream = MockServer::start().await;
+async fn recording_upstream() -> MockUpstream {
+    let upstream = MockUpstream::start().await;
     Mock::given(any())
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .mount(&upstream)
@@ -494,9 +494,9 @@ fn publish_body(name: &str, version: &str, tarball: &[u8]) -> Vec<u8> {
 }
 
 /// An upstream serving `is-odd@3.0.1` (released long ago) and its tarball.
-async fn is_odd_upstream() -> MockServer {
+async fn is_odd_upstream() -> MockUpstream {
     use wiremock::matchers::{method, path};
-    let up = MockServer::start().await;
+    let up = MockUpstream::start().await;
     let doc = serde_json::json!({
         "name": "is-odd",
         "dist-tags": { "latest": "3.0.1" },
