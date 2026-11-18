@@ -136,6 +136,78 @@ impl ChartVersion {
     }
 }
 
+/// When NORA first saw a version of a `trust_created` repo with this digest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Sighting {
+    /// [`ledger_digest`] form.
+    digest: String,
+    seen: i64,
+}
+
+/// `name/version` → its first sighting: the repo's first-seen ledger.
+type FirstSeen = BTreeMap<String, Sighting>;
+
+fn sighting_key(name: &str, version: &str) -> String {
+    format!("{name}/{version}")
+}
+
+/// `.nora-first-seen/helm/index/{repo}.json`: an internal key, carried by backup and
+/// migrate, outside every listing of the helm key space.
+fn first_seen_key(repo: &str) -> String {
+    super::npm::first_seen_key(&index_key(repo))
+}
+
+/// The release date of version `v` of chart `name`: its `created`, but never earlier
+/// than NORA's first sight of its digest, as the publisher writes `created` (A068).
+fn effective_date(seen: &FirstSeen, name: &str, v: &ChartVersion) -> Option<i64> {
+    let created = v.created_unix();
+    match (seen.get(&sighting_key(name, &v.version)), v.sha256()) {
+        (Some(row), Some(d)) if row.digest == ledger_digest(d) => {
+            Some(created.map_or(row.seen, |c| c.max(row.seen)))
+        }
+        _ => created,
+    }
+}
+
+/// Each `name/version` of `index` with its digest, as [`chart`] looks it up (first entry).
+fn digests(index: &IndexFile) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (name, versions) in &index.entries {
+        for v in versions {
+            if let Some(d) = v.sha256() {
+                out.entry(sighting_key(name, &v.version))
+                    .or_insert_with(|| ledger_digest(d));
+            }
+        }
+    }
+    out
+}
+
+/// Record `now` for every version `refreshed` lists with a digest `previous` did not:
+/// new, or re-pushed with other bytes. A digest already recorded keeps its earlier time;
+/// rows past the quarantine ledger's prune age go. Whether `seen` changed.
+fn record_sightings(
+    seen: &mut FirstSeen,
+    previous: &IndexFile,
+    refreshed: &IndexFile,
+    now: i64,
+) -> bool {
+    let before = digests(previous);
+    let mut changed = false;
+    for (key, digest) in digests(refreshed) {
+        if before.get(&key) == Some(&digest)
+            || seen.get(&key).is_some_and(|row| row.digest == digest)
+        {
+            continue;
+        }
+        seen.insert(key, Sighting { digest, seen: now });
+        changed = true;
+    }
+    let rows = seen.len();
+    seen.retain(|_, row| row.seen >= now - crate::digest_quarantine::PRUNE_TTL_SECS);
+    changed || seen.len() != rows
+}
+
 /// Parse an upstream `index.yaml` under a budget sized for large repositories; aliases
 /// and anchors keep the parser's default limits (alias bombs).
 fn parse_index_yaml(bytes: &[u8]) -> Result<IndexFile, String> {
@@ -181,13 +253,15 @@ fn chart_file(name: &str, version: &str) -> String {
 }
 
 /// Hide internal-namespace charts, versions whose digest is `held`, and (when the
-/// repo's `created` is `dated`) versions younger than `min_release_age`; point every
+/// repo's `created` is `dated`) versions younger than `min_release_age` by their
+/// [`effective_date`]; point every
 /// chart URL back at NORA. A version NORA could not serve (a name or version it does
 /// not route, or no digest to check the archive against) is left out.
 fn render_index(
     engine: &crate::curation::CurationEngine,
     index: &mut IndexFile,
     dated: bool,
+    seen: &FirstSeen,
     held: impl Fn(&str) -> bool,
 ) {
     index.entries.retain(|name, versions| {
@@ -204,7 +278,7 @@ fn render_index(
                         RegistryType::Helm,
                         name,
                         &v.version,
-                        v.created_unix(),
+                        effective_date(seen, name, v),
                     ))
         });
         for v in versions.iter_mut() {
@@ -285,31 +359,108 @@ async fn stale_index(state: &AppState, key: &str) -> Option<IndexFile> {
     parse_cached_index(state.storage.get(key).await.ok()?).await
 }
 
-/// The upstream index of `repo` (JSON form) and whether it is a stale copy, or the
-/// response to give when there is none. One refresh per repo runs at a time: a request
-/// arriving meanwhile gets the stale copy at once, or (with none) waits for the
-/// refresh and reads what it cached.
+/// The first-seen ledger of `repo`. A missing one is empty, and so is one that cannot
+/// be parsed or fails its pin (rewritten on the next change); a storage fault is an
+/// error, never an empty ledger.
+async fn read_first_seen(state: &AppState, repo: &str) -> Result<FirstSeen, String> {
+    let key = first_seen_key(repo);
+    match state.storage.get(&key).await {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            tracing::warn!(key = %key, error = %e, "helm: unreadable first-seen ledger");
+            FirstSeen::new()
+        })),
+        Err(crate::storage::StorageError::NotFound) => Ok(FirstSeen::new()),
+        Err(crate::storage::StorageError::IntegrityViolation) => {
+            tracing::warn!(key = %key, "helm: first-seen ledger failed its pin");
+            Ok(FirstSeen::new())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Before the refreshed index of a `trust_created` repo replaces the cached one at
+/// `key`, record what it adds or re-digests (A068). The caller holds the refresh lock of
+/// `key`, which serializes this read-modify-write. The ledger is written before the
+/// index, so whoever reads the new index finds its ledger; on an error the index must
+/// not be cached. A repo's first fetch records nothing: adding a repo holds no history.
+async fn record_first_sight(
+    state: &AppState,
+    repo: &str,
+    key: &str,
+    refreshed: &IndexFile,
+) -> Result<FirstSeen, String> {
+    let previous = match state.storage.get(key).await {
+        Ok(bytes) => parse_cached_index(bytes).await,
+        Err(crate::storage::StorageError::NotFound) => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut seen = read_first_seen(state, repo).await?;
+    let Some(previous) = previous else {
+        return Ok(seen);
+    };
+    if record_sightings(
+        &mut seen,
+        &previous,
+        refreshed,
+        chrono::Utc::now().timestamp(),
+    ) {
+        let bytes = serde_json::to_vec(&seen).map_err(|e| e.to_string())?;
+        state
+            .storage
+            .put(&first_seen_key(repo), &bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(seen)
+}
+
+/// The upstream index of `repo` (JSON form), its first-seen ledger (empty unless the
+/// repo is `dated`) and whether it is a stale copy, or the response to give when there
+/// is none.
 async fn load_index(
     state: &AppState,
     repo: &str,
     up: &RepoProxyEntry,
-) -> Result<(IndexFile, bool), Response> {
+) -> Result<(IndexFile, FirstSeen, bool), Response> {
+    let (index, seen, stale) = load_index_file(state, repo, up).await?;
+    let seen = match seen {
+        Some(seen) => seen,
+        // Read after the index: the ledger is written first, so it covers this copy.
+        None if dated(state, repo) => read_first_seen(state, repo).await.map_err(|e| {
+            tracing::warn!(repo, error = %e, "helm: first-seen ledger unreadable");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        })?,
+        None => FirstSeen::new(),
+    };
+    Ok((index, seen, stale))
+}
+
+/// [`load_index`] without the ledger, unless a refresh recorded it. One refresh per repo
+/// runs at a time: a request arriving meanwhile gets the stale copy at once, or (with
+/// none) waits for the refresh and reads what it cached.
+async fn load_index_file(
+    state: &AppState,
+    repo: &str,
+    up: &RepoProxyEntry,
+) -> Result<(IndexFile, Option<FirstSeen>, bool), Response> {
     let key = index_key(repo);
     if let Some(index) = fresh_index(state, &key).await {
-        return Ok((index, false));
+        return Ok((index, None, false));
     }
+    // LOCK-SAFE: tokio mutex of the index key; held for the refresh, which takes no
+    // other lock. It also serializes the first-seen ledger's read-modify-write.
     let lock = state.publish_lock(&key);
     let _refresh = match lock.try_lock() {
         Ok(guard) => guard,
         Err(_) => {
             if let Some(index) = stale_index(state, &key).await {
-                return Ok((index, true));
+                return Ok((index, None, true));
             }
             lock.lock().await
         }
     };
     if let Some(index) = fresh_index(state, &key).await {
-        return Ok((index, false));
+        return Ok((index, None, false));
     }
 
     let base = up.url().trim_end_matches('/');
@@ -333,10 +484,25 @@ async fn load_index(
         .await
         {
             Ok(Ok((index, json))) => {
+                let seen = if dated(state, repo) {
+                    match record_first_sight(state, repo, &key, &index).await {
+                        Ok(seen) => Some(seen),
+                        // The cached index stays in service until its ledger is written.
+                        Err(e) => {
+                            tracing::warn!(repo, error = %e, "helm: first-seen ledger not written, keeping the cached index");
+                            if let Some(index) = stale_index(state, &key).await {
+                                return Ok((index, None, true));
+                            }
+                            return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+                        }
+                    }
+                } else {
+                    None
+                };
                 if let Err(e) = state.storage.put(&key, &json).await {
                     tracing::warn!(key = %key, error = %e, "helm: failed to cache index");
                 }
-                return Ok((index, false));
+                return Ok((index, seen, false));
             }
             Ok(Err(e)) => {
                 tracing::warn!(repo, url = %url, error = %e, "helm: upstream index unreadable");
@@ -349,7 +515,7 @@ async fn load_index(
     // Any failure, a 404 included (a static host mid-deploy), falls back to the last copy.
     if let Some(index) = stale_index(state, &key).await {
         tracing::warn!(registry = "helm", repo, error = ?err, "Helm upstream error, serving stale index");
-        return Ok((index, true));
+        return Ok((index, None, true));
     }
     Err(match err {
         ProxyError::NotFound => StatusCode::NOT_FOUND.into_response(),
@@ -362,7 +528,7 @@ async fn index(State(state): State<AppState>, Path(repo): Path<String>) -> Respo
     let Some(up) = upstream(&state, &repo) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let (mut index, stale) = match load_index(&state, &repo, up).await {
+    let (mut index, seen, stale) = match load_index(&state, &repo, up).await {
         Ok(loaded) => loaded,
         Err(response) => return response,
     };
@@ -383,6 +549,7 @@ async fn index(State(state): State<AppState>, Path(repo): Path<String>) -> Respo
         &state.curation().curation_engine,
         &mut index,
         dated(&state, &repo),
+        &seen,
         held,
     );
     let body = match tokio::task::spawn_blocking(move || serde_json::to_vec(&index)).await {
@@ -452,18 +619,23 @@ async fn chart(
     };
     let dated = dated(&state, &repo);
     let mut entry = None;
+    let mut seen = FirstSeen::new();
     if dated {
         match load_index(&state, &repo, up).await {
-            Ok((index, _)) => entry = Some(lookup(index)),
+            Ok((index, ledger, _)) => {
+                entry = Some(lookup(index));
+                seen = ledger;
+            }
             Err(response) => return response,
         }
     }
     // `created` dates a chart only in a repo that does not re-stamp it: there it is the
     // release age, and with `trust_upstream_dates` also the quarantine's first seen.
+    // Never earlier than NORA first saw that version's digest (A068).
     let created = entry
         .as_ref()
         .and_then(Option::as_ref)
-        .and_then(ChartVersion::created_unix);
+        .and_then(|v| effective_date(&seen, &name, v));
     let publish_date = created.filter(|_| state.config.server.trust_upstream_dates);
 
     if let Some(response) = crate::curation::check_download(
@@ -534,7 +706,7 @@ async fn chart(
         // No index and no copy: the upstream's failure, not a 404 Helm would read as
         // "no such version".
         None => match load_index(&state, &repo, up).await {
-            Ok((index, _)) => lookup(index),
+            Ok((index, _, _)) => lookup(index),
             Err(response) => return response,
         },
     };
@@ -779,7 +951,7 @@ serverInfo:
     fn renders_urls_back_to_nora_and_hides_young_versions_of_dated_repos() {
         let e = engine(|_| {});
         let mut index = parse_index_yaml(INDEX.as_bytes()).unwrap();
-        render_index(&e, &mut index, false, |_| false);
+        render_index(&e, &mut index, false, &FirstSeen::new(), |_| false);
         assert!(!index.entries.contains_key("empty"));
         let v = &index.entries["cert-manager"];
         assert_eq!(
@@ -791,7 +963,7 @@ serverInfo:
         assert_eq!(v[1].urls, ["charts/cert-manager/cert-manager-1.10.tgz"]);
 
         let mut index = parse_index_yaml(INDEX.as_bytes()).unwrap();
-        render_index(&e, &mut index, true, |_| false);
+        render_index(&e, &mut index, true, &FirstSeen::new(), |_| false);
         let v = &index.entries["cert-manager"];
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].version, "v1.10.0");
@@ -807,7 +979,7 @@ serverInfo:
         let mut bad = index.entries["cert-manager"][0].clone();
         bad.version = "1.0/../x".into();
         index.entries.get_mut("cert-manager").unwrap().push(bad);
-        render_index(&e, &mut index, false, |d| d == "abc");
+        render_index(&e, &mut index, false, &FirstSeen::new(), |d| d == "abc");
         assert!(!index.entries.contains_key("corp-lib"), "internal name");
         let v = &index.entries["cert-manager"];
         assert_eq!(v.len(), 1, "{v:?}");
@@ -815,7 +987,7 @@ serverInfo:
 
         // Nothing left of a chart: the chart is gone.
         let mut index = parse_index_yaml(INDEX.as_bytes()).unwrap();
-        render_index(&e, &mut index, true, |d| d == "abc");
+        render_index(&e, &mut index, true, &FirstSeen::new(), |d| d == "abc");
         assert!(index.entries.is_empty());
     }
 
@@ -863,6 +1035,79 @@ serverInfo:
             format!("sha256:{sha}"),
             "the ledger key of an index digest"
         );
+    }
+
+    /// A068: what a refresh records, and the date it gives a version.
+    #[test]
+    fn first_sight_records_new_and_re_digested_versions_and_bounds_created() {
+        let index = |rows: &[(&str, Option<&str>, &str)]| {
+            let mut s = String::from("apiVersion: v1\nentries:\n  a:\n");
+            for (version, created, digest) in rows {
+                let created = created.map_or(String::new(), |c| format!("    created: {c}\n"));
+                s.push_str(&format!(
+                    "  - version: {version}\n{created}    digest: {digest}\n"
+                ));
+            }
+            parse_index_yaml(s.as_bytes()).unwrap()
+        };
+        let old = "2019-01-01T00:00:00Z";
+        let old_unix = crate::curation::parse_iso8601_to_unix(old).unwrap();
+        let previous = index(&[("1.0.0", Some(old), "aa"), ("1.1.0", Some(old), "bb")]);
+        let refreshed = index(&[
+            ("1.0.0", Some(old), "cc"),
+            ("1.1.0", Some(old), "BB"),
+            ("2.0.0", Some(old), "dd"),
+            ("3.0.0", None, "ee"),
+            ("4.0.0", None, ""),
+        ]);
+        let now = 2_000_000_000;
+        let mut seen = FirstSeen::new();
+        assert!(record_sightings(&mut seen, &previous, &refreshed, now));
+        let keys: Vec<&str> = seen.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["a/1.0.0", "a/2.0.0", "a/3.0.0"],
+            "unchanged (case aside) and digest-less versions record nothing"
+        );
+        let v = &refreshed.entries["a"];
+        assert_eq!(effective_date(&seen, "a", &v[0]), Some(now), "re-digested");
+        assert_eq!(
+            effective_date(&seen, "a", &v[1]),
+            Some(old_unix),
+            "unchanged"
+        );
+        assert_eq!(effective_date(&seen, "a", &v[2]), Some(now), "backdated");
+        assert_eq!(effective_date(&seen, "a", &v[3]), Some(now), "undated");
+        assert_eq!(
+            effective_date(&seen, "b", &v[2]),
+            Some(old_unix),
+            "other chart"
+        );
+        // A row for other bytes than the index now names does not date this digest.
+        assert_eq!(
+            effective_date(&seen, "a", &previous.entries["a"][0]),
+            Some(old_unix)
+        );
+        // A created later than the sighting wins.
+        let mut late = v[2].clone();
+        late.created = Some("2040-01-01T00:00:00Z".into());
+        assert_eq!(
+            effective_date(&seen, "a", &late),
+            crate::curation::parse_iso8601_to_unix("2040-01-01T00:00:00Z")
+        );
+
+        // The same refresh again, later: the earlier time stays, nothing to write.
+        assert!(!record_sightings(
+            &mut seen,
+            &previous,
+            &refreshed,
+            now + 60
+        ));
+        assert_eq!(seen["a/2.0.0"].seen, now);
+        // Rows past the prune age go.
+        let later = now + crate::digest_quarantine::PRUNE_TTL_SECS + 1;
+        assert!(record_sightings(&mut seen, &refreshed, &refreshed, later));
+        assert!(seen.is_empty());
     }
 
     #[test]
@@ -1268,6 +1513,198 @@ mod integration_tests {
                 assert_eq!(resp.status(), StatusCode::OK);
             }
         }
+    }
+
+    /// An index of chart `demo`: (version, created, bytes); the chart is `demo-{version}.tgz`.
+    fn dated_index(versions: &[(&str, Option<&str>, &[u8])]) -> String {
+        let mut s = String::from("apiVersion: v1\nentries:\n  demo:\n");
+        for (version, created, body) in versions {
+            let created = created.map_or(String::new(), |c| format!("    created: \"{c}\"\n"));
+            s.push_str(&format!(
+                "  - name: demo\n    version: {version}\n{created}    digest: {}\n    urls:\n    - demo-{version}.tgz\n",
+                hex::encode(sha2::Sha256::digest(body))
+            ));
+        }
+        s
+    }
+
+    /// An upstream serving `first` once, then `then`, and every chart of `then`.
+    async fn changing_upstream(first: &str, then: &[(&str, Option<&str>, &[u8])]) -> MockServer {
+        let up = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repo/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(first))
+            .up_to_n_times(1)
+            .mount(&up)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repo/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(dated_index(then)))
+            .mount(&up)
+            .await;
+        for (version, _, body) in then {
+            Mock::given(method("GET"))
+                .and(path(format!("/repo/demo-{version}.tgz")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+                .mount(&up)
+                .await;
+        }
+        up
+    }
+
+    /// The live shape: a `trust_created` repo, dates trusted, quarantine observing.
+    fn dated_context(up: &MockServer, storage: crate::storage::Storage) -> TestContext {
+        let entry = proxy(up);
+        create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.helm.enabled = true;
+            cfg.helm.metadata_ttl = 0;
+            cfg.helm.proxies.insert("demo".into(), entry);
+            cfg.helm.allow_private_chart_hosts = true;
+            cfg.helm.trust_created = vec!["demo".into()];
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.helm.min_release_age = Some("3d".into());
+            cfg.curation.helm.quarantine = Some(QuarantineMode::Observe);
+            cfg.curation.helm.quarantine_ttl = Some("3d".into());
+        })
+    }
+
+    fn listed(doc: &serde_json::Value) -> Vec<String> {
+        doc["entries"]["demo"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|v| v["version"].as_str().unwrap().into())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn get_chart(ctx: &TestContext, version: &str) -> (StatusCode, String) {
+        let uri = format!("/helm/demo/charts/demo/demo-{version}.tgz");
+        let resp = send(&ctx.app, Method::GET, &uri, "").await;
+        let status = resp.status();
+        (
+            status,
+            String::from_utf8_lossy(&body_bytes(resp).await).into(),
+        )
+    }
+
+    /// Both storage backends: a directory and an object store.
+    fn backends() -> Vec<(tempfile::TempDir, crate::storage::Storage)> {
+        let dir = tempfile::tempdir().unwrap();
+        let local = crate::storage::Storage::new_local(dir.path().to_str().unwrap());
+        let object = crate::storage::Storage::from_backend(std::sync::Arc::new(
+            crate::storage::ObjectStorage::in_memory(),
+        ));
+        vec![(dir, local), (tempfile::tempdir().unwrap(), object)]
+    }
+
+    /// A068: a version a `trust_created` repo adds after NORA first read it, with a
+    /// backdated or no `created`, or an old version whose digest changed, is dated from
+    /// NORA's first sight of that digest: left out of the index, refused by the release
+    /// age, and not seeded into the quarantine as mature. An unchanged version is not.
+    #[tokio::test]
+    async fn a_version_first_seen_after_the_baseline_is_dated_by_its_first_sight() {
+        const OLD: &str = "2019-06-01T00:00:00Z";
+        for (_dir, storage) in backends() {
+            let first = dated_index(&[
+                ("1.0.0", Some(OLD), b"one"),
+                ("1.1.0", Some(OLD), b"eleven"),
+            ]);
+            let then: &[(&str, Option<&str>, &[u8])] = &[
+                ("1.0.0", Some(OLD), b"one, re-pushed"),
+                ("1.1.0", Some(OLD), b"eleven"),
+                ("2.0.0", Some(OLD), b"two"),
+                ("3.0.0", None, b"three"),
+            ];
+            let up = changing_upstream(&first, then).await;
+            let ctx = dated_context(&up, storage.clone());
+
+            assert_eq!(listed(&index_json(&ctx).await), ["1.0.0", "1.1.0"]);
+            assert_eq!(listed(&index_json(&ctx).await), ["1.1.0"]);
+            for version in ["1.0.0", "2.0.0", "3.0.0"] {
+                let (status, body) = get_chart(&ctx, version).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{version}: {body}");
+                assert!(body.contains("min-release-age"), "{version}: {body}");
+            }
+            for body in [&b"one, re-pushed"[..], b"two", b"three"] {
+                let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(body)));
+                assert!(!matches!(
+                    ctx.state.digest_store.check("helm", &digest, 3 * 86400),
+                    crate::digest_quarantine::QuarantineStatus::Mature
+                ));
+            }
+            let (status, body) = get_chart(&ctx, "1.1.0").await;
+            assert_eq!(status, StatusCode::OK, "unchanged: {body}");
+            assert_eq!(body, "eleven");
+            // Internal, so backup and migrate carry it.
+            assert!(storage
+                .list_internal(crate::registry::npm::FIRST_SEEN_PREFIX)
+                .await
+                .unwrap()
+                .contains(&super::first_seen_key("demo")));
+        }
+    }
+
+    /// A068: a repo's first fetch records nothing, so adding a repo holds none of the
+    /// history its index already lists, a backdated or undated version included.
+    #[tokio::test]
+    async fn a_repo_first_fetch_holds_no_history() {
+        const OLD: &str = "2019-06-01T00:00:00Z";
+        for (_dir, storage) in backends() {
+            let versions: &[(&str, Option<&str>, &[u8])] =
+                &[("2.0.0", Some(OLD), b"two"), ("3.0.0", None, b"three")];
+            let up = changing_upstream(&dated_index(versions), versions).await;
+            let ctx = dated_context(&up, storage.clone());
+            assert_eq!(listed(&index_json(&ctx).await), ["2.0.0", "3.0.0"]);
+            for (version, bytes) in [("2.0.0", "two"), ("3.0.0", "three")] {
+                assert_eq!(
+                    get_chart(&ctx, version).await,
+                    (StatusCode::OK, bytes.into())
+                );
+            }
+        }
+    }
+
+    /// A068: the ledger is written before the index; when it cannot be, the cached index
+    /// stays in service (stale) and in storage, and nothing new is listed until it is.
+    #[tokio::test]
+    async fn an_unwritten_ledger_keeps_the_cached_index() {
+        const OLD: &str = "2019-06-01T00:00:00Z";
+        let first = dated_index(&[("1.0.0", Some(OLD), b"one")]);
+        let then: &[(&str, Option<&str>, &[u8])] =
+            &[("1.0.0", Some(OLD), b"one"), ("2.0.0", Some(OLD), b"two")];
+        let up = changing_upstream(&first, then).await;
+        let (storage, ops) = op_counting_storage();
+        let ctx = dated_context(&up, storage.clone());
+        let ledger = super::first_seen_key("demo");
+        let index_key = super::index_key("demo");
+
+        assert_eq!(listed(&index_json(&ctx).await), ["1.0.0"]);
+        ops.fail_puts_ending(Some(&ledger));
+        let resp = send(&ctx.app, Method::GET, "/helm/demo/index.yaml", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["x-nora-stale"], "true");
+        let doc: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(listed(&doc), ["1.0.0"]);
+        let cached: serde_json::Value =
+            serde_json::from_slice(&storage.get(&index_key).await.unwrap()).unwrap();
+        assert_eq!(
+            listed(&cached),
+            ["1.0.0"],
+            "the cached index was not replaced"
+        );
+        assert_eq!(get_chart(&ctx, "2.0.0").await.0, StatusCode::NOT_FOUND);
+
+        ops.fail_puts_ending(None);
+        ops.reset();
+        assert_eq!(listed(&index_json(&ctx).await), ["1.0.0"], "2.0.0 is young");
+        assert!(
+            ops.position("put", &ledger).unwrap() < ops.position("put", &index_key).unwrap(),
+            "the ledger is written first"
+        );
+        assert_eq!(get_chart(&ctx, "2.0.0").await.0, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
