@@ -304,9 +304,19 @@ async fn central_search_date(
     (group, artifact, version): (&str, &str, &str),
     timeout: Duration,
 ) -> Result<i64, DateMiss> {
+    // A070: each value is a Solr phrase, encoded as one query value: a `"`, `&` or `+` in a
+    // coordinate stays inside its own term.
+    let term = |v: &str| {
+        let phrase = format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""));
+        percent_encoding::utf8_percent_encode(&phrase, percent_encoding::NON_ALPHANUMERIC)
+            .to_string()
+    };
     let url = format!(
-        "{}/solrsearch/select?q=g:%22{}%22+AND+a:%22{}%22+AND+v:%22{}%22&core=gav&rows=1&wt=json",
-        search_base, group, artifact, version
+        "{}/solrsearch/select?q=g:{}+AND+a:{}+AND+v:{}&core=gav&rows=1&wt=json",
+        search_base,
+        term(group),
+        term(artifact),
+        term(version)
     );
     let body = super::upstream_dates::get(state, RegistryType::Maven, search_base, &url, timeout)
         .await
@@ -352,8 +362,10 @@ fn record_date_lookup(source: &str, result: Result<i64, DateMiss>, path: &str) {
 
 /// Upload date of a Maven Central file: its `Last-Modified`, else the search API's GAV
 /// `timestamp`, both within one `budget` (a slow or throttled lookup must not hold the
-/// download). `None` leaves the quarantine on NORA's first-seen clock; every failure is
-/// logged at WARN with its reason and counted in `nora_maven_date_lookup_total`.
+/// download). A miss leaves the quarantine on NORA's first-seen clock; every failure is
+/// logged at WARN with its reason and counted in `nora_maven_date_lookup_total`. Only the
+/// HEAD's 404 is [`DateMiss::NotFound`] (not on Central): an empty search after a failed
+/// HEAD proves no absence and is [`DateMiss::Missing`].
 #[allow(clippy::too_many_arguments)]
 async fn maven_central_publish_date(
     state: &AppState,
@@ -363,31 +375,34 @@ async fn maven_central_publish_date(
     search_base: &str,
     gav: (&str, &str, &str),
     budget: Duration,
-) -> Option<i64> {
+) -> Result<i64, DateMiss> {
     let started = std::time::Instant::now();
     let head = central_last_modified(state, central, file_url, auth, budget).await;
     record_date_lookup("last_modified", head, file_url);
     match head {
-        Ok(ts) => return Some(ts),
         // Not on Central / out of budget: the search cannot answer either.
-        Err(DateMiss::NotFound | DateMiss::Timeout) => return None,
+        Ok(_) | Err(DateMiss::NotFound | DateMiss::Timeout) => return head,
         // Central is throttling or down: the search is Central's too, asked no further.
-        Err(DateMiss::Status(429 | 503) | DateMiss::BreakerOpen) => return None,
+        Err(DateMiss::Status(429 | 503) | DateMiss::BreakerOpen) => return head,
         Err(_) => {}
     }
     let remaining = budget.saturating_sub(started.elapsed());
     if remaining.is_zero() {
         record_date_lookup("search", Err(DateMiss::Timeout), file_url);
-        return None;
+        return Err(DateMiss::Timeout);
     }
     let search = tokio::time::timeout(
         remaining,
         central_search_date(state, search_base, gav, remaining),
     )
     .await
-    .unwrap_or(Err(DateMiss::Timeout));
+    .unwrap_or(Err(DateMiss::Timeout))
+    .map_err(|miss| match miss {
+        DateMiss::NotFound => DateMiss::Missing,
+        miss => miss,
+    });
     record_date_lookup("search", search, file_url);
-    search.ok()
+    search
 }
 
 /// [`maven_central_publish_date`] of `path` on the configured Central proxy; `None` with no
@@ -431,7 +446,8 @@ async fn central_publish_date(
                 (&group, &artifact, &version),
                 budget,
             )
-            .await?;
+            .await
+            .ok()?;
             Some(std::collections::HashMap::from([(version, at)]))
         },
     )
@@ -573,6 +589,7 @@ async fn download(
     // so a cheap local stat skips the upstream round-trip — a cache hit never pays it.
     let cached_meta = state.storage.stat(&key).await;
     let already_cached = cached_meta.is_some();
+    let mut central_asked = false;
     let publish_date: Option<i64> =
         if let Some((ref maven_name, ref maven_version)) = curation_coords {
             if state.config.maven.proxies.is_empty() {
@@ -580,6 +597,7 @@ async fn download(
             } else if !already_cached && !internal && state.config.server.trust_upstream_dates {
                 // #68/#733: never send an internal-namespace GAV to Central — that would
                 // leak operator-internal coordinates.
+                central_asked = true;
                 central_publish_date(&state, &path, maven_name, maven_version).await
             } else {
                 None
@@ -960,6 +978,33 @@ async fn download(
                         digest,
                     ) {
                         return response;
+                    }
+                }
+                // A070: Central served the file but gave it no date: judged by
+                // `[curation.maven] unknown_date` before anything is cached. Not before the
+                // loop: a coordinate another proxy serves (maven.google.com) has no Central
+                // date either and stays on the quarantine path, which keeps `publish_date`.
+                if let Some((maven_name, maven_version)) = curation_coords
+                    .as_ref()
+                    .filter(|_| central_asked && publish_date.is_none())
+                    .filter(|_| url_is_maven_central(proxy.url()))
+                {
+                    if let Some(judged) = engine.judged_release_date(
+                        crate::curation::RegistryType::Maven,
+                        state.config.server.trust_upstream_dates,
+                        None,
+                    ) {
+                        if let Some(response) = crate::curation::check_download(
+                            engine,
+                            state.bypass_token().as_deref(),
+                            &headers,
+                            crate::curation::RegistryType::Maven,
+                            maven_name,
+                            crate::curation::RequestVersion::Known(maven_version.to_string()),
+                            Some(judged),
+                        ) {
+                            return response;
+                        }
                     }
                 }
                 state.metrics.record_download("maven");

@@ -34,7 +34,7 @@ because a later upstream does not have it. Before, `software/amazon/awssdk/bundl
 
 | Upstream | Date | `min_release_age` | Quarantine clock |
 |---|---|---|---|
-| Maven Central | the file's `Last-Modified` on Central, else search.maven.org `timestamp` (with `server.trust_upstream_dates`) | applies | seeded with the publish date |
+| Maven Central | the file's `Last-Modified` on Central, else search.maven.org `timestamp` (with `server.trust_upstream_dates`) | applies; a date the lookup could not get is judged by `unknown_date` | seeded with the publish date |
 | maven.google.com, any other proxy | none NORA reads | skipped | first seen by NORA |
 
 An artifact without a date is held only by the digest quarantine, counted from NORA's first
@@ -48,9 +48,19 @@ Central date lookup also runs for it (a HEAD 404, no date, no search).
 
 The date lookup runs on a cache miss before the download, within `maven.date_lookup_timeout`
 (default 5 s, `NORA_MAVEN_DATE_LOOKUP_TIMEOUT`) for the HEAD and the search together. A lookup
-that fails (timeout, throttled 403, no date) leaves the artifact on the first-seen clock, logs
-`Maven Central date lookup failed` at WARN with `source` and `reason`, and counts
-`nora_maven_date_lookup_total{source,outcome}`. Before 1.4.3-maestra.16 only the search was asked,
+that fails (timeout, throttled 403, no date) logs `Maven Central date lookup failed` at WARN
+with `source` and `reason` and counts `nora_maven_date_lookup_total{source,outcome}`. Only the
+HEAD's 404 means "not on Central"; an empty search after a failed HEAD is `missing`.
+
+When Central then serves the file anyway, its date stayed unknown and `[curation.maven]
+unknown_date` decides before anything is cached: `log` (the default) serves it, logs
+`[SECURITY] min-release-age unknown date` and counts
+`nora_curation_unknown_release_date_total{registry="maven"}`, the quarantine keeping it on the
+first-seen clock; `hold` judges it released now, so `min_release_age` refuses it (403, nothing
+cached, a later request asks the date again). A file another proxy serves after a Central 404
+stays on the quarantine path either way. Before switching to `hold`, read
+`nora_maven_date_lookup_total{outcome!~"ok|not_found"}`: each such cold miss of a Central file
+would be a 403. Before 1.4.3-maestra.16 only the search was asked,
 on `proxy_timeout` (30 s), silently: a throttled search added 30 s to a cold miss and held a
 years-old artifact as new.
 

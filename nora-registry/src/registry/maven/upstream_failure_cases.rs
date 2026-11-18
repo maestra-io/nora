@@ -149,3 +149,116 @@ async fn an_open_upstream_leaves_the_stale_copy_served() {
     );
     assert_eq!(body_bytes(resp).await.as_ref(), b"cached-copy");
 }
+
+/// A070: a file on Maven Central (mounted under `/repo1.maven.org/maven2`, so
+/// `url_is_maven_central` matches) whose date lookup gives no answer.
+mod a070_central_undated {
+    use super::*;
+    use crate::config::UnknownDate;
+    use crate::test_helpers::TestContext;
+    use wiremock::matchers::path;
+
+    const CENTRAL: &str = "/repo1.maven.org/maven2";
+    const FILE: &str = "org/example/fresh/1.0.0/fresh-1.0.0.jar";
+
+    /// Live shape: enforce, maven min_release_age 3d, quarantine observe, trusted dates.
+    fn min_age(proxies: Vec<String>, unknown: Option<UnknownDate>) -> TestContext {
+        create_test_context_with_config(move |c| {
+            c.maven.proxies = proxies.into_iter().map(MavenProxyEntry::Simple).collect();
+            c.maven.date_lookup_timeout = 1;
+            c.server.trust_upstream_dates = true;
+            c.curation.mode = crate::config::CurationMode::Enforce;
+            c.curation.maven.min_release_age = Some("3d".into());
+            c.curation.maven.quarantine = Some(crate::digest_quarantine::QuarantineMode::Observe);
+            c.curation.maven.quarantine_ttl = Some("3d".into());
+            c.curation.maven.unknown_date = unknown;
+        })
+    }
+
+    /// Central serving the jar while its HEAD (the date) fails; the search is not asked
+    /// after a 503.
+    async fn central_undated() -> MockServer {
+        let up = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&up)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{CENTRAL}/{FILE}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("FRESH-JAR-BYTES"))
+            .mount(&up)
+            .await;
+        up
+    }
+
+    async fn get(ctx: &TestContext) -> StatusCode {
+        let holders = ctx.state.storage.holders();
+        let status = send(&ctx.app, Method::GET, &format!("/maven2/{FILE}"), "")
+            .await
+            .status();
+        crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
+        status
+    }
+
+    async fn cached(ctx: &TestContext) -> bool {
+        ctx.state
+            .storage
+            .stat(&super::super::storage_key(FILE))
+            .await
+            .is_some()
+    }
+
+    /// `hold`: refused, not cached, refused again.
+    #[tokio::test]
+    async fn held_under_hold_and_not_cached() {
+        let up = central_undated().await;
+        let ctx = min_age(
+            vec![format!("{}{CENTRAL}", up.uri())],
+            Some(UnknownDate::Hold),
+        );
+        assert_eq!(get(&ctx).await, StatusCode::FORBIDDEN);
+        assert!(!cached(&ctx).await);
+        assert_eq!(get(&ctx).await, StatusCode::FORBIDDEN);
+        assert!(!cached(&ctx).await);
+    }
+
+    /// `log` (Maven's default): served and cached, the undated download counted.
+    #[tokio::test]
+    async fn served_and_counted_under_log() {
+        let up = central_undated().await;
+        let ctx = min_age(vec![format!("{}{CENTRAL}", up.uri())], None);
+        let counter =
+            crate::metrics::CURATION_UNKNOWN_RELEASE_DATE_TOTAL.with_label_values(&["maven"]);
+        let before = counter.get();
+        assert_eq!(get(&ctx).await, StatusCode::OK);
+        assert!(counter.get() > before);
+        assert!(cached(&ctx).await);
+    }
+
+    /// Not on Central, served by a second, non-Central proxy: the quarantine path, even
+    /// under `hold`.
+    #[tokio::test]
+    async fn another_proxy_stays_on_the_quarantine_path() {
+        let central = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&central)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&central)
+            .await;
+        let google = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{FILE}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("GOOGLE-JAR"))
+            .mount(&google)
+            .await;
+        let ctx = min_age(
+            vec![format!("{}{CENTRAL}", central.uri()), google.uri()],
+            Some(UnknownDate::Hold),
+        );
+        assert_eq!(get(&ctx).await, StatusCode::OK);
+        assert!(cached(&ctx).await);
+    }
+}

@@ -43,6 +43,15 @@ mod central_date {
 
     /// Runs the lookup with a log capture; returns (date, elapsed, log).
     async fn lookup(server: &MockServer, budget: Duration) -> (Option<i64>, Duration, String) {
+        let (date, elapsed, log) = lookup_miss(server, budget).await;
+        (date.ok(), elapsed, log)
+    }
+
+    /// [`lookup`] with the miss reason.
+    async fn lookup_miss(
+        server: &MockServer,
+        budget: Duration,
+    ) -> (Result<i64, DateMiss>, Duration, String) {
         let sink = Sink::default();
         let writer = sink.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -285,6 +294,67 @@ mod central_date {
         let yesterday = crate::cache_ttl::now_unix() as i64 - 86400;
         redate_held(&store, young, ttl, lookup(Some(yesterday))).await;
         assert!(held(young), "a young Central date still holds");
+    }
+
+    /// A070: only the HEAD's 404 says "not on Central"; an empty search after a failed HEAD
+    /// proves no absence, so it is a miss judged by `unknown_date`, logged at WARN.
+    #[tokio::test]
+    async fn a070_empty_search_after_failed_head_is_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(path("/solrsearch/select"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"response": {"docs": []}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (date, _, log) = lookup_miss(&server, Duration::from_secs(5)).await;
+        assert_eq!(date, Err(DateMiss::Missing));
+        assert!(log.contains("search") && log.contains("missing"), "{log}");
+
+        let gone = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&gone)
+            .await;
+        let (date, _, _) = lookup_miss(&gone, Duration::from_secs(5)).await;
+        assert_eq!(date, Err(DateMiss::NotFound));
+    }
+
+    /// A070: each coordinate is one encoded Solr phrase: a `"`, `&` or `+` in it cannot add
+    /// a term or a query parameter.
+    #[tokio::test]
+    async fn a070_search_query_is_encoded() {
+        let server = MockServer::start().await;
+        Mock::given(path("/solrsearch/select"))
+            .respond_with(search_hit())
+            .mount(&server)
+            .await;
+        let ctx = crate::test_helpers::create_test_context_with_config(|_| {});
+        let at = central_search_date(
+            &ctx.state,
+            &server.uri(),
+            ("org.x", "a\" AND v:\"1&core=x", "1.0+b"),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(at, Ok(1_173_268_800));
+        let asked = &server.received_requests().await.unwrap()[0].url;
+        let pairs: Vec<(String, String)> = asked.query_pairs().into_owned().collect();
+        assert_eq!(
+            pairs.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            ["q", "core", "rows", "wt"]
+        );
+        assert_eq!(pairs[1].1, "gav");
+        assert_eq!(
+            pairs[0].1,
+            r#"g:"org.x" AND a:"a\" AND v:\"1&core=x" AND v:"1.0+b""#
+        );
     }
 
     /// Not on Central (a maven.google.com artifact): no date, no search, no WARN.
