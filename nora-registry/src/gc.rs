@@ -1885,23 +1885,38 @@ async fn evict_proxy_cache(
     .await
 }
 
-/// Whether the npm tarball at `key` is still the proxy fill its provenance record names: no
-/// version document publishes it, and its pin is the digest the record cached. A copy from
-/// before pins, or a record from before digests (one line), is taken at the record's word as
-/// before. Anything the store does not answer keeps it.
-async fn npm_still_cached(storage: &Storage, key: &str) -> bool {
+/// Whether the npm tarball or PyPI file at `key` is still the proxy fill its provenance record
+/// names: no version document (npm) or own-file record (PyPI) claims it, and its pin is the
+/// digest the record cached. A copy from before pins, or a record without a digest (npm's from
+/// before digests is one line), is taken at the record's word as before. Anything the store
+/// does not answer keeps it. Keys of other formats are not asked.
+async fn still_cached(storage: &Storage, key: &str) -> bool {
     use crate::storage::StorageError;
-    if let Some(version) = crate::registry::npm::imported_version_key(key) {
-        if !matches!(storage.get(&version).await, Err(StorageError::NotFound)) {
+    let npm = key.starts_with("npm/");
+    let claim = if npm {
+        crate::registry::npm::imported_version_key(key)
+    } else if let Some((project, file)) = key.strip_prefix("pypi/").and_then(|r| r.split_once('/'))
+    {
+        Some(crate::registry::pypi_own_file_key(project, file))
+    } else {
+        return true;
+    };
+    if let Some(claim) = claim {
+        if !matches!(storage.get(&claim).await, Err(StorageError::NotFound)) {
             return false;
         }
     }
     let Ok(record) = storage.get(&crate::registry::npm::origin_key(key)).await else {
         return false;
     };
-    let cached = String::from_utf8_lossy(&record)
-        .split_once('\n')
-        .map(|(_, digest)| digest.trim().to_string());
+    // npm: `<origin>\n<sha256>`; PyPI: `<sha256>`.
+    let record = String::from_utf8_lossy(&record);
+    let cached = if npm {
+        record.split_once('\n').map(|(_, digest)| digest.trim())
+    } else {
+        Some(record.trim())
+    }
+    .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()));
     match (cached, storage.pin(key).await) {
         (Some(cached), Some(pin)) => cached == pin,
         _ => true,
@@ -1942,18 +1957,18 @@ async fn evict_oldest(
         if bytes_freed >= bytes_to_free {
             break;
         }
+        let lock = crate::acquire_publish_lock(publish_locks, key);
+        let _guard = lock.lock().await;
+        // Asked again under the lock, so a publish, upload or import that landed after the
+        // listing is never what is deleted, nor what a dry run lists.
+        if !still_cached(storage, key).await {
+            info!("proxy-cache: {} is published or replaced, kept", key);
+            kept += 1;
+            continue;
+        }
         if dry_run {
             info!("[dry-run] proxy-cache evict: {} ({} bytes)", key, size);
         } else {
-            let lock = crate::acquire_publish_lock(publish_locks, key);
-            let _guard = lock.lock().await;
-            // Asked again under the lock, so a publish or import that landed after the
-            // listing is never what is deleted.
-            if key.starts_with("npm/") && !npm_still_cached(storage, key).await {
-                info!("proxy-cache: {} is published or replaced, kept", key);
-                kept += 1;
-                continue;
-            }
             // Only a delete the store confirmed frees anything: a refused one is not counted,
             // so the loop goes on to the next file and the totals say what is really gone.
             if let Err(e) = storage.delete(key).await {
@@ -5088,6 +5103,51 @@ mod tests {
         assert!(storage.stat(cached).await.is_none());
         assert!(storage.stat(own).await.is_some());
         assert!(storage.stat(&format!("{own}.sha256")).await.is_some());
+    }
+
+    /// A032/A078: under the file's lock, a PyPI file an upload made its project's own, or whose
+    /// pin is no longer the digest its marker cached, is kept; a dry run lists only what an
+    /// apply run deletes.
+    #[tokio::test]
+    async fn test_evict_oldest_rechecks_pypi_files_under_the_lock() {
+        use crate::registry::npm::origin_key;
+        let storage = Storage::from_backend(Arc::new(crate::storage::ObjectStorage::in_memory()));
+        let uploaded = "pypi/up/up-1.0.tar.gz";
+        let replaced = "pypi/re/re-1.0.tar.gz";
+        let cached = "pypi/ca/ca-1.0.tar.gz";
+        for key in [uploaded, replaced, cached] {
+            storage.put(key, b"x").await.unwrap();
+            let digest = if key == replaced {
+                sha_hex(b"what the upstream served")
+            } else {
+                sha_hex(b"x")
+            };
+            storage
+                .put(&origin_key(key), digest.as_bytes())
+                .await
+                .unwrap();
+        }
+        storage
+            .put(
+                &crate::registry::pypi::own_file_key("up", "up-1.0.tar.gz"),
+                b"",
+            )
+            .await
+            .unwrap();
+        let files = || {
+            [uploaded, replaced, cached]
+                .iter()
+                .map(|k| (k.to_string(), 1, 0))
+                .collect()
+        };
+        let locks = test_publish_locks();
+        let dry = evict_oldest(&storage, &locks, files(), 0, true, "test").await;
+        let applied = evict_oldest(&storage, &locks, files(), 0, false, "test").await;
+        assert_eq!((dry.evicted_files, applied.evicted_files), (1, 1));
+        assert!(storage.stat(cached).await.is_none());
+        for key in [uploaded, replaced] {
+            assert!(storage.stat(key).await.is_some(), "{key} kept");
+        }
     }
 
     /// A032: when the own-file records cannot be listed, no PyPI file is evicted this pass.

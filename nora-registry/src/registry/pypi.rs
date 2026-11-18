@@ -994,11 +994,14 @@ async fn download_file(
                         if let Ok(true) = data_clone.cache(&cache_state, &key_clone, true).await {
                             // The records under the file's lock again, as `store_file` writes
                             // its own, and only while the stored bytes are still these: an
-                            // upload that replaced them in between keeps its records.
+                            // upload that replaced them in between (it pins other bytes) keeps
+                            // its records. A pin that cannot be read is no replacement: the
+                            // records are written, as without the check.
                             // LOCK-SAFE: nothing else is taken under it.
                             let lock = cache_state.publish_lock(&key_clone);
                             let _guard = lock.lock().await;
-                            if storage.pin(&key_clone).await.as_deref() != Some(hash.as_str()) {
+                            let pin = storage.pin(&key_clone).await;
+                            if pin.is_some_and(|pin| pin != hash) {
                                 tracing::info!(key = %key_clone, "pypi proxy: file replaced while caching, its records kept");
                                 return;
                             }

@@ -2516,6 +2516,38 @@ mod integration_tests {
         }
     }
 
+    /// An import whose commit fails leaves the cached copy it would have replaced a cache: its
+    /// provenance record is back, naming that copy's digest.
+    #[tokio::test]
+    async fn an_npm_import_that_fails_to_commit_keeps_the_cache_provenance() {
+        use crate::registry::npm::origin_key;
+        let (storage, ops) = crate::test_helpers::op_counting_storage();
+        let key = "npm/corp-lib/tarballs/corp-lib-1.0.0.tgz";
+        let served =
+            npm_tgz(&json!({ "name": "corp-lib", "version": "1.0.0", "description": "UP" }));
+        storage.put(key, &served).await.unwrap();
+        let record = format!("npm:http://up\n{}", hex::encode(Sha256::digest(&served)));
+        storage
+            .put(&origin_key(key), record.as_bytes())
+            .await
+            .unwrap();
+        ops.fail_put_from_path(key);
+        let own = npm_tgz(&json!({ "name": "corp-lib", "version": "1.0.0", "description": "OWN" }));
+        let state = tempfile::tempdir().unwrap();
+        let res = import_npm(
+            &storage,
+            vec![("corp-lib/-/corp-lib-1.0.0.tgz".into(), own)],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (0, 1), "{res:?}");
+        assert_eq!(
+            storage.get(&origin_key(key)).await.unwrap(),
+            record.as_bytes()
+        );
+        assert_eq!(storage.get(key).await.unwrap(), served);
+    }
+
     /// A032: an import over a proxy-cached PyPI file drops its provenance marker, so the imported
     /// file is the project's own and gc never evicts it as cache.
     #[tokio::test]

@@ -650,6 +650,9 @@ pub struct OpCounts {
     counts: [AtomicUsize; COUNTED_METHODS.len()],
     /// Puts to keys ending with this fail (see [`fail_puts_ending`](Self::fail_puts_ending)).
     failing_puts: std::sync::Mutex<Option<String>>,
+    /// `put_from_path` of exactly this key fails (see
+    /// [`fail_put_from_path`](Self::fail_put_from_path)).
+    failing_file_put: std::sync::Mutex<Option<String>>,
     /// Every counted call as (method, key or prefix), for [`calls`](Self::calls).
     log: std::sync::Mutex<Vec<(&'static str, String)>>,
     /// Listings under this prefix park (see [`stall_lists`](Self::stall_lists)).
@@ -684,6 +687,11 @@ impl OpCounts {
     /// handler's storage-failure branch.
     pub fn fail_puts_ending(&self, suffix: Option<&str>) {
         *self.failing_puts.lock().unwrap() = suffix.map(str::to_string);
+    }
+
+    /// Make every `put_from_path` of exactly `key` fail; other writes of it go through.
+    pub fn fail_put_from_path(&self, key: &str) {
+        *self.failing_file_put.lock().unwrap() = Some(key.to_string());
     }
 
     /// Make every `list_with_meta` under `prefix` park before returning until called
@@ -955,6 +963,11 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         sha256: Option<&str>,
     ) -> crate::storage::Result<()> {
         self.counts.hit("put_from_path", key);
+        if self.counts.failing_file_put.lock().unwrap().as_deref() == Some(key) {
+            return Err(crate::storage::StorageError::Network(
+                "put refused by the test".into(),
+            ));
+        }
         self.inner.put_from_path(key, src, sha256).await
     }
 

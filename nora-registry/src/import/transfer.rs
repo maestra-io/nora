@@ -293,18 +293,22 @@ pub async fn transfer_artifact(
             };
         }
     }
-    // An npm tarball or PyPI file shares its key with what a proxy fill caches: it is committed
-    // with all its records under the key's publish lock, which uploads, publishes, fills and gc
-    // eviction take, and the fill's provenance record goes first, so nothing left by a cached
-    // copy (the record, npm's `.sha256`) ever describes the imported bytes.
+    // An npm tarball or PyPI file shares its key with what a proxy fill caches: the fill's
+    // provenance record goes first, so nothing left by a cached copy (the record, npm's
+    // `.sha256`) ever describes the imported bytes. The commit runs under the key's publish lock;
+    // that lock is per process, so it orders the writes of this run, not a server's fills (gc
+    // keeps an imported file by its version document or own-file record).
     let commit_lock = matches!(rt, RegistryType::Npm | RegistryType::PyPI)
         .then(|| crate::acquire_publish_lock(locks, key));
     let _commit = match &commit_lock {
         Some(lock) => Some(lock.lock().await),
         None => None,
     };
+    let record_key = crate::registry::npm::origin_key(key);
+    let mut prior_record = None;
     if commit_lock.is_some() {
-        match storage.delete(&crate::registry::npm::origin_key(key)).await {
+        prior_record = storage.get(&record_key).await.ok();
+        match storage.delete(&record_key).await {
             Ok(()) | Err(crate::storage::StorageError::NotFound) => {}
             Err(e) => {
                 return Outcome::Failed {
@@ -317,6 +321,11 @@ pub async fn transfer_artifact(
         }
     }
     if let Err(e) = storage.put_from_path(key, &temp_path, Some(&sha256)).await {
+        // The cached copy stays a cache: its record goes back. It names that copy's digest, so
+        // it describes nothing else should the put have landed after all.
+        if let Some(record) = prior_record {
+            let _ = storage.put(&record_key, &record).await;
+        }
         return Outcome::Failed {
             reason: format!("commit {key}: {e}"),
         };
