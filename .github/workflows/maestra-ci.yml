@@ -39,6 +39,7 @@ jobs:
   changes:
     name: changes
     runs-on: runs-on=${{ github.run_id }}-changes/pool=small
+    timeout-minutes: 10
     outputs:
       rust: ${{ steps.diff.outputs.rust }}
     steps:
@@ -70,6 +71,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: runs-on=${{ github.run_id }}-test/pool=build
+    timeout-minutes: 75  # ~30 min green; a hung test holds the runner until this
     steps:
       - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 
@@ -113,6 +115,7 @@ jobs:
   chart:
     name: helm chart
     runs-on: runs-on=${{ github.run_id }}-chart/pool=build
+    timeout-minutes: 10
     steps:
       - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 
@@ -156,6 +159,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: runs-on=${{ github.run_id }}-deny/pool=build
+    timeout-minutes: 10
     steps:
       - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 
@@ -177,6 +181,7 @@ jobs:
   coherence:
     name: coherence
     runs-on: runs-on=${{ github.run_id }}-coherence/pool=small
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read  # workflow states for check-upstream-workflows.sh
