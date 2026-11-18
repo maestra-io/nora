@@ -3251,28 +3251,36 @@ fn consults_push_record(ns: Option<&str>, name: &str, reference: &str) -> bool {
 /// (a push answers its tag); otherwise the namespaced (proxied) copy, then the bare one.
 /// Digest references are content-addressed and skip the record. A storage error other than
 /// NotFound is the answer: a failed read never hands the reference to another copy.
+///
+/// `push_answers` is false for a routed name whose bare twin takes pushes ([`push_answers`]):
+/// neither such a push nor its bare copy answers the upstream's name (A011).
 async fn resolve_manifest(
     state: &AppState,
     ns: Option<&str>,
     name: &str,
     reference: &str,
     pushed: Option<crate::storage::Result<PushedTag>>,
+    push_answers: bool,
 ) -> crate::storage::Result<Option<(Bytes, bool)>> {
     use crate::storage::StorageError;
     let key = manifest_key(ns, name, reference);
     let legacy_key = manifest_key(None, name, reference);
+    let mut bare_is_push = false;
     if consults_push_record(ns, name, reference) {
         let pushed = match pushed {
             Some(pushed) => pushed,
             None => pushed_tag(&state.storage, name, reference).await,
         };
         if let PushedTag::Push { manifest, .. } = pushed? {
-            return Ok(Some((manifest, true)));
+            if push_answers {
+                return Ok(Some((manifest, true)));
+            }
+            bare_is_push = true;
         }
     }
     match state.storage.get(&key).await {
         Ok(data) => Ok(Some((data, key == legacy_key))),
-        Err(StorageError::NotFound) if key != legacy_key => {
+        Err(StorageError::NotFound) if key != legacy_key && !bare_is_push => {
             match state.storage.get(&legacy_key).await {
                 Ok(data) => Ok(Some((data, true))),
                 Err(StorageError::NotFound) => Ok(None),
@@ -3282,6 +3290,26 @@ async fn resolve_manifest(
         Err(StorageError::NotFound) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Whether a push of the canonical name answers a read of it. A name a prefix or a served host
+/// routes to the fallback chain's first upstream has a bare twin on the same keys: the
+/// fallback-chain name, which takes pushes [`write_gate`] does not refuse. Such a push must not
+/// change what pullers of the routed name get (A011), so a push answers the routed name only
+/// while `curation.internal_namespaces` lists it. A routed name without a writable twin (bound by
+/// `namespaces`, or `default_action = "deny"`) holds only pushes made under it.
+fn push_answers(state: &AppState, c: &Canonical) -> bool {
+    if !c.routed()
+        || crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Docker,
+            &c.name,
+        )
+    {
+        return true;
+    }
+    let bare = canonicalize(&c.name, &state.config.docker);
+    !(bare.route == Route::Chain && !bare.denied && bare.namespace == c.namespace)
 }
 
 /// What a pull reads of a tag a push may answer: the one decision that the tag is the push's.
@@ -3363,6 +3391,7 @@ async fn get_manifest(
         return r;
     }
     let upstreams_to_try = c.upstreams_to_try(&state.config.docker.upstreams);
+    let push_answers = push_answers(&state, &c);
     let ns = c.namespace;
     let name = c.name;
     if let Err(e) = validate_docker_name(&name) {
@@ -3381,17 +3410,22 @@ async fn get_manifest(
         None
     };
     let publish_date = match &pushed {
-        Some(Ok(PushedTag::Push { record, .. })) => {
+        Some(Ok(PushedTag::Push { record, .. })) if push_answers => {
             (record.push_timestamp > 0).then_some(record.push_timestamp as i64)
         }
-        Some(Ok(PushedTag::NotPushed { bare_meta })) => {
+        Some(Ok(pushed)) => {
+            // A push the routed name does not answer with does not date it either.
+            let bare_meta = match pushed {
+                PushedTag::NotPushed { bare_meta } => bare_meta.clone(),
+                PushedTag::Push { .. } => None,
+            };
             extract_docker_publish_date(
                 &state.storage,
                 &name,
                 &reference,
                 state.config.docker.upstreams.is_empty(),
                 ns.as_deref(),
-                &mut BareMeta::Read(Ok(bare_meta.clone())),
+                &mut BareMeta::Read(Ok(bare_meta)),
             )
             .await
         }
@@ -3443,8 +3477,15 @@ async fn get_manifest(
     // fallback silently flips WHICH copy answers (proxied-current vs legacy/hosted), and
     // an error-driven proxy would resolve a hosted name against an upstream that may be
     // squatted. Only `NotFound` may advance to the next source.
-    let (cached, hosted) = match resolve_manifest(&state, ns.as_deref(), &name, &reference, pushed)
-        .await
+    let (cached, hosted) = match resolve_manifest(
+        &state,
+        ns.as_deref(),
+        &name,
+        &reference,
+        pushed,
+        push_answers,
+    )
+    .await
     {
         Ok(Some((data, hosted))) => (Some(data), hosted),
         Ok(None) => (None, true),
@@ -3968,7 +4009,8 @@ async fn put_manifest(
     // A push takes its tag back from the upstream: the proxied copy of this tag goes, with its
     // metadata (this handler holds the manifest lock; the metadata lock is taken after it).
     // Only a fallback-chain name gets here with a namespace: `write_gate` refuses a routed
-    // name unless it is internal (A011).
+    // name unless it is internal (A011). The routed name that shares these keys reads neither
+    // the push nor its bare copy ([`push_answers`]): it fetches the upstream's tag again.
     if let Some(ns) = ns.as_deref() {
         if manifest_key(Some(ns), &name, &reference) != key {
             delete_proxied_tag(&state, ns, &name, &reference).await;
@@ -4412,7 +4454,8 @@ async fn repository_tags(
 }
 
 /// The tags of a repository that answer with the manifest `digest`, each resolved as a read
-/// resolves it. Err when the listing or any tag cannot be read.
+/// resolves it. Err when the listing or any tag cannot be read. Only deletes ask, and
+/// [`write_gate`] lets a delete through only where a push answers its name.
 async fn tags_resolving_to(
     state: &AppState,
     ns: Option<&str>,
@@ -4422,7 +4465,7 @@ async fn tags_resolving_to(
     use sha2::Digest as _;
     let mut resolving = Vec::new();
     for tag in repository_tags(state, ns, name).await?.0 {
-        if let Some((data, _)) = resolve_manifest(state, ns, name, &tag, None).await? {
+        if let Some((data, _)) = resolve_manifest(state, ns, name, &tag, None, true).await? {
             if format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data))) == digest {
                 resolving.push(tag);
             }
@@ -4457,7 +4500,7 @@ async fn delete_tags_for_digest(
         let _guard = lock.lock().await;
         // Re-read under the lock, as a read resolves the tag (a recorded push first); only delete if
         // it STILL resolves to `digest`.
-        match resolve_manifest(state, ns, name, &tag, None).await? {
+        match resolve_manifest(state, ns, name, &tag, None, true).await? {
             Some((data, _)) if resolves_to_digest(&data) => {}
             _ => continue,
         }
@@ -4504,7 +4547,7 @@ async fn delete_manifest(
         // The manifest the tag answers with, as a read resolves it (a recorded push first). A read
         // that fails is the answer: a delete that cannot tell what the tag answers with removes
         // nothing, as a pull of the tag answers 500 — never the tag without its manifest.
-        match resolve_manifest(&state, ns.as_deref(), &name, &reference, None).await {
+        match resolve_manifest(&state, ns.as_deref(), &name, &reference, None, true).await {
             Ok(Some((data, _))) => {
                 use sha2::Digest;
                 let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));

@@ -230,3 +230,68 @@ async fn a_write_to_an_upstream_routed_name_is_refused() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 }
+
+async fn pull(ctx: &TestContext, path: &str) -> (StatusCode, Vec<u8>) {
+    let resp = super::docker_v2_dispatch(
+        State(ctx.state.clone()),
+        Method::GET,
+        Path(path.to_string()),
+        Extension(NamespaceAuthority::Unrestricted),
+        None,
+        format!("/v2/{path}").parse::<Uri>().unwrap(),
+        axum::http::HeaderMap::new(),
+        Body::empty(),
+    )
+    .await;
+    (resp.status(), body_bytes(resp).await.to_vec())
+}
+
+/// A011 (review R02): the bare name shares its keys with the name a prefix routes to the
+/// fallback upstream. A push of the bare name answers the bare name only; the routed name stays
+/// the upstream's, never the push or its bare copy, unless `curation.internal_namespaces` lists it.
+#[tokio::test]
+async fn a_bare_push_does_not_answer_the_routed_name() {
+    let upstream_copy = br#"{"schemaVersion":2,"layers":[]}"#;
+    for internal in [false, true] {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = vec![upstream("ghcr.io", Some("ghcr"))];
+            if internal {
+                cfg.curation.internal_namespaces = vec!["payments/*".into()];
+            }
+        });
+        let storage = &ctx.state.storage;
+        storage
+            .put(&format!("docker/payments/api/blobs/{CFG}"), b"x")
+            .await
+            .unwrap();
+        storage
+            .put(
+                "docker/ghcr.io/payments/api/manifests/latest.json",
+                upstream_copy,
+            )
+            .await
+            .unwrap();
+        let pushed = manifest();
+        let path = "payments/api/manifests/latest";
+        let (status, _) = call(
+            &ctx,
+            NamespaceAuthority::Unrestricted,
+            Method::PUT,
+            path,
+            pushed.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        assert_eq!(pull(&ctx, path).await, (StatusCode::OK, pushed.clone()));
+        let (status, body) = pull(&ctx, "ghcr/payments/api/manifests/latest").await;
+        if internal {
+            assert_eq!((status, body), (StatusCode::OK, pushed));
+        } else {
+            assert_ne!(
+                body, pushed,
+                "the routed name answered the bare push ({status})"
+            );
+        }
+    }
+}
