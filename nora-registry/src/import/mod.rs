@@ -2516,8 +2516,8 @@ mod integration_tests {
         }
     }
 
-    /// An import whose commit fails leaves the cached copy it would have replaced a cache: its
-    /// provenance record is back, naming that copy's digest.
+    /// An import whose commit fails leaves the cached copy it would have replaced a cache: the
+    /// copy and its provenance record stay as they were.
     #[tokio::test]
     async fn an_npm_import_that_fails_to_commit_keeps_the_cache_provenance() {
         use crate::registry::npm::origin_key;
