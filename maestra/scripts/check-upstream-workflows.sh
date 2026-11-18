@@ -10,7 +10,8 @@
 #     (decide: `gh workflow disable <file>` and add it to DISABLED, or to ACTIVE);
 #   - GitHub reports a DISABLED workflow, or an unlisted non-maestra one, as active;
 #   - maestra-release.yml loses its release gate (see below);
-#   - a maestra-* workflow runs `pip install` without --require-hashes (see below).
+#   - a maestra-* workflow runs `pip install` (pip3, pip3.12, `uv pip`, ...) without
+#     --require-hashes (see below).
 #
 # Usage: GH_TOKEN=... GITHUB_REPOSITORY=maestra-io/nora maestra/scripts/check-upstream-workflows.sh
 #        STATES_FILE=<file of "path state" lines> skips the API call (self-test, offline).
@@ -36,7 +37,9 @@ done
 
 # Release gate (audit A016): job `image`, the only one that gets push credentials, runs
 # in the protected `nora-release` environment after `verify` and `ci`, and `verify` and
-# `image` accept the same anchored v<version>-maestra.<n> tag pattern.
+# `image` accept the same anchored v<version>-maestra.<n> tag pattern. Every checkout is
+# of github.sha, never the tag re-read by name (audit R18), and only `image` and `ci`
+# get an OIDC token (audit R04).
 release="$WORKFLOWS_DIR/maestra-release.yml"
 job() { awk -v j="  $1:" '$0 == j { on = 1; next } on && /^  [^ #]/ { exit } on' "$release"; }
 # shellcheck disable=SC2016  # $GIT_TAG is matched literally
@@ -49,6 +52,14 @@ else
         fail "maestra-release.yml: job image is not in environment nora-release"
     grep -qx '    needs: \[verify, ci\]' <<<"$image" ||
         fail "maestra-release.yml: job image does not need [verify, ci]"
+    # shellcheck disable=SC2016  # ${{ github.sha }} is matched literally
+    while IFS= read -r line; do
+        fail "maestra-release.yml:${line%%:*}: checks out ${line#*ref: }, not \${{ github.sha }}"
+    done < <(grep -nE '^[[:space:]]+ref:' "$release" | grep -vF 'ref: ${{ github.sha }}' || true)
+    while IFS= read -r where; do
+        fail "maestra-release.yml: $where gets id-token: write (only image and ci may)"
+    done < <(awk '/^jobs:/ { jobs = 1 } jobs && /^  [^ #][^ ]*:$/ { j = "job " substr($1, 1, length($1) - 1) }
+        /^[[:space:]]*id-token:[[:space:]]*write/ { w = jobs ? j : "the workflow (top level)"; if (w != "job image" && w != "job ci") print w }' "$release")
     re=$(tag_re image)
     if [ -z "$re" ] || [ "$re" != "$(tag_re verify)" ]; then
         fail "maestra-release.yml: verify and image do not share one [[ \"\$GIT_TAG\" =~ ... ]] tag check"
@@ -68,7 +79,7 @@ for path in "$WORKFLOWS_DIR"/maestra-*; do
     [ -f "$path" ] || continue
     while IFS= read -r line; do
         fail "$(basename "$path"):${line%%:*}: pip install without --require-hashes"
-    done < <(grep -nE "pip[\"']? install" "$path" | grep -v -- '--require-hashes' || true)
+    done < <(grep -nE "pip[0-9.]*[\"']?[[:space:]]+install" "$path" | grep -v -- '--require-hashes' || true)
 done
 
 states="${STATES_FILE:-}"
