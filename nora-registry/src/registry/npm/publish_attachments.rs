@@ -422,3 +422,72 @@ async fn a_publish_stores_no_document_or_packument_over_its_limit() {
         StatusCode::OK
     );
 }
+
+/// Review R29: `npm deprecate` keeps both A092 bounds. A message under the document limit is
+/// refused when the version document it lands in would pass `npm.max_document_kb`, and a
+/// deprecate whose messages would grow the packument past `npm.max_packument_mb` is refused
+/// with every version document put back. Clearing the messages is always let through.
+#[tokio::test]
+async fn a_deprecate_stores_no_document_or_packument_over_its_limit() {
+    const KIB: usize = 1024;
+    let ctx = limited(64, 1);
+    let versions: Vec<String> = (0..20).map(|i| format!("1.0.{i}")).collect();
+    for version in &versions {
+        assert_eq!(
+            publish_sized(&ctx, "dep", version, 40 * KIB, 0).await,
+            StatusCode::CREATED,
+            "{version}"
+        );
+    }
+    let before = stored(&ctx, "dep").await;
+    let deprecate_all = |len: usize| {
+        let versions: serde_json::Map<String, serde_json::Value> = versions
+            .iter()
+            .map(|v| {
+                let message = if len == 0 {
+                    String::new()
+                } else {
+                    "d".repeat(len)
+                };
+                (v.clone(), serde_json::json!({ "deprecated": message }))
+            })
+            .collect();
+        let body = serde_json::to_vec(&serde_json::json!({ "name": "dep", "versions": versions }))
+            .unwrap();
+        let app = ctx.app.clone();
+        async move {
+            send(&app, Method::PUT, "/npm/dep", Body::from(body))
+                .await
+                .status()
+        }
+    };
+
+    // (a) A 30 KiB message is under the limit, the 70 KiB version document is not.
+    assert_eq!(
+        deprecate(&ctx, "dep", "1.0.0", 30 * KIB).await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(stored(&ctx, "dep").await, before);
+
+    // (b) 20 KiB on each of 20 versions: every document is under 64 KiB, the packument
+    // would be past 1 MiB.
+    assert_eq!(deprecate_all(20 * KIB).await, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(stored(&ctx, "dep").await, before);
+
+    // (c) The same message on one version fits, and clearing it is let through.
+    assert_eq!(
+        deprecate(&ctx, "dep", "1.0.0", 20 * KIB).await,
+        StatusCode::OK
+    );
+    assert_ne!(stored(&ctx, "dep").await, before);
+    assert_eq!(deprecate_all(0).await, StatusCode::OK);
+    let resp = send(&ctx.app, Method::GET, "/npm/dep", "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let doc: serde_json::Value =
+        serde_json::from_slice(&crate::test_helpers::body_bytes(resp).await).unwrap();
+    assert!(
+        doc["versions"]["1.0.0"].get("deprecated").is_none(),
+        "{}",
+        doc["versions"]["1.0.0"]
+    );
+}

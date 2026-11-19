@@ -1353,6 +1353,32 @@ async fn an_upload_outside_the_hosted_groups_is_refused_and_the_upstream_stays_s
     }
 }
 
+/// Review R38: a SNAPSHOT version's own `maven-metadata.xml` (and its checksums) is the
+/// artifact's, so an exact `group:artifact` or a `group:*` hosted pattern admits the whole
+/// SNAPSHOT deploy, not only its jar.
+#[tokio::test]
+async fn a_snapshot_deploy_under_an_exact_or_group_star_hosted_pattern_stores_its_metadata() {
+    use crate::config::HostedGroupsEnforcement;
+    for pattern in ["com.corp:lib", "com.corp:*"] {
+        let ctx = create_test_context_with_config(move |c| {
+            c.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(
+                "http://127.0.0.1:9".to_string(),
+            )];
+            c.maven.hosted_groups = vec![pattern.to_string()];
+            c.maven.hosted_groups_enforcement = HostedGroupsEnforcement::Enforce;
+        });
+        for uri in [
+            "/maven2/com/corp/lib/1.0-SNAPSHOT/lib-1.0-20261118.120000-1.jar",
+            "/maven2/com/corp/lib/1.0-SNAPSHOT/maven-metadata.xml",
+            "/maven2/com/corp/lib/1.0-SNAPSHOT/maven-metadata.xml.sha1",
+            "/maven2/com/corp/lib/1.0-SNAPSHOT/maven-metadata.xml.md5",
+        ] {
+            let resp = send(&ctx.app, Method::PUT, uri, "snapshot").await;
+            assert_eq!(resp.status(), StatusCode::CREATED, "{pattern} {uri}");
+        }
+    }
+}
+
 /// A017: `hosted_groups_enforcement = "warn"` (the default) stores the upload and reports it,
 /// so the groups in use can be listed before `enforce`; a hosted-only registry hosts every
 /// coordinate, also under `enforce`.
