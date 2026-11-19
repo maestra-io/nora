@@ -140,7 +140,33 @@ in the days before switching to `enforce` still has a copy behind it. A tag that
 of a tag that resolves to a held digest, moved or not, logs
 `Quarantine: tag resolves to a held digest` and counts
 `nora_docker_quarantine_tag_held_total{upstream, outcome}`: `fallback` and `blocked` under
-`enforce`, `would_fallback` and `would_block` under `observe`.
+`enforce`, `would_fallback` and `would_block` under `observe`, `observe_fallback` with the
+option below.
+
+#### The same fallback under observe (`quarantine_observe_fallback`)
+
+```toml
+[curation.docker]
+quarantine = "observe"
+quarantine_observe_fallback = true   # default false; NORA_CURATION_DOCKER_QUARANTINE_OBSERVE_FALLBACK
+```
+
+Under `observe` a tag that moved answers with the held digest, so a client that pins what a
+tag resolves to (Renovate digest updates read `Docker-Content-Digest` of a `HEAD`) proposes
+a digest that a quarantine check (`x-nora-quarantine: pending`) then refuses until it
+matures. With this option a tag that moved to a held digest answers as under `enforce`,
+and nothing is ever refused:
+
+| request | previous admitted copy | answer | outcome |
+|---|---|---|---|
+| tag, new digest held | yes | 200 with the previous digest (`GET` and `HEAD`), `x-nora-quarantine-held`, `x-nora-quarantine-held-until` | `observe_fallback` |
+| tag, new digest held | no (a brand-new tag) | 200 with the held digest, `x-nora-quarantine: pending` | `would_block` |
+| digest of a held manifest | any | 200, `x-nora-quarantine: pending` | — |
+
+The held digest is cached and its clock runs as without the option, and the tag moves on the
+first pull after it matures. A `quarantine_exempt` repository and a digest a break-glass
+exception admits are not held, so their tags follow the upstream. Read at start, like
+`quarantine`; only `[curation.docker]` takes it (elsewhere it is a configuration error).
 
 ### The verdict on every manifest answer
 

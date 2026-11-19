@@ -217,7 +217,8 @@ pub static DOCKER_QUARANTINE_FIRST_SIGHT_TOTAL: LazyLock<IntCounterVec> = LazyLo
 });
 
 /// A tag that moved to a digest the quarantine holds. `fallback` served the admitted copy,
-/// `blocked` had none and refused; `would_fallback` and `would_block` are the same under observe.
+/// `blocked` had none and refused; `would_fallback` and `would_block` are the same under observe;
+/// `observe_fallback` served the admitted copy under observe (`quarantine_observe_fallback`).
 pub static DOCKER_QUARANTINE_TAG_HELD_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "nora_docker_quarantine_tag_held_total",

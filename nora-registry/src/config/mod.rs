@@ -1623,6 +1623,7 @@ impl Config {
         // Every curation duration parses, in every mode: a typo in one is a
         // configuration error naming it, never a silent default (#1099).
         errors.extend(self.curation.duration_errors());
+        errors.extend(self.curation.observe_fallback_errors());
 
         // Enforce mode must have at least ONE active control, otherwise it blocks
         // nothing. An allowlist is one option, not the only one — a blocklist,

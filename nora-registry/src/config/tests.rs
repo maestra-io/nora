@@ -3265,6 +3265,39 @@ fn test_curation_env_override_per_registry_quarantine() {
     std::env::remove_var("NORA_CURATION_DOCKER_QUARANTINE_TTL");
 }
 
+/// `quarantine_observe_fallback`: off by default, read from `[curation.docker]` and its env
+/// var, refused in any other section.
+#[test]
+fn test_quarantine_observe_fallback_is_docker_only() {
+    let _lock = env_lock();
+    assert!(
+        !Config::default()
+            .curation
+            .docker
+            .quarantine_observe_fallback
+    );
+    let docker: Config =
+        toml::from_str("[curation.docker]\nquarantine_observe_fallback = true\n").unwrap();
+    assert!(docker.curation.docker.quarantine_observe_fallback);
+    assert!(docker.curation.observe_fallback_errors().is_empty());
+
+    let mut env = Config::default();
+    std::env::set_var("NORA_CURATION_DOCKER_QUARANTINE_OBSERVE_FALLBACK", "true");
+    env.apply_env_overrides().unwrap();
+    std::env::remove_var("NORA_CURATION_DOCKER_QUARANTINE_OBSERVE_FALLBACK");
+    assert!(env.curation.docker.quarantine_observe_fallback);
+
+    let npm: Config =
+        toml::from_str("[curation.npm]\nquarantine_observe_fallback = true\n").unwrap();
+    let (_, errors) = npm.validate();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("curation.npm.quarantine_observe_fallback")),
+        "{errors:?}"
+    );
+}
+
 #[test]
 fn test_quarantine_toml_rejects_typo() {
     let toml = r#"

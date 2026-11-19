@@ -6309,6 +6309,16 @@ mod trust_upstream_dates {
     }
 
     fn context(server: &MockServer, trust: bool, mode: QuarantineMode) -> TestContext {
+        context_with(server, trust, mode, |_| {})
+    }
+
+    /// [`context`], then `extra` on the config.
+    fn context_with(
+        server: &MockServer,
+        trust: bool,
+        mode: QuarantineMode,
+        extra: impl FnOnce(&mut crate::config::Config),
+    ) -> TestContext {
         let url = server.uri();
         create_test_context_with_config(move |cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
@@ -6324,7 +6334,21 @@ mod trust_upstream_dates {
             }];
             cfg.curation.quarantine = Some(mode);
             cfg.curation.quarantine_ttl = Some("3d".to_string());
+            extra(cfg);
         })
+    }
+
+    /// Observe with `[curation.docker] quarantine_observe_fallback = true`.
+    fn observe_fallback(server: &MockServer) -> TestContext {
+        context_with(server, false, QuarantineMode::Observe, |cfg| {
+            cfg.curation.docker.quarantine_observe_fallback = true;
+        })
+    }
+
+    fn tag_held(outcome: &str) -> u64 {
+        crate::metrics::DOCKER_QUARANTINE_TAG_HELD_TOTAL
+            .with_label_values(&["quay.io", outcome])
+            .get()
     }
 
     /// The upstream as `namespace` (a registry that dates by walking the repository),
@@ -7034,6 +7058,214 @@ mod trust_upstream_dates {
             ctx.state.storage.get(&key).await.unwrap().as_ref(),
             &image[..]
         );
+    }
+
+    /// The flag off is observe as before: the moved tag answers the held digest's own
+    /// bytes, with no held headers, counted `would_fallback`.
+    #[tokio::test]
+    async fn observe_without_the_flag_still_serves_the_held_digest_of_a_moved_tag() {
+        let (server, image, _) = upstream_with_image().await;
+        let ctx = context(&server, false, QuarantineMode::Observe);
+        assert!(!ctx.state.config.curation.docker.quarantine_observe_fallback);
+        mature_tag_cached(&ctx, &image).await;
+        let moved = moved_manifest();
+        tag_answers(&server, &moved).await;
+        let before = tag_held("would_fallback");
+        let resp = manifest(&ctx, "manifests/v1").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            header(&resp, "docker-content-digest"),
+            Some(sha(&moved).as_str())
+        );
+        assert_eq!(header(&resp, "x-nora-quarantine"), Some("pending"));
+        assert_eq!(header(&resp, "x-nora-quarantine-held"), None);
+        assert_eq!(header(&resp, "x-nora-quarantine-held-until"), None);
+        assert!(tag_held("would_fallback") > before);
+        assert_eq!(body_bytes(resp).await.as_ref(), &moved[..]);
+    }
+
+    /// `quarantine_observe_fallback`: under observe a moved tag answers the admitted copy
+    /// with the headers enforce sends, GET and HEAD alike (Renovate reads HEAD's
+    /// `Docker-Content-Digest`), counted `observe_fallback`. The held digest is still cached
+    /// and its clock runs, and asked for by digest it is served: observe never refuses.
+    #[tokio::test]
+    async fn observe_fallback_answers_a_moved_tag_with_its_admitted_copy() {
+        let (server, image, _) = upstream_with_image().await;
+        let ctx = observe_fallback(&server);
+        mature_tag_cached(&ctx, &image).await;
+        let moved = moved_manifest();
+        tag_answers(&server, &moved).await;
+
+        let before = tag_held("observe_fallback");
+        let get = manifest(&ctx, "manifests/v1").await;
+        let head = send(
+            &ctx.app,
+            Method::HEAD,
+            "/v2/library/demo/manifests/v1",
+            Body::empty(),
+        )
+        .await;
+        assert!(tag_held("observe_fallback") >= before + 2);
+        for (label, resp) in [("GET", &get), ("HEAD", &head)] {
+            assert_eq!(resp.status(), StatusCode::OK, "{label}");
+            assert_eq!(
+                header(resp, "docker-content-digest"),
+                Some(sha(&image).as_str()),
+                "{label}"
+            );
+            assert_eq!(header(resp, "x-nora-quarantine"), Some("mature"), "{label}");
+            assert_eq!(
+                header(resp, "x-nora-quarantine-held"),
+                Some(sha(&moved).as_str()),
+                "{label}"
+            );
+        }
+        let until = header(&get, "x-nora-quarantine-held-until").map(str::to_owned);
+        assert!(until.is_some());
+        assert_eq!(
+            header(&head, "x-nora-quarantine-held-until"),
+            until.as_deref()
+        );
+        assert_eq!(body_bytes(get).await.as_ref(), &image[..]);
+        assert!(body_bytes(head).await.is_empty());
+
+        // The held digest's clock started on this fetch, and its copy is cached.
+        assert!(matches!(
+            ctx.state
+                .digest_store
+                .check("docker", &sha(&moved), 3 * 86400),
+            QuarantineStatus::Pending { .. }
+        ));
+        let digest_key = manifest_key(Some("quay.io"), "library/demo", &sha(&moved));
+        let mut cached = false;
+        for _ in 0..200 {
+            if ctx.state.storage.get(&digest_key).await.is_ok() {
+                cached = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(cached, "held digest cached");
+        let key = manifest_key(Some("quay.io"), "library/demo", "v1");
+        assert_eq!(
+            ctx.state.storage.get(&key).await.unwrap().as_ref(),
+            &image[..],
+            "the tag copy stays the admitted one"
+        );
+
+        let by_digest = manifest(&ctx, &format!("manifests/{}", sha(&moved))).await;
+        assert_eq!(by_digest.status(), StatusCode::OK);
+        assert_eq!(header(&by_digest, "x-nora-quarantine"), Some("pending"));
+        assert_eq!(header(&by_digest, "x-nora-quarantine-held"), None);
+    }
+
+    /// A brand-new tag has no admitted copy: observe serves the held digest, `would_block`.
+    #[tokio::test]
+    async fn observe_fallback_serves_a_new_tag_with_nothing_behind_it() {
+        let (server, image, _) = upstream_with_image().await;
+        let ctx = observe_fallback(&server);
+        let before = tag_held("would_block");
+        let resp = manifest(&ctx, "manifests/v1").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            header(&resp, "docker-content-digest"),
+            Some(sha(&image).as_str())
+        );
+        assert_eq!(header(&resp, "x-nora-quarantine"), Some("pending"));
+        assert_eq!(header(&resp, "x-nora-quarantine-held"), None);
+        assert!(tag_held("would_block") > before);
+    }
+
+    /// Past the TTL the tag moves to the new digest on the next pull.
+    #[tokio::test]
+    async fn observe_fallback_moves_the_tag_when_the_new_digest_matures() {
+        let (server, image, _) = upstream_with_image().await;
+        let ctx = observe_fallback(&server);
+        mature_tag_cached(&ctx, &image).await;
+        let moved = moved_manifest();
+        tag_answers(&server, &moved).await;
+        let held = manifest(&ctx, "manifests/v1").await;
+        assert_eq!(
+            header(&held, "docker-content-digest"),
+            Some(sha(&image).as_str())
+        );
+        // The TTL passes: the clock the first fetch started moves 4 days back.
+        assert!(ctx
+            .state
+            .digest_store
+            .backdate("docker", &sha(&moved), days_ago(4), false)
+            .is_some());
+        let resp = manifest(&ctx, "manifests/v1").await;
+        assert_eq!(
+            header(&resp, "docker-content-digest"),
+            Some(sha(&moved).as_str())
+        );
+        assert_eq!(header(&resp, "x-nora-quarantine"), Some("mature"));
+        assert_eq!(header(&resp, "x-nora-quarantine-held"), None);
+    }
+
+    /// A break-glass exception admits the new digest: the tag moves to it at once.
+    #[tokio::test]
+    async fn observe_fallback_honours_a_break_glass_exception() {
+        let (server, image, _) = upstream_with_image().await;
+        let ctx = observe_fallback(&server);
+        mature_tag_cached(&ctx, &image).await;
+        let moved = moved_manifest();
+        tag_answers(&server, &moved).await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("exceptions.toml");
+        let expires = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        std::fs::write(
+            &file,
+            format!(
+                "[[exception]]\ndigest = {:?}\nreason = \"hotfix\"\nexpires = {expires:?}\n",
+                sha(&moved)
+            ),
+        )
+        .unwrap();
+        {
+            let _gauges = crate::quarantine_exceptions::GAUGES.lock();
+            ctx.state
+                .quarantine_exceptions
+                .reload(file.to_str().unwrap());
+        }
+        let resp = manifest(&ctx, "manifests/v1").await;
+        assert_eq!(
+            header(&resp, "docker-content-digest"),
+            Some(sha(&moved).as_str())
+        );
+        assert_eq!(header(&resp, "x-nora-quarantine"), Some("exception"));
+        assert_eq!(header(&resp, "x-nora-quarantine-held"), None);
+    }
+
+    /// A `quarantine_exempt` repository is never held, so its tag follows the upstream.
+    #[tokio::test]
+    async fn observe_fallback_leaves_an_exempt_repository_alone() {
+        let (server, image, _) = upstream_with_image().await;
+        let ctx = context_with(&server, false, QuarantineMode::Observe, |cfg| {
+            cfg.curation.docker.quarantine_observe_fallback = true;
+            cfg.docker.quarantine_exempt = vec![crate::config::QuarantineExempt {
+                repository: "quay.io/library/demo".to_string(),
+                reason: "test".to_string(),
+            }];
+        });
+        mature_tag_cached(&ctx, &image).await;
+        let moved = moved_manifest();
+        tag_answers(&server, &moved).await;
+        // The exemption binds a routed name: the host form of the same repository.
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/quay.io/library/demo/manifests/v1",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(
+            header(&resp, "docker-content-digest"),
+            Some(sha(&moved).as_str())
+        );
+        assert_eq!(header(&resp, "x-nora-quarantine"), Some("exempt"));
+        assert_eq!(header(&resp, "x-nora-quarantine-held"), None);
     }
 
     /// No usable date — the tag names another digest, a date in the future, the API
