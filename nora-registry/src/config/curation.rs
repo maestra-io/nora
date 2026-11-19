@@ -64,8 +64,9 @@ pub enum CurationOnFailure {
 /// What curation makes of a proxied version whose trusted upstream release date stayed
 /// unknown after every date source was tried (`[curation.<registry>] unknown_date`).
 ///
-/// - `hold` — judged as released now: refused while `min_release_age` lasts
-/// - `log` — left undated (min-release-age defers to the quarantine), with a
+/// - `hold` — judged as released now: refused while `min_release_age` lasts; a version
+///   NORA holds a cached copy of (Ansible, Go, Terraform) is dated by that copy's write time
+/// - `log` — left undated, cached copy or not (min-release-age defers to the quarantine), with a
 ///   `[SECURITY] min-release-age unknown date` line and
 ///   `nora_curation_unknown_release_date_total{registry}`
 ///

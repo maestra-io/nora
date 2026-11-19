@@ -264,16 +264,7 @@ impl CurationEngine {
         if date.is_some() || !trust || !self.reads_release_date(registry) {
             return date;
         }
-        let mode = self
-            .config
-            .registry_override(registry)
-            .and_then(|own| own.unknown_date)
-            .unwrap_or(if registry == RegistryType::Nuget {
-                crate::config::UnknownDate::Hold
-            } else {
-                crate::config::UnknownDate::Log
-            });
-        if mode == crate::config::UnknownDate::Hold {
+        if self.holds_unknown_dates(registry) {
             return self.unknown_release_date();
         }
         crate::metrics::CURATION_UNKNOWN_RELEASE_DATE_TOTAL
@@ -284,6 +275,49 @@ impl CurationEngine {
             "[SECURITY] min-release-age unknown date: not held (unknown_date = \"log\")"
         );
         None
+    }
+
+    /// Whether `[curation.<registry>] unknown_date` is `hold` (NuGet's default).
+    fn holds_unknown_dates(&self, registry: RegistryType) -> bool {
+        let mode = self
+            .config
+            .registry_override(registry)
+            .and_then(|own| own.unknown_date);
+        mode.unwrap_or(if registry == RegistryType::Nuget {
+            crate::config::UnknownDate::Hold
+        } else {
+            crate::config::UnknownDate::Log
+        }) == crate::config::UnknownDate::Hold
+    }
+
+    /// [`Self::judged_release_date`] for a version NORA may hold a proxied copy of at
+    /// `cached`: a version held undated (`unknown_date = "hold"`, or `unasked`, R01) is dated
+    /// by that copy's write time instead (never earlier than the release), so a copy held
+    /// past the release age is served. Under `log` the write time is no date: an undated
+    /// version stays undated on a cache hit as on the miss that cached it (R42).
+    pub async fn judged_release_date_of_copy(
+        &self,
+        registry: RegistryType,
+        trust: bool,
+        date: Option<i64>,
+        unasked: bool,
+        storage: &crate::storage::Storage,
+        cached: Option<&str>,
+    ) -> Option<i64> {
+        if date.is_some() || !trust || !self.reads_release_date(registry) {
+            return date;
+        }
+        if unasked || self.holds_unknown_dates(registry) {
+            if let Some(key) = cached {
+                if let Some(written) = extract_mtime_as_publish_date(storage, key).await {
+                    return Some(written);
+                }
+            }
+        }
+        if unasked {
+            return self.unasked_release_date(registry, trust);
+        }
+        self.judged_release_date(registry, trust, None)
     }
 
     /// The date min-release-age judges a proxied `registry` version by when a kept upstream

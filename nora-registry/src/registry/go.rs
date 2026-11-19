@@ -910,21 +910,23 @@ fn go_attested_in_range(at: i64) -> bool {
     (GO_PROXY_EPOCH..=crate::cache_ttl::now_unix() as i64 + 60).contains(&at)
 }
 
-/// The date min-release-age judges a `.zip` by: `date`, else the write time of NORA's copy
-/// of the zip (NORA's clock, never earlier than the release), then what
-/// `[curation.go] unknown_date` makes of a date still unknown. Not the quarantine's seed:
-/// a cached copy's age is the quarantine's own business (R4-C05).
+/// The date min-release-age judges a `.zip` by: `date`, else what `[curation.go]
+/// unknown_date` makes of a date still unknown (under `hold`, the write time of NORA's copy
+/// of the zip). Not the quarantine's seed: a cached copy's age is the quarantine's own
+/// business (R4-C05).
 async fn go_judged_date(state: &AppState, date: Option<i64>, zip_key: &str) -> Option<i64> {
-    let trust = state.config.server.trust_upstream_dates;
     let curation = state.curation();
-    let engine = &curation.curation_engine;
-    let date = match date {
-        None if trust && engine.reads_release_date(RegistryType::Go) => {
-            crate::curation::extract_mtime_as_publish_date(&state.storage, zip_key).await
-        }
-        date => date,
-    };
-    engine.judged_release_date(RegistryType::Go, trust, date)
+    curation
+        .curation_engine
+        .judged_release_date_of_copy(
+            RegistryType::Go,
+            state.config.server.trust_upstream_dates,
+            date,
+            false,
+            &state.storage,
+            Some(zip_key),
+        )
+        .await
 }
 
 /// Store the upstream `.info` (`file`) at `info_key` when NORA has none, synchronously, so the
@@ -2515,6 +2517,16 @@ mod release_date_judged {
             status(&ctx, "/go/example.org/mod/@nora-dates/v2.3.4").await,
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// R42: under `log` the write time of NORA's copy dates nothing: an undated zip cached a
+    /// moment ago is served.
+    #[tokio::test]
+    async fn under_log_a_fresh_zip_without_a_date_is_served() {
+        let up = upstream(None).await;
+        let ctx = min_age(&up, false);
+        ctx.state.storage.put(ZIP_KEY, b"ZIP").await.unwrap();
+        assert_eq!(status(&ctx, ZIP).await, StatusCode::OK);
     }
 
     /// A zip NORA cached more than 3 days ago is as old as that, `.info` or not.

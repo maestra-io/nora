@@ -1647,9 +1647,9 @@ fn parse_registry_dates(json: &serde_json::Value) -> std::collections::HashMap<S
 }
 
 /// The date min-release-age judges one provider version by: its date from
-/// [`fetch_terraform_registry_dates`], else the write time of its `cached` copy (NORA held
-/// it no later than that). Without either: held as released now when a kept answer lacking
-/// it was reused unasked (R01), otherwise judged (`[curation.terraform] unknown_date`, A082).
+/// [`fetch_terraform_registry_dates`]. Without it: held when a kept answer lacking it was
+/// reused unasked (R01), otherwise judged (`[curation.terraform] unknown_date`, A082); a
+/// version held is dated by the write time of its `cached` copy, if any (R42).
 async fn fetch_terraform_registry_date(
     state: &AppState,
     ns: &str,
@@ -1660,17 +1660,20 @@ async fn fetch_terraform_registry_date(
     let engine = &state.curation().curation_engine;
     let trust = state.config.server.trust_upstream_dates;
     let answer = fetch_terraform_registry_dates(state, ns, ptype, &[ver]).await;
-    let mut date = answer
+    let date = answer
         .dates
         .filter(|_| !answer.unasked)
         .and_then(|dates| dates.get(ver).copied());
-    if let (None, Some(key)) = (date, cached) {
-        date = crate::curation::extract_mtime_as_publish_date(&state.storage, key).await;
-    }
-    if date.is_none() && answer.unasked {
-        return engine.unasked_release_date(RegistryType::Terraform, trust);
-    }
-    engine.judged_release_date(RegistryType::Terraform, trust, date)
+    engine
+        .judged_release_date_of_copy(
+            RegistryType::Terraform,
+            trust,
+            date,
+            answer.unasked,
+            &state.storage,
+            cached,
+        )
+        .await
 }
 
 /// Q04 for Terraform (Maestra): drop the versions `min_release_age` refuses from a
@@ -1872,8 +1875,8 @@ async fn extract_terraform_publish_date(
 }
 
 /// The date min-release-age judges a proxied module version by (A083): `published_at` of the
-/// upstream's `/v1/modules/{ns}/{name}/{system}/{ver}`, else the write time of its `cached`
-/// copy (NORA held it no later than that), else judged (`[curation.terraform] unknown_date`).
+/// upstream's `/v1/modules/{ns}/{name}/{system}/{ver}`, else judged
+/// (`[curation.terraform] unknown_date`; under `hold`, the write time of its `cached` copy).
 /// `None`, and nothing asked, when no release age reads it: no upstream, an internal module,
 /// untrusted upstream dates or no rule.
 async fn module_publish_date(
@@ -1901,7 +1904,7 @@ async fn module_publish_date(
         "{}/v1/modules/{ns}/{name}/{system}/{ver}",
         proxy_url.trim_end_matches('/')
     );
-    let mut date = proxy_fetch_text(
+    let date = proxy_fetch_text(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.terraform.proxy_timeout),
@@ -1918,10 +1921,16 @@ async fn module_publish_date(
             .as_str()
             .and_then(crate::curation::parse_iso8601_to_unix)
     });
-    if let (None, Some(key)) = (date, cached) {
-        date = crate::curation::extract_mtime_as_publish_date(&state.storage, key).await;
-    }
-    engine.judged_release_date(RegistryType::Terraform, trust, date)
+    engine
+        .judged_release_date_of_copy(
+            RegistryType::Terraform,
+            trust,
+            date,
+            false,
+            &state.storage,
+            cached,
+        )
+        .await
 }
 
 /// Resolve the real upstream download URL for a provider file.
@@ -5533,8 +5542,7 @@ mod terraform_dates_judged {
     }
 
     /// A083: a module version the registry leaves undated follows `unknown_date`: `hold`
-    /// refuses it unless its cached source address is old, `log` serves it (a cached source
-    /// address still dates it: NORA held it no later than that).
+    /// refuses it unless its cached source address is old, `log` serves it.
     #[tokio::test]
     async fn an_undated_module_follows_unknown_date() {
         let server = modules(serde_json::json!({"id": "acme/young/aws/9.9.9"})).await;
@@ -5555,6 +5563,27 @@ mod terraform_dates_judged {
             StatusCode::OK
         );
         let logged = ctx(server.uri(), None);
+        assert_eq!(
+            send(&logged.app, Method::GET, MOD_DL, "").await.status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    /// R42: under `log` the write time of NORA's copy dates nothing: an undated provider file
+    /// or module cached a moment ago is served on the cache hit as on the miss that cached it.
+    #[tokio::test]
+    async fn under_log_a_fresh_copy_of_an_undated_version_is_served() {
+        let down = registry(503, &[]).await;
+        let _api = Api::at(&down.uri());
+        let ctx = ctx(format!("{}/registry.terraform.io", down.uri()), None);
+        ctx.state.storage.put(ZIP_KEY, b"ZIP").await.unwrap();
+        assert_eq!(
+            send(&ctx.app, Method::GET, ZIP, "").await.status(),
+            StatusCode::OK
+        );
+
+        let server = modules(serde_json::json!({"id": "acme/young/aws/9.9.9"})).await;
+        let logged = module_ctx(&server, None).await;
         assert_eq!(
             send(&logged.app, Method::GET, MOD_DL, "").await.status(),
             StatusCode::NO_CONTENT

@@ -285,20 +285,22 @@ async fn fetched_publish_date(state: &AppState, ns: &str, name: &str, ver: &str)
     detail_date(&serde_json::from_slice(&body).ok()?)
 }
 
-/// The date min-release-age judges a tarball by: `date`, else the write time of NORA's copy
-/// (never earlier than the release), then what `[curation.ansible] unknown_date` makes of a
-/// date still unknown. Not the quarantine's seed (R4-C05).
+/// The date min-release-age judges a tarball by: `date`, else what
+/// `[curation.ansible] unknown_date` makes of a date still unknown (under `hold`, the write
+/// time of NORA's copy). Not the quarantine's seed (R4-C05).
 async fn judged_date(state: &AppState, date: Option<i64>, tarball_key: &str) -> Option<i64> {
-    let trust = state.config.server.trust_upstream_dates;
     let curation = state.curation();
-    let engine = &curation.curation_engine;
-    let date = match date {
-        None if trust && engine.reads_release_date(RegistryType::Ansible) => {
-            crate::curation::extract_mtime_as_publish_date(&state.storage, tarball_key).await
-        }
-        date => date,
-    };
-    engine.judged_release_date(RegistryType::Ansible, trust, date)
+    curation
+        .curation_engine
+        .judged_release_date_of_copy(
+            RegistryType::Ansible,
+            state.config.server.trust_upstream_dates,
+            date,
+            false,
+            &state.storage,
+            Some(tarball_key),
+        )
+        .await
 }
 
 /// Per-version `created_at` from cached Galaxy metadata (#748/#750).
@@ -306,8 +308,7 @@ async fn judged_date(state: &AppState, date: Option<i64>, tarball_key: &str) -> 
 /// Prefers the per-version detail JSON (`{ver}.json`, cached when the client
 /// fetches version metadata immediately before download) — it carries the exact
 /// version's `created_at` at top level with no pagination concern. Falls back to
-/// the first page of the versions listing (`versions.json`), which only holds the
-/// most recent versions for large collections (Galaxy paginates). Any miss →
+/// the cached pages of the versions listing (Galaxy paginates). Any miss →
 /// `None` (the quarantine falls back to NORA's own first-seen clock).
 async fn extract_ansible_publish_date(
     storage: &crate::storage::Storage,
@@ -326,15 +327,34 @@ async fn extract_ansible_publish_date(
         }
     }
 
-    // First-page versions listing (data[]; recent versions only).
-    let key = format!("ansible/metadata/{}/{}/versions.json", ns, name);
-    let data = storage.get(&key).await.ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
-    let entries = json.get("data").and_then(|d| d.as_array())?;
-    let entry = entries
-        .iter()
-        .find(|e| e.get("version").and_then(|v| v.as_str()) == Some(ver))?;
-    detail_date(entry)
+    // Every cached versions listing page (`data[]`), whatever paging it was asked with:
+    // `ansible-galaxy` lists with `?limit=100`, cached as `versions-limit-100.json` (R41).
+    let dir = format!("ansible/metadata/{}/{}/", ns, name);
+    for key in storage.list(&dir).await.ok()? {
+        let Some(page) = key.strip_prefix(&dir) else {
+            continue;
+        };
+        if page != "versions.json" && !page.starts_with("versions-") {
+            continue;
+        }
+        let Ok(data) = storage.get(&key).await else {
+            continue;
+        };
+        let json: Option<serde_json::Value> = serde_json::from_slice(&data).ok();
+        let date = json
+            .as_ref()
+            .and_then(|json| json.get("data")?.as_array())
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|e| e.get("version").and_then(|v| v.as_str()) == Some(ver))
+            })
+            .and_then(detail_date);
+        if date.is_some() {
+            return date;
+        }
+    }
+    None
 }
 
 // ── Tarball download (immutable) ───────────────────────────────────────
@@ -2078,6 +2098,44 @@ mod release_date_judged {
         let up = upstream(None).await;
         let ctx = min_age(&up, true);
         put_written_days_ago(&ctx, TARBALL_KEY, b"TARBALL", 30).await;
+        assert_eq!(status(&ctx, TARBALL).await, StatusCode::OK);
+    }
+
+    /// R41: the listing `ansible-galaxy` asks for (`?limit=100`) dates a tarball whose
+    /// version detail cannot be had.
+    #[tokio::test]
+    async fn a_listing_paged_by_limit_dates_the_tarball() {
+        let up = upstream(None).await;
+        Mock::given(method("GET"))
+            .and(path(format!("{API_PREFIX}/acme/tools/versions/")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"count": 1}, "links": {},
+                "data": [{"version": "7.0.0",
+                          "created_at": (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339()}],
+            })))
+            .mount(&up)
+            .await;
+        let ctx = min_age(&up, false);
+        let holders = ctx.state.storage.holders();
+        let listing = "/ansible/v3/collections/acme/tools/versions/?limit=100";
+        assert_eq!(status(&ctx, listing).await, StatusCode::OK);
+        background_writes_done(&ctx.state.storage, holders).await;
+        assert_eq!(status(&ctx, TARBALL).await, StatusCode::FORBIDDEN);
+    }
+
+    /// R42: under `log` an undated tarball NORA served and cached stays served on the cache
+    /// hit: the write time of its copy is no release date.
+    #[tokio::test]
+    async fn under_log_an_undated_tarball_is_served_again_once_cached() {
+        let up = upstream(None).await;
+        let ctx = min_age(&up, false);
+        let holders = ctx.state.storage.holders();
+        assert_eq!(status(&ctx, TARBALL).await, StatusCode::OK);
+        background_writes_done(&ctx.state.storage, holders).await;
+        assert!(
+            ctx.state.storage.stat(TARBALL_KEY).await.is_some(),
+            "cached"
+        );
         assert_eq!(status(&ctx, TARBALL).await, StatusCode::OK);
     }
 
