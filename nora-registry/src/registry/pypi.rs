@@ -989,15 +989,21 @@ async fn download_file(
                         } else {
                             None
                         };
-                        // Create-only under the file's publish lock: an upload that
-                        // got there first wins (C53).
-                        if let Ok(true) = data_clone.cache(&cache_state, &key_clone, true).await {
-                            let _ = storage
-                                .put(&format!("{}.sha256", key_clone), hash.as_bytes())
-                                .await;
+                        // The file create-only and then its records, all under the file's
+                        // publish lock, as `store_file` writes an upload's: an upload that got
+                        // there first wins (C53), and one that comes later waits for the whole
+                        // fill and then replaces the file and every record (A078).
+                        // LOCK-SAFE: nothing else is taken under it.
+                        let lock = cache_state.publish_lock(&key_clone);
+                        let _guard = lock.lock().await;
+                        if let Ok(true) = data_clone.cache_locked(&storage, &key_clone, true).await
+                        {
                             // Provenance: cached from upstream, so GC may evict it (C22).
                             let _ = storage
                                 .put(&proxied_marker_key(&key_clone), hash.as_bytes())
+                                .await;
+                            let _ = storage
+                                .put(&format!("{}.sha256", key_clone), hash.as_bytes())
                                 .await;
                             put_hash_marker(&storage, &project, &file_name, &hash).await;
                             if let Some(meta) = core_meta {
@@ -1550,7 +1556,8 @@ async fn claim_uploaded_project(state: &AppState, normalized: &str) -> Result<()
 /// Store a validated distribution file of `project` as an upload does, under the file's
 /// publish lock: the file itself (immutable: an existing name is a 409), its `.sha256`
 /// sidecar and hash marker, a wheel's core metadata as `<file>.metadata`, and its
-/// `Requires-Python` (empty = none). Shared with `nora import`.
+/// `Requires-Python` (empty = none). `nora import` commits its files in `transfer_artifact`,
+/// under the same lock.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn store_file(
     storage: &crate::storage::Storage,

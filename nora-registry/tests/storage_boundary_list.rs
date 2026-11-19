@@ -22,6 +22,7 @@ const READS: &[&str] = &[
     "total_size",
     "backend_name",
     "pin",
+    "try_pin",
     "get_versioned",
 ];
 

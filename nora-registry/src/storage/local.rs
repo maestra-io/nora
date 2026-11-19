@@ -1019,6 +1019,11 @@ impl StorageBackend for LocalStorage {
         self.pins.get(key)
     }
 
+    /// No pin while the pin log is not fully loaded is unanswered, as for a read.
+    async fn try_pin(&self, key: &str) -> Result<Option<String>> {
+        self.loaded_pin(key, self.pins.get(key))
+    }
+
     async fn delete(&self, key: &str) -> Result<()> {
         let path = self.key_to_path(key);
         // Body and pin leave as one critical section, as they arrive (#1041, see commit_lock):
@@ -1755,8 +1760,10 @@ mod tests {
             storage.get_reader("raw/unpinned").await,
             Err(StorageError::IntegrityViolation)
         ));
+        assert!(storage.try_pin("raw/unpinned").await.is_err());
         put(&storage, "raw/new", b"new").await.unwrap();
         assert!(storage.get("raw/new").await.is_ok());
+        assert!(storage.try_pin("raw/new").await.unwrap().is_some());
         drop(storage);
 
         // The operator removes the bad line; the next start loads the whole log.

@@ -2438,6 +2438,209 @@ mod integration_tests {
         assert_eq!(asked(&upstream).await, Vec::<String>::new());
     }
 
+    /// A031: an import over a proxy-cached npm tarball leaves nothing of the cache describing the
+    /// imported bytes, whether they equal the cached ones or not: no provenance record (gc would
+    /// evict the version), and the `.sha256` sidecar names the imported digest.
+    #[tokio::test]
+    async fn an_npm_import_over_a_cached_tarball_drops_its_provenance_and_sidecar() {
+        use crate::registry::npm::origin_key;
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let key = "npm/corp-lib/tarballs/corp-lib-1.0.0.tgz";
+        let served =
+            npm_tgz(&json!({ "name": "corp-lib", "version": "1.0.0", "description": "UP" }));
+        let own = npm_tgz(&json!({ "name": "corp-lib", "version": "1.0.0", "description": "OWN" }));
+        for (case, imported) in [("other bytes", own), ("same bytes", served.clone())] {
+            let uri = upstream.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.npm.proxy = Some(uri);
+                cfg.server.public_url = Some("http://nora.example".to_string());
+            });
+            let storage = &ctx.state.storage;
+            let cached_sha = hex::encode(Sha256::digest(&served));
+            storage.put(key, &served).await.unwrap();
+            storage
+                .put(&format!("{key}.sha256"), cached_sha.as_bytes())
+                .await
+                .unwrap();
+            let record = format!("npm:{}\n{cached_sha}", upstream.uri());
+            storage
+                .put(&origin_key(key), record.as_bytes())
+                .await
+                .unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let res = import_npm(
+                storage,
+                vec![("corp-lib/-/corp-lib-1.0.0.tgz".into(), imported.clone())],
+                state.path(),
+            )
+            .await;
+            assert_eq!((res.imported, res.failed), (1, 0), "{case}: {res:?}");
+            assert!(
+                storage.stat(&origin_key(key)).await.is_none(),
+                "{case}: provenance left"
+            );
+            let sidecar = storage.get(&format!("{key}.sha256")).await.unwrap();
+            assert_eq!(
+                sidecar,
+                hex::encode(Sha256::digest(&imported)).as_bytes(),
+                "{case}"
+            );
+            let reload = ctx.state.curation();
+            crate::gc::run_gc(
+                storage,
+                &ctx.state.publish_locks,
+                false,
+                0,
+                true,
+                false,
+                1,
+                &reload.curation_engine,
+            )
+            .await;
+            let tarball = send(
+                &ctx.app,
+                Method::GET,
+                "/npm/corp-lib/-/corp-lib-1.0.0.tgz",
+                "",
+            )
+            .await;
+            assert_eq!(tarball.status(), StatusCode::OK, "{case}");
+            assert_eq!(&body_bytes(tarball).await[..], &imported[..], "{case}");
+        }
+    }
+
+    /// An import whose commit fails leaves the cached copy it would have replaced a cache: the
+    /// copy and its provenance record stay as they were.
+    #[tokio::test]
+    async fn an_npm_import_that_fails_to_commit_keeps_the_cache_provenance() {
+        use crate::registry::npm::origin_key;
+        let (storage, ops) = crate::test_helpers::op_counting_storage();
+        let key = "npm/corp-lib/tarballs/corp-lib-1.0.0.tgz";
+        let served =
+            npm_tgz(&json!({ "name": "corp-lib", "version": "1.0.0", "description": "UP" }));
+        storage.put(key, &served).await.unwrap();
+        let record = format!("npm:http://up\n{}", hex::encode(Sha256::digest(&served)));
+        storage
+            .put(&origin_key(key), record.as_bytes())
+            .await
+            .unwrap();
+        ops.fail_put_from_path(key);
+        let own = npm_tgz(&json!({ "name": "corp-lib", "version": "1.0.0", "description": "OWN" }));
+        let state = tempfile::tempdir().unwrap();
+        let res = import_npm(
+            &storage,
+            vec![("corp-lib/-/corp-lib-1.0.0.tgz".into(), own)],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (0, 1), "{res:?}");
+        assert_eq!(
+            storage.get(&origin_key(key)).await.unwrap(),
+            record.as_bytes()
+        );
+        assert_eq!(storage.get(key).await.unwrap(), served);
+    }
+
+    /// An import that commits a tarball a gc pass of a server is evicting (its intent is fresh)
+    /// fails the artifact instead of leaving it to that delete; with the intent gone, the next
+    /// run imports it.
+    #[tokio::test]
+    async fn an_import_under_a_pending_eviction_fails_and_the_next_run_imports() {
+        let storage = crate::storage::Storage::from_backend(std::sync::Arc::new(
+            crate::storage::ObjectStorage::in_memory(),
+        ));
+        let key = "npm/corp-lib/tarballs/corp-lib-1.0.0.tgz";
+        let intent = format!("{}{key}", crate::gc::GC_DELETING_PREFIX);
+        storage.put(&intent, b"0").await.unwrap();
+        let own = npm_tgz(&json!({ "name": "corp-lib", "version": "1.0.0" }));
+        let entry = || vec![("corp-lib/-/corp-lib-1.0.0.tgz".into(), own.clone())];
+        let state = tempfile::tempdir().unwrap();
+        let res = import_npm(&storage, entry(), state.path()).await;
+        assert_eq!((res.imported, res.failed), (0, 1), "{res:?}");
+
+        storage.delete(&intent).await.unwrap();
+        let res = import_npm(&storage, entry(), state.path()).await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        assert_eq!(storage.get(key).await.unwrap(), own);
+    }
+
+    /// A032: an import over a proxy-cached PyPI file drops its provenance marker, so the imported
+    /// file is the project's own and gc never evicts it as cache.
+    #[tokio::test]
+    async fn a_pypi_import_over_a_cached_file_drops_its_provenance_marker() {
+        use crate::registry::npm::origin_key;
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.enabled = true;
+            cfg.pypi.proxy = Some(format!("{uri}/simple/"));
+        });
+        let storage = &ctx.state.storage;
+        let file = "corppkg-1.0.0-py3-none-any.whl";
+        let key = format!("pypi/corppkg/{file}");
+        let served_sha = hex::encode(Sha256::digest(b"what an upstream served"));
+        storage.put(&key, b"what an upstream served").await.unwrap();
+        storage
+            .put(&format!("{key}.sha256"), served_sha.as_bytes())
+            .await
+            .unwrap();
+        storage
+            .put(&origin_key(&key), served_sha.as_bytes())
+            .await
+            .unwrap();
+        let own = zip(&[("corppkg/__init__.py", b"", true)]);
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            storage,
+            crate::registry_type::RegistryType::PyPI,
+            "pypi",
+            vec![(format!("corppkg/1.0.0/{file}"), own.clone())],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        assert!(storage.stat(&origin_key(&key)).await.is_none());
+        assert!(storage
+            .stat(&crate::registry::pypi_own_file_key("corppkg", file))
+            .await
+            .is_some());
+        let reload = ctx.state.curation();
+        crate::gc::run_gc(
+            storage,
+            &ctx.state.publish_locks,
+            false,
+            0,
+            false,
+            false,
+            1,
+            &reload.curation_engine,
+        )
+        .await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/simple/corppkg/{file}"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], &own[..]);
+    }
+
     /// A project the import made hosted whose file record was never written (the record write
     /// failed, or the process stopped between the marker and the record) lists no file: a file
     /// an upstream served under the name is not one of its files, and the upstream is not asked.
