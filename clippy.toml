@@ -8,7 +8,7 @@ type-complexity-threshold = 300
 #   * ui/ calls no Storage write: the methods of `impl Storage` that are not reads
 #     (get, get_verified, get_verified_bounded, get_reader, get_range, list, list_internal,
 #     list_with_meta, list_often_empty, list_claiming_empty, stat, total_size, backend_name,
-#     pin, get_versioned). A new Storage method that writes
+#     pin, try_pin, get_versioned). A new Storage method that writes
 #     goes on this list;
 #     tests/storage_boundary_list.rs fails until every method is on one side;
 #   * registry/ names no concrete backend: a handler reaches storage through Storage (ADR-3).
