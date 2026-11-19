@@ -3103,11 +3103,12 @@ async fn an_upload_of_the_cached_bytes_mid_fill_leaves_no_provenance_marker() {
     fill_racing_an_upload(true).await;
 }
 
-/// A078: a pin the store does not answer when the fill comes back for the file's records may
-/// hide an upload's bytes, so the records an upload also writes (sidecar, hash marker, core
-/// metadata) are left unwritten. The provenance marker is written: the copy stays cache.
+/// A078: the fill writes the file's records in the same hold of the file's lock as the file,
+/// with no pin read in between, so a store that does not answer pin reads still gets every
+/// record (sidecar, hash marker, core metadata, provenance marker): a later download is a
+/// cache hit and never writes them again.
 #[tokio::test]
-async fn an_unanswered_pin_leaves_a_fills_upload_records_unwritten() {
+async fn a_fill_writes_its_records_with_the_file_whatever_a_pin_read_answers() {
     use crate::test_helpers::{
         background_writes_done, create_test_context_with_storage_and_config, outage_storage,
     };
@@ -3151,13 +3152,13 @@ async fn an_unanswered_pin_leaves_a_fills_upload_records_unwritten() {
 
     assert!(storage.stat(KEY).await.is_some(), "cached");
     for key in [format!("{KEY}.sha256"), format!("{KEY}.metadata")] {
-        assert!(storage.stat(&key).await.is_none(), "{key} written");
+        assert!(storage.stat(&key).await.is_some(), "{key} not written");
     }
     let markers = storage
         .list(&format!("{}vfour/{FILE}/", super::HASH_MARKER_PREFIX))
         .await
         .unwrap();
-    assert!(markers.is_empty(), "{markers:?}");
+    assert_eq!(markers.len(), 1, "{markers:?}");
     assert!(
         storage
             .stat(&super::proxied_marker_key(KEY))

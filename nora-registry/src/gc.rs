@@ -159,7 +159,7 @@ static CONFIRMED_BLOBS: LazyLock<parking_lot::Mutex<HashMap<String, Instant>>> =
 const GC_CONFIRMED_PREFIX: &str = ".nora-gc-confirmed/";
 /// `<prefix><key>` says a sweep is about to delete `key`: a confirmation that sees it answers
 /// "absent".
-const GC_DELETING_PREFIX: &str = ".nora-gc-deleting/";
+pub(crate) const GC_DELETING_PREFIX: &str = ".nora-gc-deleting/";
 /// An intent older than this is a crashed sweep's: confirmations ignore it, and a sweep that
 /// took half of it between its intent and its delete keeps the blob.
 const GC_INTENT_TTL_SECS: u64 = 300;
@@ -1890,8 +1890,8 @@ async fn evict_proxy_cache(
 /// digest the record cached. A copy the store reports without a pin, or a record without a
 /// digest (npm's from before digests is one line), is taken at the record's word as before.
 /// Anything the store does not answer, a pin read included, keeps it. Keys of other formats are
-/// not asked.
-async fn still_cached(storage: &Storage, key: &str) -> bool {
+/// not asked: they stay at their `listed` size.
+async fn still_cached(storage: &Storage, key: &str, listed: u64) -> Recheck {
     use crate::storage::StorageError;
     let npm = key.starts_with("npm/");
     let claim = if npm {
@@ -1900,15 +1900,19 @@ async fn still_cached(storage: &Storage, key: &str) -> bool {
     {
         Some(crate::registry::pypi_own_file_key(project, file))
     } else {
-        return true;
+        return Recheck::Cached(listed);
     };
     if let Some(claim) = claim {
-        if !matches!(storage.get(&claim).await, Err(StorageError::NotFound)) {
-            return false;
+        match storage.get(&claim).await {
+            Err(StorageError::NotFound) => {}
+            Ok(_) => return Recheck::NotCache,
+            Err(_) => return Recheck::Unanswered,
         }
     }
-    let Ok(record) = storage.get(&crate::registry::npm::origin_key(key)).await else {
-        return false;
+    let record = match storage.get(&crate::registry::npm::origin_key(key)).await {
+        Ok(record) => record,
+        Err(StorageError::NotFound) => return Recheck::NotCache,
+        Err(_) => return Recheck::Unanswered,
     };
     // npm: `<origin>\n<sha256>`; PyPI: `<sha256>`.
     let record = String::from_utf8_lossy(&record);
@@ -1918,14 +1922,39 @@ async fn still_cached(storage: &Storage, key: &str) -> bool {
         Some(record.trim())
     }
     .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()));
-    let Some(cached) = cached else {
-        return true;
-    };
-    match storage.try_pin(key).await {
-        Ok(Some(pin)) => cached == pin,
-        Ok(None) => true,
-        Err(_) => false,
+    if let Some(cached) = cached {
+        match storage.try_pin(key).await {
+            Ok(Some(pin)) if pin != cached => return Recheck::NotCache,
+            Ok(_) => {}
+            Err(_) => return Recheck::Unanswered,
+        }
     }
+    // The size now: a fill may have replaced the listed copy with one of another size.
+    match storage.stat(key).await {
+        Some(meta) => Recheck::Cached(meta.size),
+        None => Recheck::Unanswered,
+    }
+}
+
+/// What [`still_cached`] found under the lock.
+enum Recheck {
+    /// Still the proxy fill, this many bytes now.
+    Cached(u64),
+    /// Claimed or replaced: not cache any more.
+    NotCache,
+    /// The store did not answer: kept, but still counted as cache.
+    Unanswered,
+}
+
+/// Whether a sweep in another process is evicting `key` now (its intent is younger than the
+/// TTL): `nora import` asks after it commits an npm tarball or PyPI file, and fails the artifact
+/// rather than leave it to a delete that may have passed its checks first. The sweep writes its
+/// intent before those checks, so one of the two sees the other.
+pub(crate) async fn eviction_pending(storage: &Storage, key: &str) -> bool {
+    storage
+        .stat(&format!("{GC_DELETING_PREFIX}{key}"))
+        .await
+        .is_some_and(|m| now_unix_secs().saturating_sub(m.modified) < GC_INTENT_TTL_SECS)
 }
 
 /// Evict `proxy_files` (key, size, mtime) oldest-first until their total is within
@@ -1964,37 +1993,84 @@ async fn evict_oldest(
         }
         let lock = crate::acquire_publish_lock(publish_locks, key);
         let _guard = lock.lock().await;
+        // A `nora import` in another process takes no lock of this one: the intent, written
+        // before the checks, is what it looks for after its commit (see `eviction_pending`).
+        let intent = format!("{GC_DELETING_PREFIX}{key}");
+        let handshake = !dry_run && (key.starts_with("npm/") || key.starts_with("pypi/"));
+        if handshake {
+            if let Err(e) = storage
+                .put(&intent, now_unix_secs().to_string().as_bytes())
+                .await
+            {
+                warn!("proxy-cache: cannot record the eviction of {key}, it stays: {e}");
+                failed += 1;
+                continue;
+            }
+        }
+        let intent_at = Instant::now();
         // Asked again under the lock, so a publish, upload or import that landed after the
         // listing is never what is deleted, nor what a dry run lists.
-        if !still_cached(storage, key).await {
-            info!(
-                "proxy-cache: {} is published, replaced or unanswered, kept",
-                key
-            );
-            kept += 1;
-            // No longer cache: its bytes leave the total the cap is measured against.
-            bytes_to_free = bytes_to_free.saturating_sub(*size);
-            continue;
+        let current = match still_cached(storage, key, *size).await {
+            Recheck::Cached(current) => current,
+            recheck => {
+                info!(
+                    "proxy-cache: {} is published, replaced or unanswered, kept",
+                    key
+                );
+                kept += 1;
+                // No longer cache: its bytes leave the total the cap is measured against. An
+                // unanswered one may still be cache, so the others still make up for it.
+                if matches!(recheck, Recheck::NotCache) {
+                    bytes_to_free = bytes_to_free.saturating_sub(*size);
+                }
+                if handshake {
+                    drop_intent(storage, &intent).await;
+                }
+                continue;
+            }
+        };
+        // The cache holds `current` bytes under this key now, not the listed `size`.
+        bytes_to_free = bytes_to_free.saturating_add(current).saturating_sub(*size);
+        if bytes_freed >= bytes_to_free {
+            if handshake {
+                drop_intent(storage, &intent).await;
+            }
+            break;
         }
         if dry_run {
-            info!("[dry-run] proxy-cache evict: {} ({} bytes)", key, size);
+            info!("[dry-run] proxy-cache evict: {} ({} bytes)", key, current);
         } else {
+            // An import that does not see an intent this old may have committed unseen.
+            if handshake && intent_at.elapsed().as_secs() >= GC_INTENT_TTL_SECS / 2 {
+                warn!(
+                    "proxy-cache: the eviction of {key} stalled past half the intent TTL, it stays"
+                );
+                drop_intent(storage, &intent).await;
+                continue;
+            }
             // Only a delete the store confirmed frees anything: a refused one is not counted,
             // so the loop goes on to the next file and the totals say what is really gone.
-            if let Err(e) = storage.delete(key).await {
+            let deleted = storage.delete(key).await;
+            if deleted.is_ok() {
+                info!("proxy-cache evicted: {} ({} bytes)", key, current);
+                if key.starts_with("npm/") {
+                    let _ = storage.delete(&origin_key(key)).await;
+                }
+                if key.starts_with("pypi/") {
+                    evict_pypi_companions(storage, key).await;
+                }
+            }
+            // After the companions too: an import that commits meanwhile still sees it.
+            if handshake {
+                drop_intent(storage, &intent).await;
+            }
+            if let Err(e) = deleted {
                 warn!("proxy-cache: evicting {} failed, it stays: {}", key, e);
                 failed += 1;
                 continue;
             }
-            info!("proxy-cache evicted: {} ({} bytes)", key, size);
-            if key.starts_with("npm/") {
-                let _ = storage.delete(&origin_key(key)).await;
-            }
-            if key.starts_with("pypi/") {
-                evict_pypi_companions(storage, key).await;
-            }
         }
-        bytes_freed += size;
+        bytes_freed += current;
         evicted += 1;
     }
     GC_DELETE_FAILURES.inc_by(failed);
@@ -5195,6 +5271,51 @@ mod tests {
         for key in [npm, pypi] {
             assert!(storage.stat(key).await.is_some(), "{key} kept");
         }
+    }
+
+    /// An unanswered candidate is kept but may still be cache: its bytes stay in the target, so
+    /// the next candidate is evicted in its place. The bytes freed are the evicted copy's size
+    /// now, not its listed one; no intent outlives the pass.
+    #[tokio::test]
+    async fn test_evict_oldest_frees_past_an_unanswered_candidate_by_current_sizes() {
+        use crate::registry::npm::origin_key;
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        let unanswered = "pypi/un/un-1.0.tar.gz";
+        let cached = "pypi/ca/ca-1.0.tar.gz";
+        for key in [unanswered, cached] {
+            storage.put(key, b"x").await.unwrap();
+            storage
+                .put(&origin_key(key), sha_hex(b"x").as_bytes())
+                .await
+                .unwrap();
+        }
+        outage.fail_pins_of(unanswered);
+        let files = vec![
+            (unanswered.to_string(), 100, 0),
+            (cached.to_string(), 100, 1),
+        ];
+        let result = evict_oldest(&storage, &test_publish_locks(), files, 100, false, "test").await;
+        assert_eq!((result.evicted_files, result.bytes_freed), (1, 1));
+        assert!(storage.stat(cached).await.is_none());
+        assert!(storage.stat(unanswered).await.is_some());
+        let intents = storage.list_internal(GC_DELETING_PREFIX).await.unwrap();
+        assert!(intents.is_empty(), "{intents:?}");
+    }
+
+    /// A candidate whose eviction a sweep has recorded is what an import that commits it then
+    /// sees: `eviction_pending` answers for a fresh intent only.
+    #[tokio::test]
+    async fn test_eviction_pending_sees_only_a_fresh_intent() {
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        let key = "npm/a/tarballs/a-1.0.0.tgz";
+        assert!(!eviction_pending(&storage, key).await);
+        storage
+            .put(&format!("{GC_DELETING_PREFIX}{key}"), b"0")
+            .await
+            .unwrap();
+        assert!(eviction_pending(&storage, key).await);
+        outage.age_markers(GC_INTENT_TTL_SECS + 1);
+        assert!(!eviction_pending(&storage, key).await);
     }
 
     /// A032: a candidate kept under the lock leaves the cache, so the bytes eviction must free

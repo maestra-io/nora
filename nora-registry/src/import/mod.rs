@@ -2548,6 +2548,29 @@ mod integration_tests {
         assert_eq!(storage.get(key).await.unwrap(), served);
     }
 
+    /// An import that commits a tarball a gc pass of a server is evicting (its intent is fresh)
+    /// fails the artifact instead of leaving it to that delete; with the intent gone, the next
+    /// run imports it.
+    #[tokio::test]
+    async fn an_import_under_a_pending_eviction_fails_and_the_next_run_imports() {
+        let storage = crate::storage::Storage::from_backend(std::sync::Arc::new(
+            crate::storage::ObjectStorage::in_memory(),
+        ));
+        let key = "npm/corp-lib/tarballs/corp-lib-1.0.0.tgz";
+        let intent = format!("{}{key}", crate::gc::GC_DELETING_PREFIX);
+        storage.put(&intent, b"0").await.unwrap();
+        let own = npm_tgz(&json!({ "name": "corp-lib", "version": "1.0.0" }));
+        let entry = || vec![("corp-lib/-/corp-lib-1.0.0.tgz".into(), own.clone())];
+        let state = tempfile::tempdir().unwrap();
+        let res = import_npm(&storage, entry(), state.path()).await;
+        assert_eq!((res.imported, res.failed), (0, 1), "{res:?}");
+
+        storage.delete(&intent).await.unwrap();
+        let res = import_npm(&storage, entry(), state.path()).await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        assert_eq!(storage.get(key).await.unwrap(), own);
+    }
+
     /// A032: an import over a proxy-cached PyPI file drops its provenance marker, so the imported
     /// file is the project's own and gc never evicts it as cache.
     #[tokio::test]

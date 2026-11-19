@@ -1595,7 +1595,11 @@ async fn fill_tarball(state: &AppState, key: &str, name: &str, body: ProxyBody, 
     let _package = package_lock.lock().await;
     let tarball_lock = state.publish_lock(key);
     let _tarball = tarball_lock.lock().await;
-    if !matches!(published_state(&state.storage, name).await, Published::No) {
+    // The listing itself, not a remembered "no": a version another process (`nora import`)
+    // committed within the memo's TTL is seen.
+    let versions = format!("npm/{name}/versions/");
+    let unlisted = matches!(state.storage.list(&versions).await, Ok(v) if v.is_empty());
+    if !unlisted || !matches!(published_state(&state.storage, name).await, Published::No) {
         tracing::info!(key = %key, "npm proxy: package published here (or unknown), fetched tarball not cached");
         return;
     }

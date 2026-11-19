@@ -315,6 +315,16 @@ pub async fn transfer_artifact(
     // guard's delete is the cleanup or a harmless NotFound.
     drop(guard);
     if commit_lock.is_some() {
+        // A server's gc may have checked the cached copy and be about to delete what was just
+        // committed: the next run imports it again, after the eviction.
+        if crate::gc::eviction_pending(storage, key).await {
+            return Outcome::Failed {
+                reason: format!(
+                    "{}: a gc pass is evicting {key}; the next run imports it again",
+                    artifact.path
+                ),
+            };
+        }
         match storage.delete(&crate::registry::npm::origin_key(key)).await {
             Ok(()) | Err(crate::storage::StorageError::NotFound) => {}
             Err(e) => {
