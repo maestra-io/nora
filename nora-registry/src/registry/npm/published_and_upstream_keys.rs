@@ -1251,9 +1251,10 @@ async fn a_publish_over_a_packument_of_unknown_origin_waits_for_the_operator() {
         move |cfg| {
             cfg.npm.proxy = Some(uri);
             cfg.npm.import_embedded = vec!["corp-lib".to_string()];
-            cfg.curation.internal_namespaces = internal();
         },
     );
+    // Review R39: listing the name in `import_embedded` is enough, it need not also be in
+    // `curation.internal_namespaces`.
     assert_eq!(put(&allowed).await.status(), StatusCode::CREATED);
     assert_eq!(
         versions(&allowed, "/npm/corp-lib").await,

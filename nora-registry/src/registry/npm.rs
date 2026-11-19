@@ -3378,7 +3378,7 @@ async fn handle_publish(
         import_embedded: state.config.npm.import_embedded.contains(&package_name),
         internal: is_internal(&state, &package_name),
         max_document: max_document(&state),
-        max_packument: kib_limit(state.config.npm.max_packument_mb.saturating_mul(1024)),
+        max_packument: max_packument(&state),
     };
     if let Err(e) = publish_versions(
         &state.storage,
@@ -3415,13 +3415,17 @@ async fn handle_publish(
 /// A091: a name an upstream serves belongs to the upstream until it is published here. The
 /// first publish of such a name passes only when it is in `curation.internal_namespaces`;
 /// otherwise it is a 403 (with `curation.mode = "audit"`, a WARN only), and a 503 when the
-/// published versions cannot be listed. A name no upstream serves is anyone's to publish.
+/// published versions cannot be listed. A name no upstream serves is anyone's to publish, and
+/// so is one the operator lists in `npm.import_embedded` (a package published here before).
 async fn claim_publish(
     state: &AppState,
     user: &Option<Extension<AuthenticatedUser>>,
     name: &str,
 ) -> Result<(), Response> {
-    if state.config.npm.route(name).is_none() || is_internal(state, name) {
+    if state.config.npm.route(name).is_none()
+        || is_internal(state, name)
+        || state.config.npm.import_embedded.iter().any(|n| n == name)
+    {
         return Ok(());
     }
     match published_state(&state.storage, name).await {
@@ -3480,6 +3484,27 @@ fn kib_limit(kib: u64) -> usize {
 /// `npm.max_document_kb` in bytes.
 fn max_document(state: &AppState) -> usize {
     kib_limit(state.config.npm.max_document_kb)
+}
+
+/// `npm.max_packument_mb` in bytes.
+fn max_packument(state: &AppState) -> usize {
+    kib_limit(state.config.npm.max_packument_mb.saturating_mul(1024))
+}
+
+/// A092: the 413 for a packument over `max_packument` bytes.
+fn packument_too_large(
+    package_name: &str,
+    size: usize,
+    max_packument: usize,
+) -> (StatusCode, String) {
+    tracing::warn!(package = %package_name, bytes = size, "npm publish refused: packument over npm.max_packument_mb");
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!(
+            "the packument of {package_name} would be {size} bytes, over the {} MiB limit (npm.max_packument_mb, NORA_NPM_MAX_PACKUMENT_MB)",
+            max_packument / (1024 * 1024)
+        ),
+    )
 }
 
 /// A092: refuse a document a publish would store when it is over `max_document` bytes.
@@ -3905,14 +3930,10 @@ async fn write_publish(
         }
     };
     if policy.max_packument > 0 && bytes.len() > policy.max_packument {
-        tracing::warn!(package = %package_name, bytes = bytes.len(), "npm publish refused: packument over npm.max_packument_mb");
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
-                "the packument of {package_name} would be {} bytes, over the {} MiB limit (npm.max_packument_mb, NORA_NPM_MAX_PACKUMENT_MB)",
-                bytes.len(),
-                policy.max_packument / (1024 * 1024)
-            ),
+        return Err(packument_too_large(
+            package_name,
+            bytes.len(),
+            policy.max_packument,
         ));
     }
     if let Err(e) = store_assembled_packument(storage, package_name, &bytes).await {
@@ -4243,12 +4264,15 @@ async fn deprecate_versions(
     }
     let lock = state.publish_lock(&published_packument_key(name));
     let _guard = lock.lock().await;
+    // Each rewritten version document: (key, stored bytes, new bytes). Nothing is written
+    // until every one is within `max_document`.
+    let mut rewrites = Vec::new();
     for (ver, data) in versions {
         let key = format!("npm/{name}/versions/{ver}.json");
-        let Ok(stored) = state.storage.get(&key).await else {
+        let Ok(old) = state.storage.get(&key).await else {
             continue;
         };
-        let Ok(mut stored) = serde_json::from_slice::<serde_json::Value>(&stored) else {
+        let Ok(mut stored) = serde_json::from_slice::<serde_json::Value>(&old) else {
             continue;
         };
         let wanted = data
@@ -4270,14 +4294,48 @@ async fn deprecate_versions(
         } else {
             obj.insert("deprecated".into(), wanted.into());
         }
+        // A092: the document the message lands in stays within the bound, not only the
+        // message (a clear only shrinks it).
+        if !wanted.is_empty() {
+            if let Err(refused) =
+                check_document_size(&format!("version {ver}"), &stored, max_document(state))
+            {
+                return refused.into_response();
+            }
+        }
         let Ok(bytes) = serde_json::to_vec(&stored) else {
             continue;
         };
-        if state.storage.put(&key, &bytes).await.is_err() {
+        rewrites.push((key, old, bytes));
+    }
+    for (key, _, bytes) in &rewrites {
+        if state.storage.put(key, bytes).await.is_err() {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
-    if regenerate_packument(&state.storage, name).await.is_err() {
+    let packument = match assemble_packument(&state.storage, name).await {
+        Ok(bytes) => bytes,
+        Err(unassembled) => {
+            tracing::error!(registry = "npm", package = %name, reason = %unassembled, "packument not regenerated");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    // A092: a deprecate that grows the packument past `max_packument` is refused, and its
+    // documents put back; one that only shrinks it is let through (it is the way back under).
+    let grew = rewrites.iter().any(|(_, old, new)| new.len() > old.len());
+    let limit = max_packument(state);
+    if grew && limit > 0 && packument.len() > limit {
+        for (key, old, _) in &rewrites {
+            if let Err(e) = state.storage.put(key, old).await {
+                tracing::error!(key = %key, error = %e, "npm deprecate: failed to restore a version document");
+            }
+        }
+        return packument_too_large(name, packument.len(), limit).into_response();
+    }
+    if store_assembled_packument(&state.storage, name, &packument)
+        .await
+        .is_err()
+    {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     let actor = crate::auth::audit_actor(user);
