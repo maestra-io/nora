@@ -908,6 +908,8 @@ async fn build_suite(
     let mut matures_at: Option<i64> = None;
     let mut young: BTreeMap<String, BTreeMap<String, (String, String, i64)>> = BTreeMap::new();
     let mut served: HashSet<String> = HashSet::new();
+    // Upstream copy (when changed) and ledger of each index, written once the holds are.
+    let mut ledgers_out = Vec::new();
     // Indexes the upstream did not host this time: their holds stay (audit A049).
     let mut skipped: HashSet<String> = HashSet::new();
     // Every ledger of the repo: one pool file can be listed by several suites, components
@@ -1002,10 +1004,20 @@ async fn build_suite(
                 .filter(|s| first || now - s.first_seen < age)
                 .map(|s| s.filename.clone())
                 .collect();
-            let others: Vec<String> = ledgers.iter().filter(|k| **k != lkey).cloned().collect();
-            let earliest = earliest_seen(state, &others, &wanted)
+            // This build's earlier indexes count as rewritten, though written only later.
+            let pending = |k: &String| ledgers_out.iter().any(|(_, _, p, _)| p == k);
+            let others: Vec<String> = (ledgers.iter())
+                .filter(|k| **k != lkey && !pending(k))
+                .cloned()
+                .collect();
+            let mut earliest = earliest_seen(state, &others, &wanted)
                 .await
                 .map_err(BuildError::Internal)?;
+            for (_, _, k, l) in &ledgers_out {
+                if ledgers.contains(k) {
+                    merge_dates(&mut earliest, l, &wanted);
+                }
+            }
             for s in current_st.iter_mut().chain(retired.iter_mut()) {
                 if let Some(&t) = earliest.get(&s.filename) {
                     if first || t < s.first_seen {
@@ -1083,30 +1095,55 @@ async fn build_suite(
             (gz_sha, gz.len() as u64),
         );
         young.insert(format!("{suite}/{comp}/{arch}"), held);
-        if !unchanged {
-            state
-                .storage
-                .put(&ukey, &data)
-                .await
-                .map_err(|e| BuildError::Internal(e.to_string()))?;
-        }
         let ledger = Ledger {
             upstream: Some((path.clone(), hash)),
             seen,
             retired,
         };
-        put_json(state, &lkey, &ledger)
-            .await
-            .map_err(BuildError::Internal)?;
+        ledgers_out.push((ukey, (!unchanged).then_some(data), lkey, ledger));
     }
 
     if files.is_empty() {
         return Err(BuildError::Upstream(ProxyError::NotFound));
     }
     // Held versions first, so a direct package fetch is refused before apt can see them.
-    update_young(state, repo, suite, young, &skipped, min_age, now)
+    // Added to the current holds only: until the ledgers below are written, the old ones
+    // still date what a dropped hold covered (audit A044).
+    update_young(
+        state,
+        repo,
+        suite,
+        young.clone(),
+        &skipped,
+        min_age,
+        now,
+        true,
+    )
+    .await
+    .map_err(BuildError::Internal)?;
+    // Then the ledgers: a date the download gate reads always has its hold committed, a
+    // build failing earlier leaves its new files undated (audit A044).
+    for (ukey, data, lkey, ledger) in ledgers_out {
+        if let Some(data) = data {
+            state
+                .storage
+                .put(&ukey, &data)
+                .await
+                .map_err(|e| BuildError::Internal(e.to_string()))?;
+        }
+        put_json(state, &lkey, &ledger)
+            .await
+            .map_err(BuildError::Internal)?;
+    }
+    // The download gate's dated files follow the ledgers this build wrote; only then may
+    // the holds they no longer date go.
+    state.deb_dated.lock().remove(repo);
+    update_young(state, repo, suite, young, &skipped, min_age, now, false)
         .await
         .map_err(BuildError::Internal)?;
+    if let Err(e) = dated(state, repo).await {
+        tracing::warn!(repo, error = %e, "deb proxy: dated pool files not reloaded");
+    }
 
     let release = release_text(&rel, &state.config.deb.architectures, &files);
     let inrelease = signer.clearsign(&release).map_err(BuildError::Internal)?;
@@ -1230,21 +1267,29 @@ async fn earliest_seen(
         let Some(ledger) = read_json::<Ledger>(state, key).await? else {
             continue;
         };
-        let dates = ledger
-            .seen
-            .iter()
-            .map(|(f, t)| (f, *t))
-            .chain(ledger.retired.iter().map(|s| (&s.filename, s.first_seen)));
-        for (f, t) in dates {
-            if files.contains(f) {
-                let e = earliest.entry(f.clone()).or_insert(t);
-                *e = (*e).min(t);
-            }
-        }
+        merge_dates(&mut earliest, &ledger, files);
     }
     Ok(earliest)
 }
 
+/// Fold the dates `ledger` gives `files` into `earliest`.
+fn merge_dates(earliest: &mut HashMap<String, i64>, ledger: &Ledger, files: &HashSet<String>) {
+    let dates = ledger
+        .seen
+        .iter()
+        .map(|(f, t)| (f, *t))
+        .chain(ledger.retired.iter().map(|s| (&s.filename, s.first_seen)));
+    for (f, t) in dates {
+        if files.contains(f) {
+            let e = earliest.entry(f.clone()).or_insert(t);
+            *e = (*e).min(t);
+        }
+    }
+}
+
+/// Commit a build's holds of `suite`. With `merge` they are only added to the current ones:
+/// the ledgers that drop a hold's date are not written yet, so no hold may go (audit A044).
+#[allow(clippy::too_many_arguments)]
 async fn update_young(
     state: &AppState,
     repo: &str,
@@ -1253,6 +1298,7 @@ async fn update_young(
     skipped: &HashSet<String>,
     min_age: Option<i64>,
     since: i64,
+    merge: bool,
 ) -> Result<(), String> {
     let key = young_key(repo);
     let lock = state.publish_lock(&key);
@@ -1260,10 +1306,18 @@ async fn update_young(
     // An unreadable set fails the build: rewritten from empty it would drop every other
     // suite's holds (audit A043, A049).
     let mut young: Young = read_json(state, &key).await?.unwrap_or_default();
-    let prefix = format!("{suite}/");
-    young.retain(|k, _| !k.starts_with(&prefix) || skipped.contains(k));
     let mut held = held;
-    if min_age.is_some() {
+    if merge {
+        for (k, files) in std::mem::take(&mut held) {
+            if !files.is_empty() {
+                young.entry(k).or_default().extend(files);
+            }
+        }
+    } else {
+        let prefix = format!("{suite}/");
+        young.retain(|k, _| !k.starts_with(&prefix) || skipped.contains(k));
+    }
+    if !merge && min_age.is_some() {
         // Ledgers another build wrote after this one read them (a suite's first build
         // dates everything 0): under the lock, so that build's own update has run or
         // will run after this one and clear what it serves.
@@ -1349,6 +1403,142 @@ async fn load_young(state: &AppState, repo: &str) -> Result<Arc<Young>, String> 
         .lock()
         .insert(key, (Instant::now(), y.clone()));
     Ok(y)
+}
+
+/// Every pool file a ledger of `repo` dates (listed or retired). The cached set is reused
+/// for `YOUNG_TTL`, then only while the ledger listing is unchanged: another process's
+/// build can drop a date as well as add one.
+// ponytail: one in-memory set of every ledgered filename per repository (Ubuntu main +
+// universe is ~10^5 names, a few tens of MiB); an on-disk filename index if that grows.
+async fn dated(state: &AppState, repo: &str) -> Result<Arc<HashSet<String>>, String> {
+    let usable = || {
+        let cached = state.deb_dated.lock().get(repo).cloned();
+        match &cached {
+            Some((at, _, files)) if at.elapsed() < YOUNG_TTL => Ok(files.clone()),
+            _ => Err(cached),
+        }
+    };
+    if let Ok(files) = usable() {
+        return Ok(files);
+    }
+    // One reload per repository at a time: a burst of downloads after a restart parses the
+    // ledgers once.
+    let lock = state.publish_lock(&format!("{}/dated", meta(repo)));
+    let _g = lock.lock().await;
+    let cached = match usable() {
+        Ok(files) => return Ok(files),
+        Err(cached) => cached,
+    };
+    let listing: Vec<(String, u64, u64)> = state
+        .storage
+        .list_with_meta(&format!("{}/ledger/", meta(repo)))
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(k, m)| (k, m.size, m.modified))
+        .collect();
+    if let Some((_, seen, files)) = cached {
+        if seen == listing {
+            state
+                .deb_dated
+                .lock()
+                .insert(repo.to_string(), (Instant::now(), listing, files.clone()));
+            return Ok(files);
+        }
+    }
+    let mut files = HashSet::new();
+    for (key, ..) in &listing {
+        let Some(ledger) = read_json::<Ledger>(state, key).await? else {
+            continue;
+        };
+        files.extend(ledger.seen.into_keys());
+        files.extend(ledger.retired.into_iter().map(|s| s.filename));
+    }
+    let files = Arc::new(files);
+    state
+        .deb_dated
+        .lock()
+        .insert(repo.to_string(), (Instant::now(), listing, files.clone()));
+    // The holds are read again, none older than these ledgers: an older set is no fallback,
+    // it may lack the hold of a file they now date.
+    state.deb_young.lock().remove(&young_key(repo));
+    Ok(files)
+}
+
+/// What NORA knows of a pool file across every `[deb.proxies]` repository: one pool can be
+/// served through an entry other than the one whose suites list it.
+enum Sighting {
+    Held(String, String, i64),
+    Dated,
+    Undated,
+}
+
+/// The requesting repository decides a file it knows (its index may serve a file another
+/// entry still holds); otherwise any other repository's hold, then the date of one with
+/// the same upstream. `Err`: a hold set that cannot be read.
+async fn sighting(state: &AppState, repo: &str, path: &str) -> Result<Sighting, String> {
+    let proxies = &state.config.deb.proxies;
+    let upstream = |r: &str| proxies.get(r).map(|u| u.url().trim_end_matches('/'));
+    let others: Vec<&str> = (state.config.deb.proxies.keys())
+        .map(String::as_str)
+        .filter(|r| *r != repo)
+        .collect();
+    for repos in [&[repo][..], &others] {
+        // Dates before holds: a build commits its holds before its ledgers, so the holds
+        // read next cover every date read here.
+        let mut dates = false;
+        for r in repos {
+            // A date vouches only for the bytes of its own upstream: another can serve
+            // different ones under the same pool path. An unreadable ledger dates nothing.
+            if upstream(r) == upstream(repo) {
+                dates |= (dated(state, r).await).is_ok_and(|f| f.contains(path));
+            }
+        }
+        for r in repos {
+            if let Some((name, version, first_seen)) = load_young(state, r)
+                .await?
+                .values()
+                .find_map(|m| m.get(path))
+            {
+                return Ok(Sighting::Held(name.clone(), version.clone(), *first_seen));
+            }
+        }
+        if dates {
+            return Ok(Sighting::Dated);
+        }
+    }
+    Ok(Sighting::Undated)
+}
+
+/// Name and version of a pool `.deb` of a configured architecture or `all`; `None` for
+/// any other file (`.udeb`, other architectures), which keeps the first-sight rule.
+fn judged_package<'a>(path: &'a str, archs: &[String]) -> Option<(&'a str, &'a str)> {
+    let file = path.rsplit('/').next()?.strip_suffix(".deb")?;
+    let mut parts = file.splitn(3, '_');
+    let (name, version, arch) = (parts.next()?, parts.next()?, parts.next()?);
+    (arch == "all" || archs.iter().any(|a| a == arch)).then_some((name, version))
+}
+
+/// Refresh every suite NORA has built, of every repository, at once (each under its
+/// `metadata_ttl`, waiting at most `STALE_AFTER` on one with a previous build).
+async fn refresh_built_suites(state: &AppState) {
+    let mut refreshes = Vec::new();
+    for (repo, up) in &state.config.deb.proxies {
+        let Ok(keys) = state.storage.list(&format!("{}/dists/", meta(repo))).await else {
+            continue;
+        };
+        for key in keys {
+            let suite = key
+                .strip_prefix(&format!("{}/dists/", meta(repo)))
+                .and_then(|k| k.strip_suffix("/state.json"));
+            if let Some(suite) = suite.filter(|s| valid_token(s)).map(str::to_string) {
+                refreshes.push(async move {
+                    let _ = ensure_suite(state, repo, up, &suite).await;
+                });
+            }
+        }
+    }
+    futures::future::join_all(refreshes).await;
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -1455,25 +1645,54 @@ pub(crate) async fn serve(
     }
 }
 
-/// The curation check of a package download: a held version is refused (403 in
-/// enforce, logged in audit).
+/// The curation check of a package download, by the file's date (audit A044): a version
+/// any repository holds is refused (403 in enforce, logged in audit); one a ledger dates
+/// passes; a `.deb` of a configured architecture or `all` that no ledger dates, even after
+/// the built suites are refreshed, is judged by `[curation.deb] unknown_date`.
 pub(crate) async fn package_gate(
     state: &AppState,
     headers: &HeaderMap,
     repo: &str,
     path: &str,
 ) -> Option<Response> {
-    // Unknown holds: no download passes (audit A043).
-    let Ok(young) = load_young(state, repo).await else {
-        return Some(
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(header::RETRY_AFTER, "30")],
+    let mut found = sighting(state, repo, path).await;
+    let mut judged = None;
+    if matches!(found, Ok(Sighting::Undated)) {
+        judged = judged_package(path, &state.config.deb.architectures).filter(|_| {
+            state
+                .curation()
+                .curation_engine
+                .reads_release_date(RegistryType::Deb)
+        });
+        if judged.is_some() {
+            refresh_built_suites(state).await;
+            found = sighting(state, repo, path).await;
+        }
+    }
+    let (name, version, date) = match found {
+        // Unknown holds: no download passes (audit A043).
+        Err(_) => {
+            return Some(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::RETRY_AFTER, "30")],
+                )
+                    .into_response(),
             )
-                .into_response(),
-        );
+        }
+        Ok(Sighting::Held(name, version, first_seen)) => (name, version, Some(first_seen)),
+        Ok(Sighting::Dated) => return None,
+        Ok(Sighting::Undated) => {
+            let (name, version) = judged?;
+            tracing::warn!(repo, path, "[AUDIT] deb: undated pool file");
+            let date =
+                state
+                    .curation()
+                    .curation_engine
+                    .judged_release_date(RegistryType::Deb, true, None);
+            (name.to_string(), version.to_string(), date)
+        }
     };
-    let (name, version, first_seen) = young.values().find_map(|m| m.get(path))?.clone();
     let engine = &state.curation().curation_engine;
     crate::curation::check_download(
         engine,
@@ -1482,7 +1701,7 @@ pub(crate) async fn package_gate(
         RegistryType::Deb,
         &name,
         crate::curation::RequestVersion::Known(version),
-        Some(first_seen),
+        date,
     )
 }
 
@@ -1975,6 +2194,311 @@ mod integration_tests {
         );
     }
 
+    /// A filtered repo `debian` (min_release_age 3d, enforce) and a pool-only `pool` on the
+    /// same upstream; `unknown_date` for deb as given.
+    fn undated_ctx(
+        uri: String,
+        keydir: &tempfile::TempDir,
+        ttl: i64,
+        unknown: Option<crate::config::UnknownDate>,
+    ) -> TestContext {
+        undated_ctx_at(uri.clone(), uri, keydir, ttl, unknown)
+    }
+
+    /// `undated_ctx` with `pool` proxying `pool_uri`.
+    fn undated_ctx_at(
+        uri: String,
+        pool_uri: String,
+        keydir: &tempfile::TempDir,
+        ttl: i64,
+        unknown: Option<crate::config::UnknownDate>,
+    ) -> TestContext {
+        let dir = keydir.path().to_str().unwrap().to_string();
+        create_test_context_with_config(move |cfg| {
+            cfg.deb.enabled = true;
+            cfg.deb.metadata_ttl = ttl;
+            cfg.deb.upstream_keyring_dir = dir;
+            cfg.deb
+                .proxies
+                .insert("debian".into(), RepoProxyEntry::Simple(uri.clone()));
+            cfg.deb
+                .proxies
+                .insert("pool".into(), RepoProxyEntry::Simple(pool_uri));
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.deb.min_release_age = Some("3d".into());
+            cfg.curation.deb.quarantine = Some(QuarantineMode::Observe);
+            cfg.curation.deb.unknown_date = unknown;
+        })
+    }
+
+    async fn mount_pool(server: &MockServer, files: &[&str]) {
+        for f in files {
+            Mock::given(method("GET"))
+                .and(path(format!("/pool/main/{f}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(f.as_bytes().to_vec()))
+                .mount(server)
+                .await;
+        }
+    }
+
+    /// A044: a version published after NORA's last look at a suite is dated by a refresh
+    /// on its download and held, through the repo whose suite lists it and through
+    /// another entry serving the same pool; a file a ledger dates passes through both.
+    #[tokio::test]
+    async fn an_undated_pool_file_of_a_tracked_suite_is_refused() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        publish(&server, &key, &[("a", "1")]).await;
+        let ctx = undated_ctx(server.uri(), &keydir, 0, None);
+        served(&ctx).await;
+        publish(&server, &key, &[("a", "2")]).await;
+        mount_pool(&server, &["a_1_amd64.deb"]).await;
+        let get = |p: &'static str| send(&ctx.app, Method::GET, p, "");
+        let status = |p: &'static str| async move { get(p).await.status() };
+        assert_eq!(
+            status("/deb/debian/pool/main/a_2_amd64.deb").await,
+            StatusCode::FORBIDDEN,
+            "the suite was not asked for since a 2 appeared"
+        );
+        assert_eq!(
+            status("/deb/debian/pool/main/a_1_amd64.deb").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status("/deb/pool/pool/main/a_2_amd64.deb").await,
+            StatusCode::FORBIDDEN,
+            "another entry's hold applies to the same pool"
+        );
+        assert_eq!(
+            status("/deb/pool/pool/main/a_1_amd64.deb").await,
+            StatusCode::OK,
+            "another entry's ledger dates it"
+        );
+        // Once `pool`'s own suite has listed a 2 for 4 days, its index serves it: its own
+        // date decides over `debian`'s hold.
+        let ledger = super::Ledger {
+            upstream: None,
+            seen: [("pool/main/a_2_amd64.deb".to_string(), 0)].into(),
+            retired: Vec::new(),
+        };
+        let lkey = super::ledger_key("pool", "updates", "main", "amd64");
+        super::put_json(&ctx.state, &lkey, &ledger).await.unwrap();
+        ctx.state.deb_dated.lock().remove("pool");
+        assert_eq!(
+            status("/deb/pool/pool/main/a_2_amd64.deb").await,
+            StatusCode::OK,
+            "the requesting entry's own date decides"
+        );
+    }
+
+    /// A044: a `.deb` of a configured architecture or `all` that no ledger dates after the
+    /// refresh is judged by `unknown_date`: `hold` refuses it, `log` serves and counts it;
+    /// `.udeb` and other architectures keep the first-sight rule.
+    #[tokio::test]
+    async fn an_undated_pool_file_is_judged_by_unknown_date() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        publish(&server, &key, &[("a", "1")]).await;
+        mount_pool(
+            &server,
+            &[
+                "z_1_amd64.deb",
+                "x_1_all.deb",
+                "n_1_i386.deb",
+                "d_1_amd64.udeb",
+            ],
+        )
+        .await;
+        let hold = undated_ctx(
+            server.uri(),
+            &keydir,
+            3600,
+            Some(crate::config::UnknownDate::Hold),
+        );
+        served(&hold).await;
+        let status = |ctx: &TestContext, p: &str| {
+            let (app, p) = (ctx.app.clone(), p.to_string());
+            async move { send(&app, Method::GET, &p, "").await.status() }
+        };
+        for (p, want) in [
+            ("/deb/debian/pool/main/z_1_amd64.deb", StatusCode::FORBIDDEN),
+            ("/deb/pool/pool/main/x_1_all.deb", StatusCode::FORBIDDEN),
+            ("/deb/debian/pool/main/a_1_amd64.deb", StatusCode::OK),
+            ("/deb/debian/pool/main/n_1_i386.deb", StatusCode::OK),
+            ("/deb/debian/pool/main/d_1_amd64.udeb", StatusCode::OK),
+        ] {
+            assert_eq!(status(&hold, p).await, want, "{p}");
+        }
+
+        let log = undated_ctx(server.uri(), &keydir, 3600, None);
+        let counter =
+            crate::metrics::CURATION_UNKNOWN_RELEASE_DATE_TOTAL.with_label_values(&["deb"]);
+        let before = counter.get();
+        assert_eq!(
+            status(&log, "/deb/debian/pool/main/z_1_amd64.deb").await,
+            StatusCode::OK
+        );
+        assert!(counter.get() > before, "a logged undated file is counted");
+    }
+
+    /// A044: a build that fails before it commits its holds leaves the new versions it read
+    /// undated, so they are judged by `unknown_date`, never passed as dated.
+    #[tokio::test]
+    async fn a_failed_build_dates_nothing_it_did_not_hold() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        publish(&server, &key, &[("a", "1")]).await;
+        let ctx = undated_ctx(
+            server.uri(),
+            &keydir,
+            0,
+            Some(crate::config::UnknownDate::Hold),
+        );
+        served(&ctx).await;
+        publish(&server, &key, &[("a", "2")]).await;
+        // An unreadable hold set fails the next build when it commits its holds.
+        let ykey = super::young_key("debian");
+        let young = ctx.state.storage.get(&ykey).await.unwrap();
+        ctx.state.storage.put(&ykey, b"{").await.unwrap();
+        ctx.state.deb_young.lock().clear();
+        let up = ctx.state.config.deb.proxies["debian"].clone();
+        let _ = super::refresh_suite(&ctx.state, "debian", &up, "bookworm", false).await;
+        ctx.state.storage.put(&ykey, &young).await.unwrap();
+        ctx.state.deb_young.lock().clear();
+        ctx.state.deb_dated.lock().clear();
+        // The upstream index is gone: the download's refresh cannot date it either.
+        server.reset().await;
+        mount_pool(&server, &["a_2_amd64.deb"]).await;
+        let res = send(
+            &ctx.app,
+            Method::GET,
+            "/deb/debian/pool/main/a_2_amd64.deb",
+            "",
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Every cache entry of `map` read `YOUNG_TTL` ago or earlier.
+    fn age<K, A, B>(map: &mut std::collections::HashMap<K, (std::time::Instant, A, B)>) {
+        let long_ago = std::time::Instant::now()
+            .checked_sub(super::YOUNG_TTL * 2)
+            .unwrap();
+        for e in map.values_mut() {
+            e.0 = long_ago;
+        }
+    }
+
+    /// A044: a date another process's build dropped does not outlive `YOUNG_TTL` here.
+    #[tokio::test]
+    async fn a_dropped_date_leaves_the_cache() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        publish(&server, &key, &[("a", "1")]).await;
+        let hold = Some(crate::config::UnknownDate::Hold);
+        let ctx = undated_ctx(server.uri(), &keydir, 3600, hold);
+        served(&ctx).await;
+        mount_pool(&server, &["a_1_amd64.deb"]).await;
+        let p = "/deb/debian/pool/main/a_1_amd64.deb";
+        assert_eq!(
+            send(&ctx.app, Method::GET, p, "").await.status(),
+            StatusCode::OK
+        );
+        let lkey = super::ledger_key("debian", "bookworm", "main", "amd64");
+        super::put_json(&ctx.state, &lkey, &super::Ledger::default())
+            .await
+            .unwrap();
+        age(&mut ctx.state.deb_dated.lock());
+        assert_eq!(
+            send(&ctx.app, Method::GET, p, "").await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// A044: a build failing after it committed its holds keeps the holds its old ledgers
+    /// still date, though its new listing drops the package.
+    #[tokio::test]
+    async fn a_build_failing_before_its_ledgers_keeps_the_old_holds() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        publish(&server, &key, &[("a", "1")]).await;
+        let hold = Some(crate::config::UnknownDate::Hold);
+        let ctx = undated_ctx(server.uri(), &keydir, 0, hold);
+        served(&ctx).await;
+        let up = ctx.state.config.deb.proxies["debian"].clone();
+        publish(&server, &key, &[("a", "1"), ("a", "2")]).await;
+        super::refresh_suite(&ctx.state, "debian", &up, "bookworm", false)
+            .await
+            .unwrap();
+        publish(&server, &key, &[("b", "1")]).await;
+        // The upstream copy cannot be written: the build fails after its holds.
+        let ukey = super::upstream_copy_key("debian", "bookworm", "main", "amd64");
+        ctx.state.storage.delete(&ukey).await.unwrap();
+        ctx.state
+            .storage
+            .put(&format!("{ukey}/x"), b"")
+            .await
+            .unwrap();
+        let _ = super::refresh_suite(&ctx.state, "debian", &up, "bookworm", false).await;
+        mount_pool(&server, &["a_2_amd64.deb"]).await;
+        let p = "/deb/debian/pool/main/a_2_amd64.deb";
+        assert_eq!(
+            send(&ctx.app, Method::GET, p, "").await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// A044: ledgers that newly date a file are never paired with an older hold set read
+    /// before them: with the holds unreadable, the download waits.
+    #[tokio::test]
+    async fn new_dates_never_fall_back_on_older_holds() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        publish(&server, &key, &[("a", "1")]).await;
+        let ctx = undated_ctx(server.uri(), &keydir, 3600, None);
+        served(&ctx).await;
+        let file = "pool/main/a_2_amd64.deb";
+        let lkey = super::ledger_key("debian", "bookworm", "main", "amd64");
+        let mut ledger: super::Ledger = super::read_json(&ctx.state, &lkey).await.unwrap().unwrap();
+        ledger
+            .seen
+            .insert(file.to_string(), chrono::Utc::now().timestamp());
+        super::put_json(&ctx.state, &lkey, &ledger).await.unwrap();
+        let ykey = super::young_key("debian");
+        ctx.state.storage.put(&ykey, b"{").await.unwrap();
+        age(&mut ctx.state.deb_dated.lock());
+        mount_pool(&server, &["a_2_amd64.deb"]).await;
+        let res = send(&ctx.app, Method::GET, &format!("/deb/debian/{file}"), "").await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A044: another entry's date does not date a file of a different upstream: the same
+    /// pool path may name other bytes there.
+    #[tokio::test]
+    async fn another_upstreams_date_does_not_date_a_file() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        let other = MockServer::start().await;
+        publish(&server, &key, &[("a", "1")]).await;
+        let hold = Some(crate::config::UnknownDate::Hold);
+        let ctx = undated_ctx_at(server.uri(), other.uri(), &keydir, 3600, hold);
+        served(&ctx).await;
+        mount_pool(&server, &["a_1_amd64.deb"]).await;
+        mount_pool(&other, &["a_1_amd64.deb"]).await;
+        let status = |p: &'static str| {
+            let app = ctx.app.clone();
+            async move { send(&app, Method::GET, p, "").await.status() }
+        };
+        assert_eq!(
+            status("/deb/debian/pool/main/a_1_amd64.deb").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status("/deb/pool/pool/main/a_1_amd64.deb").await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
     /// jammy-updates and jammy-security list one pool file, days apart (issues-maestra#1649);
     /// here under different components, as an `_all.deb` is under different architectures.
     #[tokio::test]
@@ -2108,15 +2632,25 @@ mod integration_tests {
             &none,
             age,
             now + 3600,
+            false,
         )
         .await
         .unwrap();
         let young = super::load_young(state, "debian").await.unwrap();
         assert!(young["security/main/amd64"].contains_key(&f));
         // Written during the build: the hold goes, but not the one on an internal name.
-        super::update_young(state, "debian", "security", held(now), &none, age, now)
-            .await
-            .unwrap();
+        super::update_young(
+            state,
+            "debian",
+            "security",
+            held(now),
+            &none,
+            age,
+            now,
+            false,
+        )
+        .await
+        .unwrap();
         let young = super::load_young(state, "debian").await.unwrap();
         let files = &young["security/main/amd64"];
         assert!(!files.contains_key(&f), "{files:?}");
@@ -3168,7 +3702,7 @@ mod integration_tests {
         let none = std::collections::HashSet::new();
         let held = Default::default();
         assert!(
-            super::update_young(state, "debian", "bookworm", held, &none, None, 0)
+            super::update_young(state, "debian", "bookworm", held, &none, None, 0, false)
                 .await
                 .is_err()
         );

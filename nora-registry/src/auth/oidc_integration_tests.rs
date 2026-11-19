@@ -215,6 +215,7 @@ fn create_oidc_test_context_with(
         cancel_token: tokio_util::sync::CancellationToken::new(),
         nuget_hosted: Default::default(),
         deb_young: Default::default(),
+        deb_dated: Default::default(),
         pull_stats: std::sync::Arc::new(crate::registry::docker::PullStatsAccumulator::default()),
         tasks: ctx.state.tasks.clone(),
         maintenance: ctx.state.maintenance.clone(),
