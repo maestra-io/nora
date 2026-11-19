@@ -2259,6 +2259,9 @@ mod a063_unanswered_date_lookup {
         let upstream = MockServer::start().await;
         versions(&upstream, "r429", ResponseTemplate::new(429)).await;
         versions(&upstream, "r503", ResponseTemplate::new(503)).await;
+        versions(&upstream, "r451", ResponseTemplate::new(451)).await;
+        versions(&upstream, "r408", ResponseTemplate::new(408)).await;
+        versions(&upstream, "r404", ResponseTemplate::new(404)).await;
         versions(
             &upstream,
             "html",
@@ -2327,6 +2330,23 @@ mod a063_unanswered_date_lookup {
             serde_json::from_slice(&ctx.state.storage.get("gems/dates/old.json").await.unwrap())
                 .unwrap();
         assert_eq!(kept.get("1.0.0"), Some(&1_577_836_800));
+    }
+
+    /// R40: a 4xx other than 404 (a 451, a 408) answers nothing about the name: held under
+    /// `hold` like a 5xx. A 404 is an answer without the version: left undated, served.
+    #[tokio::test]
+    async fn only_a_404_is_an_answer() {
+        let (upstream, ctx) = upstream_and_nora(true).await;
+        for uri in ["/gems/gems/r451-1.0.0.gem", "/gems/gems/r408-1.0.0.gem"] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
+        assert!(
+            files_asked(&upstream).await.is_empty(),
+            "a held file was fetched"
+        );
+        let resp = send(&ctx.app, Method::GET, "/gems/gems/r404-1.0.0.gem", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// `log` (the gems default) serves it, and counts it.

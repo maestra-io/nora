@@ -213,31 +213,77 @@ async fn store_pub_listing(
 }
 
 /// Fetch `package`'s listing from the upstream and store it, whatever the stored copy's
-/// freshness: the archive download asks for it when the stored listing does not date the
-/// version (A077). Best-effort: a failed fetch leaves the stored copy as it is.
-async fn refresh_pub_listing(state: &AppState, package: &str) {
-    let Some(proxy_url) = &state.config.pub_dart.proxy else {
-        return;
+/// freshness: the archive download asks for it when the stored listing does not date
+/// `version` (A077). Best-effort: a failed fetch leaves the stored copy as it is.
+/// Memoised (`upstream_dates`, R43): a refresh that lists `version`, dated or not, is not
+/// repeated for `metadata_ttl` (an upstream that never sends `published` is asked once, not on
+/// every download); one that does not list it, or failed, is repeated at most once a minute.
+/// True when a refresh not listing `version` was reused without asking (R01).
+async fn refresh_pub_listing(state: &AppState, package: &str, version: &str) -> bool {
+    let Some(proxy_url) = state.config.pub_dart.proxy.clone() else {
+        return false;
     };
-    let fetched = proxy_fetch_conditional(
-        &state.http_client,
-        &listing_url(proxy_url, package),
-        Duration::from_secs(state.config.pub_dart.proxy_timeout),
-        expose_opt(&state.config.pub_dart.proxy_auth).map(UpstreamAuth::Basic),
-        &Validators::default(),
-        &state.circuit_breaker,
+    let ttl = Duration::from_secs(state.config.pub_dart.metadata_ttl.max(0) as u64);
+    let wanted = crate::curation::curation_version(RegistryType::PubDart, version);
+    let fetching = state.clone();
+    let package_owned = package.to_owned();
+    let answer = super::upstream_dates::dates(
+        state,
         RegistryType::PubDart,
+        &format!("{proxy_url}#{package}"),
+        ttl,
+        &[&wanted],
+        move || async move {
+            let state = &fetching;
+            let package = package_owned.as_str();
+            let fetched = proxy_fetch_conditional(
+                &state.http_client,
+                &listing_url(&proxy_url, package),
+                Duration::from_secs(state.config.pub_dart.proxy_timeout),
+                expose_opt(&state.config.pub_dart.proxy_auth).map(UpstreamAuth::Basic),
+                &Validators::default(),
+                &state.circuit_breaker,
+                RegistryType::PubDart,
+            )
+            .await;
+            match fetched {
+                Ok(Revalidation::Modified { body, validators }) => {
+                    let listed = listed_versions(&body);
+                    store_pub_listing(state, package, body, &validators).await;
+                    Some(listed)
+                }
+                Ok(Revalidation::NotModified) => None,
+                Err(e) => {
+                    tracing::warn!(package, error = ?e, "pub listing refresh for a release date failed");
+                    None
+                }
+            }
+        },
     )
     .await;
-    match fetched {
-        Ok(Revalidation::Modified { body, validators }) => {
-            store_pub_listing(state, package, body, &validators).await;
-        }
-        Ok(Revalidation::NotModified) => {}
-        Err(e) => {
-            tracing::warn!(package, error = ?e, "pub listing refresh for a release date failed")
-        }
-    }
+    answer.unasked
+}
+
+/// The versions a pub listing names, by their curation key, for the refresh memo: the value is
+/// the row's `published`, 0 when it has none. Only which versions are listed is read from it;
+/// the release date is read from the stored listing.
+fn listed_versions(body: &[u8]) -> super::upstream_dates::Dates {
+    let json: Value = serde_json::from_slice(body).unwrap_or_default();
+    let rows = json.get("versions").and_then(Value::as_array);
+    rows.into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let version = row.get("version")?.as_str()?;
+            let published = row
+                .get("published")
+                .and_then(Value::as_str)
+                .and_then(crate::curation::parse_iso8601_to_unix);
+            Some((
+                crate::curation::curation_version(RegistryType::PubDart, version),
+                published.unwrap_or(0),
+            ))
+        })
+        .collect()
 }
 
 async fn package_listing(
@@ -583,8 +629,9 @@ async fn download_archive(
             .curation()
             .curation_engine
             .reads_release_date(crate::curation::RegistryType::PubDart);
+    let mut unasked = false;
     if publish_date.is_none() && judged {
-        refresh_pub_listing(&state, &package).await;
+        unasked = refresh_pub_listing(&state, &package, version).await;
         publish_date = extract_pub_publish_date(&state.storage, &package, version, trust).await;
     }
 
@@ -596,7 +643,12 @@ async fn download_archive(
             crate::curation::RegistryType::PubDart,
             &package,
             crate::curation::RequestVersion::Known(version.to_string()),
-            if judged {
+            if judged && unasked && publish_date.is_none() {
+                state
+                    .curation()
+                    .curation_engine
+                    .unasked_release_date(crate::curation::RegistryType::PubDart, trust)
+            } else if judged {
                 state.curation().curation_engine.judged_release_date(
                     crate::curation::RegistryType::PubDart,
                     trust,
@@ -2450,6 +2502,40 @@ mod release_date_refresh {
         let (_up, ctx) = context(r#"{"version":"3.2.1"}"#, None).await;
         let resp = send(&ctx.app, Method::GET, ARCHIVE, "").await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    fn listing_fetches(asked: &[String]) -> usize {
+        asked.iter().filter(|p| *p == "/api/packages/vpkg").count()
+    }
+
+    /// R43: an upstream that lists the version without `published` is asked once for the
+    /// listing, not again on every download of the archive.
+    #[tokio::test]
+    async fn an_undated_listing_is_not_fetched_on_every_download() {
+        let (up, ctx) = context(r#"{"version":"3.2.1"}"#, None).await;
+        for _ in 0..3 {
+            let resp = send(&ctx.app, Method::GET, ARCHIVE, "").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        let asked = crate::test_helpers::upstream_paths(&up).await;
+        assert_eq!(listing_fetches(&asked), 1, "{asked:?}");
+    }
+
+    /// R43 with R01: a version a refresh did not list is not refreshed again within the
+    /// minute; until it is, it is held as released now, whatever `unknown_date` says.
+    #[tokio::test]
+    async fn a_version_the_last_refresh_did_not_list_is_held_until_the_next() {
+        let (up, ctx) = context(
+            r#"{"version":"1.0.0","published":"2019-01-01T00:00:00.000Z"}"#,
+            None,
+        )
+        .await;
+        let resp = send(&ctx.app, Method::GET, ARCHIVE, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "asked: not listed, log");
+        let resp = send(&ctx.app, Method::GET, ARCHIVE, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "unasked: held");
+        let asked = crate::test_helpers::upstream_paths(&up).await;
+        assert_eq!(listing_fetches(&asked), 1, "{asked:?}");
     }
 
     #[tokio::test]

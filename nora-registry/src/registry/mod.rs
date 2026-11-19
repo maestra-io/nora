@@ -840,6 +840,7 @@ where
         extra_headers,
         (extract, |_: &reqwest::Response| None),
         (cb, scope.into()),
+        false,
     )
     .await
 }
@@ -857,6 +858,7 @@ async fn proxy_fetch_core_with<T, F, Fut, R>(
     extra_headers: Option<(&str, &str)>,
     reading: (F, R),
     breaker: (&CircuitBreakerRegistry, BreakerScope<'_>),
+    only_404: bool,
 ) -> Result<T, ProxyError>
 where
     F: Fn(reqwest::Response) -> Fut + Copy,
@@ -873,13 +875,15 @@ where
         extra_headers,
         reading,
         breaker,
+        only_404,
     )
     .await
 }
 
 /// [`proxy_fetch_core_with`] with the `Authorization` value already built: what a fetch
 /// that outlives its request (a detached artifact fill) owns instead of the borrowed
-/// credential.
+/// credential. With `only_404`, a 4xx [`upstream_4xx`] calls not-found is `Upstream(status)`
+/// unless it is a 404: a lookup that reads not-found as an answer takes no other 4xx as one.
 #[allow(clippy::too_many_arguments)]
 async fn proxy_fetch_prepared<T, F, Fut, R>(
     client: &reqwest::Client,
@@ -890,6 +894,7 @@ async fn proxy_fetch_prepared<T, F, Fut, R>(
     extra_headers: Option<(&str, &str)>,
     (extract, redirected): (F, R),
     (cb, scope): (&CircuitBreakerRegistry, BreakerScope<'_>),
+    only_404: bool,
 ) -> Result<T, ProxyError>
 where
     F: Fn(reqwest::Response) -> Fut + Copy,
@@ -984,6 +989,9 @@ where
                     // is a no-op in Closed, so a 4xx never clears a real failure
                     // tally (#606). A 429 is the exception: back off.
                     let mut err = upstream_4xx(status, response.headers());
+                    if only_404 && status != 404 && matches!(err, ProxyError::NotFound) {
+                        err = ProxyError::Upstream(status);
+                    }
                     if matches!(err, ProxyError::RateLimited(_)) {
                         cb.record_failure(&cb_key, probe);
                     } else {
@@ -1128,20 +1136,37 @@ pub(crate) async fn proxy_fetch_capped(
     scope: impl Into<BreakerScope<'_>>,
     cap: u64,
 ) -> Result<Bytes, ProxyError> {
-    proxy_fetch_core(
+    proxy_fetch_capped_as(client, url, timeout, auth, (cb, scope.into()), cap, false).await
+}
+
+/// [`proxy_fetch_capped`] whose only not-found is a 404 (`only_404` of
+/// [`proxy_fetch_prepared`]): for a lookup that takes not-found as an answer (R40).
+pub(crate) async fn proxy_fetch_capped_as(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    breaker: (&CircuitBreakerRegistry, BreakerScope<'_>),
+    cap: u64,
+    only_404: bool,
+) -> Result<Bytes, ProxyError> {
+    proxy_fetch_core_with(
         client,
         url,
         timeout,
         false,
         auth,
         None,
-        // The caller's cap, never above `server.proxy_max_buffered_mb`.
-        move |r| async move {
-            let cap = cap.min(MAX_BUFFERED_BODY.load(std::sync::atomic::Ordering::Relaxed));
-            read_capped(r, cap).await.map(Bytes::from)
-        },
-        cb,
-        scope,
+        (
+            // The caller's cap, never above `server.proxy_max_buffered_mb`.
+            move |r| async move {
+                let cap = cap.min(MAX_BUFFERED_BODY.load(std::sync::atomic::Ordering::Relaxed));
+                read_capped(r, cap).await.map(Bytes::from)
+            },
+            |_: &reqwest::Response| None,
+        ),
+        breaker,
+        only_404,
     )
     .await
 }
@@ -2013,6 +2038,7 @@ fn owned_artifact_fetch(
                 },
             ),
             (&state.circuit_breaker, scope),
+            false,
         )
         .await
     })

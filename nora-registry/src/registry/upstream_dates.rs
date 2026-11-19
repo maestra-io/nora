@@ -139,7 +139,8 @@ fn make_room(keys: &mut HashMap<String, (Stamp, Lookup)>, kept_for: Duration) {
 }
 
 /// GET `url` of `upstream` for a date lookup: at most [`MAX_BODY`], on the breaker
-/// `<upstream>#dates`.
+/// `<upstream>#dates`. Only a 404 is `NotFound`: any other 4xx (a 400, 410, 451, a block)
+/// answers nothing about the name, and is `Upstream(status)` (R40).
 pub(super) async fn get(
     state: &AppState,
     registry: RegistryType,
@@ -148,14 +149,17 @@ pub(super) async fn get(
     timeout: Duration,
 ) -> Result<axum::body::Bytes, ProxyError> {
     let scope = format!("{}#dates", upstream.trim_end_matches('/'));
-    let fetched = super::proxy_fetch_capped(
+    let fetched = super::proxy_fetch_capped_as(
         &state.http_client,
         url,
         timeout,
         None,
-        &state.circuit_breaker,
-        BreakerScope::upstream(registry, &scope),
+        (
+            &state.circuit_breaker,
+            BreakerScope::upstream(registry, &scope),
+        ),
         MAX_BODY,
+        true,
     )
     .await;
     if let Err(e) = &fetched {
