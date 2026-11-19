@@ -132,8 +132,9 @@ serves is dropped.
    repository (a pool can be served through an entry other than the one whose suites
    list it, such as a `debian-archive-security` beside `debian-security`). A file any
    repository holds is refused (403, curation `enforce`; logged in `audit`), unless a
-   published suite serves that file: apt found it in that suite's index. A file a ledger
-   dates passes. A `.deb` of a configured architecture or `_all` that no ledger dates
+   published suite serves that file: apt found it in that suite's index. A file dated by
+   a ledger of the requesting repository, or of another entry with the same upstream URL,
+   passes: another upstream may serve other bytes under the same pool path. A `.deb` of a configured architecture or `_all` that no ledger dates
    (a version published after NORA's last look at its suite, or a suite NORA never
    built) first refreshes every suite NORA has built (each under `metadata_ttl`, at once,
    waiting at most 10 s on one with a previous build), then is judged by
