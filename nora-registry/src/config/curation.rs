@@ -109,6 +109,8 @@ impl std::str::FromStr for UnknownDate {
 ///   `_UNKNOWN_DATE` — per-registry overrides
 /// - `NORA_CURATION_<REGISTRY>_ALLOW` — comma-separated `allow` entries exempt from
 ///   `min_release_age` (e.g., `NORA_CURATION_NUGET_ALLOW=Newtonsoft.Json@13.0.4,Microsoft.NETCore.*`)
+/// - `NORA_CURATION_DOCKER_QUARANTINE_OBSERVE_FALLBACK` — `[curation.docker]
+///   quarantine_observe_fallback` (default: false)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurationConfig {
     #[serde(default)]
@@ -211,6 +213,12 @@ pub struct RegistryCurationOverride {
     /// [`UnknownDate`]. Reloaded on SIGHUP.
     #[serde(default)]
     pub unknown_date: Option<UnknownDate>,
+    /// Docker only (`[curation.docker]`; validation refuses it elsewhere): under
+    /// `quarantine = "observe"`, a tag that moved to a held digest answers with the copy
+    /// NORA admitted for it, as `enforce` does, instead of the held digest. A tag with no
+    /// admitted copy and a digest request are served as under observe: never a 403.
+    #[serde(default)]
+    pub quarantine_observe_fallback: bool,
 }
 
 impl Default for CurationConfig {
@@ -350,10 +358,15 @@ impl CurationConfig {
                 unknown_date: _,
                 quarantine,
                 quarantine_ttl,
+                quarantine_observe_fallback,
             } = own;
             settings.push((
                 format!("curation.{rt}.quarantine"),
                 format!("{quarantine:?}"),
+            ));
+            settings.push((
+                format!("curation.{rt}.quarantine_observe_fallback"),
+                format!("{quarantine_observe_fallback:?}"),
             ));
             settings.push((
                 format!("curation.{rt}.quarantine_ttl"),
@@ -504,8 +517,27 @@ impl CurationConfig {
                     .collect();
             }
         }
+        if let Ok(val) = env::var("NORA_CURATION_DOCKER_QUARANTINE_OBSERVE_FALLBACK") {
+            self.docker.quarantine_observe_fallback = val.to_lowercase() == "true" || val == "1";
+        }
 
         Ok(())
+    }
+
+    /// `quarantine_observe_fallback` set in a section other than `[curation.docker]`, where
+    /// nothing reads it.
+    pub fn observe_fallback_errors(&self) -> Vec<String> {
+        RegistryType::all()
+            .iter()
+            .filter(|&&rt| rt != RegistryType::Docker)
+            .filter(|&&rt| {
+                self.registry_override(rt)
+                    .is_some_and(|s| s.quarantine_observe_fallback)
+            })
+            .map(|rt| {
+                format!("curation.{rt}.quarantine_observe_fallback is read only under [curation.docker]")
+            })
+            .collect()
     }
 
     /// Every `min_release_age` and `quarantine_ttl`, global and per registry, that

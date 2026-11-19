@@ -3105,10 +3105,16 @@ async fn try_fetch_and_cache(
                         .filter(|_| held)
                         .filter(|(copy, _)| admitted_copy(state, reference, copy, &digest, q_secs));
                     keep_tag_copy = admitted.is_some();
+                    // `quarantine_observe_fallback`: observe answers a moved tag with its
+                    // admitted copy as enforce does; with none it serves, never a 403.
+                    let observe_fallback = !enforce
+                        && admitted.is_some()
+                        && state.config.curation.docker.quarantine_observe_fallback;
                     if held && !reference.starts_with("sha256:") {
                         let outcome = match (enforce, admitted.is_some()) {
                             (true, true) => "fallback",
                             (true, false) => "blocked",
+                            (false, true) if observe_fallback => "observe_fallback",
                             (false, true) => "would_fallback",
                             (false, false) => "would_block",
                         };
@@ -3125,7 +3131,8 @@ async fn try_fetch_and_cache(
                     }
                     // In enforce mode, still cache by digest, but the client gets the tag's
                     // admitted copy or a refusal. The tag copy stays: it is the fallback.
-                    if enforce && held {
+                    // `observe_fallback` takes the same branch, always with a copy.
+                    if (enforce || observe_fallback) && held {
                         let storage = state.storage.clone();
                         let key_clone = manifest_key(cache_ns, name, &digest);
                         let repo_index = Arc::clone(&state.repo_index);
