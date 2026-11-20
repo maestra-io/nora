@@ -120,8 +120,15 @@ is held for the TTL from its first pull.
 A ledger entry older than 90 days is pruned at boot, and a registry date that old is never
 written, so after a restart a cached manifest of an old image has no record. Serving such a
 proxied copy admits what it names, so an uncached blob of it does not start a new TTL. A
-manifest still held, a local push, and any manifest while the ledger is loading or could not
-be read whole (a failed listing, an unreadable entry) admit nothing.
+manifest still held, a local push, and a manifest with no record while the ledger is loading
+or could not be read whole (a failed listing, an unreadable entry) admit nothing.
+
+Serving an admitted manifest that has a record dates what it names with it, and stores that
+date (`<digest>.dated`). This includes a child with a later entry of its own, for example a
+layer first fetched by a pod that could not read the ledger. Without the stored date, such a
+child would be held as new after every restart. While the ledger loads, a digest with no
+record in memory is judged by its stored entry and its `.dated` date together, the earlier
+one winning, as the load does.
 
 ### A floating tag under enforce
 
