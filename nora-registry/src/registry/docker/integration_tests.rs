@@ -6321,21 +6321,26 @@ mod trust_upstream_dates {
     ) -> TestContext {
         let url = server.uri();
         create_test_context_with_config(move |cfg| {
-            cfg.docker.upstreams = vec![DockerUpstream {
-                trust_upstream_dates: trust,
-                date_token_file: None,
-                token_hosts: Vec::new(),
-                url: url.clone(),
-                auth: None,
-                auth_env: None,
-                namespace: Some("quay.io".into()),
-                prefix: None,
-                namespaces: Vec::new(),
-            }];
-            cfg.curation.quarantine = Some(mode);
-            cfg.curation.quarantine_ttl = Some("3d".to_string());
+            configure(cfg, url, trust, mode);
             extra(cfg);
         })
+    }
+
+    /// The upstream at `url` as quay.io, quarantine `mode` with a 3-day TTL.
+    fn configure(cfg: &mut crate::config::Config, url: String, trust: bool, mode: QuarantineMode) {
+        cfg.docker.upstreams = vec![DockerUpstream {
+            trust_upstream_dates: trust,
+            date_token_file: None,
+            token_hosts: Vec::new(),
+            url,
+            auth: None,
+            auth_env: None,
+            namespace: Some("quay.io".into()),
+            prefix: None,
+            namespaces: Vec::new(),
+        }];
+        cfg.curation.quarantine = Some(mode);
+        cfg.curation.quarantine_ttl = Some("3d".to_string());
     }
 
     /// Observe with `[curation.docker] quarantine_observe_fallback = true`.
@@ -7506,6 +7511,65 @@ mod trust_upstream_dates {
         ] {
             assert_eq!(get(&ctx, &rest).await, StatusCode::OK, "{rest}");
         }
+    }
+
+    /// #1649: a layer first fetched by a pod that could not read the ledger has its own later
+    /// entry under an image dated long before. Serving the admitted manifest dates the layer
+    /// with it in storage, so a restart (while the ledger loads, and once it is loaded) does
+    /// not hold the cached layer as new.
+    #[tokio::test]
+    async fn an_admitted_manifest_dates_a_later_child_across_a_restart() {
+        let (server, image, layer) = upstream_with_image().await;
+        let ctx = context(&server, false, QuarantineMode::Enforce);
+        let storage = ctx.state.storage.clone();
+        storage
+            .put(
+                &manifest_key(Some("quay.io"), "library/demo", &sha(&image)),
+                &image,
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                &super::super::blob_key(Some("quay.io"), "library/demo", &sha(&layer)),
+                &layer,
+            )
+            .await
+            .unwrap();
+        let holders = storage.holders();
+        for (digest, at) in [(sha(&image), days_ago(30)), (sha(&layer), days_ago(1))] {
+            let entry = serde_json::json!({
+                "registry": "docker", "digest": digest, "first_seen": at, "upstream": "up"
+            });
+            storage
+                .put(
+                    &format!(".nora-quarantine/docker/{digest}"),
+                    entry.to_string().as_bytes(),
+                )
+                .await
+                .unwrap();
+            ctx.state
+                .digest_store
+                .record("docker", &digest, "up", Some(at));
+        }
+        let manifest = format!("manifests/{}", sha(&image));
+        assert_eq!(get(&ctx, &manifest).await, StatusCode::OK);
+        crate::test_helpers::background_writes_done(&storage, holders).await;
+
+        // A restart while the ledger loads: the cached layer is judged by what is stored.
+        let restarted = crate::test_helpers::create_test_context_with_storage_and_config(
+            storage.clone(),
+            |cfg| configure(cfg, server.uri(), false, QuarantineMode::Enforce),
+        );
+        restarted.state.digest_store.set_loaded(false);
+        let blob = format!("blobs/{}", sha(&layer));
+        assert_eq!(get(&restarted, &blob).await, StatusCode::OK);
+        // A restart: the ledger loaded from storage.
+        let reloaded = crate::digest_quarantine::DigestStore::load(storage, "/nonexistent").await;
+        assert_eq!(
+            reloaded.check("docker", &sha(&layer), 3 * 86400),
+            QuarantineStatus::Mature
+        );
     }
 
     /// A copy still held admits nothing, under observe too, where it is served.

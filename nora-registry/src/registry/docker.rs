@@ -1271,14 +1271,23 @@ pub(crate) fn named_digests(manifest: &[u8]) -> Vec<String> {
     named
 }
 
-/// Admit what a cached proxied manifest names when the manifest itself is admitted. A
-/// ledger entry past 90 days is pruned at boot, or never written for a registry date that
-/// old, so after a restart the manifest serves with no record while an uncached blob of it
-/// would read as new and start a fresh TTL. The date is past the prune line, so nothing is
-/// persisted, and `record` leaves a digest with its own record alone. Not for a local push
-/// (`ns` is `None`: a push never matures a proxy digest), a manifest still held, or a
-/// ledger not read whole (loading, or failed in part), where a held manifest has no record
-/// either.
+/// Admit what a cached proxied manifest names when the manifest itself is admitted.
+///
+/// A manifest with its record dates its children with it, persisted: a child whose own
+/// entry is later (first fetched by a pod that could not read the ledger) would read as new
+/// after every restart, while the ledger loads and once the load returns that entry (#1649:
+/// a hashicorp/vault:2.2.1 layer, first fetched 18.11.2026 under an image dated 22.10, held
+/// in the first minute of each start). A recorded admitted manifest stays admitted (a date
+/// only ever moves back), so this holds while the ledger loads too.
+///
+/// A manifest with no record: its entry is past 90 days and pruned at boot, or was never
+/// written for a registry date that old, so an uncached blob of it would read as new and
+/// start a fresh TTL. Its children are dated past the prune line, in memory only, and
+/// `record` leaves a digest with its own record alone. Only once the ledger is read whole:
+/// before that, a held manifest has no record either.
+///
+/// Not for a local push (`ns` is `None`: a push never matures a proxy digest) or a manifest
+/// still held.
 fn quarantine_readmit_referenced(
     state: &AppState,
     manifest: &[u8],
@@ -1286,7 +1295,7 @@ fn quarantine_readmit_referenced(
     ns: Option<&str>,
 ) {
     let (q_mode, q_secs) = resolve_quarantine(state);
-    let Some(ns) = ns.filter(|_| state.digest_store.loaded()) else {
+    let Some(ns) = ns else {
         return;
     };
     if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off)
@@ -1297,8 +1306,15 @@ fn quarantine_readmit_referenced(
     {
         return;
     }
-    let long_ago = chrono::Utc::now().timestamp() - crate::digest_quarantine::PRUNE_TTL_SECS - 1;
-    quarantine_record_referenced(state, manifest, ns, long_ago, false);
+    let cutoff = chrono::Utc::now().timestamp() - crate::digest_quarantine::PRUNE_TTL_SECS;
+    match state.digest_store.first_seen("docker", digest) {
+        // (a record past the prune line: one this dated in memory, an index's platform)
+        Some(at) => quarantine_record_referenced(state, manifest, ns, at, at >= cutoff),
+        None if state.digest_store.loaded() => {
+            quarantine_record_referenced(state, manifest, ns, cutoff - 1, false);
+        }
+        None => {}
+    }
 }
 
 /// Whether `copy`, the cached answer for tag `reference`, may stand in for `held`, the

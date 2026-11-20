@@ -304,10 +304,17 @@ impl DigestStore {
         tokio::time::timeout(wait, done.cancelled()).await.is_ok()
     }
 
-    /// Read `digest`'s own entry object (one GET) and keep it in memory when found, for a
-    /// ledger that is not in memory whole. `Err` when the store could not answer.
+    /// Read `digest`'s own entry object and its `.dated` move (two GETs) and keep the earlier
+    /// date in memory, as the load does, for a ledger that is not in memory whole. `Err` when
+    /// the store could not answer.
     async fn read_through(&self, registry: &str, digest: &str) -> Result<(), StorageError> {
-        if let Some(stored) = fetch_entry(&self.storage, &object_key(registry, digest)).await? {
+        let key = object_key(registry, digest);
+        let dated = format!("{key}.dated");
+        let (entry, dated) = tokio::join!(
+            fetch_entry(&self.storage, &key),
+            fetch_entry(&self.storage, &dated)
+        );
+        for stored in [entry?, dated?].into_iter().flatten() {
             adopt(&self.entries, stored);
         }
         Ok(())
@@ -316,7 +323,7 @@ impl DigestStore {
     /// [`Self::read_through`] for a digest with no record while the ledger is not in memory
     /// whole (loading, or a walk that failed or timed out): a cache hit is judged by its own
     /// entry, never served as unrecorded. No-op once loaded or for a digest it knows.
-    // ponytail: a missing entry is not remembered, so an unrecorded digest costs one GET per
+    // ponytail: a missing entry is not remembered, so an unrecorded digest costs two GETs per
     // request while unloaded; cache negative lookups if the R2 cost shows up.
     pub(crate) async fn read_unknown(
         &self,
@@ -386,8 +393,9 @@ impl DigestStore {
     ///
     /// `persist` writes a move to [`dated_key`]: the entry object stays the first writer's,
     /// and a boot reads it from the snapshot, so a restart would forget the date otherwise.
-    /// The load takes the earliest of the two. Not for an admitted manifest's children
-    /// ([`DigestStore::record`] does not write a date past the prune line either).
+    /// The load takes the earliest of the two. Not for a date past the prune line (the
+    /// children of an admitted manifest with no record): [`DigestStore::record`] does not
+    /// write one either.
     pub fn backdate(
         &self,
         registry: &str,
@@ -481,6 +489,14 @@ impl DigestStore {
     // A prior `record_trusted` matured local pushes here; it was removed because it
     // wrote the same key the proxy `check` reads, letting a local push set the
     // first-seen clock for a digest later fetched from upstream.
+
+    /// The digest's first-seen, `None` with no record.
+    pub fn first_seen(&self, registry: &str, digest: &str) -> Option<i64> {
+        self.entries
+            .read()
+            .get(&map_key(registry, digest))
+            .map(|entry| entry.first_seen)
+    }
 
     /// Check quarantine status for a digest.
     #[must_use = "ignoring quarantine status may serve blocked artifacts"]
