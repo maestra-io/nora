@@ -52,8 +52,10 @@ no tag): they take the index's date.
 
 A digest already held by NORA's own clock, recorded before its registry had a date source
 or in a failed lookup, is asked about again each time a tag pull revalidates it, and moves
-back to the registry's date, with everything it names. Only Docker Hub and quay.io are not
-asked again: they date a tag, and the first sight used that. A pull by digest of a cached
+back to the registry's date, with everything it names. Docker Hub and quay.io date a tag,
+so they are asked again on a tag pull only: a digest first pulled by digest whose tag sat
+past the searched pages (otel/opentelemetry-collector-contrib:0.116.1 of December 2024, in a
+repository of 6334 tags) is dated by the next pull of its tag. A pull by digest of a cached
 held manifest asks the walked registries (ghcr.io, mcr, public.ecr.aws, cgr.dev) too, which costs no
 request of its own; for registry.k8s.io and Artifact Registry it stays held until a tag pull
 or the TTL. A move is written beside the ledger entry (`<entry>.dated`), and every start

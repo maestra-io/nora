@@ -2996,10 +2996,15 @@ async fn try_fetch_and_cache(
                     // date starts the clock, so an image older than the TTL is not new here.
                     // A digest held by NORA's clock is asked about again: it may have been
                     // recorded before its registry had a date source, or in a failed lookup.
+                    // Docker Hub and quay date a tag, so a held digest first seen by digest
+                    // (its tag past the searched pages) is dated by a request of its tag
+                    // (#1649: otel/opentelemetry-collector-contrib:0.116.1 of 17.12.2024).
                     let mut dated = None;
                     if let Some(source) = upstream.date_source().filter(|source| {
                         upstream.trust_upstream_dates
-                            && (first_sight || (still_held && source.dates_digests()))
+                            && (first_sight
+                                || (still_held
+                                    && (source.dates_digests() || !reference.contains(':'))))
                     }) {
                         dated = super::docker_dates::published_at(
                             state,
