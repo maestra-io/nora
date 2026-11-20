@@ -159,8 +159,8 @@ impl DateSource {
     }
 
     /// Whether the registry dates a digest whatever the request named, so a digest NORA
-    /// holds by its own clock can be asked about again (Hub and quay date a tag, and such a
-    /// digest was dated on its first sight already).
+    /// holds by its own clock can be asked about again on a digest request too (Hub and
+    /// quay date a tag: a held digest is asked about again on a request of its tag).
     pub fn dates_digests(self) -> bool {
         !matches!(self, Self::HubTagLastPushed | Self::QuayLastModified)
     }

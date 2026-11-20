@@ -53,6 +53,11 @@ const LOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 /// it answers 503 with [`LOAD_RETRY_AFTER_SECS`].
 const LOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 pub(crate) const LOAD_RETRY_AFTER_SECS: u64 = 30;
+/// A new entry the store failed to take is written again, first after this, then at
+/// twice the wait up to [`PERSIST_RETRY_MAX`], for [`PERSIST_RETRY_FOR`] in all.
+const PERSIST_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(30);
+const PERSIST_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(600);
+const PERSIST_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
 /// Stale entry TTL: entries older than 90 days are pruned on startup.
 pub(crate) const PRUNE_TTL_SECS: i64 = 90 * 24 * 3600;
@@ -417,6 +422,11 @@ impl DigestStore {
     /// Write a new entry off the request path. The object is created once: when it
     /// exists already (another replica, or a pod that started before it), the stored
     /// entry is the ledger's and replaces the one just recorded in memory.
+    ///
+    /// A store that cannot answer is asked again ([`PERSIST_RETRY_FIRST`] on): the entry
+    /// in memory may be a digest the ledger dated long ago, which a pod that could not list
+    /// the ledger recorded as new. #1649: on 18.11.2026 a pod that started during an hour of
+    /// R2 403s held hashicorp/vault:2.2.1 (pushed 22.10) as new for the 21 hours it ran.
     fn persist(&self, entry: DigestEntry) {
         let storage = self.storage.clone();
         let entries = Arc::clone(&self.entries);
@@ -425,19 +435,42 @@ impl DigestStore {
             let Some(body) = entry_body(&entry) else {
                 return;
             };
-            match storage.put_if_absent(&key, body).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    if let Some(stored) = read_entry(&storage, &key).await {
-                        // A date moved back meanwhile stays: the earlier one wins.
-                        adopt(&entries, stored);
+            let started = tokio::time::Instant::now();
+            let mut wait = PERSIST_RETRY_FIRST;
+            let mut retried = false;
+            loop {
+                let stored = match storage.put_if_absent(&key, body.clone()).await {
+                    Ok(true) => Ok(None),
+                    Ok(false) => fetch_entry(&storage, &key).await,
+                    Err(e) => Err(e),
+                };
+                match stored {
+                    // A date moved back meanwhile stays: the earlier one wins.
+                    Ok(stored) => {
+                        if let Some(stored) = stored {
+                            adopt(&entries, stored);
+                        }
+                        if retried {
+                            info!(key = %key, "Quarantine entry persisted after a retry");
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        let retry = started.elapsed() + wait <= PERSIST_RETRY_FOR;
+                        error!(
+                            key = %key,
+                            error = %e,
+                            retry_in_secs = retry.then_some(wait.as_secs()),
+                            "Failed to persist quarantine entry (fail-open)"
+                        );
+                        if !retry {
+                            return;
+                        }
+                        tokio::time::sleep(wait).await;
+                        wait = (wait * 2).min(PERSIST_RETRY_MAX);
+                        retried = true;
                     }
                 }
-                Err(e) => error!(
-                    key = %key,
-                    error = %e,
-                    "Failed to persist quarantine entry (fail-open)"
-                ),
             }
         });
     }
@@ -1576,6 +1609,35 @@ mod tests {
         ));
 
         assert_eq!(store.len(), 2);
+    }
+
+    /// A new entry the store could not take is written again once the store answers, and
+    /// the ledger's older date found then replaces the one in memory (#1649: a pod started
+    /// during R2 403s held hashicorp/vault:2.2.1, pushed 22.10, as new for 21 hours).
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_persist_is_retried_and_adopts_the_ledger_date() {
+        let (st, outage) = crate::test_helpers::outage_storage();
+        let ttl = 3 * 86400;
+        let old = entry("sha256:old", Utc::now().timestamp() - 30 * 86400);
+        st.put(&entry_key(&old), &serde_json::to_vec(&old).unwrap())
+            .await
+            .unwrap();
+        // The pod that could not list the ledger knows nothing of it.
+        let store = DigestStore::empty(st.clone());
+        outage.begin();
+        store.record("docker", "sha256:old", "up", None);
+        tokio::time::sleep(PERSIST_RETRY_FIRST / 2).await;
+        assert!(matches!(
+            store.check("docker", "sha256:old", ttl),
+            QuarantineStatus::Pending { .. }
+        ));
+        outage.end();
+        tokio::time::sleep(PERSIST_RETRY_FIRST * 2).await;
+        assert_eq!(
+            store.check("docker", "sha256:old", ttl),
+            QuarantineStatus::Mature,
+            "the retry found the stored entry"
+        );
     }
 
     /// A legacy `quarantine.jsonl` is imported into storage at boot.

@@ -7938,6 +7938,43 @@ mod trust_upstream_dates {
             StatusCode::FORBIDDEN
         );
     }
+
+    /// A digest first pulled by digest, its tag past the searched pages, is held by
+    /// NORA's clock; the next request of its tag, which still names it, dates it, and
+    /// what it names matures with it (#1649: otel/opentelemetry-collector-contrib:0.116.1,
+    /// pushed 17.12.2024, refused for a TTL after a digest pull of a 6334-tag repository).
+    #[tokio::test]
+    async fn a_held_digest_is_dated_by_a_later_request_of_its_tag() {
+        let (server, image, layer) = upstream_with_image().await;
+        Mock::given(method("GET"))
+            .and(path(TAG_API))
+            .and(wiremock::matchers::query_param("specificTag", "v1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(quay_tag(&sha(&image), days_ago(30))),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(TAG_API))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"tags": [], "has_additional": false})),
+            )
+            .mount(&server)
+            .await;
+        let ctx = context(&server, true, QuarantineMode::Enforce);
+        assert_eq!(
+            get(&ctx, &format!("manifests/{}", sha(&image))).await,
+            StatusCode::FORBIDDEN,
+            "the search finds no tag naming it"
+        );
+        assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::OK);
+        assert_eq!(
+            get(&ctx, &format!("blobs/{}", sha(&layer))).await,
+            StatusCode::OK
+        );
+    }
 }
 
 /// Positive control for the integrity check: when the upstream bytes hash to
