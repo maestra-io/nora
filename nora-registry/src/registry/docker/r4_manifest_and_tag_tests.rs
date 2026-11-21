@@ -969,7 +969,10 @@ async fn a_config_digest_that_is_not_a_digest_is_not_read() {
 async fn tags_list_follows_an_off_origin_redirect_without_credentials() {
     use wiremock::matchers::header_exists;
     let (registry, mirror) = (MockServer::start().await, MockServer::start().await);
-    let target = format!("{}/v2/k8s-artifacts-prod/images/pause/tags/list", mirror.uri());
+    let target = format!(
+        "{}/v2/k8s-artifacts-prod/images/pause/tags/list",
+        mirror.uri()
+    );
     Mock::given(method("GET"))
         .and(path("/v2/pause/tags/list"))
         .respond_with(ResponseTemplate::new(307).insert_header("Location", target.as_str()))
@@ -1001,7 +1004,10 @@ async fn tags_list_follows_an_off_origin_redirect_without_credentials() {
         assert_eq!(json["tags"], serde_json::json!(["3.10", "3.9"]));
     }
     let health = ctx.state.circuit_breaker.health_snapshot("docker").unwrap();
-    assert_eq!(health.failure_count, 0, "a redirect is not an upstream failure");
+    assert_eq!(
+        health.failure_count, 0,
+        "a redirect is not an upstream failure"
+    );
 }
 
 /// A redirect NORA does not take (no Location, a scheme it does not speak) is the upstream
