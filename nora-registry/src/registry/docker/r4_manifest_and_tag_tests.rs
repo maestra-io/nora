@@ -961,3 +961,80 @@ async fn a_config_digest_that_is_not_a_digest_is_not_read() {
     assert_eq!(info, ("unknown".into(), "unknown".into(), None));
     assert_eq!(counts.total(), 0, "{:?}", counts.snapshot());
 }
+
+/// registry.k8s.io answers every `tags/list` with a 307 to its Artifact Registry mirror, an
+/// origin of its own. NORA takes that hop once, carrying no credential there, and lists the
+/// tags; the redirect is not an upstream failure, so it never opens the circuit breaker.
+#[tokio::test]
+async fn tags_list_follows_an_off_origin_redirect_without_credentials() {
+    use wiremock::matchers::header_exists;
+    let (registry, mirror) = (MockServer::start().await, MockServer::start().await);
+    let target = format!("{}/v2/k8s-artifacts-prod/images/pause/tags/list", mirror.uri());
+    Mock::given(method("GET"))
+        .and(path("/v2/pause/tags/list"))
+        .respond_with(ResponseTemplate::new(307).insert_header("Location", target.as_str()))
+        .mount(&registry)
+        .await;
+    Mock::given(method("GET"))
+        .and(header_exists("authorization"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mirror)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/k8s-artifacts-prod/images/pause/tags/list"))
+        .respond_with(tag_page(&["3.9", "3.10"]))
+        .mount(&mirror)
+        .await;
+    let url = registry.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.circuit_breaker.enabled = true;
+        cfg.circuit_breaker.failure_threshold = 2;
+        cfg.circuit_breaker.reset_timeout = 3600;
+        let mut k8s = upstream(url, "k8s");
+        k8s.auth = Some("robot:secret".to_string().into());
+        cfg.docker.upstreams = vec![k8s];
+    });
+    for _ in 0..3 {
+        let (status, _, json) = tags(&ctx, "/v2/pause/tags/list").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["tags"], serde_json::json!(["3.10", "3.9"]));
+    }
+    let health = ctx.state.circuit_breaker.health_snapshot("docker").unwrap();
+    assert_eq!(health.failure_count, 0, "a redirect is not an upstream failure");
+}
+
+/// A redirect NORA does not take (no Location, a scheme it does not speak) is the upstream
+/// answering: the listing fails, the circuit breaker stays closed.
+#[tokio::test]
+async fn tags_list_redirect_not_taken_does_not_open_the_breaker() {
+    let registry = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/nowhere/tags/list"))
+        .respond_with(ResponseTemplate::new(307))
+        .mount(&registry)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/ftp/tags/list"))
+        .respond_with(
+            ResponseTemplate::new(307).insert_header("Location", "ftp://other.example/tags"),
+        )
+        .mount(&registry)
+        .await;
+    let url = registry.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.circuit_breaker.enabled = true;
+        cfg.circuit_breaker.failure_threshold = 2;
+        cfg.circuit_breaker.reset_timeout = 3600;
+        cfg.docker.upstreams = vec![upstream(url, "hub")];
+    });
+    for _ in 0..3 {
+        for repo in ["team/nowhere", "team/ftp"] {
+            let (status, _, _) = tags(&ctx, &format!("/v2/{repo}/tags/list")).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{repo}");
+        }
+    }
+    let health = ctx.state.circuit_breaker.health_snapshot("docker").unwrap();
+    assert_eq!(health.status, "closed");
+    assert_eq!(health.failure_count, 0);
+}
