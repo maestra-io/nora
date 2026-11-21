@@ -1298,7 +1298,9 @@ const MAX_UPSTREAM_TAGS_PAGES: usize = 100;
 /// a registry may page `tags/list` without being asked (`Link: <…>; rel="next"`). The 401
 /// challenge is answered as for a blob. A next page off the upstream's origin is not followed:
 /// the request would carry NORA's credential there. `client` must not follow a redirect off it
-/// either (`http_client_same_origin`).
+/// either (`http_client_same_origin`): it hands such a hop back, and that 3xx is the upstream
+/// answering, not the upstream down, so it does not count against the circuit breaker
+/// (registry.k8s.io answers every `tags/list` with a 307 to its Artifact Registry mirror).
 pub(crate) async fn fetch_tags_from_upstream(
     client: &reqwest::Client,
     upstream_url: &str,
@@ -1345,6 +1347,11 @@ pub(crate) async fn fetch_tags_from_upstream(
                 return Err(source.proxy_error(e));
             }
         };
+        if response.status().is_redirection() {
+            tracing::warn!(upstream = %upstream_url, name, status = %response.status(), "upstream tag list redirects off its origin, which NORA does not follow");
+            cb.record_alive(&cb_key, probe);
+            return Err(ProxyError::Upstream(502));
+        }
         let status = response.status().as_u16();
         if status == 429 {
             cb.record_failure(&cb_key, probe);

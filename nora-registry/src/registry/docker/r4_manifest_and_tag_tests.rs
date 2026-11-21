@@ -961,3 +961,49 @@ async fn a_config_digest_that_is_not_a_digest_is_not_read() {
     assert_eq!(info, ("unknown".into(), "unknown".into(), None));
     assert_eq!(counts.total(), 0, "{:?}", counts.snapshot());
 }
+
+/// registry.k8s.io answers every `tags/list` with a 307 to its Artifact Registry mirror, an
+/// origin of its own. NORA does not take that hop (R4-R09), and the redirect is the upstream
+/// answering: it never opens the circuit breaker of the whole upstream.
+#[tokio::test]
+async fn tags_list_redirect_off_origin_does_not_open_the_breaker() {
+    let (registry, mirror) = (MockServer::start().await, MockServer::start().await);
+    let target = format!(
+        "{}/v2/k8s-artifacts-prod/images/pause/tags/list",
+        mirror.uri()
+    );
+    Mock::given(method("GET"))
+        .respond_with(tag_page(&["3.10"]))
+        .expect(0)
+        .mount(&mirror)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pause/tags/list"))
+        .respond_with(ResponseTemplate::new(307).insert_header("Location", target.as_str()))
+        .mount(&registry)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/team/nowhere/tags/list"))
+        .respond_with(ResponseTemplate::new(307))
+        .mount(&registry)
+        .await;
+    let url = registry.uri();
+    let ctx = create_test_context_with_config(move |cfg| {
+        cfg.circuit_breaker.enabled = true;
+        cfg.circuit_breaker.failure_threshold = 2;
+        cfg.circuit_breaker.reset_timeout = 3600;
+        cfg.docker.upstreams = vec![upstream(url, "k8s")];
+    });
+    for _ in 0..3 {
+        for repo in ["pause", "team/nowhere"] {
+            let (status, _, _) = tags(&ctx, &format!("/v2/{repo}/tags/list")).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{repo}");
+        }
+    }
+    let health = ctx.state.circuit_breaker.health_snapshot("docker").unwrap();
+    assert_eq!(health.status, "closed");
+    assert_eq!(
+        health.failure_count, 0,
+        "a redirect is not an upstream failure"
+    );
+}
