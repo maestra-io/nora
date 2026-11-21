@@ -1298,11 +1298,9 @@ const MAX_UPSTREAM_TAGS_PAGES: usize = 100;
 /// a registry may page `tags/list` without being asked (`Link: <…>; rel="next"`). The 401
 /// challenge is answered as for a blob. A next page off the upstream's origin is not followed:
 /// the request would carry NORA's credential there. `client` must not follow a redirect off it
-/// either (`http_client_same_origin`): it hands such a hop back, and NORA takes it once itself,
-/// with no credential, to the origin the upstream names (registry.k8s.io answers every
-/// `tags/list` with a 307 to its Artifact Registry mirror). The pages after it stay on that
-/// origin and carry no credential either. A redirect NORA does not take is the upstream
-/// answering, not the upstream down: it does not count against the circuit breaker.
+/// either (`http_client_same_origin`): it hands such a hop back, and that 3xx is the upstream
+/// answering, not the upstream down, so it does not count against the circuit breaker
+/// (registry.k8s.io answers every `tags/list` with a 307 to its Artifact Registry mirror).
 pub(crate) async fn fetch_tags_from_upstream(
     client: &reqwest::Client,
     upstream_url: &str,
@@ -1328,24 +1326,17 @@ pub(crate) async fn fetch_tags_from_upstream(
     };
     let mut tags = Vec::new();
     let mut read = 0;
-    // Set once the upstream redirected off its origin: no credential of NORA goes there.
-    let mut anonymous = false;
     for page in 0..MAX_UPSTREAM_TAGS_PAGES {
-        let mut source = BlobSource {
+        let source = BlobSource {
             client: client.clone(),
             upstream_url: upstream_url.to_string(),
             name: name.to_string(),
             url: url.to_string(),
             docker_auth: docker_auth.clone(),
-            basic_auth: basic_auth.filter(|_| !anonymous).map(String::from),
+            basic_auth: basic_auth.map(String::from),
             timeout,
         };
-        let sent = if anonymous {
-            source.send_once(None, None).await
-        } else {
-            source.send(None).await
-        };
-        let mut response = match sent {
+        let mut response = match source.send(None).await {
             Ok(response) => response,
             Err(BlobRequestError::Network(reason)) => {
                 cb.record_failure(&cb_key, probe);
@@ -1356,29 +1347,8 @@ pub(crate) async fn fetch_tags_from_upstream(
                 return Err(source.proxy_error(e));
             }
         };
-        if response.status().is_redirection() && !anonymous {
-            if let Some(target) = off_origin_hop(&response, &url) {
-                tracing::debug!(upstream = %upstream_url, name, target = %target, "upstream tag list redirects off its origin; following it without credentials");
-                url = target;
-                anonymous = true;
-                source.url = url.to_string();
-                source.basic_auth = None;
-                response = match source.send_once(None, None).await {
-                    Ok(response) => response,
-                    Err(BlobRequestError::Network(reason)) => {
-                        cb.record_failure(&cb_key, probe);
-                        return Err(ProxyError::Network(reason));
-                    }
-                    Err(e @ BlobRequestError::Token(_)) => {
-                        cb.record_alive(&cb_key, probe);
-                        return Err(source.proxy_error(e));
-                    }
-                };
-            }
-        }
         if response.status().is_redirection() {
-            // The upstream answered with a hop NORA does not take: alive, not down.
-            tracing::warn!(upstream = %upstream_url, name, status = %response.status(), "upstream tag list redirects where NORA does not follow");
+            tracing::warn!(upstream = %upstream_url, name, status = %response.status(), "upstream tag list redirects off its origin, which NORA does not follow");
             cb.record_alive(&cb_key, probe);
             return Err(ProxyError::Upstream(502));
         }
@@ -1474,20 +1444,6 @@ pub(crate) async fn fetch_tags_from_upstream(
     tracing::warn!(upstream = %upstream_url, name, pages = MAX_UPSTREAM_TAGS_PAGES, "upstream tag list has more pages than NORA follows");
     cb.record_alive(&cb_key, probe);
     Err(ProxyError::Upstream(502))
-}
-
-/// Where a redirect handed back by the same-origin client points, when NORA takes that hop
-/// itself: an absolute URL off the origin of `asked`, over HTTPS or the scheme `asked` uses.
-/// The outbound guard of `client` still judges the host it resolves to.
-fn off_origin_hop(response: &reqwest::Response, asked: &reqwest::Url) -> Option<reqwest::Url> {
-    let location = response
-        .headers()
-        .get(reqwest::header::LOCATION)?
-        .to_str()
-        .ok()?;
-    let target = response.url().join(location).ok()?;
-    let scheme_ok = target.scheme() == "https" || target.scheme() == asked.scheme();
-    (scheme_ok && target.origin() != asked.origin()).then_some(target)
 }
 
 /// The target of the `next` link in a `Link` header value, if any (RFC 8288): links are
