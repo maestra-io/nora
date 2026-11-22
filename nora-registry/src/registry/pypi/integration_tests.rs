@@ -2973,3 +2973,197 @@ async fn concurrent_uploads_keep_every_requires_python_entry() {
         );
     }
 }
+
+/// A078: an upload that replaces a proxied file while its fill is still writing the file's
+/// records keeps its own. `same` uploads the upstream's very bytes: the file is the project's
+/// own then too, so the fill leaves no provenance marker and gc keeps the file.
+async fn fill_racing_an_upload(same: bool) {
+    use crate::test_helpers::{
+        background_writes_done, create_test_context_with_storage_and_config, op_counting_storage,
+    };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const FILE: &str = "vthree-2.0-py3-none-any.whl";
+    const KEY: &str = "pypi/vthree/vthree-2.0-py3-none-any.whl";
+    let meta = |dep: &str| {
+        format!("Metadata-Version: 2.1\nName: vthree\nVersion: 2.0\nRequires-Dist: {dep}\n")
+    };
+    let upstream_whl = wheel("vthree-2.0.dist-info", &meta("upstream-dep"));
+    let upload_whl = if same {
+        upstream_whl.clone()
+    } else {
+        wheel("vthree-2.0.dist-info", &meta("hosted-dep"))
+    };
+    let upstream = MockServer::start().await;
+    let index = format!(
+        r#"<a href="{}/f/{FILE}#sha256={}">{FILE}</a>"#,
+        upstream.uri(),
+        sha256_hex(&upstream_whl)
+    );
+    Mock::given(method("GET"))
+        .and(path("/vthree/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(index))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/f/{FILE}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(upstream_whl.clone()))
+        .mount(&upstream)
+        .await;
+    let (storage, ops) = op_counting_storage();
+    let uri = upstream.uri();
+    let ctx =
+        create_test_context_with_storage_and_config(storage, move |cfg| cfg.pypi.proxy = Some(uri));
+    let storage = ctx.state.storage.clone();
+    let holders = storage.holders();
+
+    // The fill has cached the file and parks on its first record.
+    ops.hold_next_put(&format!("{KEY}.sha256"));
+    let resp = send(&ctx.app, Method::GET, &format!("/simple/vthree/{FILE}"), "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    ops.put_parked().await;
+    // The project is imported meanwhile, and the file uploaded: it replaces what an upstream
+    // served before the import.
+    crate::registry::pypi_claim_imported_project(&storage, "vthree")
+        .await
+        .unwrap();
+    let app = ctx.app.clone();
+    let body = upload_whl.clone();
+    let mut upload = tokio::spawn(async move {
+        twine_upload(&app, &[("name", "vthree"), ("version", "2.0")], FILE, &body)
+            .await
+            .status()
+    });
+    // Unfixed, the upload is done here; fixed, it waits for the fill's lock.
+    let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut upload).await;
+    ops.release_put();
+    let status = match early {
+        Ok(done) => done.unwrap(),
+        Err(_) => upload.await.unwrap(),
+    };
+    assert_eq!(status, StatusCode::OK);
+    background_writes_done(&storage, holders).await;
+
+    let own = sha256_hex(&upload_whl);
+    let sidecar = storage.get(&format!("{KEY}.sha256")).await.unwrap();
+    assert_eq!(sidecar, own.as_bytes(), "sidecar");
+    let markers = storage
+        .list(&format!("{}vthree/{FILE}/", super::HASH_MARKER_PREFIX))
+        .await
+        .unwrap();
+    assert_eq!(markers.len(), 1, "{markers:?}");
+    assert!(markers[0].ends_with(&own), "{markers:?}");
+    assert!(
+        storage
+            .stat(&super::proxied_marker_key(KEY))
+            .await
+            .is_none(),
+        "the upload's file left with a provenance marker"
+    );
+    let index = text(send(&ctx.app, Method::GET, "/simple/vthree/", "").await).await;
+    assert!(index.contains(&format!("sha256={own}")), "{index}");
+    let metadata = text(
+        send(
+            &ctx.app,
+            Method::GET,
+            &format!("/simple/vthree/{FILE}.metadata"),
+            "",
+        )
+        .await,
+    )
+    .await;
+    let dep = if same { "upstream-dep" } else { "hosted-dep" };
+    assert!(metadata.contains(dep), "{metadata}");
+
+    let reload = ctx.state.curation();
+    crate::gc::run_gc(
+        &storage,
+        &ctx.state.publish_locks,
+        false,
+        0,
+        false,
+        false,
+        1,
+        &reload.curation_engine,
+    )
+    .await;
+    let resp = send(&ctx.app, Method::GET, &format!("/simple/vthree/{FILE}"), "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(&body_bytes(resp).await[..], &upload_whl[..]);
+}
+
+#[tokio::test]
+async fn an_upload_replacing_a_file_mid_fill_keeps_its_records() {
+    fill_racing_an_upload(false).await;
+}
+
+#[tokio::test]
+async fn an_upload_of_the_cached_bytes_mid_fill_leaves_no_provenance_marker() {
+    fill_racing_an_upload(true).await;
+}
+
+/// A078: the fill writes the file's records in the same hold of the file's lock as the file,
+/// with no pin read in between, so a store that does not answer pin reads still gets every
+/// record (sidecar, hash marker, core metadata, provenance marker): a later download is a
+/// cache hit and never writes them again.
+#[tokio::test]
+async fn a_fill_writes_its_records_with_the_file_whatever_a_pin_read_answers() {
+    use crate::test_helpers::{
+        background_writes_done, create_test_context_with_storage_and_config, outage_storage,
+    };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const FILE: &str = "vfour-1.0-py3-none-any.whl";
+    const KEY: &str = "pypi/vfour/vfour-1.0-py3-none-any.whl";
+    let whl = wheel(
+        "vfour-1.0.dist-info",
+        "Metadata-Version: 2.1\nName: vfour\nVersion: 1.0\n",
+    );
+    let upstream = MockServer::start().await;
+    let index = format!(
+        r#"<a href="{}/f/{FILE}#sha256={}">{FILE}</a>"#,
+        upstream.uri(),
+        sha256_hex(&whl)
+    );
+    Mock::given(method("GET"))
+        .and(path("/vfour/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(index))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/f/{FILE}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(whl.clone()))
+        .mount(&upstream)
+        .await;
+    let (storage, outage) = outage_storage();
+    outage.fail_pins_of(KEY);
+    let uri = upstream.uri();
+    let ctx =
+        create_test_context_with_storage_and_config(storage, move |cfg| cfg.pypi.proxy = Some(uri));
+    let storage = ctx.state.storage.clone();
+    let holders = storage.holders();
+
+    let resp = send(&ctx.app, Method::GET, &format!("/simple/vfour/{FILE}"), "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(&body_bytes(resp).await[..], &whl[..]);
+    background_writes_done(&storage, holders).await;
+
+    assert!(storage.stat(KEY).await.is_some(), "cached");
+    for key in [format!("{KEY}.sha256"), format!("{KEY}.metadata")] {
+        assert!(storage.stat(&key).await.is_some(), "{key} not written");
+    }
+    let markers = storage
+        .list(&format!("{}vfour/{FILE}/", super::HASH_MARKER_PREFIX))
+        .await
+        .unwrap();
+    assert_eq!(markers.len(), 1, "{markers:?}");
+    assert!(
+        storage
+            .stat(&super::proxied_marker_key(KEY))
+            .await
+            .is_some(),
+        "provenance"
+    );
+}

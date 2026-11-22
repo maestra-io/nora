@@ -761,15 +761,22 @@ impl StorageBackend for ObjectStorage {
     }
 
     async fn pin(&self, key: &str) -> Option<String> {
+        self.try_pin(key).await.ok().flatten()
+    }
+
+    async fn try_pin(&self, key: &str) -> Result<Option<String>> {
         let head = || GetOptions {
             head: true,
             ..Default::default()
         };
         let path = Path::from(encode_object_key(key));
-        let result = bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get_opts(&path, head()))
-            .await
-            .ok()?;
-        read_pin(&result.attributes)
+        match bounded_edge_retry(METADATA_OP_TIMEOUT, || self.store.get_opts(&path, head())).await {
+            Ok(result) => Ok(read_pin(&result.attributes)),
+            Err(e) => match map_err(e) {
+                StorageError::NotFound => Ok(None),
+                e => Err(e),
+            },
+        }
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
@@ -1164,6 +1171,18 @@ mod tests {
         let started = tokio::time::Instant::now();
         assert!(stalled.pin(key).await.is_none());
         assert_eq!(started.elapsed(), METADATA_OP_TIMEOUT, "pin: one request");
+        // Unanswered is not "no pin" where the caller asks which.
+        assert!(stalled.try_pin(key).await.is_err(), "try_pin");
+    }
+
+    /// An absent key has no pin: `try_pin` answers it, as `pin` does.
+    #[tokio::test]
+    async fn try_pin_of_an_absent_key_is_no_pin() {
+        let object = ObjectStorage::in_memory();
+        assert!(matches!(object.try_pin("raw/none.bin").await, Ok(None)));
+        let sha = hex::encode(sha2::Sha256::digest(b"x"));
+        object.put("raw/x.bin", b"x", &sha).await.unwrap();
+        assert_eq!(object.try_pin("raw/x.bin").await.unwrap(), Some(sha));
     }
 
     #[test]

@@ -293,6 +293,19 @@ pub async fn transfer_artifact(
             };
         }
     }
+    // An npm tarball or PyPI file shares its key with what a proxy fill caches: nothing a cached
+    // copy left (its provenance record, npm's `.sha256`) may describe the imported bytes. The
+    // record is deleted right after the put, so a failed put leaves the cached copy a cache; in
+    // between it names the old copy's digest, not the new pin.
+    // The commit runs under the key's publish lock; that lock is per process, so it orders the
+    // writes of this run, not a server's fills (gc keeps an imported file by its version
+    // document or own-file record).
+    let commit_lock = matches!(rt, RegistryType::Npm | RegistryType::PyPI)
+        .then(|| crate::acquire_publish_lock(locks, key));
+    let _commit = match &commit_lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
     if let Err(e) = storage.put_from_path(key, &temp_path, Some(&sha256)).await {
         return Outcome::Failed {
             reason: format!("commit {key}: {e}"),
@@ -301,6 +314,40 @@ pub async fn transfer_artifact(
     // Storage moved the temp file into place (local) or copied it (S3): either way the
     // guard's delete is the cleanup or a harmless NotFound.
     drop(guard);
+    if commit_lock.is_some() {
+        // A server's gc may have checked the cached copy and be about to delete what was just
+        // committed: the next run imports it again, after the eviction.
+        if crate::gc::eviction_pending(storage, key).await {
+            return Outcome::Failed {
+                reason: format!(
+                    "{}: a gc pass is evicting {key}; the next run imports it again",
+                    artifact.path
+                ),
+            };
+        }
+        match storage.delete(&crate::registry::npm::origin_key(key)).await {
+            Ok(()) | Err(crate::storage::StorageError::NotFound) => {}
+            Err(e) => {
+                return Outcome::Failed {
+                    reason: format!(
+                        "{}: removing the cache provenance of {key}: {e}",
+                        artifact.path
+                    ),
+                }
+            }
+        }
+    }
+    // An npm tarball's `.sha256` names the imported bytes, as a fill's names its own.
+    if npm_version.is_some() {
+        if let Err(e) = storage
+            .put(&format!("{key}.sha256"), sha256.as_bytes())
+            .await
+        {
+            return Outcome::Failed {
+                reason: format!("commit {key}.sha256: {e}"),
+            };
+        }
+    }
     // The tarball first, as a publish writes it: a version document always names bytes that are
     // there. A failed document write is retried by the next run, which transfers the
     // tarball again: a tarball without its document is not taken for the import's.

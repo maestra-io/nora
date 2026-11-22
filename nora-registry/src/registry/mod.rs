@@ -2634,12 +2634,21 @@ impl ProxyBody {
         key: &str,
         immutable: bool,
     ) -> crate::storage::Result<bool> {
-        let storage = &state.storage;
         let lock = immutable.then(|| state.publish_lock(key));
         let _guard = match &lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
+        self.cache_locked(&state.storage, key, immutable).await
+    }
+
+    /// [`cache`](Self::cache) for a caller that holds the key's publish lock already.
+    pub(crate) async fn cache_locked(
+        &self,
+        storage: &crate::Storage,
+        key: &str,
+        immutable: bool,
+    ) -> crate::storage::Result<bool> {
         let spool = match self {
             ProxyBody::Mem(b) if immutable => return storage.put_if_absent(key, b.clone()).await,
             ProxyBody::Mem(b) => return storage.put_bytes(key, b.clone()).await.map(|()| true),

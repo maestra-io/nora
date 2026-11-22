@@ -198,6 +198,11 @@ pub trait StorageBackend: Send + Sync {
     }
     /// The recorded pin for `key` without reading the bytes.
     async fn pin(&self, key: &str) -> Option<String>;
+    /// [`pin`](Self::pin), with a read the store did not answer as an error rather than as no
+    /// pin. A backend whose pin reads cannot fail keeps this default.
+    async fn try_pin(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.pin(key).await)
+    }
     async fn delete(&self, key: &str) -> Result<()>;
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
     async fn stat(&self, key: &str) -> Option<FileMeta>;
@@ -925,6 +930,24 @@ impl Storage {
         // the backend cannot tell them apart, and neither is an error.
         STORAGE_OPERATIONS
             .with_label_values(&["pin", if pin.is_some() { "ok" } else { "miss" }])
+            .inc();
+        pin
+    }
+
+    /// [`pin`](Self::pin), but a read the store did not answer is an error, not "no pin": for
+    /// a decision where an unanswered read must not pass for a copy written before pins.
+    pub async fn try_pin(&self, key: &str) -> Result<Option<String>> {
+        if validate_storage_key(key).is_err() {
+            return Ok(None);
+        }
+        let pin = Self::timed("pin", self.inner.try_pin(key)).await;
+        let outcome = match &pin {
+            Ok(Some(_)) => "ok",
+            Ok(None) => "miss",
+            Err(_) => "error",
+        };
+        STORAGE_OPERATIONS
+            .with_label_values(&["pin", outcome])
             .inc();
         pin
     }
@@ -2291,6 +2314,7 @@ mod tests {
         "put_if_version",
         "repin",
         "stat",
+        "try_pin",
     ];
 
     /// Every key- or prefix-taking wrapper method refuses an empty segment on both backends
@@ -2353,6 +2377,7 @@ mod tests {
                     ("copy", copy_to && copy_from),
                     ("stat", s.stat(key).await.is_none()),
                     ("pin", s.pin(key).await.is_none()),
+                    ("try_pin", matches!(s.try_pin(key).await, Ok(None))),
                 ];
                 for (method, ok) in checks {
                     assert!(ok, "{b} {method} {key}");

@@ -650,6 +650,9 @@ pub struct OpCounts {
     counts: [AtomicUsize; COUNTED_METHODS.len()],
     /// Puts to keys ending with this fail (see [`fail_puts_ending`](Self::fail_puts_ending)).
     failing_puts: std::sync::Mutex<Option<String>>,
+    /// `put_from_path` of exactly this key fails (see
+    /// [`fail_put_from_path`](Self::fail_put_from_path)).
+    failing_file_put: std::sync::Mutex<Option<String>>,
     /// Every counted call as (method, key or prefix), for [`calls`](Self::calls).
     log: std::sync::Mutex<Vec<(&'static str, String)>>,
     /// Listings under this prefix park (see [`stall_lists`](Self::stall_lists)).
@@ -684,6 +687,11 @@ impl OpCounts {
     /// handler's storage-failure branch.
     pub fn fail_puts_ending(&self, suffix: Option<&str>) {
         *self.failing_puts.lock().unwrap() = suffix.map(str::to_string);
+    }
+
+    /// Make every `put_from_path` of exactly `key` fail; other writes of it go through.
+    pub fn fail_put_from_path(&self, key: &str) {
+        *self.failing_file_put.lock().unwrap() = Some(key.to_string());
     }
 
     /// Make every `list_with_meta` under `prefix` park before returning until called
@@ -955,6 +963,11 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         sha256: Option<&str>,
     ) -> crate::storage::Result<()> {
         self.counts.hit("put_from_path", key);
+        if self.counts.failing_file_put.lock().unwrap().as_deref() == Some(key) {
+            return Err(crate::storage::StorageError::Network(
+                "put refused by the test".into(),
+            ));
+        }
         self.inner.put_from_path(key, src, sha256).await
     }
 
@@ -1011,6 +1024,8 @@ struct Faults {
     stats: Vec<String>,
     /// Key suffixes whose delete fails.
     deletes: Vec<String>,
+    /// Key suffixes whose pin read fails.
+    pins: Vec<String>,
     /// Seconds every object's reported modification time lies in the past.
     age_secs: u64,
     /// Seconds the GC handshake markers' (`.nora-gc-`) modification time lies in the past.
@@ -1093,6 +1108,12 @@ impl StorageOutage {
         self.faults().deletes.push(suffix.to_string());
     }
 
+    /// Fail the pin reads of the keys ending with `suffix` with a network error; reads,
+    /// `stat` and listings answer.
+    pub fn fail_pins_of(&self, suffix: &str) {
+        self.faults().pins.push(suffix.to_string());
+    }
+
     /// Report every object as last modified `secs` ago: an in-memory store stamps "now", and
     /// age-based cleanup needs old objects. The GC handshake markers (`.nora-gc-`) are aged by
     /// [`Self::age_markers`] instead: the code under test writes them during the test.
@@ -1152,6 +1173,10 @@ impl StorageOutage {
             .stats
             .iter()
             .any(|s| key.ends_with(s.as_str()))
+    }
+
+    fn pin_fails(&self, key: &str) -> bool {
+        self.faults().pins.iter().any(|s| key.ends_with(s.as_str()))
     }
 
     fn delete_fails(&self, key: &str) -> bool {
@@ -1269,9 +1294,16 @@ impl crate::storage::StorageBackend for OutageBackend {
     }
 
     async fn pin(&self, key: &str) -> Option<String> {
+        self.try_pin(key).await.ok().flatten()
+    }
+
+    async fn try_pin(&self, key: &str) -> crate::storage::Result<Option<String>> {
         self.outage.wait_answer().await;
-        self.check().ok()?;
-        self.inner.pin(key).await
+        self.check()?;
+        if self.outage.pin_fails(key) {
+            return Err(network_error());
+        }
+        self.inner.try_pin(key).await
     }
 
     async fn delete(&self, key: &str) -> crate::storage::Result<()> {
