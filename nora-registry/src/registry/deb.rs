@@ -735,13 +735,13 @@ impl OsRepo for Deb {
         if !super::deb_proxy::active(&state.config) {
             return None;
         }
-        if let Some(response) = super::deb_proxy::serve(state, repo, entry, path).await {
-            return Some(response);
+        // A package is a package wherever its Filename puts it: Docker's repositories keep
+        // the pool under dists/<suite>/pool/.
+        if immutable {
+            return super::deb_proxy::package_gate(state, headers, repo, path).await;
         }
-        if !immutable {
-            return Some(StatusCode::NOT_FOUND.into_response());
-        }
-        super::deb_proxy::package_gate(state, headers, repo, path).await
+        let served = super::deb_proxy::serve(state, repo, entry, path).await;
+        Some(served.unwrap_or_else(|| StatusCode::NOT_FOUND.into_response()))
     }
 }
 
