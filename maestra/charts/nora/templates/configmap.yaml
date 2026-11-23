@@ -267,6 +267,9 @@ data:
     {{- with $cur.internal_namespaces }}
     internal_namespaces = {{ toJson . }}
     {{- end }}
+    {{- with $cur.renovate_principals }}
+    renovate_principals = {{ toJson . }}
+    {{- end }}
     {{- range $name, $reg := $curRegs }}
 
     [curation.{{ $name }}]

@@ -1037,6 +1037,10 @@ pub(crate) fn request_layers(router: Router<AppState>, state: &AppState) -> Rout
     router
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            digest_quarantine::hold_client_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             audit::curation_refusal_middleware,
         ))
         .layer(middleware::from_fn(request_id::request_id_middleware))

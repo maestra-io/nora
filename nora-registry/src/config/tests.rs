@@ -3265,6 +3265,21 @@ fn test_curation_env_override_per_registry_quarantine() {
     std::env::remove_var("NORA_CURATION_DOCKER_QUARANTINE_TTL");
 }
 
+/// `renovate_principals`: empty by default, read from `[curation]` and its env var.
+#[test]
+fn test_renovate_principals_from_toml_and_env() {
+    let _lock = env_lock();
+    assert!(Config::default().curation.renovate_principals.is_empty());
+    let file: Config =
+        toml::from_str("[curation]\nrenovate_principals = [\"renovate\"]\n").unwrap();
+    assert_eq!(file.curation.renovate_principals, ["renovate"]);
+    let mut env = Config::default();
+    std::env::set_var("NORA_CURATION_RENOVATE_PRINCIPALS", "renovate, bot ,");
+    env.apply_env_overrides().unwrap();
+    std::env::remove_var("NORA_CURATION_RENOVATE_PRINCIPALS");
+    assert_eq!(env.curation.renovate_principals, ["renovate", "bot"]);
+}
+
 /// `quarantine_observe_fallback`: off by default, read from `[curation.docker]` and its env
 /// var, refused in any other section.
 #[test]

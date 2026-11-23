@@ -673,12 +673,12 @@ pub async fn proxy_gate_digest(
     } else {
         "observed"
     };
-    crate::metrics::QUARANTINE_HOLDS_TOTAL
-        .with_label_values(&[registry, outcome])
-        .inc();
+    let client = count_hold(registry, outcome);
     warn!(
         registry = %registry,
         digest = %digest,
+        client = client.class,
+        principal = client.principal.as_deref().unwrap_or("-"),
         status = %status.header_value(),
         mode = %mode,
         quarantine_ttl_secs = quarantine_secs,
@@ -1330,6 +1330,78 @@ async fn load_entries(storage: &Storage, legacy: &Path) -> (HashMap<String, Dige
         "Quarantine store loaded"
     );
     (entries, unread == 0)
+}
+
+/// Who a quarantine hold met, for `nora_quarantine_holds_total{client}` and the hold log:
+/// - `renovate`: a principal listed in `[curation] renovate_principals`; its tag lookups ask
+///   for releases nothing runs yet;
+/// - `pull_request`: a workload (OIDC) identity whose subject ends in `:pull_request`, the
+///   GitHub Actions subject of a pull request run: CI of a change not merged yet;
+/// - `consumer`: anyone else (a node, CI of a branch, a person, an unauthenticated request).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HoldClient {
+    pub class: &'static str,
+    /// The authenticated principal (token owner, htpasswd user, OIDC subject); `None` when
+    /// unauthenticated. Logged, never a label.
+    pub principal: Option<String>,
+}
+
+tokio::task_local! {
+    /// The [`HoldClient`] of the request being served ([`hold_client_middleware`]).
+    static HOLD_CLIENT: HoldClient;
+}
+
+/// Classify a request's principal. `workload` is whether an OIDC JWT admitted it: a token
+/// owner or htpasswd name is never read as a pull request subject.
+pub fn classify_client(principal: Option<&str>, workload: bool, renovate: &[String]) -> HoldClient {
+    let principal = principal.filter(|p| *p != "anonymous");
+    let class = match principal {
+        Some(p) if renovate.iter().any(|r| r == p) => "renovate",
+        Some(p) if workload && p.ends_with(":pull_request") => "pull_request",
+        _ => "consumer",
+    };
+    HoldClient {
+        class,
+        principal: principal.map(String::from),
+    }
+}
+
+/// The [`HoldClient`] of the current request; `consumer` outside one.
+pub fn hold_client() -> HoldClient {
+    HOLD_CLIENT.try_with(Clone::clone).unwrap_or(HoldClient {
+        class: "consumer",
+        principal: None,
+    })
+}
+
+/// Count one hold in `nora_quarantine_holds_total` under the current request's client class.
+pub fn count_hold(registry: &str, outcome: &str) -> HoldClient {
+    let client = hold_client();
+    crate::metrics::QUARANTINE_HOLDS_TOTAL
+        .with_label_values(&[registry, outcome, client.class])
+        .inc();
+    client
+}
+
+/// Runs inside the auth layer: classifies the authenticated principal once per request for
+/// every quarantine gate the request reaches.
+pub async fn hold_client_middleware(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let client = classify_client(
+        request
+            .extensions()
+            .get::<crate::auth::AuthenticatedUser>()
+            .map(|u| u.0.as_str()),
+        request
+            .extensions()
+            .get::<crate::auth::WorkloadIdentity>()
+            .is_some(),
+        &state.config.curation.renovate_principals,
+    );
+    HOLD_CLIENT.scope(client, next.run(request)).await
 }
 
 // ============================================================================
@@ -2485,5 +2557,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_hold_is_classed_by_who_asked() {
+        let renovate = vec!["renovate-bot".to_string()];
+        let class = |p: Option<&str>, workload| classify_client(p, workload, &renovate);
+        assert_eq!(
+            class(Some("renovate-bot"), false),
+            HoldClient {
+                class: "renovate",
+                principal: Some("renovate-bot".into())
+            }
+        );
+        assert_eq!(
+            class(Some("repo:myorg/app:pull_request"), true).class,
+            "pull_request"
+        );
+        // Default-branch CI and people are consumers.
+        assert_eq!(
+            class(Some("repo:myorg/app:ref:refs/heads/main"), true).class,
+            "consumer"
+        );
+        assert_eq!(class(Some("teleport:alice"), false).class, "consumer");
+        // Only a JWT subject says pull request: a token owner of that spelling does not.
+        assert_eq!(
+            class(Some("repo:myorg/app:pull_request"), false).class,
+            "consumer"
+        );
+        // Unauthenticated, however the principal is spelled.
+        assert_eq!(
+            class(None, false),
+            HoldClient {
+                class: "consumer",
+                principal: None
+            }
+        );
+        let anonymous = vec!["anonymous".to_string()];
+        assert_eq!(
+            classify_client(Some("anonymous"), false, &anonymous),
+            HoldClient {
+                class: "consumer",
+                principal: None
+            }
+        );
+        // Outside a request.
+        assert_eq!(hold_client().class, "consumer");
     }
 }

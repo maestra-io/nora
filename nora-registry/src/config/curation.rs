@@ -105,6 +105,7 @@ impl std::str::FromStr for UnknownDate {
 /// - `NORA_CURATION_MIN_RELEASE_AGE` — minimum release age (e.g., "7d", "24h", "1w")
 /// - `NORA_CURATION_QUARANTINE` — quarantine mode: off/observe/enforce (default: off)
 /// - `NORA_CURATION_QUARANTINE_TTL` — quarantine hold duration (e.g., "14d", "24h")
+/// - `NORA_CURATION_RENOVATE_PRINCIPALS` — comma-separated `renovate_principals`
 /// - `NORA_CURATION_<REGISTRY>_MIN_RELEASE_AGE` / `_QUARANTINE` / `_QUARANTINE_TTL` /
 ///   `_UNKNOWN_DATE` — per-registry overrides
 /// - `NORA_CURATION_<REGISTRY>_ALLOW` — comma-separated `allow` entries exempt from
@@ -146,6 +147,12 @@ pub struct CurationConfig {
     /// How long new digests are held in quarantine (e.g., "14d", "24h", "1w").
     #[serde(default)]
     pub quarantine_ttl: Option<String>,
+    /// Principals (token owner or htpasswd user, exactly as authenticated) whose
+    /// quarantine holds count as `client="renovate"` in `nora_quarantine_holds_total`
+    /// rather than `consumer`: a dependency bot's lookups of tags nothing runs yet.
+    /// Labels the metric only; the quarantine judges them as everyone else.
+    #[serde(default)]
+    pub renovate_principals: Vec<String>,
     /// Per-registry curation overrides. Overrides `min_release_age` per registry.
     #[serde(default)]
     pub npm: RegistryCurationOverride,
@@ -235,6 +242,7 @@ impl Default for CurationConfig {
             min_release_age: None,
             quarantine: None,
             quarantine_ttl: None,
+            renovate_principals: Vec::new(),
             npm: RegistryCurationOverride::default(),
             pypi: RegistryCurationOverride::default(),
             cargo: RegistryCurationOverride::default(),
@@ -319,6 +327,7 @@ impl CurationConfig {
             on_failure: _,
             quarantine,
             quarantine_ttl,
+            renovate_principals,
             // A registry's own section, walked below through `registry_override`.
             npm: _,
             pypi: _,
@@ -345,6 +354,10 @@ impl CurationConfig {
             (
                 "curation.quarantine_ttl".to_string(),
                 format!("{quarantine_ttl:?}"),
+            ),
+            (
+                "curation.renovate_principals".to_string(),
+                format!("{renovate_principals:?}"),
             ),
         ];
         for &rt in RegistryType::all() {
@@ -460,6 +473,14 @@ impl CurationConfig {
         }
         if let Ok(val) = env::var("NORA_CURATION_QUARANTINE_TTL") {
             self.quarantine_ttl = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_CURATION_RENOVATE_PRINCIPALS") {
+            self.renovate_principals = val
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
         }
 
         // Per-registry curation overrides

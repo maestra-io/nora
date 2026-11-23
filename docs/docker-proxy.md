@@ -177,6 +177,28 @@ first pull after it matures. A `quarantine_exempt` repository and a digest a bre
 exception admits are not held, so their tags follow the upstream. Read at start, like
 `quarantine`; only `[curation.docker]` takes it (elsewhere it is a configuration error).
 
+### Who a hold met (`nora_quarantine_holds_total{client}`)
+
+Every hold counts `nora_quarantine_holds_total{registry, outcome, client}`: `outcome` is
+`blocked` (a 403), `fallback` (enforce answered a moved tag with its admitted copy) or
+`observed`; `client` says who asked:
+
+| `client` | principal |
+|---|---|
+| `renovate` | listed in `[curation] renovate_principals` (token owner or htpasswd user, exact) |
+| `pull_request` | an OIDC JWT whose subject ends in `:pull_request` (GitHub Actions on a pull request) |
+| `consumer` | anyone else: a node, CI of a branch, a person, an unauthenticated pull |
+
+```toml
+[curation]
+renovate_principals = ["renovate"]   # NORA_CURATION_RENOVATE_PRINCIPALS, comma-separated
+```
+
+A Renovate lookup of a fresh tag and the CI of a pull request bumping to it are refused
+like anyone else; the label only lets an alert on `client="consumer"` page for refusals
+of what runs. Every hold log line (`Quarantine: tag resolves to a held digest` among
+them) carries `client` and `principal` (`-` when unauthenticated). Read at start.
+
 ### The verdict on every manifest answer
 
 Every manifest `GET` and `HEAD` returns the quarantine verdict, so a client can read it
