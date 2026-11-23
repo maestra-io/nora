@@ -842,6 +842,15 @@ tests:
           path: data["config.toml"]
           pattern: '\[curation\]\nmode = "off"\non_failure = "closed"\ninternal_namespaces = \["maestra\.\*"\]'
 
+  - it: renders renovate_principals under [curation]
+    set:
+      config.curation.quarantine: enforce
+      config.curation.renovate_principals: ["renovate"]
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[curation\]\nmode = "off"\non_failure = "closed"\nquarantine = "enforce"\nrenovate_principals = \["renovate"\]\n'
+
   - it: refuses min_release_age without a quarantine
     set:
       config.curation.mode: audit

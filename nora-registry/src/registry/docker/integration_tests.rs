@@ -7018,6 +7018,78 @@ mod trust_upstream_dates {
         assert_eq!(get(&ctx, "manifests/v1").await, StatusCode::FORBIDDEN);
     }
 
+    /// `nora_quarantine_holds_total{client}`: a `renovate_principals` user's holds count as
+    /// `renovate`, a person's and an unauthenticated pull's do not; a tag answered with its
+    /// admitted copy under enforce is a `fallback`, only a 403 is `blocked`.
+    #[tokio::test]
+    async fn a_hold_counts_under_the_client_class_of_who_asked() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let (server, image, _) = upstream_with_image().await;
+        let url = server.uri();
+        let ctx = crate::test_helpers::create_test_context_with_auth_and_config(
+            &[("renovate-bot", "pw"), ("alice", "pw")],
+            move |cfg| {
+                configure(cfg, url, false, QuarantineMode::Enforce);
+                cfg.auth.docker_anon_pull = true;
+                cfg.curation.renovate_principals = vec!["renovate-bot".into()];
+            },
+        );
+        let renovate = |outcome: &str| {
+            crate::metrics::QUARANTINE_HOLDS_TOTAL
+                .with_label_values(&["docker", outcome, "renovate"])
+                .get()
+        };
+        let pull = |user: Option<&str>, rest: String| {
+            let auth = user.map(|u| format!("Basic {}", STANDARD.encode(format!("{u}:pw"))));
+            let app = ctx.app.clone();
+            async move {
+                let headers = auth
+                    .as_deref()
+                    .map(|a| vec![("authorization", a)])
+                    .unwrap_or_default();
+                let uri = format!("/v2/library/demo/{rest}");
+                send_with_headers(&app, Method::GET, &uri, headers, "")
+                    .await
+                    .status()
+            }
+        };
+        mature_tag_cached(&ctx, &image).await;
+        let moved = moved_manifest();
+        tag_answers(&server, &moved).await;
+        let (blocked, fallback) = (renovate("blocked"), renovate("fallback"));
+
+        assert_eq!(
+            pull(Some("renovate-bot"), "manifests/v1".into()).await,
+            StatusCode::OK
+        );
+        assert_eq!(renovate("fallback"), fallback + 1);
+        assert_eq!(renovate("blocked"), blocked);
+
+        let held = format!("manifests/{}", sha(&moved));
+        assert_eq!(
+            pull(Some("renovate-bot"), held.clone()).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(renovate("blocked"), blocked + 1);
+        let consumer = || {
+            crate::metrics::QUARANTINE_HOLDS_TOTAL
+                .with_label_values(&["docker", "blocked", "consumer"])
+                .get()
+        };
+        let consumers = consumer();
+        for user in [Some("alice"), None] {
+            assert_eq!(pull(user, held.clone()).await, StatusCode::FORBIDDEN);
+        }
+        // Other tests count consumers too, so at least these two.
+        assert!(consumer() >= consumers + 2);
+        assert_eq!(
+            renovate("blocked"),
+            blocked + 1,
+            "consumers are not renovate"
+        );
+        assert_eq!(renovate("fallback"), fallback + 1);
+    }
+
     /// Once the new digest is past the TTL the tag moves to it.
     #[tokio::test]
     async fn a_moved_tag_follows_the_new_digest_when_it_matures() {

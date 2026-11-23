@@ -1908,3 +1908,55 @@ async fn test_oidc_format_bound_scope_admits_only_its_format() {
         );
     }
 }
+
+/// The quarantine's hold client class through the real auth layer: a pull request JWT is
+/// `pull_request`, a default-branch JWT and an unauthenticated request are `consumer`.
+#[tokio::test]
+async fn a_pull_request_jwt_is_a_pull_request_hold_client() {
+    use axum::{middleware, routing::get, Router};
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/jwks.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"))
+        .mount(&mock_server)
+        .await;
+    let ctx = create_oidc_test_context(&mock_server.uri());
+    let app = Router::new()
+        .route(
+            "/raw/probe",
+            get(|| async { crate::digest_quarantine::hold_client().class }),
+        )
+        .layer(middleware::from_fn_with_state(
+            ctx.state.clone(),
+            crate::digest_quarantine::hold_client_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            ctx.state.clone(),
+            crate::auth::auth_middleware,
+        ))
+        .with_state(ctx.state.clone());
+    let now = now_secs();
+    for (subject, class) in [
+        ("repo:myorg/app:pull_request", "pull_request"),
+        ("repo:myorg/app:ref:refs/heads/main", "consumer"),
+    ] {
+        let bearer = format!(
+            "Bearer {}",
+            make_jwt(&mock_server.uri(), subject, "nora", now, now + 600)
+        );
+        let response = send_with_headers(
+            &app,
+            Method::GET,
+            "/raw/probe",
+            vec![("authorization", &bearer)],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{subject}");
+        assert_eq!(
+            &body_bytes(response).await[..],
+            class.as_bytes(),
+            "{subject}"
+        );
+    }
+}

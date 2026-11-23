@@ -379,6 +379,9 @@ config:
     quarantine_ttl: ""
     # -- Name globs never proxied upstream and never cooled down, in every mode.
     internal_namespaces: []
+    # -- Principals (token owner / htpasswd user) whose quarantine holds count as
+    # client="renovate" in nora_quarantine_holds_total (Maestra fork); metric only.
+    renovate_principals: []
     # -- Per-registry [curation.<registry>] tables: min_release_age, quarantine,
     # quarantine_ttl, allow (Maestra fork: entries exempt from min_release_age only:
     # "name@version", "name" / "name@*" for every version, "prefix*" for every

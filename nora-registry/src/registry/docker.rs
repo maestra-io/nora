@@ -1018,11 +1018,11 @@ async fn quarantine_cache_serve_gate(
         } else {
             "observed"
         };
-        crate::metrics::QUARANTINE_HOLDS_TOTAL
-            .with_label_values(&["docker", outcome])
-            .inc();
+        let client = crate::digest_quarantine::count_hold("docker", outcome);
         tracing::warn!(
             digest = %digest,
+            client = client.class,
+            principal = client.principal.as_deref().unwrap_or("-"),
             status = %status.header_value(),
             mode = ?q_mode,
             quarantine_ttl_secs = q_secs,
@@ -1099,12 +1099,12 @@ async fn quarantine_proxy_fetch_gate(
         } else {
             "observed"
         };
-        crate::metrics::QUARANTINE_HOLDS_TOTAL
-            .with_label_values(&["docker", outcome])
-            .inc();
+        let client = crate::digest_quarantine::count_hold("docker", outcome);
         tracing::warn!(
             digest = %digest,
             upstream = %upstream,
+            client = client.class,
+            principal = client.principal.as_deref().unwrap_or("-"),
             status = %status.header_value(),
             mode = ?q_mode,
             quarantine_ttl_secs = q_secs,
@@ -3094,30 +3094,6 @@ async fn try_fetch_and_cache(
                         } else {
                             q_status
                         };
-                    match &q_status {
-                        crate::digest_quarantine::QuarantineStatus::Mature => {}
-                        _ => {
-                            let outcome = if matches!(
-                                q_mode,
-                                crate::digest_quarantine::QuarantineMode::Enforce
-                            ) {
-                                "blocked"
-                            } else {
-                                "observed"
-                            };
-                            crate::metrics::QUARANTINE_HOLDS_TOTAL
-                                .with_label_values(&["docker", outcome])
-                                .inc();
-                            tracing::warn!(
-                                digest = %digest,
-                                upstream = %upstream.url,
-                                status = %q_status.header_value(),
-                                mode = ?q_mode,
-                                quarantine_ttl_secs = q_secs,
-                                "Quarantine: proxy-fetched manifest"
-                            );
-                        }
-                    }
                     let enforce =
                         matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce);
                     let held =
@@ -3125,6 +3101,26 @@ async fn try_fetch_and_cache(
                     let admitted = cached
                         .filter(|_| held)
                         .filter(|(copy, _)| admitted_copy(state, reference, copy, &digest, q_secs));
+                    let client = crate::digest_quarantine::hold_client();
+                    if held {
+                        // `blocked` only for a 403: an admitted copy answered is a `fallback`.
+                        let outcome = match (enforce, admitted.is_some()) {
+                            (true, false) => "blocked",
+                            (true, true) => "fallback",
+                            (false, _) => "observed",
+                        };
+                        crate::digest_quarantine::count_hold("docker", outcome);
+                        tracing::warn!(
+                            digest = %digest,
+                            upstream = %upstream.url,
+                            client = client.class,
+                            principal = client.principal.as_deref().unwrap_or("-"),
+                            status = %q_status.header_value(),
+                            mode = ?q_mode,
+                            quarantine_ttl_secs = q_secs,
+                            "Quarantine: proxy-fetched manifest"
+                        );
+                    }
                     keep_tag_copy = admitted.is_some();
                     // `quarantine_observe_fallback`: observe answers a moved tag with its
                     // admitted copy as enforce does; with none it serves, never a 403.
@@ -3147,6 +3143,8 @@ async fn try_fetch_and_cache(
                             tag = %reference,
                             held = %digest,
                             outcome,
+                            client = client.class,
+                            principal = client.principal.as_deref().unwrap_or("-"),
                             "Quarantine: tag resolves to a held digest"
                         );
                     }

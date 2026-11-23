@@ -34,6 +34,11 @@ pub struct AuthenticatedUser(pub String);
 #[derive(Clone, Debug)]
 pub struct AuthenticatedRole(pub crate::tokens::Role);
 
+/// Present when a workload (OIDC) identity admitted the request ([`admit_workload`]): its
+/// [`AuthenticatedUser`] is then the JWT subject, not a token owner or htpasswd name.
+#[derive(Clone, Copy, Debug)]
+pub struct WorkloadIdentity;
+
 /// The lifetime ceiling (seconds) the caller's own credential imposes on any
 /// token it mints. Inserted for OIDC identities: the shorter of the
 /// provider's `max_token_lifetime_secs` and what is left of the JWT until its
@@ -1648,6 +1653,7 @@ async fn admit_workload(
     request
         .extensions_mut()
         .insert(AuthenticatedUser(identity.subject.clone()));
+    request.extensions_mut().insert(WorkloadIdentity);
     request
         .extensions_mut()
         .insert(AuthenticatedRole(identity.role));

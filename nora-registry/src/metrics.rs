@@ -190,15 +190,17 @@ pub static AUTH_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create AUTH_REJECTED_TOTAL metric at startup")
 });
 
-/// Proxy artifacts held by the digest quarantine, by registry and outcome
-/// (`blocked` = enforce returned 403; `observed` = observe served but recorded).
+/// Proxy artifacts held by the digest quarantine, by registry, outcome
+/// (`blocked` = enforce returned 403; `fallback` = enforce answered a docker tag with its
+/// admitted copy; `observed` = observe served but recorded) and client class
+/// (`digest_quarantine::HoldClient`: `renovate`, `pull_request`, `consumer`).
 /// Gives the operator an alertable/graphable signal — the quarantine was
 /// previously visible only in WARN logs.
 pub static QUARANTINE_HOLDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "nora_quarantine_holds_total",
-        "Proxy artifacts held by the digest quarantine, by registry and outcome",
-        &["registry", "outcome"]
+        "Proxy artifacts held by the digest quarantine, by registry, outcome and client class",
+        &["registry", "outcome", "client"]
     )
     .expect("failed to create QUARANTINE_HOLDS_TOTAL metric at startup")
 });
