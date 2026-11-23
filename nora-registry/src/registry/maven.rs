@@ -1454,10 +1454,20 @@ fn upload_allowed(state: &AppState, kind: &MavenPathKind) -> bool {
             group_path,
             artifact_id,
             ..
-        } => vec![
-            maven_name(group_path, artifact_id),
-            format!("{}.{artifact_id}", group_path.replace('/', ".")),
-        ],
+        } => {
+            let mut names = vec![
+                maven_name(group_path, artifact_id),
+                format!("{}.{artifact_id}", group_path.replace('/', ".")),
+            ];
+            // A SNAPSHOT version's own metadata (`g/a/1.0-SNAPSHOT/maven-metadata.xml`) is
+            // the artifact's: `g:a`.
+            if is_snapshot(artifact_id) {
+                if let Some((group, artifact)) = group_path.rsplit_once('/') {
+                    names.push(maven_name(group, artifact));
+                }
+            }
+            names
+        }
         MavenPathKind::Opaque => return false,
     };
     let engine = &state.curation().curation_engine;
