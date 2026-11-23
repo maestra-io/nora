@@ -152,6 +152,18 @@ of a tag that resolves to a held digest, moved or not, logs
 `enforce`, `would_fallback` and `would_block` under `observe`, `observe_fallback` with the
 option below.
 
+#### A refused tag leaves `tags/list` under enforce
+
+A tag answered 403 (its digest held, no admitted copy) is left out of `tags/list` while the
+digest is held, as npm and helm indexes leave out held versions. Renovate has no release date
+for most registries, takes the newest tag at once and fetches its manifest on every run; with
+the tag left out it keeps the previous one until the digest matures, and stops asking. A tag
+NORA has not resolved yet stays listed (its first pull starts the clock), a tag answered with
+its admitted copy stays listed, a break-glass exception or a `quarantine_exempt` repository
+lists it again, and `observe` leaves out nothing. Pagination (`n`, `last`) counts what is
+listed. NORA keeps the refused tags in memory, so after a restart a tag is listed until its
+next refusal.
+
 #### The same fallback under observe (`quarantine_observe_fallback`)
 
 ```toml
