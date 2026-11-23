@@ -427,9 +427,10 @@ struct PublishDate {
     unasked: Vec<String>,
 }
 
-/// Publish date of `path` on the first dated proxy that has one, in configured order: Maven
-/// Central ([`maven_central_publish_date`]), maven.google.com (`Last-Modified`). Empty with
-/// neither configured, so a private mirror's coordinates never reach a public host
+/// Publish date of `path` on the first dated proxy that has the file, in configured order:
+/// Maven Central ([`maven_central_publish_date`]), maven.google.com (`Last-Modified`). Only a
+/// "not found" passes to the next one: a proxy whose lookup failed may still be the one that
+/// serves (or served the cached copy of) the file. Empty with neither configured, so a private mirror's coordinates never reach a public host
 /// (#68/#733). All lookups share `maven.date_lookup_timeout`.
 async fn publish_date(
     state: &AppState,
@@ -449,29 +450,34 @@ async fn publish_date(
         if remaining.is_zero() {
             break;
         }
-        let (at, unasked) =
+        let (found, unasked) =
             proxy_publish_date(state, proxy, path, (group, artifact, version), remaining).await;
         if unasked {
             answer.unasked.push(proxy.url().to_owned());
         }
-        if at.is_some() {
-            answer.at = at;
-            answer.by = Some(proxy.url().to_owned());
-            break;
+        match found {
+            Err(DateMiss::NotFound) => {}
+            Ok(at) => {
+                answer.at = Some(at);
+                answer.by = Some(proxy.url().to_owned());
+                break;
+            }
+            Err(_) => break,
         }
     }
     answer
 }
 
 /// The date of `path` on one dated proxy, one lookup per file for `maven.metadata_ttl`, a miss
-/// for a minute (`upstream_dates`). The flag: a kept "not found" was reused without asking.
+/// for a minute (`upstream_dates`). [`DateMiss::NotFound`] = not on this proxy; any other miss
+/// is [`DateMiss::Missing`]. The flag: a kept "not found" was reused without asking.
 async fn proxy_publish_date(
     state: &AppState,
     proxy: &crate::config::MavenProxyEntry,
     path: &str,
     (group, artifact, version): (&str, &str, &str),
     budget: Duration,
-) -> (Option<i64>, bool) {
+) -> (Result<i64, DateMiss>, bool) {
     let base = proxy.url().trim_end_matches('/').to_owned();
     let central = url_is_maven_central(&base);
     let file_url = format!("{base}/{path}");
@@ -513,7 +519,10 @@ async fn proxy_publish_date(
         },
     )
     .await;
-    let date = answer.dates.and_then(|dates| dates.get(&wanted).copied());
+    let date = match answer.dates {
+        Some(dates) => dates.get(&wanted).copied().ok_or(DateMiss::NotFound),
+        None => Err(DateMiss::Missing),
+    };
     (date, answer.unasked)
 }
 
@@ -796,9 +805,11 @@ async fn download(
                     .filter(|_| !internal && state.config.server.trust_upstream_dates)
                 {
                     redate_held(&state.digest_store, digest, q_secs, || async {
-                        self::publish_date(&state, &path, maven_name, maven_version)
-                            .await
-                            .at
+                        // Which proxy served the copy is not kept: a date reached through a
+                        // reused "not found" may be another proxy's than the bytes'.
+                        let dated =
+                            self::publish_date(&state, &path, maven_name, maven_version).await;
+                        dated.at.filter(|_| dated.unasked.is_empty())
                     })
                     .await;
                 }
@@ -1053,7 +1064,8 @@ async fn download(
                 let undated = dates_asked
                     && url_is_dated(proxy.url())
                     && dated.by.as_deref() != Some(proxy.url());
-                let publish_date = publish_date.filter(|_| !undated);
+                let publish_date =
+                    publish_date.filter(|_| dated.by.as_deref() == Some(proxy.url()));
                 if let Some((maven_name, maven_version)) =
                     curation_coords.as_ref().filter(|_| undated)
                 {

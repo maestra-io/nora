@@ -61,9 +61,9 @@ because a later upstream does not have it. Before, `software/amazon/awssdk/bundl
 | maven.google.com (`dl.google.com/dl/android/maven2`) | the file's `Last-Modified` there (with `server.trust_upstream_dates`) | applies; `unknown_date` as above | seeded with the publish date |
 | any other proxy | none NORA reads | skipped | first seen by NORA |
 
-Dated proxies are asked in configured order until one has a date, all within one
-`maven.date_lookup_timeout`. A date names the bytes of the upstream that gave it: a file another
-dated proxy serves is judged undated. Google's `Last-Modified` is the publish time (measured
+Dated proxies are asked in configured order, all within one `maven.date_lookup_timeout`; only a
+404 passes to the next. A date names the bytes of the upstream that gave it: a file another
+dated proxy serves is judged undated, and one an undated proxy serves keeps the first-seen clock. Google's `Last-Modified` is the publish time (measured
 23.11.2026: within 4 minutes of `lastUpdated` in `maven-metadata.xml` for androidx core, AGP,
 Firebase and Play services; files from before 2019 carry the day they were moved).
 
