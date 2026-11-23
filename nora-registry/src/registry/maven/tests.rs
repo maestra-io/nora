@@ -20,6 +20,24 @@ fn test_url_is_maven_central() {
     assert!(!url_is_maven_central(""));
 }
 
+#[test]
+fn only_central_and_google_are_dated() {
+    for google in [
+        "https://maven.google.com",
+        "https://dl.google.com/dl/android/maven2",
+    ] {
+        assert!(url_is_google_maven(google) && url_is_dated(google));
+        assert!(!url_is_maven_central(google));
+    }
+    assert!(url_is_dated("https://repo1.maven.org/maven2"));
+    for other in [
+        "https://packages.confluent.io/maven",
+        "https://dl.google.com/x",
+    ] {
+        assert!(!url_is_dated(other), "{other}");
+    }
+}
+
 mod central_date {
     use super::*;
     use std::sync::{Arc, Mutex};
