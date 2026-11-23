@@ -31,7 +31,7 @@ use nora_registry::docker_manifest::detect_manifest_media_type;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -3127,6 +3127,17 @@ async fn try_fetch_and_cache(
                     let observe_fallback = !enforce
                         && admitted.is_some()
                         && state.config.curation.docker.quarantine_observe_fallback;
+                    if !reference.starts_with("sha256:") {
+                        // A tag answered 403 is left out of `tags/list` while its digest is held.
+                        let repo = held_tags_key(cache_ns, name);
+                        if enforce && held && admitted.is_none() {
+                            state
+                                .docker_upstream_tags
+                                .hold_tag(repo, reference, &digest);
+                        } else {
+                            state.docker_upstream_tags.release_tag(&repo, reference);
+                        }
+                    }
                     if held && !reference.starts_with("sha256:") {
                         let outcome = match (enforce, admitted.is_some()) {
                             (true, true) => "fallback",
@@ -4171,6 +4182,24 @@ async fn list_tags(
     if !known {
         return name_unknown_response(&name);
     }
+    // Under enforce a tag answered 403 (its digest held, no admitted copy) is left out while
+    // the digest is held, as npm and helm indexes leave out held versions: a client taking the
+    // newest tag (Renovate) does not ask for it on every run. A tag NORA has not resolved stays.
+    let (q_mode, q_secs) = resolve_quarantine(&state);
+    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce) {
+        let hidden =
+            state
+                .docker_upstream_tags
+                .held_tags(&held_tags_key(ns.as_deref(), &name), |digest| {
+                    matches!(
+                        state.digest_store.check("docker", digest, q_secs),
+                        crate::digest_quarantine::QuarantineStatus::Pending { .. }
+                    ) && state.quarantine_exceptions.covering(digest).is_none()
+                });
+        if !hidden.is_empty() {
+            tags.retain(|t| !hidden.contains(t));
+        }
+    }
     let base = format!("/v2/{raw_name}/tags/list?");
     let link = page(&mut tags, n, params.get("last"), &base);
     with_link(
@@ -4281,9 +4310,69 @@ struct UpstreamTagsInner {
     /// Repository → (fetched at, tags, bytes counted for the entry).
     entries: HashMap<String, (u64, Arc<[String]>, usize)>,
     bytes: usize,
+    /// Repository ([`held_tags_key`]) → tag → the held digest it was refused for.
+    held: HashMap<String, HashMap<String, String>>,
+    held_count: usize,
+}
+
+/// Tags [`UpstreamTags::hold_tag`] keeps at once.
+const HELD_TAGS_MAX: usize = 65_536;
+
+/// The repository key of [`UpstreamTags::hold_tag`]: the storage namespace and canonical name,
+/// as both the manifest fetch and `tags/list` resolve them.
+fn held_tags_key(ns: Option<&str>, name: &str) -> String {
+    format!("{}/{name}", ns.unwrap_or_default())
 }
 
 impl UpstreamTags {
+    /// Remember that `tag` of `repo` was refused for the held `digest`. In memory: after a
+    /// restart the tag is listed until its next refusal.
+    fn hold_tag(&self, repo: String, tag: &str, digest: &str) {
+        let mut inner = self.0.lock();
+        // ponytail: full = the tag stays listed (today's behaviour); evict if that ever shows.
+        if inner.held_count >= HELD_TAGS_MAX {
+            return;
+        }
+        let previous = inner
+            .held
+            .entry(repo)
+            .or_default()
+            .insert(tag.to_string(), digest.to_string());
+        if previous.is_none() {
+            inner.held_count += 1;
+        }
+    }
+
+    /// Forget a held `tag` of `repo`: it resolved to a digest NORA serves.
+    fn release_tag(&self, repo: &str, tag: &str) {
+        let mut inner = self.0.lock();
+        let Some(tags) = inner.held.get_mut(repo) else {
+            return;
+        };
+        if tags.remove(tag).is_some() {
+            if tags.is_empty() {
+                inner.held.remove(repo);
+            }
+            inner.held_count -= 1;
+        }
+    }
+
+    /// The tags of `repo` whose digest `still_held` says is held; the others are forgotten.
+    fn held_tags(&self, repo: &str, still_held: impl Fn(&str) -> bool) -> HashSet<String> {
+        let mut inner = self.0.lock();
+        let Some(tags) = inner.held.get_mut(repo) else {
+            return HashSet::new();
+        };
+        let before = tags.len();
+        tags.retain(|_, digest| still_held(digest));
+        let (left, held) = (tags.len(), tags.keys().cloned().collect());
+        if left == 0 {
+            inner.held.remove(repo);
+        }
+        inner.held_count -= before - left;
+        held
+    }
+
     fn get(&self, key: &str) -> Option<(u64, Arc<[String]>)> {
         let inner = self.0.lock();
         inner

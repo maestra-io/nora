@@ -7090,6 +7090,100 @@ mod trust_upstream_dates {
         assert_eq!(renovate("fallback"), fallback + 1);
     }
 
+    /// `tags/list` of the upstream at `server`: `v1` and `v2`, with `v2` a fresh manifest.
+    async fn tags_with_fresh_v2(server: &MockServer) -> Vec<u8> {
+        let fresh = moved_manifest();
+        for route in ["v2".to_string(), sha(&fresh)] {
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/library/demo/manifests/{route}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+                        .set_body_bytes(fresh.clone()),
+                )
+                .mount(server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/v2/library/demo/tags/list"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"name": "library/demo", "tags": ["v1", "v2"]}),
+                ),
+            )
+            .mount(server)
+            .await;
+        fresh
+    }
+
+    async fn listed(ctx: &TestContext, query: &str) -> Vec<String> {
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/v2/library/demo/tags/list{query}"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        serde_json::from_value(body["tags"].clone()).unwrap()
+    }
+
+    /// Under enforce a tag refused for a held digest leaves `tags/list` until the digest
+    /// matures; a tag never resolved stays listed, and pagination counts what is listed.
+    #[tokio::test]
+    async fn a_tag_refused_for_a_held_digest_leaves_the_tag_list() {
+        let (server, _, _) = upstream_with_image().await;
+        let fresh = tags_with_fresh_v2(&server).await;
+        let ctx = context(&server, false, QuarantineMode::Enforce);
+        assert_eq!(listed(&ctx, "").await, ["v1", "v2"], "nothing resolved yet");
+
+        assert_eq!(get(&ctx, "manifests/v2").await, StatusCode::FORBIDDEN);
+        assert_eq!(listed(&ctx, "").await, ["v1"]);
+        assert_eq!(listed(&ctx, "?n=1").await, ["v1"]);
+        assert!(listed(&ctx, "?n=1&last=v1").await.is_empty());
+
+        // Matured: listed again, and the tag answers.
+        ctx.state
+            .digest_store
+            .backdate("docker", &sha(&fresh), days_ago(30), false)
+            .unwrap();
+        assert_eq!(listed(&ctx, "").await, ["v1", "v2"]);
+        assert_eq!(get(&ctx, "manifests/v2").await, StatusCode::OK);
+    }
+
+    /// A break-glass exception lists the tag again; under observe nothing is left out.
+    #[tokio::test]
+    async fn an_excepted_or_observed_held_tag_stays_listed() {
+        let (server, _, _) = upstream_with_image().await;
+        let fresh = tags_with_fresh_v2(&server).await;
+        let ctx = context(&server, false, QuarantineMode::Enforce);
+        assert_eq!(get(&ctx, "manifests/v2").await, StatusCode::FORBIDDEN);
+        assert_eq!(listed(&ctx, "").await, ["v1"]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("exceptions.toml");
+        let expires = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        std::fs::write(
+            &file,
+            format!(
+                "[[exception]]\ndigest = {:?}\nreason = \"hotfix\"\nexpires = {expires:?}\n",
+                sha(&fresh)
+            ),
+        )
+        .unwrap();
+        {
+            let _gauges = crate::quarantine_exceptions::GAUGES.lock();
+            ctx.state
+                .quarantine_exceptions
+                .reload(file.to_str().unwrap());
+        }
+        assert_eq!(listed(&ctx, "").await, ["v1", "v2"]);
+
+        let observed = context(&server, false, QuarantineMode::Observe);
+        assert_eq!(get(&observed, "manifests/v2").await, StatusCode::OK);
+        assert_eq!(listed(&observed, "").await, ["v1", "v2"]);
+    }
+
     /// Once the new digest is past the TTL the tag moves to it.
     #[tokio::test]
     async fn a_moved_tag_follows_the_new_digest_when_it_matures() {
