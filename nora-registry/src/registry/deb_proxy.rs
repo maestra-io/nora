@@ -1652,8 +1652,18 @@ mod integration_tests {
         super::gzip(data).unwrap()
     }
 
+    /// Docker's layout for a `docker-*` package: the pool under `dists/<suite>/`.
+    fn pool_path(name: &str, version: &str) -> String {
+        let pool = match name.starts_with("docker-") {
+            true => "dists/bookworm/pool/stable/amd64",
+            false => "pool/main",
+        };
+        format!("{pool}/{name}_{version}_amd64.deb")
+    }
+
     fn stanza(name: &str, version: &str) -> String {
-        format!("Package: {name}\nVersion: {version}\nArchitecture: amd64\nFilename: pool/main/{name}_{version}_amd64.deb\n")
+        let file = pool_path(name, version);
+        format!("Package: {name}\nVersion: {version}\nArchitecture: amd64\nFilename: {file}\n")
     }
 
     /// Mount a signed suite listing `stanzas` and their package files.
@@ -1768,7 +1778,7 @@ mod integration_tests {
         }
         for (n, v) in comps.iter().flat_map(|(_, s)| s.iter()) {
             mount(
-                format!("/pool/main/{n}_{v}_amd64.deb"),
+                format!("/{}", pool_path(n, v)),
                 format!("{n}-{v}").into_bytes(),
             )
             .await;
@@ -1860,6 +1870,48 @@ mod integration_tests {
             !asked.iter().any(|p| p.starts_with("/pool/main/a_2")),
             "{asked:?}"
         );
+    }
+
+    /// Docker's repositories name `dists/<suite>/pool/...` in `Filename`: a package path
+    /// under `dists/` is served and held like one under `pool/`, an index file is not.
+    #[tokio::test]
+    async fn a_package_under_dists_is_served_and_held() {
+        let (key, keydir) = upstream_key();
+        let server = MockServer::start().await;
+        publish(&server, &key, &[("docker-ce-cli", "1")]).await;
+        let uri = server.uri();
+        let dir = keydir.path().to_str().unwrap().to_string();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.deb.enabled = true;
+            cfg.deb.metadata_ttl = 0;
+            cfg.deb.upstream_keyring_dir = dir;
+            cfg.deb
+                .proxies
+                .insert("debian".into(), RepoProxyEntry::Simple(uri));
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.deb.min_release_age = Some("3d".into());
+        });
+        let get = |v: &str| format!("/deb/debian/{}", pool_path("docker-ce-cli", v));
+        served(&ctx).await;
+        let resp = send(&ctx.app, Method::GET, &get("1"), "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"docker-ce-cli-1");
+
+        publish(
+            &server,
+            &key,
+            &[("docker-ce-cli", "1"), ("docker-ce-cli", "2")],
+        )
+        .await;
+        let (_, pkgs) = served(&ctx).await;
+        assert_eq!(pkgs, [("docker-ce-cli".into(), "1".into())], "2 is held");
+        let resp = send(&ctx.app, Method::GET, &get("2"), "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let index = "/deb/debian/dists/bookworm/pool/Contents-amd64.gz";
+        let resp = send(&ctx.app, Method::GET, index, "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let asked = upstream_paths(&server).await;
+        assert!(!asked.iter().any(|p| p.contains("Contents")), "{asked:?}");
     }
 
     #[tokio::test]
