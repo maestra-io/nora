@@ -185,15 +185,26 @@ fn is_mutable_maven_path(path: &str) -> bool {
     matches!(classify_path(path), MavenPathKind::VersionFile(c) if is_snapshot(&c.version))
 }
 
-/// True when a URL points at Maven Central (one of its canonical hosts) — the only
-/// Maven upstream NORA reads a per-artifact date from (`Last-Modified`, its search API).
-/// A private mirror (Nexus/Artifactory) returns false, so its coordinates are never sent
-/// to the public search.maven.org (#68/#733).
+/// True when a URL points at Maven Central (one of its canonical hosts): dated by the file's
+/// `Last-Modified`, else Central's search API. A private mirror (Nexus/Artifactory) returns
+/// false, so its coordinates are never sent to the public search.maven.org (#68/#733).
 fn url_is_maven_central(u: &str) -> bool {
     u.contains("repo1.maven.org")
         || u.contains("repo.maven.apache.org")
         || u.contains("search.maven.org")
         || u.contains("central.sonatype")
+}
+
+/// True when a URL points at Google's Maven repository, whose `Last-Modified` is the publish
+/// date (measured 23.11.2026: within minutes of `lastUpdated` in `maven-metadata.xml`; files
+/// older than 2019 carry the day they were moved).
+fn url_is_google_maven(u: &str) -> bool {
+    u.contains("maven.google.com") || u.contains("dl.google.com/dl/android/maven2")
+}
+
+/// True for an upstream NORA reads a per-artifact date from.
+fn url_is_dated(u: &str) -> bool {
+    url_is_maven_central(u) || url_is_google_maven(u)
 }
 
 /// Central's search API: the fallback date source when the file's own `Last-Modified` is
@@ -206,7 +217,7 @@ enum DateMiss {
     Timeout,
     Transport,
     Status(u16),
-    /// Central has no such file / GAV: not a failure, the artifact is not on Central.
+    /// The upstream has no such file / GAV: not a failure, the artifact is not there.
     NotFound,
     /// Answered without a date (no `Last-Modified`, no `timestamp`).
     Missing,
@@ -245,11 +256,11 @@ impl DateMiss {
     }
 }
 
-/// `Last-Modified` of the file on Central (a HEAD): Central files are immutable, so it is
-/// the upload date. Reported to the `<central>#dates` breaker, never the download one.
-async fn central_last_modified(
+/// `Last-Modified` of the file on a dated upstream (a HEAD): its files are immutable, so it is
+/// the upload date. Reported to the `<upstream>#dates` breaker, never the download one.
+async fn last_modified(
     state: &AppState,
-    central: &str,
+    upstream: &str,
     file_url: &str,
     auth: Option<&str>,
     timeout: Duration,
@@ -262,7 +273,7 @@ async fn central_last_modified(
         request = request.header(header::AUTHORIZATION, value);
     }
     let cb = &state.circuit_breaker;
-    let key = super::upstream_dates::breaker_key(RegistryType::Maven, central);
+    let key = super::upstream_dates::breaker_key(RegistryType::Maven, upstream);
     let probe = cb.check(&key).map_err(|_| {
         super::upstream_dates::count(RegistryType::Maven, "breaker_open");
         DateMiss::BreakerOpen
@@ -346,16 +357,16 @@ fn record_date_lookup(source: &str, result: Result<i64, DateMiss>, path: &str) {
         .inc();
     match result {
         Ok(_) => {}
-        // Not on Central (a maven.google.com artifact): expected, nothing to act on.
+        // Not on this upstream (a maven.google.com artifact on Central): expected.
         Err(DateMiss::NotFound) => {
-            tracing::debug!(source, path, "Maven Central has no date for this artifact")
+            tracing::debug!(source, path, "the Maven upstream has no such artifact")
         }
         Err(miss) => tracing::warn!(
             source,
             path,
             reason = outcome,
             status = ?match miss { DateMiss::Status(code) => Some(code), _ => None },
-            "Maven Central date lookup failed; the quarantine falls back to first_seen"
+            "Maven date lookup failed; the quarantine falls back to first_seen"
         ),
     }
 }
@@ -377,7 +388,7 @@ async fn maven_central_publish_date(
     budget: Duration,
 ) -> Result<i64, DateMiss> {
     let started = std::time::Instant::now();
-    let head = central_last_modified(state, central, file_url, auth, budget).await;
+    let head = last_modified(state, central, file_url, auth, budget).await;
     record_date_lookup("last_modified", head, file_url);
     match head {
         // Not on Central / out of budget: the search cannot answer either.
@@ -405,64 +416,113 @@ async fn maven_central_publish_date(
     search
 }
 
-/// [`maven_central_publish_date`] of `path` on the configured Central proxy; `None` with no
-/// Central proxy, so a private mirror's coordinates never reach Central (#68/#733). One
-/// lookup per file for `maven.metadata_ttl`, a miss for a minute (`upstream_dates`). The flag:
-/// a kept "not on Central" was reused without asking, so the file may be newer than it (R01).
-async fn central_publish_date(
+/// What the dated upstreams say about a file.
+#[derive(Default)]
+struct PublishDate {
+    at: Option<i64>,
+    /// The proxy that gave `at`: the date names the bytes of that upstream only.
+    by: Option<String>,
+    /// Proxies whose kept "not found" was reused without asking, so the file may be newer
+    /// than the answer (R01).
+    unasked: Vec<String>,
+}
+
+/// Publish date of `path` on the first dated proxy that has the file, in configured order:
+/// Maven Central ([`maven_central_publish_date`]), maven.google.com (`Last-Modified`). Only a
+/// "not found" passes to the next one: a proxy whose lookup failed may still be the one that
+/// serves (or served the cached copy of) the file. Empty with neither configured, so a private mirror's coordinates never reach a public host
+/// (#68/#733). All lookups share `maven.date_lookup_timeout`.
+async fn publish_date(
     state: &AppState,
     path: &str,
     maven_name: &str,
     version: &str,
-) -> (Option<i64>, bool) {
-    let Some(central) = state
-        .config
-        .maven
-        .proxies
-        .iter()
-        .find(|p| url_is_maven_central(p.url()))
-    else {
-        return (None, false);
-    };
+) -> PublishDate {
+    let mut answer = PublishDate::default();
     let Some((group, artifact)) = maven_name.split_once(':') else {
-        return (None, false);
+        return answer;
     };
-    let base = central.url().trim_end_matches('/').to_owned();
-    let file_url = format!("{base}/{path}");
-    let auth = central.auth().map(str::to_owned);
-    let (group, artifact, version) = (group.to_owned(), artifact.to_owned(), version.to_owned());
+    let started = std::time::Instant::now();
     let budget = Duration::from_secs(state.config.maven.date_lookup_timeout);
+    let dated = |p: &&crate::config::MavenProxyEntry| url_is_dated(p.url());
+    for proxy in state.config.maven.proxies.iter().filter(dated) {
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        let (found, unasked) =
+            proxy_publish_date(state, proxy, path, (group, artifact, version), remaining).await;
+        if unasked {
+            answer.unasked.push(proxy.url().to_owned());
+        }
+        match found {
+            Err(DateMiss::NotFound) => {}
+            Ok(at) => {
+                answer.at = Some(at);
+                answer.by = Some(proxy.url().to_owned());
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    answer
+}
+
+/// The date of `path` on one dated proxy, one lookup per file for `maven.metadata_ttl`, a miss
+/// for a minute (`upstream_dates`). [`DateMiss::NotFound`] = not on this proxy; any other miss
+/// is [`DateMiss::Missing`]. The flag: a kept "not found" was reused without asking.
+async fn proxy_publish_date(
+    state: &AppState,
+    proxy: &crate::config::MavenProxyEntry,
+    path: &str,
+    (group, artifact, version): (&str, &str, &str),
+    budget: Duration,
+) -> (Result<i64, DateMiss>, bool) {
+    let base = proxy.url().trim_end_matches('/').to_owned();
+    let central = url_is_maven_central(&base);
+    let file_url = format!("{base}/{path}");
+    let auth = proxy.auth().map(str::to_owned);
+    let (group, artifact, version) = (group.to_owned(), artifact.to_owned(), version.to_owned());
     let ttl = Duration::from_secs(state.config.maven.metadata_ttl.max(0) as u64);
     let fetching = state.clone();
     let key = file_url.clone();
-    let dated = version.clone();
+    let wanted = version.clone();
     let answer = super::upstream_dates::dates(
         state,
         RegistryType::Maven,
         &key,
         ttl,
-        &[&dated],
+        &[&wanted],
         move || async move {
-            match maven_central_publish_date(
-                &fetching,
-                &base,
-                &file_url,
-                auth.as_deref(),
-                MAVEN_CENTRAL_SEARCH,
-                (&group, &artifact, &version),
-                budget,
-            )
-            .await
-            {
+            let at = if central {
+                maven_central_publish_date(
+                    &fetching,
+                    &base,
+                    &file_url,
+                    auth.as_deref(),
+                    MAVEN_CENTRAL_SEARCH,
+                    (&group, &artifact, &version),
+                    budget,
+                )
+                .await
+            } else {
+                let at = last_modified(&fetching, &base, &file_url, auth.as_deref(), budget).await;
+                record_date_lookup("google", at, &file_url);
+                at
+            };
+            match at {
                 Ok(at) => Some(std::collections::HashMap::from([(version, at)])),
-                // Not on Central: an answer without the version.
+                // Not on this upstream: an answer without the version.
                 Err(DateMiss::NotFound) => Some(Default::default()),
                 Err(_) => None,
             }
         },
     )
     .await;
-    let date = answer.dates.and_then(|dates| dates.get(&dated).copied());
+    let date = match answer.dates {
+        Some(dates) => dates.get(&wanted).copied().ok_or(DateMiss::NotFound),
+        None => Err(DateMiss::Missing),
+    };
     (date, answer.unasked)
 }
 
@@ -523,7 +583,7 @@ async fn redate_held<F, Fut>(
                 digest,
                 first_seen = at,
                 ?was,
-                "Quarantine: held Maven artifact dated by Central"
+                "Quarantine: held Maven artifact dated by its upstream"
             );
         }
     }
@@ -587,32 +647,31 @@ async fn download(
         .unwrap_or(false);
 
     // Release date for the digest-quarantine first-seen clock (#748/#750), hoisted
-    // to function scope so the serve gate below can use it. For a Maven Central upstream
-    // it is the file's `Last-Modified` on Central, else the Central search API, within
-    // `maven.date_lookup_timeout` (gated to a Central proxy to avoid leaking coordinates);
-    // other proxies have no date (None → NORA's own clock). Hosted-only uses mtime.
+    // to function scope so the serve gate below can use it. For a Maven Central or
+    // maven.google.com upstream it is the file's `Last-Modified` there (Central: else its
+    // search API), within `maven.date_lookup_timeout` (gated to those proxies to avoid
+    // leaking coordinates); other proxies have no date (None → NORA's own clock).
+    // Hosted-only uses mtime.
     // The search used to run on `proxy_timeout` and fail silently: a throttled search
     // added 30 s to every cold miss and held years-old artifacts by first_seen.
     //
-    // #754: the Central query only happens on a cache MISS. On a cache hit the digest
+    // #754: the upstream query only happens on a cache MISS. On a cache hit the digest
     // is already recorded (quarantine `record` is idempotent → the date is ignored),
     // so a cheap local stat skips the upstream round-trip — a cache hit never pays it.
     let cached_meta = state.storage.stat(&key).await;
     let already_cached = cached_meta.is_some();
-    let mut central_asked = false;
-    let mut central_unasked = false;
+    let mut dates_asked = false;
+    let mut dated = PublishDate::default();
     let publish_date: Option<i64> =
         if let Some((ref maven_name, ref maven_version)) = curation_coords {
             if state.config.maven.proxies.is_empty() {
                 crate::curation::extract_mtime_as_publish_date(&state.storage, &key).await
             } else if !already_cached && !internal && state.config.server.trust_upstream_dates {
-                // #68/#733: never send an internal-namespace GAV to Central — that would
-                // leak operator-internal coordinates.
-                central_asked = true;
-                let (date, unasked) =
-                    central_publish_date(&state, &path, maven_name, maven_version).await;
-                central_unasked = unasked;
-                date
+                // #68/#733: never send an internal-namespace GAV to a public upstream — that
+                // would leak operator-internal coordinates.
+                dates_asked = true;
+                dated = self::publish_date(&state, &path, maven_name, maven_version).await;
+                dated.at
             } else {
                 None
             }
@@ -746,9 +805,11 @@ async fn download(
                     .filter(|_| !internal && state.config.server.trust_upstream_dates)
                 {
                     redate_held(&state.digest_store, digest, q_secs, || async {
-                        central_publish_date(&state, &path, maven_name, maven_version)
-                            .await
-                            .0
+                        // Which proxy served the copy is not kept: a date reached through a
+                        // reused "not found" may be another proxy's than the bytes'.
+                        let dated =
+                            self::publish_date(&state, &path, maven_name, maven_version).await;
+                        dated.at.filter(|_| dated.unasked.is_empty())
                     })
                     .await;
                 }
@@ -996,18 +1057,22 @@ async fn download(
                         return response;
                     }
                 }
-                // A070: Central served the file but gave it no date: judged by
-                // `[curation.maven] unknown_date` before anything is cached. Not before the
-                // loop: a coordinate another proxy serves (maven.google.com) has no Central
-                // date either and stays on the quarantine path, which keeps `publish_date`.
-                if let Some((maven_name, maven_version)) = curation_coords
-                    .as_ref()
-                    .filter(|_| central_asked && publish_date.is_none())
-                    .filter(|_| url_is_maven_central(proxy.url()))
+                // A070: a dated upstream served the file but gave it no date (another one's
+                // date is not its date): judged by `[curation.maven] unknown_date` before
+                // anything is cached. Not before the loop: a coordinate an undated proxy
+                // serves has no date either and stays on the quarantine path.
+                let undated = dates_asked
+                    && url_is_dated(proxy.url())
+                    && dated.by.as_deref() != Some(proxy.url());
+                let publish_date =
+                    publish_date.filter(|_| dated.by.as_deref() == Some(proxy.url()));
+                if let Some((maven_name, maven_version)) =
+                    curation_coords.as_ref().filter(|_| undated)
                 {
-                    // R01: a kept "not on Central" that Central now serves is held, not logged.
+                    // R01: a kept "not found" on an upstream that now serves the file is held,
+                    // not logged.
                     let trust = state.config.server.trust_upstream_dates;
-                    let judged = if central_unasked {
+                    let judged = if dated.unasked.iter().any(|u| u == proxy.url()) {
                         engine.unasked_release_date(crate::curation::RegistryType::Maven, trust)
                     } else {
                         engine.judged_release_date(

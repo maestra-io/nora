@@ -58,32 +58,40 @@ because a later upstream does not have it. Before, `software/amazon/awssdk/bundl
 | Upstream | Date | `min_release_age` | Quarantine clock |
 |---|---|---|---|
 | Maven Central | the file's `Last-Modified` on Central, else search.maven.org `timestamp` (with `server.trust_upstream_dates`) | applies; a date the lookup could not get is judged by `unknown_date` | seeded with the publish date |
-| maven.google.com, any other proxy | none NORA reads | skipped | first seen by NORA |
+| maven.google.com (`dl.google.com/dl/android/maven2`) | the file's `Last-Modified` there (with `server.trust_upstream_dates`) | applies; `unknown_date` as above | seeded with the publish date |
+| any other proxy | none NORA reads | skipped | first seen by NORA |
 
-An artifact without a date is held only by the digest quarantine, counted from NORA's first
-fetch of that file. With `quarantine = "observe"` that is a log line and
-`nora_quarantine_holds_total{registry="maven",outcome="observed"}`, no 403: a Google artifact
-released yesterday is served. With `enforce` every Google artifact NORA has not fetched before,
-including one released years ago, is refused for `quarantine_ttl` after its first fetch.
+Dated proxies are asked in configured order, all within one `maven.date_lookup_timeout`; only a
+404 passes to the next. A date names the bytes of the upstream that gave it: a file another
+dated proxy serves is judged undated, and one an undated proxy serves keeps the first-seen clock. Google's `Last-Modified` is the publish time (measured
+23.11.2026: within 4 minutes of `lastUpdated` in `maven-metadata.xml` for androidx core, AGP,
+Firebase and Play services; files from before 2019 carry the day they were moved).
 
-Central is asked first, so a Google-only coordinate costs one Central 404 per cache miss, and the
-Central date lookup also runs for it (a HEAD 404, no date, no search).
+An artifact without a date (Cloudsmith, Confluent) is held only by the digest quarantine,
+counted from NORA's first fetch of that file. With `quarantine = "observe"` that is a log line and
+`nora_quarantine_holds_total{registry="maven",outcome="observed"}`, no 403. With `enforce` every
+such artifact NORA has not fetched before, including one released years ago, is refused for
+`quarantine_ttl` after its first fetch.
+
+Central is asked first, so a Google-only coordinate costs a Central HEAD and GET 404 per cache
+miss.
 
 The date lookup runs on a cache miss before the download, within `maven.date_lookup_timeout`
-(default 5 s, `NORA_MAVEN_DATE_LOOKUP_TIMEOUT`) for the HEAD and the search together. A lookup
-that fails (timeout, throttled 403, no date) logs `Maven Central date lookup failed` at WARN
+(default 5 s, `NORA_MAVEN_DATE_LOOKUP_TIMEOUT`) for the HEADs and the search together. A lookup
+that fails (timeout, throttled 403, no date) logs `Maven date lookup failed` at WARN
 with `source` and `reason` and counts `nora_maven_date_lookup_total{source,outcome}`. Only the
-HEAD's 404 means "not on Central"; an empty search after a failed HEAD is `missing`.
+HEAD's 404 means "not on that upstream"; an empty search after a failed HEAD is `missing`.
+`source` is `last_modified` or `search` (Central) or `google`.
 
-When Central then serves the file anyway, its date stayed unknown and `[curation.maven]
-unknown_date` decides before anything is cached: `log` (the default) serves it, logs
+When a dated upstream then serves the file anyway, its date stayed unknown and
+`[curation.maven] unknown_date` decides before anything is cached: `log` (the default) serves it, logs
 `[SECURITY] min-release-age unknown date` and counts
 `nora_curation_unknown_release_date_total{registry="maven"}`, the quarantine keeping it on the
 first-seen clock; `hold` judges it released now, so `min_release_age` refuses it (403, nothing
-cached, a later request asks the date again). A file another proxy serves after a Central 404
-stays on the quarantine path either way. Before switching to `hold`, read
-`nora_maven_date_lookup_total{outcome!~"ok|not_found"}`: each such cold miss of a Central file
-would be a 403. Before 1.4.3-maestra.16 only the search was asked,
+cached, a later request asks the date again). A file an undated proxy serves stays on
+the quarantine path either way. Before switching to `hold`, read
+`nora_maven_date_lookup_total{outcome!~"ok|not_found"}`: each such cold miss of a file
+on a dated upstream would be a 403. Before 1.4.3-maestra.16 only the search was asked,
 on `proxy_timeout` (30 s), silently: a throttled search added 30 s to a cold miss and held a
 years-old artifact as new.
 
@@ -94,7 +102,7 @@ and the search answer is read up to 32 MiB. The same memo serves the RubyGems ve
 the registry.terraform.io `/v2` API; `nora_upstream_date_lookup_total{registry,outcome}` counts
 `memo`, `fetch` and `breaker_open`.
 
-A cache hit asks Central again (once per digest per hour) when the quarantine holds the artifact
-or has no entry for it, and a Central date moves the clock back. No entry is what a restart
+A cache hit asks the dated upstreams again (once per digest per hour) when the quarantine holds the artifact
+or has no entry for it, and a date moves the clock back. No entry is what a restart
 leaves for an artifact dated past the prune line on its miss: that entry is never persisted, so
 the first hit after a restart used to hold it as new.
