@@ -7019,7 +7019,8 @@ mod trust_upstream_dates {
     }
 
     /// `nora_quarantine_holds_total{client}`: a `renovate_principals` user's holds count as
-    /// `renovate`, a person's and an unauthenticated pull's do not; a tag answered with its
+    /// `renovate`, a Teleport person's as `laptop`, a Teleport bot's, an htpasswd user's and
+    /// an unauthenticated pull's as `consumer`, all refused alike; a tag answered with its
     /// admitted copy under enforce is a `fallback`, only a 403 is `blocked`.
     #[tokio::test]
     async fn a_hold_counts_under_the_client_class_of_who_asked() {
@@ -7088,6 +7089,29 @@ mod trust_upstream_dates {
             "consumers are not renovate"
         );
         assert_eq!(renovate("fallback"), fallback + 1);
+
+        // A token a person minted through Teleport: refused alike, counted apart. A Teleport
+        // bot's token is a host or CI: a consumer.
+        let laptop = || {
+            crate::metrics::QUARANTINE_HOLDS_TOTAL
+                .with_label_values(&["docker", "blocked", "laptop"])
+                .get()
+        };
+        let (laptops, consumers) = (laptop(), consumer());
+        for owner in ["teleport:alice", "teleport:bot-asbo-ro"] {
+            let tokens = ctx.state.tokens.as_ref().unwrap();
+            let token = tokens
+                .create_token(owner, 1, None, crate::tokens::Role::Read)
+                .await
+                .unwrap();
+            let bearer = format!("Bearer {token}");
+            let uri = format!("/v2/library/demo/{held}");
+            let headers = vec![("authorization", bearer.as_str())];
+            let answer = send_with_headers(&ctx.app, Method::HEAD, &uri, headers, "").await;
+            assert_eq!(answer.status(), StatusCode::FORBIDDEN, "{owner}");
+        }
+        assert_eq!(laptop(), laptops + 1);
+        assert!(consumer() > consumers);
     }
 
     /// `tags/list` of the upstream at `server`: `v1` and `v2`, with `v2` a fresh manifest.

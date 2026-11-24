@@ -199,16 +199,18 @@ Every hold counts `nora_quarantine_holds_total{registry, outcome, client}`: `out
 |---|---|
 | `renovate` | listed in `[curation] renovate_principals` (token owner or htpasswd user, exact) |
 | `pull_request` | an OIDC JWT whose subject ends in `:pull_request` (GitHub Actions on a pull request) |
-| `consumer` | anyone else: a node, CI of a branch, a person, an unauthenticated pull |
+| `laptop` | a token a person minted through Teleport: owner `teleport:<username>`, the username not `bot-…` |
+| `consumer` | anyone else: a node, CI of a branch, a Teleport bot (`teleport:bot-<name>`), any other token owner or htpasswd user, an unauthenticated pull |
 
 ```toml
 [curation]
 renovate_principals = ["renovate"]   # NORA_CURATION_RENOVATE_PRINCIPALS, comma-separated
 ```
 
-A Renovate lookup of a fresh tag and the CI of a pull request bumping to it are refused
-like anyone else; the label only lets an alert on `client="consumer"` page for refusals
-of what runs. Every hold log line (`Quarantine: tag resolves to a held digest` among
+A Renovate lookup of a fresh tag, the CI of a pull request bumping to it and a person's
+pull are refused like anyone else; the label only lets an alert on `client="consumer"` page
+for refusals of what runs. Never give a person's Teleport token to a service: its refusals
+would count as `laptop`. Every hold log line (`Quarantine: tag resolves to a held digest` among
 them) carries `client` and `principal` (`-` when unauthenticated). Read at start.
 
 ### The verdict on every manifest answer
