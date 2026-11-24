@@ -1337,7 +1337,9 @@ async fn load_entries(storage: &Storage, legacy: &Path) -> (HashMap<String, Dige
 ///   for releases nothing runs yet;
 /// - `pull_request`: a workload (OIDC) identity whose subject ends in `:pull_request`, the
 ///   GitHub Actions subject of a pull request run: CI of a change not merged yet;
-/// - `consumer`: anyone else (a node, CI of a branch, a person, an unauthenticated request).
+/// - `laptop`: a token a person minted through Teleport ([`is_person`]): nothing that runs;
+/// - `consumer`: anyone else (a node, CI of a branch, a Teleport bot, a token whose owner is
+///   not a Teleport identity, an unauthenticated request).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HoldClient {
     pub class: &'static str,
@@ -1351,13 +1353,25 @@ tokio::task_local! {
     static HOLD_CLIENT: HoldClient;
 }
 
+/// Whether a token owner is a person's Teleport identity, `teleport:<username>`. Teleport
+/// names the user of a Machine ID bot `bot-<bot name>`, so a host or CI job that mints
+/// through one stays a consumer. Owners of other sources (an admin mint, a token minted
+/// before the prefix) are not read as people: services hold tokens under such names.
+fn is_person(owner: &str) -> bool {
+    owner
+        .strip_prefix(crate::auth::teleport::TELEPORT_OWNER_PREFIX)
+        .is_some_and(|user| !user.is_empty() && !user.starts_with("bot-"))
+}
+
 /// Classify a request's principal. `workload` is whether an OIDC JWT admitted it: a token
-/// owner or htpasswd name is never read as a pull request subject.
+/// owner or htpasswd name is never read as a pull request subject, nor a JWT subject as a
+/// token owner.
 pub fn classify_client(principal: Option<&str>, workload: bool, renovate: &[String]) -> HoldClient {
     let principal = principal.filter(|p| *p != "anonymous");
     let class = match principal {
         Some(p) if renovate.iter().any(|r| r == p) => "renovate",
         Some(p) if workload && p.ends_with(":pull_request") => "pull_request",
+        Some(p) if !workload && is_person(p) => "laptop",
         _ => "consumer",
     };
     HoldClient {
@@ -2574,12 +2588,39 @@ mod tests {
             class(Some("repo:myorg/app:pull_request"), true).class,
             "pull_request"
         );
-        // Default-branch CI and people are consumers.
+        // A person's Teleport identity.
         assert_eq!(
-            class(Some("repo:myorg/app:ref:refs/heads/main"), true).class,
-            "consumer"
+            class(Some("teleport:alice"), false),
+            HoldClient {
+                class: "laptop",
+                principal: Some("teleport:alice".into())
+            }
         );
-        assert_eq!(class(Some("teleport:alice"), false).class, "consumer");
+        // `renovate_principals` wins over it.
+        let renovate_person = vec!["teleport:alice".to_string()];
+        assert_eq!(
+            classify_client(Some("teleport:alice"), false, &renovate_person).class,
+            "renovate"
+        );
+        // Consumers: Teleport bots (hosts, CI), an OIDC subject spelled like a person, other
+        // workloads, owners that are not Teleport identities.
+        for (principal, workload) in [
+            ("teleport:bot-asbo-ro", false),
+            ("teleport:", false),
+            ("teleport:alice", true),
+            ("repo:myorg/app:ref:refs/heads/main", true),
+            ("owner:team:project:web:environment:production", true),
+            ("spiffe://teleport.example.com/svc/indexer", true),
+            ("alice", false),
+            ("bot-asbo-ro", false),
+            ("admin", false),
+        ] {
+            assert_eq!(
+                class(Some(principal), workload).class,
+                "consumer",
+                "{principal}"
+            );
+        }
         // Only a JWT subject says pull request: a token owner of that spelling does not.
         assert_eq!(
             class(Some("repo:myorg/app:pull_request"), false).class,

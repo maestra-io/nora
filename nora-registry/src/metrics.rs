@@ -194,7 +194,7 @@ pub static AUTH_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 /// Proxy artifacts held by the digest quarantine, by registry, outcome
 /// (`blocked` = enforce returned 403; `fallback` = enforce answered a docker tag with its
 /// admitted copy; `observed` = observe served but recorded) and client class
-/// (`digest_quarantine::HoldClient`: `renovate`, `pull_request`, `consumer`).
+/// (`digest_quarantine::HoldClient`: `renovate`, `pull_request`, `laptop`, `consumer`).
 /// Gives the operator an alertable/graphable signal — the quarantine was
 /// previously visible only in WARN logs.
 pub static QUARANTINE_HOLDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
