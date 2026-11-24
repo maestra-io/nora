@@ -227,9 +227,10 @@ under `observe`, where nothing is refused (fluxcd `scripts/nora-image-check.py`)
 
 A plain request for a digest NORA has not cached fetches it and starts its clock. To read a
 verdict without that, send `Cache-Control: only-if-cached` (RFC 9111 5.2.1.7): NORA answers
-from its cache only, never asks an upstream and records nothing; a manifest it does not hold
-is `504` (`MANIFEST_UNKNOWN`), a cached tag answers its cached copy. The github-actions
-`base-images` PR check asks this way (issues-maestra#1649).
+from its cache only, never asks an upstream and starts no clock; a manifest it does not hold
+is `504` (`MANIFEST_UNKNOWN`), a cached tag answers its cached copy. Under `enforce` a held
+manifest is still a 403 and still counts a hold, under the `client` of whoever asked. The
+github-actions `base-images` PR check asks this way (issues-maestra#1649).
 
 ## Break-glass: admit a held image before the TTL (`quarantine_exceptions`)
 
