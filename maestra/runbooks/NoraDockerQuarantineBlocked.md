@@ -4,8 +4,7 @@
 > The rule lives in `maestra-io/fluxcd` `iota/us-iota-lw-kube-infra/nora/helm-release.yaml`
 > (`metrics.prometheusRule.extraGroups`); its expression and `runbook_url` change with a fluxcd PR only.
 
-For an automation agent; every step is read-only. Quarantine policy, who decides exceptions and how
-to repin: `maestra-io/skillz` `plugins/delivery/rules/quarantine.md`.
+Read-only. Policy, exceptions and repin: `maestra-io/skillz` `plugins/delivery/rules/quarantine.md`.
 
 ## What the alert means
 
@@ -32,14 +31,14 @@ for L in $(jq -r 'select(."fields.message"|test("blob held"))|."fields.digest"//
 for D in $(jq -r 'select(."fields.message"|test("blob held")|not)|."fields.digest"//empty' <<<"$R" | sed 's/^sha256://' | sort -u); do
   echo "== $D entered quarantine (3 days back; 'dated by its registry' = backdated first_seen)"; vl "_time:[$(date -u -d "$S -3 days" +%FT%TZ), $E] kubernetes.pod_namespace:nora fields.digest:\"sha256:$D\" fields.message:~\"Quarantine: (proxy-fetched|first sight|held manifest dated)\" | stats by (fields.message, fields.first_seen) min(_time) first" | jq -c .
   echo "== $D pinned in git"; GH_TOKEN=$(asbo creds github --ro) timeout 60 gh api "search/code?q=$D+org:maestra-io" --jq '.items[]|"\(.repository.full_name) \(.path)"'
-  # a `held cached artifact` row may be a layer (nora logs no path, so its image is not resolvable here): [] below is not "no impact" alone
-  for c in us-omega-lw-kube-common us-omicron-lw-kube-common us-iota-lw-kube-infra; do printf '== %s running on %s: ' "$D" "$c"
-    gcx metrics query -d tp-$c "count by (namespace) (max_over_time({__name__=~\"kube_pod_(init_)?container_info\",image_spec=~\".*$D.*\"}[1h]))" -o json 2>/dev/null | jq -c '[.data.result[]|"\(.metric.namespace)=\(.value[1])"]'; done
+  # a `held cached artifact` row may be a layer (nora logs no path: image not resolvable): [] below is not "no impact" alone
+  for c in us-omega-lw-kube-common us-omicron-lw-kube-common us-iota-lw-kube-infra; do printf '== %s (as an image manifest) running on %s: ' "$D" "$c"
+    gcx metrics query -d tp-$c "count by (namespace,pod) (max_over_time({__name__=~\"kube_pod_(init_)?container_info\",image_spec=~\".*$D.*\"}[1h]))" -o json 2>/dev/null | jq -c '[.data.result[]|"\(.metric.namespace)/\(.metric.pod)"]'; done
 done
 for c in us-omega-lw-kube-common us-omicron-lw-kube-common us-iota-lw-kube-infra; do printf '== pods failing to pull on %s: ' "$c"
   gcx metrics query -d tp-$c 'count by (namespace,pod) (max_over_time({__name__=~"kube_pod_(init_)?container_status_waiting_reason",reason=~"ImagePullBackOff|ErrImagePull"}[1h]) > 0)' -o json 2>/dev/null | jq -c '[.data.result[]|"\(.metric.namespace)/\(.metric.pod)"]'; done
 echo "== holds since S until now (still happening?)"; vl "_time:[$S, now] kubernetes.pod_namespace:nora fields.message:~\"Quarantine: (held cached|proxy-fetched)\" fields.client:consumer | stats by (fields.digest, fields.principal) count() n, max(_time) last" | jq -c .
-echo "== blocked holds to consumers in the last 15m (0 = the alert clears on its next evaluation)"; gcx metrics query -d tp-us-iota-lw-kube-infra 'sum(increase(nora_quarantine_holds_total{namespace="nora",registry="docker",outcome="blocked",client="consumer"}[15m]))' -o json 2>/dev/null | jq -c '[.data.result[].value[1]]'
+echo "== blocked holds to consumers in the last 15m (0 = clears on next evaluation)"; gcx metrics query -d tp-us-iota-lw-kube-infra 'sum(increase(nora_quarantine_holds_total{namespace="nora",registry="docker",outcome="blocked",client="consumer"}[15m]))' -o json 2>/dev/null | jq -c '[.data.result[].value[1]]'
 echo "== alert now"; gcx metrics query -d tp-us-iota-lw-kube-infra 'ALERTS{alertname="NoraDockerQuarantineBlocked"}' -o json 2>/dev/null | jq -c '[.data.result[]|.metric.alertstate]'
 ```
 
@@ -82,10 +81,8 @@ echo "== alert now"; gcx metrics query -d tp-us-iota-lw-kube-infra 'ALERTS{alert
 
 ## Traps
 
-- One held request fires the alert; the count says nothing about impact. Impact is only `running on`
-  plus failing pods or jobs.
+- One held request fires it; impact = failing pods or jobs.
 - `outcome="fallback"` (an enforce fallback to an admitted copy) is not a refusal; the block drops it.
 - Renovate (`client="renovate"`), `pull_request` CI and laptop tokens are excluded from the rule; if
   the rows show them, the alert is about another request in the window.
-- Do not run `kubectl get pods -A` over the clusters for the digest (over a minute per cluster): the
-  metrics probe above answers in seconds.
+- Never `kubectl get pods -A` per cluster for the digest (over a minute each): use the metrics probe.
