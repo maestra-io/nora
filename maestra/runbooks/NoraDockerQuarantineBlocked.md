@@ -32,8 +32,8 @@ for D in $(jq -r 'select(."fields.message"|test("blob held")|not)|."fields.diges
   echo "== $D entered quarantine (3 days back; 'dated by its registry' = backdated first_seen)"; vl "_time:[$(date -u -d "$S -3 days" +%FT%TZ), $E] kubernetes.pod_namespace:nora fields.digest:\"sha256:$D\" fields.message:~\"Quarantine: (proxy-fetched|first sight|held manifest dated)\" | stats by (fields.message, fields.first_seen) min(_time) first" | jq -c .
   echo "== $D pinned in git"; GH_TOKEN=$(asbo creds github --ro) timeout 60 gh api "search/code?q=$D+org:maestra-io" --jq '.items[]|"\(.repository.full_name) \(.path)"'
   # a `held cached artifact` row may be a layer (nora logs no path: image not resolvable): [] below is not "no impact" alone
-  for c in us-omega-lw-kube-common us-omicron-lw-kube-common us-iota-lw-kube-infra; do printf '== %s (as an image manifest) in pods of the last 1h on %s: ' "$D" "$c"
-    gcx metrics query -d tp-$c "count by (namespace,pod) (max_over_time({__name__=~\"kube_pod_(init_)?container_info\",image_spec=~\".*$D.*\"}[1h]))" -o json 2>/dev/null | jq -c '[.data.result[]|"\(.metric.namespace)/\(.metric.pod)"]'; done
+  for c in us-omega-lw-kube-common us-omicron-lw-kube-common us-iota-lw-kube-infra; do printf '== %s (as an image manifest) in pods now on %s: ' "$D" "$c"
+    gcx metrics query -d tp-$c "count by (namespace,pod) (last_over_time({__name__=~\"kube_pod_(init_)?container_info\",image_spec=~\".*$D.*\"}[5m]))" -o json 2>/dev/null | jq -c '[.data.result[]|"\(.metric.namespace)/\(.metric.pod)"]'; done
 done
 for c in us-omega-lw-kube-common us-omicron-lw-kube-common us-iota-lw-kube-infra; do printf '== pods failing to pull on %s: ' "$c"
   gcx metrics query -d tp-$c 'count by (namespace,pod) (max_over_time({__name__=~"kube_pod_(init_)?container_status_waiting_reason",reason=~"ImagePullBackOff|ErrImagePull"}[1h]) > 0)' -o json 2>/dev/null | jq -c '[.data.result[]|"\(.metric.namespace)/\(.metric.pod)"]'; done
@@ -58,17 +58,17 @@ echo "== alert now"; gcx metrics query -d tp-us-iota-lw-kube-infra 'ALERTS{alert
   `first sight of a proxied manifest` line. Neither in the window: "release time not measured". The
   exact time is only in the 403 body (`quarantine_until`); never pull the digest to read it: a consumer
   pull is one more hold and re-fires the alert.
-- **Nothing broken** needs all of: `in pods of the last 1h` all `[]` (a listed pod may be gone: check it); no live pin (only a comment, a test fixture or
+- **Nothing broken** needs all of: `in pods now` all `[]`; no live pin (only a comment, a test fixture or
   a closed PR); `pods failing to pull` empty or unrelated to the row's upstream image; and a principal
   that is a person checking by hand. Then: "quarantine worked as designed", the principal, the release
   time, and that the alert clears when `blocked holds … last 15m` is 0 (rows of the log also count fallback and observe holds, which the alert does not) (`for: 0m`, `increase[15m]`).
 - A bot or service principal pulls for a job or a host: find what failed in the window (its
   default-branch runs, its host's unit) before "nothing broken"; a tag pull stores no digest in git.
-- A pod in `in pods of the last 1h` or a live pin (HelmRelease, Kustomize image patch, a default-branch
+- A pod in `in pods now` or a live pin (HelmRelease, Kustomize image patch, a default-branch
   workflow) is potential impact; a real pull is failing only with a failing pod or job of that image
   (`pods failing to pull`, the job's run). Name the pod or job and the commit
   that pinned it (`git log -S <digest>`). `image_spec` carries a digest only for digest-pinned pods; a
-  tag-pinned pod shows up in `pods failing to pull`, not in `in pods of the last 1h`.
+  tag-pinned pod shows up in `pods failing to pull`, not in `in pods now`.
 
 ## Answers
 
