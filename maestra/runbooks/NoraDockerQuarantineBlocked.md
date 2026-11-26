@@ -36,7 +36,8 @@ for D in $(jq -r 'select(."fields.message"|test("blob held")|not)|."fields.diges
     gcx metrics query -d tp-$c "count by (namespace) (max_over_time({__name__=~\"kube_pod_(init_)?container_info\",image_spec=~\".*$D.*\"}[1h]))" -o json 2>/dev/null | jq -c '[.data.result[]|"\(.metric.namespace)=\(.value[1])"]'; done
 done
 for c in us-omega-lw-kube-common us-omicron-lw-kube-common us-iota-lw-kube-infra; do printf '== pods failing to pull on %s: ' "$c"
-  gcx metrics query -d tp-$c 'count by (namespace,pod) (max_over_time(kube_pod_container_status_waiting_reason{reason=~"ImagePullBackOff|ErrImagePull"}[1h]) > 0)' -o json 2>/dev/null | jq -c '[.data.result[]|"\(.metric.namespace)/\(.metric.pod)"]'; done
+  gcx metrics query -d tp-$c 'count by (namespace,pod) (max_over_time({__name__=~"kube_pod_(init_)?container_status_waiting_reason",reason=~"ImagePullBackOff|ErrImagePull"}[1h]) > 0)' -o json 2>/dev/null | jq -c '[.data.result[]|"\(.metric.namespace)/\(.metric.pod)"]'; done
+echo "== holds since S until now (still happening?)"; vl "_time:[$S, now] kubernetes.pod_namespace:nora fields.message:~\"Quarantine: (held cached|proxy-fetched)\" fields.client:consumer | stats by (fields.digest, fields.principal) count() n, max(_time) last" | jq -c .
 echo "== alert now"; gcx metrics query -d tp-us-iota-lw-kube-infra 'ALERTS{alertname="NoraDockerQuarantineBlocked"}' -o json 2>/dev/null | jq -c '[.data.result[]|.metric.alertstate]'
 ```
 
@@ -48,8 +49,9 @@ echo "== alert now"; gcx metrics query -d tp-us-iota-lw-kube-infra 'ALERTS{alert
   the 403s); `Observe` rows never refuse. `principal`: a Teleport bot (`teleport:bot-*`, asbo hosts), a
   service token, or a person's token without the `teleport:` prefix.
 - A layer (blob) digest is pinned nowhere and runs nowhere by itself, and nora logs no request path:
-  the block skips it and names its image as the manifest row of the same principal and upstream within
-  those seconds. No such row = owning image unknown: say so; `pods failing to pull` still covers pods.
+  so its owning image cannot be resolved from logs: the block prints it as a layer and its image is the
+  manifest row of the same principal and upstream within those seconds. No such row = owning image
+  unknown, say so; live impact is then judged only by `pods failing to pull` and the principal's job.
 - **Released at** ≈ `first_seen` + 3 days: `fields.first_seen` (epoch, `date -u -d @<N>`) of the
   `held manifest dated by its registry` line when present (backdated to the publish date), else of the
   `first sight of a proxied manifest` line. Neither in the window: "release time not measured". The
@@ -58,11 +60,12 @@ echo "== alert now"; gcx metrics query -d tp-us-iota-lw-kube-infra 'ALERTS{alert
 - **Nothing broken** needs all of: `running on` all `[]`; no live pin (only a comment, a test fixture or
   a closed PR); `pods failing to pull` empty or unrelated to the row's upstream image; and a principal
   that is a person checking by hand. Then: "quarantine worked as designed", the principal, the release
-  time, and that the alert clears itself ~15 min after the last row (`for: 0m`, `increase[15m]`).
+  time, and that the alert clears itself ~15 min after the last row of `holds since S until now` (`for: 0m`, `increase[15m]`).
 - A bot or service principal pulls for a job or a host: find what failed in the window (its
   default-branch runs, its host's unit) before "nothing broken"; a tag pull stores no digest in git.
-- A namespace in `running on`, a live pin (HelmRelease, Kustomize image patch, a default-branch
-  workflow) or a failing pod of that image: a real pull is failing. Name the pod or job and the commit
+- A namespace in `running on` or a live pin (HelmRelease, Kustomize image patch, a default-branch
+  workflow) is potential impact; a real pull is failing only with a failing pod or job of that image
+  (`pods failing to pull`, the job's run). Name the pod or job and the commit
   that pinned it (`git log -S <digest>`). `image_spec` carries a digest only for digest-pinned pods; a
   tag-pinned pod shows up in `pods failing to pull`, not in `running on`.
 
