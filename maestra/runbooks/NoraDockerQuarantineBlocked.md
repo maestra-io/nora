@@ -32,13 +32,14 @@ for L in $(jq -r 'select(."fields.message"|test("blob held"))|."fields.digest"//
 for D in $(jq -r 'select(."fields.message"|test("blob held")|not)|."fields.digest"//empty' <<<"$R" | sed 's/^sha256://' | sort -u); do
   echo "== $D entered quarantine (3 days back; 'dated by its registry' = backdated first_seen)"; vl "_time:[$(date -u -d "$S -3 days" +%FT%TZ), $E] kubernetes.pod_namespace:nora fields.digest:\"sha256:$D\" fields.message:~\"Quarantine: (proxy-fetched|first sight|held manifest dated)\" | stats by (fields.message, fields.first_seen) min(_time) first" | jq -c .
   echo "== $D pinned in git"; GH_TOKEN=$(asbo creds github --ro) timeout 60 gh api "search/code?q=$D+org:maestra-io" --jq '.items[]|"\(.repository.full_name) \(.path)"'
-  # a `held cached artifact` row may be a layer: its digest matches no image_spec and no pin, so [] here is not "no impact" alone
+  # a `held cached artifact` row may be a layer (nora logs no path, so its image is not resolvable here): [] below is not "no impact" alone
   for c in us-omega-lw-kube-common us-omicron-lw-kube-common us-iota-lw-kube-infra; do printf '== %s running on %s: ' "$D" "$c"
     gcx metrics query -d tp-$c "count by (namespace) (max_over_time({__name__=~\"kube_pod_(init_)?container_info\",image_spec=~\".*$D.*\"}[1h]))" -o json 2>/dev/null | jq -c '[.data.result[]|"\(.metric.namespace)=\(.value[1])"]'; done
 done
 for c in us-omega-lw-kube-common us-omicron-lw-kube-common us-iota-lw-kube-infra; do printf '== pods failing to pull on %s: ' "$c"
   gcx metrics query -d tp-$c 'count by (namespace,pod) (max_over_time({__name__=~"kube_pod_(init_)?container_status_waiting_reason",reason=~"ImagePullBackOff|ErrImagePull"}[1h]) > 0)' -o json 2>/dev/null | jq -c '[.data.result[]|"\(.metric.namespace)/\(.metric.pod)"]'; done
 echo "== holds since S until now (still happening?)"; vl "_time:[$S, now] kubernetes.pod_namespace:nora fields.message:~\"Quarantine: (held cached|proxy-fetched)\" fields.client:consumer | stats by (fields.digest, fields.principal) count() n, max(_time) last" | jq -c .
+echo "== blocked holds to consumers in the last 15m (0 = the alert clears on its next evaluation)"; gcx metrics query -d tp-us-iota-lw-kube-infra 'sum(increase(nora_quarantine_holds_total{namespace="nora",registry="docker",outcome="blocked",client="consumer"}[15m]))' -o json 2>/dev/null | jq -c '[.data.result[].value[1]]'
 echo "== alert now"; gcx metrics query -d tp-us-iota-lw-kube-infra 'ALERTS{alertname="NoraDockerQuarantineBlocked"}' -o json 2>/dev/null | jq -c '[.data.result[]|.metric.alertstate]'
 ```
 
@@ -51,8 +52,8 @@ echo "== alert now"; gcx metrics query -d tp-us-iota-lw-kube-infra 'ALERTS{alert
   service token, or a person's token without the `teleport:` prefix.
 - A layer digest (every `blob held` row, and a `held cached artifact` row may be one too) is pinned nowhere and runs nowhere by itself, and nora logs no request path:
   so its owning image cannot be resolved from logs: the block prints it as a layer and its image is the
-  manifest row of the same principal and upstream within those seconds. No such row = owning image
-  unknown, say so; live impact is then judged only by `pods failing to pull` and the principal's job.
+  manifest row of the same principal and upstream within those seconds. No such row, or more than one
+  = owning image unknown or ambiguous: say so and check each candidate; live impact is then judged only by `pods failing to pull` and the principal's job.
 - **Released at** ≈ `first_seen` + 3 days: `fields.first_seen` (epoch, `date -u -d @<N>`) of the
   `held manifest dated by its registry` line when present (backdated to the publish date), else of the
   `first sight of a proxied manifest` line. Neither in the window: "release time not measured". The
@@ -61,7 +62,7 @@ echo "== alert now"; gcx metrics query -d tp-us-iota-lw-kube-infra 'ALERTS{alert
 - **Nothing broken** needs all of: `running on` all `[]`; no live pin (only a comment, a test fixture or
   a closed PR); `pods failing to pull` empty or unrelated to the row's upstream image; and a principal
   that is a person checking by hand. Then: "quarantine worked as designed", the principal, the release
-  time, and that the alert clears itself ~15 min after the last row of `holds since S until now` (`for: 0m`, `increase[15m]`).
+  time, and that the alert clears when `blocked holds … last 15m` is 0 (rows of the log also count fallback and observe holds, which the alert does not) (`for: 0m`, `increase[15m]`).
 - A bot or service principal pulls for a job or a host: find what failed in the window (its
   default-branch runs, its host's unit) before "nothing broken"; a tag pull stores no digest in git.
 - A namespace in `running on` or a live pin (HelmRelease, Kustomize image patch, a default-branch
