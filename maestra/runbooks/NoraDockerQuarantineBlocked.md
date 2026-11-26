@@ -32,6 +32,7 @@ for L in $(jq -r 'select(."fields.message"|test("blob held"))|."fields.digest"//
 for D in $(jq -r 'select(."fields.message"|test("blob held")|not)|."fields.digest"//empty' <<<"$R" | sed 's/^sha256://' | sort -u); do
   echo "== $D entered quarantine (3 days back; 'dated by its registry' = backdated first_seen)"; vl "_time:[$(date -u -d "$S -3 days" +%FT%TZ), $E] kubernetes.pod_namespace:nora fields.digest:\"sha256:$D\" fields.message:~\"Quarantine: (proxy-fetched|first sight|held manifest dated)\" | stats by (fields.message, fields.first_seen) min(_time) first" | jq -c .
   echo "== $D pinned in git"; GH_TOKEN=$(asbo creds github --ro) timeout 60 gh api "search/code?q=$D+org:maestra-io" --jq '.items[]|"\(.repository.full_name) \(.path)"'
+  # a `held cached artifact` row may be a layer: its digest matches no image_spec and no pin, so [] here is not "no impact" alone
   for c in us-omega-lw-kube-common us-omicron-lw-kube-common us-iota-lw-kube-infra; do printf '== %s running on %s: ' "$D" "$c"
     gcx metrics query -d tp-$c "count by (namespace) (max_over_time({__name__=~\"kube_pod_(init_)?container_info\",image_spec=~\".*$D.*\"}[1h]))" -o json 2>/dev/null | jq -c '[.data.result[]|"\(.metric.namespace)=\(.value[1])"]'; done
 done
@@ -48,7 +49,7 @@ echo "== alert now"; gcx metrics query -d tp-us-iota-lw-kube-infra 'ALERTS{alert
   `fields.mode` = `Enforce` a row is a 403 or a fallback to an admitted copy (the metric counts only
   the 403s); `Observe` rows never refuse. `principal`: a Teleport bot (`teleport:bot-*`, asbo hosts), a
   service token, or a person's token without the `teleport:` prefix.
-- A layer (blob) digest is pinned nowhere and runs nowhere by itself, and nora logs no request path:
+- A layer digest (every `blob held` row, and a `held cached artifact` row may be one too) is pinned nowhere and runs nowhere by itself, and nora logs no request path:
   so its owning image cannot be resolved from logs: the block prints it as a layer and its image is the
   manifest row of the same principal and upstream within those seconds. No such row = owning image
   unknown, say so; live impact is then judged only by `pods failing to pull` and the principal's job.
