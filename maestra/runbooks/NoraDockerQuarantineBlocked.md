@@ -28,7 +28,8 @@ S=<startsAt-15m>; E=<startsAt+10m>
 vl(){ timeout 90 gcx api "/api/datasources/proxy/uid/tp-victorialogs-pod-logs-iota/select/logsql/query?query=$(jq -rn --arg q "$1" '$q|@uri')" 2>&1 | grep -v '"class":"hint"'; }
 echo "== held requests by consumer"
 R=$(vl "_time:[$S, $E] kubernetes.pod_namespace:nora fields.message:~\"Quarantine: (held cached|proxy-fetched)\" fields.client:consumer | stats by (fields.message, fields.digest, fields.upstream, fields.principal, fields.mode) count() n, min(_time) first, max(_time) last"); jq -c . <<<"$R"
-for D in $(jq -r '."fields.digest"//empty' <<<"$R" | sed 's/^sha256://' | sort -u); do
+for L in $(jq -r 'select(."fields.message"|test("blob held"))|."fields.digest"//empty' <<<"$R" | sort -u); do grep -q "$L" <<<"$(jq -r 'select(."fields.message"|test("blob")|not)|."fields.digest"' <<<"$R")" || echo "== $L is a layer: its image = the manifest row of the same principal and upstream within those seconds"; done
+for D in $(jq -r 'select(."fields.message"|test("blob held")|not)|."fields.digest"//empty' <<<"$R" | sed 's/^sha256://' | sort -u); do
   echo "== $D entered quarantine (3 days back; 'dated by its registry' = backdated first_seen)"; vl "_time:[$(date -u -d "$S -3 days" +%FT%TZ), $E] kubernetes.pod_namespace:nora fields.digest:\"sha256:$D\" fields.message:~\"Quarantine: (proxy-fetched|first sight|held manifest dated)\" | stats by (fields.message, fields.first_seen) min(_time) first" | jq -c .
   echo "== $D pinned in git"; GH_TOKEN=$(asbo creds github --ro) timeout 60 gh api "search/code?q=$D+org:maestra-io" --jq '.items[]|"\(.repository.full_name) \(.path)"'
   for c in us-omega-lw-kube-common us-omicron-lw-kube-common us-iota-lw-kube-infra; do printf '== %s running on %s: ' "$D" "$c"
@@ -46,8 +47,9 @@ echo "== alert now"; gcx metrics query -d tp-us-iota-lw-kube-infra 'ALERTS{alert
   `fields.mode` = `Enforce` a row is a 403 or a fallback to an admitted copy (the metric counts only
   the 403s); `Observe` rows never refuse. `principal`: a Teleport bot (`teleport:bot-*`, asbo hosts), a
   service token, or a person's token without the `teleport:` prefix.
-- A layer (blob) digest is pinned nowhere and runs nowhere by itself: judge it by the manifest row of
-  the same principal within the same seconds, its owning image.
+- A layer (blob) digest is pinned nowhere and runs nowhere by itself, and nora logs no request path:
+  the block skips it and names its image as the manifest row of the same principal and upstream within
+  those seconds. No such row = owning image unknown: say so; `pods failing to pull` still covers pods.
 - **Released at** ≈ `first_seen` + 3 days: `fields.first_seen` (epoch, `date -u -d @<N>`) of the
   `held manifest dated by its registry` line when present (backdated to the publish date), else of the
   `first sight of a proxied manifest` line. Neither in the window: "release time not measured". The
